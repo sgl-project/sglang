@@ -232,8 +232,10 @@ class StreamingSession(BasePrefixCache):
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # Floor-align prefix_len to page boundary (NPU workaround).
-        if is_npu() and self.page_size > 1:
+        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
+        # cursor must also land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
+        if self.page_size > 1 and (is_npu() or req.kv.swa_evicted_seqlen > prefix_len):
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
@@ -401,13 +403,7 @@ class StreamingSession(BasePrefixCache):
             )
 
         if slot.kv.holds_kv:
-            start = protected_len
-            end = slot.kv.kv_allocated_len
-            if start < end:
-                kv_indices = self.req_to_token_pool.req_to_token[
-                    slot.kv.req_pool_idx, start:end
-                ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
+            self.free_kv_row(slot.kv, [(protected_len, slot.kv.kv_allocated_len)])
             self.req_to_token_pool.free(slot)
 
         self._free_slot_mamba(slot)
@@ -504,7 +500,7 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(kv.req_pool_idx, prefix_len, kv.kv_allocated_len)
+        self._free_kv_aligned(kv, prefix_len, kv.kv_allocated_len)
         kv.kv_allocated_len = prefix_len
         kv.kv_committed_len = min(kv.kv_committed_len, prefix_len)
         kv.swa_evicted_seqlen = min(kv.swa_evicted_seqlen, prefix_len)
@@ -516,14 +512,18 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.kv.req_pool_idx, target, req.kv.kv_allocated_len)
+        if self.page_size > 1 and req.kv.swa_evicted_seqlen > target:
+            # Same hazard as the match-path rewind: the cursor must stay
+            # page-aligned; the partial page is re-prefilled next turn.
+            target = (target // self.page_size) * self.page_size
+        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv.kv_committed_len = min(req.kv.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
-        """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
+    def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
+        """Free the record's kv row over [ceil_align(target), end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
         still holding committed tokens. The range [target, ceil_align(target))
@@ -534,9 +534,7 @@ class StreamingSession(BasePrefixCache):
         start = target
         if self.page_size > 1:
             start = ceil_align(start, self.page_size)
-        if start < end:
-            tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
+        self.free_kv_row(kv, [(start, end)])
 
     # -- Pass-through methods --
 
