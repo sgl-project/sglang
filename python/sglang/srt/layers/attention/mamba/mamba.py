@@ -4,6 +4,10 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.mamba.triton_ops import (
+    mamba_chunk_scan_combined,
+    selective_state_update,
+)
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
     extra_groups_for_head_shards,
@@ -13,10 +17,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
-from sglang.srt.layers.attention.mamba.ops import (
-    mamba_chunk_scan_combined,
-    selective_state_update,
-)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -27,7 +27,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
@@ -42,15 +41,15 @@ from sglang.srt.utils import (
 )
 
 if is_cuda():
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn as causal_conv1d_fn_triton,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_update as causal_conv1d_update_triton,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn,
         causal_conv1d_update,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update_triton,
     )
 elif is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import (
@@ -63,16 +62,16 @@ elif is_xpu():
     # XPU has no native causal_conv1d kernel yet; use the portable Triton
     # implementation for both the "native" and the "_triton" entry points so
     # `causal_conv1d_fn` / `causal_conv1d_fn_triton` are always bound on XPU.
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn_triton,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update,
     )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_update as causal_conv1d_update_triton,
     )
 
@@ -445,10 +444,8 @@ class MambaMixer2(torch.nn.Module):
         output: Optional[torch.Tensor] = None,
         layer_cache: MambaPool.State,
         metadata: Mamba2Metadata,
-        forward_batch: ForwardBatch,
         mup_vector: Optional[torch.Tensor] = None,
         use_triton_causal_conv: bool = False,
-        should_allreduce_fusion: bool = False,
     ):
         # Returns the projected result. When `output` is given it is also
         # written into that buffer (required by the cuda-graph split ops, which
@@ -565,14 +562,13 @@ class MambaMixer2(torch.nn.Module):
             x = hidden_states_B_C_p.transpose(
                 0, 1
             )  # this is the form that causal-conv see
+            # Runs once per mamba layer
             if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
+                metadata.has_mamba_track_mask
                 and metadata.track_conv_indices is not None
             ):
                 x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_state[forward_batch.mamba_track_indices[mask_indices]] = x_to_track
+                conv_state[metadata.conv_states_mask_indices] = x_to_track
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
@@ -761,9 +757,7 @@ class MambaMixer2(torch.nn.Module):
         # norm usage
         hidden_states = self.norm(preallocated_ssm_out, gate)
 
-        mixer_out, _ = self.out_proj(
-            hidden_states, skip_all_reduce=should_allreduce_fusion
-        )
+        mixer_out, _ = self.out_proj(hidden_states)
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 

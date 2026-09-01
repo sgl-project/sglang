@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.utils import TypeBasedDispatcher
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 class TestTypeBasedDispatcher(unittest.TestCase):
@@ -34,7 +34,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             FlushCacheReqInput,
             FreezeGCReq,
             GetInternalStateReq,
-            GetLoadsReqInput,
             GetWeightsByNameReqInput,
             InitWeightsSendGroupForRemoteInstanceReqInput,
             InitWeightsUpdateGroupReqInput,
@@ -114,7 +113,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             (ExpertDistributionReq, lambda req: "expert_distribution_handled"),
             (LoadLoRAAdapterReqInput, lambda req: "load_lora_adapter_handled"),
             (UnloadLoRAAdapterReqInput, lambda req: "unload_lora_adapter_handled"),
-            (GetLoadsReqInput, lambda req: "get_loads_handled"),
         ]
 
         # Create requests that conforms to the real distribution
@@ -209,7 +207,6 @@ class TestTypeBasedDispatcher(unittest.TestCase):
         test_requests.append(GetWeightsByNameReqInput(name=""))
         test_requests.append(ReleaseMemoryOccupationReqInput())
         test_requests.append(RpcReqInput(method=""))
-        test_requests.append(GetLoadsReqInput())
 
         dispatcher = TypeBasedDispatcher(mapping)
 

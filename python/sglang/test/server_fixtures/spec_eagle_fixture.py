@@ -17,7 +17,6 @@ import time
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -28,6 +27,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # Chat-style prompts shared by send_request / send_requests_abort.
@@ -58,8 +58,12 @@ class SpecEagleServerBase(CustomTestCase):
     attention_backend = "flashinfer"
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    mem_fraction_static = 0.85
-    max_running_requests = 8
+    # Leaves ~3.3GB on a 32GB card for the verify logits and activations at a
+    # cap of 64; higher OOMs, lower starves the KV pool into capping the batch.
+    mem_fraction_static = 0.80
+    # The eval kits drive 128 client threads, so a small cap just serializes them.
+    # Capture follows: capture_bs is clipped to req_to_token_pool.size (cap + 1).
+    max_running_requests = 64
     chunked_prefill_size = 128
     # bf16 rather than fp16: fp16 activations can overflow (-> Inf -> NaN) on
     # degenerate draft branches in verify and trip the CI NaN asserts.
@@ -69,6 +73,7 @@ class SpecEagleServerBase(CustomTestCase):
     # Launch with --enable-return-hidden-states so SpecHiddenStatesKit can probe
     # per-request hidden states; per-request gated, so other requests don't pay.
     enable_return_hidden_states = False
+    enable_deterministic_inference = False
 
     # -- extras --
     # env_overrides: (env_var_obj, value) pairs applied only around launch.
@@ -109,6 +114,8 @@ class SpecEagleServerBase(CustomTestCase):
             args.append("--trust-remote-code")
         if cls.enable_return_hidden_states:
             args.append("--enable-return-hidden-states")
+        if cls.enable_deterministic_inference:
+            args.append("--enable-deterministic-inference")
         if cls.cuda_graph_max_bs_decode is not None:
             args += ["--cuda-graph-max-bs-decode", str(cls.cuda_graph_max_bs_decode)]
         args += [str(a) for a in cls.extra_args]
@@ -143,7 +150,7 @@ class SpecEagleServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid, wait_timeout=60)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     @property
     def tokenizer(self):

@@ -22,12 +22,14 @@ from sglang.srt.layers.moe.topk import (
     remap_topk_for_per_rank_shared_slots,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 
 
 class HashTopK(nn.Module):
@@ -44,15 +46,13 @@ class HashTopK(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        from sglang.srt.server_args import get_global_server_args
 
-        self.enable_deepep_waterfill = (
-            num_fused_shared_experts > 0
-            and get_global_server_args().enable_deepep_waterfill
+        self.enable_waterfill = (
+            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
         )
-        self.deepep_waterfill_balancer = None
+        self.waterfill_balancer = None
 
-        if self.enable_deepep_waterfill:
+        if self.enable_waterfill:
             # Waterfill appends the shared expert after EPLB maps routed IDs.
             topk -= num_fused_shared_experts
             num_fused_shared_experts = 0
@@ -120,18 +120,18 @@ class HashTopK(nn.Module):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_deepep_waterfill(topk_output, num_tokens=0)
+        return self._apply_waterfill(topk_output, num_tokens=0)
 
-    def _apply_deepep_waterfill(
+    def _apply_waterfill(
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
-        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+        if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
-                "DeepEP waterfill HashTopK must be prepared by ModelRunner before forward."
+                "Waterfill HashTopK must be prepared by ModelRunner before forward."
             )
-        if self.deepep_waterfill_balancer is None:
+        if self.waterfill_balancer is None:
             return topk_output
-        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+        return self.waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def _forward_torch(
         self, router_logits: torch.Tensor, input_ids: torch.Tensor
@@ -178,6 +178,38 @@ class HashTopK(nn.Module):
 
         return topk_weights, topk_ids
 
+    def _forward_xpu(
+        self, router_logits: torch.Tensor, input_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The XPU 'hash_topk' kernel currently supports the 'sqrtsoftplus' score func only.
+        # Other score funcs fall back to the torch implementation; more will be supported in the future.
+        if self.score_func == "sqrtsoftplus":
+            from sgl_kernel import hash_topk
+
+            num_tokens = router_logits.size(0)
+            topk_routed = self.tid2eid.size(1)
+            topk_fused = topk_routed + self.num_fused_shared_experts
+            topk_ids = torch.empty(
+                (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
+            )
+            topk_weights = torch.empty(
+                (num_tokens, topk_fused),
+                dtype=torch.float32,
+                device=router_logits.device,
+            )
+            hash_topk(
+                router_logits,
+                input_ids,
+                self.tid2eid,
+                topk_weights,
+                topk_ids,
+                self.routed_scaling_factor,
+                self.score_func,
+            )
+            return topk_weights, topk_ids
+        else:
+            return self._forward_torch(router_logits, input_ids)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -190,8 +222,10 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.dsv4 import hash_topk
+        if _is_xpu:
+            topk_weights, topk_ids = self._forward_xpu(router_logits, input_ids)
+        elif envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
+            from sglang.kernels.ops.attention.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -268,7 +302,7 @@ class HashTopK(nn.Module):
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        topk_output = self._apply_deepep_waterfill(topk_output, hidden_states.shape[0])
+        topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
         if is_hip():
             _zero_topk_weights_padded_region(
                 topk_output.topk_weights, num_token_non_padded

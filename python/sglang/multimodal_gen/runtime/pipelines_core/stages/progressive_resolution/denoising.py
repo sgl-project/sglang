@@ -50,9 +50,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.upsample import (
     apply_upsample,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 
 logger = init_logger(__name__)
 
@@ -217,11 +219,6 @@ class ProgressiveDenoisingStageRouter(PipelineStage):
         raise ValueError(f"Unsupported progressive_mode: {mode!r}")
 
 
-def _get_scm_preset() -> str | None:
-    preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
-    return None if (preset is None or preset == "none") else preset
-
-
 class ProgressiveDenoisingStage(DenoisingStage):
     """DenoisingStage extended with progressive resolution growing.
 
@@ -297,6 +294,13 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> None:
         """Called after each stage transition. Update resolution-dependent state."""
         pass
+
+    def _effective_scm_preset(self) -> str | None:
+        """SCM preset for this request: per-request override, then env default."""
+        preset = self._cache_dit_request_overrides.get(
+            "scm_preset", envs.SGLANG_CACHE_DIT_SCM_PRESET
+        )
+        return None if (preset is None or preset == "none") else preset
 
     def _refresh_cache_dit_context(
         self, n_remaining: int, scm_preset: str | None
@@ -537,9 +541,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
         # ── Stage loop ────────────────────────────────────────────────────────
         # DenoisingStage.forward() wraps its denoising loop in torch.autocast;
         # we bypass that path, so we must apply the same context here.
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=ctx.target_dtype,
+        with precision_autocast_context(
+            ctx.target_dtype,
+            server_args.disable_autocast,
             enabled=ctx.autocast_enabled,
         ):
             for stage in range(1, num_stages + 1):
@@ -610,7 +614,9 @@ class ProgressiveDenoisingStage(DenoisingStage):
                 # residual-diff decision for the first full-res steps.
                 if self._cache_dit_enabled:
                     n_remaining = n_steps - stage_end
-                    self._refresh_cache_dit_context(n_remaining, _get_scm_preset())
+                    self._refresh_cache_dit_context(
+                        n_remaining, self._effective_scm_preset()
+                    )
                     logger.info(
                         "cache-dit context refreshed at stage transition "
                         "(step %d, %d steps remaining)",

@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     should_include_warmup_image,
+    supports_synthetic_warmup,
 )
 
 logger = init_logger(__name__)
@@ -68,7 +69,7 @@ def should_return_warmup_result(req_or_group: Any) -> bool:
 
 
 def should_run_server_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.server_warmup
+    return server_args.warmup_mode == "server"
 
 
 def is_realtime_serving(server_args: ServerArgs) -> bool:
@@ -85,13 +86,19 @@ def is_realtime_serving(server_args: ServerArgs) -> bool:
 
 
 def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
-    return should_run_server_warmup(server_args) and not is_realtime_serving(
-        server_args
+    return (
+        should_run_server_warmup(server_args)
+        and supports_synthetic_warmup(server_args)
+        and not is_realtime_serving(server_args)
     )
 
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.warmup_resolutions is not None
+    return (
+        server_args.warmup_mode != "off"
+        and server_args.warmup_resolutions is not None
+        and supports_synthetic_warmup(server_args)
+    )
 
 
 def format_warmup_req(req_or_group: Any) -> str:
@@ -102,9 +109,12 @@ def format_warmup_req(req_or_group: Any) -> str:
     if req is None:
         return prefix
 
-    shape = f"{req.width}x{req.height}"
-    if req.num_frames is not None and req.num_frames > 1:
-        shape += f"x{req.num_frames}f"
+    width = getattr(req, "width", None)
+    height = getattr(req, "height", None)
+    shape = "action" if width is None or height is None else f"{width}x{height}"
+    num_frames = getattr(req, "num_frames", None)
+    if num_frames is not None and num_frames > 1:
+        shape += f"x{num_frames}f"
 
     default_steps = req.extra.get("cache_dit_num_inference_steps")
     if default_steps is not None and default_steps != req.num_inference_steps:
@@ -153,7 +163,7 @@ async def run_async_client_warmup(
             response = await forward(req)
             if response.error is not None:
                 raise RuntimeError(response.error)
-    except Exception as e:
+    except Exception:
         if fail_open:
             logger.warning(
                 "Synthetic server warmup failed; continuing startup", exc_info=True
@@ -243,15 +253,16 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        progress_n = self._warmup_processed
         if _is_ci_log_env():
             logger.info(
                 "Warmup requests: %s/%s %s",
-                self._warmup_progress_bar.n,
+                progress_n,
                 self._warmup_progress_bar.total,
                 self._format_warmup_req(req_or_group),
             )
 
-        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
+        if progress_n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()
             self._warmup_progress_bar = None
 
@@ -288,10 +299,9 @@ class SchedulerWarmupMixin:
     ) -> list[tuple[bytes, Any]]:
         if (
             self.req_based_warmup_scheduled
-            or not self.server_args.warmup
+            or self.server_args.warmup_mode != "request"
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
-            or self.server_args.server_warmup
         ):
             return recv_reqs
 

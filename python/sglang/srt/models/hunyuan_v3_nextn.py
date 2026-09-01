@@ -186,6 +186,10 @@ class HYV3ForCausalLMNextN(nn.Module):
                 subname = name[len(nextn_prefix) :]
                 if any(subname.startswith(s) for s in spec_weight_names):
                     name = f"model.{subname}"
+                elif subname.startswith("final_layernorm"):
+                    # Released checkpoints store the draft head's output norm
+                    # as model.layers.<N>.final_layernorm.weight.
+                    name = "model.shared_head.norm.weight"
                 else:
                     name = f"model.decoder.{subname}"
             elif name == "model.shared_head.norm.weight":

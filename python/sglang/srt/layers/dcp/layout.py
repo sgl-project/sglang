@@ -17,8 +17,7 @@ the owner-rule local-index filter."""
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
-from sglang.srt.layers.dcp.comm import dcp_enabled
+from sglang.srt.runtime_context import get_parallel
 
 
 def get_dcp_lens(
@@ -43,12 +42,32 @@ def get_dcp_lens(
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
-    if dcp_enabled():
+    parallel = get_parallel()
+    if parallel.dcp_enabled:
         kv_indices = (
-            kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
-            // get_dcp_world_size()
+            kv_indices[kv_indices % parallel.dcp_size == parallel.dcp_rank]
+            // parallel.dcp_size
         )
     return kv_indices
+
+
+def filter_dcp_local_chunk_kv_indices(
+    kv_indices: torch.Tensor,
+    chunk_starts_cpu: torch.Tensor,
+    chunk_seq_lens_cpu: torch.Tensor,
+) -> torch.Tensor:
+    parallel = get_parallel()
+    if not parallel.dcp_enabled:
+        return kv_indices
+
+    dcp_size = parallel.dcp_size
+    parts = []
+    offset = 0
+    for start, length in zip(chunk_starts_cpu.tolist(), chunk_seq_lens_cpu.tolist()):
+        first = (parallel.dcp_rank - start) % dcp_size
+        parts.append(kv_indices[offset + first : offset + length : dcp_size])
+        offset += length
+    return torch.cat(parts) // dcp_size
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):
@@ -59,6 +78,7 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     in-place mutation because callers (plan_dcp_decode_metadata, the FlashInfer-MLA
     cuda-graph replay path) rely on it.
     """
-    if not dcp_enabled():
+    parallel = get_parallel()
+    if not parallel.dcp_enabled:
         return
-    kv_len_arr.copy_(get_dcp_lens(kv_len_arr, get_dcp_world_size(), get_dcp_rank()))
+    kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))

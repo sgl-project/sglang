@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build synthetic diffusion warmup requests.
+"""Build synthetic generation warmup requests.
 
 Default server warmup should cover a representative serving path before the
 first real request, without copying user traffic. It starts from the model's
@@ -17,10 +17,7 @@ from copy import copy
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -42,6 +39,7 @@ SERVER_WARMUP_IMAGE_MAX_AREA = 768 * 768
 SERVER_WARMUP_DIFFUSERS_IMAGE_MAX_AREA = 512 * 512
 SERVER_WARMUP_VIDEO_MAX_AREA = 832 * 480
 SERVER_WARMUP_MAX_VIDEO_FRAMES = 17
+SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES = 25
 SERVER_WARMUP_IMAGE_STEPS = 2
 SERVER_WARMUP_VIDEO_STEPS = 2
 
@@ -146,7 +144,7 @@ def _fallback_warmup_resolution(server_args: ServerArgs) -> tuple[int, int]:
 
 
 def _is_video_warmup_task(server_args: ServerArgs) -> bool:
-    return server_args.pipeline_config.task_type.data_type() == DataType.VIDEO
+    return server_args.pipeline_config.task_type.is_video_gen()
 
 
 def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
@@ -234,22 +232,49 @@ def _resolve_warmup_num_frames(
     *,
     server_based_warmup: bool,
 ) -> int:
-    num_frames = sampling_defaults.num_frames
-    if (
-        not server_based_warmup
-        or not _is_video_warmup_task(server_args)
-        or num_frames is None
-    ):
-        # use default num frames
+    default_num_frames = getattr(sampling_defaults, "num_frames", 1)
+    if not _is_video_warmup_task(server_args):
+        return default_num_frames
+
+    # Most tests and a few lightweight integrations use MagicMock server args,
+    # whose missing attributes resolve to another mock. Only accept a concrete
+    # integer as an explicit override.
+    explicit_num_frames = getattr(server_args, "warmup_num_frames", None)
+    num_frames = (
+        explicit_num_frames
+        if isinstance(explicit_num_frames, int)
+        else default_num_frames
+    )
+    if num_frames is None:
         return num_frames
 
-    return min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
+    # Breakable CUDA graph replays only exact latent shapes: the warmup
+    # request must run the full serving frame count so its captured graphs
+    # match serving signatures (mirrors the uncapped-steps rule in
+    # _resolve_warmup_steps).
+    if (
+        not server_based_warmup
+        or getattr(server_args, "enable_breakable_cuda_graph", False) is True
+    ):
+        warmup_num_frames = num_frames
+    else:
+        # Multi-GPU LTX two-stage aligns a one-second request to 25 frames;
+        # cover its latent shape during warmup
+        frame_budget = (
+            SERVER_WARMUP_LTX2_TWO_STAGE_MAX_VIDEO_FRAMES
+            if is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            and server_args.num_gpus > 1
+            else SERVER_WARMUP_MAX_VIDEO_FRAMES
+        )
+        warmup_num_frames = min(num_frames, frame_budget)
+
+    return server_args.pipeline_config.adjust_num_frames(warmup_num_frames)
 
 
 def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
-    if sampling_defaults.true_cfg_scale is not None:
+    if getattr(sampling_defaults, "true_cfg_scale", None) is not None:
         return sampling_defaults.true_cfg_scale
-    return sampling_defaults.guidance_scale
+    return getattr(sampling_defaults, "guidance_scale", None)
 
 
 def _resolve_warmup_steps(
@@ -295,15 +320,30 @@ def should_include_warmup_image(
     server_args: ServerArgs, server_based_warmup: bool
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
+    if not supports_synthetic_warmup(server_args):
+        return False
     if not task_type.accepts_image_input():
         return False
     if task_type.requires_image_input():
         return True
+    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+        # BCG replays only exact input signatures. A synthetic warmup image
+        # flips optional-TI2V pipelines (e.g. LTX-2) into image-conditioned
+        # kwargs (denoise-mask -> per-token timestep) that pure T2V serving
+        # never produces, so every T2V request would miss the captured
+        # graphs and silently run eager. Capture the T2V signature instead;
+        # image-conditioned requests fall back to eager.
+        return False
     if type(server_args.pipeline_config).__name__ == "GlmImagePipelineConfig":
         return False
     if server_based_warmup:
         return task_type in (ModelTaskType.TI2I, ModelTaskType.TI2V)
     return True
+
+
+def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
+    task_type = server_args.pipeline_config.task_type
+    return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
 def build_warmup_reqs(
@@ -315,6 +355,8 @@ def build_warmup_reqs(
     server_based_warmup: bool = False,
 ) -> list[Req]:
     task_type = server_args.pipeline_config.task_type
+    if not supports_synthetic_warmup(server_args):
+        return []
     sampling_defaults = get_model_sampling_defaults(server_args)
 
     if warmup_resolutions is None:
@@ -327,7 +369,7 @@ def build_warmup_reqs(
     else:
         resolutions = [parse_size(resolution) for resolution in warmup_resolutions]
 
-    negative_prompt: Any = sampling_defaults.negative_prompt
+    negative_prompt: Any = getattr(sampling_defaults, "negative_prompt", None)
     cfg_scale = _effective_cfg_scale(sampling_defaults)
     warmup_steps = _resolve_warmup_steps(
         server_args,
@@ -392,6 +434,9 @@ def build_warmup_reqs(
                 req.suppress_logs = True
                 req.metrics.suppress_stage_breakdown = True
                 req.extra["server_internal_prewarm"] = True
+            req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+                req, server_args
+            )
             if return_warmup_result:
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:

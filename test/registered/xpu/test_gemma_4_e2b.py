@@ -19,7 +19,6 @@ Server is started with ``sglang serve`` (``--model-impl sglang``).
 
 from __future__ import annotations
 
-import os
 import unittest
 
 import openai
@@ -29,8 +28,8 @@ from sglang.srt.utils.common import is_xpu
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.vlm_utils import (
     DEFAULT_URL_FOR_TEST,
-    kill_process_tree,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 MODEL = "google/gemma-4-E2B-it"
@@ -83,7 +82,6 @@ class TestGemma4E2BXPU(CustomTestCase):
         cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
 
         _empty_xpu_cache()
         cls.process = popen_launch_server(
@@ -98,7 +96,7 @@ class TestGemma4E2BXPU(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
         _empty_xpu_cache()
 
     def test_simple_qa(self):

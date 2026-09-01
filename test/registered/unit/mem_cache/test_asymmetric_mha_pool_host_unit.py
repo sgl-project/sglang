@@ -50,6 +50,7 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
         raise ValueError(f"Unsupported test layout: {layout}")
 
     host.kv_buffer = (torch.empty(k_dims), torch.empty(v_dims))
+    host.can_use_write_back_jit = False
     return host
 
 
@@ -77,6 +78,42 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertIs(get_mha_host_pool_cls(symmetric_pool), MHATokenToKVPoolHost)
         self.assertIs(
             get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
+        )
+
+    def test_staged_write_back_jit_uses_separate_kv_buffers(self):
+        host = _make_host("page_first")
+        host.page_num = 4
+        host.v_head_dim = 8
+        host.device_pool = SimpleNamespace(device="cuda")
+        cpu_empty = torch.empty
+
+        def _cpu_empty(shape, *, dtype, device):
+            return cpu_empty(shape, dtype=dtype)
+
+        with (
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_cuda", True),
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_hip", False),
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_npu", False),
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_xpu", False),
+            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_mps", False),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.can_use_write_back_jit_kernel",
+                return_value=True,
+            ) as can_use,
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.torch.empty",
+                side_effect=_cpu_empty,
+            ),
+        ):
+            host._init_write_back_staging_buffers()
+
+        self.assertTrue(host.can_use_write_back_jit)
+        self.assertEqual(host.staging_page_capacity, 4)
+        self.assertEqual(host.staging_token_capacity, 8)
+        self.assertEqual(host.staging_k_buffer.shape, (8, 3, 2, 4))
+        self.assertEqual(host.staging_v_buffer.shape, (8, 3, 2, 8))
+        self.assertEqual(
+            [call.kwargs["element_size"] for call in can_use.call_args_list], [16, 32]
         )
 
     def test_kernel_load_splits_k_and_v_with_separate_strides(self):
@@ -136,6 +173,116 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertIs(v_call.kwargs["dst"], host.v_buffer)
         self.assertEqual(v_call.kwargs["item_size"], 24)
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
+
+    def test_kernel_backup_uses_staged_kernel_for_each_kv_buffer(self):
+        host = _make_host("page_first")
+        host.can_use_write_back_jit = True
+        host.staging_k_buffer = torch.empty(4, 3, 2, 4)
+        host.staging_v_buffer = torch.empty(4, 3, 2, 6)
+        device_pool = _make_device_pool(host)
+        host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.jit_transfer_hicache_all_layer_mla_staged_lf_pf"
+            ) as staged,
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_mla_lf_pf",
+                create=True,
+            ) as fallback,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="kernel"
+            )
+
+        self.assertEqual(staged.call_count, 2)
+        self.assertEqual(fallback.call_count, 0)
+        k_call, v_call = staged.call_args_list
+        self.assertIs(k_call.kwargs["ptr_src"], device_pool.k_data_ptrs)
+        self.assertIs(k_call.kwargs["staging"], host.staging_k_buffer)
+        self.assertIs(k_call.kwargs["dst"], host.k_buffer)
+        self.assertIs(v_call.kwargs["ptr_src"], device_pool.v_data_ptrs)
+        self.assertIs(v_call.kwargs["staging"], host.staging_v_buffer)
+        self.assertIs(v_call.kwargs["dst"], host.v_buffer)
+
+    def test_staged_kernel_backup_load_roundtrip_preserves_asymmetric_kv(self):
+        """Staged write-back must preserve both K and V values across a round trip."""
+        host = _make_host("page_first")
+        host.can_use_write_back_jit = True
+        host.staging_k_buffer = torch.empty(4, 3, 2, 4)
+        host.staging_v_buffer = torch.empty(4, 3, 2, 6)
+        device_pool = _make_device_pool(host)
+        host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+
+        for layer_id in range(host.layer_num):
+            device_pool.k_buffer[layer_id].copy_(
+                torch.arange(device_pool.k_buffer[layer_id].numel()).reshape_as(
+                    device_pool.k_buffer[layer_id]
+                )
+                + layer_id * 1000
+            )
+            device_pool.v_buffer[layer_id].copy_(
+                torch.arange(device_pool.v_buffer[layer_id].numel()).reshape_as(
+                    device_pool.v_buffer[layer_id]
+                )
+                + layer_id * 10000
+            )
+
+        expected_k = [buffer[device_indices].clone() for buffer in device_pool.k_buffer]
+        expected_v = [buffer[device_indices].clone() for buffer in device_pool.v_buffer]
+        buffers_by_ptrs = {
+            tuple(device_pool.k_data_ptrs.tolist()): device_pool.k_buffer,
+            tuple(device_pool.v_data_ptrs.tolist()): device_pool.v_buffer,
+        }
+
+        def staged_copy(*, ptr_src, src_indices, dst_indices, dst, **_):
+            src_buffers = buffers_by_ptrs[tuple(ptr_src.tolist())]
+            for layer_id, src in enumerate(src_buffers):
+                dst[dst_indices, layer_id] = src[src_indices]
+
+        def per_layer_copy(*, src, dst, src_indices, dst_indices, layer_id, **_):
+            dst[dst_indices] = src[src_indices, layer_id]
+
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.jit_transfer_hicache_all_layer_mla_staged_lf_pf",
+                side_effect=staged_copy,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
+                side_effect=per_layer_copy,
+                create=True,
+            ),
+        ):
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend="kernel"
+            )
+            for buffer in device_pool.k_buffer + device_pool.v_buffer:
+                buffer.zero_()
+            for layer_id in range(host.layer_num):
+                host.load_to_device_per_layer(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    layer_id=layer_id,
+                    io_backend="kernel",
+                )
+
+        for layer_id in range(host.layer_num):
+            torch.testing.assert_close(
+                host.k_buffer[host_indices, layer_id], expected_k[layer_id]
+            )
+            torch.testing.assert_close(
+                host.v_buffer[host_indices, layer_id], expected_v[layer_id]
+            )
+            torch.testing.assert_close(
+                device_pool.k_buffer[layer_id][device_indices], expected_k[layer_id]
+            )
+            torch.testing.assert_close(
+                device_pool.v_buffer[layer_id][device_indices], expected_v[layer_id]
+            )
 
     def test_direct_load_splits_k_and_v_for_page_first_direct(self):
         # Direct kernels derive copy size from each call's first tensor, so K/V

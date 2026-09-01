@@ -42,14 +42,14 @@ def _fake_mooncake_modules(fake_store_cls, replicate_config_cls):
     }
 
 
-def _fake_memory_pool_host_module():
-    memory_pool_host = types.ModuleType("sglang.srt.mem_cache.memory_pool_host")
+def _fake_pool_host_mla_module():
+    pool_host_mla = types.ModuleType("sglang.srt.mem_cache.pool_host.mla")
 
     class MLATokenToKVPoolHost:
         pass
 
-    memory_pool_host.MLATokenToKVPoolHost = MLATokenToKVPoolHost
-    return memory_pool_host
+    pool_host_mla.MLATokenToKVPoolHost = MLATokenToKVPoolHost
+    return pool_host_mla
 
 
 def _fake_pool_host_module():
@@ -68,8 +68,8 @@ def _fake_pool_host_module():
 
 def _fake_host_pool_modules():
     return {
-        "sglang.srt.mem_cache.memory_pool_host": _fake_memory_pool_host_module(),
         "sglang.srt.mem_cache.pool_host": _fake_pool_host_module(),
+        "sglang.srt.mem_cache.pool_host.mla": _fake_pool_host_mla_module(),
     }
 
 
@@ -200,6 +200,7 @@ def _make_config(
     *,
     enable_group_semantics=True,
     extra_backend_tag=None,
+    model_name=None,
     is_mla_model=False,
     should_split_heads=False,
     tp_rank=0,
@@ -225,7 +226,7 @@ def _make_config(
         is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=True,
-        model_name="test",
+        model_name=model_name,
         tp_lcm_size=tp_lcm_size,
         should_split_heads=should_split_heads,
         extra_config=extra_config,
@@ -237,6 +238,7 @@ def _make_store(
     enable_group_semantics=True,
     replicate_config_cls=ReplicateConfigWithGroupIds,
     extra_backend_tag=None,
+    model_name=None,
     is_mla_model=False,
     should_split_heads=False,
     tp_rank=0,
@@ -247,6 +249,7 @@ def _make_store(
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
         extra_backend_tag=extra_backend_tag,
+        model_name=model_name,
         is_mla_model=is_mla_model,
         should_split_heads=should_split_heads,
         tp_rank=tp_rank,
@@ -448,6 +451,25 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             call["args"][0].group_ids,
             ["sglang-hicache:tag_page0", "sglang-hicache:tag_page1"],
         )
+
+    def test_model_names_isolate_the_same_logical_key(self):
+        store_a, fake_store_a = _make_store(
+            enable_group_semantics=False, model_name="org/model-a"
+        )
+        store_b, fake_store_b = _make_store(
+            enable_group_semantics=False, model_name="org/model-b"
+        )
+        store_a.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+        store_b.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        self.assertEqual(store_a.batch_set_v1(["page0"], torch.tensor([0])), [True])
+        self.assertEqual(store_b.batch_set_v1(["page0"], torch.tensor([0])), [True])
+
+        keys_a = fake_store_a.batch_put_calls[0]["keys"]
+        keys_b = fake_store_b.batch_put_calls[0]["keys"]
+        self.assertEqual(keys_a, ["org-model-a_page0_0_k", "org-model-a_page0_0_v"])
+        self.assertEqual(keys_b, ["org-model-b_page0_0_k", "org-model-b_page0_0_v"])
+        self.assertTrue(set(keys_a).isdisjoint(keys_b))
 
 
 if __name__ == "__main__":

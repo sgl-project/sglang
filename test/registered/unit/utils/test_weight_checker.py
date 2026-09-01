@@ -20,6 +20,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
@@ -110,7 +111,7 @@ class _TinyModel(nn.Module):
         self.w = nn.Parameter(torch.randn(4, 4), requires_grad=False)
         self.b = nn.Parameter(torch.zeros(4), requires_grad=False)
         self.register_buffer("running_mean", torch.zeros(4))
-        # Buffer names that match weight_checker's hard-coded skip patterns.
+        # Buffer names used to exercise weight checker's hard-coded filters.
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
@@ -129,14 +130,18 @@ class _FakeModelRunner:
         dp_size: int = 1,
         pp_rank: int = 0,
         pp_size: int = 1,
+        attn_dp_size: int | None = None,
     ):
         self.model = model
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.dp_rank = dp_rank
-        self.dp_size = dp_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
+        self.ps = ParallelState.trivial(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            attn_dp_size=attn_dp_size if attn_dp_size is not None else dp_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +250,6 @@ class TestPostprocessTensors(CustomTestCase):
         _assert_entries_close(
             _build_check_entries({"model.rotary_emb.inv_freq": t}, set()),
             [("model.rotary_emb.inv_freq", False, RawComparable(t))],
-        )
-
-    def test_skips_weight_fp32_substring(self):
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_check_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, RawComparable(t))],
         )
 
     def test_substring_match_not_endswith(self):
@@ -490,7 +488,8 @@ class _WeightCheckerTestBase(CustomTestCase):
     def setUp(self):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
-        self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
+        runner = _FakeModelRunner(self.model)
+        self.checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
 
 
 class TestSnapshot(_WeightCheckerTestBase):
@@ -539,10 +538,12 @@ class TestResetTensors(_WeightCheckerTestBase):
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_freqs_cis, before)
 
-    def test_skips_weight_fp32(self):
+    def test_poisons_weight_fp32_cache(self):
         before = self.model.gate_proj_weight_fp32_cache.clone()
+        before_ptr = self.model.gate_proj_weight_fp32_cache.data_ptr()
         self.checker._reset_tensors()
-        torch.testing.assert_close(self.model.gate_proj_weight_fp32_cache, before)
+        self.assertEqual(self.model.gate_proj_weight_fp32_cache.data_ptr(), before_ptr)
+        self.assertFalse(torch.equal(self.model.gate_proj_weight_fp32_cache, before))
 
 
 class TestCompare(_WeightCheckerTestBase):
@@ -639,11 +640,6 @@ class TestIsNonPersistentBufferName(CustomTestCase):
     def test_matches_freqs_cis_substring(self):
         self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.freqs_cis"))
 
-    def test_matches_weight_fp32_substring(self):
-        self.assertTrue(
-            _is_non_persistent_buffer_name("model.layers.0.mlp.gate._weight_fp32")
-        )
-
     def test_does_not_match_normal_param_names(self):
         self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
         self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
@@ -697,7 +693,9 @@ class _ChecksumTestBase(CustomTestCase):
             pp_rank=0,
             pp_size=1,
         )
-        self.checker = WeightChecker(model_runner=self.runner)
+        self.checker = WeightChecker(
+            get_model=lambda: self.runner.model, ps=self.runner.ps
+        )
 
 
 class TestComputeChecksum(_ChecksumTestBase):
@@ -715,10 +713,10 @@ class TestComputeChecksum(_ChecksumTestBase):
         self.assertIn("w", names)
         self.assertIn("b", names)
         self.assertIn("running_mean", names)
+        self.assertIn("gate_proj_weight_fp32_cache", names)
         # Non-persistent buffer patterns are filtered out.
         self.assertNotIn("rotary_emb_cos_sin_cache", names)
         self.assertNotIn("rotary_emb_freqs_cis", names)
-        self.assertNotIn("gate_proj_weight_fp32_cache", names)
 
     def test_hashes_are_hex_strings(self):
         out = self.checker._compute_checksum()
