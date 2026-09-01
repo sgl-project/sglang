@@ -594,6 +594,31 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### LiLiCorr: reranked DFlash drafts
+
+A DFLASH drafter is trained on per-position marginals rather than on the joint block distribution, so its drafted tokens are individually plausible yet jointly incoherent. **LiLiCorr** ([arXiv:2608.20530](https://arxiv.org/abs/2608.20530)) keeps the top-`k` candidates per block position and scores the whole lattice jointly with a small two-layer transformer, then commits a path through it greedily instead of taking the per-slot argmax. Verify is unchanged, so outputs remain distributionally identical to the target model's.
+
+LiLiCorr is **not a separate `--speculative-algorithm`**: it is a property of the draft checkpoint, the same way the DFlash candidate selector is. Serve it with `--speculative-algorithm DFLASH` and point `--speculative-draft-model-path` at a checkpoint whose config declares `architectures: ["LiLiCorrDraftModel"]` and carries the `lilicorr_*` geometry fields inside `dflash_config`. The head is then built, loaded and folded into the draft CUDA graph automatically; nothing else changes.
+
+Two operational notes:
+
+- **Use an attention backend that opts out of the host `seq_lens` mirror; `fa3` is the one the numbers above were measured on.** `AttentionBackend.needs_cpu_seq_lens` defaults to `True` and a backend opts out by setting it `False` — `fa3`, `triton`, `trtllm_mha`, `trtllm_mla`, `flashmla` and `dsa` all do, while `FlashInferAttnBackend` never declares it and so inherits `True`. Under a backend that does not opt out the worker publishes `seq_lens_cpu` every step, which is a device-to-host sync per block. The flag is OR-ed over the target **and** draft runners, so both have to opt out for the sync to disappear. This is a property of DFlash decoding generally rather than of LiLiCorr, but it dominates the throughput of a 16-slot block. Backends also differ in attention numerics, so acceptance figures measured on different backends do not belong in one table.
+- A checkpoint that carries head weights but declares `architectures: ["DFlashDraftModel"]` loads as plain DFlash and ignores the head, which reads as a small acceptance loss rather than an error. The reverse — declaring `LiLiCorrDraftModel` without complete head weights — is refused at load.
+
+#### Drafters with grouped convolutions
+
+LiLiCorr composes with the grouped dynamic convolutions that wrap each DFlash sublayer, and serving one needs no extra flag: the convolution belongs to the DFlash backbone, so a `LiLiCorrDraftModel` inherits the builder and picks it up from `conv_kernel_size` and `conv_group_size` in `dflash_config`. Both the plain and the convolutional drafter therefore serve through the same path shown above.
+
+The one thing worth knowing is how it fails. Both geometry keys default to `0`, so a checkpoint whose config lost them builds no convolution modules at all; the backbone loader then drops every convolution tensor it cannot resolve — correct behaviour for rotary caches, and the worst possible behaviour here, because the draft would serve as its convolution-free parent at a lower but entirely believable acceptance length. The loader therefore refuses any checkpoint whose convolution tensors and built modules disagree, in either direction, rather than letting that happen quietly.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model Qwen/Qwen3-8B \
+    --attention-backend fa3 \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path <org>/<target>-DFlash-LiLiCorr
+```
+
 ---
 
 ## Standalone Speculative Decoding (Small Draft Model)
