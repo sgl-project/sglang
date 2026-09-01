@@ -79,6 +79,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
     ModelOptFp8Config,
+    ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
@@ -103,9 +104,19 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_checkpoint_files,
     resolve_transformer_quant_load_spec,
 )
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    hf_to_custom_state_dict,
+)
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
+    Flux2Transformer2DModel,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
@@ -149,6 +160,218 @@ def _make_quant_config(name: str, **attrs):
 
 
 class TestTransformerQuantHelpers(unittest.TestCase):
+    def test_modelopt_fp8_packed_cutlass_preserves_checkpoint_shard_scales(self):
+        method = ModelOptFp8LinearMethod(
+            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+        )
+        method.cutlass_fp8_supported = True
+        layer = torch.nn.Module()
+        layer.logical_widths = [2, 2, 2]
+        weight = (
+            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
+        )
+        layer.register_parameter(
+            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+        )
+        layer.register_parameter(
+            "weight_scale",
+            torch.nn.Parameter(
+                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "input_scale",
+            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
+        )
+
+        method.process_weights_after_loading(layer)
+
+        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.weight_scale,
+            torch.tensor([[0.1], [0.1], [0.2], [0.2], [0.3], [0.3]]),
+        )
+        torch.testing.assert_close(layer.input_scale, torch.tensor(1.0))
+
+    def test_modelopt_fp8_packed_cutlass_requantizes_incomplete_shard_scales(self):
+        method = ModelOptFp8LinearMethod(
+            ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+        )
+        method.cutlass_fp8_supported = True
+        layer = torch.nn.Module()
+        layer.logical_widths = [2, 2, 2]
+        weight = (
+            torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.float8_e4m3fn)
+        )
+        layer.register_parameter(
+            "weight", torch.nn.Parameter(weight.clone(), requires_grad=False)
+        )
+        layer.register_parameter(
+            "weight_scale",
+            torch.nn.Parameter(
+                torch.tensor(
+                    [0.1, torch.finfo(torch.float32).min, 0.3],
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "input_scale",
+            torch.nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=False),
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+            "requantize_with_max_scale",
+            return_value=(torch.tensor(0.3), weight.clone()),
+        ) as requantize:
+            method.process_weights_after_loading(layer)
+
+        requantize.assert_called_once()
+        torch.testing.assert_close(layer.weight, weight.t(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            layer.weight_scale, torch.full((6, 1), 0.3), rtol=0, atol=0
+        )
+
+    def test_modelopt_packed_layer_requires_consistent_shard_precision(self):
+        prefix = "blocks.0.attn.to_qkv"
+        mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+        layer = LinearBase(input_size=16, output_size=48)
+
+        quantized = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            packed_modules_mapping=mapping,
+        )
+        self.assertIsInstance(
+            quantized.get_quant_method(layer, prefix), ModelOptFp8LinearMethod
+        )
+
+        excluded = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            exclude_modules=[
+                "blocks.0.attn.to_q",
+                "blocks.0.attn.to_k",
+                "blocks.0.attn.to_v",
+            ],
+            packed_modules_mapping=mapping,
+        )
+        self.assertIsInstance(
+            excluded.get_quant_method(layer, prefix), UnquantizedLinearMethod
+        )
+
+        partial = ModelOptFp8Config(
+            is_checkpoint_fp8_serialized=True,
+            exclude_modules=["blocks.0.attn.to_q"],
+            packed_modules_mapping=mapping,
+        )
+        with self.assertRaisesRegex(ValueError, "some but not all shards"):
+            partial.get_quant_method(layer, prefix)
+
+    def test_qwen_modelopt_fp8_qkv_checkpoint_tensors_are_merged(self):
+        mapping = get_param_names_mapping(
+            QwenImageTransformer2DModel.get_param_names_mapping_for_quant_config(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
+        prefix = "transformer_blocks.0.attn"
+        source = {}
+        for shard_id, shard_name in enumerate(("q", "k", "v")):
+            source[f"{prefix}.to_{shard_name}.weight"] = torch.full(
+                (2, 3), shard_id + 1, dtype=torch.float8_e4m3fn
+            )
+            source[f"{prefix}.to_{shard_name}.bias"] = torch.full(
+                (2,), shard_id + 1, dtype=torch.bfloat16
+            )
+            source[f"{prefix}.to_{shard_name}.weight_scale"] = torch.tensor(
+                [0.1 * (shard_id + 1)], dtype=torch.float32
+            )
+            source[f"{prefix}.to_{shard_name}.input_scale"] = torch.tensor(
+                [0.2 * (shard_id + 1)], dtype=torch.float32
+            )
+
+        merged, _ = hf_to_custom_state_dict(source, mapping)
+
+        self.assertEqual(merged[f"{prefix}.to_qkv.weight"].shape, (6, 3))
+        self.assertEqual(merged[f"{prefix}.to_qkv.bias"].shape, (6,))
+        torch.testing.assert_close(
+            merged[f"{prefix}.to_qkv.weight_scale"],
+            torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            merged[f"{prefix}.to_qkv.input_scale"],
+            torch.tensor([0.2, 0.4, 0.6], dtype=torch.float32),
+        )
+        self.assertEqual(
+            QwenImageTransformer2DModel.packed_modules_mapping["to_qkv"],
+            ["to_q", "to_k", "to_v"],
+        )
+
+    def test_qwen_non_fp8_qkv_checkpoint_tensors_are_not_merged(self):
+        prefix = "transformer_blocks.0.attn"
+        source_name = f"{prefix}.to_q.weight"
+        for quant_config in (None, ModelOptFp4Config()):
+            with self.subTest(quant_config=quant_config):
+                mapping = get_param_names_mapping(
+                    QwenImageTransformer2DModel.get_param_names_mapping_for_quant_config(
+                        quant_config
+                    )
+                )
+                target_name, merge_index, total_shards = mapping(source_name)
+                self.assertEqual(target_name, source_name)
+                self.assertIsNone(merge_index)
+                self.assertIsNone(total_shards)
+
+    def test_flux2_modelopt_fp8_qkv_checkpoint_tensors_are_merged(self):
+        mapping = get_param_names_mapping(Flux2Transformer2DModel.param_names_mapping)
+        prefix = "transformer_blocks.0.attn"
+        source = {}
+        for projection_prefix in ("to_", "add_"):
+            source_names = (
+                ("q", "k", "v")
+                if projection_prefix == "to_"
+                else ("q_proj", "k_proj", "v_proj")
+            )
+            for shard_id, shard_name in enumerate(source_names):
+                name = f"{prefix}.{projection_prefix}{shard_name}"
+                source[f"{name}.weight"] = torch.full(
+                    (2, 3), shard_id + 1, dtype=torch.float8_e4m3fn
+                )
+                source[f"{name}.weight_scale"] = torch.tensor(
+                    [0.1 * (shard_id + 1)], dtype=torch.float32
+                )
+                source[f"{name}.input_scale"] = torch.tensor([0.2], dtype=torch.float32)
+
+        merged, _ = hf_to_custom_state_dict(source, mapping)
+
+        for target in ("to_qkv", "to_added_qkv"):
+            self.assertEqual(merged[f"{prefix}.{target}.weight"].shape, (6, 3))
+            torch.testing.assert_close(
+                merged[f"{prefix}.{target}.weight_scale"],
+                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+            )
+            torch.testing.assert_close(
+                merged[f"{prefix}.{target}.input_scale"],
+                torch.tensor([0.2, 0.2, 0.2], dtype=torch.float32),
+            )
+        self.assertEqual(
+            Flux2Transformer2DModel.packed_modules_mapping["to_qkv"],
+            ["to_q", "to_k", "to_v"],
+        )
+
+        # On an unfused model (BF16, Hopper FP8, or TP>1), the source
+        # projection names are valid model parameters and the loader must keep
+        # them separate rather than producing a nonexistent packed target.
+        unmerged, _ = hf_to_custom_state_dict(
+            source,
+            mapping,
+            valid_target_names=set(source),
+        )
+        self.assertEqual(set(unmerged), set(source))
+        for name, tensor in source.items():
+            torch.testing.assert_close(unmerged[name], tensor)
+
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
         return_value=None,
@@ -1021,8 +1244,8 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         warning.assert_called_once()
 
     def test_modelopt_fp8_always_needs_device_weight_postprocess(self):
-        # Even a serialized checkpoint requantizes fused shards through
-        # scaled_fp8_quant(), which cannot process CPU tensors.
+        # Serialized checkpoints still transpose weights and may requantize
+        # packed shards through scaled_fp8_quant() on the runtime device.
         self.assertTrue(
             _needs_device_weight_postprocess(
                 ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
