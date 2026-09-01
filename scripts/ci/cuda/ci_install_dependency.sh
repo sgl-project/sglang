@@ -85,13 +85,23 @@ detect_host() {
     else
         IS_BLACKWELL=0
         if command -v nvidia-smi >/dev/null 2>&1; then
+            # A wedged NVIDIA driver (dmesg: NVRM fullchip-reset asserts) makes
+            # nvidia-smi hang forever, silently eating the whole step timeout.
+            # Bound it and fail fast with a diagnosable error instead.
+            COMPUTE_CAPS=$(timeout -k 10 60 nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null) || {
+                if [ $? -ge 124 ]; then
+                    echo "FATAL: nvidia-smi hung for 60s -- GPU/driver likely wedged on this host (check dmesg for NVRM asserts; a reboot usually recovers it)" >&2
+                    exit 1
+                fi
+                COMPUTE_CAPS=""
+            }
             while IFS= read -r cap; do
                 major="${cap%%.*}"
                 if [ "${major:-0}" -ge 10 ] 2>/dev/null; then
                     IS_BLACKWELL=1
                     break
                 fi
-            done <<< "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null || true)"
+            done <<< "$COMPUTE_CAPS"
         fi
         echo "IS_BLACKWELL=${IS_BLACKWELL} (auto-detected via nvidia-smi)"
     fi
