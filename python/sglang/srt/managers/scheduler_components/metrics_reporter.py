@@ -23,11 +23,13 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
+    exports_expert_balancedness_to_prometheus,
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_spec,
+    logs_expert_balancedness_to_server_log,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -238,7 +240,7 @@ class SchedulerMetricsReporter:
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
         self.scheduler.enable_fpm = False
         if (
-            self.scheduler.server_args.enable_forward_pass_metrics
+            get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         ):
@@ -252,7 +254,7 @@ class SchedulerMetricsReporter:
                 else 0
             )
             self.scheduler._fpm_worker_id = (
-                self.scheduler.server_args.forward_pass_metrics_worker_id
+                get_observability().forward_pass_metrics_worker_id
             )
             base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
@@ -1009,9 +1011,7 @@ class SchedulerMetricsReporter:
         if (m := result.expert_distribution_metrics) is not None:
             balancedness = m.eplb_balancedness.item()
 
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
+            if logs_expert_balancedness_to_server_log():
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
@@ -1033,10 +1033,7 @@ class SchedulerMetricsReporter:
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 )
 
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
+            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),
@@ -1117,7 +1114,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if configured_pp_size() > 1:
+            if get_parallel().pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
