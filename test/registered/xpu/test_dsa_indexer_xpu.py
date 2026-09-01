@@ -149,6 +149,7 @@ class MockModelRunner:
         self.dtype = cfg["dtype"]
         self.kv_cache_dtype = cfg["kv_cache_dtype"]
         self.is_hybrid_swa = False
+        self.is_draft_worker = False
 
         hf_config = type(
             "HfConfig",
