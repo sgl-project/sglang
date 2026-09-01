@@ -104,6 +104,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "FlyDSL (ROCm gfx950) residual + norm + scale/shift.",
     ),
     (
+        "diffusion.scale_residual_norm_scale_shift_nvfp4",
+        KernelBackend.JIT,
+        "norm.norm_scale_shift_jit:try_fused_scale_residual_norm_scale_shift_nvfp4",
+        _CUDA,
+        "Qwen residual LayerNorm/modulation + NVFP4 quantization.",
+    ),
+    (
         "diffusion.norm_scale_shift",
         KernelBackend.CUTE_DSL,
         "norm.scale_residual_norm_cutedsl:fused_norm_scale_shift",
@@ -405,6 +412,7 @@ _EXPORTS: dict[str, str] = {
     "try_fused_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
     "try_fused_scale_residual_norm_scale_shift_fp8": "norm.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
+    "try_fused_scale_residual_norm_scale_shift_nvfp4": "norm.norm_scale_shift_jit",
     "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
