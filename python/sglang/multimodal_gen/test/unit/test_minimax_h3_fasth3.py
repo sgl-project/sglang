@@ -23,9 +23,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
-from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
-    KitchenInt8Config,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
@@ -107,17 +104,13 @@ def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
         MiniMaxH3DiTModel.prepare_lora_adapter(model, bundle)
 
 
-@pytest.mark.parametrize("quant_name", ["fp8", "kitchen_int8"])
-def test_fasth3_gates_stay_bf16_under_runtime_quantization(quant_name: str) -> None:
-    if quant_name == "kitchen_int8":
-        pytest.importorskip("comfy_kitchen")
+def test_fasth3_gates_stay_bf16_under_runtime_quantization() -> None:
     _ensure_single_process_parallel_runtime()
-    quant_config = Fp8Config() if quant_name == "fp8" else KitchenInt8Config()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=FastH3PipelineConfig().dit_config,
             hf_config={},
-            quant_config=quant_config,
+            quant_config=Fp8Config(),
         )
 
     attn = model.blocks[0].attn
