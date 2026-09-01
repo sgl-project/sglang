@@ -11,6 +11,10 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -172,7 +176,7 @@ class SchedulerPoolStatsObserver:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
-                if req.kv.req_pool_idx is not None:
+                if req.kv.holds_kv:
                     idxs.add(req.kv.req_pool_idx)
         return idxs
 
@@ -284,9 +288,18 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        # `*_num_used` is `static_cap - (available + evictable)`, so the
+        # available term must match the static cap's denomination: the conserve
+        # view, never the byte-coordinated one (see
+        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
+            full_available_size = allocator.conserve_full_available_size()
+            swa_available_size = allocator.conserve_swa_available_size()
+        else:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size

@@ -2156,6 +2156,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
+    # pinned mirrors without a device sync.
+    mix_running_indices_cpu: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -2853,13 +2856,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        if not self.spec_algorithm.is_none():
+            # Spec keeps no per-step out_cache_loc on the running batch; gather
+            # each tail's bonus slot at the committed length (rebound under overlap).
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                tail_base,
+            ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch
+            # would null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
+        else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
+            tail_base = None
+            running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
+        if tail_base is not None:
+            # Spec seq_lens sit at the committed base (bonus token pending);
+            # this step commits it, so tails carry base + 1 or attention drops the row.
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
+        # For overlap scheduler, the output_ids has one step delay;
+        # spec tail request state carries no delay in either mode.
+        if self.spec_algorithm.is_none():
+            delta = 0 if self.enable_overlap else -1
+        else:
+            delta = -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens = self.prefix_lens + [
@@ -2934,11 +2979,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        """Reclaim evictable tree-cache entries (shortfall only), then report
-        whether the next decode step fits in the KV pool."""
+        """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
+        the capacity gate (eviction + any per-step reservations of its own) —
+        the retract loop converges on this same check, so allocator-side
+        shortfalls retract gracefully instead of tripping fail-loud alloc
+        errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            num_tokens=num_tokens, tree_cache=self.tree_cache
+        )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
