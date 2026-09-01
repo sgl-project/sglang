@@ -662,7 +662,7 @@ mod tests {
         let got = fast_introspector().fetch(&url).await;
         assert!(
             got.served_model_name.is_none(),
-            "an unparseable body must register empty model_ids",
+            "an unparsable body must register empty model_ids",
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
