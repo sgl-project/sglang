@@ -22,6 +22,7 @@ on:
         type: choice
         default: rocm724
         options:
+          - rocm10
           - rocm724
           - rocm720
       target_stage_select:

@@ -641,8 +641,6 @@ class DSparkDraftMixin:
         rotary = attn0.rotary_emb
         if type(rotary).__name__ != "RotaryEmbedding":
             return None
-        if not getattr(rotary, "is_neox_style", False):
-            return None
         if getattr(rotary, "rotary_dim", None) != head_dim:
             return None
         eps = attn0.k_norm.variance_epsilon
@@ -661,6 +659,8 @@ class DSparkDraftMixin:
             if attn.rotary_emb is not rotary and not torch.equal(
                 attn.rotary_emb.cos_sin_cache, rotary.cos_sin_cache
             ):
+                return None
+            if attn.rotary_emb.is_neox_style != rotary.is_neox_style:
                 return None
             if attn.k_norm.variance_epsilon != eps:
                 return None
@@ -769,6 +769,7 @@ class DSparkDraftMixin:
                 eps,
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
+                is_neox_style=self.layers[0].self_attn.rotary_emb.is_neox_style,
             )
             return
 

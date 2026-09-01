@@ -765,9 +765,11 @@ name, for example `sglang generate --quality high`.
 </Note>
 
 For manually tuned Cache-DiT experiments outside that validated path, omit
-the request `quality` field and set the process-wide environment controls
-directly. An explicit `quality: "lossless"` request overrides those controls
-and restores native denoising:
+the request `quality` field and set `--enable-cache-dit` or the
+process-wide `SGLANG_CACHE_DIT_*` defaults. An explicit `quality`
+(including `"lossless"`) takes H3 off the generic Cache-DiT path. The
+24 GB layerwise recipe above can use the same switch; skipped blocks are
+not streamed.
 
 ```bash Command
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -787,12 +789,14 @@ sglang serve \
 ```
 
 <Warning>
-Cache-DiT skips selected block computation and is approximate. It cannot be
-combined with FSDP inference or DiT layerwise offload. Breakable CUDA graph
-execution takes precedence and leaves Cache-DiT disabled. Tune the cache
-thresholds only after comparing both video and audio quality on the target
-task profile. A real B200 request has completed, but the `quality: "high"`
-path above remains fail-closed to the audited 4×H200 workload.
+Cache-DiT skips selected block computation and is approximate. It cannot
+be combined with FSDP inference. DiT layerwise offload is compatible:
+skipped blocks are not streamed, and the first layer after a skip may
+sync-load. Breakable CUDA graph execution takes precedence and leaves
+Cache-DiT disabled. Tune the cache thresholds only after comparing both
+video and audio quality on the target task profile. A real B200 request
+has completed, but the `quality: "high"` path above remains fail-closed
+to the audited 4×H200 workload.
 </Warning>
 
 ## 7. Feature contracts and advanced recipes
@@ -816,7 +820,7 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
-| CPU and layerwise offload | Verified: 2× RTX 5090 TP2; 1× RTX 4090 24 GB | The 5090 lossless recipe keeps 20 DiT blocks plus both VAE encoders resident, streams the remaining DiT blocks, text encoder, and video VAE decoder blocks, and leaves the small audio VAE resident. The 4090 recipe streams DiT and the text encoder with zero resident DiT layers and **omits `vae`** from `--layerwise-offload-components`. |
+| CPU and layerwise offload | Verified: 2× RTX 5090 TP2; 1× RTX 4090 24 GB | The 5090 lossless recipe keeps 20 DiT blocks plus both VAE encoders resident, streams the remaining DiT blocks, text encoder, and video VAE decoder blocks, and leaves the small audio VAE resident. The 4090 recipe streams DiT and the text encoder with zero resident DiT layers and **omits `vae`** from `--layerwise-offload-components`. Compatible with Cache-DiT; skipped blocks are not streamed. |
 | Breakable CUDA graph | Verified: B200 Ref2VA, opt-in | Matching eager output was observed for the captured signature, without a measured speedup. Re-capture for other shapes and reference sets. |
 | `torch.compile` | Measured: H200, opt-in | Steady-state benefit was below measurement noise, while startup increased and numerical output changed. Do not use it for consistency ground truth. |
 
@@ -1440,7 +1444,8 @@ timed (seed 42); only the timed pass is reported. GPU peak stayed about
 `kitchen_int8` + FA changes Linear numerics only. The `sol_attn` /
 `sage_attn` / hybrid rows also change the attention algorithm, so speed
 and pixel fidelity rank in opposite orders there. Default remains
-`kitchen_int8` + `fa`.
+`kitchen_int8` + `fa`. Cache-DiT can share this layerwise recipe; omit
+`quality` and see the quality-level section.
 
 ### AMD Instinct task and scaling runs
 

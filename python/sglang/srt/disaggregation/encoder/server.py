@@ -451,7 +451,7 @@ class MMEncoder:
         this instance's value, not a config change, so it travels as an
         argument."""
         assert_published(server_args, role="encoder")
-        logger.info(f"init MMEncoder {rank}/{get_parallel().config.tp_size}")
+        logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
         configure_media_url_security(
             get_mm().allowed_media_domains,
@@ -492,14 +492,12 @@ class MMEncoder:
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
-            world_size=get_parallel().config.tp_size,
+            world_size=get_parallel().tp_size,
             rank=rank,
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(
-            tensor_model_parallel_size=get_parallel().config.tp_size
-        )
+        initialize_model_parallel(tensor_model_parallel_size=get_parallel().tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
         self.model = load_model(
@@ -563,7 +561,7 @@ class MMEncoder:
                 )
                 self.mm_global_cache = EmbeddingCacheController(
                     rank,
-                    get_parallel().config.tp_size,
+                    get_parallel().tp_size,
                     max_pool_size_gb=get_mm().mm_global_cache_size_gb,
                     embedding_store=embedding_store,
                     hidden_dims=self._embedding_dims,
@@ -1037,7 +1035,7 @@ class MMEncoder:
         )
 
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
-        if get_parallel().config.tp_size > 1:
+        if get_parallel().tp_size > 1:
             torch.distributed.broadcast(
                 mask_tensor,
                 src=0,
