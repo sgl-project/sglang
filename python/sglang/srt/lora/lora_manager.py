@@ -896,9 +896,8 @@ class LoRAManager:
     def register_lora_adapter(
         self, lora_ref: LoRARef, config_dict: Dict
     ) -> LoRAUpdateOutput:
-        """Create-or-refresh an adapter's identity and config; weights untouched
-        by the caller (a new adapter starts zeroed, re-registration re-zeroes —
-        a slot's new tenant must not serve its predecessor's weights)."""
+        """Create-or-refresh an adapter's identity and config; re-registration
+        re-zeroes — a slot's new tenant must not serve its predecessor's weights."""
         return self.load_lora_adapter_from_tensors(
             lora_ref, tensors={}, config_dict=config_dict, upsert=True
         )

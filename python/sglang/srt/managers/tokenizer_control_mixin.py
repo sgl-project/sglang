@@ -738,11 +738,7 @@ class TokenizerControlMixin:
         obj: RegisterLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
     ) -> RegisterLoRAAdapterReqOutput:
-        """Create-or-refresh an adapter's identity and config (control plane).
-
-        Weights are untouched: a new adapter starts zeroed, and the bytes
-        arrive later as prefixed tensors in the update_weights_from_* stream,
-        applied at end_weight_update."""
+        """Create-or-refresh an adapter's identity and config (control plane)."""
         self.auto_create_handle_loop()
 
         try:
@@ -761,9 +757,8 @@ class TokenizerControlMixin:
                     ),
                     upsert=True,
                 )
-                # Streamed adapters have no path to reload from, so the cap rejects
-                # new registrations instead of evicting (eviction would lose the only
-                # engine-side copy). Same-name upserts don't change the count.
+                # No path to reload a streamed adapter from: eviction would lose the
+                # only engine-side copy, so the cap rejects new names instead.
                 if (
                     not reused
                     and self.server_args.max_loaded_loras is not None

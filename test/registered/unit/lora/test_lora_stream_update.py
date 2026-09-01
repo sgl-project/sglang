@@ -1,17 +1,5 @@
-"""Unit tests for streamed LoRA weight updates (miles weight-sync unification).
-
-Adapter tensors ride the ordinary update_weights_from_* stream with
-``{lora_name}:{hf_key}`` names, accumulate in a session-scoped stash, and are
-applied by end_weight_update through the manager's whole-adapter upsert entry.
-Covers:
-
-  * _split_lora_named_tensors prefix routing + unprefixed-lora guard
-  * SchedulerWeightUpdaterManager._stash_lora_tensors grouping
-  * _apply_lora_stash: checksum verification, name-set stability, error
-    propagation, stash lifecycle
-  * LoRAManager.register_lora_adapter / require_registered /
-    apply_streamed_adapter delegation
-"""
+"""Streamed LoRA updates: prefix routing, the session stash, and the
+whole-adapter apply at end_weight_update."""
 
 import unittest
 from unittest.mock import MagicMock, Mock
