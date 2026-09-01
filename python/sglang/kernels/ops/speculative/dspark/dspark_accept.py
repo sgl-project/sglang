@@ -9,8 +9,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.reject_sampling import (
+    chain_block_speculative_sampling_triton,
     chain_speculative_sampling_triton,
 )
+from sglang.srt.runtime_context import get_spec
+
+
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -119,7 +123,12 @@ def _accept_sampling_core(
     )
     uniform_samples = torch.rand((bs, gamma), dtype=torch.float32, device=device)
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    chain_speculative_sampling_triton(
+    accept_fn = (
+        chain_block_speculative_sampling_triton
+        if get_spec().speculative_use_block_verification
+        else chain_speculative_sampling_triton
+    )
+    accept_fn(
         predicts=predicts,
         accept_index=accept_index,
         accept_token_num=accept_token_num,

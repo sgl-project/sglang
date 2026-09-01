@@ -2163,6 +2163,13 @@ class ServerArgs:
         "Use rejection sampling for speculative decoding (requires topk=1).",
         NS("spec"),
     ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification (arXiv:2403.10444) for speculative decoding "
+        "rejection sampling (requires --speculative-use-rejection-sampling "
+        "for EAGLE/EAGLE3).",
+        NS("spec"),
+    ] = False
     speculative_token_map: A[
         Optional[str], "The path of the draft model's small vocab table.", NS("spec")
     ] = None

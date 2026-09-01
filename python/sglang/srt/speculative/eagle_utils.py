@@ -778,16 +778,21 @@ def eagle_sample(
         )
 
         from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_block_speculative_sampling_triton,
             chain_speculative_sampling_triton,
         )
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+        use_block_verification = get_spec().speculative_use_block_verification
+        # Hook guarantees block implies rejection sampling; join defensively.
+        use_sampling_accept = use_rejection_sampling or use_block_verification
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        if use_block_verification:
+            sampling_fn = chain_block_speculative_sampling_triton
+        elif use_rejection_sampling:
+            sampling_fn = chain_speculative_sampling_triton
+        else:
+            sampling_fn = tree_speculative_sampling_target_only
 
         # These full-vocabulary matrices are consumed by the sampling kernel
         # within this step. Returned tensors were allocated before the scope,
@@ -824,12 +829,12 @@ def eagle_sample(
             target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
             draft_probs = (
                 verify_input.draft_probs
-                if use_rejection_sampling
+                if use_sampling_accept
                 else torch.zeros_like(target_probs)
             )
             # Defense-in-depth behind the spec_hook startup allowlist: validate
             # the actual kernel inputs before the Triton kernel.
-            if use_rejection_sampling and (
+            if use_sampling_accept and (
                 draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
             ):
                 raise ValueError(
