@@ -8,10 +8,10 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
 )
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
     LoRAPipeline,
     stack_or_compose_fused_lora,
