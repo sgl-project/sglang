@@ -29,7 +29,9 @@ from sglang.kernels.ops.diffusion import (
     try_fused_bias_mul_add,
     try_fused_bias_scale_residual_norm_scale_shift,
     try_fused_norm_scale_shift_fp8,
+    try_fused_qwen_qkv_epilogue,
     try_fused_scale_residual_norm_scale_shift_fp8,
+    try_fused_scale_residual_norm_scale_shift_nvfp4,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
@@ -80,7 +82,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     is_nunchaku_available,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
     ModelOptFp8LinearMethod,
+    apply_nvfp4_gemm_prequantized,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
@@ -285,6 +289,48 @@ def _qwen_modulation_cache_key(
         hidden_dtype=hidden_states.dtype,
         hidden_device=hidden_states.device,
     )
+
+
+def _modelopt_quant_name(
+    quant_config: Optional[QuantizationConfig],
+) -> str | None:
+    return None if quant_config is None else quant_config.get_name()
+
+
+_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING = {
+    # ModelOpt FP8 uses one QKV GEMM per stream. Merge the three Diffusers
+    # projections and their static scales into MergedColumnParallelLinear.
+    r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_qkv.\2",
+        2,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_q_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_k_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.add_v_proj\.(weight|bias|weight_scale|input_scale)$": (
+        r"\1.to_added_qkv.\2",
+        2,
+        3,
+    ),
+}
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
@@ -703,8 +749,14 @@ class QwenImageCrossAttention(nn.Module):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
         self.defer_output_bias = _defer_modelopt_output_bias(quant_config)
-
-        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+        quant_name = _modelopt_quant_name(quant_config)
+        self.use_fused_qkv_epilogue = quant_name in {
+            "modelopt_fp4",
+            "modelopt_fp8",
+        }
+        self.use_fused_qkv = (
+            isinstance(quant_config, NunchakuConfig) or quant_name == "modelopt_fp8"
+        )
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
@@ -714,6 +766,7 @@ class QwenImageCrossAttention(nn.Module):
             self.num_heads % tp_size == 0
         ), f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
         self.local_num_heads = self.num_heads // tp_size
+        self._unquantized_added_qkv_is_packed = False
 
         if self.use_fused_qkv:
             # Use fused QKV projection for nunchaku quantization
@@ -759,6 +812,7 @@ class QwenImageCrossAttention(nn.Module):
             self.use_fused_added_qkv = (
                 self._unquantized_added_qkv_is_packed
                 or isinstance(quant_config, NunchakuConfig)
+                or quant_name == "modelopt_fp8"
             )
             if self.use_fused_added_qkv:
                 self.to_added_qkv = MergedColumnParallelLinear(
@@ -896,12 +950,31 @@ class QwenImageCrossAttention(nn.Module):
         # Rows of tail padding inside THIS rank's text chunk (sp_shard meta).
         sp_txt_pad = _attn_mask_meta_local_pad(attn_mask_meta)
 
-        img_query, img_key, img_value, _, _, _ = _get_qkv_projections(
-            self, hidden_states
-        )
-        txt_query, txt_key, txt_value = self._get_added_qkv_projections(
-            encoder_hidden_states
-        )
+        if self._unquantized_added_qkv_is_packed and not qwen_image_added_qkv_active(
+            self
+        ):
+            img_query, img_key, img_value, _, _, _ = _get_qkv_projections(
+                self,
+                hidden_states,
+                make_contiguous=not self.use_fused_qkv_epilogue,
+            )
+            txt_query, txt_key, txt_value = self._get_added_qkv_projections(
+                encoder_hidden_states
+            )
+        else:
+            (
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+            ) = _get_qkv_projections(
+                self,
+                hidden_states,
+                encoder_hidden_states,
+                make_contiguous=not self.use_fused_qkv_epilogue,
+            )
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, self.head_dim))
@@ -922,34 +995,70 @@ class QwenImageCrossAttention(nn.Module):
 
             img_cache, txt_cache = image_rotary_emb
 
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm_with_optional_rope(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=img_cache,
-                is_neox=False,
-                allow_inplace=True,
+        joint_qkv = None
+        if (
+            self.use_fused_qkv_epilogue
+            and self.qk_norm
+            and img_cache is not None
+            and txt_cache is not None
+            and not sp_text_sharded
+            and sp_txt_pad == 0
+        ):
+            joint_qkv = try_fused_qwen_qkv_epilogue(
+                img_query,
+                img_key,
+                img_value,
+                txt_query,
+                txt_key,
+                txt_value,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                img_cache,
+                txt_cache,
+                self.norm_q.variance_epsilon,
+                self.norm_added_q.variance_epsilon,
             )
-            txt_query, txt_key = apply_qk_norm_with_optional_rope(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=self.head_dim,
-                cos_sin_cache=txt_cache,
-                is_neox=False,
-                allow_inplace=True,
-            )
-        elif img_cache is not None and txt_cache is not None:
-            img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                img_query, img_key, img_cache, is_neox=False
-            )
-            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
-                txt_query, txt_key, txt_cache, is_neox=False
-            )
+
+        if joint_qkv is None:
+            # Fused ModelOpt FP8 projections expose zero-copy Q/K/V views into
+            # one packed GEMM output. Unsupported epilogue cases keep the old
+            # contiguous contract before entering the generic QKNorm/RoPE path.
+            img_query, img_key, img_value = [
+                tensor.contiguous() for tensor in (img_query, img_key, img_value)
+            ]
+            txt_query, txt_key, txt_value = [
+                tensor.contiguous() for tensor in (txt_query, txt_key, txt_value)
+            ]
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm_with_optional_rope(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=img_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+                txt_query, txt_key = apply_qk_norm_with_optional_rope(
+                    q=txt_query,
+                    k=txt_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=self.head_dim,
+                    cos_sin_cache=txt_cache,
+                    is_neox=False,
+                    allow_inplace=True,
+                )
+            elif img_cache is not None and txt_cache is not None:
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                    txt_query, txt_key, txt_cache, is_neox=False
+                )
 
         # Joint order [text, image]; join_seqs relocates any SP text tail-pad
         # behind the image (see sp_shard.join_seqs for why).
@@ -981,7 +1090,9 @@ class QwenImageCrossAttention(nn.Module):
                 img_value,
                 sp_txt_pad,
             )
-        if seg_qkv is not None:
+        if joint_qkv is not None:
+            joint_query, joint_key, joint_value = joint_qkv
+        elif seg_qkv is not None:
             joint_query, joint_key, joint_value = seg_qkv
         elif attn_mask is not None and not sp_text_sharded:
             # Let the eager attention break point pack directly from the text
@@ -1063,12 +1174,23 @@ class QwenImageGELU(nn.Module):
         # epilogue. Off by default; mounted per batch by the denoising stage.
         mark_fused_gelu_site(self, "proj")
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+    def forward(
+        self,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = apply_nvfp4_gemm_prequantized(
+                self.proj,
+                *hidden_states,
+                output_dtype=self.proj.params_dtype,
+                bias=self.proj.bias,
+            )
+        elif fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
-        hidden_states, _ = self.proj(hidden_states)
+        else:
+            hidden_states, _ = self.proj(hidden_states)
         return F.gelu(hidden_states, approximate="tanh")
 
 
@@ -1122,13 +1244,15 @@ class QwenImageFeedForward(nn.Module):
         )
 
     def forward_with_bias(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         hidden_states = self.net[0](hidden_states)
         hidden_states = self.net[1](hidden_states)
         return self.net[2](hidden_states)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
         hidden_states, bias = self.forward_with_bias(hidden_states)
         return hidden_states if bias is None else hidden_states + bias
 
@@ -1261,6 +1385,20 @@ class QwenImageTransformerBlock(nn.Module):
             }
             self.img_mlp = NunchakuFeedForward(self.img_mlp, **nunchaku_kwargs)
             self.txt_mlp = NunchakuFeedForward(self.txt_mlp, **nunchaku_kwargs)
+
+        self._enable_nvfp4_resnorm_quant = False
+        capability = current_platform.get_device_capability()
+        if (
+            not nunchaku_enabled
+            and dim == 3072
+            and capability is not None
+            and capability.major == 10
+        ):
+            img_fc1 = self.img_mlp.net[0].proj
+            txt_fc1 = self.txt_mlp.net[0].proj
+            self._enable_nvfp4_resnorm_quant = isinstance(
+                img_fc1.quant_method, ModelOptFp4LinearMethod
+            ) and isinstance(txt_fc1.quant_method, ModelOptFp4LinearMethod)
 
         self._fp8_img_attn_norm_quant = False
         self._fp8_txt_attn_norm_quant = False
@@ -1395,6 +1533,52 @@ class QwenImageTransformerBlock(nn.Module):
             else None
         )
         return img_mod_params, txt_mod_params
+
+    def _try_nvfp4_resnorm_quant(
+        self,
+        norm_module: ScaleResidualLayerNormScaleShift,
+        mlp: QwenImageFeedForward,
+        *,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        x_bias: Optional[torch.Tensor],
+        residual_gate: torch.Tensor,
+        mod_params: torch.Tensor,
+        modulate_index: Optional[torch.Tensor],
+        use_bcg_helpers: bool,
+    ) -> Optional[
+        tuple[
+            tuple[torch.Tensor, torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ]:
+        if (
+            not self._enable_nvfp4_resnorm_quant
+            or modulate_index is not None
+            or use_bcg_helpers
+        ):
+            return None
+
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        fc1 = mlp.net[0].proj
+        result = try_fused_scale_residual_norm_scale_shift_nvfp4(
+            residual,
+            x,
+            x_bias,
+            residual_gate,
+            getattr(norm_module.norm, "weight", None),
+            getattr(norm_module.norm, "bias", None),
+            scale.unsqueeze(1),
+            shift.unsqueeze(1),
+            fc1.input_scale_inv,
+            norm_module.norm_type,
+            norm_module.eps,
+        )
+        if result is None:
+            return None
+        packed, residual_out = result
+        return packed, residual_out, gate.unsqueeze(1)
 
     def _try_fp8_norm_quant(
         self,
@@ -1710,40 +1894,55 @@ class QwenImageTransformerBlock(nn.Module):
             txt_attn_bias,
         ) = attn_output
         # Process image stream - norm2 + MLP
-        img_fp8_mlp = self._try_fp8_residual_norm_quant(
+        img_nvfp4 = self._try_nvfp4_resnorm_quant(
             self.img_norm2,
+            self.img_mlp,
             residual=hidden_states,
             x=img_attn_output,
+            x_bias=img_attn_bias,
             residual_gate=img_gate1,
             mod_params=img_mod2,
-            input_scale=(
-                self.img_mlp.net[0].proj.input_scale
-                if self._fp8_img_mlp_norm_quant
-                else None
-            ),
-            enabled=self._fp8_img_mlp_norm_quant,
             modulate_index=modulate_index,
             use_bcg_helpers=use_bcg_helpers,
         )
-        if img_fp8_mlp is None:
-            img_modulated2, hidden_states, img_gate2 = self._modulate(
-                img_attn_output,
-                img_mod2,
-                self.img_norm2,
-                modulate_index,
-                gate_x=img_gate1,
-                residual_x=hidden_states,
-                x_bias=img_attn_bias,
-                use_bcg_helpers=use_bcg_helpers,
-            )
+        if img_nvfp4 is not None:
+            img_modulated2, hidden_states, img_gate2 = img_nvfp4
             img_modulated2_bf16 = None
         else:
-            (
-                img_modulated2,
-                hidden_states,
-                img_gate2,
-                img_modulated2_bf16,
-            ) = img_fp8_mlp
+            img_fp8_mlp = self._try_fp8_residual_norm_quant(
+                self.img_norm2,
+                residual=hidden_states,
+                x=img_attn_output,
+                residual_gate=img_gate1,
+                mod_params=img_mod2,
+                input_scale=(
+                    self.img_mlp.net[0].proj.input_scale
+                    if self._fp8_img_mlp_norm_quant
+                    else None
+                ),
+                enabled=self._fp8_img_mlp_norm_quant,
+                modulate_index=modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
+            )
+            if img_fp8_mlp is None:
+                img_modulated2, hidden_states, img_gate2 = self._modulate(
+                    img_attn_output,
+                    img_mod2,
+                    self.img_norm2,
+                    modulate_index,
+                    gate_x=img_gate1,
+                    residual_x=hidden_states,
+                    x_bias=img_attn_bias,
+                    use_bcg_helpers=use_bcg_helpers,
+                )
+                img_modulated2_bf16 = None
+            else:
+                (
+                    img_modulated2,
+                    hidden_states,
+                    img_gate2,
+                    img_modulated2_bf16,
+                ) = img_fp8_mlp
         if isinstance(self.img_mlp, QwenImageFeedForward):
             img_mlp_output, img_mlp_bias = self.img_mlp.forward_with_bias(
                 img_modulated2
@@ -1765,63 +1964,79 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process text stream - norm2 + MLP
         txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
-        txt_fp8_mlp = self._try_fp8_residual_norm_quant(
+        txt_nvfp4 = self._try_nvfp4_resnorm_quant(
             self.txt_norm2,
+            self.txt_mlp,
             residual=encoder_hidden_states,
             x=txt_attn_output,
+            x_bias=txt_attn_bias,
             residual_gate=txt_gate1,
             mod_params=txt_mod2,
-            input_scale=(
-                self.txt_mlp.net[0].proj.input_scale
-                if self._fp8_txt_mlp_norm_quant
-                else None
-            ),
-            enabled=self._fp8_txt_mlp_norm_quant,
             modulate_index=modulate_index,
             use_bcg_helpers=use_bcg_helpers,
         )
-        if txt_fp8_mlp is not None:
-            (
-                txt_modulated2,
-                encoder_hidden_states,
-                txt_gate2,
-                txt_modulated2_bf16,
-            ) = txt_fp8_mlp
-        elif use_bcg_helpers:
+        txt_fp8_mlp = None
+        if txt_nvfp4 is not None:
+            txt_modulated2, encoder_hidden_states, txt_gate2 = txt_nvfp4
             txt_modulated2_bf16 = None
-            if txt_attn_bias is not None:
-                txt_attn_output = txt_attn_output + txt_attn_bias
-            (
-                txt_modulated2,
-                encoder_hidden_states,
-            ) = self._scale_residual_norm_scale_shift(
-                self.txt_norm2,
-                residual=encoder_hidden_states,
-                x=txt_attn_output,
-                gate=txt_gate1,
-                shift=txt_shift2,
-                scale=txt_scale2,
-            )
-        elif txt_attn_bias is not None:
-            txt_modulated2_bf16 = None
-            txt_modulated2, encoder_hidden_states, _ = self._modulate(
-                txt_attn_output,
-                txt_mod2,
-                self.txt_norm2,
-                gate_x=txt_gate1,
-                residual_x=encoder_hidden_states,
-                x_bias=txt_attn_bias,
-            )
         else:
-            txt_modulated2_bf16 = None
-            txt_modulated2, encoder_hidden_states = self.txt_norm2(
+            txt_fp8_mlp = self._try_fp8_residual_norm_quant(
+                self.txt_norm2,
                 residual=encoder_hidden_states,
                 x=txt_attn_output,
-                gate=txt_gate1,
-                shift=txt_shift2,
-                scale=txt_scale2,
+                residual_gate=txt_gate1,
+                mod_params=txt_mod2,
+                input_scale=(
+                    self.txt_mlp.net[0].proj.input_scale
+                    if self._fp8_txt_mlp_norm_quant
+                    else None
+                ),
+                enabled=self._fp8_txt_mlp_norm_quant,
+                modulate_index=modulate_index,
+                use_bcg_helpers=use_bcg_helpers,
             )
-        if txt_fp8_mlp is None:
+            if txt_fp8_mlp is not None:
+                (
+                    txt_modulated2,
+                    encoder_hidden_states,
+                    txt_gate2,
+                    txt_modulated2_bf16,
+                ) = txt_fp8_mlp
+            elif use_bcg_helpers:
+                txt_modulated2_bf16 = None
+                if txt_attn_bias is not None:
+                    txt_attn_output = txt_attn_output + txt_attn_bias
+                (
+                    txt_modulated2,
+                    encoder_hidden_states,
+                ) = self._scale_residual_norm_scale_shift(
+                    self.txt_norm2,
+                    residual=encoder_hidden_states,
+                    x=txt_attn_output,
+                    gate=txt_gate1,
+                    shift=txt_shift2,
+                    scale=txt_scale2,
+                )
+            elif txt_attn_bias is not None:
+                txt_modulated2_bf16 = None
+                txt_modulated2, encoder_hidden_states, _ = self._modulate(
+                    txt_attn_output,
+                    txt_mod2,
+                    self.txt_norm2,
+                    gate_x=txt_gate1,
+                    residual_x=encoder_hidden_states,
+                    x_bias=txt_attn_bias,
+                )
+            else:
+                txt_modulated2_bf16 = None
+                txt_modulated2, encoder_hidden_states = self.txt_norm2(
+                    residual=encoder_hidden_states,
+                    x=txt_attn_output,
+                    gate=txt_gate1,
+                    shift=txt_shift2,
+                    scale=txt_scale2,
+                )
+        if txt_nvfp4 is None and txt_fp8_mlp is None:
             txt_gate2 = txt_gate2_raw.unsqueeze(1)
         if isinstance(self.txt_mlp, QwenImageFeedForward):
             txt_mlp_output, txt_mlp_bias = self.txt_mlp.forward_with_bias(
@@ -1869,7 +2084,20 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "to_added_qkv": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    }
     _fsdp_shard_conditions = [is_transformer_block]
+
+    @classmethod
+    def get_param_names_mapping_for_quant_config(
+        cls, quant_config: Optional[QuantizationConfig]
+    ) -> dict:
+        mapping = dict(cls.param_names_mapping)
+        if _modelopt_quant_name(quant_config) == "modelopt_fp8":
+            mapping.update(_MODEL_OPT_FP8_QKV_PARAM_NAMES_MAPPING)
+        return mapping
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
@@ -1901,6 +2129,12 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__(config=config, hf_config=hf_config)
+        # Only ModelOpt FP8 constructs packed QKV modules for checkpoints with
+        # Diffusers-style split Q/K/V names. Keep the mapping instance-local so
+        # eager and NVFP4 checkpoints still target their split projections.
+        self.param_names_mapping = self.get_param_names_mapping_for_quant_config(
+            quant_config
+        )
         arch = self.config
         patch_size = arch.patch_size
         in_channels = arch.in_channels
