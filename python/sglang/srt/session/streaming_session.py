@@ -232,10 +232,9 @@ class StreamingSession(BasePrefixCache):
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # NPU requires page-aligned KV reuse; and a rewind below the SWA
-        # eviction cursor must land on a page boundary -- free_kv_row_segments
-        # splits dead/alive at the cursor, and a mid-page cut frees the shared
-        # page twice.
+        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
+        # cursor must also land on a page boundary -- free_kv_row_segments
+        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
         if self.page_size > 1 and (is_npu() or req.kv.swa_evicted_seqlen > prefix_len):
             prefix_len = (prefix_len // self.page_size) * self.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
