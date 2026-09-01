@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
+    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
@@ -33,16 +34,10 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     get_quantization_config,
-    is_cuda,
-    is_hip,
     is_mps,
-    is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
-    is_xpu,
     parse_connector_type,
 )
 
@@ -50,7 +45,6 @@ logger = logging.getLogger(__name__)
 
 
 def handle_model_specific_adjustments(server_args: Any):
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -189,7 +183,9 @@ def handle_model_specific_adjustments(server_args: Any):
                     "shared layers would run sparse attention without indices."
                 )
 
-            if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
+            if (
+                not get_platform().is_npu and not get_platform().is_xpu
+            ):  # CUDA or ROCm GPU
                 if cfg.enable_prefill_cp:
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
@@ -302,7 +298,7 @@ def handle_model_specific_adjustments(server_args: Any):
         # latter awaiting the speculative-hook migration) stays below.
 
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
-        if is_hip():
+        if get_platform().is_hip:
             if is_deepseek_dsa(hf_config):
                 # The fused top-k v2 kernel (topk_transform_512_v2) is a
                 # CUDA/Hopper-only path: its JIT source includes
@@ -336,7 +332,7 @@ def handle_model_specific_adjustments(server_args: Any):
         validate_deepseek_v4_cp(server_args)
         validate_deepseek_v4_mega_moe_token_budget(server_args)
 
-        if is_sm120_supported():
+        if get_platform().is_sm120:
             # SM120 lacks tcgen05/TMEM: disable features that depend on
             # DeepGEMM or require >99KB SMEM (topk_v2).
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
@@ -348,7 +344,7 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             # Prefer TileLang over the Torch fallback.
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
-        elif is_hip():
+        elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
@@ -395,7 +391,7 @@ def handle_model_specific_adjustments(server_args: Any):
         if (
             not resolved_view(server_args).enable_dp_attention
             and cfg.nnodes == 1
-            and is_hip()
+            and get_platform().is_hip
         ):
             # TODO (Hubert): Put this back later
             # server_args.enable_aiter_allreduce_fusion = True
@@ -714,8 +710,8 @@ def handle_model_capability_adjustments(server_args: Any):
             cfg.prefill_attention_backend or cfg.attention_backend
         )
         if (
-            is_cuda()
-            and (is_sm90_supported() or is_sm100_supported())
+            get_platform().is_cuda
+            and (get_platform().is_sm90 or get_platform().is_sm100)
             and requested_prefill_backend in (None, "fa3", "fa4")
         ):
             # Hopper/Blackwell's default FA backend can consume raw K/V
@@ -735,7 +731,10 @@ def handle_model_capability_adjustments(server_args: Any):
                 cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
             ),
         )
-        if is_cuda() and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        if (
+            get_platform().is_cuda
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
             declare_resolution(
                 server_args,
                 "_handle_model_capability_adjustments",
@@ -776,7 +775,7 @@ def handle_model_capability_adjustments(server_args: Any):
                         cfg.cuda_graph_config, Phase.PREFILL, **sizing
                     ),
                 )
-        elif not is_cuda():
+        elif not get_platform().is_cuda:
             # BCG is CUDA-only. Other graph backends do not support this
             # encoder-style prefill, so retain the eager Triton path.
             declare_resolution(

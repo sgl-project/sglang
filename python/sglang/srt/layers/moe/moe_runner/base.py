@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
     RoutingMethodType,
 )
+from sglang.srt.runtime_context import get_forward
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -29,7 +30,6 @@ if TYPE_CHECKING:
 
 def moe_output_buffer_ctx(buf: torch.Tensor):
     """Provide the MoE output buffer for the current forward scope."""
-    from sglang.srt.runtime_context import get_forward
 
     return get_forward().scoped(moe_output_buffer=buf)
 

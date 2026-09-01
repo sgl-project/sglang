@@ -16,6 +16,12 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
+
 logger = logging.getLogger(__name__)
 
 # Each thread moves _NUMEL_PER_THREAD bf16 via one 128-bit multimem op; the
@@ -423,7 +429,6 @@ def recommended_max_tokens(include_prefill: bool, floor: int = 0) -> int:
     NCCL. Covers the spec-decode batch plus, if ``include_prefill``, a prefill
     chunk. Returns ``floor`` if server args are unavailable."""
     try:
-        from sglang.srt.runtime_context import get_schedule, get_spec
 
         def g(value) -> int:
             return value if isinstance(value, int) and value > 0 else 0
@@ -466,7 +471,6 @@ class MultimemAllGatherer:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
-            from sglang.srt.runtime_context import get_parallel
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
