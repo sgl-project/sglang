@@ -228,7 +228,7 @@ export const Llama31Deployment = () => {
     }
 
     // Add quantization flag only if not using FP8 variant model
-    if (quantization === 'fp8' && (hardware === 'arc_b' || (category !== 'instruct' && !isXeon))) {
+    if (quantization === 'fp8' && category !== 'instruct' && !isXeon) {
       args.push(`--quantization fp8`);
     }
 
