@@ -95,6 +95,16 @@ def _dp_dbg_tag() -> str:
         return "?"
 
 
+def _dp_dbg_enabled() -> bool:
+    # Only TP0 logs, to keep one line per event across the whole deployment.
+    if not _DP_DBG:
+        return False
+    try:
+        return get_parallel().tp_rank == 0
+    except Exception:
+        return True
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -1909,7 +1919,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            if _DP_DBG:
+            if _dp_dbg_enabled():
                 _hs = logits_output.hidden_states
                 _sum_ext = int(sum(batch.extend_lens))
                 logger.warning(
@@ -2100,7 +2110,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        if _DP_DBG:
+        if _dp_dbg_enabled():
             logger.warning(
                 "[DFLASH-DPDBG] %s BLOCK bs=%d seq_lens=%s bonus=%s pos0=%s ocl0=%s ocl0_1=%s",
                 _dp_dbg_tag(),
@@ -2226,7 +2236,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
-        if _DP_DBG:
+        if _dp_dbg_enabled():
             logger.warning(
                 "[DFLASH-DPDBG] %s DRAFT bs=%d draft0=%s draft1=%s",
                 _dp_dbg_tag(),
@@ -2431,7 +2441,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
-        if _DP_DBG:
+        if _dp_dbg_enabled():
             _ntl = logits_output.next_token_logits
             logger.warning(
                 "[DFLASH-DPDBG] %s VERIFY bs=%d commit=%s bonus=%s tgt_top1_0=%s "
