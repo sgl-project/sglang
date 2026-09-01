@@ -45,9 +45,7 @@ class TestSamplingMaskCapture(CustomTestCase):
         batch_size = 256
         top_k = 2
         top_p = 0.45
-        base_probs = torch.tensor(
-            [[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda"
-        )
+        base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda")
         probs = base_probs.repeat(batch_size, 1)
 
         # Derive the threshold-based joint support independently. Both filters
@@ -68,9 +66,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             need_top_k_sampling=True,
             need_top_p_sampling=True,
             need_min_p_sampling=False,
-            top_ks=torch.full(
-                (batch_size,), top_k, dtype=torch.int32, device="cuda"
-            ),
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.zeros(batch_size, device="cuda"),
             return_sampling_masks=[True] * batch_size,
