@@ -242,7 +242,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 | **Purpose** | During chunked prefill, insert partial results so the next chunk can match the prefix |
 | **Inputs** | `req` — the in-progress request |
 | **Output** | `None` |
-| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
+| **Mutation** | Inserts partial KV → re-matches prefix → updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`; transfers lock from old node to new node |
 | **Complexity** | **O(K + D·C)** — two tree traversals: insert O(K + D·C) + re-match O(K + D·C) + lock transfer O(D). Simplifies to **O(K)**. |
 
 **Algorithm detail:**
@@ -252,7 +252,7 @@ Cache an in-progress request's partial KV data (chunked prefill).
 4. Writes new prefix indices into `req_to_token_pool`
 5. `dec_lock_ref()` on old `req.last_node`
 6. `inc_lock_ref()` on new matched node
-7. Updates `req.prefix_indices`, `req.cache_protected_len`, `req.last_node`
+7. Updates `req.prefix_indices`, `req.kv.cache_protected_len`, `req.last_node`
 8. `cleanup_after_caching_req()` per component
 
 ---
@@ -329,7 +329,7 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 
 ## Construction
 
-`UnifiedRadixCache` is constructed directly from `mem_cache/registry.py` when `SGLANG_ENABLE_UNIFIED_RADIX_TREE` is enabled. The registry sets `params.tree_components` before construction:
+`UnifiedRadixCache` is the default tree cache and is constructed directly from `mem_cache/registry.py`. The registry sets `params.tree_components` before construction:
 
 - Regular full-attention models → `(ComponentType.FULL,)`
 - Hybrid SWA models → `(ComponentType.FULL, ComponentType.SWA)`

@@ -7,24 +7,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    can_use_fused_silu_mul,
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
-    mark_fused_gate_rmsnorm_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
     fused_rope_rotate_half_bitexact,
-)
-from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
-    can_use_fused_silu_mul,
     fused_silu_mul_bitexact,
+    mark_fused_gate_rmsnorm_site,
+    modulate_scale_shift,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_layer

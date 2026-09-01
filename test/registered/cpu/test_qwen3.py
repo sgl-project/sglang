@@ -1,13 +1,14 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.utils import is_host_cpu_arm64
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)

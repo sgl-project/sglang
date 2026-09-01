@@ -1,7 +1,5 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
-//! ([`GenerateBody`] → [`GenerateRequest`]s), the variant bodies, and the
-//! scheduler ingress encodings (`TokenizedGenerateReqInput` header,
-//! control/abort, `IngressMsg`).
+//! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -11,10 +9,12 @@ use itertools::izip;
 use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
-use crate::environ::env_u64;
-use crate::error::Error;
-use crate::ids::Rid;
+use super::response::ResponseSink;
+use super::sampling::{SamplingParams, SamplingParamsInput};
+use super::types::{OneOrMany, OneOrManyItem, TokenIds};
+use crate::message::ids::Rid;
+use crate::utils::fsm::RequestState;
+use crate::utils::{environ::env_i64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -27,8 +27,12 @@ use crate::ids::Rid;
 /// `python/sglang/srt/environ.py`, which owns the default). Memoized because the
 /// value is process-static — Python sets it before launching this server — and a
 /// per-request `env::var` would take a lock on the hot path for a constant.
-static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<usize> =
-    LazyLock::new(|| env_u64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096) as usize);
+static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
+    LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
+
+fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
+    limit >= 0 && batch_size as u128 > limit as u128
+}
 
 /// Hard cap on the total bytes a broadcast value may clone into the batch (see
 /// the `One` arms of the fan-out).
@@ -55,73 +59,52 @@ const JSON_TO_HEAP_FACTOR: usize = 8;
 pub struct GenerateBody {
     /// Optional client-supplied request id(s): a single string (a batch fans it
     /// out as `{rid}_{i}`, mirroring Python `_normalize_batch`) or one per item.
-    #[serde(default)]
     pub rid: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub text: Option<OneOrMany<String>>,
-    #[serde(default)]
     pub input_ids: Option<OneOrMany<TokenIds>>,
     #[serde(default)]
     pub stream: bool,
     /// One params object (broadcast) or a list of them (per item); see
     /// [`SamplingParamsInput`].
-    #[serde(default)]
     pub sampling_params: Option<SamplingParamsInput>,
     /// Logprob / hidden-state options: a scalar broadcasts to every prompt, a
     /// list is per-prompt (Python `_normalize_logprob_params`).
-    #[serde(default)]
     pub return_logprob: Option<OneOrMany<bool>>,
-    #[serde(default)]
     pub logprob_start_len: Option<OneOrMany<i64>>,
-    #[serde(default)]
     pub top_logprobs_num: Option<OneOrMany<i64>>,
     /// Token ids to report logprobs for: one list (broadcast to every prompt) or
     /// one list per prompt, mirroring Python's
     /// `Union[List[int], List[List[int]]]` fan-out in `_normalize_batch`.
-    #[serde(default)]
     pub token_ids_logprob: Option<OneOrMany<TokenIds>>,
-    #[serde(default)]
     pub return_hidden_states: Option<OneOrMany<bool>>,
     /// Scalar-only in Python too (`return_text_in_logprobs: bool`).
-    #[serde(default)]
     pub return_text_in_logprobs: Option<bool>,
     // PD-disaggregation routing, injected per request by the PD router
     // (mini_lb / sgl-model-gateway): a scalar for a single prompt, one-per-item
     // lists for a batch. Elements are nullable (`List[Optional[...]]` in
     // Python) — the router sends `bootstrap_port: [null, …]` when deferring to
     // the scheduler's `--disaggregation-bootstrap-port` default.
-    #[serde(default)]
     pub bootstrap_host: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub bootstrap_port: Option<OneOrMany<Option<i64>>>,
     /// `bootstrap_room` fits in i64: the PD routers draw it from `[0, 2^63)`.
-    #[serde(default)]
     pub bootstrap_room: Option<OneOrMany<Option<i64>>>,
-    #[serde(default)]
     pub bootstrap_pair_key: Option<OneOrMany<Option<String>>>,
-    #[serde(default)]
     pub decode_tp_size: Option<OneOrMany<Option<i64>>>,
     /// DP routing hints — per-request scalars even for batches, as in Python.
-    #[serde(default)]
     pub routed_dp_rank: Option<i64>,
-    #[serde(default)]
     pub disagg_prefill_dp_rank: Option<i64>,
     // Multimodal inputs, permissive `Value` so any shape Python's
     // `GenerateReqInput` accepts (URL / base64 / list / list-of-lists) parses.
     // `into_requests` fans them out per the Python
     // `_normalize_{image,video,audio}_data` batch rules.
-    #[serde(default)]
     pub image_data: Option<rmpv::Value>,
     /// Caller-supplied per-item content hashes (hex) overriding the computed
     /// ones, so an external router's keys align with the prefix cache. Single
     /// requests only: Python declares the batched shapes but `__getitem__` never
     /// forwards them, so a batch is rejected here rather than answered with
     /// hashes it did not ask for.
-    #[serde(default)]
     pub mm_hashes: Option<rmpv::Value>,
-    #[serde(default)]
     pub video_data: Option<rmpv::Value>,
-    #[serde(default)]
     pub audio_data: Option<rmpv::Value>,
 }
 
@@ -170,7 +153,7 @@ impl GenerateBody {
             (None, Some(OneOrMany::Many(v))) => v.len(),
             _ => 1,
         };
-        if declared_n > *MAX_BATCH_REQS_PER_HTTP_REQ {
+        if batch_size_exceeds_limit(declared_n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
             return Err(Error::Validation(format!(
                 "batch size {declared_n} exceeds the maximum of {}",
                 *MAX_BATCH_REQS_PER_HTTP_REQ
@@ -519,12 +502,12 @@ fn split_mm_column(
 /// plus the owned inputs from [`GenerateRequest::take_mm_work`].
 #[derive(Debug)]
 pub struct MmRequest {
-    pub rid: crate::ids::Rid,
+    pub rid: Rid,
     pub work: MmWorkItem,
 }
 
 /// The parked request's fields the MM worker owns; converted to the driver input
-/// by [`super::mm_payload::to_mm_input`].
+/// by [`crate::multi_modality::payload::to_mm_input`].
 #[derive(Debug, Default)]
 pub struct MmWorkItem {
     pub text: Option<String>,
@@ -541,17 +524,40 @@ pub struct MmWorkItem {
 /// Whether an optional mm field counts as multimodal input, via the same
 /// `value_present` the MM worker's payload parser uses.
 fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
-    v.as_ref().is_some_and(super::mm_payload::value_present)
+    v.as_ref()
+        .is_some_and(crate::multi_modality::payload::value_present)
 }
 
-/// Request variant — selects the ingress branch, scheduler wire message, and
-/// egress shape. Each owns its body, so generate/control fields stay type-separate.
+/// The owned request as it travels request stages (single owner, so `state` is
+/// mutated lock-free). Common fields here; variant data in [`RequestKind`].
+#[derive(Debug)]
+pub struct Request {
+    /// Client-visible request id (uuid hex) — what the scheduler wire and
+    /// `meta_info.id` carry.
+    pub rid: Rid,
+    pub state: RequestState,
+    /// Back-channel to the client connection for response frames.
+    pub sink: ResponseSink,
+    /// Discriminant + variant body (generate vs control).
+    pub kind: RequestKind,
+}
+
+/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+#[derive(Debug)]
+pub struct SchedulerRequest {
+    pub header: Bytes,
+    pub ids: Bytes,
+}
+
+/// Request variant — selects the request branch, scheduler wire message, and
+/// response shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
-    /// the egress is a single non-streamed JSON result.
+    /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the
@@ -595,7 +601,7 @@ pub struct GenerateRequest {
     /// by the pool before the header is built; never reaches the scheduler wire.
     pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
-    /// normalized + verified at ingress, then serialized into the header.
+    /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
@@ -639,13 +645,16 @@ pub struct GenerateRequest {
 }
 
 /// The opaque multimodal fields of one request (see [`GenerateRequest::mm`]).
+///
+/// Constructed directly only by tests: `api_server::prefetch` fills its
+/// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
     pub image_data: Option<rmpv::Value>,
     pub video_data: Option<rmpv::Value>,
     pub audio_data: Option<rmpv::Value>,
     /// Bytes of `image_data`'s I/O-backed sources, resolved by
-    /// `api_server::prefetch` in `mm_payload::io_sources` order so MM workers
+    /// `api_server::prefetch` in `payload::io_sources` order so MM workers
     /// never block on I/O. Out-of-band: the values above stay as the client
     /// sent them.
     pub prefetched: Vec<bytes::Bytes>,
@@ -693,8 +702,8 @@ impl GenerateRequest {
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
-    /// when not tokenized.
+    /// `array("q")` columnar cell — rides the to-scheduler channel outside
+    /// msgpack). Empty when not tokenized.
     pub fn encode_data_buf(&self) -> Bytes {
         let ids = self.input_ids.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(ids.len() * 8);
@@ -882,7 +891,7 @@ mod tests {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization (the ingress step), not here.
+        // at normalization, not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }
@@ -1089,19 +1098,16 @@ mod tests {
     /// capped before any column is built.
     #[test]
     fn oversized_batches_are_rejected_before_allocating() {
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ + 1)
-            .map(|i| i.to_string())
-            .collect();
+        let cap = usize::try_from(*MAX_BATCH_REQS_PER_HTTP_REQ).unwrap();
+        let texts: Vec<String> = (0..cap + 1).map(|i| i.to_string()).collect();
         let body = serde_json::json!({ "text": texts }).to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("exceeds the maximum"), "{err}");
 
         // At the cap it is accepted.
-        let texts: Vec<String> = (0..*MAX_BATCH_REQS_PER_HTTP_REQ)
-            .map(|i| i.to_string())
-            .collect();
+        let texts: Vec<String> = (0..cap).map(|i| i.to_string()).collect();
         let (reqs, _) = requests(&serde_json::json!({ "text": texts }).to_string()).unwrap();
-        assert_eq!(reqs.len(), *MAX_BATCH_REQS_PER_HTTP_REQ);
+        assert_eq!(reqs.len(), cap);
 
         // A small batch with a huge broadcast `custom_params` is the quadratic case:
         // few items, but each clone carries the whole blob. The item count is a
@@ -1116,6 +1122,13 @@ mod tests {
         .to_string();
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("would allocate more than"), "{err}");
+    }
+
+    #[test]
+    fn negative_batch_limit_disables_the_item_cap() {
+        assert!(!batch_size_exceeds_limit(usize::MAX, -1));
+        assert!(batch_size_exceeds_limit(11, 10));
+        assert!(!batch_size_exceeds_limit(10, 10));
     }
 
     /// `token_ids_logprob` mirrors Python `_normalize_batch`'s nested-structure

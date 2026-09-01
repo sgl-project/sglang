@@ -297,39 +297,53 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
 
-    # The blk64 kernel is built `-gencode=arch=compute_100a,code=sm_100a`, which
-    # is arch-specific: 10.3 (B300 / GB300) and 12.x have no cubin. Its own guard
-    # only compares the major version, so it would accept 10.3 and fail later.
-    required_capability = (10, 0)
+    # Hopper uses SGLang's SM90 CuTe-DSL block-sparse kernel. Blackwell uses the
+    # FlashInfer blk64 kernel built specifically for sm_100a; 10.3 and 12.x do
+    # not have a compatible cubin and must still fail closed.
+    supported_capabilities = {(9, 0), (10, 0)}
 
     @classmethod
     def resolve(cls, platform) -> str:
         capability = platform.get_device_capability()
-        if capability is None or capability != cls.required_capability:
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "SubBlock sparse attention needs compute capability "
-                f"{'.'.join(map(str, cls.required_capability))} (B200 / GB200); "
-                f"this device reports {found}."
+                "SubBlock sparse attention needs compute capability 9.0 "
+                f"(Hopper) or 10.0 (B200 / GB200); this device reports {found}."
             )
         try:
-            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
-                load_bsa_attn_blk64_fwd,
-            )
             from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (  # noqa: F401
                 SubBlockSparseAttentionBackend,
             )
 
-            # Importing the entry point catches a missing or broken FlashInfer;
-            # the CUDA extension itself is built lazily on the first call.
-            load_bsa_attn_blk64_fwd()
+            if capability_tuple == (9, 0):
+                # Importing catches missing/incompatible CuTe-DSL and Quack;
+                # the CUDA kernel itself is compiled lazily on the first call.
+                from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (  # noqa: F401
+                    BlockSparseTensorsTorch,
+                )
+                from sglang.kernels.ops.attention.flash_attn.cute.interface import (  # noqa: F401
+                    flash_attn_func,
+                )
+            else:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (  # noqa: F401
+                    load_bsa_attn_blk64_fwd,
+                )
+
+                load_bsa_attn_blk64_fwd()
             return "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn.SubBlockSparseAttentionBackend"
         except Exception as e:
             logger.error("Failed to import SubBlock sparse attention: %s", str(e))
-            raise ImportError(
-                "SubBlock sparse attention needs FlashInfer with the blk64 "
-                "block-sparse kernel (flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)."
-            ) from e
+            dependency = (
+                "SGLang's SM90 CuTe-DSL FlashAttention dependencies"
+                if capability_tuple == (9, 0)
+                else "FlashInfer with the blk64 block-sparse kernel "
+                "(flashinfer.cute_dsl.sparse.bsa_attn_blk64_fwd)"
+            )
+            raise ImportError(f"SubBlock sparse attention needs {dependency}.") from e
 
 
 class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
@@ -429,7 +443,10 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "trtllm"
+        # flashinfer.mm_fp4 rejects backend="trtllm" on sm_120 ("does not support
+        # backend 'trtllm' with capability 120"); "auto" resolves to its sm_12x
+        # NVFP4 kernel there.
+        default_backend = "auto" if cls.is_sm120() else "trtllm"
         if backend is None:
             return default_backend
 

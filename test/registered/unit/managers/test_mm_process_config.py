@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.serving_hook import handle_multimodal
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,22 +22,25 @@ class TestMmProcessConfigValidation(CustomTestCase):
 
     def _validate_config(self, mm_process_config):
         args = ServerArgs(model_path="dummy", mm_process_config=mm_process_config)
-        args._handle_multimodal()
+        handle_multimodal(args)
         return args
 
     def test_valid_config_accepted(self):
         args = self._validate_config({"image": {"max_pixels": 5000000}})
-        self.assertEqual(args.mm_process_config, {"image": {"max_pixels": 5000000}})
+        self.assertEqual(
+            resolution_result(args, "mm_process_config"),
+            {"image": {"max_pixels": 5000000}},
+        )
 
     def test_empty_config_accepted(self):
         args = self._validate_config({})
-        self.assertEqual(args.mm_process_config, {})
+        self.assertEqual(resolution_result(args, "mm_process_config"), {})
 
     def test_none_config_defaults_to_empty_dict(self):
         args = self._validate_config(None)
         # None is kept as-is for dummy models (default happens after early return)
         # but for real models it would be set to {}
-        self.assertIsNone(args.mm_process_config)
+        self.assertIsNone(resolution_result(args, "mm_process_config"))
 
     def test_top_level_non_dict_rejected(self):
         with self.assertRaises(TypeError) as ctx:
@@ -63,7 +69,7 @@ class TestMmProcessConfigValidation(CustomTestCase):
             "audio": {"sample_rate": 16000},
         }
         args = self._validate_config(config)
-        self.assertEqual(args.mm_process_config, config)
+        self.assertEqual(resolution_result(args, "mm_process_config"), config)
 
 
 class TestBaseProcessorConfigExtraction(CustomTestCase):
@@ -74,24 +80,47 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         mm_process_config,
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
+        image_processor=None,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
         )
 
-        server_args = MagicMock()
-        server_args.mm_process_config = mm_process_config
-        server_args.mm_processor_worker_num = mm_processor_worker_num
-        server_args.mm_io_worker_num = mm_io_worker_num
-        server_args.mm_preprocess_cache_size_mb = None
-        server_args.tokenizer_worker_num = 1
-        server_args.trust_mm_content_hashes = False
-        server_args.allowed_media_domains = []
-        server_args.media_url_max_file_size_mb = 64
+        override = get_context().override_server_args(
+            mm_process_config=mm_process_config,
+            allowed_media_domains=[],
+            mm_processor_worker_num=mm_processor_worker_num,
+            mm_io_worker_num=mm_io_worker_num,
+            mm_preprocess_cache_size_mb=None,
+            tokenizer_worker_num=1,
+            trust_mm_content_hashes=False,
+            media_url_max_file_size_mb=64,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        # A real record: a bare MagicMock makes every attribute truthy, which
+        # sends the worker-count decision down the wrong branch.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_process_config=mm_process_config,
+            allowed_media_domains=[],
+            mm_processor_worker_num=mm_processor_worker_num,
+            mm_io_worker_num=mm_io_worker_num,
+            mm_preprocess_cache_size_mb=None,
+            tokenizer_worker_num=1,
+            trust_mm_content_hashes=False,
+            media_url_max_file_size_mb=64,
+            disable_fast_image_processor=False,
+        )
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
+        if image_processor is not None:
+            mock_hf_processor.image_processor = image_processor
 
         # Call real __init__ so we test actual config extraction
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
@@ -101,6 +130,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
                 _processor=mock_hf_processor,
                 transport_mode=None,
             )
+        if proc.mm_processor_executor is not None:
+            self.addCleanup(proc.mm_processor_executor.shutdown)
         return proc
 
     def test_configs_extracted(self):
@@ -155,9 +186,85 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertIsNone(proc.mm_processor_executor)
 
     def test_parallel_workers_require_processor_support(self):
-        proc = self._make_processor({}, mm_processor_worker_num=2)
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "supports_mm_processor_concurrency", False
+        ):
+            proc = self._make_processor({}, mm_processor_worker_num=2)
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_cpu_preprocessing_path_gets_two_workers(self):
+        """A processor whose preprocessing stays on the CPU: the second worker is
+        real parallelism there (H200 4.46 -> 6.08 req/s, GB300 7.07 -> 8.76)."""
+        proc = self._make_processor({})
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_gpu_preprocessing_path_stays_at_one_worker(self):
+        """A fast image processor submits to the device the scheduler serves
+        from, so a second worker there only contends for it: flat on H200 and
+        9.30 -> 4.02 req/s on GB300 for full-page images."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {}, image_processor=MagicMock(spec=BaseImageProcessor)
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+        self.assertIsNone(proc.mm_processor_executor)
+
+    def test_explicit_request_overrides_the_path_decision(self):
+        """The server argument wins: an operator who measured their own workload
+        can still ask for concurrency on the GPU path."""
+        from transformers import BaseImageProcessor
+
+        proc = self._make_processor(
+            {},
+            mm_processor_worker_num=2,
+            image_processor=MagicMock(spec=BaseImageProcessor),
+        )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
+
+    def test_gpu_path_caps_a_count_the_model_declared(self):
+        """Contending for the scheduler's device is a property of the path, so a
+        subclass asking for concurrency does not exempt it. Qwen-VL declares two
+        and is the model that measures 9.30 -> 4.02 req/s on GB300 full-page
+        images."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 1)
+
+    def test_cpu_path_honours_a_count_the_model_declared(self):
+        """On the CPU path the extra threads are real parallelism, so a model's
+        own measured count stands."""
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+            proc = self._make_processor({})
+        self.assertEqual(proc.mm_processor_worker_num, 3)
+
+    def test_clone_resolves_tokenizer_like_init(self):
+        proc = self._make_processor({})
+
+        wrapping = MagicMock()
+        self.assertIs(proc._resolve_processor(wrapping)[1], wrapping.tokenizer)
+
+        bare = MagicMock(spec=["encode"])
+        self.assertIs(proc._resolve_processor(bare)[1], bare)
 
     def test_explicit_io_worker_count_overrides_auto(self):
         from sglang.srt.multimodal.processors.base_processor import (
@@ -170,8 +277,14 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
 
 class TestMultimodalFeatureTransportRuntime(CustomTestCase):
-    @staticmethod
-    def _server_args(mm_feature_transport):
+    def _server_args(self, mm_feature_transport):
+        override = get_context().override_server_args(
+            mm_feature_transport=mm_feature_transport,
+            mm_process_config={},
+            allowed_media_domains=[],
+        )
+        override.install()
+        self.addCleanup(override.restore)
         return SimpleNamespace(
             mm_feature_transport=mm_feature_transport,
             image_processor_backend="auto",
@@ -197,8 +310,7 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         return processor
 
     def test_cuda_ipc_pool_uses_resolved_server_arg(self):
-        # The processor module can be imported before this instance is built;
-        # transport policy must still resolve from the instance's ServerArgs.
+        # Transport policy resolves from the mm bag, so the test publishes it.
         from sglang.srt.multimodal.processors import base_processor
 
         with (
@@ -296,8 +408,12 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
     def test_consumer_slot_uses_global_tp_rank(self):
         from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 
-        parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
-        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+        # State the topology on the context, not by stubbing the accessor:
+        # `memory_pool` imports `get_parallel` at module scope, so a patch on
+        # the defining module never reaches the copy doing the reading.
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
@@ -379,6 +495,38 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         self.assertFalse(pool._recycle_thread.is_alive())
 
 
+class TestCudaIpcProcessorRollback(CustomTestCase):
+    def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.cudaipc_mmfeature_pool = MagicMock()
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[proxy, RuntimeError("wrap failed")]
+        )
+        features = [torch.ones(2), torch.ones(3)]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "wrap failed"):
+            processor._prepare_mm_items_for_transport(items)
+
+        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        self.assertIs(items[0].feature, features[0])
+        self.assertIs(items[1].feature, features[1])
+
+
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
     @staticmethod
     def _processor(enabled):
@@ -437,8 +585,9 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
         ):
             processor = BaseMultimodalProcessor()
 
+        hf_processor = SimpleNamespace(tokenizer=object())
         processor.mm_processor_executor = MultimodalProcessorExecutor(
-            SimpleNamespace(tokenizer=object()), max_workers=2
+            lambda: hf_processor, max_workers=2
         )
         processor.process_and_combine_mm_data = MagicMock(
             side_effect=lambda *_args, **_kwargs: threading.current_thread().name
@@ -482,7 +631,8 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
             MultimodalProcessorExecutor,
         )
 
-        executor = MultimodalProcessorExecutor(object(), max_workers=2)
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
         return_processor = lambda *, processor: processor
         try:
             first = await executor.run(return_processor)
@@ -492,30 +642,37 @@ class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, second)
 
-    async def test_replacement_worker_lazily_clones_processor(self):
-        from sglang.srt.multimodal.processors import executor as executor_module
+    async def test_clone_carries_customization_applied_after_construction(self):
+        """A subclass keeps customizing `_processor` after `super().__init__()`.
 
-        source_processor = object()
-        replacement_clone = SimpleNamespace(tokenizer=object())
-        with patch.object(
-            executor_module.copy,
-            "deepcopy",
-            return_value=replacement_clone,
-        ) as deepcopy:
-            executor = executor_module.MultimodalProcessorExecutor(
-                source_processor, max_workers=2
-            )
-            executor._processor_clones.clear()
-            return_processor = lambda *, processor: processor
-            try:
-                first = await executor.run(return_processor)
-                second = await executor.run(return_processor)
-            finally:
-                executor.shutdown()
+        Sarashina2Vision patches its image processor there and Pixtral sets
+        `patch_size` / `spatial_merge_size`; a clone snapshotted while the pool
+        was built would serve requests from a half-configured processor.
+        """
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
 
-        self.assertIs(first, replacement_clone)
-        self.assertIs(first, second)
-        self.assertEqual(deepcopy.call_count, 3)
+        owner = SimpleNamespace(_processor=SimpleNamespace(patch_size=16))
+        executor = MultimodalProcessorExecutor(lambda: owner._processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        owner._processor.patch_size = 14
+
+        seen = await executor.run(lambda *, processor: processor.patch_size)
+        self.assertEqual(seen, 14)
+
+    async def test_worker_gets_a_clone_not_the_shared_processor(self):
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+
+        hf_processor = SimpleNamespace(tokenizer=object())
+        executor = MultimodalProcessorExecutor(lambda: hf_processor, max_workers=2)
+        self.addCleanup(executor.shutdown)
+
+        worker_processor = await executor.run(lambda *, processor: processor)
+        self.assertIsNot(worker_processor, hf_processor)
 
 
 class TestProcessMmDataKwargs(CustomTestCase):
@@ -683,6 +840,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
+        proc._tokenizer = mock_hf_processor.tokenizer
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})
@@ -792,16 +950,21 @@ class TestDoubleBosGuard(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
+        override = get_context().override_server_args(
+            mm_process_config={},
+            mm_feature_transport="cpu",
+            allowed_media_domains=[],
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         server_args = MagicMock()
-        server_args.mm_process_config = {}
         server_args.mm_processor_worker_num = 0
         server_args.mm_io_worker_num = 0
-        server_args.mm_feature_transport = "cpu"
         server_args.disable_fast_image_processor = True
         server_args.mm_preprocess_cache_size_mb = None
         server_args.tokenizer_worker_num = 1
         server_args.trust_mm_content_hashes = False
-        server_args.allowed_media_domains = []
         server_args.media_url_max_file_size_mb = 64
 
         mock_hf_processor = MagicMock()

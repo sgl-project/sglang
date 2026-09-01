@@ -97,10 +97,17 @@ class DataType(Enum):
 @dataclass
 class SamplingParams:
     """
-    Sampling parameters for generation.
+    Model-agnostic sampling parameters for generation.
 
     Dynamic batching compares these fields for compatibility, except fields
     marked with `batch_sig_exclude`.
+
+    New fields in this base class must be shared across model families; legacy
+    compatibility fields are not precedent. A model-specific field belongs on
+    that model's SamplingParams subclass and, when accepted by an online
+    endpoint, must also be declared via ``image_request_extra_fields`` or
+    ``video_request_extra_fields``. Do not add model fields here merely to make
+    the common API transport accept them.
     """
 
     data_type: DataType = DataType.VIDEO
@@ -180,23 +187,10 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
-    # LTX-2.5 duration head. Ignored by other models, so the flags stay
-    # universally accepted.
-    # Decode with the diffusion decoder instead of the VAE one. Ignored by
-    # models that ship no such decoder.
-    use_diffusion_decoder: bool = False
-
-    auto_duration: bool = False
-    auto_duration_min_seconds: float = 1.0
-    auto_duration_max_seconds: float = 20.0
-
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
-
-    # Output audio duration in seconds (models without an audio modality ignore this).
-    sound_duration: float = 0.0
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -206,21 +200,32 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+    # CFG gating (lossy): reuse the cached cond-uncond residual after this
+    # fraction of the steps. None = follow the SGLANG_DIFFUSION_CFG_GATE_STEP
+    # server default; 1.0 = off for this request.
+    cfg_gate_step: float | None = None
 
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
     progressive_delta: float = 0.01
-
-    # LongCat-Image parameters
-    enable_cfg_renorm: bool = False
-    cfg_renorm_min: float = 0.0
-    enable_prompt_rewrite: bool = False
 
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
+
+    # Cache-DiT (lossy). None = follow the SGLANG_CACHE_DIT_ENABLED server
+    # default; True/False = explicit per-request opt-in/out.
+    enable_cache_dit: bool | None = None
+    # Per-request knob overrides on top of the SGLANG_CACHE_DIT_* defaults.
+    # Valid keys: CACHE_DIT_REQUEST_PARAM_KEYS in cache_dit_integration.py.
+    cache_dit_params: dict[str, Any] | None = None
+
+    # Per-request DiT attention backend ("fa", "torch_sdpa", "sage_attn",
+    # "sage_attn_3"; sage is lossy). Incompatible server settings reject the
+    # request; see DenoisingStage._maybe_override_attention_backend.
+    attention_backend_override: str | None = None
 
     # Spectrum parameters
     enable_spectrum: bool = False
@@ -276,16 +281,8 @@ class SamplingParams:
     max_sequence_length: int | None = None
     flow_shift: float | None = None
 
-    # cosmos-related
-    use_duration_template: bool | None = None
-    use_resolution_template: bool | None = None
-    use_system_prompt: bool | None = None
-    use_guardrails: bool | None = None
     condition_inputs: dict[str, Any] = field(default_factory=dict)
     realtime_chunk_size: int | None = None
-
-    # Prompt enhancement (ErnieImage)
-    use_pe: bool | None = None
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -379,10 +376,38 @@ class SamplingParams:
             req.realtime_chunk_size = self.realtime_chunk_size
 
     @classmethod
-    def video_request_extra_fields(cls) -> frozenset[str]:
-        """Declare model-specific multipart video fields accepted by this type."""
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-owned JSON fields accepted by the image API.
+
+        Every returned name must be an init field on ``cls``. The common
+        endpoint resolves the active subclass before reading these fields, so
+        model-specific extraction and defaults stay out of the API layer.
+        """
 
         return frozenset()
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-owned JSON or multipart fields accepted by the video API.
+
+        Dataclass-backed names are forwarded to ``cls``. Transport-only aliases
+        may also be declared so multipart parsing preserves them, but the
+        subclass must consume those aliases in ``lower_video_request_kwargs``.
+        """
+
+        return frozenset()
+
+    @classmethod
+    def default_image_output_format(cls) -> str | None:
+        """Return a model-owned default format for the image API, if any."""
+
+        return None
+
+    @classmethod
+    def default_image_response_format(cls) -> str | None:
+        """Return a model-owned default response format for the image API, if any."""
+
+        return None
 
     @classmethod
     def lower_video_request_kwargs(
@@ -888,7 +913,13 @@ class SamplingParams:
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
-        """Add CLI arguments for SamplingParam fields"""
+        """Add CLI arguments for SamplingParam fields.
+
+        This shared parser still contains legacy model-specific flags because
+        argparse is constructed before the active model is resolved. Do not add
+        new model-specific dataclass fields to ``SamplingParams`` or new API
+        special cases here; model request ownership remains on subclasses.
+        """
 
         def add_argument(*name_or_flags, **kwargs):
             kwargs.setdefault("default", argparse.SUPPRESS)
@@ -907,6 +938,22 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-cache-dit",
+            action=StoreBoolean,
+        )
+        add_argument(
+            "--cache-dit-params",
+            type=json.loads,
+        )
+        add_argument(
+            "--cfg-gate-step",
+            type=float,
+        )
+        add_argument(
+            "--attention-backend-override",
+            type=str,
         )
         add_argument(
             "--enable-spectrum",
@@ -976,7 +1023,7 @@ class SamplingParams:
         add_argument(
             "--enable-cfg-renorm",
             action=StoreBoolean,
-            help="Enable CFG renormalization for LongCat-Image (default: false).",
+            help="Enable CFG renormalization for LongCat-Image (enabled by default).",
         )
         add_argument(
             "--cfg-renorm-min",
@@ -986,7 +1033,7 @@ class SamplingParams:
         add_argument(
             "--enable-prompt-rewrite",
             action=StoreBoolean,
-            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (enabled by default).",
         )
 
         # profiling

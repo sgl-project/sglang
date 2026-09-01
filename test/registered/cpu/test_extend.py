@@ -1,12 +1,13 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 torch.manual_seed(1234)
 
@@ -197,6 +198,7 @@ class TestExtendAttention(CustomTestCase):
         b_seq_len_prefix=None,
         b_seq_len_extend=None,
         kv_from_cache=False,
+        is_causal=True,
     ):
         dtype = torch.bfloat16
 
@@ -315,7 +317,7 @@ class TestExtendAttention(CustomTestCase):
                 b_seq_len_extend,
                 scaling=sm_scale,
                 enable_gqa=enable_gqa,
-                causal=not is_cross_attn,
+                causal=(not is_cross_attn) and is_causal,
                 is_cross_attn=is_cross_attn,
                 encoder_lens=encoder_lens,
             )
@@ -340,6 +342,8 @@ class TestExtendAttention(CustomTestCase):
             sliding_window if sliding_window is not None else 0,
             encoder_lens,
             sinks if has_sink else None,
+            None,  # tree_mask
+            is_causal,
         )
 
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
@@ -418,6 +422,20 @@ class TestExtendAttention(CustomTestCase):
             DV=96,
             b_seq_len_prefix=[97],
             b_seq_len_extend=[37],
+        )
+
+    def test_extend_attention_bidirectional(self):
+        # Test for is_causal=False: encoder-only self-attention (e.g. bge-reranker)
+        self._test_extend_attention_once(
+            B=4,
+            N_CTX=123,
+            H_Q=16,
+            H_KV=4,
+            D=128,
+            DV=96,
+            b_seq_len_prefix=[0, 0, 0, 0],
+            b_seq_len_extend=[41, 90, 123, 5],
+            is_causal=False,
         )
 
 

@@ -285,7 +285,7 @@ class LongCatPromptRewriteStage(PipelineStage):
             self.text_encoder = text_encoder
 
             if enable_prompt_rewrite:
-                logger.info(
+                logger.debug(
                     "Prompt rewriting is enabled (enable_prompt_rewrite=True). "
                     "This runs autoregressive decoding on the Qwen2.5-VL text "
                     "encoder (up to %d tokens). Pass --enable-prompt-rewrite "

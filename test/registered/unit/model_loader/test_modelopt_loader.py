@@ -5,7 +5,10 @@ This test module verifies the functionality of ModelOptModelLoader, which
 applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -693,6 +696,120 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
 
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
+    def test_fp8_pb_wo_dispatches_to_native_block_fp8(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8_PB_WO"},
+                },
+                "packed_modules_mapping": {},
+            }
+        )
+
+        # Type dispatch only needs a LinearBase instance; skip GPU weight setup.
+        linear = ReplicatedLinear.__new__(ReplicatedLinear)
+        method = quant_config.get_quant_method(
+            linear, "model.layers.0.self_attn.q_proj"
+        )
+
+        self.assertIsInstance(method, Fp8LinearMethod)
+        self.assertEqual(method.quant_config.weight_block_size, [128, 128])
+        self.assertTrue(method.quant_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(method.quant_config.activation_scheme, "dynamic")
+
+    def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
+        packed_modules_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        }
+        file_quantized_layers = {
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"}
+        }
+        file_config = {
+            "producer": {"name": "modelopt"},
+            "quantization": {
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": "FP8",
+                "exclude_modules": [],
+                "quantized_layers": file_quantized_layers,
+            },
+        }
+        inline_configs = (
+            {
+                "quant_method": "modelopt_mixed",
+                "quant_algo": "MIXED_PRECISION",
+                "kv_cache_quant_algo": "NVFP4",
+            },
+            {
+                "quant_method": "modelopt_mixed",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "inline.layer": {"quant_algo": "NVFP4", "group_size": 16}
+                },
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as model_path:
+            Path(model_path, "hf_quant_config.json").write_text(
+                json.dumps(file_config), encoding="utf-8"
+            )
+            for inline_config in inline_configs:
+                with self.subTest(inline_config=inline_config):
+                    model_config = SimpleNamespace(
+                        quantization="modelopt_mixed",
+                        hf_config=SimpleNamespace(
+                            quantization_config=inline_config,
+                        ),
+                        model_path=model_path,
+                        revision=None,
+                        is_draft_model=False,
+                        is_draft_quantization_explicit=False,
+                    )
+
+                    config = get_quant_config(
+                        model_config, LoadConfig(), packed_modules_mapping
+                    )
+
+                    self.assertIsInstance(config, ModelOptMixedPrecisionConfig)
+                    self.assertEqual(config.quantized_layers, file_quantized_layers)
+                    self.assertEqual(config.kv_cache_quant_algo, "FP8")
+                    self.assertEqual(
+                        config.packed_modules_mapping, packed_modules_mapping
+                    )
+
+    @patch("sglang.srt.model_loader.weight_utils.snapshot_download")
+    def test_complete_inline_config_does_not_download_metadata(self, mock_download):
+        packed_modules_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        }
+        inline_quantized_layers = {
+            "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"}
+        }
+        model_config = SimpleNamespace(
+            quantization="modelopt_mixed",
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                    "kv_cache_scheme": {"type": "float", "num_bits": 8},
+                    "exclude_modules": [],
+                    "quantized_layers": inline_quantized_layers,
+                }
+            ),
+            model_path="remote/model",
+            revision=None,
+            is_draft_model=False,
+            is_draft_quantization_explicit=False,
+        )
+
+        config = get_quant_config(model_config, LoadConfig(), packed_modules_mapping)
+
+        self.assertIsInstance(config, ModelOptMixedPrecisionConfig)
+        self.assertEqual(config.quantized_layers, inline_quantized_layers)
+        self.assertEqual(config.kv_cache_quant_algo, "FP8")
+        self.assertEqual(config.packed_modules_mapping, packed_modules_mapping)
+        mock_download.assert_not_called()
+
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(
             {
@@ -844,6 +961,20 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 lm_head, ModelOptNvFp4A16LinearMethod(ModelOptFp4Config())
             )
         )
+
+    def test_lm_head_guard_accepts_modelopt_fp4_cutedsl_w4a16_runtime_state(self):
+        lm_head = nn.Module()
+        lm_head.weight = nn.Parameter(
+            torch.empty(128, 1024, dtype=torch.uint8), requires_grad=False
+        )
+        lm_head.weight_scale_interleaved = nn.Parameter(torch.empty(1))
+        lm_head.alpha = nn.Parameter(torch.empty(1))
+        lm_head.input_size_per_partition = 2048
+        lm_head.output_size_per_partition = 128
+        quant_method = ModelOptFp4LinearMethod(ModelOptFp4Config())
+        quant_method.quant_mode = "w4a16"
+
+        self.assertTrue(should_apply_lm_head_quant_method(lm_head, quant_method))
 
     def test_lm_head_guard_rejects_stale_modelopt_fp4_method_on_dense_head(self):
         lm_head = nn.Module()

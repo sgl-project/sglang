@@ -21,11 +21,13 @@ maybe_stub_sgl_kernel()
 from sglang.srt.multimodal.processors.qwen_vl import (  # noqa: E402
     QwenVLImageProcessor,
 )
+from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=0, suite="base-a-test-cpu", disabled="Qwen test fixtures")
 
 
-def make_processor(config, image_processor_cls=None):
+def make_processor(case, config, image_processor_cls=None):
     """A ``QwenVLImageProcessor`` over a tiny hand-built tokenizer.
     ``image_processor_cls`` picks the HF backend; they resample differently."""
     image_processor_cls = image_processor_cls or HfQwenImageProcessor
@@ -74,7 +76,7 @@ def make_processor(config, image_processor_cls=None):
         skip_tokenizer_init=False,
         mm_preprocess_cache_size_mb=0,
         trust_mm_content_hashes=False,
-        # Read by NativeMmHost._use_feature_shm (single-rank fixture → the
+        # Read by RustMmProcessor._use_feature_shm (single-rank fixture → the
         # inline zero-copy transport, like the 1-GPU e2e).
         tp_size=1,
         dist_init_addr=None,
@@ -87,6 +89,19 @@ def make_processor(config, image_processor_cls=None):
         allowed_media_domains=[],
         media_url_max_file_size_mb=64,
     )
+    # Left at the default backend, the fast image processor sends the tensor to
+    # `cuda:<base_gpu_id>`, which a CPU-only host cannot do.
+    publish(
+        ServerArgs(
+            model_path="dummy",
+            mm_feature_transport=server_args.mm_feature_transport,
+            mm_process_config=server_args.mm_process_config,
+            allowed_media_domains=server_args.allowed_media_domains,
+            disable_fast_image_processor=server_args.disable_fast_image_processor,
+        ),
+        role="tokenizer",
+    )
+    case.addCleanup(reset_context)
     return QwenVLImageProcessor(
         hf_config, server_args, processor, None, skip_mm_pool=True
     )

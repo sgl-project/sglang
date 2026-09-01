@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
     triton_create_paged_compress_data,
@@ -16,9 +15,6 @@ from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-)
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -44,6 +40,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -185,15 +182,12 @@ class CompressorBackendMixin:
         )
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_extra_key_buffer_fused(
-                layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc,
+            cache_k=new_compressed_kv,
+        )
 
     def forward_indexer_compressor(
         self,
@@ -217,21 +211,11 @@ class CompressorBackendMixin:
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
-        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        else:
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
             )
 
 
@@ -359,6 +343,7 @@ class Compressor(BaseFusedOp):
         head_dim: int,
         rotate: bool = False,
         prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
     ) -> None:
         super().__init__()
@@ -382,7 +367,7 @@ class Compressor(BaseFusedOp):
             self.dim,
             2 * coff * self.head_dim,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
@@ -442,7 +427,7 @@ class Compressor(BaseFusedOp):
         comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
         if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
             return
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_wkv_gate(x)
         # Keyed by forward_batch: each TBO ubatch carries its own, so the two
         # ubatches cannot collect each other's gather.
         pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
@@ -457,7 +442,7 @@ class Compressor(BaseFusedOp):
             if handle is not None:
                 return cp_all_gather_rerange_finish(handle)
 
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -467,6 +452,19 @@ class Compressor(BaseFusedOp):
                 torch.cuda.current_stream(),
             )
         return kv_score
+
+    def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.wkv_gate, "weight", None)
+        if weight is not None:
+            return linear_bf16_fp32(x, weight)
+
+        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+        return fused_mul_mat_gguf(
+            x,
+            self.wkv_gate.qweight,
+            self.wkv_gate.qweight_type.weight_type,
+        )
 
     def forward_native(
         self,

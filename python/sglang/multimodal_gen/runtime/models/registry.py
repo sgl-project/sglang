@@ -19,6 +19,9 @@ from typing import NoReturn, TypeVar, cast
 import cloudpickle
 from torch import nn
 
+from sglang.multimodal_gen.runtime.utils.external_model_package import (
+    load_external_model_package,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -242,7 +245,6 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     """
 
     module_name: str
-    component_name: str
     class_name: str
 
     # Performed in another process to avoid initializing CUDA
@@ -289,10 +291,12 @@ class _ModelRegistry:
     registered_models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
+        load_external_model_package()
         return self.registered_models.keys()
 
     def resolve_by_alias(self, alias: str) -> type[nn.Module] | None:
         """Resolve a model class by its alias (external module path)."""
+        load_external_model_package()
         if alias in _ALIAS_TO_MODEL:
             canonical_name = _ALIAS_TO_MODEL[alias]
             return self._try_load_model_cls(canonical_name)
@@ -304,7 +308,7 @@ class _ModelRegistry:
         model_cls: type[nn.Module] | str,
     ) -> None:
         """
-        Register an external model to be used in vLLM.
+        Register an external model to be used in SGLang-Diffusion.
 
         :code:`model_cls` can be either:
 
@@ -328,7 +332,9 @@ class _ModelRegistry:
                 msg = "Expected a string in the format `<module>:<class>`"
                 raise ValueError(msg)
 
-            model = _LazyRegisteredModel(*split_str)
+            model = _LazyRegisteredModel(
+                module_name=split_str[0], class_name=split_str[1]
+            )
         else:
             model = _RegisteredModel.from_model_cls(model_cls)
 
@@ -364,6 +370,7 @@ class _ModelRegistry:
         self,
         architectures: str | list[str],
     ) -> list[str]:
+        load_external_model_package()
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
@@ -417,7 +424,6 @@ ModelRegistry = _ModelRegistry(
     {
         model_arch: _LazyRegisteredModel(
             module_name=f"sglang.multimodal_gen.runtime.models.{component_name}.{mod_relname}",
-            component_name=component_name,
             class_name=cls_name,
         )
         for model_arch, (

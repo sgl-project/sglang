@@ -77,7 +77,9 @@ def _patch_cache_dit_similarity():
         tp_sp_group = getattr(self, "_sglang_tp_sp_group", None)
         target_group = tp_sp_group or sp_group or tp_group
 
-        if target_group is None:
+        # Averaging over a one-rank group returns the input, so skip the
+        # collective rather than pay for a round trip that cannot change it.
+        if target_group is None or dist.get_world_size(target_group) == 1:
             return _original_similarity(
                 self,
                 t1,
@@ -190,6 +192,75 @@ def get_scm_mask(
     )
 
     return mask
+
+
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
+CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
+    {
+        "Fn_compute_blocks",
+        "Bn_compute_blocks",
+        "max_warmup_steps",
+        "residual_diff_threshold",
+        "max_continuous_cached_steps",
+        "enable_taylorseer",
+        "taylorseer_order",
+    }
+)
+CACHE_DIT_REQUEST_SCM_KEYS = frozenset(
+    {
+        "scm_preset",
+        "scm_compute_bins",
+        "scm_cache_bins",
+        "scm_policy",
+    }
+)
+CACHE_DIT_REQUEST_PARAM_KEYS = (
+    CACHE_DIT_REQUEST_KNOB_KEYS | CACHE_DIT_REQUEST_SCM_KEYS | {"secondary"}
+)
+
+
+def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
+    """Validate cache_dit_params and return a copy; unknown keys fail the request."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"cache_dit_params must be a dict, got {type(raw).__name__}.")
+    unknown = set(raw) - CACHE_DIT_REQUEST_PARAM_KEYS
+    if unknown:
+        raise ValueError(
+            f"Unknown cache_dit_params keys: {sorted(unknown)}. "
+            f"Valid keys: {sorted(CACHE_DIT_REQUEST_PARAM_KEYS)}."
+        )
+    overrides = dict(raw)
+    secondary = overrides.get("secondary")
+    if secondary is not None:
+        if not isinstance(secondary, dict):
+            raise ValueError(
+                "cache_dit_params['secondary'] must be a dict, got "
+                f"{type(secondary).__name__}."
+            )
+        unknown = set(secondary) - CACHE_DIT_REQUEST_KNOB_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown cache_dit_params['secondary'] keys: {sorted(unknown)}. "
+                f"Valid keys: {sorted(CACHE_DIT_REQUEST_KNOB_KEYS)}."
+            )
+        overrides["secondary"] = dict(secondary)
+    return overrides
+
+
+def cache_dit_overrides_key(overrides: dict) -> tuple:
+    """Hashable snapshot of request overrides, for mount-change detection."""
+
+    def _freeze(value):
+        if isinstance(value, dict):
+            return tuple(sorted((k, _freeze(v)) for k, v in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(_freeze(v) for v in value)
+        return value
+
+    return _freeze(overrides)
 
 
 @dataclass

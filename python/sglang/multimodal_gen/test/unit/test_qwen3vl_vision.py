@@ -4,11 +4,15 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLArchConfig
+from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
+    QuantoInt8Config,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import (
     Qwen3VLForConditionalGeneration,
+    _make_text_rms_norm,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     Qwen3VLVisionRotaryEmbedding,
@@ -16,6 +20,12 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
     _vision_cu_seqlens,
     _vision_position_ids,
 )
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.models.qwen3_vl import (
+    Qwen3VLMoeVisionPatchMerger,
+    Qwen3VLVisionPatchEmbed,
+)
+from sglang.srt.runtime_context import get_parallel
 
 
 def test_native_vision_layout_matches_qwen3_merge_order():
@@ -38,6 +48,13 @@ def test_native_vision_layout_matches_qwen3_merge_order():
     assert cu_seqlens.tolist() == [0, 24, 32, 40]
 
 
+def test_qwen3vl_text_reuses_srt_rms_norm():
+    norm = _make_text_rms_norm(16, 1e-6)
+
+    assert isinstance(norm, RMSNorm)
+    assert norm.cast_x_before_out_mul
+
+
 def test_native_vision_keeps_checkpoint_parameter_names():
     config = SimpleNamespace(
         hidden_size=16,
@@ -53,7 +70,11 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         out_hidden_size=12,
         deepstack_visual_indexes=[],
     )
-    model = Qwen3VLVisionTransformer(config)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(config)
+
+    assert isinstance(model.patch_embed, Qwen3VLVisionPatchEmbed)
+    assert isinstance(model.merger, Qwen3VLMoeVisionPatchMerger)
 
     assert set(model.state_dict()) == {
         "patch_embed.proj.weight",
@@ -66,6 +87,41 @@ def test_native_vision_keeps_checkpoint_parameter_names():
         "merger.linear_fc2.weight",
         "merger.linear_fc2.bias",
     }
+
+
+def test_native_vision_accepts_srt_linear_quantization():
+    config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=1,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=12,
+        deepstack_visual_indexes=[],
+    )
+    prefixes = {
+        "model.visual.blocks.0.attn.qkv_proj",
+        "model.visual.blocks.0.attn.proj",
+        "model.visual.blocks.0.mlp.linear_fc1",
+        "model.visual.blocks.0.mlp.linear_fc2",
+    }
+    quant_config = QuantoInt8Config(prefixes)
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLVisionTransformer(
+            config,
+            quant_config=quant_config,
+            prefix="model.visual",
+        )
+
+    assert quant_config.selected == prefixes
+    for name, parameter in model.blocks[0].named_parameters():
+        if name.endswith("weight") and not name.startswith("norm"):
+            assert parameter.dtype == torch.int8
 
 
 def test_native_vision_keeps_position_math_in_fp32():
@@ -112,6 +168,52 @@ def test_native_vision_keeps_position_math_in_fp32():
     assert interpolated_position.dtype == torch.float32
     assert output.pooler_output.dtype == torch.bfloat16
     assert block.position_embedding_dtypes == (torch.float32, torch.float32)
+
+
+def test_qwen3vl_ties_lm_head_to_input_embeddings():
+    vision_config = SimpleNamespace(
+        hidden_size=16,
+        intermediate_size=24,
+        hidden_act="gelu_pytorch_tanh",
+        num_heads=2,
+        depth=0,
+        patch_size=2,
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=16,
+        spatial_merge_size=2,
+        out_hidden_size=16,
+        deepstack_visual_indexes=[],
+    )
+    text_config = SimpleNamespace(
+        hidden_size=16,
+        vocab_size=32,
+        pad_token_id=0,
+        num_hidden_layers=0,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=True,
+    )
+    arch_config = SimpleNamespace(
+        vision_config=vision_config,
+        text_config=text_config,
+        tie_word_embeddings=True,
+        _fsdp_shard_conditions=[],
+        stacked_params_mapping=[],
+    )
+    config = SimpleNamespace(arch_config=arch_config)
+
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        model = Qwen3VLForConditionalGeneration(config)
+
+    assert model.lm_head.weight is model.model.get_input_embeddings().weight
+    parameters = dict(model.named_parameters())
+    parameters_with_duplicates = dict(model.named_parameters(remove_duplicate=False))
+    assert "model.language_model.embed_tokens.weight" in parameters
+    assert "lm_head.weight" not in parameters
+    assert (
+        parameters_with_duplicates["lm_head.weight"]
+        is parameters["model.language_model.embed_tokens.weight"]
+    )
 
 
 def test_qwen3_multimodal_encoders_layerwise_offload_vision_blocks():

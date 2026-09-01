@@ -34,8 +34,6 @@ _W4A8_MEGAMOE_ENV = {
 
 _W4A4_MEGAMOE_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
@@ -115,6 +113,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

@@ -149,18 +149,21 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return self._flashkda_extend(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            lower_bound=lower_bound,
+        return (
+            self._flashkda_extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+            ),
+            None,
         )
 
     @staticmethod

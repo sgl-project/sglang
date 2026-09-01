@@ -1,9 +1,14 @@
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
 from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     _check_index_files_for_missing_shards,
@@ -12,6 +17,35 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
 )
 from sglang.srt.environ import envs
+
+
+def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
+    repo_root = tmp_path / "FLUX.1-dev-bnb-4bit"
+    component_root = repo_root / "text_encoder_2"
+    component_root.mkdir(parents=True)
+    pipeline = SimpleNamespace(model_path="/base")
+    server_args = SimpleNamespace(
+        component_paths={
+            "text_encoder_2": "diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2"
+        }
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+        return_value=str(repo_root),
+    ) as download:
+        component_path = ComposedPipelineBase._resolve_component_path(
+            pipeline,
+            server_args,
+            "text_encoder_2",
+            "text_encoder_2",
+        )
+
+    assert component_path == str(component_root)
+    download.assert_called_once_with(
+        "diffusers/FLUX.1-dev-bnb-4bit",
+        allow_patterns=["text_encoder_2/**", "text_encoder_2/*"],
+    )
 
 
 def _write_model_index(root):
@@ -202,6 +236,31 @@ def test_complete_cached_snapshot_is_served_without_download(
 
     assert maybe_download_model("org/repo") == str(tmp_path)
     assert calls == ["probe"]
+
+
+def test_cached_snapshot_respects_requested_revision(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_snapshot_download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", fake_snapshot_download)
+
+    assert maybe_download_model("org/repo", revision="a" * 40, download=False) == str(
+        tmp_path
+    )
+    assert calls == [
+        {
+            "repo_id": "org/repo",
+            "ignore_patterns": ["*.onnx", "*.msgpack"],
+            "allow_patterns": None,
+            "local_dir": None,
+            "local_files_only": True,
+            "max_workers": 8,
+            "revision": "a" * 40,
+        }
+    ]
 
 
 def test_partially_populated_cached_snapshot_is_served_without_download(
