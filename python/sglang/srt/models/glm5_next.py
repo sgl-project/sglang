@@ -1694,7 +1694,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if getattr(self, "encoder_only", False) and not is_visual_weight:
                 continue
             if (
-                getattr(self, "language_only", False) or self.visual is None
+                getattr(self, "language_only", False)
+                or getattr(self, "visual", None) is None
             ) and is_visual_weight:
                 continue
 
@@ -1705,7 +1706,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
             if (
                 "visual" in name
-                and getattr(self.mm_config, "vision_config", None) is not None
+                and getattr(getattr(self, "mm_config", None), "vision_config", None)
+                is not None
             ):
                 name = name.replace("attn.qkv.", "attn.qkv_proj.")
                 loaded_weight = vision_utils.pad_vit_attn_dummy_heads(

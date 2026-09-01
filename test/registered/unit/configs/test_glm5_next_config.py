@@ -193,6 +193,9 @@ class TestGlm5NextVisionConfig(CustomTestCase):
             ),
             get_parallel().override(tp_size=1, attn_tp_size=1),
             get_context().override_server_args(mm_enable_dp_encoder=False),
+            patch(
+                "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads"
+            ) as mock_pad,
         ):
             model = Glm5NextForConditionalGeneration(config)
             visual_weight = torch.randn(4, 4)
@@ -200,6 +203,29 @@ class TestGlm5NextVisionConfig(CustomTestCase):
             # Should execute cleanly without dereferencing missing vision_config
             model.load_weights(weights)
             self.assertIsNone(model.visual)
+            mock_pad.assert_not_called()
+
+    def test_glm5_next_for_conditional_generation_load_weights_with_language_only(
+        self,
+    ):
+        config = Glm5NextConfig(vision_config={}, language_only=True, encoder_only=True)
+        with (
+            patch(
+                "sglang.srt.models.glm5_next.get_pp_group",
+                return_value=SimpleNamespace(is_last_rank=True, world_size=1),
+            ),
+            get_parallel().override(tp_size=1, attn_tp_size=1),
+            get_context().override_server_args(mm_enable_dp_encoder=False),
+            patch(
+                "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads"
+            ) as mock_pad,
+        ):
+            model = Glm5NextForConditionalGeneration(config)
+            visual_weight = torch.randn(4, 4)
+            weights = [("visual.attn.qkv.weight", visual_weight)]
+            model.load_weights(weights)
+            self.assertIsNone(model.visual)
+            mock_pad.assert_not_called()
 
 
 if __name__ == "__main__":
