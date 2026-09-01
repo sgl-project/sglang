@@ -355,6 +355,19 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_with_scale_buffer[layer_id]
 
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        """Every indexer buffer as 2D page rows, for PD and HiCache transfer.
+
+        FP8 keeps key and scale fused in one buffer per layer; the FP4 layout
+        stores payload and scale separately, so it yields two buffers per layer.
+        """
+        if self.index_k_with_scale_buffer is not None:
+            return self.index_k_with_scale_buffer
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_payload_buffer, *self.index_k_scale_buffer)
+        ]
+
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_k_payload_buffer[layer_id]
 
@@ -737,7 +750,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             for i in c4_locals:
                 _append_compressed_entry(i, 4)
-            for buf in self.c4_indexer_kv_pool.index_k_with_scale_buffer:
+            for buf in self.c4_indexer_kv_pool.contiguous_page_row_buffers():
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -749,7 +762,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         buf_groups = [
             self.c4_kv_pool.kv_buffer,
-            self.c4_indexer_kv_pool.index_k_with_scale_buffer,
+            self.c4_indexer_kv_pool.contiguous_page_row_buffers(),
             self.c128_kv_pool.kv_buffer,
         ]
 
