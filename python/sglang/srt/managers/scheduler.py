@@ -2088,7 +2088,7 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
     def rust_server_tokenizer_path(self) -> str:
-        return self.server_args.tokenizer_path
+        return get_serving().tokenizer_path
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(

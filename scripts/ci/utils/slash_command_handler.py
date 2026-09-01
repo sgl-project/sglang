@@ -501,12 +501,21 @@ MULTIMODAL_PATH_TO_RUNNER = {
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
+NAMED_TEST_GROUPS = {
+    "rust-server": (
+        "registered/rust/test_run_rust_tests.py",
+        "registered/core/test_srt_endpoint.py",
+        "registered/vlm/test_rust_native_mm_e2e.py",
+        "registered/vlm/test_rust_native_mm_mmmu.py",
+    ),
+}
+
 
 def _known_test_groups():
-    groups = []
+    groups = set(NAMED_TEST_GROUPS)
     for group_dir in glob.glob("test/registered/*"):
         if os.path.isdir(group_dir):
-            groups.append(os.path.basename(group_dir))
+            groups.add(os.path.basename(group_dir))
     return sorted(groups)
 
 
@@ -514,8 +523,9 @@ def resolve_test_group_specs(group_name):
     """
     Resolve a test group name into /rerun-test specs.
 
-    A group maps to a directory under test/registered/. For example,
-    "hicache" maps to all test_*.py files under test/registered/hicache/.
+    A group maps to either a named cross-directory file set or a directory
+    under test/registered/. For example, "hicache" maps to all test_*.py
+    files under test/registered/hicache/.
 
     Returns (test_specs, error_message). On success error_message is None.
     """
@@ -527,6 +537,20 @@ def resolve_test_group_specs(group_name):
         or ".." in group_name.split("/")
     ):
         return [], f"Invalid test group `{group_name}`."
+
+    if group_name in NAMED_TEST_GROUPS:
+        test_specs = list(NAMED_TEST_GROUPS[group_name])
+        missing = [
+            test_spec
+            for test_spec in test_specs
+            if not os.path.isfile(os.path.join("test", test_spec))
+        ]
+        if missing:
+            return [], (
+                f"Named test group `{group_name}` references missing files: "
+                + ", ".join(f"`test/{path}`" for path in missing)
+            )
+        return test_specs, None
 
     group_dir = os.path.join("test", "registered", group_name)
     if not os.path.isdir(group_dir):
