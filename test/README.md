@@ -94,6 +94,20 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 
 See the [write-sglang-test skill](../.claude/skills/write-sglang-test/SKILL.md) for templates, fixtures, model selection, and a complete checklist.
 
+Before adding a registered test, identify the production change that would make
+it fail. Prefer extending an existing fixture/server launch over adding another
+file. The incremental admission check applies these ratchets to new or modified
+registered tests:
+
+- Temporary `disabled=` registrations and unconditional skips must reference an
+  issue and include `until YYYY-MM-DD`; expired entries fail lint.
+- A file registered on CUDA plus another accelerator must place a nearby
+  `backend-specific:` comment above the extra registration and name the path or
+  failure mode that only that backend can catch.
+- Default PR registrations are limited to 1,200 estimated weighted accelerator-seconds
+  per backend (`est_time * GPU count`). Move larger matrices to extra/nightly,
+  or document a nearby `ci-cost-override:` rationale.
+
 ## Multi-Hardware Backends
 
 This README mostly describes the NVIDIA GPU CI pipeline. Other hardware backends (AMD, NPU) follow the same practices and use the multi-backend registry system. A scheduled job summarizes test coverage across all backends; [here is an example run](https://github.com/sgl-project/sglang/actions/runs/23424304300).
