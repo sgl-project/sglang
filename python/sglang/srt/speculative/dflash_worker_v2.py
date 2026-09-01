@@ -96,11 +96,12 @@ def _dp_dbg_tag() -> str:
 
 
 def _dp_dbg_enabled() -> bool:
-    # Only TP0 logs, to keep one line per event across the whole deployment.
+    # Only the first rank of each DP group logs (attn_tp_rank==0), so each DP
+    # rank prints one line per event without the intra-TP duplicates.
     if not _DP_DBG:
         return False
     try:
-        return get_parallel().tp_rank == 0
+        return get_parallel().attn_tp_rank == 0
     except Exception:
         return True
 
