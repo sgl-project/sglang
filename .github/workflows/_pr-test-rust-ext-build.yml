@@ -96,7 +96,7 @@ jobs:
         run: bash scripts/ci/utils/ensure_zstd.sh
 
       # The setup hook and torch helper select and configure what gets built;
-      # pyproject.toml pins the libtorch ABI used by mem-cache.
+      # pyproject.toml pins the libtorch ABI used by sglang-radix-tree.
       - name: Restore built modules
         id: cache
         uses: actions/cache/restore@v4
@@ -218,8 +218,8 @@ jobs:
               LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
               export LIBTORCH
               export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
-              cargo clean --release --manifest-path rust/mem-cache/Cargo.toml \
-                  -p torch-sys -p mem_cache 2>/dev/null || true
+              cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
+                  -p torch-sys -p sglang-radix-tree 2>/dev/null || true
               (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
               python - <<'PY'
           import importlib.util
@@ -245,7 +245,7 @@ jobs:
               root / "python/sglang/srt/rust_extensions/torch_build.py"
           )
           build = helper["torch_build_configuration"](
-              compat_header=root / "rust/mem-cache/torch_2_13_compat.h",
+              compat_header=root / "rust/sglang-radix-tree/torch_2_13_compat.h",
               python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
               torch_module=torch,
               include_absolute_rpath=False,
@@ -257,7 +257,7 @@ jobs:
                   "--release",
                   "--locked",
                   "--manifest-path",
-                  "rust/mem-cache/Cargo.toml",
+                  "rust/sglang-radix-tree/Cargo.toml",
                   "--features",
                   "python-extension,inspection",
               ],
