@@ -125,6 +125,7 @@ class TestMambaRatioEnvGate(unittest.TestCase):
             with rc.get_context().override_server_args(
                 disable_radix_cache=False,
                 disable_overlap_schedule=disable_overlap,
+                uses_mamba_radix_cache=True,
                 mamba_radix_cache_strategy=strategy,
             ):
                 return KVCacheConfigurator._calculate_mamba_ratio(fake)

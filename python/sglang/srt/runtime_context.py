@@ -1672,13 +1672,15 @@ def reset_context() -> None:
 def mamba_extra_buffer_enabled() -> bool:
     """Whether the mamba radix cache keeps its extra state buffer.
 
-    A predicate over two published leaves (``memory.disable_radix_cache`` and
+    A predicate over published leaves (``memory.disable_radix_cache``,
+    ``exec.mamba.uses_mamba_radix_cache``, and
     ``exec.mamba.mamba_radix_cache_strategy``), so it reads the bags rather
     than the startup record — the ``ServerArgs`` member of the same name is the
     pre-publish equivalent used inside the resolution pipeline.
     """
     return (
         get_memory().disable_radix_cache is False
+        and get_exec().mamba.uses_mamba_radix_cache
         and get_exec().mamba.mamba_radix_cache_strategy
         in ("extra_buffer", "extra_buffer_lazy")
     )
@@ -1688,6 +1690,7 @@ def mamba_extra_buffer_lazy_enabled() -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_enabled`."""
     return (
         get_memory().disable_radix_cache is False
+        and get_exec().mamba.uses_mamba_radix_cache
         and get_exec().mamba.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 

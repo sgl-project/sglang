@@ -58,6 +58,10 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # against the unresolved token ("auto") if that day comes.
     if cfg.mamba_radix_cache_strategy == ServerArgs.mamba_radix_cache_strategy:
         overrides["mamba_radix_cache_strategy"] = "extra_buffer"
+    # The extra-buffer predicates also require the arch-derived leaf, which the
+    # generic resolution likewise never sets for Inkling.
+    if not cfg.disable_radix_cache:
+        overrides["uses_mamba_radix_cache"] = True
     # Inkling attention runs only on the fa4 (Blackwell) or triton backends --
     # models/inkling_common/attn.py asserts attention_backend in {fa4, triton}.
     # The generic resolver would otherwise pick trtllm_mha (SM100) / fa3

@@ -405,6 +405,7 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
         cfg.disable_radix_cache is False
+        and cfg.uses_mamba_radix_cache
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 

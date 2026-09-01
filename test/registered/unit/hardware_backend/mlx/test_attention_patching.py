@@ -1267,7 +1267,8 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(
-            mamba_radix_cache_strategy="extra_buffer"
+            uses_mamba_radix_cache=True,
+            mamba_radix_cache_strategy="extra_buffer",
         )
         override.install()
         try:
