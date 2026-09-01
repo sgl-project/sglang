@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
@@ -8094,6 +8095,39 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
         self.assertIsNotNone(_device_value(cache, window_node, ComponentType.SWA))
         self.assertIsNotNone(_device_value(cache, window_node, ComponentType.FULL))
+        cache.sanity_check()
+
+    def test_dup_slice_below_eviction_floor_frees_full_only(self):
+        """A re-insert whose duplicate slice starts below the request's eviction
+        floor gives back only the full side there: window eviction already
+        released those SWA peers, so freeing both sides would double-free."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, _ = build_fixture(self.cfg)
+        seq = list(range(1, 2 * sw + 1))
+        key = RadixKey(array("q", seq))
+        cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
+
+        value = self._alloc(allocator, len(seq))
+        actions = []
+        step = cache.tree_core.begin_insert(
+            InsertParams(key=key, value=value, swa_evicted_seqlen=sw)
+        )
+        while True:
+            actions.extend(step.actions)
+            cache._apply_cache_actions(step.actions)
+            if step.result is not None:
+                break
+            step = cache.tree_core.resume_insert()
+        tail = cache.tree_core.end_insert()
+        actions.extend(tail)
+        cache._apply_cache_actions(tail)
+
+        full_only = [
+            i for a in actions if isinstance(a, FreeDeviceKVFullOnly) for i in a.indices
+        ]
+        both = [i for a in actions if isinstance(a, FreeDeviceKV) for i in a.indices]
+        torch.testing.assert_close(torch.cat(full_only), value[:sw])
+        torch.testing.assert_close(torch.cat(both), value[sw:])
         cache.sanity_check()
 
     def test_dec_swa_lock_only_early_release_keeps_full_lock(self):
