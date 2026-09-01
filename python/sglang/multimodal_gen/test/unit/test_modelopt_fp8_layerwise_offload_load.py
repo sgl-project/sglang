@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Serialized ModelOpt FP8 checkpoints must postprocess on device even under
-layerwise offload: requantize_with_max_scale() runs scaled_fp8_quant(), a
-CUDA-only kernel, so a CPU-resident postprocess must never come back."""
+"""Serialized ModelOpt FP8 checkpoints must postprocess correctly even when
+layerwise offload moves the component back to CPU after loading."""
 
 import unittest
 from unittest.mock import patch

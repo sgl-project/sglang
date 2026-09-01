@@ -1,23 +1,14 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: [
-    "gb300", "h100", "h200", "b200", "b300", "gb200",
-    "mi300x", "mi325x", "mi355x",
-  ],
+  supportedHardware: ["gb300", "h100", "h200", "b200", "b300", "gb200"],
 
   matchDims: [
     {
       id: "strategy",
       title: "Strategy",
       options: [
-        {
-          id: "low-latency",
-          label: "Low Latency",
-          subtitle: "Adaptive MTP 5/1/6",
-          disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
-          disableReason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; use the non-speculative High Throughput recipe.",
-        },
+        { id: "low-latency", label: "Low Latency", subtitle: "Adaptive MTP 5/1/6" },
         { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
       ],
     },
@@ -30,16 +21,14 @@ export const config = {
           id: "nvfp4",
           label: "NVFP4",
           disabled: (s) => !["gb300", "gb200", "b200", "b300"].includes(s.hw),
-          disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper and AMD ROCm cannot serve this checkpoint.",
+          disableReason: "The NVFP4 W4A4 kernels are Blackwell-only; Hopper cannot serve this checkpoint.",
         },
       ],
     },
   ],
 
   isRecommendedSelection(s) {
-    const pairing = ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw)
-      ? "bf16-tilelang"
-      : "fp8-trtllm";
+    const pairing = ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
     return (
       s.kvDsaPair === pairing &&
       s.mmTransport === "auto" &&
@@ -57,8 +46,8 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200", "mi300x", "mi325x", "mi355x"].includes(s.hw),
-          disableReason: "This recipe uses BF16 KV cache with TileLang DSA on Hopper and AMD ROCm GPUs.",
+          disabled: (s) => ["h100", "h200"].includes(s.hw),
+          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper GPUs.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -186,9 +175,8 @@ sgl-eval run gsm8k \\
     ["aime2026_pct", "AIME 2026", "%"],
   ],
 
-  // Support is not in a public sglang release yet. NVIDIA uses the
-  // purpose-built CUDA 13 image. AMD validation used these ROCm 7.2 images
-  // with the GLM-5.3 ROCm engine branch mounted over the image source tree.
+  // Support is not in a public sglang release yet, so the nightly images do
+  // not work; every NVIDIA lane uses the purpose-built CUDA 13 image.
   dockerImages: {
     gb300: "lmsysorg/sglang:glm-5.3-flash",
     h100: "lmsysorg/sglang:glm-5.3-flash",
@@ -196,9 +184,6 @@ sgl-eval run gsm8k \\
     b200: "lmsysorg/sglang:glm-5.3-flash",
     b300: "lmsysorg/sglang:glm-5.3-flash",
     gb200: "lmsysorg/sglang:glm-5.3-flash",
-    mi300x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
-    mi325x: "lmsysorg/sglang:v0.5.18-rocm720-mi30x",
-    mi355x: "lmsysorg/sglang:v0.5.18-rocm720-mi35x",
   },
 
   github: {
@@ -256,8 +241,6 @@ sgl-eval run gsm8k \\
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
-            disabled: (s) => ["mi300x", "mi325x", "mi355x"].includes(s.hw),
-            disableReason: "The validated AMD ROCm recipe uses the Triton MoE runner.",
           },
         ],
       },
@@ -310,10 +293,6 @@ sgl-eval run gsm8k \\
               when: { dpAttnOn: [true] },
               reason: "Adaptive MTP does not support DP-Attention — the server falls back to a static draft depth and warns. Turn DP-Attention off in the Attention card above.",
             },
-            {
-              when: { hw: ["mi300x", "mi325x", "mi355x"] },
-              reason: "MTP speculative decoding has not been validated for GLM-5.3-Flash on AMD ROCm; the Strategy row disables Low Latency there for the same reason.",
-            },
           ],
         },
         {
@@ -338,10 +317,6 @@ sgl-eval run gsm8k \\
             {
               when: { dpAttnOn: [true] },
               reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
-            },
-            {
-              when: { hw: ["mi300x", "mi325x", "mi355x"] },
-              reason: "DFLASH speculative decoding only supports CUDA and NPU devices; the server rejects it on ROCm at startup.",
             },
           ],
         },
@@ -852,72 +827,6 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend deep_gemm",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    // AMD ROCm — one non-speculative TP8 operating point. The explicit BF16
-    // KV and TileLang DSA flags match the resolved defaults observed in the
-    // validation server logs. AITER remains enabled for the ROCm kernel paths,
-    // while Triton owns the MoE runner. CUDA graphs stay disabled because that
-    // is the architecture-gated configuration used for correctness validation.
-    {
-      match: { hw: "mi300x", strategy: "high-throughput", quant: "fp8" },
-      nnodes: 1,
-      verified: true,
-      env: ["SGLANG_USE_AITER=1"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp-size 8",
-        "--trust-remote-code",
-        "--disable-cuda-graph",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend triton",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "mi325x", strategy: "high-throughput", quant: "fp8" },
-      nnodes: 1,
-      verified: false,
-      warn: "This MI325X recipe is inferred from the validated MI300X gfx942 path. It has not been measured directly on MI325X.",
-      env: ["SGLANG_USE_AITER=1"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp-size 8",
-        "--trust-remote-code",
-        "--disable-cuda-graph",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend triton",
-        "--reasoning-parser glm45",
-        "--tool-call-parser glm47",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "mi355x", strategy: "high-throughput", quant: "fp8" },
-      nnodes: 1,
-      verified: true,
-      env: ["SGLANG_USE_AITER=1"],
-      flags: [
-        "--model-path {{MODEL_NAME}}",
-        "--tp-size 8",
-        "--trust-remote-code",
-        "--disable-cuda-graph",
-        "--dsa-prefill-backend tilelang",
-        "--dsa-decode-backend tilelang",
-        "--kv-cache-dtype bfloat16",
-        "--moe-runner-backend triton",
         "--reasoning-parser glm45",
         "--tool-call-parser glm47",
         "--host {{HOST_IP}}",
