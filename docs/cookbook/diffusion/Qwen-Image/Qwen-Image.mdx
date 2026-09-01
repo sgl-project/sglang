@@ -7,13 +7,13 @@ metatags:
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 import { QwenImageDeployment } from '/src/snippets/diffusion/qwen-image-deployment.jsx';
 
-<DiffusionModelTags tags={["image", "text-to-image", "text rendering", "NVFP4"]} />
+<DiffusionModelTags tags={["image", "text-to-image", "bilingual typography", "complex layouts", "NVFP4"]} />
 
 ## 1. Model Introduction
 
-[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is a text-to-image diffusion model developed by the Qwen team.
+[Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) is a 20B text-to-image model built for strong prompt following and precise rendering of English and Chinese text. It is especially useful for posters, signs, diagrams, and dense layouts where typography and spatial relationships matter as much as general image quality.
 
-For more details, please refer to the [official Qwen-Image HuggingFace page](https://huggingface.co/Qwen/Qwen-Image), the [Blog](https://qwenlm.github.io/blog/qwen-image/), and the [Tech Report](https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-Image/Qwen_Image.pdf).
+This page covers generation rather than editing: use Qwen-Image-Edit when an existing image, subject identity, or untouched region must be preserved. The full checkpoint is memory-heavy, while the validated ModelOpt NVFP4 release provides a supported low-precision deployment option with an expected quality tradeoff.
 
 ## 2. SGLang-diffusion Installation
 

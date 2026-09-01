@@ -204,14 +204,14 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output = aiter.flash_attn_func(
             query,
             key,
             value,
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=True,
+            return_lse=False,
         )
         return output
 

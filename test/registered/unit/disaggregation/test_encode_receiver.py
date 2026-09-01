@@ -4,7 +4,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.encode_receiver import MMReceiverBase
+from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci

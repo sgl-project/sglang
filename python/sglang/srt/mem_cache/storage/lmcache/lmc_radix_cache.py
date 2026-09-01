@@ -455,7 +455,7 @@ class LMCRadixCache(RadixCache):
         topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
-            kv_committed_len = req.kv_committed_len
+            kv_committed_len = req.kv.kv_committed_len
         else:
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
@@ -463,7 +463,7 @@ class LMCRadixCache(RadixCache):
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.

@@ -25,6 +25,7 @@ export const config = {
   variants: [
     { id: "flash", label: "Flash", subtitle: "284B" },
     { id: "flash-official", label: "Flash Official", subtitle: "284B · 0731" },
+    { id: "flash-vision", label: "Flash Vision", subtitle: "305B · Exp" },
     { id: "pro",   label: "Pro",   subtitle: "1.6T" },
     { id: "pro-official", label: "Pro Official", subtitle: "1.6T · 0813" },
   ],
@@ -49,6 +50,7 @@ export const config = {
     "flash|fp8": "deepseek-ai/DeepSeek-V4-Flash",
     "flash|nvfp4": "nvidia/DeepSeek-V4-Flash-NVFP4",
     "flash-official|fp4": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "flash-vision|fp4": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
     "pro|fp4":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|fp8":   "deepseek-ai/DeepSeek-V4-Pro",
     "pro|nvfp4": "nvidia/DeepSeek-V4-Pro-NVFP4",
@@ -146,6 +148,14 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
       },
+      mmmu_pro_pct: {
+        "flash-vision":
+`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+sgl-eval run mmmu_pro \\
+  --reasoning-effort max \\
+  --temperature 1.0 --top-p 0.95 \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
+      },
     },
     numPromptsByConc: { 1: 32, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096 },
   },
@@ -162,6 +172,7 @@ sgl-eval run aime25 \\
     ["gpqa_pct",   "GPQA Diamond",   "%"],
     ["aime25_pct", "AIME25",         "%"],
     ["gsm8k_pct",  "GSM8K (1-shot)", "%"],
+    ["mmmu_pro_pct", "MMMU-Pro (standard, 10-option)", "%"],
   ],
 
   // Prepended as `# ...` comments above multi-node commands.
@@ -175,6 +186,10 @@ sgl-eval run aime25 \\
   },
 
   dockerImages: {
+    // Flash Vision (Exp) support has not shipped in a release yet
+    // (sgl-project/sglang#37253) — until it does, the variant needs this
+    // preview build on every hardware.
+    "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
     h100:  "lmsysorg/sglang:latest",
     h200:  "lmsysorg/sglang:latest",
     b200:  "lmsysorg/sglang:latest",
@@ -183,8 +198,8 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi30x-20260623",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.14-rocm720-mi35x-20260710",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi30x-20260829",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260829",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -258,11 +273,8 @@ sgl-eval run aime25 \\
           { id: "w4a8", label: "W4A8",
             env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
           { id: "w4a4", label: "W4A4",
-            env: [
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
-              "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
-            ] },
+            flags: ["--enable-w4a4-mxfp4-megamoe"],
+            env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"] },
         ],
       },
       ep: { label: "EP", values: [
@@ -292,11 +304,11 @@ sgl-eval run aime25 \\
         { id: "mtp-314",    label: "EAGLE / MTP 3-1-4",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
-          hide: { variant: ["flash-official", "pro-official"] } },
+          hide: { variant: ["flash-official", "flash-vision", "pro-official"] } },
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
-          hide: { variant: ["flash-official", "pro-official"] } },
+          hide: { variant: ["flash-official", "flash-vision", "pro-official"] } },
         { id: "dspark",     label: "DSpark",
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
@@ -1646,7 +1658,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1655,9 +1667,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1666,7 +1678,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1678,7 +1690,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -1689,7 +1701,7 @@ sgl-eval run aime25 \\
       // DSpark requires CUDA; EAGLE binds a head that accepts nothing on 0813 -> target-only.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -1701,7 +1713,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2239,6 +2251,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
       ],
@@ -2252,7 +2265,7 @@ sgl-eval run aime25 \\
         "--swa-full-tokens-ratio 0.1",
         "--disable-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2266,6 +2279,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2298,6 +2312,7 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
@@ -2332,8 +2347,10 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2343,9 +2360,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -2355,8 +2372,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2366,9 +2385,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2382,12 +2401,14 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2400,7 +2421,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2412,12 +2433,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2430,7 +2453,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2446,12 +2469,14 @@ sgl-eval run aime25 \\
       verified: false,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2464,7 +2489,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--host {{HOST_IP}}",
@@ -2476,12 +2501,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2494,7 +2521,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2512,8 +2539,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2523,9 +2552,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2539,12 +2568,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2557,7 +2588,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2573,12 +2604,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2591,7 +2624,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2609,8 +2642,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2620,9 +2655,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2636,12 +2671,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2654,7 +2691,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2670,12 +2707,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2688,7 +2727,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2706,8 +2745,10 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2717,9 +2758,9 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
-        "--chunked-prefill-size 8192",
+        "--chunked-prefill-size 16384",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -2733,12 +2774,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2751,7 +2794,7 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
@@ -2767,12 +2810,14 @@ sgl-eval run aime25 \\
       verified: true,
       env: [
         "SGLANG_USE_ROCM700A=0",
+        "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_SHARED_EXPERT_TP1=1",
         "SGLANG_DP_SHARED_EXPERT_LOCAL=1",
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
       ],
       flags: [
         "--trust-remote-code",
@@ -2785,13 +2830,291 @@ sgl-eval run aime25 \\
         "--page-size 256",
         "--mem-fraction-static 0.90",
         "--swa-full-tokens-ratio 0.15",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         "--kv-cache-dtype fp8_e4m3",
         "--chunked-prefill-size 65536",
         "--speculative-algorithm EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B200 + FP4 — Flash Vision (Exp)
+    //
+    // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
+    // Flash base plus a vision encoder + aligner. The checkpoint bundles a
+    // DSpark head; low-latency recipes enable it (--speculative-algorithm
+    // DSPARK, no other spec flags — the draft ships in the main checkpoint),
+    // verified on B200 via the MMMU-Pro round (4×B200, image batches).
+    // Balanced / high-throughput stay target-only: those recipes run DP
+    // attention, which DSpark is incompatible with on the current release.
+    // Non-B200 hardware — final verification in progress.
+    // ====================================================================
+    {
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.85",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // B300 / GB200 / GB300 + FP4 — Flash Vision (Exp)
+    // ====================================================================
+    {
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.85",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.85",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend deepep",
+        "--mem-fraction-static 0.85",
+        "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--dp 4",
+        "--enable-dp-attention",
+        "--moe-a2a-backend megamoe",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // H200 + FP4 — Flash Vision (Exp)
+    // ====================================================================
+    {
+      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend marlin",
+        "--speculative-algorithm DSPARK",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--moe-runner-backend flashinfer_mxfp4",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
+    // H100 + FP4 — Flash Vision (Exp)
+    // ====================================================================
+    {
+      match: { hw: "h100", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      verificationStatus: "in-progress",
+      warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--moe-runner-backend marlin",
+        "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
