@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.runtime_context import get_parallel
 
 
 @triton.jit
@@ -87,15 +88,15 @@ def set_mla_kv_buffer_kernel(
 _TMA_BULK_STORE_MIN_LOCS = 768
 
 
-def set_mla_kv_buffer_triton(
+def _set_mla_kv_buffer_impl(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
     *,
-    reserved_skip_index: int = 0,
-    dcp_world_size: int = 1,
-    dcp_rank: int = 0,
+    reserved_skip_index: int,
+    dcp_world_size: int,
+    dcp_rank: int,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -123,11 +124,8 @@ def set_mla_kv_buffer_triton(
     Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
     for CUDA-graph padding by default; pass -1 to disable skipping.
 
-    ``dcp_world_size`` / ``dcp_rank``: the owner rule to apply to ``loc``, which
-    the CALLER owns -- a pool whose write loc is still widened passes the live
-    topology, one that resolved it beforehand passes the default ``1, 0``.
-    Reading the process-global topology here instead would make this kernel's
-    semantics depend on which pool happens to be calling it.
+    Shared body of the two entry points below; the owner rule reaches it as
+    ``1, 0`` (nothing to select) or as the live topology.
     """
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
@@ -180,6 +178,57 @@ def set_mla_kv_buffer_triton(
         DCP_RANK=dcp_rank,
         DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
+    )
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at locs that already address this rank's rows.
+
+    Nothing to select or collapse, so this asks the parallel context nothing.
+    Under DCP the caller must have resolved the owner rule already (the unified
+    pool does it in `KVIndexTranslator.rebind_write_loc`); a widened loc reaches
+    the wrong row here. `set_mla_kv_buffer_dcp_sharded_triton` is that case.
+    """
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=1,
+        dcp_rank=0,
+    )
+
+
+def set_mla_kv_buffer_dcp_sharded_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them.
+
+    The width is a live topology read, not an argument -- a stamped one is a
+    quotient of whatever the group was when someone passed it.
+    """
+    parallel = get_parallel()
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
     )
 
 

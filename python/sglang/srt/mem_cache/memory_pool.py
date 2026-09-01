@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
+    set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -4116,10 +4117,25 @@ class MLATokenToKVPool(KVCache):
         """How many logical ids one stored row spans in the write-loc space."""
         return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
 
-    @property
-    def _write_loc_dcp_rank(self) -> int:
-        """This rank's share of the write-loc space; 0 once it is resolved."""
-        return 0 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_rank
+    def _scatter_mla_rows(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        """Scatter through the entry point matching this pool's write-loc space.
+
+        Picking by name rather than handing the kernel a width: the DCP width is
+        live topology, so the kernel that needs it reads it, and a pool whose loc
+        space has no sharding left calls the entry point that never asks.
+        """
+        if self.write_loc_is_dcp_resolved:
+            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_dcp_sharded_triton(
+                dst_buffer, loc, cache_k_nope, cache_k_rope
+            )
 
     def set_kv_buffer(
         self,
@@ -4197,14 +4213,7 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-                dcp_world_size=self._write_loc_dcp_span,
-                dcp_rank=self._write_loc_dcp_rank,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -4213,14 +4222,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-                dcp_world_size=self._write_loc_dcp_span,
-                dcp_rank=self._write_loc_dcp_rank,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope, cache_k_rope)
 
     def set_mla_kv_buffer(
         self,
@@ -4442,13 +4444,11 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
+            self._scatter_mla_rows(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4,
                 cache_k_rope_fp4,
-                dcp_world_size=self._write_loc_dcp_span,
-                dcp_rank=self._write_loc_dcp_rank,
             )
             set_mla_kv_scale_buffer_triton(
                 self.kv_scale_buffer[layer_id - self.start_layer],
