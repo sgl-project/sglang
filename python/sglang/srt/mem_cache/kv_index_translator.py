@@ -63,7 +63,6 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_parallel
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -104,12 +103,13 @@ class KVIndexTranslator:
         token_to_kv_pool_allocator,
         token_to_kv_pool,
         page_size: int,
+        dcp_size: int,
         device: str,
     ):
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
-        self.dcp_size = get_parallel().dcp_size
+        self.dcp_size = dcp_size
 
         self.is_translating = (
             isinstance(

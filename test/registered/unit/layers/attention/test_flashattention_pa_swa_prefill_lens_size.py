@@ -79,6 +79,7 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             token_to_kv_pool=token_to_kv_pool,
             page_size=1,
+            dcp_size=1,
             device=device,
         ),
         kv_cache_dtype=torch.float16,

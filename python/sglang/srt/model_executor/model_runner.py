@@ -866,6 +866,7 @@ class ModelRunner:
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             token_to_kv_pool=self.token_to_kv_pool,
             page_size=self.page_size or 1,
+            dcp_size=self.ps.attn_dcp_size,
             device=self.device,
         )
 

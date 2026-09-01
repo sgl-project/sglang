@@ -117,6 +117,7 @@ def _make_source(allocator, req_to_token, ps):
         token_to_kv_pool_allocator=allocator,
         token_to_kv_pool=allocator.get_kvcache(),
         page_size=ps,
+        dcp_size=1,
         device=_DEV,
     )
 
@@ -146,6 +147,7 @@ class TestPassthrough(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),  # not a composite
             token_to_kv_pool=SimpleNamespace(),  # not an SWAKVPool
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         self.assertFalse(src.is_translating)
@@ -313,6 +315,7 @@ class TestBuildInto(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         with self.assertRaises(AssertionError):
@@ -372,6 +375,7 @@ class TestPoolOwnership(unittest.TestCase):
             token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
             token_to_kv_pool=bundle.token_to_kv_pool,
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         self.assertTrue(src.is_translating)
@@ -386,6 +390,7 @@ class TestPoolOwnership(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=own_pool,
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         self.assertFalse(src.is_translating)
@@ -401,6 +406,7 @@ class TestPoolOwnership(unittest.TestCase):
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         rows = torch.tensor([1, 0], dtype=torch.int32, device=_DEV)
@@ -641,6 +647,7 @@ class TestWriteLoc(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),
             token_to_kv_pool=pool,
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         loc = torch.tensor([5, 6], dtype=torch.int64)
@@ -660,6 +667,7 @@ class TestWriteLoc(unittest.TestCase):
             token_to_kv_pool_allocator=SimpleNamespace(),
             token_to_kv_pool=SimpleNamespace(),
             page_size=1,
+            dcp_size=1,
             device=_DEV,
         )
         self.assertIsNone(

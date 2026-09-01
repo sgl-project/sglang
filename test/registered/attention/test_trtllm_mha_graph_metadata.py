@@ -54,6 +54,7 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
         token_to_kv_pool_allocator=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
         page_size=PAGE_SIZE,
+        dcp_size=1,
         device="cpu",
     )
     backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
