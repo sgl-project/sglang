@@ -73,7 +73,12 @@ jobs:
         run: |
           # Fixed tag (no SHA): a new build overwrites the previous image so a
           # self-hosted box does not accumulate multi-GB images across runs.
-          docker build . -f docker/xeon.Dockerfile -t sglang_xeon --no-cache
+          # Build the image from THIS ref so the installed sglang package
+          # carries our nightly changes (run_suite whitelist + the 11 test
+          # files); the default Dockerfile arg would clone upstream main.
+          docker build \
+            --build-arg VER_SGLANG=${{ inputs.ref || github.sha }} \
+            . -f docker/xeon.Dockerfile -t sglang_xeon --no-cache
 
       - name: Run container
         run: |
