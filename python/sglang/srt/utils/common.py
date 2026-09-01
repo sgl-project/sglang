@@ -50,6 +50,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -4757,19 +4758,45 @@ def is_confidential_compute() -> bool:
         return forced == "1"
     if not torch.cuda.is_available():
         return False
+
     try:
         import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            state = pynvml.nvmlSystemGetConfComputeState()
-            # ccFeature != 0 means CC is enabled (ON or devtools).
-            return int(getattr(state, "ccFeature", 0)) != 0
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.debug("[SGLang]: Confidential-compute detection failed: %r", e)
+    except ImportError:
+        logger.error("pynvml not available; assuming Confidential Computing is off")
         return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.error(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.error(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():
