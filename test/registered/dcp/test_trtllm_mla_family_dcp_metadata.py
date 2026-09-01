@@ -1,6 +1,6 @@
 """DCP cuda-graph metadata for the trtllm_mla backend family.
 
-The rank-local KV-length and page-table plumbing is kernel-agnostic and lives on
+The rank-local KV-length and page-table plumbing lives on
 :class:`TRTLLMMLABackend`, so the same expectations are asserted for the base
 backend and for both subclasses that inherit it.
 """
@@ -94,8 +94,7 @@ class _DCPMetadataTests:
         expected_local = get_dcp_lens(seq_lens, DCP_SIZE, DCP_RANK).to(torch.int32)
         fill.assert_called_once()
         torch.testing.assert_close(fill.call_args.args[2], expected_local)
-        # Plain decode keeps both views in the capture-stable buffers so
-        # forward_decode reads them instead of recomputing per MLA layer.
+        # Plain decode keeps both views in the capture-stable buffers.
         torch.testing.assert_close(metadata.global_seq_lens_k, seq_lens)
         torch.testing.assert_close(metadata.seq_lens_k, expected_local)
 
@@ -116,11 +115,9 @@ class TestCuteDslMLADCPMetadata(_DCPMetadataTests, CustomTestCase):
 class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
     """``_run_decode_kernel`` must refuse every spec path under DCP.
 
-    trtllm-gen takes no global causal bound, which a ``q_len > 1`` batch needs
-    to resolve a per-query visible prefix. Single-token spec batches still read
-    as ``q_len == 1``, so the refusal also keys on ``causal_seqs`` (target-verify)
-    and ``not return_lse`` (draft-extend, which skips the cross-rank merge)
-    rather than the query length alone.
+    trtllm-gen takes no global causal bound, which a ``q_len > 1`` batch needs.
+    Single-token spec batches still read as ``q_len == 1``, so the refusal also
+    keys on ``causal_seqs`` and ``return_lse``.
     """
 
     def _make_backend(self):
@@ -176,10 +173,8 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
             self._call(self._make_backend(), q_len=NUM_DRAFT_TOKENS, dcp_enabled=True)
 
     def test_explicit_causal_bound_under_dcp_raises_at_q_len_one(self):
-        # The query length is a proxy for "needs a global causal bound", so an
-        # explicit request for one is refused on its own terms. Nothing forces
-        # speculative_num_draft_tokens > 1, so a q_len == 1 target-verify is
-        # expressible and must not slip past on the proxy alone.
+        # Nothing forces speculative_num_draft_tokens > 1, so a q_len == 1
+        # target-verify is expressible and must not slip past the q_len proxy.
         with self.assertRaises(NotImplementedError):
             self._call(
                 self._make_backend(),
@@ -189,10 +184,8 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
             )
 
     def test_single_token_query_under_dcp_is_allowed(self):
-        # The whole premise of trtllm_mla DCP decode: q_len == 1 needs no
-        # global bound, so the guard must not swallow the decode path it
-        # exists to protect. That path returns the LSE for the cross-rank
-        # merge, which is what tells it apart from a non-merging draft-extend.
+        # The premise of trtllm_mla DCP decode: q_len == 1 needs no global
+        # bound, so the guard must not swallow the path it exists to protect.
         calls = []
         self._call(
             self._make_backend(),
@@ -204,16 +197,12 @@ class TestTRTLLMMLARejectsDcpMultiTokenQuery(CustomTestCase):
         self.assertEqual(len(calls), 1)
 
     def test_single_token_draft_extend_under_dcp_raises(self):
-        # A single-token draft-extend also reads as q_len == 1 with no
-        # causal_seqs, but its return path skips the cross-rank shard merge:
-        # not requesting the LSE is the signal, so it must not slip past on
-        # the query length alone.
+        # A single-token draft-extend reads as q_len == 1 with no causal_seqs;
+        # skipping the cross-rank merge (no LSE requested) is the only signal.
         with self.assertRaises(NotImplementedError):
             self._call(self._make_backend(), q_len=1, dcp_enabled=True)
 
     def test_multi_token_query_without_dcp_is_allowed(self):
-        # Non-DCP speculative target-verify is a q_len > 1 batch and must
-        # keep working.
         calls = []
         self._call(
             self._make_backend(),

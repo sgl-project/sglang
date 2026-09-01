@@ -10,9 +10,8 @@ returns the rank-local ``(out, lse)`` needed by the cross-rank merge in
 ``deepseek_common/attention_forward_methods/forward_mla.py``.
 
 Non-DCP (``dcp_size == 1``) decode falls through to the base cute-dsl path
-unchanged. The DCP metadata helpers (rank-local KV lengths and page table) are
-kernel-agnostic and live on :class:`TRTLLMMLABackend`; this module only supplies
-the cute-dsl kernel call and its decode forward.
+unchanged. The DCP metadata helpers live on :class:`TRTLLMMLABackend`; this
+module only supplies the cute-dsl kernel call and its decode forward.
 """
 
 from __future__ import annotations

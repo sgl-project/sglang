@@ -221,9 +221,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size
         self.num_kv_heads = config.get_num_kv_heads(get_parallel().attn_tp_size)
         self.num_local_heads = config.num_attention_heads // get_parallel().attn_tp_size
-        # A DCP decode attends with the query all-gathered across the DCP group,
-        # so the kernel sees attn_dcp_size x this rank's heads (see the
-        # attn_mqa_for_dcp_decode RadixAttention in deepseek_v2.py). Anything
+        # A DCP decode attends with the query all-gathered across the DCP
+        # group, so the kernel sees attn_dcp_size x this rank's heads. Anything
         # sized per decode head must use this, not num_q_heads.
         self.num_decode_q_heads = self.num_q_heads * get_parallel().attn_dcp_size
 
@@ -301,12 +300,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # async asserts: the fused path writes the pool directly and would
         # skip the pool's OOB probe.
         # Also disabled under DCP: unlike its fp8 sibling, set_mla_kv_concat_q
-        # takes no dcp_world_size/dcp_rank, so it writes the KV row at the raw
-        # VIRTUAL out_cache_loc from every rank. Under DCP that loc is widened
-        # and the reader (create_mla_kv_page_table_for_dcp) expects the
-        # compacted row loc // dcp_size written only by the owning rank, so the
-        # fused write lands where no page table points. Fall back to the pool's
-        # DCP-aware set_mla_kv_buffer instead.
+        # takes no dcp_world_size/dcp_rank, so it writes at the raw virtual
+        # out_cache_loc from every rank, while the reader expects the compacted
+        # row loc // dcp_size written only by the owner. Fall back to the pool's
+        # DCP-aware set_mla_kv_buffer.
         self._fused_set_kv_concat_q = (
             self.data_type == torch.bfloat16
             and not envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
@@ -350,11 +347,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return blocks
 
     # ------------------------------------------------------------------
-    # DCP metadata (rank-local KV lengths + page table).
-    #
-    # Kernel-agnostic: keyed only on dcp_size / dcp_rank / page_size /
-    # req_to_token, so the whole trtllm_mla family shares one implementation.
-    # Every method below is a no-op when DCP is off.
+    # DCP metadata (rank-local KV lengths + page table). Kernel-agnostic, so
+    # the whole trtllm_mla family shares it. A no-op when DCP is off.
     # ------------------------------------------------------------------
     def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         parallel = get_parallel()
@@ -582,10 +576,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         if get_parallel().dcp_enabled:
             if metadata.global_seq_lens_k is None:
-                # Plain decode under DCP also keeps the int32 GLOBAL lens in a
-                # capture-stable buffer (the branches above allocate it only for
-                # verify): a DCP decode consumes both the rank-local and the
-                # global lens, so both are maintained once per step.
+                # A DCP decode consumes both the rank-local and the global
+                # lens, and the branches above allocate this only for verify.
                 metadata.global_seq_lens_k = torch.zeros(
                     (bs,), dtype=torch.int32, device=device
                 )
@@ -672,9 +664,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """DCP variant of the capture+replay body.
 
-        Refreshes the int32 global and rank-local lengths into the
-        capture-stable buffers once per step (rather than per MLA layer) and
-        rebuilds the page table over this rank's cyclic slice.
+        Refreshes the global and rank-local lengths into the capture-stable
+        buffers once per step, and rebuilds the page table over this rank's
+        cyclic slice.
         """
         if forward_mode.is_target_verify():
             torch.add(
@@ -914,10 +906,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     or forward_batch.forward_mode.is_decode_or_idle()
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ) and metadata.seq_lens_k is not None:
-                    # The branches above stored the int32 GLOBAL lengths in
-                    # seq_lens_k. Keep those as global_seq_lens_k and derive the
-                    # rank-local view once per step; a DCP decode reads both
-                    # every MLA layer.
+                    # super() stored the global lengths in seq_lens_k; keep
+                    # them as global_seq_lens_k and derive the rank-local view
+                    # once per step rather than per MLA layer.
                     metadata.global_seq_lens_k = metadata.seq_lens_k
                     metadata.seq_lens_k = self._get_dcp_local_seq_lens(
                         metadata.global_seq_lens_k
@@ -1025,28 +1016,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         The DCP arguments belong to the hook contract because forward_extend
         passes them on the DCP target-verify path.
 
-        The trtllm-gen kernel has no in-kernel DCP support: flashinfer rejects
-        ``enable_dcp=True`` for every backend except ``cute-dsl``. It does not
-        need it for a ``q_len == 1`` decode, though. ``cp_world`` / ``cp_rank`` /
-        ``causal_seqlens_kv_global`` exist so the kernel can resolve a per-query
-        global causal bound, which only varies when ``q_len > 1``; with a single
-        query token this rank's cyclic slice is exactly the tokens below the
-        current position, so the rank-local page table and ``seq_lens`` already
-        describe the shard completely.
+        The trtllm-gen kernel has no in-kernel DCP support (flashinfer rejects
+        ``enable_dcp=True`` for every backend except ``cute-dsl``), but a
+        ``q_len == 1`` decode does not need it: the per-query global causal
+        bound only varies across query rows when ``q_len > 1``, so for a single
+        query token the rank-local page table and ``seq_lens`` already describe
+        the shard completely.
 
-        The refusal uses three checks, each catching a spec path DCP cannot
-        serve here:
-
-        - ``q_len > 1`` catches multi-token verify / draft-extend, whose
-          per-row causal bound the kernel cannot resolve.
-        - ``causal_seqs is not None`` catches target-verify, which hands in a
-          global causal bound the kernel cannot forward.
-        - ``not return_lse`` catches draft-extend, whose return path skips the
-          cross-rank shard merge -- spec decode never requests the LSE that
-          merge needs, while plain decode always does.
-
-        The last two are what refuse the single-token (``q_len == 1``) verify
-        and draft-extend that ``q_len`` alone would let through.
+        Every other DCP path is refused. ``q_len > 1`` catches multi-token
+        verify / draft-extend; ``causal_seqs`` and ``return_lse`` catch the
+        single-token verify and draft-extend that ``q_len`` alone lets through
+        (only plain decode requests the LSE the cross-rank merge needs).
         """
         q_len = query.shape[1] if query.dim() == 4 else 1
         if get_parallel().dcp_enabled and (
@@ -1424,8 +1404,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Rank-local MLA decode under DCP, returning ``(out, lse)``.
 
-        The metadata already carries this rank's cyclic slice: a page table
-        built by ``_fill_dcp_block_kv_indices`` and rank-local ``seq_lens_k``.
         The cross-rank merge lives in the model
         (``deepseek_common/attention_forward_methods/forward_mla.py``), so this
         returns the rank-local attention state rather than a final output.
