@@ -89,6 +89,7 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
@@ -2746,6 +2747,72 @@ class AiterAttnBackend(AttentionBackend):
                 and sinks is not None
                 and self.forward_metadata.unified_page_table is not None
                 and self.kv_cache_dtype != fp8_dtype
+                and (
+                    layer.sliding_window_size is None or layer.sliding_window_size <= -1
+                )
+                and self.forward_metadata.max_q_len is not None
+                and self.forward_metadata.max_q_len >= 8192
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_flat = k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v_flat = v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                num_seqs = bs0 - 1
+                kv_indptr_t = self.forward_metadata.kv_indptr
+                kv_indices_t = self.forward_metadata.kv_indices
+                cache_loc = forward_batch.out_cache_loc
+                prefix_lens = forward_batch.extend_prefix_lens_cpu
+                extend_lens = forward_batch.extend_seq_lens_cpu
+                tok_chunks = []
+                cu_k_list = [0]
+                p0 = 0
+                e0 = 0
+                max_kv_i = 0
+                for i in range(num_seqs):
+                    p_len = int(prefix_lens[i])
+                    e_len = int(extend_lens[i])
+                    ext = cache_loc[e0 : e0 + e_len].to(torch.int64)
+                    if p_len:
+                        pfx = kv_indices_t[p0 : p0 + p_len].to(torch.int64)
+                        tok_chunks.append(torch.cat((pfx, ext)))
+                    else:
+                        tok_chunks.append(ext)
+                    cu_k_list.append(cu_k_list[-1] + p_len + e_len)
+                    max_kv_i = max(max_kv_i, p_len + e_len)
+                    p0 += p_len
+                    e0 += e_len
+                gather_idx = tok_chunks[0] if num_seqs == 1 else torch.cat(tok_chunks)
+                k_full = k_flat.index_select(0, gather_idx)
+                v_full = v_flat.index_select(0, gather_idx)
+                cu_q = self.qo_indptr[:bs0].to(torch.int32)
+                cu_k = torch.tensor(cu_k_list, device=q.device, dtype=torch.int32)
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+                flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_full,
+                    v_full,
+                    cu_q,
+                    cu_k,
+                    self.forward_metadata.max_q_len,
+                    max_kv_i,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=(-1, 0, 0),
+                    sink_ptr=sinks,
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if (
+                self.use_triton_unified_attention
+                and sinks is not None
+                and self.forward_metadata.unified_page_table is not None
+                and self.kv_cache_dtype != fp8_dtype
             ):
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 if layer.qk_head_dim != layer.v_head_dim:
@@ -2761,9 +2828,7 @@ class AiterAttnBackend(AttentionBackend):
                 ):
                     unified_window = (layer.sliding_window_size - 1, 0)
                 unified_attention(
-                    q=q.contiguous().view(
-                        -1, layer.tp_q_head_num, layer.qk_head_dim
-                    ),
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k=k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                     ),
