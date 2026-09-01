@@ -11,12 +11,13 @@ on:
   workflow_dispatch:
     inputs:
       rocm_version:
-        description: 'ROCm image version ("all" runs every flavor, as the nightly schedule does)'
+        description: 'ROCm image version ("all" runs the scheduled ROCm 7.2 matrix; select rocm10 explicitly)'
         required: false
         type: choice
         default: 'all'
         options:
           - 'all'
+          - rocm10
           - rocm724
           - rocm720
       aiter_ref:
@@ -110,7 +111,7 @@ on:
   workflow_call:
     inputs:
       rocm_version:
-        description: 'ROCm image version ("all" runs every flavor)'
+        description: 'ROCm image version ("all" runs the scheduled ROCm 7.2 matrix; pass rocm10 explicitly)'
         required: false
         type: string
         # A single flavor, unlike the schedule and the dispatch form: a caller
@@ -444,7 +445,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      - name: Performance Test ROCm 7.2 (2-GPU Text Models)
+      - name: Performance Test (2-GPU Text Models)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -1008,7 +1009,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V3.2 Basic)
+      - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 Basic)
         timeout-minutes: 150
         continue-on-error: true
         run: |

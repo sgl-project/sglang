@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -28,6 +27,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -63,7 +63,7 @@ class HiCacheStorageBaseMixin:
     def tearDownClass(cls):
         """Clean up test environment"""
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
         import shutil
 

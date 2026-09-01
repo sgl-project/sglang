@@ -346,9 +346,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return
-        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
-        # host-resident scalar and blocks until the stream drains.
-        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
+        full_indices = full_indices.to(torch.int64)
+        if _is_npu:
+            # NPU: aclnnIndexFill is unoptimized; direct assignment avoids the overhead.
+            self.full_to_swa_index_mapping[full_indices] = 0
+        else:
+            # CUDA: index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0
+            # copies a host-resident scalar and blocks until the stream drains.
+            self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
