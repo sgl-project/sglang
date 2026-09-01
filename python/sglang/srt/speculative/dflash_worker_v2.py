@@ -1494,6 +1494,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._logged_dp_padding_trim = True
             target_hidden = target_hidden[:expected_tokens]
             num_tokens = expected_tokens
+        if num_tokens > 0 and not getattr(self, "_dbg_dp_prefill_logged", False):
+            self._dbg_dp_prefill_logged = True
+            logger.info(
+                "[DBG-DP-PREFILL] tokens=%d expected=%d prefix0=%s bonus0=%s",
+                int(target_hidden.shape[0]),
+                expected_tokens,
+                (positions[:1].tolist() if positions is not None else None),
+                None,
+            )
         if int(cache_loc.numel()) != num_tokens:
             raise ValueError(
                 "DFLASH cache_loc length mismatch: "
@@ -1878,6 +1887,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "but got None."
                 )
 
+            # [DBG-DP] reset per-request iteration counter at prefill.
+            self._dbg_dp_iter = 0
+            if len(batch.extend_lens) > 0:
+                logger.info(
+                    "[DBG-DP-PREFILL] extend_lens=%s bonus0=%s hidden=%s cache_loc=%s",
+                    batch.extend_lens[:4],
+                    next_token_ids[:2].tolist(),
+                    list(logits_output.hidden_states.shape),
+                    list(batch.out_cache_loc.shape),
+                )
+
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
@@ -2181,6 +2201,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        # [DBG-DP] per-iteration draft block for DP vs non-DP comparison.
+        self._dbg_dp_iter = getattr(self, "_dbg_dp_iter", 0) + 1
+        if bs > 0 and self._dbg_dp_iter <= 8:
+            logger.info(
+                "[DBG-DP-DRAFT] iter=%d bs=%d prefix0=%s block0=%s",
+                self._dbg_dp_iter,
+                bs,
+                int(prefix_lens[0].item()),
+                draft_tokens[0].tolist(),
+            )
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
@@ -2230,6 +2261,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+
+        # [DBG-DP] shape alignment check: under dp attention the target verify
+        # output may be DP-padded/gathered; hidden must be exactly bs*block_size
+        # rows or the view(bs, block_size) below silently misaligns.
+        if bs > 0 and self._dbg_dp_iter <= 8:
+            logger.info(
+                "[DBG-DP-VERIFY] iter=%d bs=%d block=%d logits=%s hidden=%s",
+                self._dbg_dp_iter,
+                bs,
+                int(self.block_size),
+                list(logits_output.next_token_logits.shape),
+                (
+                    list(logits_output.hidden_states.shape)
+                    if logits_output.hidden_states is not None
+                    else None
+                ),
+            )
 
         grammar_mask = None
         if batch.has_grammar:
@@ -2319,6 +2367,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                     target_predict=target_predict,
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+
+        # [DBG-DP] per-iteration accept result for DP vs non-DP comparison.
+        if bs > 0 and self._dbg_dp_iter <= 8:
+            logger.info(
+                "[DBG-DP-ACCEPT] iter=%d target0=%s accept0=%s out0=%s",
+                self._dbg_dp_iter,
+                target_predict[0].tolist() if target_predict is not None else None,
+                int(accept_len[0].item()) if accept_len is not None else None,
+                out_tokens[0].tolist(),
+            )
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
