@@ -462,7 +462,10 @@ class KVCacheConfigurator:
                     )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     unified_memory_pool_bytes=sizes.unified_memory_pool_bytes,
+                    unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
                 # Fail loud, not silently fall through to the normal pools (which would
@@ -810,6 +813,7 @@ class KVCacheConfigurator:
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
         unified_memory_pool_bytes: Optional[int] = None,
+        unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
         buffer split between the full-attention and SWA KV pools."""
@@ -869,6 +873,10 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        total_bytes = unified_memory_pool_bytes
+        if total_bytes is None and self.spec_algorithm.is_none():
+            total_bytes = unified_total_bytes
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -885,7 +893,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
-            total_bytes=unified_memory_pool_bytes,
+            total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as

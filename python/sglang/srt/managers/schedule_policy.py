@@ -575,9 +575,12 @@ class PrefillAdder:
             self.token_to_kv_pool_allocator, PureSWATokenToKVPoolAllocator
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
-        self.is_unified_swa = isinstance(
-            self.token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator
-        ) and self.token_to_kv_pool_allocator.supports_asymmetric_reservation
+        self.is_unified_swa = (
+            isinstance(
+                self.token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator
+            )
+            and self.token_to_kv_pool_allocator.supports_asymmetric_reservation
+        )
 
         self.rem_swa_token_offset = (
             num_mixed_decode_tokens if self.is_unified_swa else 0
