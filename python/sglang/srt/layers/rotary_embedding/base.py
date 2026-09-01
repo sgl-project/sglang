@@ -473,6 +473,7 @@ class RotaryEmbedding(BaseFusedOp):
             return query, key
         else:
             # Use fallback kernel of 'rotary_embedding'
+            self._match_cos_sin_cache_dtype(query)
             return torch.ops.sgl_kernel.rotary_embedding(
                 positions,
                 query,
