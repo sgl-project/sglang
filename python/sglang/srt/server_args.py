@@ -81,7 +81,11 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
 )
-from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+from sglang.srt.utils.network import (
+    NetworkAddress,
+    get_free_rendezvous_port,
+    wait_port_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4333,7 +4337,7 @@ class PortArgs:
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
-            nccl_port = get_free_port()
+            nccl_port = get_free_rendezvous_port()
         else:
             nccl_port = server_args.nccl_port
 

@@ -7,6 +7,7 @@ from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
     get_free_port,
+    get_free_rendezvous_port,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -118,6 +119,31 @@ class TestSocketUtilities(CustomTestCase):
         port = get_free_port()
         self.assertGreater(port, 0)
         self.assertLessEqual(port, 65535)
+
+    def test_get_free_rendezvous_port_avoids_linux_ephemeral_range(self):
+        """Rendezvous ports should avoid Linux ephemeral client ports."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(10000, 61000),
+            ),
+            patch(
+                "sglang.srt.utils.network.is_port_available",
+                side_effect=lambda port: port == 9999,
+            ),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 9999)
+
+    def test_get_free_rendezvous_port_falls_back_without_candidate(self):
+        """Use OS-assigned ports when no non-ephemeral TCP port is available."""
+        with (
+            patch(
+                "sglang.srt.utils.network._read_linux_ephemeral_port_range",
+                return_value=(1024, 65535),
+            ),
+            patch("sglang.srt.utils.network.get_free_port", return_value=49152),
+        ):
+            self.assertEqual(get_free_rendezvous_port(), 49152)
 
     def test_bind_port(self):
         """bind_port should return a listening socket."""
