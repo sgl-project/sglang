@@ -66,7 +66,7 @@ def _dense_reference(q, k, v, used: int) -> torch.Tensor:
     return (torch.softmax(scores, dim=-1) @ vf).permute(1, 0, 2)
 
 
-def _impl(device):
+def _impl():
     impl = VideoSparseAttentionH3Impl(
         num_heads=HEADS,
         head_size=HEAD_DIM,
@@ -100,7 +100,7 @@ def test_zero_sparsity_matches_dense() -> None:
     used, total, (q, k, v) = _packed_qkv(device)
     assert meta.total_seq_length == used
 
-    out = _run(_impl(device), meta, used, total, q, k, v)
+    out = _run(_impl(), meta, used, total, q, k, v)
     reference = _dense_reference(q, k, v, used)
     diff = (out[:used].float() - reference).abs().max().item()
     assert diff < 2e-2, f"sparse(0) vs dense max diff {diff}"
@@ -112,7 +112,7 @@ def test_zero_gate_is_noop_and_trained_gate_activates() -> None:
     device = torch.device("cuda")
     meta = _build_metadata(0.5, device)
     used, total, (q, k, v) = _packed_qkv(device)
-    impl = _impl(device)
+    impl = _impl()
 
     base = _run(impl, meta, used, total, q, k, v).clone()
     zero_gate = torch.zeros_like(q)
@@ -129,7 +129,7 @@ def test_dense_layer_optout_matches_dense() -> None:
     device = torch.device("cuda")
     meta = _build_metadata(0.9, device, dense_layers=(3,))
     used, total, (q, k, v) = _packed_qkv(device)
-    out = _run(_impl(device), meta, used, total, q, k, v)
+    out = _run(_impl(), meta, used, total, q, k, v)
     reference = _dense_reference(q, k, v, used)
     diff = (out[:used].float() - reference).abs().max().item()
     assert diff < 2e-2, f"dense-layer opt-out vs dense max diff {diff}"
@@ -162,9 +162,7 @@ def test_block_mask_semantics() -> None:
     assert exempt[:, :, :num_prefix, :].all()
     assert exempt[:, :, :, :num_prefix].all()
     keep = math.ceil(0.5 * num_video)
-    assert (
-        exempt[:, :, num_prefix:, num_prefix:].sum(dim=-1) == keep
-    ).all()
+    assert (exempt[:, :, num_prefix:, num_prefix:].sum(dim=-1) == keep).all()
 
     compete = _build_block_mask(scores, num_prefix, num_video, 0.5, False)
     assert compete[:, :, :num_prefix, :].all()
@@ -184,10 +182,12 @@ def test_metadata_tile_geometry_accounts_every_row() -> None:
     assert meta.non_pad_index.numel() == used
     # Prefix chunks never straddle segment boundaries: 70 -> 64+6, 100 -> 64+36.
     assert meta.num_prefix_tiles == 4
-    assert (
-        meta.variable_block_sizes[: meta.num_prefix_tiles].tolist()
-        == [64, 6, 64, 36]
-    )
+    assert meta.variable_block_sizes[: meta.num_prefix_tiles].tolist() == [
+        64,
+        6,
+        64,
+        36,
+    ]
     video_tiles = (
         math.ceil(VIDEO_SHAPE[0] / 4)
         * math.ceil(VIDEO_SHAPE[1] / 4)

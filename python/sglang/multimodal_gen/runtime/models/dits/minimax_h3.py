@@ -1070,8 +1070,7 @@ class MiniMaxH3Attention(nn.Module):
 
         gate_compress = None
         if (
-            self._attention_backend_enum
-            is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            self._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
             and self.to_gate_compress is not None
         ):
             gate_flat, _ = self.to_gate_compress(x)

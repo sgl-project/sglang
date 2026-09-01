@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
 )
 from sglang.multimodal_gen.configs.sample.minimax_h3 import (
     FastH3SamplingParams,
-    MiniMaxH3SamplingParams,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3ReleaseMetadata,

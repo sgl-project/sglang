@@ -1,8 +1,9 @@
-# SPDX-License-Identifier: Apache-2.0
-# Adapted from FastVideo's fastvideo-kernel (Apache-2.0):
-# triton_kernels/block_sparse_attn_triton.py and triton_kernels/index.py.
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# (fastvideo-kernel triton_kernels/block_sparse_attn_triton.py and index.py).
 # Inference-only subset: the block-sparse forward and the mask -> index
 # conversion. Backward stays upstream; SGLang serves no-grad forwards.
+
+# SPDX-License-Identifier: Apache-2.0
 """Triton 64-token block-sparse attention for MiniMax-H3 VSA.
 
 The kernel consumes an explicit per-query-block index list (``q2k_index`` /
@@ -194,9 +195,7 @@ def vsa_h3_map_to_index(block_map: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     """[B, H, Gq, Gk] bool map -> ([B, H, Gq, Gk] int32 ascending index list
     padded with -1, [B, H, Gq] int32 per-row counts)."""
     batch, heads, num_q_blocks, num_kv_blocks = block_map.shape
-    index = torch.full(
-        block_map.shape, -1, dtype=torch.int32, device=block_map.device
-    )
+    index = torch.full(block_map.shape, -1, dtype=torch.int32, device=block_map.device)
     index_num = torch.empty(
         (batch, heads, num_q_blocks), dtype=torch.int32, device=block_map.device
     )
@@ -246,9 +245,7 @@ def vsa_h3_block_sparse_attn_forward(
     max_kv_blks = q2k_index.shape[-1]
     out = torch.empty_like(q)
     # Row-max running stats in Triton's base-2 M format; inference discards it.
-    row_max = torch.empty(
-        (batch, heads, seq_q), dtype=torch.float32, device=q.device
-    )
+    row_max = torch.empty((batch, heads, seq_q), dtype=torch.float32, device=q.device)
     grid = lambda _: (triton.cdiv(seq_q, VSA_H3_KERNEL_BLOCK), batch * heads, 1)
     _attn_fwd_sparse[grid](
         q,

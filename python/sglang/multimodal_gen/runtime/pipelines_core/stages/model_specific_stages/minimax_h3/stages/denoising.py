@@ -927,7 +927,7 @@ def _maybe_prepare_vsa_h3_step_metadata(
     *,
     model: Any,
     packed: Mapping[str, torch.Tensor],
-    ctx: "_FullLoopContext",
+    ctx: _FullLoopContext,
     server_args: ServerArgs,
     device: torch.device,
 ) -> Callable[[int], Any] | None:

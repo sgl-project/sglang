@@ -29,9 +29,8 @@ _ROPE_FILE = "sglang_rope_inv_freq.safetensors"
 def _write_rope_inv_freq(*, source_dir: str, output_dir: str) -> None:
     with open(os.path.join(source_dir, "transformer", "config.json")) as f:
         rope_freq_dim = int(json.load(f)["rope_freq_dim"])
-    exponents = (
-        torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32)
-        / (2 * rope_freq_dim)
+    exponents = torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32) / (
+        2 * rope_freq_dim
     )
     inv_freq = 1.0 / (10000.0**exponents)
     transformer_dir = os.path.join(output_dir, "transformer")
@@ -39,7 +38,9 @@ def _write_rope_inv_freq(*, source_dir: str, output_dir: str) -> None:
 
     # Keep the weight index consistent with the added shard. The symlinked
     # index is replaced by a patched real file.
-    index_path = os.path.join(transformer_dir, "diffusion_pytorch_model.safetensors.index.json")
+    index_path = os.path.join(
+        transformer_dir, "diffusion_pytorch_model.safetensors.index.json"
+    )
     with open(index_path) as f:
         index = json.load(f)
     index["weight_map"]["rope.inv_freq"] = _ROPE_FILE
@@ -49,7 +50,9 @@ def _write_rope_inv_freq(*, source_dir: str, output_dir: str) -> None:
         json.dump(index, f, indent=2, sort_keys=True)
 
 
-def _interleave_qkv_rows(qkv: torch.Tensor, *, heads: int, dim_head: int) -> torch.Tensor:
+def _interleave_qkv_rows(
+    qkv: torch.Tensor, *, heads: int, dim_head: int
+) -> torch.Tensor:
     """Stacked [q; k; v] rows -> the per-head (q, k, v) interleave the fused
     source to_qkv projection stores."""
     rest_shape = qkv.shape[1:]
@@ -92,7 +95,9 @@ def _convert_video_vae(*, source_dir: str, output_dir: str) -> None:
     heads = int(config["decoder_num_attention_heads"])
     dim_head = int(config["decoder_attention_head_dim"])
 
-    with open(os.path.join(vae_dir, "diffusion_pytorch_model.safetensors.index.json")) as f:
+    with open(
+        os.path.join(vae_dir, "diffusion_pytorch_model.safetensors.index.json")
+    ) as f:
         weight_map = json.load(f)["weight_map"]
 
     handles: dict[str, object] = {}
@@ -183,7 +188,9 @@ def _write_patched_component_config(
         json.dump(config, f, indent=2, sort_keys=True)
 
 
-def materialize(*, overlay_dir: str, source_dir: str, output_dir: str, manifest: dict) -> None:
+def materialize(
+    *, overlay_dir: str, source_dir: str, output_dir: str, manifest: dict
+) -> None:
     _write_rope_inv_freq(source_dir=source_dir, output_dir=output_dir)
     _convert_video_vae(source_dir=source_dir, output_dir=output_dir)
     _write_patched_component_config(

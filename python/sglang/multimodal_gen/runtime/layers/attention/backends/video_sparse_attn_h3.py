@@ -1,6 +1,8 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+# (the video_sparse_attn_h3 backend), rewritten for SGLang's packed-varlen
+# MiniMax-H3 attention contract.
+
 # SPDX-License-Identifier: Apache-2.0
-# Ported from FastVideo's video_sparse_attn_h3 backend (Apache-2.0), adapted
-# to SGLang's packed-varlen MiniMax-H3 attention contract.
 """VSA for MiniMax-H3's packed mixed-modality self-attention.
 
 H3 runs one joint bidirectional attention over
@@ -52,17 +54,6 @@ VSA_H3_TILE_SHAPE = (4, 4, 4)
 VSA_H3_TILE_ELEMS = math.prod(VSA_H3_TILE_SHAPE)
 
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
-
-
-class _TileBufferHolder:
-    """Process-wide no-grad tile scratch reused across layers and steps."""
-
-    def __init__(self) -> None:
-        self.buffer: torch.Tensor | None = None
-        self.geometry: torch.Tensor | None = None
-
-
-_TILE_BUFFER_HOLDER = _TileBufferHolder()
 
 
 @functools.lru_cache(maxsize=8)
@@ -164,6 +155,9 @@ class VideoSparseAttentionH3Metadata(AttentionMetadata):
     variable_block_sizes: torch.Tensor
     non_pad_index: torch.Tensor
     dense_layers: tuple[int, ...] = ()
+    # Per-step padded tile scratch shared by all layers; pad rows stay zero
+    # because only valid rows are ever written (same contract as Wan VSA).
+    tile_buf: torch.Tensor | None = None
 
 
 class VideoSparseAttentionH3MetadataBuilder(AttentionMetadataBuilder):
@@ -264,6 +258,62 @@ def _build_block_mask(
     return mask
 
 
+def _tile_scores_and_mask(
+    q_tiled: torch.Tensor,
+    k_tiled: torch.Tensor,
+    meta: VideoSparseAttentionH3Metadata,
+    *,
+    sparsity: float,
+    head_size: int,
+    need_scores: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """Pooled tile scores (None when nothing consumes them) and the bool
+    block mask, both [B, H, n_tiles, n_tiles]."""
+    if sparsity <= 0.0 and not need_scores:
+        n_tiles = meta.variable_block_sizes.numel()
+        mask = torch.ones(
+            1,
+            q_tiled.shape[2],
+            n_tiles,
+            n_tiles,
+            dtype=torch.bool,
+            device=q_tiled.device,
+        )
+        return None, mask
+    q_pooled = _pool_tiles(q_tiled, meta.variable_block_sizes)
+    k_pooled = _pool_tiles(k_tiled, meta.variable_block_sizes)
+    scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) * (head_size**-0.5)
+    mask = _build_block_mask(
+        scores=scores,
+        num_prefix_tiles=meta.num_prefix_tiles,
+        num_video_tiles=meta.num_video_tiles,
+        sparsity=sparsity,
+        exempt=meta.exempt,
+    )
+    return scores, mask
+
+
+def _add_compression_branch(
+    out: torch.Tensor,
+    *,
+    scores: torch.Tensor,
+    v_tiled: torch.Tensor,
+    gate_tiled: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> torch.Tensor:
+    """Dense attention over pooled tiles, broadcast to each tile's rows and
+    scaled by the learned gate. Zero gates contribute nothing, which is the
+    base-H3 contract."""
+    n_tiles = variable_block_sizes.numel()
+    v_pooled = _pool_tiles(v_tiled, variable_block_sizes)
+    out_c = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
+    out_c = out_c.permute(0, 2, 1, 3).to(out.dtype)
+    batch, seq_pad, heads, dim = out.shape
+    out_tiled = out.view(batch, n_tiles, VSA_H3_TILE_ELEMS, heads, dim)
+    gate_view = gate_tiled.view(batch, n_tiles, VSA_H3_TILE_ELEMS, heads, dim)
+    return (out_tiled + out_c.unsqueeze(2) * gate_view).view(batch, seq_pad, heads, dim)
+
+
 class VideoSparseAttentionH3Impl(AttentionImpl):
     def __init__(
         self,
@@ -304,8 +354,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "VSA-H3 serves MiniMax-H3's packed varlen attention; use "
-            "forward_varlen."
+            "VSA-H3 serves MiniMax-H3's packed varlen attention; use " "forward_varlen."
         )
 
     def _tile(self, x: torch.Tensor, meta: VideoSparseAttentionH3Metadata):
@@ -317,22 +366,12 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             x.shape[-2],
             x.shape[-1],
         )
-        holder = _TILE_BUFFER_HOLDER
-        matches = (
-            holder.buffer is not None
-            and holder.buffer.shape == target_shape
-            and holder.buffer.dtype == x.dtype
-            and holder.buffer.device == x.device
-        )
-        if not matches:
-            holder.buffer = torch.zeros(target_shape, device=x.device, dtype=x.dtype)
-        elif holder.geometry is not meta.non_pad_index:
-            # A same-shaped geometry change may leave stale valid rows where
-            # the new geometry expects zero padding.
-            holder.buffer.zero_()
-        holder.buffer[:, meta.non_pad_index] = x[:, meta.tile_partition_indices]
-        holder.geometry = meta.non_pad_index
-        return holder.buffer
+        buf = meta.tile_buf
+        if buf is None or buf.shape != target_shape or buf.dtype != x.dtype:
+            buf = torch.zeros(target_shape, device=x.device, dtype=x.dtype)
+            meta.tile_buf = buf
+        buf[:, meta.non_pad_index] = x[:, meta.tile_partition_indices]
+        return buf
 
     def forward_varlen(
         self,
@@ -377,9 +416,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
                 "layout have diverged."
             )
 
-        sparsity = (
-            0.0 if self.layer_idx in meta.dense_layers else meta.VSA_sparsity
-        )
+        sparsity = 0.0 if self.layer_idx in meta.dense_layers else meta.VSA_sparsity
 
         stack = [query[:used], key[:used], value[:used]]
         if gate_compress is not None:
@@ -388,58 +425,32 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         q_tiled, k_tiled, v_tiled = tiled[0:1], tiled[1:2], tiled[2:3]
         gate_tiled = tiled[3:4] if gate_compress is not None else None
 
-        scores = None
-        if sparsity > 0.0 or gate_tiled is not None:
-            q_pooled = _pool_tiles(q_tiled, meta.variable_block_sizes)
-            k_pooled = _pool_tiles(k_tiled, meta.variable_block_sizes)
-            scores = torch.matmul(q_pooled, k_pooled.transpose(-2, -1)) * (
-                self.head_size**-0.5
-            )
-
-        n_tiles = meta.variable_block_sizes.numel()
-        if scores is None:
-            mask = torch.ones(
-                1,
-                query.shape[1],
-                n_tiles,
-                n_tiles,
-                dtype=torch.bool,
-                device=query.device,
-            )
-        else:
-            mask = _build_block_mask(
-                scores,
-                meta.num_prefix_tiles,
-                meta.num_video_tiles,
-                sparsity,
-                meta.exempt,
-            )
-
+        scores, mask = _tile_scores_and_mask(
+            q_tiled,
+            k_tiled,
+            meta,
+            sparsity=sparsity,
+            head_size=self.head_size,
+            need_scores=gate_tiled is not None,
+        )
         q2k_index, q2k_num = vsa_h3_map_to_index(mask)
         out_bhsd = vsa_h3_block_sparse_attn_forward(
-            q_tiled.transpose(1, 2).contiguous(),
-            k_tiled.transpose(1, 2).contiguous(),
-            v_tiled.transpose(1, 2).contiguous(),
-            q2k_index,
-            q2k_num,
-            meta.variable_block_sizes.to(torch.int32),
+            q=q_tiled.transpose(1, 2).contiguous(),
+            k=k_tiled.transpose(1, 2).contiguous(),
+            v=v_tiled.transpose(1, 2).contiguous(),
+            q2k_index=q2k_index,
+            q2k_num=q2k_num,
+            variable_block_sizes=meta.variable_block_sizes.to(torch.int32),
         )
         out = out_bhsd.transpose(1, 2)
 
         if gate_tiled is not None:
-            # Compression branch: dense attention over pooled tiles, broadcast
-            # to each tile's rows, scaled by the learned gate. Zero gates
-            # contribute nothing, which is the base-H3 contract.
-            v_pooled = _pool_tiles(v_tiled, meta.variable_block_sizes)
-            out_c = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
-            out_c = out_c.permute(0, 2, 1, 3).to(out.dtype)
-            batch, seq_pad, heads, dim = out.shape
-            out_tiled = out.view(batch, n_tiles, VSA_H3_TILE_ELEMS, heads, dim)
-            gate_view = gate_tiled.view(
-                batch, n_tiles, VSA_H3_TILE_ELEMS, heads, dim
-            )
-            out = (out_tiled + out_c.unsqueeze(2) * gate_view).view(
-                batch, seq_pad, heads, dim
+            out = _add_compression_branch(
+                out,
+                scores=scores,
+                v_tiled=v_tiled,
+                gate_tiled=gate_tiled,
+                variable_block_sizes=meta.variable_block_sizes,
             )
 
         # Untile back to packed rows; alignment-pad rows come out zero.

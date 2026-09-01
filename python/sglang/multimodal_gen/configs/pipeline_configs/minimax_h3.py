@@ -266,7 +266,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "VSA-H3 does not support --ring-degree > 1; use Ulysses "
                     "sequence parallelism."
                 )
-            if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
+            if (
+                server_args.enable_torch_compile
+                or server_args.enable_breakable_cuda_graph
+            ):
                 raise ValueError(
                     "VSA-H3 builds per-step tile metadata eagerly and is not "
                     "validated under torch.compile or the breakable CUDA "

@@ -29,11 +29,11 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
+    FastH3PipelineConfig,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
     HeliosMidConfig,
-    FastH3PipelineConfig,
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
