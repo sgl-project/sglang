@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    MigrateOutReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -42,6 +43,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
     wrap_as_pickle,
 )
+from sglang.srt.managers.dp_queue_lb import DPQueueBalancer
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -190,6 +192,24 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+
+        # DP waiting-queue load balancing (queue_lb feature, Phase 1).
+        self.queue_balancer: Optional[DPQueueBalancer] = None
+        if (
+            server_args.enable_dp_queue_balance
+            and get_parallel().config.enable_dp_attention
+        ):
+            self.queue_balancer = DPQueueBalancer(
+                server_args, get_parallel().config.dp_size
+            )
+            logger.info(
+                "DP waiting-queue load balancing enabled (interval=%sms, "
+                "threshold=%s, min_abs=%s, cap=%s).",
+                server_args.dp_queue_balance_interval_ms,
+                server_args.dp_queue_balance_threshold,
+                server_args.dp_queue_balance_min_abs,
+                server_args.dp_queue_balance_cap_per_round,
+            )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -803,8 +823,37 @@ class DataParallelController:
         )
         sock_send(self.workers[target_worker], req)
 
+    def maybe_run_queue_balance(self):
+        """Periodically rebalance per-rank waiting queues (queue_lb feature).
+
+        Reads the per-rank ``LoadSnapshot`` already collected for dispatch and,
+        when a rank is overloaded, sends a ``MigrateOutReq`` trigger to the donor
+        scheduler, which then ships requests peer-to-peer to the recipient.
+        """
+        if self.queue_balancer is None:
+            return
+        orders = self.queue_balancer.maybe_plan(self.load_snapshot_reader.read_all())
+        for order in orders:
+            src = order.src_dp_rank
+            if (
+                src >= len(self.workers)
+                or self.workers[src] is None
+                or not self.status[src]
+                or not self.status[order.dst_dp_rank]
+            ):
+                continue
+            sock_send(
+                self.workers[src],
+                MigrateOutReq(
+                    src_dp_rank=src,
+                    dst_dp_rank=order.dst_dp_rank,
+                    count=order.count,
+                ),
+            )
+
     def event_loop(self):
         while True:
+            self.maybe_run_queue_balance()
             while True:
                 self.soft_watchdog.feed()
                 try:

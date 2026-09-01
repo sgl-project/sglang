@@ -598,6 +598,9 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            # queue_lb: drain peer-migrated requests (they re-enter via the
+            # normal request path -> disagg_prefill_bootstrap_queue).
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(
@@ -637,6 +640,9 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            # queue_lb: drain peer-migrated requests (they re-enter via the
+            # normal request path -> disagg_prefill_bootstrap_queue).
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
             self.waiting_queue.extend(

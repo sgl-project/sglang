@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
 _TAG_ABORT = b"ABORT"
 
+# queue_lb (PD prefill migration): a prefill->decode control status that is
+# distinct from any real KVPoll value (KVPoll spans 0..4). When the decode
+# status worker sees this code it does NOT fail/complete the room; instead it
+# records "re-handshake this room against a new prefill dp_rank" so the decode
+# scheduler can re-point the request. The new dp_rank rides in the reason slot.
+MORI_STATUS_REBOOTSTRAP = -1
+
 
 def _normalize_state_indices_per_component(
     state_indices: Optional[List],
@@ -333,8 +340,29 @@ class MoriKVManager(CommonKVManager):
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
+            # queue_lb: rooms the source prefill asked us to re-handshake against
+            # a new prefill dp_rank (room -> new_dp_rank). Filled by the decode
+            # status worker thread, drained by the decode scheduler loop.
+            self._rebootstrap_lock = threading.Lock()
+            self._rooms_to_rebootstrap: Dict[int, int] = {}
             self._start_decode_thread()
             self._start_heartbeat_checker_thread()
+
+    def note_rebootstrap_request(self, bootstrap_room: int, new_dp_rank: int) -> None:
+        """Thread-safe: record a queue_lb re-handshake request from a source
+        prefill rank. Latest write wins (a room can only be migrating to one
+        destination at a time)."""
+        with self._rebootstrap_lock:
+            self._rooms_to_rebootstrap[bootstrap_room] = new_dp_rank
+
+    def drain_rebootstrap_requests(self) -> Dict[int, int]:
+        """Return and clear all pending queue_lb re-handshake requests."""
+        with self._rebootstrap_lock:
+            if not self._rooms_to_rebootstrap:
+                return {}
+            drained = self._rooms_to_rebootstrap
+            self._rooms_to_rebootstrap = {}
+            return drained
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -809,7 +837,28 @@ class MoriKVManager(CommonKVManager):
                         else None
                     )
 
-                    if status_code == KVPoll.Success:
+                    if status_code == MORI_STATUS_REBOOTSTRAP:
+                        # queue_lb: the source prefill migrated this queued req
+                        # to a new dp_rank. The new rank rides in the reason
+                        # slot (payload[3]). Hand it to the decode scheduler to
+                        # re-point the receiver; do NOT touch request_status here
+                        # (the room stays WaitingForInput while we re-handshake).
+                        try:
+                            new_dp_rank = int(failure_reason)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Malformed REBOOTSTRAP dp_rank %r for room %s",
+                                failure_reason,
+                                bootstrap_room,
+                            )
+                            continue
+                        self.note_rebootstrap_request(bootstrap_room, new_dp_rank)
+                        logger.debug(
+                            "Room %s asked to rebootstrap onto prefill dp_rank %s",
+                            bootstrap_room,
+                            new_dp_rank,
+                        )
+                    elif status_code == KVPoll.Success:
                         tracker = self.prefill_response_tracker[bootstrap_room]
                         tracker.add(prefill_rank)
                         expected = self.required_prefill_response_num_table.get(
@@ -875,6 +924,30 @@ class MoriKVManager(CommonKVManager):
                     info.dst_port,
                     bootstrap_room,
                 )
+
+    def notify_decode_rebootstrap(
+        self,
+        infos: List[TransferInfo],
+        bootstrap_room: int,
+        new_dp_rank: int,
+    ) -> None:
+        """queue_lb: tell the decode peer(s) of ``bootstrap_room`` to re-handshake
+        against ``new_dp_rank``. Reuses the notify_decode_status frame shape with
+        the REBOOTSTRAP status sentinel; the new dp_rank rides in the reason slot
+        so the decode status worker can parse it without a new message type."""
+        self.notify_decode_status(
+            infos,
+            bootstrap_room,
+            MORI_STATUS_REBOOTSTRAP,
+            failure_reason=str(int(new_dp_rank)),
+        )
+
+    def get_transfer_infos(self, bootstrap_room: int) -> List[TransferInfo]:
+        """queue_lb: snapshot the decode-side TransferInfo(s) for a room (used to
+        address the rebootstrap notification before we tear the room down)."""
+        with self.transfer_lock:
+            infos = self.transfer_infos.get(bootstrap_room)
+            return list(infos.values()) if infos else []
 
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key

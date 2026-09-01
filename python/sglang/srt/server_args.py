@@ -1093,6 +1093,53 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    # ---- DP waiting-queue load balancing (queue_lb feature) ----
+    # Periodically migrate queued requests from overloaded DP ranks to
+    # underloaded ones so that dp-attention lock-step bubbles shrink. See
+    # queue_lb/PLAN.md. Phase 1 only migrates un-prefilled waiting requests
+    # (no KV transfer yet); requires attn_tp_size == 1 (e.g. dp8/tp8/ep8).
+    enable_dp_queue_balance: A[
+        bool,
+        "Enable active load balancing of scheduler waiting queues across DP "
+        "ranks under DP attention (queue_lb feature, Phase 1).",
+        NS("parallel"),
+    ] = False
+    dp_queue_balance_interval_ms: A[
+        int,
+        "Minimum interval (ms) between two DP waiting-queue rebalance rounds.",
+        NS("parallel"),
+    ] = 200
+    dp_queue_balance_threshold: A[
+        float,
+        "Relative threshold over the mean queue length used to classify a DP "
+        "rank as a donor/recipient. A rank with queue length > mean*(1+thr) is "
+        "a donor; < mean*(1-thr) is a recipient.",
+        NS("parallel"),
+    ] = 0.5
+    dp_queue_balance_min_abs: A[
+        int,
+        "Minimum absolute waiting-queue length for a DP rank to be eligible as "
+        "a migration donor.",
+        NS("parallel"),
+    ] = 8
+    dp_queue_balance_cap_per_round: A[
+        int,
+        "Maximum number of requests migrated out of a single donor rank per "
+        "rebalance round.",
+        NS("parallel"),
+    ] = 32
+    dp_queue_balance_migrate_kv: A[
+        bool,
+        "queue_lb Phase 2: also migrate queued requests that already matched a "
+        "prefix KV, bridging that prefix through the shared hicache storage "
+        "backend instead of losing cache locality. Requires "
+        "--enable-hierarchical-cache with a shared --hicache-storage-backend "
+        "(e.g. file or umbp) and a rank-replicated KV cache so the storage key is "
+        "dp/tp-rank independent -- true MLA models or DeepSeek-V4 (compressed-MLA "
+        "rank-replicated pool); otherwise it degrades to Phase 1 (un-prefilled "
+        "reqs only) with a warning.",
+        NS("parallel"),
+    ] = False
     enable_tp_lm_head_all_to_all: A[
         Optional[bool],
         Arg(

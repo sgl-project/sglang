@@ -297,6 +297,12 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
     is_rebootstrap: bool = False
 
+    # queue_lb (PD prefill migration): the exact args last passed to
+    # ``kv_receiver.send_metadata`` so we can replay them verbatim to a new
+    # prefill dp_rank if the source prefill migrates this queued request. None
+    # until the request has published its destination to a prefill peer.
+    last_sent_metadata: Optional[dict] = None
+
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -1515,6 +1521,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.transfer_queue.staging_handler.register_decode_req(
                     decode_req.req.bootstrap_room, decode_req
                 )
+            # queue_lb: remember exactly what we published so a PD prefill
+            # migration can replay it verbatim to the destination dp_rank.
+            decode_req.last_sent_metadata = {
+                "page_indices": page_indices,
+                "aux_index": decode_req.metadata_buffer_index,
+                "state_indices": state_indices,
+                "metadata_kwargs": metadata_kwargs,
+            }
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
@@ -2446,6 +2460,68 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
 
 class SchedulerDisaggregationDecodeMixin:
+    def process_prefill_migration_rebootstrap(self: Scheduler) -> None:
+        """queue_lb (PD prefill migration): re-point queued requests whose prefill
+        peer moved to another dp_rank.
+
+        The source prefill notifies us over the KV control channel (mori
+        REBOOTSTRAP); the manager buffers ``room -> new_dp_rank`` and we drain it
+        here. For each still-in-flight request we invalidate the cached prefill
+        bootstrap info, re-init the receiver against the new dp_rank, and replay
+        the exact ``send_metadata`` we already published so the destination
+        prefill can pick the handshake up under the same bootstrap_room.
+        """
+        prealloc_queue = self.disagg_decode_prealloc_queue
+        if prealloc_queue is None:
+            return
+        kv_manager = prealloc_queue.kv_manager
+        drain = getattr(kv_manager, "drain_rebootstrap_requests", None)
+        if drain is None:
+            return
+        pending = drain()
+        if not pending:
+            return
+
+        # A request awaiting KV lives in the transfer queue (metadata already
+        # sent); one still resolving/preallocating lives in the prealloc queue.
+        by_room: Dict[int, DecodeRequest] = {}
+        for dr in self.disagg_decode_transfer_queue.queue:
+            by_room[dr.req.bootstrap_room] = dr
+        for dr in prealloc_queue.queue:
+            by_room.setdefault(dr.req.bootstrap_room, dr)
+
+        for room, new_dp_rank in pending.items():
+            decode_req = by_room.get(room)
+            if decode_req is None or decode_req.kv_receiver is None:
+                logger.debug(
+                    "REBOOTSTRAP for unknown/concluded room %s (dp_rank %s); skip",
+                    room,
+                    new_dp_rank,
+                )
+                continue
+            try:
+                decode_req.req.disagg_prefill_dp_rank = new_dp_rank
+                decode_req.kv_receiver.invalidate_cached_bootstrap_infos()
+                decode_req.kv_receiver.init(new_dp_rank)
+                sent = decode_req.last_sent_metadata
+                if sent is not None:
+                    decode_req.kv_receiver.send_metadata(
+                        sent["page_indices"],
+                        sent["aux_index"],
+                        sent["state_indices"],
+                        **sent["metadata_kwargs"],
+                    )
+                logger.info(
+                    "queue_lb: re-pointed room %s to prefill dp_rank %s", room, new_dp_rank
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to re-point room %s to dp_rank %s: %s",
+                    room,
+                    new_dp_rank,
+                    e,
+                )
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -2460,6 +2536,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # queue_lb: re-point requests whose prefill peer migrated dp_rank.
+            self.process_prefill_migration_rebootstrap()
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -2503,6 +2581,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # queue_lb: re-point requests whose prefill peer migrated dp_rank.
+            self.process_prefill_migration_rebootstrap()
             self.process_decode_queue()
 
             # Get the next batch to run
