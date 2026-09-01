@@ -27,10 +27,8 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
-    _resolve_sm90_fp4_symm_buffer_constructor,
     is_sm90_fp4_mega_moe_available,
     is_sm90_fp8_mega_moe_available,
-    normalize_sm90_fp4_symm_buffer_views,
     run_sm90_mega_routed,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -54,7 +52,7 @@ def _get_mega_moe_symm_buffer(
     num_topk: int,
     hidden: int,
     intermediate_hidden: int,
-    use_sm90_fp4_ring_buffer: bool = False,
+    use_sm90_fp4_buffer: bool = False,
 ) -> SymmBuffer:
     import deep_gemm
 
@@ -65,21 +63,14 @@ def _get_mega_moe_symm_buffer(
         num_topk,
         hidden,
         intermediate_hidden,
-        use_sm90_fp4_ring_buffer,
+        use_sm90_fp4_buffer,
     )
     buf = _MEGA_MOE_SYMM_BUFFER.get(key)
     if buf is None:
-        constructor = (
-            _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm)
-            if use_sm90_fp4_ring_buffer
-            else deep_gemm.get_symm_buffer_for_mega_moe
-        )
-        constructor_kwargs = (
-            {"mma_type": "fp8xfp4"}
-            if use_sm90_fp4_ring_buffer
-            else {"use_fp8_dispatch": True}
-        )
-        buf = constructor(
+        # SM90 FP8xFP4 is implemented by DeepGEMM's Hopper-specific API.  It
+        # shares the original SM90 symmetric-buffer ABI with FP8 MegaMoE; the
+        # newer ``deep_gemm.mega`` ring buffer belongs to the SM100 path.
+        buf = deep_gemm.get_symm_buffer_for_mega_moe(
             group,
             num_experts,
             num_max_tokens_per_rank,
@@ -87,10 +78,8 @@ def _get_mega_moe_symm_buffer(
             hidden,
             intermediate_hidden,
             activation="swiglu",
-            **constructor_kwargs,
+            use_fp8_dispatch=True,
         )
-        if use_sm90_fp4_ring_buffer:
-            buf = normalize_sm90_fp4_symm_buffer_views(buf)
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
 
@@ -218,7 +207,7 @@ def _run_mega_routed(
         num_topk=top_k,
         hidden=hidden_size,
         intermediate_hidden=intermediate_size,
-        use_sm90_fp4_ring_buffer=(
+        use_sm90_fp4_buffer=(
             _device_sm == 90
             and getattr(moe.experts, "_mega_moe_sm90_fp4_weights", False)
         ),

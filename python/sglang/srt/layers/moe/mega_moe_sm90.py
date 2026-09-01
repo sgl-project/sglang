@@ -15,15 +15,13 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.utils import _device_sm
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -58,92 +56,16 @@ def is_sm90_fp4_mega_moe_available(experts) -> bool:
         import deep_gemm
     except ImportError:
         return False
-    mega = getattr(deep_gemm, "mega", None)
+    extension = getattr(deep_gemm, "_C", None)
     return (
         callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None))
-        and callable(getattr(deep_gemm, "mega_moe_pre_dispatch_sm90", None))
-        and callable(getattr(mega, "get_symm_buffer_for_mega_moe", None))
+        and callable(getattr(extension, "fp8_fp4_mega_moe_sm90", None))
+        and callable(
+            getattr(deep_gemm, "transform_weights_for_mega_moe_sm90_fp4", None)
+        )
+        and callable(getattr(deep_gemm, "get_symm_buffer_for_mega_moe", None))
         and getattr(experts, "_mega_moe_sm90_fp4_weights", False)
     )
-
-
-def _resolve_sm90_fp4_symm_buffer_constructor(deep_gemm) -> Callable:
-    """Return the ring-buffer constructor required by fp8_fp4_mega_moe.
-
-    Some DeepGEMM builds expose a legacy SM90 constructor at the package root
-    while their FP8xFP4 wrapper consumes the newer ``mega.SymmBuffer`` ABI,
-    including ``num_ring_tokens``.  Selecting the constructor from the same
-    module as that wrapper keeps the buffer layout and call ABI paired.
-    """
-    mega = getattr(deep_gemm, "mega", None)
-    constructor = getattr(mega, "get_symm_buffer_for_mega_moe", None)
-    if not callable(constructor):
-        raise RuntimeError(
-            "DeepGEMM fp8_fp4_mega_moe requires the ring-buffer constructor "
-            "deep_gemm.mega.get_symm_buffer_for_mega_moe"
-        )
-    return constructor
-
-
-def normalize_sm90_fp4_symm_buffer_views(buf):
-    """Restore tensor views lost by mixed TVM-FFI/PyTorch DeepGEMM builds.
-
-    The ring-buffer slicer in affected builds returns byte tensors through
-    DLPack, and four-byte floating-point regions can arrive as integer tensors.
-    The SM90 pre-dispatch and FP8xFP4 kernel require typed views for all eight
-    regions. Reinterpreting a same-width integer wire view does not alter its
-    shape, strides, address, or underlying allocation.
-    """
-    num_ring_tokens = getattr(buf, "num_ring_tokens", None)
-    if not isinstance(num_ring_tokens, int) or num_ring_tokens <= 0:
-        raise RuntimeError(
-            "DeepGEMM SM90 FP4 buffer is missing a positive num_ring_tokens"
-        )
-    required_dtypes = {
-        "x": torch.float8_e4m3fn,
-        "x_sf": torch.float32,
-        # The pre-dispatch input topk indices are int32, but the symmetric
-        # buffer slot is int64 (see sm90_mega_moe_pre_dispatch.cuh).
-        "topk_idx": torch.int64,
-        "topk_weights": torch.float32,
-        "l1_acts": torch.float8_e4m3fn,
-        "l1_acts_sf": torch.float32,
-        "l2_acts": torch.float8_e4m3fn,
-        "l2_acts_sf": torch.float32,
-    }
-    normalized = {}
-    for name, required_dtype in required_dtypes.items():
-        tensor = getattr(buf, name, None)
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"DeepGEMM SM90 FP4 buffer {name} must be a tensor")
-        if tensor.dtype == required_dtype:
-            normalized[name] = tensor
-            continue
-        if required_dtype == torch.float8_e4m3fn:
-            allowed_wire_dtypes = (torch.int8, torch.uint8)
-        elif required_dtype == torch.float32:
-            allowed_wire_dtypes = (torch.int32, torch.uint32)
-        else:
-            allowed_wire_dtypes = ()
-        if tensor.dtype not in allowed_wire_dtypes:
-            raise TypeError(
-                f"DeepGEMM SM90 FP4 buffer {name} cannot reinterpret "
-                f"{tensor.dtype} as {required_dtype}"
-            )
-        try:
-            normalized[name] = tensor.view(required_dtype)
-        except RuntimeError as exc:
-            raise TypeError(
-                f"DeepGEMM SM90 FP4 buffer {name} byte storage is not "
-                f"view-compatible with {required_dtype}: shape={tuple(tensor.shape)}, "
-                f"stride={tuple(tensor.stride())}"
-            ) from exc
-
-    # Validate every view before mutating the buffer so a malformed field does
-    # not leave a partially normalized object in the process-wide cache.
-    for name, tensor in normalized.items():
-        setattr(buf, name, tensor)
-    return buf
 
 
 def run_sm90_mega_routed(
@@ -173,7 +95,7 @@ def run_sm90_mega_routed(
     else:
         routed_scaling_factor = float(moe.routed_scaling_factor)
 
-    deep_gemm.mega_moe_pre_dispatch_sm90(
+    mega_moe_pre_dispatch(
         hidden_states,
         topk_ids,
         topk_weights,
@@ -181,9 +103,7 @@ def run_sm90_mega_routed(
         buf.x_sf,
         buf.topk_idx,
         buf.topk_weights,
-        num_tokens=num_tokens,
-        group_size=128,
-        routed_scaling_factor=routed_scaling_factor,
+        quant_group_size=128,
     )
 
     y = torch.empty(
@@ -192,6 +112,12 @@ def run_sm90_mega_routed(
         device=hidden_states.device,
     )
     if use_fp4_weights:
+        extension = getattr(deep_gemm, "_C", None)
+        if not callable(getattr(extension, "fp8_fp4_mega_moe_sm90", None)):
+            raise RuntimeError(
+                "DeepGEMM build lacks the Hopper FP8xFP4 MegaMoE kernel "
+                "_C.fp8_fp4_mega_moe_sm90"
+            )
         deep_gemm.fp8_fp4_mega_moe(
             y,
             moe.experts.mega_l1_weights,
@@ -213,6 +139,8 @@ def run_sm90_mega_routed(
             activation_clamp=getattr(moe.config, "swiglu_limit", None),
             fast_math=True,
         )
+    if routed_scaling_factor != 1.0:
+        y.mul_(routed_scaling_factor)
     y = y[:num_tokens]
 
     return y
@@ -318,71 +246,22 @@ def _validate_sm90_fp4_transform_output(
     return validated[0], validated[1]
 
 
-def _transform_weights_for_mega_moe_sm90_fp4_compat(
-    l1_weights: tuple[torch.Tensor, torch.Tensor],
-    l2_weights: tuple[torch.Tensor, torch.Tensor],
-) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
-    """Port DeepGEMM's pure-Python SM90 FP4 transform from commit d6b9815.
-
-    Some image builds contain the SM90 native kernel but predate the public
-    transform helper. This exact layout transform keeps those builds usable
-    without falling back to a different quantization or GEMM kernel.
-    """
-
-    def _interleave_one(tensor: torch.Tensor, gran: int = 8) -> torch.Tensor:
-        groups, n, *rest = tensor.shape
-        half = n // 2
-        gate = tensor[:, :half].reshape(groups, half // gran, gran, *rest)
-        up = tensor[:, half:].reshape(groups, half // gran, gran, *rest)
-        interleaved = torch.stack([gate, up], dim=2).reshape(groups, n, *rest)
-        return torch.empty_like(tensor).copy_(interleaved)
-
-    def _pack_fp32_sf_to_ue8m0_kmajor(scale: torch.Tensor) -> torch.Tensor:
-        groups, n, k_groups = scale.shape
-        bits = scale.view(torch.int32)
-        ue8m0 = bits.bitwise_right_shift(23).bitwise_and(0xFF).to(torch.uint8)
-        ue8m0 = ue8m0.contiguous().view(groups, n, k_groups // 4, 4)
-        return ue8m0.view(torch.int32).reshape(groups, n, k_groups // 4).contiguous()
-
-    l1_fp4, l1_scale = _validate_sm90_fp4_input_pair(
-        "l1", l1_weights, interleaved=True
-    )
-    l2_fp4, l2_scale = _validate_sm90_fp4_input_pair(
-        "l2", l2_weights, interleaved=False
-    )
-    l1_fp4 = _interleave_one(l1_fp4.contiguous().view(torch.int8))
-    l2_fp4 = l2_fp4.contiguous().view(torch.int8)
-    l1_scale = _interleave_one(l1_scale)
-    return (
-        (l1_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l1_scale)),
-        (l2_fp4, _pack_fp32_sf_to_ue8m0_kmajor(l2_scale)),
-    )
-
-
 def _resolve_sm90_fp4_weight_transform(deep_gemm) -> Callable:
-    missing_kernels = [
-        name
-        for name in ("fp8_fp4_mega_moe", "mega_moe_pre_dispatch_sm90")
-        if not callable(getattr(deep_gemm, name, None))
-    ]
-    if missing_kernels:
+    extension = getattr(deep_gemm, "_C", None)
+    if not callable(getattr(deep_gemm, "fp8_fp4_mega_moe", None)) or not callable(
+        getattr(extension, "fp8_fp4_mega_moe_sm90", None)
+    ):
         raise RuntimeError(
-            "DeepGEMM does not provide the SM90 FP4 MegaMoE runtime; missing "
-            + ", ".join(missing_kernels)
+            "DeepGEMM does not provide the Hopper FP8xFP4 MegaMoE runtime; "
+            "required symbol: _C.fp8_fp4_mega_moe_sm90"
         )
     transform = getattr(deep_gemm, "transform_weights_for_mega_moe_sm90_fp4", None)
-    if transform is not None:
-        if not callable(transform):
-            raise TypeError(
-                "DeepGEMM transform_weights_for_mega_moe_sm90_fp4 must be callable"
-            )
-        return transform
-
-    logger.warning(
-        "DeepGEMM has the SM90 FP4 MegaMoE kernel but not its Python weight "
-        "transform; using the compatibility port from DeepGEMM d6b9815"
-    )
-    return _transform_weights_for_mega_moe_sm90_fp4_compat
+    if not callable(transform):
+        raise RuntimeError(
+            "DeepGEMM build lacks transform_weights_for_mega_moe_sm90_fp4; "
+            "install a build containing the Hopper implementation from d6b9815"
+        )
+    return transform
 
 
 def _transpose_scale_for_utccp(scale: torch.Tensor) -> torch.Tensor:
