@@ -414,7 +414,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )
-        return (base[:, None] + page_offsets[None, :]).reshape(-1)
+        expanded = (base[:, None] + page_offsets[None, :]).reshape(-1)
+        if self.swa_attn_allocator.debug_mode:
+            # Reference unique on CPU: the expansion must cover exactly the
+            # touched pages, on every caller's real input.
+            got = torch.unique(expanded.cpu() // self.page_size)
+            ref = torch.unique(indices.cpu() // self.page_size)
+            assert torch.equal(got, ref), "expansion page set mismatch"
+        return expanded
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)

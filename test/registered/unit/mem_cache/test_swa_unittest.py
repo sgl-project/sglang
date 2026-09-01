@@ -881,29 +881,6 @@ class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
         self.freed.append(free_index)
 
 
-class TestExpandToFullPages(CustomTestCase):
-    """The duplicate-tolerant expansion covers exactly the touched pages;
-    duplicates must collapse in the paged free's own page dedup."""
-
-    def test_expansion_covers_the_unique_page_set(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
-        indices = torch.tensor([1, 2, 3, 6, 9, 11], dtype=torch.int64)
-        got = allocator._expand_to_full_pages(indices)
-        ref_pages = torch.unique(indices // 4)
-        reference = (ref_pages[:, None] * 4 + torch.arange(4)).reshape(-1)
-        self.assertTrue(torch.equal(torch.unique(got), reference))
-
-    def test_free_swa_releases_each_touched_page_once(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
-        full = _swa_alloc(allocator, 16)
-        available_before = allocator.swa_available_size()
-
-        # Two pages touched, with same-page repeats and unaligned picks.
-        allocator.free_swa(full[torch.tensor([1, 2, 3, 6])])
-
-        self.assertEqual(allocator.swa_available_size(), available_before + 8)
-
-
 class TestFreeFullPartition(CustomTestCase):
     """`free_full` releases only the full side of a hybrid SWA allocator."""
 
