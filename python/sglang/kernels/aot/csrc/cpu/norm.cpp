@@ -9,12 +9,13 @@ struct NormParams {
   //   3D -> [B, 1, T, D]
   //   4D -> [B, H, T, D]
   //
-  // Input: last dimension contiguous.
+  // Input and residual: last dimension contiguous.
   // Output: contiguous.
 
   int ndim{0};
   int64_t B{1}, H{1}, T{1}, D{1};
   int64_t i_strideB{0}, i_strideH{0}, i_strideT{0};
+  int64_t r_strideB{0}, r_strideH{0}, r_strideT{0};
   float eps{1e-5f};
   float shift{0.f};
 
@@ -43,6 +44,21 @@ struct NormParams {
       default:
         TORCH_INTERNAL_ASSERT(false);
     }
+
+    r_strideB = H * T * D;
+    r_strideH = T * D;
+    r_strideT = D;
+  }
+
+  // Updated in place, so it needs its own strides not the output layout
+  void set_residual(const at::Tensor& residual) {
+    r_strideB = residual.stride(0);
+    if (ndim == 3) {
+      r_strideT = residual.stride(1);
+    } else if (ndim == 4) {
+      r_strideH = residual.stride(1);
+      r_strideT = residual.stride(2);
+    }
   }
 
   inline int64_t rows() const {
@@ -53,6 +69,9 @@ struct NormParams {
   }
   inline int64_t output_offset(int64_t b, int64_t h, int64_t t) const {
     return ((b * H + h) * T + t) * D;
+  }
+  inline int64_t residual_offset(int64_t b, int64_t h, int64_t t) const {
+    return b * r_strideB + h * r_strideH + t * r_strideT;
   }
 };
 
@@ -429,7 +448,7 @@ void fused_add_norm4d_kernel_impl(
     bool output_uses_input_stride = false) {
   LAUNCH_PARALLEL_LOOP(
       const int64_t out_offset = output_uses_input_stride ? p.input_offset(b, h, t) : p.output_offset(b, h, t);
-      scalar_t* __restrict__ residual_ptr = residual + p.output_offset(b, h, t);
+      scalar_t* __restrict__ residual_ptr = residual + p.residual_offset(b, h, t);
       NormReduceGeneric<M, scalar_t, true>::apply(
           out + out_offset, input + p.input_offset(b, h, t), nullptr, residual_ptr, p, p.D));
 }
@@ -782,12 +801,12 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   const auto st = input.scalar_type();
   CHECK_INPUT_ND<2, 3>(input);
-  CHECK_EQ(input.sizes(), residual.sizes());
-  CHECK_EQ(st, residual.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(residual, input.sizes(), st);
   CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, st);
 
   NormParams p{input, static_cast<float>(eps)};
   p.weight = weight.data_ptr();
+  p.set_residual(residual);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_add_rmsnorm_kernel", [&] {
     fused_add_norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(
@@ -805,13 +824,13 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
   const auto st = input.scalar_type();
   CHECK_INPUT_ND<2>(input);
-  CHECK_EQ(input.sizes(), residual.sizes());
-  CHECK_EQ(st, residual.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(residual, input.sizes(), st);
   CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, st);
 
   NormParams p{input, static_cast<float>(eps)};
   p.weight = weight.data_ptr();
   p.shift = 1.f;
+  p.set_residual(residual);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "gemma_fused_add_rmsnorm_kernel", [&] {
     fused_add_norm4d_kernel_impl<NormMode::GemmaNorm, scalar_t>(
@@ -836,8 +855,7 @@ at::Tensor fused_add_layernorm_cpu(
   const auto st = input.scalar_type();
   const int64_t hidden_size = input.size(-1);
   CHECK_INPUT_ND<2, 3>(input);
-  CHECK_EQ(input.sizes(), residual.sizes());
-  CHECK_EQ(st, residual.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<true>(residual, input.sizes(), st);
   CHECK_INPUT_SHAPE_DTYPE<false>(weight, {hidden_size}, st);
   if (bias.has_value()) {
     CHECK_INPUT_SHAPE_DTYPE<false>(bias.value(), {hidden_size}, st);
@@ -846,6 +864,7 @@ at::Tensor fused_add_layernorm_cpu(
   NormParams p{input, static_cast<float>(eps)};
   p.weight = weight.data_ptr();
   p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
+  p.set_residual(residual);
 
   at::Tensor output = at::empty_like(input);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_add_layernorm_kernel", [&] {
