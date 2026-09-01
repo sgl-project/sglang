@@ -1,8 +1,8 @@
 """MI35x PR-CI accuracy gate for the Qwen3.5 GDN out_proj fusion.
 
-Two parallel TP4 servers on the MXFP4-AttnFP8 checkpoint (8-GPU stage-c): fused
-gated-RMSNorm + FP8 per-token quant into the out_proj a8w8 GEMM (GPUs 0-3) vs
-the unfused path (GPUs 4-7, SGLANG_DISABLE_GDN_OUT_PROJ_FUSION=1). The fused
+Two parallel TP2 servers on the MXFP4-AttnFP8 checkpoint (8-GPU stage-c): fused
+gated-RMSNorm + FP8 per-token quant into the out_proj a8w8 GEMM (GPUs 0-1) vs
+the unfused path (GPUs 2-3, SGLANG_DISABLE_GDN_OUT_PROJ_FUSION=1). The fused
 path must hold GSM8K accuracy against the baseline.
 """
 
@@ -47,12 +47,13 @@ GSM8K_DATA_URL = (
     "master/grade_school_math/data/test.jsonl"
 )
 
-# TP=4 so both variants fit on the 8-GPU runner at once.
+# TP=2 keeps in_proj_ba at 2*num_v_heads/tp = 64 columns. TP=4 narrows it to 32,
+# which aiter's gemm_a8w8_bpreshuffle has no kernel for once M reaches 256.
 COMMON_ARGS: List[str] = [
     "--attention-backend",
     "aiter",
     "--tp",
-    "4",
+    "2",
     "--trust-remote-code",
     "--disable-radix-cache",
     "--mem-fraction-static",
@@ -91,12 +92,12 @@ def get_out_proj_fusion_variants() -> List[OutProjFusionVariant]:
     return [
         OutProjFusionVariant(
             variant="fused-gdn-out-proj",
-            hip_visible_devices="0,1,2,3",
+            hip_visible_devices="0,1",
             port_offset=0,
         ),
         OutProjFusionVariant(
             variant="unfused-baseline",
-            hip_visible_devices="4,5,6,7",
+            hip_visible_devices="2,3",
             port_offset=1,
             env_vars={"SGLANG_DISABLE_GDN_OUT_PROJ_FUSION": "1"},
         ),
@@ -179,7 +180,7 @@ class TestQwen35GdnOutProjFusionMI35x(CustomTestCase):
     def test_qwen35_gdn_out_proj_fusion_accuracy(self):
         summary = (
             "### Qwen3.5 MXFP4-AttnFP8 GDN out_proj fusion GSM8K "
-            "(MI35x, parallel TP4)\n\n"
+            "(MI35x, parallel TP2)\n\n"
         )
         summary += (
             "| Variant | GPUs | Accuracy | Invalid | Latency (s) | Output tok/s | "
