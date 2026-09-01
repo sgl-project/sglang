@@ -139,7 +139,11 @@ emulate them coarsely.
 
 - `launch_emulated_tp2.sh` — canonical TP=2 emulated launch + health wait
 - `run_case.sh` — parameterized case runner (`PP=2 ./run_case.sh ...` for PP)
-- `dp_like.sh` — Case 3
+- `dp_like.sh` — Case 3 runner
+- `profile_dp.sh` — Case 3 torch-profiler capture (`/start_profile` on both
+  instances under concurrent load; traces in `traces/`, open in Perfetto)
+- `traces/dp-instance-{A,B}.trace.json.gz` — Chrome traces of both instances
+  profiled simultaneously (60 forward steps, CPU+GPU activities)
 - `verify_and_bench.py` — correctness + tok/s probe against `/generate`
 - `nccl_same_gpu_test.py` — minimal proof NCCL 2.31 runs 2 ranks on one GPU
 - `all_reduce_bench_2rank.py` — emulated-interconnect busbw measurement

@@ -13,14 +13,12 @@ LOG_DIR=/root/mig-demo
 pkill -f sglang.launch_server 2>/dev/null
 sleep 3
 
+# Sequential startup: fractions assume A allocates before B measures free mem.
 for item in "30000:${MEM_A:-0.42}" "30001:${MEM_B:-0.84}"; do
     p=${item%%:*}; frac=${item##*:}
     nohup python -m sglang.launch_server --model-path Qwen/Qwen3-0.6B \
         --host 127.0.0.1 --port $p --tp 1 --mem-fraction-static $frac \
         > "$LOG_DIR/dp_$p.log" 2>&1 &
-done
-
-for p in 30000 30001; do
     ok=0
     for i in $(seq 1 60); do
         curl -sf http://127.0.0.1:$p/health > /dev/null 2>&1 && { ok=1; break; }
