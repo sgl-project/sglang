@@ -30,6 +30,13 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 // fused_sigmoid_mul
 void fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate);
 
+// indexed modulation
+at::Tensor indexed_scale_shift_bf16_cpu_impl(
+    at::Tensor& x,
+    const at::Tensor& shift,
+    const at::Tensor& scale,
+    const at::Tensor& indices);
+
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 
@@ -582,6 +589,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
   m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
+
+    m.def(
+            "indexed_scale_shift_bf16_(Tensor(a!) x, Tensor shift, Tensor scale, Tensor indices) -> Tensor(a!)");
+    m.impl("indexed_scale_shift_bf16_", torch::kCPU, &indexed_scale_shift_bf16_cpu_impl);
 
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");

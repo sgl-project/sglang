@@ -24,6 +24,7 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
 from sglang.kernels.ops.diffusion import (
+    can_use_indexed_scale_shift_bf16_cpu,
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
@@ -349,12 +350,15 @@ def _modulate_scale_shift(
     """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
-        x.is_cuda
-        and x.dtype == _BF16_DTYPE
+        x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and shift.dtype == _BF16_DTYPE
         and scale.dtype == _BF16_DTYPE
         and x.is_contiguous()
+        and (
+            x.is_cuda
+            or can_use_indexed_scale_shift_bf16_cpu(x, shift, scale, indices)
+        )
     ):
         return indexed_scale_shift_bf16_(x, shift, scale, indices)
     return (
