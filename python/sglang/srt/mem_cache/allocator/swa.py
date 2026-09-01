@@ -365,6 +365,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.page_size, dtype=free_index.dtype, device=free_index.device
             )
             mapping_indices = (base[:, None] + offsets[None, :]).reshape(-1)
+            if self.swa_attn_allocator.debug_mode:
+                # Reference unique on CPU: the expansion must cover exactly
+                # the touched pages, on every caller's real input.
+                got = torch.unique(mapping_indices.cpu() // self.page_size)
+                ref = torch.unique(free_index.cpu() // self.page_size)
+                assert torch.equal(got, ref), "expansion page set mismatch"
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         self.clear_full_to_swa_mapping(mapping_indices)

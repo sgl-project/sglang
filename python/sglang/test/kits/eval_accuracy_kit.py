@@ -194,6 +194,10 @@ class GSM8KMixin:
     gsm8k_thinking: bool = False  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
     gsm8k_n_repeats: int = 1  # sgl_eval backend
+    # None keeps run_eval's greedy default; set both to route the run through
+    # the sampling path.
+    gsm8k_temperature: Optional[float] = None
+    gsm8k_top_p: Optional[float] = None
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -228,6 +232,8 @@ class GSM8KMixin:
                 api="completion",
                 max_tokens=512,
                 num_shots=self.gsm8k_num_shots,
+                temperature=self.gsm8k_temperature,
+                top_p=self.gsm8k_top_p,
             )
 
 
