@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -598,12 +600,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
                     continue
-                if msg[0] == b"ABORT_ACK":
-                    # Drain ack for an aborted room; aggregate per prefill rank.
-                    if len(msg) >= 3:
-                        self.note_abort_ack(
-                            int(msg[1].decode("ascii")), int(msg[2].decode("ascii"))
-                        )
+                if self.handle_abort_ack_message(msg):
                     continue
                 logger.warning(
                     "decode_listener_thread: unexpected message tag %s",
@@ -2667,16 +2664,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return self.transfer_statuses[room].is_done()
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
-        if not msg or msg[0] != b"ABORT":
+        if not msg or msg[0] != ABORT_TAG:
             return False
 
-        try:
-            room_to_be_aborted = int(msg[1].decode("ascii"))
-            decode_ip = msg[2].decode("ascii") if len(msg) > 2 else None
-            decode_port = int(msg[3].decode("ascii")) if len(msg) > 3 else None
-        except Exception as e:
-            logger.debug(f"Ignoring malformed abort notification: {e}")
+        notification = AbortNotification.from_zmq(msg)
+        if notification is None:
             return True
+        room_to_be_aborted = notification.room
 
         room_active = (
             room_to_be_aborted in self.request_status
@@ -2698,22 +2692,37 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"ignoring (already completed or unknown)"
             )
 
+        self._handle_deferred_abort_ack(notification, room_active)
+        return True
+
+    def _handle_deferred_abort_ack(
+        self, notification: AbortNotification, room_active: bool
+    ) -> None:
+        room_to_be_aborted = notification.room
         # Deferred KV release: register only after the status flip above (see
         # register_deferred_ack_target), then try once -- the room may already be
         # quiescent and never revisited by the worker. A concluded/unknown room is
         # acked only when nothing is still counted for it: the ERR path abandons
         # sibling handles that may still be writing and clear() then drops the
         # room, so "unknown" alone does not imply quiescent.
-        if self.enable_deferred_decode_kv_release and decode_port is not None:
+        if (
+            self.enable_deferred_decode_kv_release
+            and notification.decode_ip is not None
+            and notification.decode_port is not None
+        ):
             if room_active:
                 self.register_deferred_ack_target(
-                    room_to_be_aborted, decode_ip, decode_port
+                    room_to_be_aborted,
+                    notification.decode_ip,
+                    notification.decode_port,
                 )
                 self._maybe_ack_drained_abort(room_to_be_aborted)
             elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
-
-        return True
+                self._send_abort_ack(
+                    notification.decode_ip,
+                    notification.decode_port,
+                    room_to_be_aborted,
+                )
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():

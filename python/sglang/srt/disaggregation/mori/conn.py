@@ -30,6 +30,8 @@ from mori.io import (
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -51,8 +53,6 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
-_TAG_ABORT = b"ABORT"
-_TAG_ABORT_ACK = b"ABORT_ACK"
 
 
 def _normalize_state_indices_per_component(
@@ -451,14 +451,6 @@ class MoriKVManager(CommonKVManager):
             # Failed is terminal — never overwrite with non-Failed.
             return
         super().update_status(bootstrap_room, status)
-
-    def reset_deferred_abort_room(self, bootstrap_room: int) -> None:
-        """Arm a new abort before its notifications can produce an ACK."""
-        self._deferred_abort_ack_tracker[bootstrap_room] = set()
-
-    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
-        """Keep ACKs that arrived between notification and scheduler deferral."""
-        self._deferred_abort_ack_tracker.setdefault(bootstrap_room, set())
 
     def _transfer_worker(self, queue: FastQueue) -> None:
         while True:
@@ -871,38 +863,12 @@ class MoriKVManager(CommonKVManager):
             return None
         return payload
 
-    def _parse_abort_message(
-        self, msg: List[bytes]
-    ) -> Optional[Tuple[int, Optional[str], Optional[int]]]:
-        if len(msg) < 2:
-            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
-            return None
-
-        try:
-            bootstrap_room = int(msg[1].decode("ascii"))
-        except (ValueError, UnicodeDecodeError):
-            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
-            return None
-
-        if len(msg) < 4:
-            return bootstrap_room, None, None
-
-        try:
-            return (
-                bootstrap_room,
-                msg[2].decode("ascii"),
-                int(msg[3].decode("ascii")),
-            )
-        except (ValueError, UnicodeDecodeError):
-            logger.warning("Malformed ABORT message: invalid return address")
-            return bootstrap_room, None, None
-
     def _handle_abort_message(self, msg: List[bytes]) -> None:
         """Handle ABORT and defer its ACK until this rank's writes drain."""
-        parsed = self._parse_abort_message(msg)
-        if parsed is None:
+        notification = AbortNotification.from_zmq(msg)
+        if notification is None:
             return
-        bootstrap_room, decode_ip, decode_port = parsed
+        bootstrap_room = notification.room
 
         with self.transfer_lock:
             current = self.request_status.get(bootstrap_room)
@@ -918,7 +884,9 @@ class MoriKVManager(CommonKVManager):
                 bootstrap_room,
             )
 
-        self._arm_abort_ack(bootstrap_room, decode_ip, decode_port)
+        self._arm_abort_ack(
+            bootstrap_room, notification.decode_ip, notification.decode_port
+        )
 
     def _arm_abort_ack(
         self,
@@ -946,7 +914,7 @@ class MoriKVManager(CommonKVManager):
                         continue
 
                     tag = msg[0]
-                    if tag == _TAG_ABORT:
+                    if tag == ABORT_TAG:
                         self._handle_abort_message(msg)
                         continue
 
@@ -973,18 +941,6 @@ class MoriKVManager(CommonKVManager):
                 if not rooms:
                     self.addr_to_rooms_tracker.pop(bootstrap_addr, None)
 
-    def _handle_abort_ack_message(self, msg: List[bytes]) -> None:
-        if len(msg) < 3:
-            logger.warning("Incomplete ABORT_ACK received")
-            return
-        try:
-            bootstrap_room = int(msg[1].decode("ascii"))
-            prefill_rank = int(msg[2].decode("ascii"))
-        except (ValueError, UnicodeDecodeError):
-            logger.warning("Malformed ABORT_ACK received")
-            return
-        self.note_abort_ack(bootstrap_room, prefill_rank)
-
     def _start_decode_thread(self) -> None:
         def decode_worker():
             while True:
@@ -993,8 +949,7 @@ class MoriKVManager(CommonKVManager):
                     if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
                         self._handle_aux_data(msg)
                         continue
-                    if msg and msg[0] == _TAG_ABORT_ACK:
-                        self._handle_abort_ack_message(msg)
+                    if self.handle_abort_ack_message(msg):
                         continue
 
                     if not msg or msg[0] != MORI_GUARD:
@@ -1965,7 +1920,6 @@ class MoriKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time: Optional[float] = None
-        self.metadata_published = False
 
     def init(
         self,
@@ -2080,7 +2034,6 @@ class MoriKVReceiver(CommonKVReceiver):
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
-        self.metadata_published = True
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
@@ -2118,12 +2071,6 @@ class MoriKVReceiver(CommonKVReceiver):
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
-
-    def _send_abort_notification(self):
-        if self.kv_mgr.enable_deferred_decode_kv_release and self.metadata_published:
-            # The peer can ACK immediately, before the scheduler defers release.
-            self.kv_mgr.reset_deferred_abort_room(self.bootstrap_room)
-        super()._send_abort_notification()
 
     def abort(self):
         if self.bootstrap_room is None:

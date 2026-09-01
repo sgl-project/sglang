@@ -50,6 +50,9 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+ABORT_TAG = b"ABORT"
+ABORT_ACK_TAG = b"ABORT_ACK"
+
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
 # so we don't open a fresh TCP connection per query (that churns short-lived
@@ -141,6 +144,76 @@ class PrefillRankInfo:
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+
+
+@dataclasses.dataclass(frozen=True)
+class AbortNotification:
+    room: int
+    decode_ip: Optional[str] = None
+    decode_port: Optional[int] = None
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortNotification]:
+        if len(msg) < 2:
+            logger.warning("Malformed ABORT message: too few frames (%d)", len(msg))
+            return None
+
+        try:
+            room = int(msg[1].decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid room field %r", msg[1])
+            return None
+
+        if len(msg) < 4:
+            return cls(room=room)
+
+        try:
+            return cls(
+                room=room,
+                decode_ip=msg[2].decode("ascii"),
+                decode_port=int(msg[3].decode("ascii")),
+            )
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT message: invalid return address")
+            return cls(room=room)
+
+    def to_zmq(self) -> List[bytes]:
+        frames = [ABORT_TAG, str(self.room).encode("ascii")]
+        if self.decode_ip is not None and self.decode_port is not None:
+            frames.extend(
+                [
+                    self.decode_ip.encode("ascii"),
+                    str(self.decode_port).encode("ascii"),
+                ]
+            )
+        return frames
+
+
+@dataclasses.dataclass(frozen=True)
+class AbortAck:
+    room: int
+    prefill_rank: int
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]) -> Optional[AbortAck]:
+        if len(msg) < 3:
+            logger.warning("Incomplete ABORT_ACK received")
+            return None
+        try:
+            return cls(
+                room=int(msg[1].decode("ascii")),
+                prefill_rank=int(msg[2].decode("ascii")),
+            )
+        except (ValueError, UnicodeDecodeError):
+            logger.warning("Malformed ABORT_ACK received")
+            return None
+
+    def to_zmq(self) -> List[bytes]:
+        return [
+            ABORT_ACK_TAG,
+            str(self.room).encode("ascii"),
+            str(self.prefill_rank).encode("ascii"),
+        ]
 
 
 class CommonKVManager(BaseKVManager):
@@ -395,6 +468,17 @@ class CommonKVManager(BaseKVManager):
         if acks is not None:
             acks.add(prefill_rank)
 
+    def handle_abort_ack_message(self, msg: List[bytes]) -> bool:
+        """Consume an ABORT_ACK and record it for an armed decode room."""
+        if not msg or msg[0] != ABORT_ACK_TAG:
+            return False
+        if not self.enable_deferred_decode_kv_release:
+            return True
+        ack = AbortAck.from_zmq(msg)
+        if ack is not None:
+            self.note_abort_ack(ack.room, ack.prefill_rank)
+        return True
+
     def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
         """True once every prefill rank that could still write these pages has acked."""
         return (
@@ -419,11 +503,7 @@ class CommonKVManager(BaseKVManager):
             na = NetworkAddress(decode_ip, decode_port)
             self._send_multipart_locked(
                 na.to_tcp(),
-                [
-                    b"ABORT_ACK",
-                    str(room).encode("ascii"),
-                    str(self._prefill_unique_rank()).encode("ascii"),
-                ],
+                AbortAck(room, self._prefill_unique_rank()).to_zmq(),
                 is_ipv6=na.is_ipv6,
             )
         except Exception as e:
@@ -1638,6 +1718,12 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
 
+    def abort_for_deferred_release(self) -> None:
+        """Arm ACK aggregation before the backend can emit an immediate ACK."""
+        if self.kv_mgr.enable_deferred_decode_kv_release:
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
+        self.abort()
+
     def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
@@ -1645,12 +1731,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
                     sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                        ]
+                        AbortNotification(
+                            room=self.bootstrap_room,
+                            decode_ip=self.kv_mgr.local_ip,
+                            decode_port=self.kv_mgr.rank_port,
+                        ).to_zmq()
                     )
                 logger.debug(
                     f"Sent abort notification for room {self.bootstrap_room} "
