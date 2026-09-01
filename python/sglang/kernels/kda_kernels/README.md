@@ -10,6 +10,6 @@ still be CUDA, Triton, or CuTe DSL; `KDA` records how the candidate was
 produced and qualified rather than which compiler built it.
 
 Each kernel package must document its source task, exact source revision,
-target hardware, supported shapes, and validation evidence. After that
-qualification, ModelOpt selects them by capability and shape allowlist rather
-than a separate environment-variable switch.
+target hardware, supported shapes, and validation evidence. Serving dispatch
+uses the capability and shape allowlist for kernels already qualified on
+their target GPU.
