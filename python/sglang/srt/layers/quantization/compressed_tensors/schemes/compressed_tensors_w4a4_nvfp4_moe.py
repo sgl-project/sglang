@@ -10,13 +10,13 @@ from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
     replace_parameter,
     swizzle_blockscale,
 )
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
     def __init__(self):
-        if not is_blackwell_supported():
+        if not get_platform().is_blackwell:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization. Please use Blackwell and"

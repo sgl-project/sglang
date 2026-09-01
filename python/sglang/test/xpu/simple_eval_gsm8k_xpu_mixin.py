@@ -84,6 +84,9 @@ class SimpleEvalGSM8KXPUMixin(ABC):
             "client": "simple_eval_gsm8k",
             "accuracy_threshold": getattr(self, "accuracy", "N/A"),
             "output_throughput_threshold": getattr(self, "output_throughput", "N/A"),
+            "num_prompts": self.num_examples,
+            "num_threads": self.num_threads,
+            "max_tokens": self.max_tokens,
         }
 
         try:

@@ -68,6 +68,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_serving,
 )
 
@@ -104,7 +105,6 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            from sglang.srt.runtime_context import get_parallel
 
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(

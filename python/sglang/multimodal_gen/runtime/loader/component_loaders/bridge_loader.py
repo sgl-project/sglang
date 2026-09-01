@@ -27,6 +27,7 @@ class BridgeLoader(PlainStateDictComponentLoader):
 
     component_names = ["dual_tower_bridge"]
     expected_library = "diffusers"
+    supports_fsdp_inference = True
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
