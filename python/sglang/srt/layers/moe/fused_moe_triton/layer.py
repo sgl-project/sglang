@@ -462,19 +462,16 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
-        self.supports_deferred_finalize = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            and (
-                nvfp4_deferred
-                or qwen35_fp8_deferred
-                # GLM-5.2 FP8 and other block-scale FP8 MoE also support
-                # do_finalize=False; deferring finalize folds it into the
-                # shared-expert add and skips the symmetric-output workaround
-                # copy (flashinfer#2703).
-                or (
-                    envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
-                    and type(self.quant_method).__name__ == "Fp8MoEMethod"
-                )
+        self.supports_deferred_finalize = get_moe_runner_backend().is_flashinfer_trtllm() and (
+            nvfp4_deferred
+            or qwen35_fp8_deferred
+            # GLM-5.2 FP8 and other block-scale FP8 MoE also support
+            # do_finalize=False; deferring finalize folds it into the
+            # shared-expert add and skips the symmetric-output workaround
+            # copy (flashinfer#2703).
+            or (
+                envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+                and type(self.quant_method).__name__ == "Fp8MoEMethod"
             )
         )
         global _deferred_finalize_info_logged
