@@ -801,6 +801,86 @@ def maybe_add_mtp_safetensors(
     return hf_weights_files + [mtp_path]
 
 
+# Modules that exist ONLY in an MTP/NextN speculative layer, never in a normal
+# transformer layer. Their presence under a `model.layers.<i>.` prefix uniquely
+# identifies <i> as the appended NextN layer in a combined target+MTP checkpoint.
+_NEXTN_LAYER_MARKERS = ("eh_proj", "enorm", "hnorm", "shared_head")
+
+
+def maybe_filter_nextn_shards(
+    hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
+) -> List[str]:
+    """Restrict a NextN/MTP *draft* load to just the shard(s) holding the MTP head.
+
+    An MTP draft (EAGLE next-token head) is loaded from the SAME combined
+    checkpoint as the target, so `_prepare_weights` hands it every shard in the
+    index -- the full ~433G checkpoint -- even though the draft consumes only the
+    appended NextN layer (~a few GB); `embed_tokens` / `shared_head.head` are
+    shared from the already-resident target, not read from disk, and every other
+    tensor is skipped by the NextN weight loader AFTER the iterator has opened it.
+    Opening the whole checkpoint for the head is pure waste (extra I/O + a
+    misleading "0.00/433G" InstantTensor bar on the draft).
+
+    This keeps only the shards that contain the NextN layer's tensors. It is
+    deliberately conservative:
+      * Only acts on a draft config (architecture ends in "NextN"/"MTP").
+      * Discovers the MTP layer index FROM THE CHECKPOINT -- the layer carrying
+        the NextN-only modules (_NEXTN_LAYER_MARKERS) -- rather than from config
+        arithmetic, which some archs rewrite (e.g. num_hidden_layers reset to the
+        nextn count). A wrong guess can't drop needed weights: if no layer shows
+        those markers, or filtering wouldn't reduce the set, it returns the list
+        unchanged.
+      * Keeps any file not described by the index (e.g. a separately-added
+        mtp.safetensors) so nothing the index omits is ever dropped.
+    """
+    arch = (getattr(hf_config, "architectures", None) or [None])[0] or ""
+    if not (arch.endswith("NextN") or arch.endswith("MTP")):
+        return hf_weights_files
+
+    index_path = os.path.join(hf_folder, index_file)
+    if not os.path.isfile(index_path):
+        return hf_weights_files
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+    except (OSError, ValueError):
+        return hf_weights_files
+    if not weight_map:
+        return hf_weights_files
+
+    # Which layer index(es) carry NextN-only modules? That is the MTP head.
+    mtp_layers = set()
+    for name in weight_map:
+        m = re.match(r"model\.layers\.(\d+)\.", name)
+        if m and any(marker in name for marker in _NEXTN_LAYER_MARKERS):
+            mtp_layers.add(m.group(1))
+    if not mtp_layers:
+        # Not a combined checkpoint we can safely narrow (or markers renamed).
+        return hf_weights_files
+
+    keep_prefixes = tuple(f"model.layers.{i}." for i in mtp_layers)
+    keep = {
+        os.path.join(hf_folder, shard)
+        for name, shard in weight_map.items()
+        if name.startswith(keep_prefixes)
+    }
+    index_shards = {os.path.join(hf_folder, s) for s in weight_map.values()}
+    # Keep MTP shards + anything the index doesn't describe (defensive).
+    filtered = [f for f in hf_weights_files if f in keep or f not in index_shards]
+
+    if not filtered or len(filtered) >= len(hf_weights_files):
+        return hf_weights_files  # nothing to gain / couldn't narrow safely
+
+    logger.info(
+        "NextN draft load: restricting %d checkpoint shard(s) to the %d holding "
+        "MTP layer(s) %s (target body skipped).",
+        len(hf_weights_files),
+        len(filtered),
+        sorted(mtp_layers, key=int),
+    )
+    return filtered
+
+
 def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[str]:
     """
     Exclude files that are not needed for inference.
