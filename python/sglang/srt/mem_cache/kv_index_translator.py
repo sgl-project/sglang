@@ -64,11 +64,11 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -154,9 +154,11 @@ class KVIndexTranslator:
             self.defer_read_translate = False
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
+            # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
+            # which is also what the backends' `_resolve_swa_kv_pool` keys on.
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
-                if isinstance(token_to_kv_pool, SWAKVPool)
+                if isinstance(token_to_kv_pool, BaseSWAKVPool)
                 else None
             )
 

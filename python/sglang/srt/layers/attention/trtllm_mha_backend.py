@@ -885,7 +885,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
-                    self.forward_metadata, forward_batch, ragged_layout, bs
+                    self.forward_metadata,
+                    forward_batch,
+                    ragged_layout,
+                    bs,
+                    in_capture=in_capture,
                 )
         elif forward_mode.is_draft_extend_v2():
             self.forward_metadata = self.draft_extend_metadata[bs]
@@ -918,7 +922,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 n = forward_batch.out_cache_loc.shape[0]
                 self.cuda_graph_swa_out_cache_loc[n:].zero_()
-                if in_capture and self.kv_index_translator.is_translating:
+                if in_capture:
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
@@ -941,6 +945,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         ragged_layout: RaggedVerifyLayout,
         bs: int,
+        in_capture: bool = False,
     ) -> None:
         """Eagerly rebuild the target-verify graph metadata for ragged verify.
 
@@ -968,11 +973,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self._apply_cuda_graph_metadata(
