@@ -17,13 +17,19 @@ import time
 
 import requests
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    Phase,
+)
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 
@@ -59,8 +65,7 @@ async def warm_up_compile(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
     print("\nGenerate warm up request for compiling DeepGEMM...\n")
-    server_args = tokenizer_manager.server_args
-    dp_size = server_args.dp_size
+    dp_size = get_parallel().dp_size
     base_ids = [0, 1, 2, 3]
     sampling_params = {
         "temperature": 0.0,
@@ -76,7 +81,8 @@ async def warm_up_compile(
         )
         generate_req_input.bootstrap_host = [FAKE_BOOTSTRAP_HOST] * dp_size
         generate_req_input.bootstrap_room = [
-            i * (2**63 // dp_size) + (i % server_args.tp_size) for i in range(dp_size)
+            i * (2**63 // dp_size) + (i % get_parallel().tp_size)
+            for i in range(dp_size)
         ]
     else:
         input_ids = (
@@ -105,6 +111,7 @@ def launch_server_process_and_send_one_request(
     # Keeps the device probe out of the fork below, for a caller that reaches
     # this without resolving first.
     server_args.resolve_once()
+    cfg = resolving_view(server_args)
 
     proc = multiprocessing.Process(target=launch_server_internal, args=(server_args,))
     proc.start()
@@ -125,7 +132,7 @@ def launch_server_process_and_send_one_request(
             if response.status_code == 200:
                 # Rank-0 node send a request to sync with other node and then return.
                 if server_args.node_rank == 0:
-                    dp_size = server_args.dp_size
+                    dp_size = cfg.dp_size
                     base_ids = [0, 1, 2, 3]
                     payload = {
                         "sampling_params": {
@@ -133,11 +140,11 @@ def launch_server_process_and_send_one_request(
                             "temperature": 0,
                         },
                     }
-                    if server_args.disaggregation_mode != "null":
+                    if cfg.disaggregation_mode != "null":
                         payload["input_ids"] = [list(base_ids) for _ in range(dp_size)]
                         payload["bootstrap_host"] = [FAKE_BOOTSTRAP_HOST] * dp_size
                         payload["bootstrap_room"] = [
-                            i * (2**63 // dp_size) + (i % server_args.tp_size)
+                            i * (2**63 // dp_size) + (i % cfg.tp_size)
                             for i in range(dp_size)
                         ]
                     else:
@@ -177,16 +184,24 @@ def compile_server_args(args, compile_args: CompileArgs) -> ServerArgs:
     """The config this script serves with: no cuda graph, no torch compile, and a
     watchdog that outlives the compilation."""
     args.enable_torch_compile = False
+    # The convenience flags lose to an explicit --cuda-graph-config JSON, which
+    # resolution applies last, so this tool's "no cuda graph" guarantee is
+    # merged into that JSON instead -- an operator serving with their own config
+    # still compiles without capture.
+    explicit = args.cuda_graph_config
+    if isinstance(explicit, CudaGraphConfig):
+        explicit = explicit.to_dict()
+    explicit = dict(explicit or {})
+    for phase in (Phase.DECODE, Phase.PREFILL):
+        phase_config = dict(explicit.get(phase) or {})
+        phase_config["backend"] = Backend.DISABLED
+        explicit[phase] = phase_config
+    args.cuda_graph_config = explicit
     # Watchdog timeout follows compile_args.timeout because compilation takes long.
     args.watchdog_timeout = compile_args.timeout
     args.warmups = "compile-deep-gemm"
-    server_args = ServerArgs.from_cli_args(args)
-    # `cuda_graph_config` is None until resolution parses it.
-    server_args.resolve_once()
-    server_args.cuda_graph_config[Phase.DECODE].backend = Backend.DISABLED
-    server_args.cuda_graph_config[Phase.PREFILL].backend = Backend.DISABLED
     print(f"Disable CUDA Graph and Torch Compile to save time...")
-    return server_args
+    return ServerArgs.from_cli_args(args)
 
 
 def run_compile(server_args: ServerArgs, compile_args: CompileArgs):

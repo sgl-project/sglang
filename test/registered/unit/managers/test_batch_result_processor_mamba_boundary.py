@@ -33,7 +33,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
         vocab_size=128,
     )
     req.output_ids.append(3)
-    req.kv_committed_len = 2
+    req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
@@ -60,11 +60,11 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=True,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
+        beam_coordinator=MagicMock(),
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,

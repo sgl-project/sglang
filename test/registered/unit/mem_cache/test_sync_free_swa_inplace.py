@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -59,14 +60,12 @@ def _segments(seed: int, n_segments: int, page_size=PAGE, pages_per_seg=2):
 def _install(alloc, segs, page_size=PAGE, mapped_fraction=1.0):
     """Install swa mappings the way paired paged allocation would: each full
     page of a segment maps onto one whole swa page with matching offsets."""
-    slot = page_size
     for seg in segs:
         n = int(seg.numel() * mapped_fraction) // page_size * page_size
         if n:
-            alloc.set_full_to_swa_mapping(
-                seg[:n], torch.arange(slot, slot + n, dtype=torch.int64)
-            )
-        slot += seg.numel()
+            swa_indices = alloc.swa_attn_allocator.alloc(n)
+            assert swa_indices is not None
+            alloc.set_full_to_swa_mapping(seg[:n], swa_indices)
 
 
 def _bitwise_state(alloc):
@@ -93,8 +92,18 @@ def _assert_states_equal(test, a, b):
 class TestSyncFreeSwaInplaceStatic(CustomTestCase):
     """Static-partition SWATokenToKVPoolAllocator (what galileo d36 runs)."""
 
-    def _run(self, segs, use_inplace, *, page_size=PAGE, group=False, mixed_seg=None,
-             mapped_fraction=1.0, partial_flag=False, start_positions=None):
+    def _run(
+        self,
+        segs,
+        use_inplace,
+        *,
+        page_size=PAGE,
+        group=False,
+        mixed_seg=None,
+        mapped_fraction=1.0,
+        partial_flag=False,
+        start_positions=None,
+    ):
         alloc = _make_allocator(page_size)
         install_segs = segs + ([mixed_seg] if mixed_seg is not None else [])
         _install(alloc, install_segs, page_size, mapped_fraction)
@@ -103,9 +112,7 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
         if group:
             alloc.free_group_begin()
         for i, seg in enumerate(segs):
-            start_pos = (
-                start_positions[i] if start_positions is not None else 0
-            )
+            start_pos = start_positions[i] if start_positions is not None else 0
             if use_inplace:
                 alloc.free_swa_segment_inplace(seg, start_pos=start_pos)
             else:
@@ -177,9 +184,7 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
             req_to_token = torch.zeros(1, 512, dtype=torch.int64)
             row = torch.arange(512, dtype=torch.int64) + 512
             req_to_token[0] = row
-            alloc.set_full_to_swa_mapping(
-                row, torch.arange(PAGE, PAGE + 512, dtype=torch.int64)
-            )
+            alloc.set_full_to_swa_mapping(row, alloc.swa_attn_allocator.alloc(512))
             return alloc, req_to_token, row
 
         alloc_a, _, row = setup()
@@ -187,12 +192,7 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
         a = _bitwise_state(alloc_a)
 
         alloc_b, req_to_token, _ = setup()
-        req = SimpleNamespace(
-            kv=SimpleNamespace(swa_evicted_seqlen=0),
-            cache_protected_len=0,
-            swa_evict_floor=0,
-            req_pool_idx=0,
-        )
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0))
         free_swa_out_of_window_slots(
             req,
             511,
@@ -362,22 +362,18 @@ class TestSyncFreeSwaInplaceUnified(CustomTestCase):
             self.assertTrue(torch.equal(ta, tb))
         self.assertEqual(a[2], b[2])
 
-    def test_multi_ended_free_v_pages_lazy_twin_parity_paged(self):
-        def run(twin):
-            allocator = self._build_composite(page_size=4, lazy=True,
-                                              n_full_pages=16, n_swa_pages=16)
-            sa = allocator.swa_attn_allocator
-            fa = allocator.full_attn_allocator
-            v_pages = fa.free_virtual_ids[:3].clone()
-            sa.alloc_with_virtual(v_pages)
-            order = torch.tensor([2, 0, 1])
-            toks = (
-                v_pages[order][:, None] * 4 + torch.arange(4)[None, :]
-            ).reshape(-1)
-            if twin:
-                sa.free_v_pages_lazy(torch.sort(toks[::4] // 4).values)
+    def test_unified_paged_inplace_equals_free_swa(self):
+        def run(inplace):
+            allocator = self._build_composite(
+                page_size=4, lazy=True, n_full_pages=16, n_swa_pages=16
+            )
+            v = allocator.alloc(16)
+            self.assertIsNotNone(v)
+            seg = v[4:12]
+            if inplace:
+                allocator.free_swa_segment_inplace(seg, start_pos=4)
             else:
-                sa.free(toks)
+                allocator.free_swa(seg)
             return self._swa_state(allocator)
 
         self._assert_swa_state_equal(run(False), run(True))
