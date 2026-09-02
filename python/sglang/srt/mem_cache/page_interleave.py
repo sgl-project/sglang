@@ -32,13 +32,14 @@ therefore can be striped without extra compute-time communication:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,12 @@ class PageInterleavePlacement:
         return self.local_index(loc[self.local_mask(loc, rank)])
 
 
+def is_kv_cache_sharding_enabled(kvc: KVCacheConfigurator) -> bool:
+    from sglang.srt.runtime_context import get_parallel
+
+    return not kvc.is_draft_worker and get_parallel().enable_kv_cache_sharding
+
+
 def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
     """The group KV pages are striped across — the axis that replicates KV
     at rest, chosen by topology:
@@ -111,3 +118,51 @@ def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
     if use_mla_backend:
         return get_parallel().attn_tp_group
     return cp_group
+
+
+def get_kv_shard_group_info(
+    kvc: KVCacheConfigurator,
+) -> Tuple[Optional[int], int]:
+    """``(shard_rank, shard_size)`` for the KV pool; ``(None, 1)`` disables."""
+    if not is_kv_cache_sharding_enabled(kvc):
+        return None, 1
+    group = get_kv_shard_group(kvc.use_mla_backend)
+    if group.world_size <= 1:
+        return None, 1
+    return group.rank_in_group, group.world_size
+
+
+def compute_page_shard_scratch_bytes(kvc: KVCacheConfigurator) -> int:
+    """Fixed HBM cost of the double-buffered assembly scratch, charged against
+    the KV budget before pool sizing. Two slots, each ``[max prefix | chunk |
+    trash page]`` rows of ONE layer's KV."""
+    shard_rank, shard_size = get_kv_shard_group_info(kvc)
+    if shard_rank is None:
+        return 0
+
+    from sglang.srt.runtime_context import get_parallel, get_schedule
+    from sglang.srt.utils.common import ceil_align
+
+    model_config = kvc.model_config
+    granule = shard_size * kvc.page_size
+    # Rotated owner-classed allocation keeps per-rank owned counts within 1, so
+    # a K-page prefix gathers as exactly N * ceil(K / N) pages, bounded by
+    # ceil_align(context_len, granule). The chunk region is sized per-page
+    # because chunk boundaries are page-size floored.
+    rows = (
+        ceil_align(model_config.context_len, granule)
+        + ceil_align(get_schedule().chunked_prefill_size, kvc.page_size)
+        + kvc.page_size
+    )
+    kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
+    if kvc.use_mla_backend:
+        row_bytes = (
+            model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        ) * kv_size
+    else:
+        row_bytes = (
+            model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+            * (model_config.head_dim + model_config.v_head_dim)
+            * kv_size
+        )
+    return 2 * rows * row_bytes

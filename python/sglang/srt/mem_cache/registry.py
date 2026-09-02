@@ -18,7 +18,12 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -100,6 +105,10 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if get_parallel().enable_kv_cache_sharding:
+        logger.info("Using UnifiedRadixCache for logical-page KV sharding.")
+        return _create_unified_radix_cache(ctx, server_args, params)
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
