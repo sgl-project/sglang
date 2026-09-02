@@ -3650,10 +3650,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Mark every node covered by one in-flight write-through backup, and return
-    /// the marked nodes ordered ancestors before descendants. The publish side
-    /// records one host store event per node and links each to its parent, so a
-    /// parent must be published before its children. Ties break on node id, which
-    /// keeps the order independent of the caller's component iteration order.
+    /// them ancestors first: publish links each host store event to its parent.
     pub fn mark_write_through_pending(
         &mut self,
         node_ids: Vec<NodeId>,
@@ -3677,7 +3674,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         marked.into_iter().map(|(_, node_id)| node_id).collect()
     }
 
-    /// The number of edges between a node and the tree root.
     fn depth_from_root_(&self, node_idx: NodeIdx_) -> usize {
         let mut depth = 0;
         let mut node = self.arena.node(node_idx);

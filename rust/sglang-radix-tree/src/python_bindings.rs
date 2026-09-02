@@ -1818,8 +1818,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
     }
 
-    /// Mark every node covered by one in-flight write-through backup, returning
-    /// them ordered ancestors before descendants.
+    /// Mark the nodes one write-through backup covers; returns them ancestors first.
     fn mark_write_through_pending(
         &self,
         py: Python<'_>,
@@ -2803,8 +2802,7 @@ macro_rules! tree_core_binding {
                 self.inner.drop_subtree_no_host(py, node_id)
             }
 
-            /// Mark every node covered by one in-flight write-through backup,
-            /// returning them ordered ancestors before descendants.
+            /// Mark the nodes one write-through backup covers; returns them ancestors first.
             fn mark_write_through_pending(
                 &self,
                 py: Python<'_>,

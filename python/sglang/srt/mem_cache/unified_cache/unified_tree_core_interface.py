@@ -535,8 +535,7 @@ class UnifiedTreeCoreInterface(ABC):
         self, node_ids: list[NodeId], ack_id: NodeId
     ) -> list[NodeId]:
         """Mark every node covered by one in-flight write-through backup, and return
-        the marked nodes ordered ancestors before descendants, the order the publish
-        side (host store events, L3 writes) expects."""
+        them ancestors first: publish links each host store event to its parent."""
         ...
 
     @abstractmethod

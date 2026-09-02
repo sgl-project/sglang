@@ -1367,9 +1367,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _backup_publish_node_ids(
         node_id: NodeId, comp_xfers: dict[ComponentType, list[PoolTransfer]]
     ) -> list[NodeId]:
-        """The nodes one backup ack publishes: the acked node plus every node a
-        component transfer covers. Unordered here; mark_write_through_pending
-        returns the set ordered ancestors before descendants."""
+        """The acked node plus every node a component backup transfer covers."""
         publish_node_ids: list[NodeId] = []
         for transfers in comp_xfers.values():
             for transfer in transfers:
