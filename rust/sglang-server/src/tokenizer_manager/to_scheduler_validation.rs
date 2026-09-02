@@ -41,19 +41,12 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         ));
     }
 
-    // Client-supplied token ids must be in-vocabulary: an out-of-range id
-    // reaches the embedding lookup and kills the scheduler process, so 400
-    // here instead — mirroring the Python `TokenizerManager` validation.
+    // Multimodal processors may consume sentinel ids outside the vocabulary.
+    // Validate their resulting ids at PreSendValidating instead. Non-MM client
+    // ids can be rejected now.
     if let RequestKind::Generate(g) = &req.kind {
-        if let Some(ids) = &g.input_ids {
-            for &id in ids {
-                if id < 0 || id as u64 >= vocab_size {
-                    return Err(Error::Validation(format!(
-                        "input_ids contains out-of-vocabulary token id {id}; \
-                         valid range is [0, {vocab_size})"
-                    )));
-                }
-            }
+        if !g.has_multimodal() {
+            validate_input_ids(g, vocab_size)?;
         }
         if let Some(ids) = &g.token_ids_logprob {
             for &id in ids {
@@ -92,6 +85,22 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
         ));
     }
 
+    Ok(())
+}
+
+/// Guard the ids that will reach the embedding lookup. Multimodal requests run
+/// this after placeholder expansion; all other requests also run it at intake.
+pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result<(), Error> {
+    if let Some(ids) = &g.input_ids {
+        for &id in ids {
+            if id < 0 || id as u64 >= vocab_size {
+                return Err(Error::Validation(format!(
+                    "input_ids contains out-of-vocabulary token id {id}; \
+                     valid range is [0, {vocab_size})"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
