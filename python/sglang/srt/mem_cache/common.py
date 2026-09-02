@@ -182,7 +182,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
         and allocator.supports_asymmetric_reservation
     ):
-        if allocator.can_reserve(num_tokens, num_tokens):
+        if allocator.ensure_capacity(num_tokens, num_tokens):
             return
 
         page_size = allocator.page_size
@@ -206,31 +206,33 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
                     lo = mid + 1
             return lo * page_size
 
+        swa_reclaim = minimum_reclaim(
+            swa_evictable,
+            lambda value: allocator.can_reserve(
+                num_tokens,
+                num_tokens,
+                full_evictable_tokens=full_evictable,
+                swa_evictable_tokens=value,
+            ),
+        )
         full_reclaim = minimum_reclaim(
             full_evictable,
             lambda value: allocator.can_reserve(
                 num_tokens,
                 num_tokens,
                 full_evictable_tokens=value,
-                swa_evictable_tokens=swa_evictable,
+                swa_evictable_tokens=swa_reclaim,
             ),
         )
-        swa_reclaim = minimum_reclaim(
-            swa_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                num_tokens,
-                full_evictable_tokens=full_reclaim,
-                swa_evictable_tokens=value,
-            ),
-        )
+        # FULL is the primary allocation. Reclaim SWA only when all evictable
+        # FULL plus compaction still cannot satisfy the shared byte demand.
         evicted = tree_cache.evict_for_alloc(
             EvictParams(
                 num_tokens=full_reclaim,
                 swa_num_tokens=swa_reclaim,
             )
         )
-        if not allocator.can_reserve(num_tokens, num_tokens):
+        if not allocator.ensure_capacity(num_tokens, num_tokens):
             logger.warning(
                 "Unified SWA eviction did not satisfy the planned reservation: "
                 f"requested=({num_tokens}, {num_tokens}), "
