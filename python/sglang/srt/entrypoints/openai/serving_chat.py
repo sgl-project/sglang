@@ -91,6 +91,9 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_params import (
+    set_request_reasoning_end_token_ids,
+)
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -1010,6 +1013,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
             renderer_handles_response_format=self.chat_encoding_spec == "kimi_k3",
         )
+        set_request_reasoning_end_token_ids(
+            sampling_params, processed_messages.reasoning_end_token_ids
+        )
 
         # Handle single vs multiple requests
         if request.input_ids is not None:
@@ -1201,6 +1207,31 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         result.skip_special_tokens = request.skip_special_tokens
+        if self.reasoning_parser == "k2_v3" and thinking_mode:
+            parser = ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                force_reasoning=True,
+                request=request,
+                tokenizer=self.tokenizer_manager.tokenizer,
+            )
+            token_ids = self.tokenizer_manager.tokenizer.encode(
+                parser.detector.think_end_token,
+                add_special_tokens=False,
+            )
+            if hasattr(token_ids, "tolist"):
+                token_ids = token_ids.tolist()
+            if (
+                not isinstance(token_ids, list)
+                or not token_ids
+                or any(
+                    type(token_id) is not int or token_id < 0 for token_id in token_ids
+                )
+            ):
+                raise ValueError(
+                    "The selected K2 reasoning terminator could not be encoded"
+                )
+            result.reasoning_end_token_ids = list(token_ids)
         return result
 
     def _apply_jinja_template(

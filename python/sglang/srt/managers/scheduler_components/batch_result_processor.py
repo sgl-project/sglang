@@ -41,6 +41,9 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_observer import CommittedTokens
+from sglang.srt.sampling.sampling_params import (
+    get_request_reasoning_end_token_ids,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -1206,8 +1209,22 @@ class SchedulerBatchResultProcessor:
         req: Req,
         next_token_id: Union[int, List[int]],
     ):
-        think_end_ids = self.model_config.think_end_ids
-        if req.require_reasoning and think_end_ids:
+        if not req.require_reasoning:
+            return
+        request_think_end_ids = get_request_reasoning_end_token_ids(
+            req.sampling_params.custom_params,
+            allowed_sequences=getattr(
+                self.model_config,
+                "request_selectable_think_end_id_sequences",
+                None,
+            ),
+        )
+        think_end_ids = (
+            request_think_end_ids
+            if request_think_end_ids is not None
+            else self.model_config.think_end_ids
+        )
+        if think_end_ids:
             req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
