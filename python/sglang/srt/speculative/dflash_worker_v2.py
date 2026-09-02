@@ -210,7 +210,7 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
 
 
 class _SelectorDraftSampler:
-    """Selector decode folded into the draft device graph, greedy and T>0 alike.
+    """Selector decode folded into the draft cuda graph, greedy and T>0 alike.
 
     One captured graph serves both: it always walks the sampling path, and a static
     greedy_mask selects the argmax per row.
@@ -476,7 +476,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
-                    "Disable DFLASH draft device graph because only %.2f GB GPU "
+                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
@@ -520,7 +520,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self.ps.tp_rank == 0:
                 logger.info(
                     "DFLASH selector decode (greedy + sampling) folded into the "
-                    "draft device graph."
+                    "draft cuda graph."
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
@@ -548,7 +548,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start = int(shard.org_vocab_start_index)
         if self.ps.tp_rank == 0:
             logger.info(
-                "DFLASH draft greedy head folded into the draft device graph (tp=%d).",
+                "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
                 tp_group.world_size,
             )
         return _DflashDraftSampler(
@@ -1719,21 +1719,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
-        sampling_verify_available = (
-            not _is_npu
-            if self.selector is not None
-            else is_dflash_sampling_verify_available()
-        )
+        if self.selector is not None:
+            if not _is_npu:
+                return
+            if not self._warned_sampling_fallback and self.ps.tp_rank == 0:
+                logger.warning(
+                    "DFLASH non-greedy verification is unavailable on this "
+                    "build/device; falling back to greedy argmax verification. "
+                    "The requested sampling distribution will not be preserved; "
+                    "use temperature=0 and top_k=1 for lossless greedy decoding."
+                )
+                self._warned_sampling_fallback = True
+            return
+
         if (
-            not sampling_verify_available
+            not is_dflash_sampling_verify_available()
             and not self._warned_sampling_fallback
             and self.ps.tp_rank == 0
         ):
             logger.warning(
                 "DFLASH non-greedy verification is unavailable on this build/device; "
-                "falling back to greedy argmax verification. The requested sampling "
-                "distribution will not be preserved; use temperature=0 and top_k=1 "
-                "for lossless greedy decoding."
+                "falling back to greedy argmax verification."
             )
             self._warned_sampling_fallback = True
 
@@ -2100,14 +2106,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # CUDA prepare_for_verify pre-plans attention metadata; NPU leaves
-        # planning to the forward path.
-        if not _is_npu:
-            verify_forward_batch.mark_forward_metadata_ready()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph

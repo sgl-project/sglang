@@ -1,7 +1,8 @@
-from sglang.kernels.ops.speculative.triton_compat import jit, tl
+import triton
+import triton.language as tl
 
 
-@jit
+@triton.jit
 def speculative_sampling_classic_kernel(
     # Pointers
     Predicts,
