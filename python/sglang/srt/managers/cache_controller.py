@@ -784,6 +784,23 @@ class HiCacheController:
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
+    def has_inflight_device_transfers(self) -> bool:
+        """Whether any L2 operation still names device rows.
+
+        The compaction move gate for a virtual-id device pool reads this: a
+        queued op holds VIRTUAL ids (still valid after a move) but a submitted
+        one has already resolved them to kernel-facing ids on the transfer
+        stream, and stays exposed until its ack event fires. Both are counted,
+        so the gate closes from enqueue to ack rather than only while a kernel
+        is running.
+        """
+        return bool(
+            self.write_queue
+            or self.load_queue
+            or self.ack_write_queue
+            or self.ack_load_queue
+        )
+
     def write(
         self,
         device_indices: torch.Tensor,

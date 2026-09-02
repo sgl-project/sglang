@@ -396,8 +396,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # While this returns False, `_flush` must not relocate any page.
+        # While either returns False, `_flush` must not relocate any page: a
+        # page's physical address is published to a reader that does not go
+        # through the allocator (an RDMA peer, or a HiCache host transfer that
+        # resolved its device indices on another stream). Two slots rather than
+        # one composed predicate because the two are installed independently
+        # and a decode node under PD can run HiCache as well.
         self.disagg_move_gate: Optional[Callable[[], bool]] = None
+        self.host_transfer_move_gate: Optional[Callable[[], bool]] = None
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
         # write-race check. Single slot: at most ONE forward in flight per call site.
@@ -722,12 +728,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         neighbor = self._growth_side_neighbor()
         if neighbor is None or not neighbor.lazy_compaction:
             return 0
-        if neighbor.disagg_move_gate is not None and not neighbor.disagg_move_gate():
-            # Not realizable: a PD transfer blocks the neighbour's compaction.
+        if neighbor.moves_blocked():
+            # Not realizable: an in-flight transfer blocks the neighbour's
+            # compaction.
             # Crediting them admits work `_flush_peer_for_alloc` cannot satisfy,
             # which the caller reads as a memory-estimation bug.
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
+
+    def moves_blocked(self) -> bool:
+        """Whether any installed gate currently forbids relocating pages."""
+        for gate in (self.disagg_move_gate, self.host_transfer_move_gate):
+            if gate is not None and not gate():
+                return True
+        return False
 
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a neighbor urgent-flush (realizable-with-
@@ -1482,9 +1496,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        assert self.disagg_move_gate is None, (
-            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran with "
-            "a PD-disaggregation move gate installed; PD requires lazy_compaction."
+        assert self.disagg_move_gate is None and self.host_transfer_move_gate is None, (
+            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran "
+            "with a move gate installed; PD disaggregation and HiCache both "
+            "require lazy_compaction."
         )
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
         if not freed_set:
@@ -1871,7 +1886,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not self.lazy_compaction:
             return 0
-        if self.disagg_move_gate is not None and not self.disagg_move_gate():
+        if self.moves_blocked():
             # Holes stay in the free list; the next flush picks them up.
             return 0
         self._stats_n_flush_calls += 1
@@ -2284,7 +2299,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             p = p.low_peer if side == "low" else p.high_peer
         if p is None or not p.lazy_compaction:
             return 0
-        if p.disagg_move_gate is not None and not p.disagg_move_gate():
+        if p.moves_blocked():
             return 0
         return len(p._free_phys_pages) * p.entry_bytes_per_page
 
@@ -2838,6 +2853,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
+        # HiCache indexes the full sub-pool's per-layer views directly, so it
+        # needs the kernel-facing translate. `host_capacity_tokens` is set by
+        # `init_unified_mamba_pools`, which knows the STATIC token cap; `size`
+        # here is the dynamic whole-buffer view and would size the host pool
+        # against the entire buffer rather than the configured limit.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
+
     # -- size: dynamic --
     @property
     def size(self) -> int:
@@ -3017,6 +3041,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_attn_allocator.disagg_move_gate = gate
         self.mamba_allocator.disagg_move_gate = gate
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the HiCache move gate on both sub-allocators.
+
+        A host transfer resolves its device rows to kernel-facing ids and then
+        reads/writes them asynchronously on the transfer stream; a relocation
+        in that window moves the bytes underneath it. The mamba end is gated
+        too even though its state is not backed up yet: the gate is about the
+        MOVER, and the two ends compact as peers.
+        """
+        assert self.lazy_compaction, (
+            "HiCache with the unified memory pool requires lazy compaction "
+            "(eager free-path compaction moves pages under in-flight host "
+            "transfers)."
+        )
+        self.full_attn_allocator.host_transfer_move_gate = gate
+        self.mamba_allocator.host_transfer_move_gate = gate
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
@@ -3221,6 +3262,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache.attach_allocators(
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,
+        )
+        # HiCache addresses each sub-pool's per-layer views directly, so it
+        # needs a TOKEN capacity to size the host pool against:
+        # `size` on these sub-pools is a kernel-facing ROW count.
+        kvcache.full_kv_pool.host_capacity_tokens = full_max_total_num_tokens
+        kvcache.swa_kv_pool.host_capacity_tokens = swa_max_total_num_tokens
+        # Only the FULL side needs the id translate. The controller hands the
+        # anchor transfer the tree's VIRTUAL token ids, but the SWA component's
+        # indices are produced by `UnifiedRadixCache` through
+        # `translate_loc_from_full_to_swa`, which on this allocator already
+        # returns swa KERNEL-FACING ids -- translating again would scale them a
+        # second time by the sub-pool's per-page block count and run off the
+        # end of the v2p table.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
         )
 
         self.free_group = None
@@ -3456,6 +3512,58 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         self.full_attn_allocator.disagg_move_gate = gate
         self.swa_attn_allocator.disagg_move_gate = gate
+
+    def bind_swa_for_loaded_rows(
+        self, full_token_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """HiCache load-back: give the sliding-window side real pages for rows
+        the anchor just loaded, and return their kernel-facing ids.
+
+        The static composite allocates the SWA rows outright
+        (`swa_attn_allocator.alloc(n)`), which this composite forbids -- the
+        full side owns the virtual ids. But the rows cannot merely be
+        TRANSLATED either: a restored node's virtual pages have no
+        sliding-window binding yet, and `translate_kv_loc_for_kernel` clamps an
+        unbound page to the sink instead of failing, so a translate-only
+        derivation hands back sink ids for every row. The node then owns
+        sliding-window rows the allocator never had live, which surfaces later
+        as the idle leak invariant.
+
+        So bind first, then translate. `alloc_with_virtual` is the
+        physical-holding non-owner's alloc: it takes physical pages FOR the
+        caller's virtual page ids, which is exactly the full/SWA pairing.
+        Returns None when the sliding-window side cannot fund the binding, so
+        the caller can roll the whole load-back back.
+        """
+        ids = full_token_ids.to(torch.int64)
+        if ids.numel() == 0:
+            return ids
+        ps = self.page_size
+        pages = torch.unique(ids // ps)
+        # `> 0` strict: -1 is tombstoned, 0 is the padding sink; neither is a
+        # binding, and both must be (re)bound before the rows are usable.
+        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
+        need = int(unbound.numel()) * ps
+        if need:
+            if need > self.swa_available_size():
+                return None
+            self.swa_attn_allocator.alloc_with_virtual(unbound)
+        return self.translate_loc_from_full_to_swa(ids)
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the HiCache move gate on both attention sub-allocators.
+
+        A host transfer resolves its device indices to kernel-facing ids on the
+        transfer stream and then reads/writes those rows asynchronously; a
+        relocation in that window silently moves the bytes underneath it.
+        """
+        assert self.lazy_compaction, (
+            "HiCache with the unified memory pool requires lazy compaction "
+            "(eager free-path compaction moves pages under in-flight host "
+            "transfers)."
+        )
+        self.full_attn_allocator.host_transfer_move_gate = gate
+        self.swa_attn_allocator.host_transfer_move_gate = gate
 
     @property
     def kernel_page_multiplier(self) -> int:

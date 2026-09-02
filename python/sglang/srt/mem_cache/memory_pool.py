@@ -31,7 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -1774,6 +1774,25 @@ class KVCache(abc.ABC):
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
+
+    # -- HiCache host<->device transfer contract -------------------------------
+    #
+    # `host_transfer_translate` turns the ids the HiCache controller holds into
+    # the ids that index THIS pool's device buffers. None means they already
+    # agree, which is every static pool. A virtual-id pool installs a callable
+    # (see the unified composite allocators): the controller allocates and
+    # stores VIRTUAL ids, while the L2 kernels index the per-layer views in
+    # kernel-facing space. `L2TransferEngine` applies it immediately before the
+    # kernels launch, so the result reflects the live virtual->physical map,
+    # and the host-transfer move gate keeps compaction out of the window
+    # between that translate and the transfer completing.
+    #
+    # `host_capacity_tokens` is the TOKEN capacity a host pool should be sized
+    # against. `size` is not always that number: on the unified pool it is a
+    # kernel-facing ROW count (num_pages * blocks_per_page * page_size), which
+    # overstates the tokens by 2 * layer_num.
+    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    host_capacity_tokens: Optional[int] = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
