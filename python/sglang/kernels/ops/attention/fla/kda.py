@@ -1155,6 +1155,7 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        safe_gate=lower_bound is not None,
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
@@ -1210,6 +1211,7 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    beta_is_raw: bool = False,
     **kwargs,
 ):
     if scale is None:
@@ -1218,6 +1220,9 @@ def chunk_kda(
     if use_qk_l2norm_in_kernel:
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
+
+    if beta_is_raw:
+        beta = beta.float().sigmoid()
 
     # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(

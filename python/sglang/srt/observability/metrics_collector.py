@@ -27,6 +27,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
+    exports_expert_balancedness_to_prometheus,
+    get_context,
     get_disagg,
     get_observability,
     get_schedule,
@@ -203,15 +205,16 @@ STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
 STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
 
 
-def resolve_collector_class(
-    server_args: Optional[ServerArgs], role: str, default_cls: type
-) -> type:
-    """Return the subclass registered for `role` on `server_args.stat_loggers`,
-    or `default_cls` if none is registered. Tolerates `server_args=None` and
-    `stat_loggers=None`."""
-    if server_args is None:
+def resolve_collector_class(role: str, default_cls: type) -> type:
+    """Return the subclass registered for `role` in the published
+    ``observability`` bag, or `default_cls` if none is registered.
+
+    An unpublished ``observability`` namespace answers with the default.
+    """
+
+    if not get_context().is_config_namespace_published("observability"):
         return default_cls
-    stat_loggers = getattr(server_args, "stat_loggers", None)
+    stat_loggers = get_observability().stat_loggers
     if not stat_loggers:
         return default_cls
     return stat_loggers.get(role, default_cls)
@@ -877,10 +880,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # Execution
         # =================================================================
-        if (
-            labels["moe_ep_rank"] == 0
-            and server_args.should_export_expert_balancedness_to_prometheus()
-        ):
+        if labels["moe_ep_rank"] == 0 and exports_expert_balancedness_to_prometheus():
             self.eplb_balancedness = Summary(
                 name="sglang:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
@@ -1114,7 +1114,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
-                server_args, STAT_LOGGER_ROLE_SCHEDULER, cls
+                STAT_LOGGER_ROLE_SCHEDULER, cls
             )
             collector = scheduler_collector_cls(
                 labels=labels,

@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
+    get_serving,
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -161,10 +162,10 @@ def _contains_tensor_container(value) -> bool:
     )
 
 
-def get_vmm_feature_consumer_count(server_args) -> int:
-    if get_parallel().config.enable_dp_attention:
-        return get_parallel().config.tp_size // get_parallel().config.dp_size
-    return get_parallel().config.tp_size
+def get_vmm_feature_consumer_count() -> int:
+    if get_parallel().enable_dp_attention:
+        return get_parallel().tp_size // get_parallel().dp_size
+    return get_parallel().tp_size
 
 
 class CudaVmmMemoryPool:
@@ -903,6 +904,13 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
             "Packed CUDA VMM features must be reconstructed before release"
         )
 
+    def release_without_reconstruction(self, consumer_count: int | None = None) -> None:
+        """Release the shared packed allocation when its request is abandoned."""
+        if self._consumer_acknowledged:
+            return
+        self._packed_owner.acknowledge_consumption(consumer_count)
+        self._consumer_acknowledged = True
+
     def reconstruct_on_target_device(
         self, rebuild_device_idx, consumer_count: int | None = None
     ):
@@ -941,14 +949,15 @@ class CudaVmmFeatureTransport:
             )
 
         per_worker_pool_size = get_mm_feature_pool_size_per_worker(
-            MM_FEATURE_CACHE_SIZE, server_args.tokenizer_worker_num
+            MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num
         )
         self.pool = CudaVmmMemoryPool(
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+            # Per-worker placement; policy above reads the bags.
             base_gpu_id=server_args.base_gpu_id,
-            consumer_count=get_vmm_feature_consumer_count(server_args),
-            allow_posix_fallback=server_args.nnodes == 1,
+            consumer_count=get_vmm_feature_consumer_count(),
+            allow_posix_fallback=get_parallel().nnodes == 1,
         )
 
     def prepare_for_dispatch(

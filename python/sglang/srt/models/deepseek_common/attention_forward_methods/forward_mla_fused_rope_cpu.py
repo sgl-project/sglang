@@ -124,6 +124,7 @@ class DeepseekMLACpuForwardMixin:
         v_input,
         forward_batch,
         zero_allocator,
+        gate=None,
     ):
         assert self.q_lora_rank is not None and use_intel_amx_backend(
             self
@@ -155,6 +156,8 @@ class DeepseekMLACpuForwardMixin:
             self.w_scale if self.qkv_proj_with_rope_is_fp8 else None,  # scale
         )
         attn_output = output
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
 
         return output
