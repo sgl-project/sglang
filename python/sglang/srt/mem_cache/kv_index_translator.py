@@ -193,6 +193,13 @@ class KVIndexTranslator:
 
     # -- per-batch view --------------------------------------------------------
 
+    @property
+    def reads_are_translated(self) -> bool:
+        """Whether a read this translator fills comes out kernel-facing. False
+        on a non-unified pool, and under DCP, where the ids stay VIRTUAL for
+        ``translate_dcp_read_ids`` to finish."""
+        return self.is_translating and not self.defer_read_translate
+
     def fill_packed_read_stream(
         self,
         *,
@@ -202,6 +209,7 @@ class KVIndexTranslator:
         total_tokens: int,
         out: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
+        sliding_window: bool = False,
     ) -> bool:
         """Fill ``out``'s CSR rows with the ids a paged wrapper plans over, and
         report whether they came out translated.
@@ -211,11 +219,24 @@ class KVIndexTranslator:
         ``[bs, max_pages]`` rectangle to repack from -- ``out`` holds one id per
         resident token, a length the pool bounds.
 
-        A ``False`` return means the ids are still VIRTUAL: the DCP path defers
-        translation to ``translate_dcp_read_ids`` over the filled prefix.
+        ``sliding_window`` selects the swa sub-pool's own id space, built from
+        VIRTUAL ids and never chained through full-physical. A ``False`` return
+        means the ids are still VIRTUAL: the DCP path defers translation to
+        ``translate_dcp_read_ids``, and a static SWA pool maps the full ids
+        through its own full->swa table.
         """
-        if not self.is_translating or self.defer_read_translate:
-            create_flashinfer_kv_indices_triton[(int(req_pool_indices.numel()),)](
+        # `seq_lens` defines the batch: a caller may hold a wider
+        # req_pool_indices (the padded graph buffer) than the rows it is asking
+        # for, and the extra lanes have no length to bound them.
+        bs = int(seq_lens.numel())
+        assert req_pool_indices.numel() >= bs, (
+            f"fill_packed_read_stream: {req_pool_indices.numel()} req rows for "
+            f"{bs} lengths"
+        )
+        req_pool_indices = req_pool_indices[:bs]
+
+        if not self.reads_are_translated:
+            create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,
                 seq_lens,
@@ -227,13 +248,22 @@ class KVIndexTranslator:
             )
             return False
 
+        if sliding_window:
+            assert self._swa_v2p_table is not None, (
+                "fill_packed_read_stream: sliding_window on a pool with no swa "
+                "sub-pool"
+            )
         build_kv_read_table_packed(
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            v2p=self._full_v2p_table,
+            v2p=self._swa_v2p_table if sliding_window else self._full_v2p_table,
             indptr=indptr,
-            multiplier=self._full_page_multiplier,
+            multiplier=(
+                self._swa_page_multiplier
+                if sliding_window
+                else self._full_page_multiplier
+            ),
             page_size=self.page_size,
             max_tokens=total_tokens,
             out=out,
