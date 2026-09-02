@@ -1020,7 +1020,7 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.kv_index_translator.assert_backends_carry_translator(
+        self.kv_index_translator.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
 
