@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -6,7 +7,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-    _state_scatter_with_mask_torch,
+    fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, organize_draft_results
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -161,6 +162,18 @@ def _ref_parents_from_mask(tree_mask, bs, draft_token_num):
             ancestors = [j for j in range(t) if mask[b, t, j]]
             parents[b, t] = max(ancestors)
     return parents
+
+
+def _ref_state_scatter_with_mask(dst, src, dst_indices_raw, step_indices_raw):
+    """Advanced-indexing reference: commit one step per request, skipping the
+    padded requests, which carry a negative step or a negative slot."""
+    valid = (step_indices_raw >= 0) & (dst_indices_raw >= 0)
+    if not valid.any():
+        return
+    requests = valid.nonzero(as_tuple=True)[0]
+    dst[:, dst_indices_raw[requests].long()] = src[
+        :, requests, step_indices_raw[requests].long()
+    ]
 
 
 def _ref_verify_tree_greedy(
@@ -2008,7 +2021,7 @@ class TestMambaStateScatterWithMask(CustomTestCase):
 
     def _run_and_check(self, dst, src, dst_indices, step_indices):
         dst_ref = dst.clone()
-        _state_scatter_with_mask_torch(dst_ref, src, dst_indices, step_indices)
+        _ref_state_scatter_with_mask(dst_ref, src, dst_indices, step_indices)
 
         out = dst.clone()
         torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
@@ -2028,24 +2041,15 @@ class TestMambaStateScatterWithMask(CustomTestCase):
         self._run_and_check(dst, src, dst_indices, step_indices)
 
     def test_skips_negative_steps_and_slots(self):
-        # padded requests carry -1 and must leave the cache untouched
+        # padded requests carry -1 and must leave the cache untouched. Requests
+        # 1 and 2 are padded on one index each, so only 0 and 3 commit.
         layers, cache_size, requests, steps = 2, 5, 4, 3
         dst = torch.randn(layers, cache_size, 4, 4, dtype=torch.bfloat16)
         src = torch.randn(layers, requests, steps, 4, 4, dtype=torch.bfloat16)
         dst_indices = torch.tensor([1, 3, -1, 0], dtype=torch.int32)
         step_indices = torch.tensor([2, -1, 1, 0], dtype=torch.int32)
 
-        out = dst.clone()
-        torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
-            out, src, dst_indices, step_indices
-        )
-        # rows 3 and -1 are skipped for their own reason; only 1 and 0 move
-        torch.testing.assert_close(out[:, 1], src[:, 0, 2], atol=0, rtol=0)
-        torch.testing.assert_close(out[:, 0], src[:, 3, 0], atol=0, rtol=0)
-        for untouched in (2, 3, 4):
-            torch.testing.assert_close(
-                out[:, untouched], dst[:, untouched], atol=0, rtol=0
-            )
+        self._run_and_check(dst, src, dst_indices, step_indices)
 
     def test_conv_window_scatter_strided_source(self):
         # the deduplicated conv-window source overlaps its per-step windows, so
@@ -2071,6 +2075,26 @@ class TestMambaStateScatterWithMask(CustomTestCase):
         step_indices = torch.tensor([1, 3, -1], dtype=torch.int32)
 
         self._run_and_check(dst, src, dst_indices, step_indices)
+
+    def test_dispatch_follows_tensor_device(self):
+        # The CPU kernel is picked from the tensors' device, not from the
+        # process-wide engine flag: with the flag off, a request whose slot is
+        # negative must still be skipped rather than committed to the last slot.
+        layers, cache_size, requests, steps = 2, 4, 2, 3
+        dst = torch.randn(layers, cache_size, 4, 4, dtype=torch.float32)
+        src = torch.randn(layers, requests, steps, 4, 4, dtype=torch.float32)
+        dst_indices = torch.tensor([3, -1], dtype=torch.int32)
+        step_indices = torch.tensor([2, 0], dtype=torch.int32)
+
+        dst_ref = dst.clone()
+        _ref_state_scatter_with_mask(dst_ref, src, dst_indices, step_indices)
+
+        out = dst.clone()
+        with mock.patch(
+            "sglang.kernels.ops.mamba.mamba_state_scatter_triton._is_cpu", False
+        ):
+            fused_mamba_state_scatter_with_mask(out, src, dst_indices, step_indices)
+        torch.testing.assert_close(out, dst_ref, atol=0, rtol=0)
 
     def test_dim_contiguous_conv_state_destination(self):
         # causal_conv1d_update_cpu re-strides conv_states to be dim-contiguous,

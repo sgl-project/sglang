@@ -151,36 +151,22 @@ def track_mamba_states_if_needed(
     )
 
 
-def _state_scatter_with_mask_torch(
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    dst_indices_raw: torch.Tensor,
-    step_indices_raw: torch.Tensor,
-):
-    """Fallback for accelerators without a masked-scatter kernel of their own.
-
-    Advanced indexing reads/writes through arbitrary strides, so it serves the
-    dense SSM/conv layouts and the overlapping conv-window view alike.
-    """
-    valid_mask = step_indices_raw >= 0
-    if not valid_mask.any():
-        return
-    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-    dst_indices = dst_indices_raw[valid_indices].long()
-    step_indices = step_indices_raw[valid_indices].long()
-    dst[:, dst_indices] = src[:, valid_indices, step_indices]
-
-
 def _state_scatter_with_mask(
     dst: torch.Tensor,
     src: torch.Tensor,
     dst_indices_raw: torch.Tensor,
     step_indices_raw: torch.Tensor,
 ):
-    """Non-CUDA masked state scatter: the CPU kernel where it applies."""
-    if not _is_cpu:
-        _state_scatter_with_mask_torch(dst, src, dst_indices_raw, step_indices_raw)
-        return
+    """Masked state scatter off CUDA, which only the CPU kernel implements.
+
+    It indexes both entries through their own strides, so it serves the dense
+    SSM/conv layouts and the overlapping conv-window view alike.
+    """
+    if dst.device.type != "cpu":
+        raise ValueError(
+            "masked mamba state scatter is implemented for CUDA and CPU tensors "
+            f"only. {dst.device=}"
+        )
 
     torch.ops.sgl_kernel.mamba_state_scatter_with_mask_cpu(
         dst,
@@ -634,7 +620,7 @@ def _conv_multi_eligible(pairs) -> bool:
         return False
     layers = pairs[0][0].shape[0]
     for dst, src in pairs:
-        # Triton-only fast path; off-CUDA the per-pair scatter falls back to torch
+        # Triton-only fast path; off CUDA every pair takes the per-pair scatter
         if not dst.is_cuda or not src.is_cuda:
             return False
         if dst.dtype != torch.bfloat16 or src.dtype != torch.bfloat16:
