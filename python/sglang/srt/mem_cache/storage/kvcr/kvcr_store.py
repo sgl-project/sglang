@@ -47,7 +47,13 @@ as ``segments_per_page`` KVCR block-keys (page key + ``#<seg>`` suffix). The
 segment size and count are discovered by probing the pool once at
 registration. This ``page -> segment-keys`` fan-out is a LOCAL-tier identity
 detail only; the remote/source path (Workstream B) matches on router-hint page
-hashes and will need to reconcile page-hash <-> segment identity.
+hashes through ``StrKeyHintAdapter``.
+
+Hybrid pools are discovered and validated at registration finalization. Each
+physical pool keeps its own buffer regions, component geometry, and key
+namespace; the logical KV anchor is intentionally absent from that manifest.
+Their data path remains disabled until KVCR can register plural framework
+regions and provide size-specific local arenas.
 """
 
 from __future__ import annotations
@@ -59,7 +65,8 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Callable, Deque, Dict, Iterator, List, Optional, Set, Tuple
 
 import msgspec
 import torch
@@ -147,6 +154,23 @@ _ABANDONED_OP_HISTORY = 256
 # ``submit_hint`` -- see _split_control_endpoint.
 _CONTROL_SCHEME = "tcp://"
 _UNDIALABLE_HINT_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
+
+@dataclass(frozen=True)
+class _PoolContext:
+    """Validated host-memory shape for one physical HiCache pool.
+
+    ``component_sizes`` is the page-major order returned by that pool's own
+    ``get_page_buffer_meta`` for one logical page.  It deliberately does not
+    assign components to KVCR local arenas yet; that is the next checkpoint.
+    """
+
+    name: PoolName
+    host_pool: HostKVCache
+    buffers: Tuple[torch.Tensor, ...]
+    regions: Tuple[FrameworkDramInput, ...]
+    page_size: int
+    component_sizes: Tuple[int, ...]
 
 
 # KVCR core methods this backend calls. Checked once at startup because
@@ -443,6 +467,7 @@ class KVCRStore(HiCacheStorage):
         self._pinning = NoFrameworkPinning()
         self._key_hint_adapter = StrKeyHintAdapter()
         self.registered_pools: Dict[PoolName, HostKVCache] = {}
+        self._pool_contexts: Dict[PoolName, _PoolContext] = {}
         self._logical_anchor = False
 
         # Single-pool layouts construct KVCR in register_mem_pool_host(). A
@@ -534,20 +559,150 @@ class KVCRStore(HiCacheStorage):
 
     def finalize_mem_pool_registration(self) -> None:
         """Construct KVCR only after the initial host-pool topology is known."""
+        self._pool_contexts = self._collect_pool_contexts()
         if self._kvcr is not None:
             return
         if self.mem_pool_host is None:
             raise RuntimeError("KVCRStore cannot finalize without a host-pool anchor.")
         if self._logical_anchor:
-            pool_names = ", ".join(
+            registered_names = ", ".join(
                 sorted(str(pool_name) for pool_name in self.registered_pools)
             )
+            physical_names = ", ".join(map(str, self._pool_contexts))
             raise RuntimeError(
-                "KVCRStore collected a logical host-pool anchor and physical "
-                f"pools [{pool_names}], but hybrid physical-pool region "
-                "planning is not implemented yet."
+                "KVCRStore collected a logical host-pool anchor and registered "
+                f"pools [{registered_names}]. Validated physical contexts are "
+                f"[{physical_names}], but plural KVCR framework regions and "
+                "local arenas are not implemented yet."
             )
         self._build_kvcr(self.mem_pool_host)
+
+    @staticmethod
+    def _iter_host_pool_buffers(host_pool: HostKVCache) -> Iterator[torch.Tensor]:
+        """Yield every contiguous tensor a physical pool exposes for I/O."""
+        get_buffers = getattr(host_pool, "get_hybrid_pool_buffer", None)
+        raw_buffers = (
+            get_buffers()
+            if callable(get_buffers)
+            else getattr(host_pool, "kv_buffer", None)
+        )
+        if raw_buffers is None:
+            return
+        if isinstance(raw_buffers, torch.Tensor):
+            raw_buffers = (raw_buffers,)
+        elif not isinstance(raw_buffers, (list, tuple)):
+            raise TypeError(
+                "KVCRStore host-pool buffers must be a tensor, list, or tuple; "
+                f"got {type(raw_buffers).__name__}."
+            )
+        for buffer in raw_buffers:
+            if buffer is None:
+                continue
+            if not isinstance(buffer, torch.Tensor):
+                raise TypeError(
+                    "KVCRStore host-pool buffer must be a torch.Tensor; "
+                    f"got {type(buffer).__name__}."
+                )
+            if buffer.numel() <= 0:
+                raise ValueError(
+                    "KVCRStore physical host-pool buffers cannot be empty."
+                )
+            if not buffer.is_contiguous():
+                raise ValueError(
+                    "KVCRStore physical host-pool buffers must be contiguous."
+                )
+            yield buffer
+
+    @staticmethod
+    def _span_is_registered(
+        address: int, length: int, regions: Tuple[FrameworkDramInput, ...]
+    ) -> bool:
+        if address < 0 or length <= 0:
+            return False
+        end = address + length
+        return any(
+            address >= region.address and end <= region.address + region.length
+            for region in regions
+        )
+
+    def _inspect_physical_pool(
+        self, name: PoolName, host_pool: HostKVCache
+    ) -> Optional[_PoolContext]:
+        """Describe one pool using its buffers and one-page metadata accessor."""
+        buffers = tuple(self._iter_host_pool_buffers(host_pool))
+        if not buffers:
+            if (
+                name == PoolName.KV
+                and host_pool is self.mem_pool_host
+                and self._logical_anchor
+                and getattr(host_pool, "kv_buffer", None) is None
+            ):
+                return None
+            raise RuntimeError(
+                f"KVCRStore physical pool {name} exposes no host-memory buffers."
+            )
+
+        regions = tuple(
+            FrameworkDramInput(
+                address=int(buffer.data_ptr()),
+                length=int(buffer.numel() * buffer.element_size()),
+            )
+            for buffer in buffers
+        )
+        page_size = int(getattr(host_pool, "page_size", 0) or 0)
+        if page_size <= 0:
+            raise RuntimeError(
+                f"KVCRStore physical pool {name} has invalid page_size={page_size}."
+            )
+        probe_indices = torch.arange(page_size, dtype=torch.int64)
+        try:
+            meta = host_pool.get_page_buffer_meta(probe_indices)
+        except Exception as exc:
+            raise RuntimeError(
+                f"KVCRStore could not inspect physical pool {name}."
+            ) from exc
+        if meta is None or len(meta) != 2:
+            raise RuntimeError(
+                f"KVCRStore physical pool {name} returned invalid page metadata."
+            )
+        ptr_list, size_list = meta
+        if not ptr_list or len(ptr_list) != len(size_list):
+            raise RuntimeError(
+                f"KVCRStore physical pool {name} returned mismatched page metadata."
+            )
+        component_sizes = tuple(int(size) for size in size_list)
+        for address, length in zip(ptr_list, component_sizes):
+            if not self._span_is_registered(int(address), length, regions):
+                raise RuntimeError(
+                    f"KVCRStore physical pool {name} returned a page component "
+                    "outside its exposed buffers."
+                )
+        return _PoolContext(
+            name=name,
+            host_pool=host_pool,
+            buffers=buffers,
+            regions=regions,
+            page_size=page_size,
+            component_sizes=component_sizes,
+        )
+
+    def _collect_pool_contexts(self) -> Dict[PoolName, _PoolContext]:
+        """Build a deterministic manifest of all registered physical pools."""
+        candidates = dict(self.registered_pools)
+        if (
+            self.mem_pool_host is not None
+            and not self._logical_anchor
+            and PoolName.KV not in candidates
+        ):
+            # The non-hybrid controller registers only its ordinary KV anchor.
+            candidates[PoolName.KV] = self.mem_pool_host
+
+        contexts: Dict[PoolName, _PoolContext] = {}
+        for name in sorted(candidates, key=str):
+            context = self._inspect_physical_pool(name, candidates[name])
+            if context is not None:
+                contexts[name] = context
+        return contexts
 
     def _control_port(self) -> int:
         """Bind port for this rank's KVCR control channel.
@@ -943,8 +1098,9 @@ class KVCRStore(HiCacheStorage):
         """Whether this backend may serve ``transfer``; log once if it may not.
 
         Pool registration records the topology but does not authorize a data
-        path. Until pool-specific descriptors and keys are implemented, scoring
-        every non-KV transfer as a miss is what keeps this fail-closed:
+        path. Until plural framework regions, size-specific local arenas, and
+        hybrid hit folding are implemented, scoring every non-KV transfer as a
+        miss is what keeps this fail-closed:
         ``update_extra_pool_hit_pages`` records 0 for the pool and
         ``_sync_and_clamp_prefetch_result`` clamps the usable prefix to 0, so
         HiCache recomputes instead of reading a page this backend never wrote.
@@ -971,19 +1127,44 @@ class KVCRStore(HiCacheStorage):
             results[str(transfer.name)] = self._deposit_transfer(transfer)
         return results
 
-    def _segment_key(self, page_key: str, seg: int) -> BlockKey:
+    def _segment_key(
+        self,
+        page_key: str,
+        seg: int,
+        pool_name: PoolName = PoolName.KV,
+    ) -> BlockKey:
         """KVCR block identity for one segment of a host page.
 
         A page fans out into ``segments_per_page`` KVCR blocks; the ``#<seg>``
         suffix keeps them distinct in the local tier. This identity is
-        local-tier-only -- the remote/source path (Workstream B) matches on
-        router-hint page hashes and will reconcile page-hash <-> segment.
-        """
-        return _encode_key(f"{page_key}#{seg}")
+        understood by both the local and remote paths. Router hints still name
+        whole pages; their adapter strips everything after the first ``#``.
 
-    def _page_segment_keys(self, page_key: str) -> List[BlockKey]:
-        segments = self._segments_per_page or 0
-        return [self._segment_key(page_key, seg) for seg in range(segments)]
+        The existing KV spelling is retained for single-pool and mixed-version
+        compatibility. Physical hybrid pools add a versioned pool namespace so
+        equal page hashes and component ordinals cannot alias different state.
+        """
+        if pool_name == PoolName.KV:
+            return _encode_key(f"{page_key}#{seg}")
+        return _encode_key(f"{page_key}#v2/{pool_name}/{seg}")
+
+    def _page_segment_keys(
+        self,
+        page_key: str,
+        pool_name: PoolName = PoolName.KV,
+        segments_per_page: Optional[int] = None,
+    ) -> List[BlockKey]:
+        if segments_per_page is None:
+            context = self._pool_contexts.get(pool_name)
+            segments_per_page = (
+                len(context.component_sizes)
+                if context is not None
+                else (self._segments_per_page or 0)
+            )
+        return [
+            self._segment_key(page_key, seg, pool_name)
+            for seg in range(segments_per_page)
+        ]
 
     def _deposit_transfer(self, transfer: PoolTransfer) -> List[bool]:
         keys = transfer.keys or []
@@ -1047,29 +1228,54 @@ class KVCRStore(HiCacheStorage):
 
         Returns ``(descriptors, per_page_keys)``, or None if the pool meta can't
         be lined up with the requested keys. ``descriptors`` is the flat
-        ``{segment_key: MemDescriptor}`` mapping KVCR takes, with
-        ``segments_per_page`` entries per page key; each descriptor is exactly
-        ``slot_size`` bytes so it lands in one KVCR slot. ``per_page_keys`` is
-        the same segment keys grouped by page, handed back so callers scoring
-        the result map index into it instead of re-formatting every key -- a
-        ``layer_first`` layout puts ``2 * layer_num`` segments on a page, which
-        makes that string building the dominant cost of the call.
+        ``{component_key: MemDescriptor}`` mapping KVCR takes. For today's KV
+        path every component is exactly ``slot_size`` bytes. Hybrid contexts
+        instead preserve the component sizes their own pool reported; those
+        descriptors remain gated from submission until checkpoint 3 supplies
+        matching local arenas. ``per_page_keys`` groups the same keys by page
+        so result folding cannot accidentally use a different key spelling.
         """
         host_indices = transfer.host_indices
         keys = transfer.keys or []
-        if host_indices is None or not keys or self._segments_per_page is None:
+        if host_indices is None or not keys:
+            return None
+
+        context = self._pool_contexts.get(transfer.name)
+        if context is not None:
+            host_pool = context.host_pool
+            component_sizes = context.component_sizes
+            regions = context.regions
+        elif transfer.name == PoolName.KV and self.mem_pool_host is not None:
+            # Compatibility for direct single-pool users that have not called
+            # the controller's registration finalizer yet.
+            if self._segments_per_page is None or self._slot_size is None:
+                return None
+            host_pool = self.mem_pool_host
+            component_sizes = (self._slot_size,) * self._segments_per_page
+            regions = ()
+        else:
+            logger.warning(
+                "KVCRStore: no physical pool context for transfer %s",
+                transfer.name,
+            )
             return None
         try:
-            ptr_list, size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            ptr_list, size_list = host_pool.get_page_buffer_meta(host_indices)
         except Exception:
-            logger.warning("KVCRStore: get_page_buffer_meta failed", exc_info=True)
-            return None
-        segments = self._segments_per_page
-        if len(ptr_list) != len(keys) * segments:
             logger.warning(
-                "KVCRStore: page meta count %d != keys %d * segments %d; "
-                "layout changed since registration?",
+                "KVCRStore: get_page_buffer_meta failed for pool %s",
+                transfer.name,
+                exc_info=True,
+            )
+            return None
+        segments = len(component_sizes)
+        if len(ptr_list) != len(size_list) or len(ptr_list) != len(keys) * segments:
+            logger.warning(
+                "KVCRStore: pool %s page meta count ptrs=%d sizes=%d != "
+                "keys %d * components %d; layout changed since registration?",
+                transfer.name,
                 len(ptr_list),
+                len(size_list),
                 len(keys),
                 segments,
             )
@@ -1082,14 +1288,27 @@ class KVCRStore(HiCacheStorage):
             for seg in range(segments):
                 ptr = int(ptr_list[base + seg])
                 size = int(size_list[base + seg])
-                if size != self._slot_size:
+                expected_size = component_sizes[seg]
+                if size != expected_size:
                     logger.warning(
-                        "KVCRStore: segment size %d != slot_size %d",
+                        "KVCRStore: pool %s component %d size %d != registered size %d",
+                        transfer.name,
+                        seg,
                         size,
-                        self._slot_size,
+                        expected_size,
                     )
                     return None
-                segment_key = self._segment_key(key, seg)
+                if context is not None and not self._span_is_registered(
+                    ptr, size, regions
+                ):
+                    logger.warning(
+                        "KVCRStore: pool %s component %d lies outside its "
+                        "registered framework regions",
+                        transfer.name,
+                        seg,
+                    )
+                    return None
+                segment_key = self._segment_key(key, seg, transfer.name)
                 page_keys.append(segment_key)
                 descriptors[segment_key] = MemDescriptor(
                     end_point_name=self._agent_name,
