@@ -40,7 +40,11 @@ from typing import (
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
+from sglang.kernels.ops.memory.virtual_slot import (
+    alloc_bind_inplace,
+    bind_inplace,
+    free_unbind_inplace,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -909,8 +913,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Bind page-granular virtual ids to physical ids."""
         with record_function("MultiEndedAlloc.bind"):
-            self.virtual_to_physical[virtual_ids] = physical_ids
-            self.physical_to_virtual[physical_ids] = virtual_ids
+            bind_inplace(
+                virtual_ids,
+                physical_ids,
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+            )
 
     def bind_pages(
         self, virtual_pages: torch.Tensor, physical_pages: torch.Tensor
@@ -1432,26 +1440,22 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
-            with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
-                free_v_pages_raw = free_index.detach().to(torch.int64)
-                if pages is not None:
-                    # `free_segment` already derived these by stride slicing.
-                    free_v_pages = pages
-                elif self.page_size == 1:
-                    free_v_pages = free_v_pages_raw
-                else:
-                    free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-                freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # Disjoint-element scatters — no barrier (a freed v has no live reader;
-            # per-element scatter writes are atomic).
-            # `index_fill_`, NOT `t[idx] = -1`: the scalar form makes torch
-            # materialise -1 as a CPU tensor and copy it H2D, and a pageable
-            # H2D copy is host-BLOCKING -- the scheduler parks behind the
-            # in-flight forward until the stream drains (~16 ms per free on an
-            # 8192-token prefill). `index_fill_` takes the scalar through the
-            # ATen Scalar overload: one device kernel, no host sync.
-            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
-            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
+            free_v_pages_raw = free_index.detach().to(torch.int64)
+            if pages is not None:
+                # `free_segment` already derived these by stride slicing.
+                free_v_pages = pages
+            elif self.page_size == 1:
+                free_v_pages = free_v_pages_raw
+            else:
+                free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
+            # One kernel for the v2p read and both tombstones. Disjoint-element
+            # scatters need no barrier (a freed v has no live reader), and the
+            # tombstone value never crosses the host -- the scalar `t[idx] = -1`
+            # form would materialise -1 on the CPU and block the scheduler on a
+            # pageable H2D copy (~16 ms per free on an 8192-token prefill).
+            freed_p_pages = free_unbind_inplace(
+                free_v_pages, self.virtual_to_physical, self.physical_to_virtual
+            )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
