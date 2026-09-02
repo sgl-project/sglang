@@ -149,6 +149,7 @@ class MambaPoolHost(HostKVCache):
                 registration_granularity_bytes=(
                     int(np.prod(dims[1:])) * dtype.itemsize
                 ),
+                require_single_registration=self.layout == "page_first",
             )
 
         if self.layout in ["page_first", "page_first_direct"]:

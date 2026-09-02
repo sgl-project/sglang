@@ -237,6 +237,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
                 registration_granularity_bytes=self.layer_num * self.item_bytes,
+                require_single_registration=True,
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -246,6 +247,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
                 registration_granularity_bytes=self.layer_num * self.item_bytes,
+                require_single_registration=False,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -642,6 +644,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
                 registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
+                require_single_registration=True,
             )
         elif self.layout == "page_first_direct":
             self.kv_buffer = alloc_func(
@@ -651,6 +654,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
                 registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
+                require_single_registration=False,
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
