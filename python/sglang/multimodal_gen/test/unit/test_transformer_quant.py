@@ -110,6 +110,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
+    Flux2Transformer2DModel,
+)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -319,6 +322,55 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 self.assertEqual(target_name, source_name)
                 self.assertIsNone(merge_index)
                 self.assertIsNone(total_shards)
+
+    def test_flux2_modelopt_fp8_qkv_checkpoint_tensors_are_merged(self):
+        mapping = get_param_names_mapping(Flux2Transformer2DModel.param_names_mapping)
+        prefix = "transformer_blocks.0.attn"
+        source = {}
+        for projection_prefix in ("to_", "add_"):
+            source_names = (
+                ("q", "k", "v")
+                if projection_prefix == "to_"
+                else ("q_proj", "k_proj", "v_proj")
+            )
+            for shard_id, shard_name in enumerate(source_names):
+                name = f"{prefix}.{projection_prefix}{shard_name}"
+                source[f"{name}.weight"] = torch.full(
+                    (2, 3), shard_id + 1, dtype=torch.float8_e4m3fn
+                )
+                source[f"{name}.weight_scale"] = torch.tensor(
+                    [0.1 * (shard_id + 1)], dtype=torch.float32
+                )
+                source[f"{name}.input_scale"] = torch.tensor([0.2], dtype=torch.float32)
+
+        merged, _ = hf_to_custom_state_dict(source, mapping)
+
+        for target in ("to_qkv", "to_added_qkv"):
+            self.assertEqual(merged[f"{prefix}.{target}.weight"].shape, (6, 3))
+            torch.testing.assert_close(
+                merged[f"{prefix}.{target}.weight_scale"],
+                torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+            )
+            torch.testing.assert_close(
+                merged[f"{prefix}.{target}.input_scale"],
+                torch.tensor([0.2, 0.2, 0.2], dtype=torch.float32),
+            )
+        self.assertEqual(
+            Flux2Transformer2DModel.packed_modules_mapping["to_qkv"],
+            ["to_q", "to_k", "to_v"],
+        )
+
+        # On an unfused model (BF16, Hopper FP8, or TP>1), the source
+        # projection names are valid model parameters and the loader must keep
+        # them separate rather than producing a nonexistent packed target.
+        unmerged, _ = hf_to_custom_state_dict(
+            source,
+            mapping,
+            valid_target_names=set(source),
+        )
+        self.assertEqual(set(unmerged), set(source))
+        for name, tensor in source.items():
+            torch.testing.assert_close(unmerged[name], tensor)
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",
