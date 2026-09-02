@@ -679,21 +679,21 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                expand = self.forward_metadata_spec_decode_expand
                 o_expand, lse_expand = self._cascade_expand_attn(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
-                    value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    expand.page_table,
-                    expand.cache_seqlens_int32,
+                    key_cache,
+                    value_cache,
+                    self.forward_metadata_spec_decode_expand,
                     layer.scaling,
                     layer.logit_cap,
+                    window_size,
+                    sinks,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
-                    lse_expand.contiguous(),
+                    lse_expand,
                 )
             else:
                 o = result
@@ -1056,21 +1056,21 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    expand = self.forward_metadata_spec_decode_expand
                     o_expand, lse_expand = self._cascade_expand_attn(
                         q_reshaped,
-                        key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
-                        value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        expand.page_table,
-                        expand.cache_seqlens_int32,
+                        key_cache,
+                        value_cache,
+                        self.forward_metadata_spec_decode_expand,
                         layer.scaling,
                         layer.logit_cap,
+                        window_size,
+                        sinks,
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
-                        lse_expand.contiguous(),
+                        lse_expand,
                     )
                 else:
                     o = result
