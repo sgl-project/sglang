@@ -2634,6 +2634,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(prefill_attention_backend="trtllm_mla")
+            ),
+            {"page_size": 64},
+        )
         # chained: flashmla via decode -> 64, then trtllm_mha accepts 64
         self.assertEqual(
             _mla_backend_page_constraints(

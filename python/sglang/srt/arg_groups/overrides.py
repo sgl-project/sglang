@@ -1183,6 +1183,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
+        or view.prefill_attention_backend == "trtllm_mla"
     ):
         if page_size not in [32, 64]:
             logger.warning(
