@@ -1,7 +1,8 @@
-"""DeepSeek-V4 MXFP4 expert backend backed by FlashInfer CUTLASS MoE.
+"""DeepSeek-V4 MXFP4 expert backends backed by FlashInfer.
 
 ``Fp8Config`` selects this backend for SM90 and SM120; SM100 uses the
-TRT-LLM implementation.
+TRT-LLM implementation. On SM120 it also supplies the native checkpoint
+loader/finalizer for FlashInfer MegaMoE.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 
@@ -37,6 +39,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
     def __init__(self, fp8_method, prefix: str):
         if not is_flashinfer_available():
             raise RuntimeError("Mxfp4FlashinferCutlassMoEMethod requires FlashInfer.")
+        self._use_flashinfer_megamoe = get_moe_runner_backend().is_flashinfer_megamoe()
         self._use_mxfp8_act_scaling = get_platform().is_sm120
         precision = get_exec().moe.flashinfer_mxfp4_moe_precision
         # precision=fp8 is an SM90 knob (Humming W4A8); on SM120 the MXFP8
@@ -51,8 +54,11 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        """Load W13 directly as ``[up; gate]`` for FlashInfer CUTLASS."""
-        return True
+        """Select the canonical W13 order expected by the chosen backend."""
+        # FlashInfer CUTLASS consumes [up; gate]. MegaMoE's public weight
+        # preprocessor consumes canonical [gate; up] and performs its own
+        # granularity-8 interleave.
+        return not self._use_flashinfer_megamoe
 
     def create_weights(
         self,
@@ -88,6 +94,12 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
         self.moe_runner_config = moe_runner_config
 
+        if self._use_flashinfer_megamoe:
+            # The public FlashInfer MoEEpLayer owns dispatch, FC1, FC2 and
+            # combine, bypassing SGLang's ordinary per-expert MoeRunner.
+            self.runner = None
+            return
+
         E = layer.num_local_experts
         device = layer.w13_weight.device
         if self._use_mxfp8_act_scaling:
@@ -122,6 +134,30 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, moe_runner_config)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self._use_flashinfer_megamoe:
+            # create_weights() deliberately kept checkpoint E8M0 scales in
+            # their native dtype. Do not call the borrowed Fp8 method here:
+            # SGLang's existing DeepGEMM MegaMoE branch would transform both
+            # weights and scales before the FlashInfer adapter can take them.
+            for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                scale = getattr(layer, name)
+                if scale.dtype != torch.float8_e8m0fnu:
+                    raise TypeError(
+                        f"{name} must remain native E8M0 for FlashInfer MegaMoE, "
+                        f"got {scale.dtype}."
+                    )
+
+            from sglang.srt.layers.moe.flashinfer_mega_moe import (
+                finalize_flashinfer_megamoe_weights,
+            )
+
+            finalize_flashinfer_megamoe_weights(
+                layer,
+                max_num_tokens=get_exec().moe.flashinfer_megamoe_max_num_tokens,
+            )
+            layer._dsv4_mxfp4_backend = "flashinfer_megamoe_sm120"
+            return
+
         # Preserve the base FP4 post-load handling.
         self._fp8.process_weights_after_loading(layer)
 

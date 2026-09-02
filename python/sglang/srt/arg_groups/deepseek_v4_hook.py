@@ -80,13 +80,18 @@ def validate_deepseek_v4_mega_moe_token_budget(
         // token_alignment
         * token_alignment
     )
-    max_tokens_per_rank = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    )
+    if cfg.moe_runner_backend == "flashinfer_megamoe":
+        max_tokens_per_rank = cfg.flashinfer_megamoe_max_num_tokens
+        capacity_name = "--flashinfer-megamoe-max-num-tokens"
+    else:
+        max_tokens_per_rank = (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        )
+        capacity_name = "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK"
     if max_tokens_per_rank < required_tokens_per_rank:
         raise ValueError(
             "DeepSeekV4 with MegaMoE requires "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
+            f"{capacity_name} to "
             "cover each rank's effective prefill token budget. "
             f"Current values: chunked_prefill_size="
             f"{cfg.chunked_prefill_size}, "
@@ -94,12 +99,10 @@ def validate_deepseek_v4_mega_moe_token_budget(
             f"token_partition_size={token_partition_size}, "
             f"token_alignment={token_alignment}, "
             f"required_per_rank={required_tokens_per_rank}, "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-            f"{max_tokens_per_rank}. Set "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
+            f"{capacity_name}={max_tokens_per_rank}. Set {capacity_name} to at "
             f"least {required_tokens_per_rank}, or lower "
             "--chunked-prefill-size until the effective per-rank budget fits. "
-            "Otherwise MegaMoE falls back to the fused MoE path at runtime."
+            "Otherwise MegaMoE cannot execute that batch."
         )
 
 

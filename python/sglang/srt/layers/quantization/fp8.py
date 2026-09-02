@@ -409,8 +409,22 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+            if self.is_fp4_experts and (
+                get_moe_runner_backend().is_flashinfer_mxfp4()
+                or get_moe_runner_backend().is_flashinfer_megamoe()
+            ):
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
+                if get_moe_runner_backend().is_flashinfer_megamoe():
+                    if not get_platform().is_sm120:
+                        raise NotImplementedError(
+                            "flashinfer_megamoe currently requires SM120."
+                        )
+                    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+                        Mxfp4FlashinferCutlassMoEMethod,
+                    )
+
+                    return Mxfp4FlashinferCutlassMoEMethod(fp8_method, prefix=prefix)
+
                 if get_platform().is_sm90 or get_platform().is_sm120:
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
                         Mxfp4FlashinferCutlassMoEMethod,

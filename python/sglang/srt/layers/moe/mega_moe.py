@@ -30,7 +30,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
@@ -43,6 +43,12 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+
+
+def get_mega_moe_max_tokens_per_rank() -> int:
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        return get_exec().moe.flashinfer_megamoe_max_num_tokens
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 
 
 def _mega_moe_mma_type() -> str:
@@ -127,6 +133,27 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
+
+    # FlashInfer takes ownership of the checkpoint-format expert parameters in
+    # post-load processing, so there is intentionally no ordinary FusedMoE
+    # fallback. Fail explicitly on a capacity violation instead of falling
+    # through to a runner whose source weights have already been released.
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        global_num_tokens = get_dp_global_num_tokens()
+        if global_num_tokens and not is_dsa_enable_prefill_cp():
+            max_tokens_per_rank = max(global_num_tokens)
+        else:
+            max_tokens_per_rank = hidden_states.shape[0]
+        cap = get_mega_moe_max_tokens_per_rank()
+        if max_tokens_per_rank > cap:
+            raise ValueError(
+                "FlashInfer MegaMoE token capacity exceeded: "
+                f"required={max_tokens_per_rank}, capacity={cap}. Raise "
+                "--flashinfer-megamoe-max-num-tokens or reduce the per-rank "
+                "prefill/decode admission limit."
+            )
+        return True
+
     if _device_sm == 90:
         if not is_sm90_fp8_mega_moe_available(moe.experts):
             return False
@@ -138,7 +165,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
-    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    cap = get_mega_moe_max_tokens_per_rank()
     return max_tokens_per_rank <= cap
 
 
@@ -186,8 +213,6 @@ def _run_mega_routed(
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:
-    import deep_gemm
-
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
@@ -218,15 +243,44 @@ def _run_mega_routed(
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
     intermediate_size = moe.config.moe_intermediate_size
-    num_max_tokens_per_rank = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    )
+    num_max_tokens_per_rank = get_mega_moe_max_tokens_per_rank()
     assert num_tokens <= num_max_tokens_per_rank, (
         f"mega MoE: num_tokens={num_tokens} exceeds cap "
-        f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-        f"{num_max_tokens_per_rank}; raise the env var or shrink "
+        f"MegaMoE max tokens per rank="
+        f"{num_max_tokens_per_rank}; raise the configured capacity or shrink "
         f"cuda_graph_max_bs / chunked_prefill_size accordingly"
     )
+
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        from sglang.srt.layers.moe.flashinfer_mega_moe import (
+            run_flashinfer_megamoe,
+        )
+
+        global_num_tokens = get_dp_global_num_tokens()
+        compile_tokens_per_rank = (
+            max(global_num_tokens) if global_num_tokens else num_tokens
+        )
+        y = run_flashinfer_megamoe(
+            moe.experts,
+            hidden_states,
+            topk_ids=(
+                topk_ids.to(torch.int64)
+                if topk_ids is not None
+                else hidden_states.new_empty((0, top_k), dtype=torch.int64)
+            ),
+            topk_weights=(
+                topk_weights.to(torch.float32)
+                if topk_weights is not None
+                else hidden_states.new_empty((0, top_k), dtype=torch.float32)
+            ),
+            compile_tokens_per_rank=max(compile_tokens_per_rank, num_tokens),
+            activation_clamp=getattr(moe.config, "swiglu_limit", None),
+        )
+        if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
+            y.mul_(moe.routed_scaling_factor)
+        return y
+
+    import deep_gemm
 
     buf = _get_mega_moe_symm_buffer(
         ep_group,
