@@ -589,20 +589,16 @@ class SchedulerPPMixin:
         )
 
     def profile_and_init_predictor(self: Scheduler) -> bool:
-        """
-        Profile prefill latency for dynamic chunk sizing.
-
-        Only PP0 profiles; the samples are broadcast so all ranks fit the same
-        coefficients. A profiling failure on PP0 is broadcast too, so every
-        rank disables dynamic chunking together instead of the later stages
-        blocking on the collective. Returns whether the predictor is ready.
-        """
+        """Fit the dynamic-chunk predictor from PP0's profiling samples; returns
+        whether it is ready."""
         samples: Optional[Tuple[List[int], List[float]]] = None
 
         if self.pp_group.is_first_rank:
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
+                # Broadcast the failure as None; every PP rank must reach the
+                # collective below or the later stages block on it.
                 logger.warning(
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
                     "Dynamic chunking will be disabled."
@@ -646,7 +642,7 @@ class SchedulerPPMixin:
         return True
 
     def _profile_prefill_latency(self: Scheduler) -> Tuple[List[int], List[float]]:
-        """Run PP0's synthetic prefill sweep; returns (seq_lens, latencies_ms)."""
+        """Sweep synthetic prefill chunks on PP0; latencies are in ms."""
         seq_lens: List[int] = []
         latencies: List[float] = []
         model_runner = self.tp_worker.model_runner
@@ -705,8 +701,7 @@ class SchedulerPPMixin:
             current_seq_len = req.extend_range.end
 
             if is_dp_attention_enabled():
-                # For profiling, we only have one request on PP0
-                # Set global_num_tokens to indicate this rank has tokens, others have 0
+                # Profiling runs one request on this rank; other DP ranks report 0.
                 dp_size = get_attention_dp_size()
                 global_num_tokens = [0] * dp_size
                 dp_rank = get_attention_dp_rank()
