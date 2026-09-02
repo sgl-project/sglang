@@ -89,15 +89,19 @@ class TestKdaTrackState(CustomTestCase):
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
         for backend, chunk_kda_fn in _BACKENDS.items():
-            with self.subTest(backend=backend):
-                self._check_track_state(chunk_kda_fn)
+            # num_heads=2 exercises the Helion small-head track config; 16
+            # crosses _PREFILL_SMALL_HEAD_THRESHOLD (12) to exercise the
+            # large-head varlen track config that real models take.
+            for num_heads in (2, 16):
+                with self.subTest(backend=backend, num_heads=num_heads):
+                    self._check_track_state(chunk_kda_fn, num_heads)
 
-    def _check_track_state(self, chunk_kda_fn):
+    def _check_track_state(self, chunk_kda_fn, num_heads):
         # seq0: 100 tokens, unaligned -> snapshot at the 64-token boundary
         # (start of chunk 1). seq1: 64 tokens, aligned -> not tracked.
         lens = [100, 64]
         q, k, v, gate, beta, a_log, dt_bias, state, cu_seqlens = _make_varlen_inputs(
-            0, lens
+            0, lens, num_heads=num_heads
         )
         num_heads, head_dim = q.shape[2], q.shape[3]
 
