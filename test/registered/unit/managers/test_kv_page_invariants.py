@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,23 +44,15 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
     return _FakeChecker(), rtt, tc, alloc
 
 
-class _FakeReq:
-    def __init__(self, rid, rpi, committed, allocated):
+class _FakeOwner:
+    # A req or a session slot; the checker reads only `kv` (and `rid` for reqs).
+    def __init__(self, rpi, committed, allocated, rid=None):
         self.rid = rid
-        self.req_pool_idx = rpi
-        self.kv = SimpleNamespace(
-            kv_committed_len=committed, kv_allocated_len=allocated, swa_evicted_seqlen=0
+        self.kv = ReqKvInfo(
+            req_pool_idx=rpi,
+            kv_committed_len=committed,
+            kv_allocated_len=allocated,
         )
-        self.is_holding_kv = True
-
-
-class _FakeSlot:
-    def __init__(self, rpi, committed, allocated):
-        self.req_pool_idx = rpi
-        self.kv = SimpleNamespace(
-            kv_committed_len=committed, kv_allocated_len=allocated, swa_evicted_seqlen=0
-        )
-        self.is_holding_kv = True
 
 
 class TestKVPageInvariants(CustomTestCase):
@@ -70,21 +63,23 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :256] = torch.arange(_PAGE_SIZE)  # req 0 owns page 0
         rtt[1, :256] = torch.arange(_PAGE_SIZE, 2 * _PAGE_SIZE)  # req 1 owns page 1
         chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeReq("a", 0, 256, 256), _FakeReq("b", 1, 200, 256)]
+            reqs=[_FakeOwner(0, 256, 256, rid="a"), _FakeOwner(1, 200, 256, rid="b")]
         )
         chk._check_kv_page_invariants()
         self.assertEqual(chk.count_memory_leak_warnings, 0)
 
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 145, 144)])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeOwner(0, 145, 144, rid="a")]
+        )
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
         chk.get_last_batch = lambda: None
-        tc.slots = {"s1": _FakeSlot(0, 145, 144)}
+        tc.slots = {"s1": _FakeOwner(0, 145, 144)}
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
@@ -94,14 +89,18 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 3, 3)])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeOwner(0, 3, 3, rid="a")]
+        )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_last_batch = lambda: SimpleNamespace(reqs=[_FakeReq("a", 0, 1, 1)])
+        chk.get_last_batch = lambda: SimpleNamespace(
+            reqs=[_FakeOwner(0, 1, 1, rid="a")]
+        )
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 

@@ -21,11 +21,12 @@ class _FakeAllocator:
 
 
 class _FakeReq:
-    req_pool_idx = 0
-
     def __init__(self):
         self.kv = SimpleNamespace(
-            swa_evicted_seqlen=6, swa_evict_floor=3, cache_protected_len=0
+            req_pool_idx=0,
+            swa_evicted_seqlen=6,
+            swa_evict_floor=3,
+            cache_protected_len=0,
         )
 
     def pop_committed_kv_cache(self):

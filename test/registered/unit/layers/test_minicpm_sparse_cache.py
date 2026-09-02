@@ -7,12 +7,14 @@ import torch
 from sglang.srt.layers.attention.minicpm.cache import (
     attach_compressed_cache,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,16 +22,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class RecordingAllocator:
+class RecordingAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
     def __init__(self, capacity: int):
+        super().__init__(
+            size=capacity,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
         self.capacity = capacity
-        self.page_size = 1
         self.next_slot = 1
         self.live: set[int] = set()
-
-    @property
-    def size(self):
-        return self.capacity
 
     def alloc(self, size: int):
         if size > self.available_size():
@@ -69,8 +77,8 @@ def make_pool_and_req(capacity: int = 64):
         enable_memory_saver=False,
     )
     req = SimpleNamespace(
-        req_pool_idx=None,
         inflight_middle_chunks=0,
+        kv=ReqKvInfo(),
     )
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
@@ -227,8 +235,7 @@ def test_streaming_session_release_frees_compressed_slots():
         )
     )
     session.slots["session-a"] = SessionSlot(
-        req_pool_idx=req_pool_idx,
-        kv=SimpleNamespace(kv_allocated_len=16, cache_protected_len=0),
+        kv=ReqKvInfo(req_pool_idx=req_pool_idx, kv_allocated_len=16),
     )
 
     session.release_session("session-a")
@@ -295,7 +302,7 @@ def test_partial_failure_rolls_back_and_free_releases_every_slot():
     assert len(cache.free_slots) == 0
 
     pool.free(req)
-    assert req.req_pool_idx is None
+    assert req.kv.req_pool_idx is None
     assert allocator.available_size() == 12
     assert len(cache.free_slots) == 8
 
