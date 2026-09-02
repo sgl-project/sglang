@@ -240,7 +240,9 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+# Not tied to FA3: Hopper CUTLASS 3.x kernels compile to arch-disabled stubs
+# without the sm_90a pass, and FA3 defaults OFF on aarch64 (Grace Hopper).
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
