@@ -5,9 +5,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
+from tempfile import NamedTemporaryFile
 
 import torch
 
+from sglang.srt.eplb.topology import load_rank_cost_matrix
 from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     rebalance_experts_topology_aware,
 )
@@ -93,6 +95,20 @@ class TestTopologyAwarePlacement(unittest.TestCase):
         costs = torch.ones((2, 2), dtype=torch.float32)
         with self.assertRaisesRegex(ValueError, "diagonal"):
             rebalance_experts_topology_aware(counts, costs)
+
+    def test_loads_and_validates_json_topology(self):
+        topology = {"rank_cost_matrix": [[0, 1], [1, 0]]}
+        matrix = load_rank_cost_matrix(topology, expected_num_ranks=2)
+        self.assertEqual(matrix.dtype, torch.float64)
+        self.assertTrue(
+            torch.equal(matrix, torch.tensor(topology["rank_cost_matrix"]).double())
+        )
+
+        with NamedTemporaryFile(mode="w+", suffix=".json") as file:
+            file.write('{"rank_cost_matrix": [[0, 2], [2, 0]]}')
+            file.flush()
+            loaded = load_rank_cost_matrix(file.name, expected_num_ranks=2)
+        self.assertEqual(loaded.tolist(), [[0.0, 2.0], [2.0, 0.0]])
 
 
 if __name__ == "__main__":

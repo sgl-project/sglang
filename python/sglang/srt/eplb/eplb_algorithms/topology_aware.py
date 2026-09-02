@@ -31,6 +31,8 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.eplb.topology import _validate_rank_cost_matrix
+
 
 def _validate_inputs(
     tokens_per_source_expert: torch.Tensor,
@@ -57,17 +59,9 @@ def _validate_inputs(
     ):
         raise ValueError("tokens_per_source_expert must be finite and non-negative")
 
-    if (
-        rank_cost_matrix.ndim != 2
-        or rank_cost_matrix.shape != (num_ranks, num_ranks)
-    ):
-        raise ValueError("rank_cost_matrix must be square and match source ranks")
     if not torch.is_floating_point(rank_cost_matrix):
         raise TypeError("rank_cost_matrix must use a floating-point dtype")
-    if not torch.isfinite(rank_cost_matrix).all() or torch.any(rank_cost_matrix < 0):
-        raise ValueError("rank_cost_matrix must be finite and non-negative")
-    if torch.any(torch.diagonal(rank_cost_matrix) != 0):
-        raise ValueError("rank_cost_matrix diagonal must be zero")
+    _validate_rank_cost_matrix(rank_cost_matrix, expected_num_ranks=num_ranks)
 
     if num_physical_experts != num_logical_experts:
         raise NotImplementedError(
