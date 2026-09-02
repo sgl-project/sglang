@@ -33,6 +33,7 @@ class AttentionBackendEnum(enum.Enum):
     DYNAMIC_CUDNN_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
+    SPARGE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
     SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
@@ -59,6 +60,7 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
+            AttentionBackendEnum.SPARGE_ATTN,
             AttentionBackendEnum.LASER_ATTN,
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,
             AttentionBackendEnum.RAIN_FUSION_ATTN,

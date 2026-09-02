@@ -673,17 +673,22 @@ done
 
 ### Choose the quality level
 
-`quality` is a request-scoped sampling parameter with two validated levels:
+`quality` is a cumulative request-scoped optimization parameter with three
+levels:
 
 - `"lossless"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
+- `"extra-high"`: includes the global fusion-only tier but does not enable
+  Cache-DiT or another approximate optimization. MiniMax-H3 currently has no
+  request-gated fusion site, so its denoise path is the same as `lossless`.
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `lossless`), but output is no longer bit-identical to the reference.
 
-One resident server serves both levels; a `quality: "high"` request mounts
-its audited Cache-DiT policy at the batch boundary, and a later
-`quality: "lossless"` request removes the hooks before denoising.
+One resident server serves all three levels; a `quality: "high"` request
+mounts its audited Cache-DiT policy at the batch boundary, and a later
+`quality: "lossless"` or `quality: "extra-high"` request removes the hooks
+before denoising.
 
 Start the validated server once:
 
@@ -720,6 +725,19 @@ omitting the field is equivalent.
 
 </Tab>
 
+<Tab title="extra-high">
+
+The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
+currently follows the same H3 denoise path as `lossless`.
+
+```json Request field
+{
+  "quality": "extra-high"
+}
+```
+
+</Tab>
+
 <Tab title="high">
 
 The audited accelerated path. Use it when you can trade bit-exactness for
@@ -740,6 +758,7 @@ The measured trade-off is:
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
+| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; no H3-specific request-gated site yet |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
@@ -766,8 +785,8 @@ name, for example `sglang generate --quality high`.
 
 For manually tuned Cache-DiT experiments outside that validated path, omit
 the request `quality` field and set `--enable-cache-dit` or the
-process-wide `SGLANG_CACHE_DIT_*` defaults. An explicit `quality`
-(including `"lossless"`) takes H3 off the generic Cache-DiT path. The
+process-wide `SGLANG_CACHE_DIT_*` defaults. Any explicit `quality`, including
+`"lossless"` and `"extra-high"`, takes H3 off the generic Cache-DiT path. The
 24 GB layerwise recipe above can use the same switch; skipped blocks are
 not streamed.
 
