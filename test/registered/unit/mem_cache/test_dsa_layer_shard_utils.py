@@ -4,7 +4,11 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.cp.utils import (
+    get_glm_dsa_cp_layer_shard_info,
+    get_layer_owner,
+    get_layer_shard_range,
+)
 from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -13,6 +17,25 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDSALayerShardUtils(CustomTestCase):
+    @patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True)
+    @patch(
+        "sglang.srt.layers.cp.utils.get_parallel",
+        return_value=SimpleNamespace(
+            enable_dsa_cache_layer_split=True,
+            attn_cp_size=4,
+            attn_cp_rank=2,
+        ),
+    )
+    def test_hybrid_dsa_model_does_not_enable_layer_split(self, *_):
+        model_runner = SimpleNamespace(
+            is_draft_worker=False,
+            use_mla_backend=True,
+            mambaish_config=SimpleNamespace(),
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
+
+        self.assertEqual(get_glm_dsa_cp_layer_shard_info(model_runner), (None, 1))
+
     def test_cpu_copy_does_not_include_kpool_compress_tail(self):
         pool = SimpleNamespace(
             layer_num=0,

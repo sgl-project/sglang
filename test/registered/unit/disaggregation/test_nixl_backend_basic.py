@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
 from sglang.srt.disaggregation.common.utils import pack_int_lists
@@ -1241,6 +1241,50 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
                 f"decode rank {rank} mapped to group {head_group_idx}, "
                 f"expected {expected[rank]} (modulo bug gives 0,1,0,1)",
             )
+
+
+class TestNixlDSALayerSplitStateTransfer(CustomTestCase):
+    def test_nonzero_cp_rank_sends_owned_dsa_layers(self):
+        send_calls = []
+        sender = SimpleNamespace(
+            attn_cp_size=4,
+            attn_cp_rank=2,
+            kv_args=SimpleNamespace(
+                state_types=[StateType.DSA],
+                state_data_ptrs=[[0x1000]],
+                state_item_lens=[[64]],
+                state_dim_per_tensor=[],
+                state_conv_shard_groups=[],
+                state_slice_outer_counts=[],
+                state_layer_ids=[[]],
+            ),
+            agent=SimpleNamespace(
+                send_notif=lambda *_: self.fail(
+                    "layer-sharded DSA state must not be treated as replicated"
+                )
+            ),
+        )
+
+        def send_kvcache_generic(**kwargs):
+            send_calls.append(kwargs)
+            return "dsa-handle"
+
+        sender._send_kvcache_generic = send_kvcache_generic
+
+        handles = NixlKVManager.maybe_send_extra(
+            sender,
+            peer_name="decode",
+            prefill_state_indices=[[3]],
+            dst_state_data_ptrs=[[0x2000]],
+            dst_state_indices=[[5]],
+            dst_gpu_id=0,
+            notif="state",
+            decode_tp_size=4,
+        )
+
+        self.assertEqual(handles, ["dsa-handle"])
+        self.assertEqual(len(send_calls), 1)
+        self.assertEqual(send_calls[0]["state_type"], StateType.DSA)
 
 
 if __name__ == "__main__":
