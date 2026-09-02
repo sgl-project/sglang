@@ -39,6 +39,7 @@ def _triton_fallback(
     A_log=None,
     dt_bias=None,
     lower_bound=None,
+    beta_is_raw=False,
     return_intermediate_states=False,
     track_state=None,
     track_chunk_idx=None,
@@ -66,6 +67,7 @@ def _triton_fallback(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        beta_is_raw=beta_is_raw,
         output_intermediate_states=return_intermediate_states,
         track_state=track_state,
         track_chunk_idx=track_chunk_idx,
@@ -122,6 +124,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         extend_seq_lens_cpu: Optional[list] = None,
         is_spec_decode: bool = False,
+        beta_is_raw: bool = False,
         return_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -144,6 +147,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 A_log=A_log,
                 dt_bias=dt_bias,
                 lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
                 return_intermediate_states=return_intermediate_states,
                 track_state=kwargs.get("track_state"),
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
@@ -162,6 +166,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 A_log=A_log,
                 dt_bias=dt_bias,
                 lower_bound=lower_bound,
+                beta_is_raw=beta_is_raw,
             ),
             None,
         )
@@ -216,6 +221,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        beta_is_raw: bool = False,
     ) -> torch.Tensor:
         flash_kda = _load_flash_kda()
 
@@ -233,12 +239,11 @@ class FlashKDAKernel(LinearAttnKernelBase):
         v = v.contiguous()
         g = g.contiguous()
 
-        # KimiDeltaAttention.forward already applies sigmoid to beta on the
-        # prefill path, but flash_kda expects beta LOGITS (it sigmoids
-        # internally). Invert back so the kernel recovers the intended value:
-        # sigmoid(logit(p)) == p. (triton/cuLA consume the post-sigmoid beta.)
-        beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7)).to(torch.bfloat16)
-        beta = beta.contiguous()
+        # FlashKDA applies sigmoid internally; invert only the already-activated
+        # Kimi beta path.
+        if not beta_is_raw:
+            beta = torch.logit(beta.float().clamp_(1e-7, 1.0 - 1e-7))
+        beta = beta.to(torch.bfloat16).contiguous()
 
         # flash_kda wants A_log [H] fp32 and dt_bias [H, K] fp32. The model
         # stores A_log as [1, 1, H, 1] and dt_bias as 1D [H*K], so reshape both.
