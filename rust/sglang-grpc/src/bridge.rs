@@ -288,9 +288,9 @@ impl PyBridge {
         })
     }
 
-    pub fn get_pause_status(&self) -> PyResult<bool> {
+    pub fn get_is_ready(&self) -> PyResult<bool> {
         Python::attach(|py| {
-            let result = self.runtime_handle.call_method0(py, "get_pause_status")?;
+            let result = self.runtime_handle.call_method0(py, "get_is_ready")?;
             result.extract::<bool>(py)
         })
     }

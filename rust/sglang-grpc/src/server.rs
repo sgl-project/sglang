@@ -563,16 +563,16 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(proto::HealthCheckResponse { healthy }))
     }
 
-    async fn get_pause_status(
+    async fn get_is_ready(
         &self,
-        _request: Request<proto::GetPauseStatusRequest>,
-    ) -> Result<Response<proto::GetPauseStatusResponse>, Status> {
-        let is_pause = self
-            .blocking_bridge_call("Failed to get pause status", PyBridge::get_pause_status)
+        _request: Request<proto::GetIsReadyRequest>,
+    ) -> Result<Response<proto::GetIsReadyResponse>, Status> {
+        let is_ready = self
+            .blocking_bridge_call("Failed to get readiness", PyBridge::get_is_ready)
             .await?;
 
-        Ok(Response::new(proto::GetPauseStatusResponse {
-            is_pause,
+        Ok(Response::new(proto::GetIsReadyResponse {
+            is_ready,
             metadata: HashMap::new(),
         }))
     }

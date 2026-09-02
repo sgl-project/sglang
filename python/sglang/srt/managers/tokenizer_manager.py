@@ -1997,8 +1997,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
-            await self._async_dispatch_to_scheduler(obj)
             self.is_pause = False
+            await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
