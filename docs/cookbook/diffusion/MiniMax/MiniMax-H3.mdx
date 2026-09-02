@@ -685,22 +685,8 @@ parallelism is supported. See
 `torch_sdpa`, ...) also runs on the FastH3 weights without VSA flags, and
 `sglang generate` takes the same flags as `sglang serve`.
 
-Measured on 4× B300 at 1344×768, 24 fps with audio, seed 1000, bf16 eager,
-Ulysses 4, `VSA_sparsity` 0.9. End-to-end is the client wall clock of a
-`/v1/videos` request including decode, muxing, and file output, median of
-three requests after one warm request; denoise and decode are the server stage
-timings of the same request.
-
-| Duration | Frames | VSA-H3 e2e | Denoise | Decode | Peak / GPU | Dense FA e2e (stage sum) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 5 s | 124 | **4.1 s** | 2.18 s | 0.87 s | 94 GB | 3.77 s |
-| 10 s | 243 | **8.0 s** | 4.83 s | 1.71 s | 103 GB | 9.84 s |
-| 15 s | 362 | **13.3 s** | 8.80 s | 2.56 s | 111 GB | 18.45 s |
-
-Dense FA is competitive at 5 s; VSA-H3 wins from 10 s on and the gap widens
-with duration. `--tp-size 2 --ulysses-degree 2` (61 GB), `--use-fsdp-inference`
-(50 GB), and `--quantization fp8` (63 GB) all run on FastH3 and trade a little
-latency for peak memory.
+Measured latencies for the 4× B300 recipe are in
+[FastH3 on B300](#fasth3-on-b300).
 
 FastH3 rejects deployment options that do not apply to the distilled preview
 instead of silently ignoring them: `--model-variant`, `quality: "high"`,
@@ -1213,6 +1199,30 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 | Ref2VA | FP8 | auto | 124.0 s | 34.30 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | fold | 112.0 s | 34.44 s | **27.12 s** | 52,816 MB |
 | Ref2VA | FP8 | replicate | 116.0 s | 33.42 s | **27.12 s** | 93,396 MB |
+
+### FastH3 on B300
+
+The same 4× B300 host served [FastH3](#6-fasth3-4-step-distilled-preview)
+with the VSA-H3 recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
+`num_inference_steps: 5`, seed 1000, eager BF16, Ulysses4, `VSA_sparsity` 0.9).
+E2E is the client wall clock of a `/v1/videos` request including decode,
+muxing, and file output, median of three requests after one warm request;
+the stage columns are the server timings of the same request. H3 aligns the
+requested durations to 124, 243, and 362 frames. Client RTF is E2E divided by
+the video duration:
+
+| Requested / aligned | Encoder | Denoise (4 forwards) | Decode | Transport + MP4 | E2E | Client RTF | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5 s / 124 | 0.07 s | 2.18 s | 0.87 s | 0.9 s | **4.1 s** | 0.79 | 95,744 MB |
+| 10 s / 243 | 0.07 s | 4.83 s | 1.71 s | 1.3 s | **8.0 s** | 0.79 | 102,666 MB |
+| 15 s / 362 | 0.07 s | 8.80 s | 2.56 s | 1.8 s | **13.3 s** | 0.88 | 110,774 MB |
+
+All three requests finish faster than playback. Dense FA on the same weights
+and topology takes 3.77 / 9.84 / 18.45 s (`sglang generate`, stage sum): it is
+competitive at 5 s, and VSA-H3 pulls ahead from 10 s on. At 5 s,
+TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
+online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
+peak memory.
 
 ### H200 topology comparison
 
