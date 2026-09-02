@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import unittest
+from http import HTTPStatus
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -267,6 +268,55 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
         self.assertEqual(
             state.out_list[0]["meta_info"]["finish_reason"]["type"], "abort"
         )
+
+    def test_abort_releases_lora_reference(self):
+        """Aborting a LoRA request should release its registry reference."""
+
+        async def run():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = MagicMock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "abort_lora_rid"
+            lora_id = "abort_lora_id"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "abort_lora_path"
+            state.obj.lora_id = lora_id
+            tm.rid_to_state[rid] = state
+
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+            tm.lora_registry.release.assert_awaited_once_with(lora_id)
+
+        asyncio.run(run())
+
+    def test_error_abort_does_not_release_lora_reference_twice(self):
+        """Consuming a scheduler error abort should not release LoRA twice."""
+
+        async def run():
+            tm = _make_tokenizer_manager()
+            tm.enable_lora = True
+            tm.lora_registry = MagicMock()
+            tm.lora_registry.release = AsyncMock()
+            rid = "error_abort_lora_rid"
+            lora_id = "error_abort_lora_id"
+            state = _make_req_state(rid)
+            state.obj.lora_path = "error_abort_lora_path"
+            state.obj.lora_id = lora_id
+            tm.rid_to_state[rid] = state
+            abort_req = _make_abort_req(rid)
+            abort_req.finished_reason["status_code"] = HTTPStatus.SERVICE_UNAVAILABLE
+
+            tm._handle_abort_req(abort_req)
+            await asyncio.sleep(0)
+            out = state.out_list[0]
+            abort_out = await tm._handle_abort_finish_reason(out, state, True)
+
+            self.assertIs(abort_out, out)
+            tm.lora_registry.release.assert_awaited_once_with(lora_id)
+
+        asyncio.run(run())
 
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
