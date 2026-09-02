@@ -2627,18 +2627,21 @@ def fill_m_indices_from_psum(
 def _fwd_kernel_scale_expanded_rows(
     x_ptr,
     x_stride0,
+    x_stride1,
     weight_ptr,
     HIDDEN: tl.constexpr,
     BLOCK_H: tl.constexpr,
     HIDDEN_IS_MULTIPLE: tl.constexpr,
 ):
-    # In-place coalesced row scaling x[r,:] *= weight[r]; hand-written because
+    # In-place row scaling x[r,:] *= weight[r]; hand-written because
     # x.mul_(w.unsqueeze(1))'s stride-0 broadcast forces the scalar kernel.
+    # x_stride1 handles column-major views (e.g. the transposed fp8 down_input
+    # scale) where the hidden axis is not unit-stride.
     row = tl.program_id(0).to(tl.int64)
     blk = tl.program_id(1)
 
     offs = blk * BLOCK_H + tl.arange(0, BLOCK_H)
-    base = x_ptr + row * x_stride0 + offs
+    base = x_ptr + row * x_stride0 + offs * x_stride1
 
     w = tl.load(weight_ptr + row).to(tl.float32)
 
@@ -2656,12 +2659,13 @@ def scale_expanded_rows_(
     x: torch.Tensor,
     row_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """In-place coalesced `x[r, :] *= row_weights[r]` for a 2D `x`.
+    """In-place `x[r, :] *= row_weights[r]` for a 2D `x`, any strides.
 
     deepep_v2 `do_expand=True` prefill path: folds the top-k weights into the
-    expanded GEMM output before ElasticBuffer.combine (which ignores topk_weights
-    in expand mode). The normalizations below are no-ops on the hot path (DeepEP
-    hands back a 1D contiguous fp32 tensor).
+    expanded GEMM output (or, folded earlier, into down_proj's transposed fp8
+    input scale) before ElasticBuffer.combine (which ignores topk_weights in
+    expand mode). The weight normalizations below are no-ops on the hot path
+    (DeepEP hands back a 1D contiguous fp32 tensor).
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
     rows, hidden = x.shape
@@ -2685,6 +2689,7 @@ def scale_expanded_rows_(
     _fwd_kernel_scale_expanded_rows[(rows, ceil_div(hidden, block_h))](
         x,
         x.stride(0),
+        x.stride(1),
         weights,
         HIDDEN=hidden,
         BLOCK_H=block_h,
