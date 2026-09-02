@@ -61,7 +61,19 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             self.assertIn(ev, types)
         self.assertEqual(types[-1], "response.completed")
 
-        seqs = [p["sequence_number"] for p in event_payloads(events)]
+        payloads = event_payloads(events)
+        snapshot_types = {
+            "response.created",
+            "response.in_progress",
+            "response.completed",
+        }
+        for payload in payloads:
+            if payload["type"] in snapshot_types:
+                self.assertIs(
+                    type(payload["response"]["created_at"]), int, payload["type"]
+                )
+
+        seqs = [p["sequence_number"] for p in payloads]
         self.assertEqual(seqs, list(range(len(seqs))))
 
     def test_required_tool_choice_emits_function_call_events(self):
