@@ -1,9 +1,6 @@
 #!/bin/bash
-# Shared `git clone` helper for CI install scripts.
 # GitHub rate limits anonymous git-over-HTTPS per source IP; shared runner egress
-# trips it as "could not read Username for 'https://github.com'". Clones reuse
-# the job token that actions/checkout persisted into this repo's .git/config, so
-# a checkout with persist-credentials: false stays anonymous by design.
+# trips it as "could not read Username for 'https://github.com'".
 
 _git_with_github_auth() {
   # Disable xtrace before touching the auth header so it is not echoed.
@@ -13,6 +10,8 @@ _git_with_github_auth() {
 
   local repo_root
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+  # Persisted by actions/checkout; absent under persist-credentials: false, and
+  # the clone then stays anonymous by design.
   local header
   header="$(git -C "$repo_root" config --local --get http.https://github.com/.extraheader 2>/dev/null || true)"
 
