@@ -5,6 +5,7 @@ import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import make_non_contiguous, precision
 
@@ -379,6 +380,17 @@ class TestLayerNorm:
 
             torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
             torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+    def test_bfloat16_input_with_float32_parameters(self) -> None:
+        """CPU LayerNorm must accept the mixed dtype used by VLM projectors."""
+        layer = LayerNorm(1536)
+        x = torch.randn([8, 1536], dtype=torch.bfloat16)
+
+        output = layer.forward_cpu(x)
+        expected = layer.forward_native(x)
+
+        assert output.dtype == torch.bfloat16
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
 class TestFusedQKGemmaRMSNorm:
