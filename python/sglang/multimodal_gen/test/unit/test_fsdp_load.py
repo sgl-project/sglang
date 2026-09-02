@@ -9,7 +9,11 @@ import torch
 from safetensors.torch import safe_open, save_file
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     BitsAndBytesConfig,
 )
@@ -46,6 +50,23 @@ class _CustomEntrypointModel(_UniformDtypeModel):
 
     def refine_prompt_embeds(self) -> None:
         pass
+
+
+class _MetaBufferModel(_UniformDtypeModel):
+    """Mirrors cosmos3: a non-checkpoint buffer stays on meta until
+    post_load_weights() rebuilds it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(4, 4, bias=False)
+        self.register_buffer("inv_freq", torch.empty(2), persistent=False)
+
+    def post_load_weights(self) -> None:
+        if self.inv_freq.is_meta:
+            device = next(self.parameters()).device
+            self.register_buffer(
+                "inv_freq", torch.ones(2, device=device), persistent=False
+            )
 
 
 class TestFSDPMixedPrecisionPolicy(unittest.TestCase):
@@ -163,6 +184,26 @@ class TestFSDPEntrypointRegistration(unittest.TestCase):
 
 
 class TestOrdinaryWeightLoading(unittest.TestCase):
+    def _load_replicated_weight(
+        self, device: torch.device, *, allow_device_tensor_assignment: bool = False
+    ) -> tuple[torch.nn.Parameter, torch.Tensor]:
+        with torch.device("meta"):
+            model = _ReplicatedLinearModel()
+        checkpoint_weight = torch.arange(
+            16, dtype=torch.float32, device=device
+        ).reshape(4, 4)
+
+        fsdp_load.load_model_from_full_model_state_dict(
+            model,
+            iter((("proj.weight", checkpoint_weight),)),
+            checkpoint_load_device=device,
+            param_dtype=torch.float32,
+            strict=True,
+            param_names_mapping=fsdp_load.get_param_names_mapping({}),
+            allow_device_tensor_assignment=allow_device_tensor_assignment,
+        )
+        return model.proj.weight, checkpoint_weight
+
     def test_direct_device_loading_skips_rank_local_cpu_checkpoint(self):
         load_plan = WeightLoadPlan(
             checkpoint_load_device=torch.device("cuda:0"),
@@ -200,21 +241,82 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
             weight_load_plan=load_plan,
         )
 
-    def test_tp1_unquantized_linear_assigns_checkpoint_tensor_without_copy(self):
-        with torch.device("meta"):
-            model = _ReplicatedLinearModel()
-        checkpoint_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-
-        fsdp_load.load_model_from_full_model_state_dict(
-            model,
-            iter((("proj.weight", checkpoint_weight),)),
-            checkpoint_load_device=torch.device("cpu"),
-            param_dtype=torch.float32,
-            strict=True,
-            param_names_mapping=fsdp_load.get_param_names_mapping({}),
+    def test_tp1_unquantized_linear_adopts_cpu_checkpoint_storage(self):
+        model_weight, checkpoint_weight = self._load_replicated_weight(
+            torch.device("cpu")
         )
 
-        self.assertEqual(model.proj.weight.data_ptr(), checkpoint_weight.data_ptr())
+        self.assertEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model_weight, checkpoint_weight)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_ordinary_cuda_loading_preserves_materialization_path(self):
+        model_weight, checkpoint_weight = self._load_replicated_weight(
+            torch.device("cuda:0")
+        )
+
+        self.assertNotEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model_weight, checkpoint_weight)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_direct_cuda_loading_adopts_checkpoint_storage(self):
+        model_weight, checkpoint_weight = self._load_replicated_weight(
+            torch.device("cuda:0"), allow_device_tensor_assignment=True
+        )
+
+        self.assertEqual(model_weight.data_ptr(), checkpoint_weight.data_ptr())
+        torch.testing.assert_close(model_weight, checkpoint_weight)
+
+    def test_zero_copy_assignment_rejects_incompatible_layout_or_tp_weights(self):
+        with torch.device("meta"):
+            model = _ReplicatedLinearModel()
+        param = model.proj.weight
+        tensor = torch.empty(4, 4)
+
+        self.assertFalse(
+            fsdp_load._can_assign_tensor_without_copy(
+                param, tensor.as_strided((4, 4), (1, 4)), param
+            )
+        )
+
+        tp_owner = ColumnParallelLinear.__new__(ColumnParallelLinear)
+        nn.Module.__init__(tp_owner)
+        tp_owner.quant_method = UnquantizedLinearMethod()
+        tp_owner.tp_size = 1
+        tp_param = nn.Parameter(tensor)
+        tp_param.weight_loader = tp_owner.weight_loader
+        tp_owner.tp_size = 2
+        self.assertFalse(
+            fsdp_load._can_assign_tensor_without_copy(tp_param, tensor, tp_param)
+        )
+
+
+class TestDevicePostprocessMove(unittest.TestCase):
+    def test_postprocess_move_preserves_meta_buffers_for_post_load_weights(self):
+        # The pre-postprocess device move must not copy buffers that are
+        # still on meta awaiting post_load_weights() (cosmos3's RoPE inv_freq).
+        load_plan = WeightLoadPlan(
+            checkpoint_load_device=torch.device("cpu"),
+            weight_postprocess_device=torch.device("cpu"),
+        )
+        checkpoint_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        with patch.object(fsdp_load.current_platform, "is_mps", return_value=False):
+            model = fsdp_load.maybe_load_fsdp_model(
+                model_cls=_MetaBufferModel,
+                init_params={},
+                weight_dir_list=[],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                weight_load_plan=load_plan,
+                weights_iterator=iter((("proj.weight", checkpoint_weight),)),
+            )
+
+        self.assertFalse(model.inv_freq.is_meta)
+        torch.testing.assert_close(model.inv_freq, torch.ones(2))
         torch.testing.assert_close(model.proj.weight, checkpoint_weight)
 
 
