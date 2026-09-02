@@ -20,7 +20,7 @@ from sglang.srt.managers.overlap_utils import (
     ResolvedConfidence,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
@@ -174,7 +174,6 @@ class DSparkVerifyPlanner:
                 and require_mlp_tp_gather()
                 and not get_schedule().disable_overlap_schedule
                 and not get_spec().speculative_skip_dp_mlp_sync
-                and get_disagg().disaggregation_mode == "null"
                 and get_parallel().pp_size == 1
                 and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
             )
