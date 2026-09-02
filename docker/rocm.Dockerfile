@@ -398,7 +398,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="12d1bc32d0c93dcd5062e74f4e0f772e36e1aac4"
+ARG MORI_COMMIT="7c51d18fda59457cc9238ed262bd93c8cad906c9"
 
 # NIXL (upstream ai-dynamo/nixl) — KV transfer backend for prefill/decode disaggregation.
 # Built from source for ROCm; needs UCX built --with-rocm (built here from openucx).
@@ -581,6 +581,25 @@ RUN git clone ${AITER_REPO} \
     git revert --no-edit --no-commit 1ecb760a5; \
     git revert --no-edit --no-commit e708f6c15; \
  fi
+
+# The pinned AITER revision uses std::optional in topk_per_row_kernels.cu without
+# including <optional>: ROCm/aiter#4702 removed the torch headers that previously
+# supplied it transitively. ROCm 7.0 therefore fails module_top_k_per_row, while
+# ROCm 7.2 toolchains still obtain <optional> from another header.
+# GPU_ARCH keeps the full selected stage name; only unsuffixed gfx942/gfx950
+# denote ROCm 7.0, while newer flavors carry a -rocm... suffix. Remove this
+# backport once AITER_COMMIT contains the upstream fix from ROCm/aiter#4853.
+RUN python3 <<'PY'
+import os
+from pathlib import Path
+
+p = Path("/sgl-workspace/aiter/csrc/kernels/topk_per_row_kernels.cu")
+anchor = "#include <type_traits>\n"
+if os.environ["GPU_ARCH"] in {"gfx942", "gfx950"} and p.exists():
+    s = p.read_text()
+    if "std::optional" in s and "#include <optional>" not in s and anchor in s:
+        p.write_text(s.replace(anchor, "#include <optional>\n" + anchor, 1))
+PY
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
