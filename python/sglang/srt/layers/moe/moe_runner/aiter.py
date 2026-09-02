@@ -378,6 +378,37 @@ class AiterDispatchChoice(NamedTuple):
     actionable: bool = False
 
 
+_MXFP8_BOUND_HINT = (
+    "MoE activation dtype varies with batch size (AITER_BF16_FP8_MOE_BOUND={bound}); "
+    "set it to 0 to pin fp8 and allow mxfp8 dispatch"
+)
+_SEPARATED_SWIGLU_REASON = "SwiGLU on SEPARATED varies with batch size"
+
+
+@functools.cache
+def _aiter_dispatch_dtype_api():
+    """AITER's own activation-dtype resolution, when the wheel exposes it.
+
+    Returns None otherwise, and the caller mirrors the decision instead.
+    """
+    try:
+        from aiter import dtypes
+        from aiter.fused_moe import resolve_activation_dtype
+        from aiter.ops.flydsl.moe_common import GateMode
+    except ImportError:
+        return None
+
+    return (
+        resolve_activation_dtype,
+        GateMode,
+        {
+            dtypes.fp8: AiterDispatchFormat.MXFP8,
+            dtypes.fp4x2: AiterDispatchFormat.MXFP4,
+            dtypes.bf16: AiterDispatchFormat.BF16,
+        },
+    )
+
+
 def resolve_aiter_dispatch_format(
     weight_dtype: Optional[torch.dtype],
     activation: str = "silu",
@@ -388,20 +419,14 @@ def resolve_aiter_dispatch_format(
 ) -> AiterDispatchChoice:
     """Which activation format AITER's fused_moe wants for MXFP4 expert weights.
 
-    Mirrors the `q_dtype_a` decision in `aiter/fused_moe.py`, which also depends
-    on the activation, gate mode, arch and token count M. A dispatch format is
-    fixed when the all-to-all buffers are sized and cannot follow M, so this only
-    commits to a compressed format when the answer is M-independent; every other
-    branch answers BF16, which the receive path always accepts.
-
-    Mirroring is a stopgap -- better would be for AITER to expose the resolution.
+    A dispatch format is fixed when the all-to-all buffers are sized, while
+    AITER's choice also depends on the token count M, so the format is only
+    committed when the answer is M-independent; every other branch answers BF16,
+    which the receive path always accepts.
     """
     if weight_dtype != torch.float4_e2m1fn_x2:
         # Only MXFP4 weights are ambiguous; callers settle the rest themselves.
         return AiterDispatchChoice(AiterDispatchFormat.BF16, "not MXFP4 weights")
-
-    if is_gfx95 is None:
-        is_gfx95 = is_gfx95_supported()
 
     if is_gfx1250 is None:
         is_gfx1250 = is_gfx1250_supported()
@@ -418,6 +443,42 @@ def resolve_aiter_dispatch_format(
         "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
     )
 
+    api = _aiter_dispatch_dtype_api()
+    if api is not None:
+        resolve_activation_dtype, GateMode, formats = api
+        from aiter import QuantType
+
+        # MXFP4 expert weights always reach fused_moe as per_1x32. M is omitted:
+        # AITER answers None wherever its choice would have needed it.
+        q_dtype_a = resolve_activation_dtype(
+            QuantType.per_1x32,
+            weight_dtype,
+            activation=_aiter_activation(activation),
+            gate_mode=GateMode.INTERLEAVE if interleave else GateMode.SEPARATED,
+        )
+        if q_dtype_a is not None:
+            return AiterDispatchChoice(
+                formats.get(q_dtype_a, AiterDispatchFormat.BF16),
+                f"MoE consumes {q_dtype_a}",
+            )
+        # AITER deferred, so its answer needs M. Only the fp8 bound is worth
+        # pointing at: the SwiGLU/SEPARATED one gates fp4, not mxfp8.
+        if activation == "swiglu" and not interleave:
+            return AiterDispatchChoice(
+                AiterDispatchFormat.BF16, _SEPARATED_SWIGLU_REASON
+            )
+        return AiterDispatchChoice(
+            AiterDispatchFormat.BF16,
+            _MXFP8_BOUND_HINT.format(
+                bound=get_int_env_var("AITER_BF16_FP8_MOE_BOUND", 256)
+            ),
+            actionable=True,
+        )
+
+    # AITER without the API: mirror the same decision from its inputs.
+    if is_gfx95 is None:
+        is_gfx95 = is_gfx95_supported()
+
     if activation == "situ":
         # AITER resolves this before the INTERLEAVE branch; never M-dependent.
         if get_bool_env_var("AITER_SITUV2_A8W4", "false"):
@@ -428,13 +489,11 @@ def resolve_aiter_dispatch_format(
 
     if activation == "swiglu" and not interleave:
         # `bf16 if M < GPTOSS_SWIGLU_MXFP4_BF16_BOUND else fp4x2` -- M-dependent.
-        return AiterDispatchChoice(
-            AiterDispatchFormat.BF16, "SwiGLU on SEPARATED varies with batch size"
-        )
+        return AiterDispatchChoice(AiterDispatchFormat.BF16, _SEPARATED_SWIGLU_REASON)
 
     if activation == "swiglu" or interleave:
-        # `bf16 if gfx != gfx950 or M < AITER_BF16_FP8_MOE_BOUND else fp8`;
-        # only a bound of 0 or 1 removes the M dependency. AITER matches gfx950
+        # `bf16 if gfx != gfx950 or M < AITER_BF16_FP8_MOE_BOUND else fp8`; since
+        # M >= 0, only a bound of 0 removes the M dependency. AITER matches gfx950
         # exactly while is_gfx95_supported() is a prefix test, so a future gfx95x
         # that AITER has not adopted would be read as capable here.
         bound = get_int_env_var("AITER_BF16_FP8_MOE_BOUND", 256)
@@ -442,12 +501,10 @@ def resolve_aiter_dispatch_format(
             return AiterDispatchChoice(
                 AiterDispatchFormat.BF16, "MoE takes bf16 activations off gfx95"
             )
-        if bound > 1:
+        if bound > 0:
             return AiterDispatchChoice(
                 AiterDispatchFormat.BF16,
-                "MoE activation dtype varies with batch size "
-                f"(AITER_BF16_FP8_MOE_BOUND={bound}); set it to 0 to pin fp8 and "
-                "allow mxfp8 dispatch",
+                _MXFP8_BOUND_HINT.format(bound=bound),
                 actionable=True,
             )
         return AiterDispatchChoice(
