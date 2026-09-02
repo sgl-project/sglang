@@ -210,6 +210,64 @@ def _sm120_sparse_decode_fwd(
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
 
 
+SM120_DECODE_MAX_TOKENS = 64
+
+
+def _flash_mla_sm120_prefill(
+    q,
+    k_cache,
+    indices,
+    topk_length,
+    attn_sink,
+    head_dim_v,
+    softmax_scale,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+):
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+
+    q2 = q.squeeze(1) if q.ndim == 4 else q
+    num_tokens, num_heads, _ = q2.shape
+    dev = q2.device
+    kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    kv_64 = (
+        _split_kv_pages_to_64(kv_u8, src_pbs, touched_indices=idx)
+        if src_pbs != _PBS_DST
+        else kv_u8
+    )
+    extra_kv_u8 = (
+        extra_k_cache.view(torch.uint8)
+        if extra_k_cache is not None and extra_k_cache.dtype != torch.uint8
+        else extra_k_cache
+    )
+    extra_idx = (
+        extra_indices.squeeze(1)
+        if extra_indices is not None and extra_indices.dim() == 3
+        else extra_indices
+    )
+    output = q2.new_empty((num_tokens, num_heads, head_dim_v), dtype=torch.bfloat16)
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=dev)
+    _sparse_mla_sm120_paged_attention(
+        q2,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_u8,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+        mid_out=None,
+        mid_lse=None,
+    )
+    return (output.unsqueeze(1), None)
+
+
 def flash_mla_with_kvcache_sm120(**kwargs):
     """SM120 FlashMLA sparse decode entry point.
 
@@ -229,6 +287,19 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_topk_length = kwargs.get("extra_topk_length")
 
     if _sm120_default_backend == "flashinfer":
+        if q.shape[0] > SM120_DECODE_MAX_TOKENS:
+            return _flash_mla_sm120_prefill(
+                q,
+                k_cache,
+                indices,
+                topk_length,
+                attn_sink,
+                head_dim_v,
+                softmax_scale,
+                extra_k_cache,
+                extra_indices,
+                extra_topk_length,
+            )
         return _flash_mla_flashinfer(
             q,
             k_cache,
@@ -326,24 +397,31 @@ def _page_split_kernel(
         if tl.load(mask_ptr + page_idx) == 0:
             return
 
-    src_base = src_ptr + page_idx * src_stride0
-    dst_base = dst_ptr + (page_idx * RATIO + sub) * dst_stride0
+    # All layout strides/offsets are 8-byte aligned (asserted at the call
+    # site), so copy in u64 lanes instead of single bytes.
+    src_u64 = src_ptr.to(tl.pointer_type(tl.uint64))
+    dst_u64 = dst_ptr.to(tl.pointer_type(tl.uint64))
+    src_base = src_u64 + page_idx * (src_stride0 // 8)
+    dst_base = dst_u64 + (page_idx * RATIO + sub) * (dst_stride0 // 8)
 
-    # Copy data region: DATA_PER_SUB bytes from src offset sub*DATA_PER_SUB
-    data_src_off = sub * DATA_PER_SUB
-    for start in tl.range(0, DATA_PER_SUB, BLOCK_SIZE):
+    DATA_U64: tl.constexpr = DATA_PER_SUB // 8
+    SCALE_U64: tl.constexpr = SCALE_PER_SUB // 8
+
+    # Copy data region: DATA_U64 u64 lanes from src offset sub*DATA_U64
+    data_src_off = sub * DATA_U64
+    for start in tl.range(0, DATA_U64, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < DATA_PER_SUB
+        mask = offs < DATA_U64
         vals = tl.load(src_base + data_src_off + offs, mask=mask)
         tl.store(dst_base + offs, vals, mask=mask)
 
-    # Copy scale region: SCALE_PER_SUB bytes
-    scale_src_off = SRC_SCALE_OFF + sub * SCALE_PER_SUB
-    for start in tl.range(0, SCALE_PER_SUB, BLOCK_SIZE):
+    # Copy scale region: SCALE_U64 u64 lanes
+    scale_src_off = SRC_SCALE_OFF // 8 + sub * SCALE_U64
+    for start in tl.range(0, SCALE_U64, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < SCALE_PER_SUB
+        mask = offs < SCALE_U64
         vals = tl.load(src_base + scale_src_off + offs, mask=mask)
-        tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
+        tl.store(dst_base + DST_SCALE_OFF // 8 + offs, vals, mask=mask)
 
 
 @triton.jit
@@ -361,13 +439,12 @@ def _page_mark_kernel(
     the same value 1 are safe (no atomic needed).
     """
     pid = tl.program_id(0)
-    if pid >= N_idx:
-        return
-    idx = tl.load(indices_ptr + pid)
-    if idx < 0:
-        return
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < N_idx
+    idx = tl.load(indices_ptr + offs, mask=valid, other=-1)
+    keep = valid & (idx >= 0)
     page = idx // SRC_PBS
-    tl.store(mask_ptr + page, 1)
+    tl.store(mask_ptr + page, tl.full((BLOCK,), 1, tl.int8), mask=keep)
 
 
 def _split_kv_pages_to_64(
@@ -441,15 +518,17 @@ def _split_kv_pages_to_64(
         idx_flat = touched_indices.reshape(-1).contiguous()
         if idx_flat.dtype != torch.int32:
             idx_flat = idx_flat.to(torch.int32)
-        _page_mark_kernel[(idx_flat.numel(),)](
+        _MARK_BLOCK = 1024
+        _page_mark_kernel[(triton.cdiv(idx_flat.numel(), _MARK_BLOCK),)](
             idx_flat,
             mask,
             idx_flat.numel(),
             src_pbs,  # SRC_PBS
-            1024,  # BLOCK (unused, kept for JIT signature)
+            _MARK_BLOCK,
         )
         mask_ptr = mask
 
+    assert src_stride0 % 8 == 0 and _BYTES_PER_DST_PAGE_PADDED % 8 == 0
     grid = (N * ratio,)
     _page_split_kernel[grid](
         src_2d,
