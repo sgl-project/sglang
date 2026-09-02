@@ -74,6 +74,7 @@ class TestLayerNormSPValidation(CustomTestCase):
     VALID = dict(
         architecture="Qwen3ForCausalLM",
         tp_size=2,
+        pp_size=1,
         enable_dp_attention=False,
         speculative_algorithm=None,
     )
@@ -88,6 +89,10 @@ class TestLayerNormSPValidation(CustomTestCase):
     def test_rejects_tp_size_one(self):
         with self.assertRaisesRegex(ValueError, "tp_size"):
             validate_layernorm_sp(**{**self.VALID, "tp_size": 1})
+
+    def test_rejects_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            validate_layernorm_sp(**{**self.VALID, "pp_size": 2})
 
     def test_rejects_dp_attention(self):
         with self.assertRaisesRegex(ValueError, "dp-attention"):
