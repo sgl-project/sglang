@@ -1736,7 +1736,7 @@ class MMReceiverBase(ABC):
         self.tp_rank = tp_rank
         self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
-        self.nnodes = server_args.nnodes
+        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
@@ -1838,19 +1838,19 @@ class MMReceiverBase(ABC):
 
         extra_kwargs = {}
         if getattr(server_args, "tokenizer_backend", None) is not None:
-            extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
+            extra_kwargs["tokenizer_backend"] = get_serving().tokenizer_backend
 
         _processor = get_processor(
             get_serving().tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
+            tokenizer_mode=get_serving().tokenizer_mode,
             trust_remote_code=get_model().trust_remote_code,
-            revision=server_args.revision,
+            revision=get_model().revision,
             image_processor_backend=resolve_image_processor_backend(get_mm()),
             **extra_kwargs,
         )
 
         enable_adaptive_dispatch_to_encoder = (
-            server_args.enable_adaptive_dispatch_to_encoder
+            get_disagg().enable_adaptive_dispatch_to_encoder
         )
         mm_processor_kwargs = {}
         if model_config is not None:

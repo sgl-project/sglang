@@ -17,6 +17,8 @@ from sglang.kernels.ops.diffusion import (
     fused_linear_gelu_tanh,
     fused_temb_table_slices,
     mark_fused_gelu_site,
+    mark_nvfp4_bias_gelu_site,
+    nvfp4_bias_gelu_active,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -48,6 +50,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -81,7 +86,7 @@ if USE_AITER:
 
 
 class _WanGELUMLP(MLP):
-    """Wan FFN with a quality-gated cublasLt GELU epilogue."""
+    """Wan FFN with request-scoped GELU fast paths."""
 
     def __init__(
         self,
@@ -96,15 +101,25 @@ class _WanGELUMLP(MLP):
             act_type="gelu_pytorch_tanh",
             prefix=prefix,
             quant_config=quant_config,
+            fuse_bias_gelu_tanh=False,
         )
         mark_fused_gelu_site(self, "fc_in")
+        self.fuse_bias_gelu_tanh = isinstance(
+            self.fc_in.quant_method, ModelOptFp4LinearMethod
+        )
+        if self.fuse_bias_gelu_tanh:
+            mark_nvfp4_bias_gelu_site(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
             x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
         else:
-            x, _ = self.fc_in(x)
-            x = self.act(x)
+            x, bias = self.fc_in(x)
+            x = self._apply_activation(
+                x,
+                bias,
+                use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
+            )
         x, _ = self.fc_out(x)
         return x
 

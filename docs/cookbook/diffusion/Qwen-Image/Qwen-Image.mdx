@@ -55,7 +55,45 @@ sglang generate \
   --save-output
 ```
 
-### 3.2 Configuration Tips
+### 3.2 Fixed-resolution latency on two H200 GPUs
+
+For `Qwen/Qwen-Image-2512` at 1024x1024, use breakable CUDA graph (BCG) to
+reduce launch overhead across graph-safe DiT segments while retaining explicit
+breakpoints around unsupported operations. This recipe was validated on two
+NVIDIA H200 GPUs with 50 denoising steps and no classifier-free guidance:
+
+```bash Command
+sglang serve \
+  --model-path Qwen/Qwen-Image-2512 \
+  --model-type diffusion \
+  --num-gpus 2 \
+  --tp-size 2 \
+  --performance-mode speed \
+  --dit-layerwise-offload false \
+  --enable-torch-compile false \
+  --enable-breakable-cuda-graph \
+  --warmup-mode server \
+  --warmup-resolutions 1024x1024
+```
+
+Declare every production resolution in `--warmup-resolutions`. A request at an
+uncaptured resolution runs eagerly, so omitting `1024x1024` removes the gain
+from this recipe. Graph capture used about 5 GB more peak memory per GPU in the
+validation run.
+
+On CUDA, the TP path dispatches supported collectives through SRT
+CustomAllReduceV2. At 1024x1024, Qwen-Image reduces 24 MiB row-parallel
+outputs; the diffusion runtime reserves a 32 MiB V2 workspace so these
+collectives do not fall back to NCCL. If profiling shows large NCCL all-reduce
+kernels again, first confirm that V2 is enabled and the requested shape fits
+the workspace.
+
+BCG changed floating-point execution order but not the sampling algorithm. The
+fixed-seed output measured 0.984 SSIM and 39.7 dB PSNR against eager output; use
+eager execution when you require bit-exact output. Regional `torch.compile` was
+also tested on this profile and did not improve steady-state latency.
+
+### 3.3 Configuration Tips
 
 Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
 

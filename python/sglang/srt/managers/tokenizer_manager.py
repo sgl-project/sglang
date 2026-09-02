@@ -717,7 +717,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             tokenizer_collector_cls = resolve_collector_class(
-                self.server_args,
                 STAT_LOGGER_ROLE_TOKENIZER,
                 TokenizerMetricsCollector,
             )
@@ -2972,9 +2971,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = real_time()
+        request = state.obj
+        input_ids = request.input_ids
+        if isinstance(input_ids, list):
+            # Keep replay data intact without making full GC traverse every token.
+            request = copy.copy(request)
+            request.input_ids = (
+                tuple(tuple(row) for row in input_ids)
+                if input_ids and isinstance(input_ids[0], list)
+                else tuple(input_ids)
+            )
         self.crash_dump_request_list.append(
             (
-                state.obj,
+                request,
                 out_dict,
                 convert_time_to_realtime(state.time_stats.created_time),
                 current_time,
