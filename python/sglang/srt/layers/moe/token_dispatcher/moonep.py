@@ -15,10 +15,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
-from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import DeepEPMode
 
+_DECODE_TOKENS_PER_REQUEST_HEADROOM = 8
+
+_DEFAULT_PREFETCH_SLOTS = 4
 
 _MOONEP_UNSUPPORTED_MESSAGE = (
     "MoonEP MoE A2A is recognized by SGLang, but the runtime dispatcher is not "
@@ -155,7 +157,7 @@ class MoonEPBuffer:
             num_prefetch_slots = envs.SGLANG_MOONEP_NUM_PREFETCH_SLOTS.get()
         num_prefetch_slots = int(num_prefetch_slots)
         if num_prefetch_slots <= 0:
-            return num_experts // num_ep_ranks
+            return min(_DEFAULT_PREFETCH_SLOTS, num_experts // num_ep_ranks)
         return MoonEPBuffer._require_positive_int(
             "num_prefetch_slots", num_prefetch_slots
         )
@@ -179,7 +181,7 @@ class MoonEPBuffer:
         if token_padding is None:
             token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
         if num_sms is None:
-            num_sms = envs.SGLANG_MOONEP_NUM_SMS.get()
+            num_sms = get_moonep_num_sms()
 
         num_ep_ranks = cls._resolve_num_ep_ranks(group)
         num_experts = cls._require_positive_int("num_experts", int(num_experts))
@@ -298,6 +300,10 @@ class MoonEPBuffer:
         for key in list(state.buffers):
             cls.destroy_buffer(key)
         state.active_key = None
+
+
+def get_moonep_num_sms() -> int:
+    return envs.SGLANG_MOONEP_NUM_SMS.get()
 
 
 def get_moonep_num_prefetch_slots(num_experts: int, num_ep_ranks: int) -> int:
@@ -451,9 +457,7 @@ def run_moonep_bf16_expert(
             f"shape {cu_seqlens.shape}"
         )
     if route_weights_nvs is not None and route_weights_nvs.ndim != 1:
-        raise ValueError(
-            f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}"
-        )
+        raise ValueError(f"route_weights_nvs must be 1D, got {route_weights_nvs.shape}")
 
     output = torch.empty_like(hidden_states)
     prev = 0
@@ -496,6 +500,23 @@ def run_moonep_bf16_expert(
     )
 
 
+def _resolve_decode_capacity(prefill_capacity: int) -> int | None:
+    override = envs.SGLANG_MOONEP_DECODE_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if override > 0:
+        capacity = override
+    else:
+        from sglang.srt.server_args import get_global_server_args
+
+        max_running = get_global_server_args().max_running_requests
+        if max_running is None:
+            return None
+        capacity = int(max_running) * _DECODE_TOKENS_PER_REQUEST_HEADROOM
+
+    token_padding = envs.SGLANG_MOONEP_TOKEN_PADDING.get()
+    capacity = -(-capacity // token_padding) * token_padding
+    return None if capacity >= prefill_capacity else capacity
+
+
 class MoonEPDispatcher(BaseDispatcher):
     """MoonEP dispatcher for the initial BF16 inference PoC."""
 
@@ -527,13 +548,26 @@ class MoonEPDispatcher(BaseDispatcher):
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_MOONEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        self.decode_max_dispatch_tokens_per_rank = _resolve_decode_capacity(
+            self.num_max_dispatch_tokens_per_rank
+        )
         self.num_prefetch_slots = None
 
     @staticmethod
     def _raise_unimplemented() -> NoReturn:
         raise NotImplementedError(_MOONEP_UNSUPPORTED_MESSAGE)
 
-    def _get_buffer(self):
+    def _phase_capacity(self) -> int:
+        if self.decode_max_dispatch_tokens_per_rank is None:
+            return self.num_max_dispatch_tokens_per_rank
+
+        from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+
+        if get_is_extend_in_batch():
+            return self.num_max_dispatch_tokens_per_rank
+        return self.decode_max_dispatch_tokens_per_rank
+
+    def _get_buffer(self, capacity: int | None = None):
         if self.hidden_size is None or self.num_experts is None:
             raise ValueError(
                 "MoonEPDispatcher requires hidden_size and num_experts to "
@@ -544,7 +578,9 @@ class MoonEPDispatcher(BaseDispatcher):
             hidden_size=self.hidden_size,
             router_topk=self.router_topk,
             num_experts=self.num_experts,
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_max_dispatch_tokens_per_rank=(
+                self._phase_capacity() if capacity is None else capacity
+            ),
             num_prefetch_slots=self.num_prefetch_slots,
         )
 
@@ -559,9 +595,9 @@ class MoonEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        capacity: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         num_tokens = int(hidden_states.shape[0])
-        capacity = int(self.num_max_dispatch_tokens_per_rank)
         if num_tokens > capacity:
             raise ValueError(
                 "MoonEP runtime batch has more tokens than its static buffer "
@@ -588,10 +624,12 @@ class MoonEPDispatcher(BaseDispatcher):
 
     def _tokens_per_expert(self, topk_ids: torch.Tensor) -> torch.Tensor:
         assert self.num_experts is not None
-        return torch.bincount(
-            topk_ids.reshape(-1).to(dtype=torch.int64),
-            minlength=self.num_experts,
-        ).to(dtype=torch.int32)
+        flat = topk_ids.reshape(-1).to(dtype=torch.int64)
+        counts = torch.zeros(
+            self.num_experts, dtype=torch.int32, device=topk_ids.device
+        )
+        counts.scatter_add_(0, flat, torch.ones_like(flat, dtype=torch.int32))
+        return counts
 
     def _expert_ids_from_plan(
         self,
@@ -599,22 +637,27 @@ class MoonEPDispatcher(BaseDispatcher):
         plan: Any,
     ) -> torch.Tensor:
         assert self.num_experts is not None
+        num_experts = int(self.num_experts)
         num_groups = int(cu_seqlens.numel())
-        expert_ids = torch.full_like(cu_seqlens, -1)
         experts_to_copy = plan.experts_to_copy
         if experts_to_copy.ndim == 2:
             experts_to_copy = experts_to_copy[self._get_rank()]
 
-        prev = 0
-        for group_id in range(num_groups):
-            cur = int(cu_seqlens[group_id].item())
-            if cur > prev:
-                if group_id < self.num_experts:
-                    expert_ids[group_id] = group_id
-                else:
-                    expert_ids[group_id] = experts_to_copy[group_id - self.num_experts]
-            prev = cur
-        return expert_ids
+        num_slots = num_groups - num_experts
+        assert 0 <= num_slots <= int(experts_to_copy.numel()), (
+            f"MoonEP plan has {experts_to_copy.numel()} prefetch slots but "
+            f"cu_seqlens describes {num_slots}"
+        )
+        ids = torch.cat(
+            [
+                torch.arange(
+                    num_experts, device=cu_seqlens.device, dtype=cu_seqlens.dtype
+                ),
+                experts_to_copy[:num_slots].to(dtype=cu_seqlens.dtype),
+            ]
+        )
+        starts = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens[:-1]])
+        return torch.where(cu_seqlens > starts, ids, torch.full_like(ids, -1))
 
     def dispatch(
         self,
@@ -632,13 +675,15 @@ class MoonEPDispatcher(BaseDispatcher):
         if self.num_experts is None:
             raise ValueError("MoonEPDispatcher requires num_experts.")
 
+        capacity = self._phase_capacity()
         hidden_states, topk_ids, topk_weights, num_tokens = self._pad_to_capacity(
             hidden_states,
             topk_output.topk_ids,
             topk_output.topk_weights,
+            capacity,
         )
         tokens_per_expert = self._tokens_per_expert(topk_ids)
-        buffer = self._get_buffer()
+        buffer = self._get_buffer(capacity)
         hidden_nvsh, route_weights_nvs, cu_seqlens, plan = buffer.dispatch(
             hidden_states,
             topk_weights,

@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    default_cuda_graph_config,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
@@ -1507,6 +1508,7 @@ class TestMoonEPArgs(CustomTestCase):
             moe_a2a_backend="moonep",
         )
 
+        server_args.cuda_graph_config = default_cuda_graph_config()
         server_args._handle_a2a_moe()
 
         from sglang.srt.arg_groups.overrides import resolved_view
@@ -1514,7 +1516,9 @@ class TestMoonEPArgs(CustomTestCase):
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "moonep")
         self.assertEqual(resolved_view(server_args).ep_size, server_args.tp_size)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(server_args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

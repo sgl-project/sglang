@@ -110,7 +110,7 @@ class TestMoonEPBuffer(unittest.TestCase):
         )
         self.assertIs(MoonEPBuffer.get_existing_buffer(), larger_buffer)
 
-    def test_resolves_env_defaults_and_training_safe_prefetch_slots(self):
+    def test_resolves_env_defaults_and_inference_prefetch_slots(self):
         group = object()
 
         with (
@@ -134,7 +134,27 @@ class TestMoonEPBuffer(unittest.TestCase):
         self.assertEqual(buffer.kwargs["S"], 384)
         self.assertEqual(buffer.kwargs["token_padding"], 32)
         self.assertEqual(buffer.kwargs["num_sms"], 18)
-        self.assertEqual(buffer.kwargs["B"], 16)
+        self.assertEqual(buffer.kwargs["B"], 4)
+
+    def test_prefetch_slots_never_exceed_the_local_expert_count(self):
+        """A model with fewer local experts than the default gets its own
+        count, not four slots it has nothing to put in."""
+        with (
+            envs.SGLANG_MOONEP_NUM_PREFETCH_SLOTS.override(-1),
+            patch.dict(sys.modules, {"moonep": _fake_moonep_module()}),
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.moonep.dist.get_world_size",
+                return_value=8,
+            ),
+        ):
+            buffer = MoonEPBuffer.get_moonep_buffer(
+                group=object(),
+                hidden_size=2048,
+                router_topk=6,
+                num_experts=16,
+            )
+
+        self.assertEqual(buffer.kwargs["B"], 2)
 
     def test_rejects_non_divisible_experts_before_allocating(self):
         with (
@@ -289,9 +309,7 @@ class TestMoonEPBf16ExpertRunner(unittest.TestCase):
         for start, end, expert in [(0, 2, 0), (2, 3, 1)]:
             x = hidden_states[start:end]
             y = torch.nn.functional.linear(
-                torch.nn.functional.silu(
-                    torch.nn.functional.linear(x, gate[expert])
-                )
+                torch.nn.functional.silu(torch.nn.functional.linear(x, gate[expert]))
                 * torch.nn.functional.linear(x, up[expert]),
                 down[expert],
             )

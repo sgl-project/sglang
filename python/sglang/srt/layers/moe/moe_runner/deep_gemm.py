@@ -50,6 +50,10 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.moonep import (
+        MoonEPCombineInput,
+        MoonEPDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -1237,6 +1241,160 @@ def post_permute_deep_gemm_to_deepep_normal(
         hidden_states=gather_out,
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
+    )
+
+
+def _moonep_m_indices(
+    cu_seqlens: torch.Tensor,
+    expert_ids: torch.Tensor,
+    all_tokens: int,
+) -> torch.Tensor:
+    num_groups = expert_ids.numel()
+    rows = torch.arange(all_tokens, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    group = torch.searchsorted(cu_seqlens, rows, right=True)
+    m_indices = expert_ids[group.clamp(max=num_groups - 1)].to(torch.int32)
+    return torch.where(group < num_groups, m_indices, torch.full_like(m_indices, -1))
+
+
+@triton.jit
+def _moonep_finalize_rows_kernel(
+    h_ptr,  # [rows, H] bf16, updated in place
+    w_ptr,  # [rows] fp32 route weights
+    m_ptr,  # [rows] int32 m_indices
+    H,
+    HAS_WEIGHTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < H
+    offs = h_ptr + row * H + col
+
+    if tl.load(m_ptr + row) < 0:
+        tl.store(offs, tl.zeros([BLOCK], dtype=h_ptr.dtype.element_ty), mask=mask)
+    elif HAS_WEIGHTS:
+        x = tl.load(offs, mask=mask).to(tl.float32) * tl.load(w_ptr + row)
+        tl.store(offs, x.to(h_ptr.dtype.element_ty), mask=mask)
+
+
+def _moonep_finalize_rows(
+    hidden_states: torch.Tensor,
+    m_indices: torch.Tensor,
+    route_weights_nvs: Optional[torch.Tensor],
+) -> None:
+    rows, hidden_size = hidden_states.shape
+    BLOCK = 1024
+    _moonep_finalize_rows_kernel[(rows, triton.cdiv(hidden_size, BLOCK))](
+        hidden_states,
+        route_weights_nvs,
+        m_indices,
+        hidden_size,
+        HAS_WEIGHTS=route_weights_nvs is not None,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
+
+
+@register_pre_permute("moonep", "deep_gemm")
+def pre_permute_moonep_to_deep_gemm(
+    dispatch_output: MoonEPDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    hidden_states = dispatch_output.hidden_states
+    if hidden_states.ndim != 2:
+        raise ValueError(
+            f"MoonEP hidden states must be [NvS, H], got {hidden_states.shape}"
+        )
+
+    all_tokens = hidden_states.shape[0]
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["route_weights_nvs"] = dispatch_output.route_weights_nvs
+    running_state["plan"] = dispatch_output.plan
+    running_state["num_tokens"] = dispatch_output.num_tokens
+
+    from sglang.srt.layers.moe.token_dispatcher import moonep_weights
+
+    expert_ids = dispatch_output.expert_ids
+    pool = moonep_weights.get_pool()
+    if pool is not None:
+        from sglang.srt.layers.moe.token_dispatcher.moonep import get_moonep_num_sms
+
+        layer_id = runner_config.layer_id
+        assert layer_id is not None, "MoonEP pre-permute needs runner_config.layer_id"
+        moonep_weights.prefetch_experts(
+            layer_id,
+            moonep_weights.expert_rows(
+                layer_id,
+                dispatch_output.plan.experts_to_copy[get_tp_group().rank_in_group],
+            ),
+            num_sms=get_moonep_num_sms(),
+        )
+        quant_info.w13_weight = pool.ranges[moonep_weights.W13_WEIGHT].view(torch.int8)
+        quant_info.w2_weight = pool.ranges[moonep_weights.W2_WEIGHT].view(torch.int8)
+        quant_info.w13_scale = pool.ranges[moonep_weights.W13_SCALE].permute(0, 2, 1)
+        quant_info.w2_scale = pool.ranges[moonep_weights.W2_SCALE].permute(0, 2, 1)
+
+        expert_ids = moonep_weights.group_rows(
+            layer_id, expert_ids, runner_config.num_experts
+        )
+
+    m_indices = _moonep_m_indices(dispatch_output.cu_seqlens, expert_ids, all_tokens)
+    running_state["m_indices"] = m_indices
+
+    if quant_info.w13_weight.dtype == torch.bfloat16:
+        return DeepGemmRunnerInput(
+            hidden_states=hidden_states,
+            hidden_states_scale=torch.empty(
+                (all_tokens, 1), device=hidden_states.device, dtype=torch.float32
+            ),
+            use_masked_gemm=False,
+            m_indices=m_indices,
+        )
+
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+    running_state["mxfp8_act_gran_k"] = block_k
+    hidden_states_fp8, hidden_states_scale = sglang_per_token_group_quant_fp8(
+        hidden_states,
+        block_k,
+        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    return DeepGemmRunnerInput(
+        hidden_states=hidden_states_fp8,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "moonep")
+def post_permute_deep_gemm_to_moonep(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> MoonEPCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.moonep import MoonEPCombineInput
+
+    hidden_states = runner_output.hidden_states
+    route_weights_nvs = running_state["route_weights_nvs"]
+    _moonep_finalize_rows(hidden_states, running_state["m_indices"], route_weights_nvs)
+
+    return MoonEPCombineInput(
+        hidden_states=hidden_states,
+        route_weights_nvs=route_weights_nvs,
+        plan=running_state["plan"],
+        num_tokens=running_state["num_tokens"],
     )
 
 

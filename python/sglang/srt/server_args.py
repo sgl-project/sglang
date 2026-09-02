@@ -6862,13 +6862,23 @@ class ServerArgs:
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if a2a_backend == "moonep":
-            logger.warning(
-                "MoonEP MoE is enabled in experimental BF16 PoC mode. "
-                "Cuda graph is disabled while the eager MoonEP dispatch/"
-                "prefetch/compute/combine path is validated."
-            )
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            if envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get():
+                logger.warning(
+                    "Disabling DeepGEMM JIT pre-compilation: MoonEP's expert "
+                    "weights span the whole symmetric range, which the warmup "
+                    "pass cannot allocate. Kernels compile on first use."
+                )
+                envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
+
+            if not envs.SGLANG_ENABLE_MOONEP_CUDA_GRAPH.get():
+                logger.warning(
+                    "Cuda graph is disabled while the eager MoonEP dispatch/"
+                    "prefetch/compute/combine path is validated. MoonEP's "
+                    "buffers are statically shaped, so capture should be "
+                    "possible; set SGLANG_ENABLE_MOONEP_CUDA_GRAPH=1 to try it."
+                )
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if (
             self.moe_a2a_backend == "none" and is_npu()

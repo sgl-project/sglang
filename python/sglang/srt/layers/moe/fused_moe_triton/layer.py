@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -397,15 +398,20 @@ class FusedMoE(torch.nn.Module):
                 f"quant_method={type(self.quant_method).__name__})."
             )
 
-        moonep_global_weight_storage = get_moe_a2a_backend().is_moonep()
-        if moonep_global_weight_storage:
-            if quant_config is not None:
-                raise NotImplementedError(
-                    "MoonEP PoC supports unquantized BF16 MoE weights only."
-                )
+        moonep_global_weight_storage = (
+            get_moe_a2a_backend().is_moonep() and quant_config is None
+        )
+        if get_moe_a2a_backend().is_moonep():
             if num_fused_shared_experts != 0:
                 raise NotImplementedError(
-                    "MoonEP PoC does not support fused shared experts yet."
+                    "MoonEP does not support fused shared experts yet."
+                )
+            if quant_config is not None and not isinstance(
+                self.quant_method, Mxfp4MoEMethod
+            ):
+                raise NotImplementedError(
+                    "MoonEP supports BF16 or MXFP4 experts, got "
+                    f"{type(self.quant_method).__name__}."
                 )
 
         self.quant_method.create_weights(

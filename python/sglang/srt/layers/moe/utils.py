@@ -496,11 +496,7 @@ def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family."""
     b = get_moe_a2a_backend()
     return (
-        b.is_deepep()
-        or b.is_moonep()
-        or b.is_mooncake()
-        or b.is_mori()
-        or b.is_pplx()
+        b.is_deepep() or b.is_moonep() or b.is_mooncake() or b.is_mori() or b.is_pplx()
     )
 
 
