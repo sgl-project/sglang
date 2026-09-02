@@ -22,9 +22,9 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO
 class BaseDiT(nn.Module, ABC):
-    # These are runtime implementation capabilities, not checkpoint metadata.
-    # Concrete DiT implementations override them when their tensor layout or
-    # execution semantics support only a subset of the available backends.
+    # These are runtime implementation settings, not checkpoint metadata.
+    # The backend set guides automatic selection; explicit backend requests are
+    # validated against platform and layer capabilities instead of this set.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
     # Methods that drive a forward pass without going through __call__. FSDP2
@@ -40,6 +40,7 @@ class BaseDiT(nn.Module, ABC):
     _supported_attention_backends: set[AttentionBackendEnum] = {
         AttentionBackendEnum.SLIDING_TILE_ATTN,
         AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SPARGE_ATTN,
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,

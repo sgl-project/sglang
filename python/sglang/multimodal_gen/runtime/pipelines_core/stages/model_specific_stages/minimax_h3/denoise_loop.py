@@ -20,6 +20,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionMetadata,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    set_forward_context,
+)
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 # ref2va audio reference anchor timestep
@@ -453,6 +459,7 @@ def minimax_h3_denoise_loop(
     device: torch.device,
     imgvid_cond_noise_aug_for_inference: float = MINIMAX_H3_IMGVID_COND_TIMESTEP,
     audio_cond_noise_aug_for_inference: float = MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+    attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -564,7 +571,16 @@ def minimax_h3_denoise_loop(
                     None if adaln_plan_slots is None else adaln_plan_slots[step]
                 ),
             )
-            with torch.inference_mode():
+            if attn_metadata is not None:
+                attn_metadata.current_timestep = step
+            if model_forward is None and attn_metadata is not None:
+                forward_cm: AbstractContextManager = set_forward_context(
+                    current_timestep=step,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                forward_cm = nullcontext()
+            with forward_cm, torch.inference_mode():
                 if model_forward is None:
                     v_video, v_audio = model(**fk)
                 else:
