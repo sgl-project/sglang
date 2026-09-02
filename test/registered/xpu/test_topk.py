@@ -1,6 +1,11 @@
 import unittest
+from typing import Optional
 
 import torch
+
+from sglang.srt.layers.moe.hash_topk import HashTopK
+
+torch.use_deterministic_algorithms(True)
 
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_gpu,
@@ -8,14 +13,24 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
+from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
+from sglang.srt.layers.moe.topk import (
+    biased_topk_xpu,
+)
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.layers.moe.topk import (
     grouped_topk_xpu,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
+
+
+def _set_seed_and_device():
+    torch.manual_seed(1024)
+    return torch.device("xpu")
 
 
 def _scatter_by_expert(
@@ -33,6 +48,39 @@ def _scatter_by_expert(
     return dense
 
 
+def assert_equal(
+    score: torch.Tensor,
+    indices_ref: torch.Tensor,
+    indices_our: torch.Tensor,
+    bs: int,
+    k: int,
+    seq_len: int,
+    topk_indices_offset: Optional[torch.Tensor] = None,
+    max_permit_error: int = 0,
+):
+    indices_our_cpu = indices_our.cpu().tolist()
+    indices_ref_cpu = indices_ref.cpu().tolist()
+
+    wrong_values = 0
+    for i in range(bs):
+        indices_ref_set_i = set(indices_ref_cpu[i])
+        indices_our_set_i = set(indices_our_cpu[i])
+        more = indices_our_set_i - indices_ref_set_i
+        less = indices_ref_set_i - indices_our_set_i
+        offset = topk_indices_offset[i].item() if topk_indices_offset is not None else 0
+        if len(more) > 0 or len(less) > 0:
+            # check whether more values are the same with less values
+            # if so, either one is acceptable, since their values are the same
+            more_values = sorted(score[i, idx - offset].item() for idx in more)
+            less_values = sorted(score[i, idx - offset].item() for idx in less)
+            if more_values != less_values:
+                wrong_values += len(more)
+                print(
+                    f"{bs=}, {k=}, {seq_len=}, {i=}, {more=}, {less=} failed, with {more_values=}, {less_values=}"
+                )
+        assert wrong_values <= max_permit_error, f"{wrong_values=}, {max_permit_error=}"
+
+
 # Nemotron-3 uses biased_grouped_topk
 class TestBiasedGroupedTopK(CustomTestCase):
     def _run_single_test(
@@ -47,8 +95,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         bias_dtype,
         routed_scaling_factor,
     ):
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
         hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
@@ -126,8 +173,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         renormalize = True
         routed_scaling_factor = 2.5
 
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         bs = [1, 2, 4, 8]
         seq_len = 1024
@@ -188,8 +234,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         renormalize = True
         routed_scaling_factor = 2.5
 
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         bs = [1]
         seq_len = 1024
@@ -226,16 +271,152 @@ class TestBiasedGroupedTopK(CustomTestCase):
                     routed_scaling_factor,
                 )
 
-                torch.testing.assert_close(
-                    _scatter_by_expert(
-                        topk_weights[:, :topk_routed], topk_ids[:, :topk_routed], E_num
-                    ),
-                    _scatter_by_expert(
-                        ref_topk_weights[:, :topk_routed],
-                        ref_topk_ids[:, :topk_routed],
-                        E_num,
-                    ),
+                assert_equal(
+                    gating_output,
+                    ref_topk_ids[:, :topk_routed],
+                    topk_ids[:, :topk_routed],
+                    bs=len(bs),
+                    k=topk_value,
+                    seq_len=seq_len,
                 )
+
+    def test_biased_topk(self):
+        # DeepSeek-V4 style routing shape
+        E_num_list = [256, 384]
+        topk_value = 6
+        gating_dtype = torch.float32
+        bias_dtype = torch.float32
+        renormalize = True
+        scoring_func_list = ["sqrtsoftplus", "sigmoid"]
+        routed_scaling_factor = 2.5
+
+        device = _set_seed_and_device()
+
+        bs = [1]
+        seq_len = 1024
+        num_tokens = [b * seq_len for b in bs]
+        num_fused_shared_experts_list = [0, 1]
+
+        for E_num in E_num_list:
+            for M in num_tokens:
+                for scoring_func in scoring_func_list:
+                    for num_fused_shared_experts in num_fused_shared_experts_list:
+
+                        topk_routed = topk_value - num_fused_shared_experts
+                        hidden_states = torch.randn(
+                            M, 100, dtype=gating_dtype, device=device
+                        )
+                        gating_output = torch.randn(
+                            M, E_num, dtype=gating_dtype, device=device
+                        )
+                        correction_bias = torch.randn(
+                            E_num, dtype=bias_dtype, device=device
+                        )
+
+                        ref_topk_weights, ref_topk_ids = native_biased_topk(
+                            hidden_states,
+                            gating_output,
+                            correction_bias,
+                            topk_value,
+                            renormalize,
+                            scoring_func,
+                            num_fused_shared_experts,
+                            routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=True,
+                        )
+
+                        # fused version
+                        topk_weights, topk_ids = biased_topk_xpu(
+                            hidden_states,
+                            gating_output,
+                            correction_bias,
+                            topk_value,
+                            renormalize,
+                            scoring_func,
+                            num_fused_shared_experts,
+                            routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=True,
+                        )
+
+                        torch.testing.assert_close(
+                            _scatter_by_expert(
+                                topk_weights[:, :topk_routed],
+                                topk_ids[:, :topk_routed],
+                                E_num,
+                            ),
+                            _scatter_by_expert(
+                                ref_topk_weights[:, :topk_routed],
+                                ref_topk_ids[:, :topk_routed],
+                                E_num,
+                            ),
+                        )
+
+    def test_hash_topk(self):
+        """Guard the XPU fused hash-topk path against math/ID drift from torch."""
+        device = _set_seed_and_device()
+
+        E_num_list = [256, 384]
+        topk = 6
+        vocab_size = 128
+        dtype = torch.float32
+
+        bs = [1]
+        seq_len = 1024
+        num_tokens = [b * seq_len for b in bs]
+        num_fused_shared_experts_list = [0, 1]
+
+        with get_context().override_server_args(enable_waterfill=False):
+            for E_num in E_num_list:
+                for M in num_tokens:
+                    for num_fused_shared_experts in num_fused_shared_experts_list:
+                        hidden_states = torch.randn(
+                            M, 1, dtype=torch.float32, device=device
+                        )
+                        router_logits = torch.randn(
+                            M, E_num, dtype=dtype, device=device
+                        )
+                        input_ids = torch.randint(
+                            low=0,
+                            high=vocab_size,
+                            size=(M,),
+                            dtype=torch.int64,
+                            device=device,
+                        )
+
+                        hash_topk = HashTopK(
+                            topk=topk,
+                            num_experts=E_num,
+                            num_fused_shared_experts=num_fused_shared_experts,
+                            vocab_size=vocab_size,
+                            scoring_func="sqrtsoftplus",
+                            routed_scaling_factor=2.5,
+                        ).to(device)
+                        topk_routed = hash_topk.tid2eid.shape[1]
+                        with torch.no_grad():
+                            hash_topk.tid2eid.copy_(
+                                torch.randint(
+                                    low=0,
+                                    high=E_num,
+                                    size=(vocab_size, topk_routed),
+                                    dtype=torch.int32,
+                                    device=device,
+                                )
+                            )
+
+                            ref_topk_weights, ref_topk_ids = hash_topk._forward_torch(
+                                router_logits, input_ids
+                            )
+
+                            output = hash_topk(
+                                hidden_states=hidden_states,
+                                router_logits=router_logits,
+                                input_ids=input_ids,
+                            )
+
+                        torch.testing.assert_close(output.topk_ids, ref_topk_ids)
+                        torch.testing.assert_close(
+                            output.topk_weights, ref_topk_weights
+                        )
 
 
 if __name__ == "__main__":

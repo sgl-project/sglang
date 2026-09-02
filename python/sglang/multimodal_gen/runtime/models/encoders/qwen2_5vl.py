@@ -5,7 +5,6 @@ from transformers import (
     DynamicCache,
     PretrainedConfig,
     Qwen2_5_VLTextConfig,
-    Qwen2RMSNorm,
 )
 from transformers.masking_utils import (
     create_causal_mask,
@@ -17,23 +16,30 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_rank,
     get_tp_world_size,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     Qwen2_5VLVisionTransformer,
 )
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    apply_qwen_vl_text_rope,
+    build_qwen_vl_text_rope,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.common import add_prefix
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLMLP
 
 # coding=utf-8
 # Adapted from
@@ -70,12 +76,9 @@ except ImportError:
 
 import torch
 import torch.nn as nn
-from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
-    Qwen2_5_VLRotaryEmbedding,
-    apply_multimodal_rotary_pos_emb,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +137,12 @@ def _tp_world_size() -> int:
     return get_tp_world_size()
 
 
+def _tp_rank() -> int:
+    if not model_parallel_is_initialized():
+        return 0
+    return get_tp_rank()
+
+
 def _linear_output(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     output = linear(x)
     return output[0] if isinstance(output, tuple) else output
@@ -152,8 +161,10 @@ def _make_column_linear(
             out_features,
             bias=bias,
             gather_output=False,
+            tp_size=_tp_world_size(),
+            tp_rank=_tp_rank(),
         )
-    return nn.Linear(in_features, out_features, bias=bias)
+    return ReplicatedLinear(in_features, out_features, bias=bias)
 
 
 def _make_row_linear(
@@ -168,8 +179,10 @@ def _make_row_linear(
             in_features,
             out_features,
             bias=bias,
+            tp_size=_tp_world_size(),
+            tp_rank=_tp_rank(),
         )
-    return nn.Linear(in_features, out_features, bias=bias)
+    return ReplicatedLinear(in_features, out_features, bias=bias)
 
 
 class Qwen2_5_VLAttention(nn.Module):
@@ -181,12 +194,14 @@ class Qwen2_5_VLAttention(nn.Module):
     def __init__(self, config: Qwen2_5_VLTextConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.layer_idx = layer_idx
         if layer_idx is None:
-            logger.warn(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
+            logger.warning(
+                "Instantiating %s without layer_idx disables correct cache updates",
+                self.__class__.__name__,
             )
 
         self.hidden_size = config.hidden_size
@@ -221,7 +236,6 @@ class Qwen2_5_VLAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.is_causal = True
         self.attention_dropout = config.attention_dropout
-        self.rope_scaling = config.rope_scaling
         self.scaling = self.head_dim**-0.5
 
         self.q_proj = _make_column_linear(
@@ -254,7 +268,7 @@ class Qwen2_5_VLAttention(nn.Module):
             else None
         )
 
-        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
+        self.rotary_emb = build_qwen_vl_text_rope(config)
         self.attn = LocalAttention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -276,9 +290,6 @@ class Qwen2_5_VLAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -291,17 +302,15 @@ class Qwen2_5_VLAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        query_states, key_states = apply_qwen_vl_text_rope(
+            self.rotary_emb,
+            position_ids,
+            query_states,
+            key_states,
         )
 
         if past_key_values is not None:
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position,
-            }  # Specific to RoPE models
+            cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -309,51 +318,19 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        # Diffusion text encoding is cache-free and historically uses the native
-        # causal kernel; its trailing padding is removed during postprocessing.
-        # Cached generation still needs the explicit mask for padded batches.
+        # LongCat masks padding on the cache-free path too; others keep the
+        # original mask-free fast path unchanged.
+        honor_mask = use_cache or self.honor_cache_free_padding_mask
         attn_output = self.attn(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask if use_cache else None,
+            attn_mask=attention_mask if honor_mask else None,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = _linear_output(self.o_proj, attn_output)
         return attn_output
-
-
-class Qwen2_5_VLTextMLP(nn.Module):
-    def __init__(self, config: Qwen2_5_VLTextConfig):
-        super().__init__()
-        tp_size = _tp_world_size()
-        use_tensor_parallel = tp_size > 1 and config.intermediate_size % tp_size == 0
-        self.gate_proj = _make_column_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.up_proj = _make_column_linear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.down_proj = _make_row_linear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            use_tensor_parallel=use_tensor_parallel,
-        )
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act_fn(_linear_output(self.gate_proj, x)) * _linear_output(
-            self.up_proj, x
-        )
-        return _linear_output(self.down_proj, x)
 
 
 class Qwen2_5_VLDecoderLayer(nn.Module):
@@ -371,11 +348,26 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             )
         self.self_attn = Qwen2_5_VLAttention(config, layer_idx)
 
-        self.mlp = Qwen2_5_VLTextMLP(config)
-        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        mlp_tp_size = _tp_world_size()
+        if config.intermediate_size % mlp_tp_size != 0:
+            mlp_tp_size = 1
+        self.mlp = Qwen2_5_VLMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+            hidden_act=config.hidden_act,
+            prefix=f"model.language_model.layers.{layer_idx}.mlp",
+            fuse_gate_up=False,
+            tp_size=mlp_tp_size,
+            tp_rank=_tp_rank() if mlp_tp_size > 1 else 0,
         )
+        norm_kwargs = dict(
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=True,
+            force_native=True,
+        )
+        self.input_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
         self.attention_type = config.layer_types[layer_idx]
 
     def forward(
@@ -387,9 +379,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -408,9 +397,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             past_key_values (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
             cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
                 Indices depicting the position of the input sequence tokens in the sequence.
-            position_embeddings (`tuple[torch.FloatTensor, torch.FloatTensor]`, *optional*):
-                Tuple containing the cosine and sine positional embeddings of shape `(batch_size, seq_len, head_dim)`,
-                with `head_dim` being the embedding dimension of each attention head.
             kwargs (`dict`, *optional*):
                 Arbitrary kwargs to be ignored, used for FSDP and other methods that injects code
                 into the model
@@ -429,7 +415,6 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -443,50 +428,35 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VLMLP(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int = None,
-        bias: bool = True,
-        hidden_act="silu",
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=in_features,
-            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act = ACT2FN[hidden_act]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        gate, up = gate_up.chunk(2, dim=-1)
-        x = self.act(gate) * up
-        x_down, _ = self.down_proj(x)
-        return x_down
+def _build_causal_padding_mask(
+    attention_mask: torch.Tensor, inputs_embeds: torch.Tensor
+) -> torch.Tensor:
+    """Build a causal+padding bool mask ``[batch, 1, q_len, kv_len]``; True attends."""
+    q_len = inputs_embeds.shape[1]
+    kv_len = attention_mask.shape[-1]
+    device = inputs_embeds.device
+    q_idx = torch.arange(kv_len - q_len, kv_len, device=device).unsqueeze(-1)
+    kv_idx = torch.arange(kv_len, device=device).unsqueeze(0)
+    causal = (kv_idx <= q_idx).unsqueeze(0)
+    padding = attention_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+    return (causal & padding).unsqueeze(1)
 
 
 class Qwen2_5_VLTextModel(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
+        self.honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            prefix="model.language_model.embed_tokens",
         )
         self.layers = nn.ModuleList(
             [
@@ -495,8 +465,12 @@ class Qwen2_5_VLTextModel(nn.Module):
             ]
         )
         self._attn_implementation = config._attn_implementation
-        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=True,
+            force_native=True,
+        )
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
         self.gradient_checkpointing = False
@@ -598,10 +572,20 @@ class Qwen2_5_VLTextModel(nn.Module):
                     create_sliding_window_causal_mask(**mask_kwargs)
                 )
 
-        hidden_states = inputs_embeds
+            # create_causal_mask returns None for this _attn_implementation, so
+            # build the causal+padding mask here. LongCat-only.
+            if (
+                self.honor_cache_free_padding_mask
+                and causal_mask_mapping["full_attention"] is None
+                and isinstance(attention_mask, torch.Tensor)
+                and attention_mask.dim() == 2
+                and not bool(attention_mask.all())
+            ):
+                causal_mask_mapping["full_attention"] = _build_causal_padding_mask(
+                    attention_mask, inputs_embeds
+                )
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -614,12 +598,11 @@ class Qwen2_5_VLTextModel(nn.Module):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
-                position_ids=text_position_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
 
@@ -1173,7 +1156,12 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         super().__init__(config)
         enable_image_understanding = config.enable_image_understanding
         generation_config = config.generation_config
+        # LongCat-only; propagate to the text config (see TextEncoderLoader).
+        honor_cache_free_padding_mask = getattr(
+            config, "honor_cache_free_padding_mask", False
+        )
         config = config.arch_config
+        config.text_config.honor_cache_free_padding_mask = honor_cache_free_padding_mask
         self.model = Qwen2_5_VLModel(
             config, enable_image_understanding=enable_image_understanding
         )
@@ -1426,6 +1414,26 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                 if not self.enable_image_understanding:
                     continue
                 name = name.replace("visual.", "model.visual.")
+                name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
+
+                loaded_stacked_param = False
+                for weight_name, shard_id in (
+                    (".gate_proj.", 0),
+                    (".up_proj.", 1),
+                ):
+                    if weight_name not in name:
+                        continue
+                    fused_name = name.replace(weight_name, ".gate_up_proj.")
+                    if fused_name not in params_dict:
+                        continue
+                    param = params_dict[fused_name]
+                    loaded_weight = loaded_weight.to(param.dtype)
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(fused_name)
+                    loaded_stacked_param = True
+                    break
+                if loaded_stacked_param:
+                    continue
             try:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:

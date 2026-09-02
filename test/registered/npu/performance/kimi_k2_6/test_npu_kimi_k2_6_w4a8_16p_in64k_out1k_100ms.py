@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=1800,
-    suite="nightly-8-npu-a3",
+    suite="full-8-npu-a3",
     nightly=True,
     disabled="Currently it is executed by the npu performance workflow.",
 )
@@ -44,7 +44,7 @@ OTHER_ARGS = [
     "--nnodes",
     2,
     "--mem-fraction-static",
-    0.662,
+    0.68,
     "--max-running-requests",
     32,
     "--chunked-prefill-size",

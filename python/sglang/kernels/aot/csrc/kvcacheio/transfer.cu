@@ -995,9 +995,9 @@ inline void transfer_kv_page_first_direct_impl(
   };
 
 #if defined(USE_ROCM) || !defined(CUDA_VERSION) || CUDA_VERSION < 12080
-#if defined(USE_ROCM)
-  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); disabled by
-  // default, falls back to per-page copy below.
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70200000
+  // Opt-in HIP batch copy path (mirrors cudaMemcpyBatchAsync); requires
+  // ROCm >= 7.2.  Disabled by default, falls back to per-page copy below.
   constexpr bool kEnableHipBatch = false;
   if (kEnableHipBatch) {
     std::vector<void*> b_srcs, b_dsts;

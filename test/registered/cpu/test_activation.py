@@ -1,13 +1,14 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import GeluAndMul, SiluAndMul, precision
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=9, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)
@@ -49,6 +50,8 @@ def test_activation(m, n, dtype):
 @pytest.mark.parametrize("num_heads", [16])
 @pytest.mark.parametrize("m", [1, 17, 128])
 def test_fused_sigmoid_mul(m, num_heads, head_dim, dtype, gate_3d):
+    from sglang.srt.models.qwen3_5 import fused_sigmoid_mul
+
     x = torch.randn([m, num_heads * head_dim], dtype=dtype)
     if gate_3d:
         gate_storage = torch.randn([m, num_heads, head_dim * 2], dtype=dtype)
@@ -58,16 +61,23 @@ def test_fused_sigmoid_mul(m, num_heads, head_dim, dtype, gate_3d):
         gate = torch.randn_like(x)
 
     gate_ref = gate.reshape(m, -1) if gate_3d else gate
-    _assert_close(
-        x * torch.sigmoid(gate_ref),
-        torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x, gate, False),
-    )
 
     x_inplace = x.clone()
-    ref_inplace = x_inplace * torch.sigmoid(gate_ref)
-    out_inplace = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x_inplace, gate, True)
-    assert out_inplace.data_ptr() == x_inplace.data_ptr()
-    _assert_close(ref_inplace, x_inplace)
+    ref = x_inplace * torch.sigmoid(gate_ref)
+    torch.ops.sgl_kernel.fused_sigmoid_mul_cpu(x_inplace, gate)
+    _assert_close(ref, x_inplace)
+
+    x_out_of_place = x.clone()
+    out = fused_sigmoid_mul(x_out_of_place, gate, inplace=False)
+    assert out.data_ptr() != x_out_of_place.data_ptr()
+    assert out.data_ptr() != x.data_ptr()
+    _assert_close(ref, out)
+    _assert_close(x, x_out_of_place)
+
+    x_wrapper_inplace = x.clone()
+    out_inplace = fused_sigmoid_mul(x_wrapper_inplace, gate, inplace=True)
+    assert out_inplace.data_ptr() == x_wrapper_inplace.data_ptr()
+    _assert_close(ref, x_wrapper_inplace)
 
 
 if __name__ == "__main__":

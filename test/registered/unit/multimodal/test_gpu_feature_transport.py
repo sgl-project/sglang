@@ -11,6 +11,86 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
+    def test_failed_consumer_reconstruction_releases_remaining_proxies(self):
+        from sglang.srt.managers.schedule_batch import (
+            Modality,
+            MultimodalDataItem,
+            MultimodalInputs,
+            MultimodalProcessorOutput,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        class FakeProxy(CudaIpcTensorTransportProxy):
+            def __init__(self, *, fail_reconstruct=False, fail_release=False):
+                self.fail_reconstruct = fail_reconstruct
+                self.fail_release = fail_release
+                self.released = False
+
+            def reconstruct_on_target_device(self, _device, consumer_count=1):
+                if self.fail_reconstruct:
+                    raise RuntimeError("reconstruct failed")
+                return torch.ones(1)
+
+            def release_without_reconstruction(self, consumer_count=1):
+                self.released = True
+                if self.fail_release:
+                    raise RuntimeError("release failed")
+
+        reconstructed = FakeProxy()
+        failed = FakeProxy(fail_reconstruct=True, fail_release=True)
+        remaining = FakeProxy()
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=1,
+                pad_value=1,
+                feature=reconstructed,
+            ),
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=2,
+                pad_value=2,
+                feature=failed,
+            ),
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=3,
+                pad_value=3,
+                feature=remaining,
+            ),
+        ]
+        output = MultimodalProcessorOutput(input_ids=[1], mm_items=items)
+
+        with (
+            patch(
+                "sglang.srt.managers.schedule_batch.torch.cuda.current_device",
+                return_value=0,
+            ),
+            self.assertRaisesRegex(RuntimeError, "reconstruct failed"),
+        ):
+            MultimodalInputs.from_processor_output(output)
+
+        self.assertIsInstance(items[0].feature, torch.Tensor)
+        self.assertTrue(failed.released)
+        self.assertTrue(remaining.released)
+
+    def test_abandoned_packed_proxy_releases_shared_owner(self):
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmPackedTensorTransportProxy,
+        )
+
+        owner = MagicMock()
+        proxy = object.__new__(CudaVmmPackedTensorTransportProxy)
+        proxy._packed_owner = owner
+        proxy._consumer_acknowledged = False
+
+        proxy.release_without_reconstruction(consumer_count=2)
+
+        owner.acknowledge_consumption.assert_called_once_with(2)
+        self.assertTrue(proxy._consumer_acknowledged)
+
     def test_partial_pool_release_can_be_retried(self):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
@@ -42,6 +122,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_model_class_controls_cuda_vmm_opt_in(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
         class SupportedModel:
             supports_cuda_vmm_feature_transport = True
@@ -49,8 +130,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         class UnsupportedModel:
             pass
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cuda_vmm")
         manager.model_config = object()
 
         with patch(
@@ -70,9 +153,12 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_cpu_transport_skips_model_opt_in_lookup(self):
         from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.runtime_context import get_context
 
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
         manager = object.__new__(TokenizerManager)
-        manager.server_args = SimpleNamespace(mm_feature_transport="cpu")
         manager.model_config = object()
 
         with patch(
@@ -83,16 +169,22 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         get_model_architecture.assert_not_called()
 
     def test_vmm_transport_initializes_pool(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         server_args = SimpleNamespace(
             mm_feature_transport="cuda_vmm",
             tokenizer_worker_num=2,
             base_gpu_id=3,
-            enable_dp_attention=False,
             tp_size=4,
             nnodes=1,
         )
+        # The consumer count comes from the published topology.
+        override = get_context().override_server_args(
+            enable_dp_attention=False, tp_size=4, mm_feature_transport="cuda_vmm"
+        )
+        override.install()
+        self.addCleanup(override.restore)
         pool = object()
         with (
             patch.object(vmm, "get_mm_feature_pool_size_per_worker", return_value=123),
@@ -110,13 +202,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
     def test_disabled_transport_is_a_noop(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
-        transport = CudaVmmFeatureTransport(
-            SimpleNamespace(mm_feature_transport="cpu"), None
-        )
+        # The transport choice is a bag leaf.
+        override = get_context().override_server_args(mm_feature_transport="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        transport = CudaVmmFeatureTransport(SimpleNamespace(), None)
 
         self.assertEqual(transport.prepare_for_dispatch([None]), [])
         transport.cancel_for_dispatch([])
@@ -124,14 +219,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertIsNone(transport.pool)
 
     def test_vmm_transport_requires_processor(self):
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
 
+        override = get_context().override_server_args(mm_feature_transport="cuda_vmm")
+        override.install()
+        self.addCleanup(override.restore)
         with self.assertRaisesRegex(RuntimeError, "multimodal processor"):
-            CudaVmmFeatureTransport(
-                SimpleNamespace(mm_feature_transport="cuda_vmm"), None
-            )
+            CudaVmmFeatureTransport(SimpleNamespace(), None)
 
     def test_image_features_are_packed_per_request(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -428,17 +525,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         manager.cuda_vmm_feature_transport = transport
-        server_args = SimpleNamespace(
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
-            reasoning_parser=None,
-            tool_call_parser=None,
-            weight_cache_mode=None,
-            enable_elastic_expert_backup=False,
-            elastic_ep_backend=None,
-            node_rank=0,
-            tokenizer_worker_num=1,
-            check_server_args=MagicMock(),
-        )
+        # A real record: the launcher publishes it partway through, and what it
+        # reads after that comes out of the bags, which only project from a
+        # dataclass. The validation is stubbed so the dummy path still launches.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        server_args.check_server_args = MagicMock()
+        from sglang.srt.runtime_context import reset_context
+
+        self.addCleanup(reset_context)
         scheduler_init_result = SimpleNamespace(
             all_child_pids=[],
             scheduler_infos=[],
@@ -503,6 +599,58 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
         scheduler._request_dispatcher = MagicMock(return_value=None)
         scheduler.flush_wrapper = SimpleNamespace(check_pending=MagicMock())
         scheduler.external_corpus_manager = None
+
+    @staticmethod
+    def _materialize_with_rank_errors(local_exception=None, remote_error=None):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        class TokenizedRequest:
+            def __init__(self):
+                self.mm_inputs = object()
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_cpu_group = object()
+        request = TokenizedRequest()
+
+        def gather_errors(errors, local_error, **_kwargs):
+            errors[:] = [local_error, remote_error]
+
+        materialize = MagicMock(
+            side_effect=local_exception,
+            return_value=object(),
+        )
+        with (
+            patch.object(
+                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module, "TokenizedEmbeddingReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module.MultimodalInputs,
+                "from_processor_output",
+                materialize,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "all_gather_object",
+                side_effect=gather_errors,
+            ),
+        ):
+            errors = scheduler._materialize_cuda_vmm_inputs(request)
+
+        return request, errors
 
     def test_materializes_inputs_directly_before_base_dispatch(self):
         from sglang.srt.managers import scheduler as scheduler_module
@@ -611,6 +759,222 @@ class TestSchedulerMmTransportBoundary(unittest.TestCase):
             self.assertIs(scheduler._get_multimodal_inputs(mm_inputs), mm_inputs)
 
         process_and_broadcast.assert_not_called()
+
+    def test_broadcast_mm_inputs_sends_entry_rank_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=0, first_rank=0)
+        scheduler.dp_tp_cpu_group = object()
+
+        with (
+            patch.object(
+                scheduler_module.MultimodalInputs,
+                "from_processor_output",
+                side_effect=ValueError("bad image"),
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "broadcast_object_list"
+            ) as broadcast,
+            self.assertRaisesRegex(
+                scheduler_module._MultimodalInputProcessingError,
+                "ValueError: bad image",
+            ),
+        ):
+            scheduler._process_and_broadcast_mm_inputs(object())
+
+        payload = broadcast.call_args.args[0][0]
+        self.assertIn("ValueError: bad image", payload.error)
+
+    def test_broadcast_mm_inputs_peer_rank_receives_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.dp_tp_group = SimpleNamespace(rank_in_group=1, first_rank=0)
+        scheduler.dp_tp_cpu_group = object()
+
+        def receive_error(obj_list, **_kwargs):
+            obj_list[0] = scheduler_module._MultimodalInputBroadcast(error="bad image")
+
+        with (
+            patch.object(
+                scheduler_module.MultimodalInputs, "from_processor_output"
+            ) as materialize,
+            patch.object(
+                scheduler_module.torch.distributed, "is_available", return_value=True
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "is_initialized",
+                return_value=True,
+            ),
+            patch.object(
+                scheduler_module.torch.distributed, "get_world_size", return_value=2
+            ),
+            patch.object(
+                scheduler_module.torch.distributed,
+                "broadcast_object_list",
+                side_effect=receive_error,
+            ),
+            self.assertRaisesRegex(
+                scheduler_module._MultimodalInputProcessingError, "bad image"
+            ),
+        ):
+            scheduler._process_and_broadcast_mm_inputs(object())
+
+        materialize.assert_not_called()
+
+    def test_embedding_request_aborts_broadcast_processing_error(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        scheduler.tokenizer = object()
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler._get_multimodal_inputs = MagicMock(
+            side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
+        )
+        req = MagicMock()
+        recv_req = SimpleNamespace(
+            rid="request-id",
+            input_text="prompt",
+            input_ids=[1],
+            sampling_params=object(),
+            positional_embed_overrides=None,
+            token_type_ids=None,
+            routed_dp_rank=None,
+            priority=None,
+            dimensions=None,
+            lora_id=None,
+            http_worker_ipc=None,
+            time_stats=None,
+            return_pooled_hidden_states=False,
+            multi_item_delimiter_indices=None,
+            mm_inputs=object(),
+        )
+
+        with patch.object(scheduler_module, "Req", return_value=req):
+            scheduler.handle_embedding_request(recv_req)
+
+        req.set_finish_with_abort.assert_called_once_with(
+            "bad image",
+            status_code=500,
+            err_type="InternalServerError",
+        )
+        scheduler._add_request_to_queue.assert_called_once_with(req)
+
+    def test_vmm_materialization_consensus_rejects_any_rank_failure(self):
+        cases = (
+            (None, "RuntimeError: remote failure", "rank 1: RuntimeError"),
+            (ValueError("bad proxy"), None, "rank 0: ValueError: bad proxy"),
+        )
+        for local_exception, remote_error, expected in cases:
+            with self.subTest(expected=expected):
+                request, errors = self._materialize_with_rank_errors(
+                    local_exception, remote_error
+                )
+                self.assertIn(expected, errors[0])
+                self.assertIsNone(request.mm_inputs)
+
+    def test_vmm_batch_dispatches_good_and_failed_requests_individually(self):
+        from sglang.srt.managers import scheduler as scheduler_module
+
+        class TokenizedRequest:
+            pass
+
+        class EmbeddingRequest:
+            pass
+
+        class BatchRequest:
+            def __init__(self, requests):
+                self.requests = requests
+
+            def __iter__(self):
+                return iter(self.requests)
+
+        scheduler = object.__new__(scheduler_module.Scheduler)
+        self._publish(mm_feature_transport="cuda_vmm")
+        self._prepare_scheduler(scheduler)
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+        scheduler.return_health_check_ipcs = []
+        scheduler.handle_generate_request = MagicMock()
+        scheduler.handle_embedding_request = MagicMock()
+        scheduler._materialize_cuda_vmm_inputs = MagicMock(
+            return_value=[None, "reconstruction failed"]
+        )
+        requests = [TokenizedRequest(), TokenizedRequest()]
+        batch = BatchRequest(requests)
+
+        with (
+            patch.object(
+                scheduler_module, "TokenizedGenerateReqInput", TokenizedRequest
+            ),
+            patch.object(
+                scheduler_module, "TokenizedEmbeddingReqInput", EmbeddingRequest
+            ),
+            patch.object(
+                scheduler_module, "BatchTokenizedGenerateReqInput", BatchRequest
+            ),
+            patch.object(scheduler_module, "BatchTokenizedEmbeddingReqInput", tuple),
+            patch.object(
+                scheduler_module, "is_health_check_generate_req", return_value=False
+            ),
+        ):
+            scheduler.process_input_requests([batch])
+
+        self.assertEqual(
+            scheduler.handle_generate_request.call_args_list,
+            [
+                call(requests[0], mm_input_error=None),
+                call(requests[1], mm_input_error="reconstruction failed"),
+            ],
+        )
+        scheduler.handle_embedding_request.assert_not_called()
+        scheduler._request_dispatcher.assert_not_called()
+
+    def test_vmm_materialization_abort_reports_internal_error(self):
+        from sglang.srt.managers import schedule_batch
+
+        req = object.__new__(schedule_batch.Req)
+        req.rid = "request-id"
+        req.multimodal_inputs = schedule_batch.MultimodalInputs(mm_items=[])
+        req.session = None
+        req.grammar = object()
+        req.origin_input_ids = [1, 2]
+        req.return_logprob = True
+        req.logprob_start_len = 0
+        req.to_finish = None
+
+        with patch.object(
+            schedule_batch, "get_parallel", return_value=SimpleNamespace(tp_rank=1)
+        ):
+            req.set_finish_with_abort(
+                "reconstruction failed",
+                status_code=500,
+                err_type="InternalServerError",
+            )
+
+        self.assertEqual(
+            req.to_finish.to_json(),
+            {
+                "type": "abort",
+                "message": "reconstruction failed",
+                "status_code": 500,
+                "err_type": "InternalServerError",
+            },
+        )
+        self.assertIsNone(req.multimodal_inputs)
 
 
 class TestVmmConsumerCount(unittest.TestCase):

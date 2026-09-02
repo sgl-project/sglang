@@ -10,10 +10,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="",
+    est_time=4800,
+    suite="nightly-acc-4-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 QWEN3_32B_ENVS = {

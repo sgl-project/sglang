@@ -2,9 +2,9 @@
 
 Builds a single-layer GPT-OSS-style MoE with random MXFP4 weights, drives the
 SGLang plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_sm90_cutlass``)
-and compares against a direct FlashInfer ``cutlass_fused_moe`` call with the
-same inputs. Both paths invoke the same SM90 kernel from FlashInfer PR #3084,
-so outputs must be bit-exact.
+and compares against direct FlashInfer ``cutlass_fused_moe`` calls. It covers
+both PR #3084's W4A16 path and PR #3738/#4431's corrected Humming W4A8 path;
+outputs must be bit-exact within each path.
 
 Run on H100/H200:
 
@@ -23,6 +23,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
 
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
+
+HAS_CORRECTED_HUMMING_API = hasattr(
+    flashinfer_fused_moe,
+    "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
+)
+preprocess_humming = getattr(
+    flashinfer_fused_moe,
+    "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
+    None,
+)
 
 if not hasattr(flashinfer_fused_moe, "interleave_moe_weights_for_sm90_mixed_gemm"):
     pytest.skip(
@@ -154,11 +164,12 @@ def _round_up(x, base):
     return ((x + base - 1) // base) * base
 
 
-def _build_method(num_experts, hidden, inter):
+def _build_method(num_experts, hidden, inter, *, use_humming=False):
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
     method._fi_kernel = "cutlass_sm90"
+    method._use_sm90_humming = use_humming
     method.num_experts = num_experts
     # The new SM90 cutlass path tracks padded sizes in dedicated attrs;
     # ``hidden_size`` / ``intermediate_size_per_partition`` keep the unpadded
@@ -348,6 +359,11 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     )
     monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(
+        fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
+        "get",
+        lambda: False,
+    )
 
     w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
@@ -392,6 +408,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         swiglu_limit=layer.swiglu_limit,
         use_w4_group_scaling=True,
         activation_type=ActivationType.Swiglu,
+        use_fused_finalize=False,
         output=out_ref_padded,
     )
     out_ref = (
@@ -402,6 +419,258 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         f"SGLang vs FlashInfer-direct mismatch; "
         f"max abs diff = {(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
     )
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+def test_process_weights_humming_matches_flashinfer_direct():
+    """The SM90 fp8 option must use #3738's preprocessing and retain #4431's
+    per-local-expert residual contract."""
+    num_experts, hidden, inter = 4, 256, 256
+    w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
+
+    # Make each expert's residual distinct so an accidental scalar/broadcast
+    # contract cannot pass this check.
+    expert_offsets = torch.arange(num_experts, dtype=torch.uint8, device="cuda").view(
+        -1, 1, 1
+    )
+    w13_s = w13_s + expert_offsets
+    w2_s = w2_s + expert_offsets + 1
+
+    layer = _build_mock_layer(
+        num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+    )
+    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method._process_weights_for_sm90_cutlass(layer)
+
+    # GPT-OSS loads pair-wise [gate, up]; FlashInfer consumes halved [up; gate].
+    ref_w13 = torch.cat((w13[:, 1::2], w13[:, 0::2]), dim=1).contiguous()
+    ref_w13_s = torch.cat((w13_s[:, 1::2], w13_s[:, 0::2]), dim=1).contiguous()
+    expected_w13, expected_w13_s, expected_w13_residual = preprocess_humming(
+        ref_w13, ref_w13_s
+    )
+    expected_w2, expected_w2_s, expected_w2_residual = preprocess_humming(w2, w2_s)
+
+    assert torch.equal(layer.w13_weight, expected_w13)
+    assert torch.equal(layer.w2_weight, expected_w2)
+    assert torch.equal(layer.w13_weight_scale, expected_w13_s)
+    assert torch.equal(layer.w2_weight_scale, expected_w2_s)
+    assert torch.equal(layer.w13_humming_residual_scale, expected_w13_residual * 64.0)
+    assert torch.equal(layer.w2_humming_residual_scale, expected_w2_residual * 64.0)
+    assert layer.w13_humming_residual_scale.shape == (num_experts,)
+    assert layer.w2_humming_residual_scale.shape == (num_experts,)
+    assert layer.humming_fc2_act_scale.shape == ()
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+def test_humming_padding_preserves_per_expert_residual():
+    """Synthetic alignment padding must not change an expert's E8M0 range."""
+    num_experts, hidden, inter = 4, 192, 192
+    w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
+    ref_w13 = torch.cat((w13[:, 1::2], w13[:, 0::2]), dim=1).contiguous()
+    ref_w13_s = torch.cat((w13_s[:, 1::2], w13_s[:, 0::2]), dim=1).contiguous()
+    _, _, expected_w13_residual = preprocess_humming(
+        ref_w13, ref_w13_s, interleave=False
+    )
+    _, _, expected_w2_residual = preprocess_humming(w2, w2_s, interleave=False)
+
+    layer = _build_mock_layer(
+        num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+    )
+    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method._process_weights_for_sm90_cutlass(layer)
+
+    assert torch.equal(layer.w13_humming_residual_scale, expected_w13_residual * 64.0)
+    assert torch.equal(layer.w2_humming_residual_scale, expected_w2_residual * 64.0)
+
+
+def _build_prerounded_case(E, hidden_real, hidden_rounded, inter, tail_fill, seed=0):
+    """Weights as ``create_weights`` leaves them when FusedMoE pre-rounds hidden.
+
+    Buffers are allocated at ``hidden_rounded``; the loader only ever writes the
+    first ``hidden_real`` columns, so the tail keeps whatever the buffer was
+    filled with (``_UE8M0_ONE`` in production). Real scales sit well BELOW 2^0
+    so a leaked tail moves the per-expert max.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    kr_bytes = hidden_real // 2
+    kr_grp = hidden_real // GROUP_SIZE
+
+    w13 = torch.zeros(
+        (E, 2 * inter, hidden_rounded // 2), dtype=torch.uint8, device="cuda"
+    )
+    w13[:, :, :kr_bytes] = torch.randint(
+        0, 256, (E, 2 * inter, kr_bytes), dtype=torch.uint8, device="cuda", generator=g
+    )
+    w2 = torch.zeros((E, hidden_rounded, inter // 2), dtype=torch.uint8, device="cuda")
+    w2[:, :hidden_real, :] = torch.randint(
+        0,
+        256,
+        (E, hidden_real, inter // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+
+    w13_s = torch.full(
+        (E, 2 * inter, hidden_rounded // GROUP_SIZE),
+        tail_fill,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_s[:, :, :kr_grp] = torch.randint(
+        100, 110, (E, 2 * inter, kr_grp), dtype=torch.uint8, device="cuda", generator=g
+    )
+    w2_s = torch.full(
+        (E, hidden_rounded, inter // GROUP_SIZE),
+        tail_fill,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_s[:, :hidden_real, :] = torch.randint(
+        100,
+        110,
+        (E, hidden_real, inter // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+
+    w13_b = torch.zeros((E, 2 * inter), dtype=torch.bfloat16, device="cuda")
+    w2_b = torch.zeros((E, hidden_rounded), dtype=torch.bfloat16, device="cuda")
+    return w13, w2, w13_s, w2_s, w13_b, w2_b
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+def test_humming_range_ignores_prerounded_hidden_tail():
+    """FusedMoE rounds GPT-OSS hidden 2880 -> 3072 BEFORE ``create_weights``, so
+    the trailing scale columns keep the ``_UE8M0_ONE`` buffer fill. Those bytes
+    are 2^0 -- above any real per-expert max -- and must not reach Humming's
+    min/max, or the residual shifts and perturbs the real weights.
+
+    Invariant: the residual must not depend on what the never-written tail holds.
+    """
+    from sglang.srt.layers.quantization.mxfp4 import _UE8M0_ONE
+
+    E, hidden_real, hidden_rounded, inter = 4, 2880, 3072, 256
+
+    residuals = []
+    for tail_fill in (_UE8M0_ONE, 105):  # 105 sits inside the real 100..110 band
+        w13, w2, w13_s, w2_s, w13_b, w2_b = _build_prerounded_case(
+            E, hidden_real, hidden_rounded, inter, tail_fill
+        )
+        layer = _build_mock_layer(
+            E, hidden_rounded, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+        )
+        method = _build_method(E, hidden_rounded, inter, use_humming=True)
+        # What create_weights records from layer.hidden_size_unpadded.
+        method._unpadded_hidden = hidden_real
+        method._process_weights_for_sm90_cutlass(layer)
+        residuals.append(
+            (
+                layer.w13_humming_residual_scale.clone(),
+                layer.w2_humming_residual_scale.clone(),
+            )
+        )
+
+    assert torch.equal(residuals[0][0], residuals[1][0]), (
+        "w13 Humming residual changed with the never-written hidden tail; "
+        "the _UE8M0_ONE fill leaked into the per-expert E8M0 range"
+    )
+    assert torch.equal(
+        residuals[0][1], residuals[1][1]
+    ), "w2 Humming residual changed with the never-written hidden tail"
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+@pytest.mark.parametrize(
+    "tokens,hidden,inter,ep_size,ep_rank",
+    [(8, 256, 256, 1, 0), (8, 192, 192, 1, 0), (8, 256, 256, 2, 1)],
+)
+def test_apply_sm90_humming_matches_flashinfer_direct(
+    tokens, hidden, inter, ep_size, ep_rank, monkeypatch
+):
+    """SGLang must forward the five Humming scales and enable the new kernel."""
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as fi_cutlass_mod
+
+    monkeypatch.setattr(
+        fi_cutlass_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
+    )
+    monkeypatch.setattr(fi_cutlass_mod, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(fi_cutlass_mod, "get_tp_group", lambda: None)
+    monkeypatch.setattr(
+        fi_cutlass_mod.envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE,
+        "get",
+        lambda: False,
+    )
+
+    num_experts, top_k = 4, 2
+    w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
+    topk_i = topk_i + ep_rank * num_experts
+
+    layer = _build_mock_layer(
+        num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+    )
+    layer.moe_ep_size = ep_size
+    layer.moe_ep_rank = ep_rank
+    method = _build_method(num_experts, hidden, inter, use_humming=True)
+    method._process_weights_for_sm90_cutlass(layer)
+    out_sglang = method._apply_sm90_cutlass(
+        layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
+    ).hidden_states
+
+    padded_hidden = method._padded_hidden
+    x_ref = (
+        torch.nn.functional.pad(x, (0, padded_hidden - hidden))
+        if padded_hidden != hidden
+        else x
+    )
+    out_ref_padded = torch.empty(
+        tokens, padded_hidden, dtype=torch.bfloat16, device="cuda"
+    )
+    cutlass_fused_moe(
+        input=x_ref,
+        token_selected_experts=topk_i,
+        token_final_scales=topk_w,
+        fc1_expert_weights=layer.w13_weight,
+        fc2_expert_weights=layer.w2_weight,
+        output_dtype=torch.bfloat16,
+        quant_scales=[
+            layer.w13_weight_scale.view(torch.int32),
+            layer.w13_humming_residual_scale,
+            layer.humming_fc2_act_scale,
+            layer.w2_weight_scale.view(torch.int32),
+            layer.w2_humming_residual_scale,
+        ],
+        fc1_expert_biases=layer.w13_weight_bias,
+        fc2_expert_biases=layer.w2_weight_bias,
+        swiglu_alpha=layer.swiglu_alpha,
+        swiglu_beta=layer.swiglu_beta,
+        swiglu_limit=layer.swiglu_limit,
+        ep_size=ep_size,
+        ep_rank=ep_rank,
+        use_w4_group_scaling=True,
+        use_wfp4afp8_humming=True,
+        activation_type=ActivationType.Swiglu,
+        tune_max_num_tokens=tokens,
+        use_fused_finalize=False,
+        output=out_ref_padded,
+    )
+    out_ref = out_ref_padded[:, :hidden].contiguous()
+    assert torch.equal(out_sglang, out_ref)
 
 
 # =============================================================================
@@ -494,10 +763,13 @@ def test_dsv4_apply_matches_flashinfer_direct(
 
     # ---- SGLang DSv4 path ----
     # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
-    method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
-        SimpleNamespace(process_weights_after_loading=lambda layer: None),
-        "test",
-    )
+    from sglang.srt.runtime_context import get_context
+
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="default"):
+        method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None),
+            "test",
+        )
     # Wire the unified MoeRunner -> flashinfer_mxfp4 fused func that
     # ``apply`` now dispatches through.
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
@@ -557,6 +829,54 @@ def test_dsv4_apply_matches_flashinfer_direct(
         f"max abs diff = "
         f"{(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
     )
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+def test_dsv4_process_weights_humming_matches_flashinfer_direct():
+    """DSv4's native [up; gate] layout must use the same #3738 transform."""
+    from types import SimpleNamespace
+
+    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
+    from sglang.srt.runtime_context import get_context
+
+    num_experts, hidden, inter = 4, 256, 256
+    w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
+    w1, w3 = w13.chunk(2, dim=1)
+    w1_s, w3_s = w13_s.chunk(2, dim=1)
+    w31 = torch.cat((w3, w1), dim=1).contiguous()
+    w31_s = torch.cat((w3_s.view(torch.uint8), w1_s.view(torch.uint8)), dim=1).view(
+        torch.float8_e8m0fnu
+    )
+
+    with get_context().override_server_args(flashinfer_mxfp4_moe_precision="fp8"):
+        method = ds_mod.Mxfp4FlashinferCutlassMoEMethod(
+            SimpleNamespace(process_weights_after_loading=lambda layer: None),
+            "test",
+        )
+
+    layer = _MockLayer()
+    layer.w13_weight = torch.nn.Parameter(w31.clone(), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(w31_s.clone(), requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s.clone(), requires_grad=False)
+    layer.num_local_experts = num_experts
+    method.process_weights_after_loading(layer)
+
+    ref_w13, ref_w13_s, ref_w13_residual = preprocess_humming(
+        w31.view(torch.uint8), w31_s.view(torch.uint8)
+    )
+    ref_w2, ref_w2_s, ref_w2_residual = preprocess_humming(
+        w2.view(torch.uint8), w2_s.view(torch.uint8)
+    )
+    assert torch.equal(layer.w13_weight, ref_w13)
+    assert torch.equal(layer.w2_weight, ref_w2)
+    assert torch.equal(layer.w13_weight_scale_inv, ref_w13_s)
+    assert torch.equal(layer.w2_weight_scale_inv, ref_w2_s)
+    assert torch.equal(layer.w13_humming_residual_scale, ref_w13_residual * 64.0)
+    assert torch.equal(layer.w2_humming_residual_scale, ref_w2_residual * 64.0)
 
 
 class _MockDispatchOutput:
