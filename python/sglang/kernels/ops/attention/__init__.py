@@ -24,6 +24,7 @@ _TRITON_KERNELS = [
     ("dsa_metadata", "fused_dsa_draft_extend_metadata"),
     ("rocm_mla_decode_rope", "decode_attention_fwd_grouped_rope"),
     ("verify_splitkv", "verify_splitkv_fwd"),
+    ("unified_attention_3d_mtp", "unified_attention_3d_mtp_func"),
     ("pad", "pad_sequence_with_mask"),
     ("pad", "pad_draft_extend_query"),
     ("pad", "unpad_draft_extend_output"),

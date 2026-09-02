@@ -79,6 +79,12 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    # The runner's KVIndexTranslator; backends that read through it set the
+    # instance attribute in __init__. None means "no translate" -- a backend
+    # that never set it cannot serve the unified pool, which the server-args
+    # allow-list enforces.
+    kv_index_translator = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
@@ -151,6 +157,16 @@ class AttentionBackend(ABC):
         if fm.is_decode() or fm.is_target_verify():
             return SharedReadEnds.IN_REPLAY
         return SharedReadEnds.UNKNOWN
+
+    def prepare_prefill_shared_read_snapshot(
+        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+    ) -> None:
+        """Snapshot late prefill reads before a PRE_REPLAY event is published.
+
+        Runners call this only after the actual eager/replay query geometry is
+        known. Backends that retain scheduler-shared reads into the model
+        forward keep the default no-op and must not declare PRE_REPLAY.
+        """
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not

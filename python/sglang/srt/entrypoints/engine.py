@@ -48,7 +48,11 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -97,6 +101,7 @@ from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -134,6 +139,12 @@ from sglang.srt.utils.network import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
+from sglang.srt.weight_cache.protocol import (
+    cleanup_stale_daemon_files,
+    compute_local_gpu_id,
+    get_ready_path,
+)
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -344,7 +355,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = get_parallel().config.dp_size
+            dp_size = get_parallel().dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -683,7 +694,7 @@ class Engine(EngineScoreMixin, EngineBase):
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                get_parallel().config.pp_size,
+                get_parallel().pp_size,
                 tp_size,
                 server_args.node_rank,
             )
@@ -711,19 +722,18 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
         # Validate and clean up stale .ready/.sock files from prior runs.
-        # If a daemon is still alive at this rank, raise instead of clobbering.
-        from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
-        from sglang.srt.weight_cache.protocol import (
-            cleanup_stale_daemon_files,
-            compute_global_rank,
-            compute_local_gpu_id,
-            get_ready_path,
-        )
-
+        # If a daemon is still alive at this GPU, raise instead of clobbering.
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                cleanup_stale_daemon_files(global_rank)
+                gpu_id = compute_local_gpu_id(
+                    pp_rank,
+                    tp_rank,
+                    pp_size_per_node,
+                    tp_size_per_node,
+                    base_gpu_id=server_args.base_gpu_id,
+                    gpu_id_step=server_args.gpu_id_step,
+                )
+                cleanup_stale_daemon_files(current_platform.get_device_uuid(gpu_id))
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
@@ -755,8 +765,17 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
-                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-                    ready_path = get_ready_path(global_rank)
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=server_args.base_gpu_id,
+                        gpu_id_step=server_args.gpu_id_step,
+                    )
+                    ready_path = get_ready_path(
+                        current_platform.get_device_uuid(gpu_id)
+                    )
                     while not os.path.exists(ready_path):
                         time.sleep(check_interval)
                         if time.time() - start_time > timeout:
@@ -831,7 +850,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            get_parallel().config.dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -844,7 +863,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,
-                    get_parallel().config.pp_size,
+                    get_parallel().pp_size,
                     server_args.tp_size,
                     server_args.node_rank,
                 )
@@ -1627,6 +1646,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
+
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
@@ -1678,10 +1698,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        if "flashinfer" in cfg.get_attention_backends():
+        if (
+            "flashinfer" in attention_backends_of(resolved_view(cfg))
+            or cfg.dsa_topk_backend == "flashinfer"
+            or cfg.speculative_dsa_topk_backend == "flashinfer"
+        ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.17",
+                "0.6.18",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1841,14 +1865,10 @@ def _compute_parallelism_ranks(
     Called while the launcher is deciding what to spawn, so the sizes are the
     configured ones -- the groups this is laying out do not exist yet.
     """
-    attn_dp_size = (
-        get_parallel().config.dp_size
-        if get_parallel().config.enable_dp_attention
-        else 1
-    )
+    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
     tp_size = server_args.tp_size
-    attn_cp_size = get_parallel().config.attn_cp_size
-    moe_dp_size = get_parallel().config.moe_dp_size
+    attn_cp_size = get_parallel().attn_cp_size
+    moe_dp_size = get_parallel().moe_dp_size
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
@@ -1859,6 +1879,6 @@ def _compute_parallelism_ranks(
     moe_ep_rank = (
         tp_rank
         % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().config.ep_size)
+        // (tp_size // moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank

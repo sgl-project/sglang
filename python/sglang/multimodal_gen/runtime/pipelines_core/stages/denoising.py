@@ -21,19 +21,25 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    mount_flux2_nvfp4_swiglu_quant,
     mount_fused_gate_rmsnorm,
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
     mount_hunyuan_qknorm,
     mount_lingbot_video_rmsnorm,
     mount_ltx2_rms_norm_modulate,
+    mount_nvfp4_bias_gelu,
+    mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
+    unmount_flux2_nvfp4_swiglu_quant,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
     unmount_hunyuan_qknorm,
     unmount_lingbot_video_rmsnorm,
     unmount_ltx2_rms_norm_modulate,
+    unmount_nvfp4_bias_gelu,
+    unmount_qwen_image_added_qkv,
     unmount_sana_video_linear_attention,
 )
 from sglang.multimodal_gen import envs
@@ -162,9 +168,24 @@ _QUALITY_FUSION_HANDLERS: tuple[
     tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
     (
+        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
+        mount_flux2_nvfp4_swiglu_quant,
+        unmount_flux2_nvfp4_swiglu_quant,
+    ),
+    (
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,
         unmount_fused_linear_gelu,
+    ),
+    (
+        "Wan NVFP4 fused bias+GELU",
+        mount_nvfp4_bias_gelu,
+        unmount_nvfp4_bias_gelu,
+    ),
+    (
+        "Qwen-Image fused added-QKV",
+        mount_qwen_image_added_qkv,
+        unmount_qwen_image_added_qkv,
     ),
     (
         "fused LN+modulate (affine folding)",
@@ -1223,8 +1244,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         image_kwargs = self.prepare_extra_func_kwargs(
             getattr(self.transformer, "forward", self.transformer),
             {
+                # Pass None (not []) so T2V paths whose transformer has no
+                # image_embedder skip the branch; diffusers guards on
+                # `is not None` only.
                 # TODO: make sure on-device
-                "encoder_hidden_states_image": image_embeds,
+                "encoder_hidden_states_image": image_embeds if image_embeds else None,
             },
         )
 

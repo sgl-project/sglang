@@ -72,17 +72,16 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    is_blackwell_supported,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_hip,
     is_npu,
-    is_sm90_supported,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -94,7 +93,7 @@ _is_cuda = is_cuda()
 _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
-    and (is_sm90_supported() or is_blackwell_supported())
+    and (get_platform().is_sm90 or get_platform().is_blackwell)
 )
 
 if _is_tinygemm_supported:
@@ -258,7 +257,7 @@ class GptOssSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if get_parallel().config.dwdp_size > 1:
+        if get_parallel().dwdp_size > 1:
             return self.forward_dwdp(hidden_states)
 
         if not get_moe_a2a_backend().is_deepep():
@@ -786,7 +785,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
