@@ -187,7 +187,7 @@ def evict_from_tree_cache(
         and allocator.supports_asymmetric_reservation
     ):
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        if allocator.can_reserve(num_tokens, required_swa):
+        if allocator.ensure_capacity(num_tokens, required_swa):
             return
 
         page_size = allocator.page_size
@@ -211,31 +211,33 @@ def evict_from_tree_cache(
                     lo = mid + 1
             return lo * page_size
 
+        swa_reclaim = minimum_reclaim(
+            swa_evictable,
+            lambda value: allocator.can_reserve(
+                num_tokens,
+                required_swa,
+                full_evictable_tokens=full_evictable,
+                swa_evictable_tokens=value,
+            ),
+        )
         full_reclaim = minimum_reclaim(
             full_evictable,
             lambda value: allocator.can_reserve(
                 num_tokens,
                 required_swa,
                 full_evictable_tokens=value,
-                swa_evictable_tokens=swa_evictable,
+                swa_evictable_tokens=swa_reclaim,
             ),
         )
-        swa_reclaim = minimum_reclaim(
-            swa_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                required_swa,
-                full_evictable_tokens=full_reclaim,
-                swa_evictable_tokens=value,
-            ),
-        )
+        # FULL owns the virtual IDs for this allocation. Reclaim SWA only when
+        # all evictable FULL plus compaction cannot satisfy the shared demand.
         evicted = tree_cache.evict_for_alloc(
             EvictParams(
                 num_tokens=full_reclaim,
                 swa_num_tokens=swa_reclaim,
             )
         )
-        if not allocator.can_reserve(num_tokens, required_swa):
+        if not allocator.ensure_capacity(num_tokens, required_swa):
             logger.warning(
                 "Unified SWA eviction did not satisfy the planned reservation: "
                 f"requested=({num_tokens}, {required_swa}), "
