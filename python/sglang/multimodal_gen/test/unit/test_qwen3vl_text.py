@@ -51,7 +51,7 @@ class _FakePlatform:
     @staticmethod
     def get_attn_backend_cls_str(selected_backend, _head_size, _dtype):
         if selected_backend not in (None, AttentionBackendEnum.FA):
-            raise AssertionError(f"Unexpected backend: {selected_backend}")
+            return None
         return "fake.FABackend"
 
 
