@@ -332,9 +332,24 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
                 captured_context = get_component_attn_backend_context()
                 return object()
 
+            def component_attention_backend_context(
+                self,
+                attn_backend,
+                component_attn_name: str | None,
+                require_backend_selection: bool,
+            ):
+                return component_attn_backend_context_manager(
+                    attn_backend,
+                    component_name=component_attn_name,
+                    allow_global_backend_fallback=allow_global_backend_fallback,
+                    require_backend_selection=require_backend_selection,
+                )
+
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -348,7 +363,6 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
             def should_use_fsdp_for_component(_component_name):
                 return False
 
-        _Loader.allow_global_attention_backend_fallback = allow_global_backend_fallback
         with (
             patch.object(ComponentLoader, "for_component_type", return_value=_Loader()),
             patch(
@@ -378,10 +392,22 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         self.assertFalse(context.allow_global_backend_fallback)
 
     def test_builtin_loader_scopes(self):
-        self.assertFalse(TransformerLoader.allow_global_attention_backend_fallback)
-        self.assertFalse(GenericComponentLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(TextEncoderLoader.allow_global_attention_backend_fallback)
-        self.assertTrue(VAELoader.allow_global_attention_backend_fallback)
+        cases = (
+            (TransformerLoader(), "transformer", False),
+            (GenericComponentLoader(), "custom", False),
+            (TextEncoderLoader(), "text_encoder", True),
+            (VAELoader(), "vae", True),
+        )
+        for loader, component_name, expected_fallback in cases:
+            with (
+                self.subTest(loader=loader.__class__.__name__),
+                loader.component_attention_backend_context(None, component_name, False),
+            ):
+                context = get_component_attn_backend_context()
+                self.assertIsNotNone(context)
+                self.assertEqual(
+                    context.allow_global_backend_fallback, expected_fallback
+                )
 
     def test_explicit_backend_must_be_consumed(self):
         with self.assertRaisesRegex(
@@ -414,6 +440,8 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
+            pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
             def requested_component_attention_backend(_component_name):
@@ -479,6 +507,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod
@@ -530,6 +559,7 @@ class TestComponentAttentionBackendScope(unittest.TestCase):
         class _Args:
             component_precisions = {}
             component_quantizations = {}
+            component_weights_paths = {}
             pipeline_config = SimpleNamespace(native_only_components=())
 
             @staticmethod

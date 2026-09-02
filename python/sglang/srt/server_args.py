@@ -1124,6 +1124,15 @@ class ServerArgs:
         "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
+        "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
+        "sequence-sharded activations with no extra communication volume. "
+        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -2389,8 +2398,8 @@ class ServerArgs:
     ] = "none"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
-        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "
+        "mxf4xmxf4 MMA type. Use with "
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
@@ -2413,8 +2422,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
-        Literal["default", "bf16"],
-        "Choose the computation precision of flashinfer mxfp4 moe",
+        Literal["default", "bf16", "fp8"],
+        "Choose the computation precision of flashinfer mxfp4 moe. "
+        "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
+        "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
         NS("exec.moe"),
     ] = "default"
     deepep_mode: A[
