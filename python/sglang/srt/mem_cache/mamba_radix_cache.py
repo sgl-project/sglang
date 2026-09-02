@@ -1112,19 +1112,21 @@ class MambaRadixCache(BasePrefixCache):
         node is greater than or equal to the sliding window size.
         """
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_len = len(key)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
 
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
             if node.mamba_value is not None:
                 best_value_len = len(value)
                 best_last_node = node
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -1133,10 +1135,10 @@ class MambaRadixCache(BasePrefixCache):
             else:
                 value.append(child.value)
                 node = child
-                key = key[prefix_len:]
+                key_offset += prefix_len
 
-                if len(key):
-                    child_key = key.child_key(self.page_size)
+                if key_offset < key_len:
+                    child_key = key.child_key_at(key_offset, self.page_size)
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if node.mamba_value is not None:
             best_value_len = len(value)
@@ -1276,17 +1278,19 @@ class MambaRadixCache(BasePrefixCache):
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
-        if len(key) == 0:
+        key_len = len(key)
+        if key_len == 0:
             return 0, True
 
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
 
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while key_offset < key_len and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
-            prefix_len = node.key.match(key, page_size=self.page_size)
+            prefix_len = node.key.match_at(key, key_offset, page_size=self.page_size)
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)
@@ -1298,21 +1302,21 @@ class MambaRadixCache(BasePrefixCache):
                 )
 
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            key_offset += prefix_len
             value = value[prefix_len:]
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            if key_offset < key_len:
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         mamba_value_exist = False
-        if len(key):
+        if key_offset < key_len:
             new_node = TreeNode()
             new_node.parent = node
-            new_node.key = key
+            new_node.key = key[key_offset:]
             new_node.value = value.clone()
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
