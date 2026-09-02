@@ -70,9 +70,7 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             sm100_default_attn_backend = "trtllm_mha"
         overrides["attention_backend"] = sm100_default_attn_backend
-        overrides["page_size"] = (
-            64 if sm100_default_attn_backend == "trtllm_mha" else 1
-        )
+        overrides["page_size"] = 64 if sm100_default_attn_backend == "trtllm_mha" else 1
 
     from sglang.srt.layers.attention.qsa.config import (
         QSA_VARIANT_COMPRESSED,
