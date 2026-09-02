@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -92,6 +92,9 @@ class BaseTpWorker(ABC):
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    def reconfigure_pd_runtime_cache(self, target_role: str) -> Dict[str, Any]:
+        return self.model_runner.reconfigure_pd_runtime_cache(target_role)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
@@ -428,6 +431,20 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
         )
+
+    def refresh_worker_info_after_cache_reconfigure(self) -> None:
+        """Refresh capacities cached outside ModelRunner after a hot rebuild."""
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_running_requests = self.model_runner.max_running_requests
+        self.max_req_len = min(
+            self.model_config.context_len - 1,
+            self.model_runner.max_token_pool_size - 1,
+        )
+        self.max_req_input_len = self.max_req_len - 5
+        if self.max_running_requests <= 0 or self.max_req_input_len <= 0:
+            raise RuntimeError(
+                "invalid worker capacity after PD runtime cache hot-reconfigure"
+            )
 
     def is_dllm(self):
         return self.dllm_algorithm is not None

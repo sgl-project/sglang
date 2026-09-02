@@ -79,6 +79,11 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # A CUDA event slot can be recorded again after its previous transfer
+        # completes.  Long-lived asynchronous consumers therefore need a
+        # generation as well as the ring index; otherwise they can mistake a
+        # re-recorded event for their still-pending transfer.
+        self.producer_generations = [0] * self.num_counters
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -87,7 +92,23 @@ class LayerDoneCounter:
         ].finish_event.query(), (
             "Producer finish event should be ready before being reused."
         )
+        self.producer_generations[self.producer_index] += 1
         return self.producer_index
+
+    def producer_ticket(self, index: int) -> int:
+        """Return a generation-stamped ticket for an asynchronous waiter."""
+        return self.producer_generations[index] * self.num_counters + index
+
+    def ticket_index(self, ticket: int) -> int:
+        return ticket % self.num_counters
+
+    def is_ticket_superseded(self, ticket: int) -> bool:
+        generation, index = divmod(ticket, self.num_counters)
+        return generation < self.producer_generations[index]
+
+    def is_next_producer_event_done(self) -> bool:
+        index = (self.producer_index + 1) % self.num_counters
+        return self.events[index].finish_event.query()
 
     def set_consumer(self, index: int):
         self.consumer_index = index
@@ -100,6 +121,7 @@ class LayerDoneCounter:
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
+        self.producer_generations = [0] * self.num_counters
 
 
 class CacheOperation:
@@ -302,6 +324,7 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self._storage_io_suspended = False
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -410,6 +433,7 @@ class HiCacheController:
 
         self.prefetch_thread.start()
         self.backup_thread.start()
+        self._storage_io_suspended = False
 
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
@@ -456,6 +480,37 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+    def suspend_storage_io(self) -> None:
+        """Quiesce L3 workers without closing the backend or host buffers.
+
+        PD runtime role switching uses this after the scheduler has drained all
+        HiCache operations and reset the local radix metadata.  Keeping the
+        backend and its registered host pools alive avoids allocating and
+        registering the large Host KV/Mamba buffers again when the worker is
+        promoted back to Prefill.
+        """
+        if not self.enable_storage or self.storage_backend is None:
+            raise RuntimeError("Cannot suspend HiCache storage: backend is detached.")
+        if self._storage_io_suspended:
+            return
+        self._stop_storage_threads()
+        self._storage_io_suspended = True
+
+    def resume_storage_io(self) -> None:
+        """Resume a backend previously quiesced by :meth:`suspend_storage_io`."""
+        if not self.enable_storage or self.storage_backend is None:
+            raise RuntimeError("Cannot resume HiCache storage: backend is detached.")
+        if not self._storage_io_suspended:
+            return
+        for name in ("prefetch_thread", "backup_thread", "prefetch_io_aux_thread"):
+            thread = getattr(self, name, None)
+            if thread is not None and thread.is_alive():
+                raise RuntimeError(
+                    "Cannot resume HiCache storage while an old worker thread is alive."
+                )
+        self.storage_stop_event.clear()
+        self._start_storage_threads()
 
     def attach_storage_backend(
         self,
@@ -604,6 +659,7 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self._storage_io_suspended = False
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -795,7 +851,7 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
-    def start_loading(self) -> int:
+    def start_loading(self, *, return_ticket: bool = False) -> int:
         if len(self.load_queue) == 0:
             return -1
 
@@ -842,6 +898,8 @@ class HiCacheController:
                 node_ids=op.node_ids,
             )
         )
+        if return_ticket:
+            return self.layer_done_counter.producer_ticket(producer_id)
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:

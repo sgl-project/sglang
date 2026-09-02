@@ -28,7 +28,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -632,6 +632,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def initialize(self, pre_model_load_memory: float):
         server_args = self.server_args
 
+        # Runtime PD cache hot-reconfiguration keeps weights resident and
+        # re-profiles only the role-specific cache plane.  Preserve the two
+        # user inputs that init_memory_pool mutates while resolving a concrete
+        # pool shape so every rebuild starts from the same budget.
+        self._pd_runtime_cache_pre_model_load_memory = pre_model_load_memory
+        self._pd_runtime_cache_requested_max_mamba_cache_size = (
+            server_args.max_mamba_cache_size
+        )
+        self._pd_runtime_cache_requested_max_running_requests = (
+            server_args.max_running_requests
+        )
+        self._pd_runtime_cache_generation = 0
+        self._pd_runtime_resident_decode_cuda_graph_runner = None
+        self._pd_runtime_resident_decode_cuda_graph_fingerprint = None
+        self._pd_runtime_resident_decode_cuda_graph_mem_usage_gb = 0.0
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -677,6 +693,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self._pd_runtime_cache_model_object_id = id(self.model)
         self._prepare_moe_topk()
 
         # Load the expert backup client
@@ -871,6 +888,490 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
+
+    def _pd_runtime_cache_profile(self, role: str) -> Dict[str, Any]:
+        role_aware_hicache = bool(
+            getattr(self.server_args, "enable_pd_runtime_shared_hicache", False)
+        )
+        if role == "prefill":
+            return {
+                "role": role,
+                "mamba_scheduler_strategy": self.server_args.pd_runtime_prefill_mamba_scheduler_strategy,
+                "disable_radix_cache": False,
+                "enable_hierarchical_cache": role_aware_hicache,
+            }
+        if role == "decode":
+            return {
+                "role": role,
+                "mamba_scheduler_strategy": self.server_args.pd_runtime_decode_mamba_scheduler_strategy,
+                "disable_radix_cache": True,
+                "enable_hierarchical_cache": False,
+            }
+        raise ValueError(f"invalid PD runtime cache role: {role}")
+
+    def _pd_runtime_validate_cache_hot_reconfigure(self) -> None:
+        if not self.server_args.enable_pd_runtime_cache_hot_reconfigure:
+            raise RuntimeError("PD runtime cache hot-reconfiguration is disabled")
+        if self.is_draft_worker or not self.spec_algorithm.is_none():
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support speculative decoding"
+            )
+        if self.server_args.enable_memory_saver:
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support --enable-memory-saver"
+            )
+        if (
+            self.server_args.enable_hierarchical_cache
+            and not getattr(
+                self.server_args, "enable_pd_runtime_shared_hicache", False
+            )
+        ):
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support hierarchical cache"
+            )
+        if self.server_args.enable_pdmux or self.enable_hisparse:
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support PDMux or HiSparse"
+            )
+        if self.server_args.enable_lora:
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support LoRA"
+            )
+        if self.canary_manager is not None:
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support KV canary"
+            )
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            raise RuntimeError(
+                "PD runtime cache hot-reconfiguration does not yet support decode KV offload"
+            )
+
+    def _pd_runtime_release_cache_plane(self) -> None:
+        """Drop every ModelRunner reference that can retain role cache tensors."""
+        current_platform.synchronize()
+        for attr in (
+            "graph_runner",
+            "piecewise_cuda_graph_runner",
+            "attn_backend",
+            "decode_attn_backend",
+            "decode_attn_backend_group",
+            "token_to_kv_pool_allocator",
+            "token_to_kv_pool",
+            "req_to_token_pool",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self.memory_pool_config = None
+        self.graph_mem_usage = 0
+        gc.collect()
+        current_platform.empty_cache()
+        current_platform.synchronize()
+
+    def _pd_runtime_decode_cuda_graph_dependency_fingerprint(self) -> Dict[str, Any]:
+        """Identify every stable object a resident Decode graph may address."""
+
+        req_pool = getattr(self, "req_to_token_pool", None)
+        req_to_token = getattr(req_pool, "req_to_token", None)
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        return {
+            "model_object_id": id(getattr(self, "model", None)),
+            "req_to_token_pool_object_id": id(req_pool),
+            "req_to_token_device_ptr": (
+                int(req_to_token.data_ptr())
+                if isinstance(req_to_token, torch.Tensor)
+                else None
+            ),
+            "mamba_pool_object_id": id(mamba_pool),
+            "token_to_kv_pool_object_id": id(
+                getattr(self, "token_to_kv_pool", None)
+            ),
+            "token_to_kv_pool_allocator_object_id": id(
+                getattr(self, "token_to_kv_pool_allocator", None)
+            ),
+            "attention_backend_object_id": id(getattr(self, "attn_backend", None)),
+            "decode_attention_backend_object_id": id(
+                getattr(self, "decode_attn_backend", None)
+            ),
+            "decode_cuda_graph_config": repr(
+                (
+                    self.server_args.disable_cuda_graph,
+                    self.server_args.cuda_graph_max_bs,
+                    self.server_args.cuda_graph_bs,
+                )
+            ),
+        }
+
+    def _pd_runtime_activate_resident_decode_cuda_graph(self) -> bool:
+        runner = self._pd_runtime_resident_decode_cuda_graph_runner
+        if runner is None:
+            return False
+        expected = self._pd_runtime_resident_decode_cuda_graph_fingerprint
+        actual = self._pd_runtime_decode_cuda_graph_dependency_fingerprint()
+        if expected != actual:
+            raise RuntimeError(
+                "resident Decode CUDA Graph dependency addresses changed; "
+                f"captured={expected}, current={actual}"
+            )
+        self.graph_runner = runner
+        self.graph_mem_usage = (
+            self._pd_runtime_resident_decode_cuda_graph_mem_usage_gb
+        )
+        logger.info(
+            "Reactivated resident Decode CUDA Graph without recapture: %s", actual
+        )
+        return True
+
+    def _pd_runtime_apply_registered_mamba_profile_in_place(
+        self, profile: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Morph a Mooncake-registered hybrid cache without reallocating it.
+
+        Mooncake registers the large KV and Mamba regions with the transfer
+        engine for the lifetime of the process.  Deregistering those overlapping
+        CUDA regions is not reliable enough to make them allocatable again, so a
+        free-and-rebuild transition can deadlock on its own old allocation.  Both
+        Qwen3-Next role profiles already own the same Mamba slot count; reuse
+        those tensors and rebuild only role semantics, the Scheduler radix tree,
+        and the active-role graph.
+        """
+        server_args = self.server_args
+        global_server_args = get_global_server_args()
+        role = str(profile["role"])
+        strategy = str(profile["mamba_scheduler_strategy"])
+        disable_radix_cache = bool(profile["disable_radix_cache"])
+        enable_hierarchical_cache = bool(
+            profile.get("enable_hierarchical_cache", False)
+        )
+        stage_timings = {}
+        available_memory_gb = {
+            "before_in_place_morph": get_available_gpu_memory(
+                self.device, self.gpu_id
+            )
+        }
+
+        req_pool = self.req_to_token_pool
+        if req_pool is None or not hasattr(req_pool, "mamba_pool"):
+            raise RuntimeError(
+                "registered Mamba cache morph requires an initialized hybrid request pool"
+            )
+
+        stage_started = time.perf_counter()
+        server_args.disaggregation_mode = role
+        server_args.mamba_scheduler_strategy = strategy
+        server_args.disable_radix_cache = disable_radix_cache
+        server_args.enable_hierarchical_cache = enable_hierarchical_cache
+        global_server_args.disaggregation_mode = role
+        global_server_args.mamba_scheduler_strategy = strategy
+        global_server_args.disable_radix_cache = disable_radix_cache
+        global_server_args.enable_hierarchical_cache = enable_hierarchical_cache
+
+        enable_extra_buffer = server_args.enable_mamba_extra_buffer()
+        enable_extra_buffer_lazy = server_args.enable_mamba_extra_buffer_lazy()
+        track_buffer_size = 2 if not server_args.disable_overlap_schedule else 1
+        req_pool.mamba_ping_pong_track_buffer_size = track_buffer_size
+        req_pool.enable_mamba_extra_buffer = enable_extra_buffer
+        req_pool.enable_mamba_extra_buffer_lazy = enable_extra_buffer_lazy
+        if enable_extra_buffer:
+            mapping_shape = (req_pool.req_to_token.shape[0], track_buffer_size)
+            mapping = getattr(
+                req_pool,
+                "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                None,
+            )
+            if mapping is None or tuple(mapping.shape) != mapping_shape:
+                req_pool.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                    torch.zeros(
+                        mapping_shape,
+                        dtype=torch.int64,
+                        device=req_pool.device,
+                    )
+                )
+        else:
+            req_pool.req_index_to_mamba_ping_pong_track_buffer_mapping = None
+
+        mamba_slots = int(req_pool.mamba_pool.size)
+        server_args.max_mamba_cache_size = mamba_slots
+        global_server_args.max_mamba_cache_size = mamba_slots
+        mamba_ratio = max(1, int(self._calculate_mamba_ratio()))
+        safe_max_running_requests = min(
+            int(req_pool.size), max(1, mamba_slots // mamba_ratio)
+        )
+        requested_max_running_requests = (
+            self._pd_runtime_cache_requested_max_running_requests
+        )
+        if requested_max_running_requests is not None:
+            safe_max_running_requests = min(
+                safe_max_running_requests,
+                int(requested_max_running_requests),
+            )
+        self.max_running_requests = safe_max_running_requests
+        server_args.max_running_requests = safe_max_running_requests
+        global_server_args.max_running_requests = safe_max_running_requests
+        if self.memory_pool_config is not None:
+            self.memory_pool_config.max_running_requests = safe_max_running_requests
+        stage_timings["apply_in_place_profile_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+
+        resident_decode_enabled = bool(
+            self.server_args.enable_pd_runtime_resident_decode_cuda_graph
+        )
+        stage_started = time.perf_counter()
+        self.graph_runner = None
+        self.piecewise_cuda_graph_runner = None
+        self.graph_mem_usage = (
+            self._pd_runtime_resident_decode_cuda_graph_mem_usage_gb
+            if resident_decode_enabled
+            else 0
+        )
+        gc.collect()
+        current_platform.empty_cache()
+        current_platform.synchronize()
+        stage_timings["release_inactive_graph_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+
+        resident_decode_reused = False
+        kernel_warmup_seconds = 0.0
+        capture_role_graph_seconds = 0.0
+        activate_resident_decode_graph_seconds = 0.0
+        if role == "decode":
+            if resident_decode_enabled:
+                stage_started = time.perf_counter()
+                resident_decode_reused = (
+                    self._pd_runtime_activate_resident_decode_cuda_graph()
+                )
+                if resident_decode_reused:
+                    activate_resident_decode_graph_seconds = (
+                        time.perf_counter() - stage_started
+                    )
+            if not resident_decode_reused:
+                stage_started = time.perf_counter()
+                self.kernel_warmup()
+                kernel_warmup_seconds = time.perf_counter() - stage_started
+                stage_started = time.perf_counter()
+                self.init_device_graphs()
+                capture_role_graph_seconds = time.perf_counter() - stage_started
+        else:
+            stage_started = time.perf_counter()
+            self.kernel_warmup()
+            kernel_warmup_seconds = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
+            self.init_piecewise_cuda_graphs()
+            capture_role_graph_seconds = time.perf_counter() - stage_started
+        stage_timings["capture_role_graph_seconds"] = capture_role_graph_seconds
+        stage_timings["activate_resident_decode_graph_seconds"] = (
+            activate_resident_decode_graph_seconds
+        )
+        stage_timings["kernel_warmup_seconds"] = kernel_warmup_seconds
+        current_platform.synchronize()
+        if id(self.model) != self._pd_runtime_cache_model_object_id:
+            raise RuntimeError("model object changed during cache hot-reconfigure")
+        available_memory_gb["complete"] = get_available_gpu_memory(
+            self.device, self.gpu_id
+        )
+
+        self._pd_runtime_cache_generation += 1
+        return {
+            "role": role,
+            "mamba_scheduler_strategy": strategy,
+            "radix_cache_disabled": disable_radix_cache,
+            "hierarchical_cache_enabled": enable_hierarchical_cache,
+            "generation": self._pd_runtime_cache_generation,
+            "max_running_requests_per_dp": int(self.max_running_requests),
+            "max_total_num_tokens": int(self.max_total_num_tokens),
+            "req_to_token_pool_type": type(self.req_to_token_pool).__name__,
+            "token_to_kv_pool_type": type(self.token_to_kv_pool).__name__,
+            "token_to_kv_pool_allocator_type": type(
+                self.token_to_kv_pool_allocator
+            ).__name__,
+            "decode_cuda_graph_loaded": self.graph_runner is not None,
+            "prefill_cuda_graph_loaded": self.piecewise_cuda_graph_runner is not None,
+            "resident_decode_cuda_graph_loaded": (
+                self._pd_runtime_resident_decode_cuda_graph_runner is not None
+            ),
+            "resident_decode_cuda_graph_active": (
+                self.graph_runner is not None
+                and self.graph_runner
+                is self._pd_runtime_resident_decode_cuda_graph_runner
+            ),
+            "resident_decode_cuda_graph_reused": resident_decode_reused,
+            "resident_decode_cuda_graph_dependency_fingerprint": (
+                self._pd_runtime_resident_decode_cuda_graph_fingerprint
+            ),
+            "registered_cache_reused_in_place": True,
+            "mamba_slots": mamba_slots,
+            "mamba_slots_per_running_request": mamba_ratio,
+            "process_id": os.getpid(),
+            "model_object_id": self._pd_runtime_cache_model_object_id,
+            "model_weights_preserved": True,
+            "stage_timings": stage_timings,
+            "available_memory_gb": available_memory_gb,
+        }
+
+    def _pd_runtime_apply_cache_profile(
+        self, profile: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        server_args = self.server_args
+        global_server_args = get_global_server_args()
+        role = str(profile["role"])
+        strategy = str(profile["mamba_scheduler_strategy"])
+        disable_radix_cache = bool(profile["disable_radix_cache"])
+        enable_hierarchical_cache = bool(
+            profile.get("enable_hierarchical_cache", False)
+        )
+        if (
+            self.mambaish_config is not None
+            and server_args.disaggregation_transfer_backend == "mooncake"
+            and self.req_to_token_pool is not None
+            and self.token_to_kv_pool_allocator is not None
+        ):
+            return self._pd_runtime_apply_registered_mamba_profile_in_place(profile)
+        if self.server_args.enable_pd_runtime_resident_decode_cuda_graph:
+            raise RuntimeError(
+                "resident Decode CUDA Graph requires the Mooncake-registered "
+                "in-place cache profile; rebuilding request/KV/attention objects "
+                "would invalidate captured device addresses"
+            )
+        stage_timings = {}
+        available_memory_gb = {
+            "before_release": get_available_gpu_memory(self.device, self.gpu_id)
+        }
+
+        stage_started = time.perf_counter()
+        server_args.disaggregation_mode = role
+        server_args.mamba_scheduler_strategy = strategy
+        server_args.disable_radix_cache = disable_radix_cache
+        server_args.enable_hierarchical_cache = enable_hierarchical_cache
+        server_args.max_mamba_cache_size = (
+            self._pd_runtime_cache_requested_max_mamba_cache_size
+        )
+        server_args.max_running_requests = (
+            self._pd_runtime_cache_requested_max_running_requests
+        )
+        global_server_args.disaggregation_mode = role
+        global_server_args.mamba_scheduler_strategy = strategy
+        global_server_args.disable_radix_cache = disable_radix_cache
+        global_server_args.enable_hierarchical_cache = enable_hierarchical_cache
+        global_server_args.max_mamba_cache_size = server_args.max_mamba_cache_size
+        global_server_args.max_running_requests = server_args.max_running_requests
+        stage_timings["apply_profile_seconds"] = time.perf_counter() - stage_started
+
+        stage_started = time.perf_counter()
+        self._pd_runtime_release_cache_plane()
+        stage_timings["release_cache_plane_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        available_memory_gb["after_release"] = get_available_gpu_memory(
+            self.device, self.gpu_id
+        )
+        logger.info(
+            "PD runtime cache plane released before target profiling: %s",
+            available_memory_gb,
+        )
+        stage_started = time.perf_counter()
+        self.init_memory_pool(self._pd_runtime_cache_pre_model_load_memory)
+        stage_timings["init_memory_pool_seconds"] = time.perf_counter() - stage_started
+        available_memory_gb["after_memory_pool"] = get_available_gpu_memory(
+            self.device, self.gpu_id
+        )
+        stage_started = time.perf_counter()
+        self.maybe_init_ngram_embedding()
+        self.init_routed_experts_capturer()
+        self.init_indexer_capturer()
+        stage_timings["rebuild_capacity_helpers_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        stage_started = time.perf_counter()
+        self.init_attention_backend()
+        stage_timings["init_attention_backend_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        stage_started = time.perf_counter()
+        self.kernel_warmup()
+        stage_timings["kernel_warmup_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        if role == "decode":
+            self.init_device_graphs()
+        else:
+            # Prefill workers never execute decode batches.  Releasing the
+            # decode graph here is part of the resource saving compared with
+            # permanently provisioning a dual-capability worker.
+            self.graph_runner = None
+            self.graph_mem_usage = 0
+            self.init_piecewise_cuda_graphs()
+        stage_timings["capture_role_graph_seconds"] = (
+            time.perf_counter() - stage_started
+        )
+        current_platform.synchronize()
+        if id(self.model) != self._pd_runtime_cache_model_object_id:
+            raise RuntimeError("model object changed during cache hot-reconfigure")
+        available_memory_gb["complete"] = get_available_gpu_memory(
+            self.device, self.gpu_id
+        )
+
+        self._pd_runtime_cache_generation += 1
+        return {
+            "role": role,
+            "mamba_scheduler_strategy": strategy,
+            "radix_cache_disabled": disable_radix_cache,
+            "hierarchical_cache_enabled": enable_hierarchical_cache,
+            "generation": self._pd_runtime_cache_generation,
+            "max_running_requests_per_dp": int(self.max_running_requests),
+            "max_total_num_tokens": int(self.max_total_num_tokens),
+            "req_to_token_pool_type": type(self.req_to_token_pool).__name__,
+            "token_to_kv_pool_type": type(self.token_to_kv_pool).__name__,
+            "token_to_kv_pool_allocator_type": type(
+                self.token_to_kv_pool_allocator
+            ).__name__,
+            "decode_cuda_graph_loaded": self.graph_runner is not None,
+            "prefill_cuda_graph_loaded": self.piecewise_cuda_graph_runner is not None,
+            "process_id": os.getpid(),
+            "model_object_id": self._pd_runtime_cache_model_object_id,
+            "model_weights_preserved": True,
+            "stage_timings": stage_timings,
+            "available_memory_gb": available_memory_gb,
+        }
+
+    def reconfigure_pd_runtime_cache(self, target_role: str) -> Dict[str, Any]:
+        """Atomically rebuild the cache plane while preserving model weights.
+
+        The Scheduler must first stop admission, drain all requests/transfers,
+        and detach its cache-owning helpers.  If constructing the target
+        profile fails, this method attempts to reconstruct the previous role
+        before returning an error; it never reloads model weights.
+        """
+        self._pd_runtime_validate_cache_hot_reconfigure()
+        old_profile = self._pd_runtime_cache_profile(
+            str(self.server_args.disaggregation_mode)
+        )
+        target_profile = self._pd_runtime_cache_profile(target_role)
+        started = time.perf_counter()
+        logger.info(
+            "PD runtime cache hot-reconfigure begin: %s -> %s",
+            old_profile,
+            target_profile,
+        )
+        try:
+            result = self._pd_runtime_apply_cache_profile(target_profile)
+        except Exception as target_error:
+            logger.exception(
+                "PD runtime target cache profile failed; rebuilding previous profile"
+            )
+            try:
+                rollback = self._pd_runtime_apply_cache_profile(old_profile)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "PD runtime cache hot-reconfigure failed and rollback failed: "
+                    f"target={target_error!r}; rollback={rollback_error!r}"
+                ) from rollback_error
+            raise RuntimeError(
+                "PD runtime cache hot-reconfigure failed; previous profile was "
+                f"restored as generation {rollback['generation']}: {target_error!r}"
+            ) from target_error
+        result["elapsed_seconds"] = time.perf_counter() - started
+        logger.info("PD runtime cache hot-reconfigure complete: %s", result)
+        return result
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -2865,7 +3366,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
-        self.graph_mem_usage = 0
+        self.graph_mem_usage = (
+            self._pd_runtime_resident_decode_cuda_graph_mem_usage_gb
+            if self._pd_runtime_resident_decode_cuda_graph_runner is not None
+            else 0
+        )
+
+        if (
+            self.server_args.enable_pd_runtime_cache_hot_reconfigure
+            and self.server_args.disaggregation_mode != "decode"
+        ):
+            logger.info(
+                "Skip decode graph capture for active PD runtime role %s.",
+                self.server_args.disaggregation_mode,
+            )
+            return
+
+        if (
+            self.server_args.enable_pd_runtime_resident_decode_cuda_graph
+            and self._pd_runtime_activate_resident_decode_cuda_graph()
+        ):
+            return
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -2909,6 +3430,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
+        if self.server_args.enable_pd_runtime_resident_decode_cuda_graph:
+            self._pd_runtime_resident_decode_cuda_graph_runner = (
+                self.graph_runner
+            )
+            self._pd_runtime_resident_decode_cuda_graph_fingerprint = (
+                self._pd_runtime_decode_cuda_graph_dependency_fingerprint()
+            )
+            self._pd_runtime_resident_decode_cuda_graph_mem_usage_gb = (
+                self.graph_mem_usage
+            )
         logger.info(
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
@@ -2917,6 +3448,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
+
+        if (
+            self.server_args.enable_pd_runtime_cache_hot_reconfigure
+            and self.server_args.disaggregation_mode != "prefill"
+        ):
+            logger.info(
+                "Skip prefill graph capture for active PD runtime role %s.",
+                self.server_args.disaggregation_mode,
+            )
+            return
 
         if self.server_args.disable_piecewise_cuda_graph:
             logger.info(

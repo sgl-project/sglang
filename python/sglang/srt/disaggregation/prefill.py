@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -238,6 +239,14 @@ class PrefillBootstrapQueue:
 
         dest_tp_ranks = [self.tp_rank]
 
+        handoff_timing = getattr(req, "pd_flip_prefill_handoff_timing", None)
+        if isinstance(handoff_timing, dict):
+            handoff_timing.setdefault(
+                "prefill_sender_create_started_mono", time.monotonic()
+            )
+            handoff_timing.setdefault(
+                "prefill_sender_create_started_epoch", time.time()
+            )
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -245,6 +254,13 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
         )
+        if isinstance(handoff_timing, dict):
+            handoff_timing.setdefault(
+                "prefill_sender_created_mono", time.monotonic()
+            )
+            handoff_timing.setdefault(
+                "prefill_sender_created_epoch", time.time()
+            )
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -359,6 +375,16 @@ class PrefillBootstrapQueue:
                     indices_to_remove.add(i)
                     req.time_stats.set_wait_queue_entry_time()
             elif poll == KVPoll.WaitingForInput:
+                handoff_timing = getattr(
+                    req, "pd_flip_prefill_handoff_timing", None
+                )
+                if isinstance(handoff_timing, dict):
+                    handoff_timing.setdefault(
+                        "prefill_handshake_ready_mono", time.monotonic()
+                    )
+                    handoff_timing.setdefault(
+                        "prefill_handshake_ready_epoch", time.time()
+                    )
                 if not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
@@ -377,6 +403,21 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs
         else:
             return bootstrapped_reqs, failed_reqs
+
+    def release_memory_occupation(self, preserve_registered_buffers=False):
+        self.queue.clear()
+        if preserve_registered_buffers and hasattr(
+            self.kv_manager, "preserve_buffer_registration_for_reuse"
+        ):
+            self.kv_manager.preserve_buffer_registration_for_reuse()
+            if hasattr(self.kv_manager, "close_for_hot_reconfigure"):
+                self.kv_manager.close_for_hot_reconfigure()
+        elif hasattr(self.kv_manager, "deregister_buffer_to_engine"):
+            self.kv_manager.deregister_buffer_to_engine()
+
+    def resume_memory_occupation(self):
+        if hasattr(self.kv_manager, "register_buffer_to_engine"):
+            self.kv_manager.register_buffer_to_engine()
 
 
 class SchedulerDisaggregationPrefillMixin:
@@ -415,12 +456,23 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        self.active_pd_event_loop_role = "prefill"
+        try:
+            self._event_loop_normal_disagg_prefill_impl()
+        finally:
+            if self.active_pd_event_loop_role == "prefill":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_normal_disagg_prefill_impl(self: Scheduler) -> None:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._pd_flip_capture_armed_prefill_bootstrap()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -447,13 +499,30 @@ class SchedulerDisaggregationPrefillMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
+        self.active_pd_event_loop_role = "prefill"
+        try:
+            self._event_loop_overlap_disagg_prefill_impl()
+        finally:
+            if self.active_pd_event_loop_role == "prefill":
+                self.active_pd_event_loop_role = None
+
+    def _event_loop_overlap_disagg_prefill_impl(self: Scheduler) -> None:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         while True:
+            if self._pd_role_loop_should_exit(DisaggregationMode.PREFILL):
+                if self.result_queue:
+                    tmp_batch, tmp_result = self.result_queue.popleft()
+                    self.process_batch_result(tmp_batch, tmp_result)
+                    self.last_batch = None
+                    self.cur_batch = None
+                    continue
+                return
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._pd_flip_capture_armed_prefill_bootstrap()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )

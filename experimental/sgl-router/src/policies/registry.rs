@@ -396,6 +396,30 @@ mod tests {
         assert_eq!(decode.len(), 2);
     }
 
+    #[test]
+    fn pd_mode_draining_prefill_is_not_a_prefill_candidate() {
+        let r = registry(&[
+            spec("p1", WorkerMode::Prefill, "m"),
+            spec("d1", WorkerMode::Decode, "m"),
+        ]);
+        let p1 = r.get(&WorkerId("p1".into())).unwrap();
+        p1.set_draining(true);
+
+        let resolver = PdPoolResolver::new(r);
+        let model = ModelId("m".into());
+        match resolver.resolve(&model).unwrap() {
+            PdPools::Pd { prefill, decode } => {
+                assert!(prefill.is_empty());
+                assert_eq!(decode.len(), 1);
+            }
+            other => panic!("expected Pd, got {other:?}"),
+        }
+        assert_eq!(
+            resolver.prefill_candidates(&model).unwrap_err(),
+            PdResolveError::NoPrefillWorkersAvailable,
+        );
+    }
+
     /// PD mode where every breaker is open (e.g. the upstream pool went
     /// hard down) must NOT collapse to the generic `NoHealthyWorkers`
     /// code. Both `prefill_candidates` and `decode_candidates` should

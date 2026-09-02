@@ -51,6 +51,7 @@ mod tests {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,

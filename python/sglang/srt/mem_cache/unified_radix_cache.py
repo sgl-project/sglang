@@ -2244,11 +2244,76 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def detach_storage_backend(self) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage detach yet. "
-            "Restart without hicache_storage_backend to disable it.",
-        )
+        try:
+            self.shutdown()
+        except Exception as exc:
+            logger.exception("Failed to detach UnifiedRadixCache storage backend")
+            return False, "Failed to detach HiCache storage backend: {}".format(exc)
+        return True, "Detached HiCache storage backend successfully."
+
+    def suspend_pd_runtime_storage(self) -> dict[str, object]:
+        """Keep Host backing buffers registered while this cache is dormant.
+
+        The caller must first drain writes and reset the radix/allocator state.
+        Only the empty backing buffers and the L3 client survive; no radix node
+        or request ownership is retained across the Decode interval.
+        """
+        controller = self.cache_controller
+        if controller is None or not self.enable_storage:
+            raise RuntimeError("Cannot suspend a UnifiedRadixCache without storage.")
+        controller.suspend_storage_io()
+        self.enable_storage = False
+        self._pd_runtime_storage_suspended = True
+        entries = getattr(controller.mem_pool_host, "entries", None) or []
+        return {
+            "host_pool_group_id": id(controller.mem_pool_host),
+            "host_pool_ids": {
+                str(getattr(entry, "name", index)): id(entry.host_pool)
+                for index, entry in enumerate(entries)
+            },
+            "storage_backend_id": id(controller.storage_backend),
+        }
+
+    def resume_pd_runtime_storage(self) -> dict[str, object]:
+        """Reactivate a safely suspended Prefill HiCache plane."""
+        controller = self.cache_controller
+        if controller is None or not bool(
+            getattr(self, "_pd_runtime_storage_suspended", False)
+        ):
+            raise RuntimeError("UnifiedRadixCache storage is not suspended.")
+        controller.resume_storage_io()
+        self.enable_storage = True
+        self._pd_runtime_storage_suspended = False
+        entries = getattr(controller.mem_pool_host, "entries", None) or []
+        return {
+            "host_pool_group_id": id(controller.mem_pool_host),
+            "host_pool_ids": {
+                str(getattr(entry, "name", index)): id(entry.host_pool)
+                for index, entry in enumerate(entries)
+            },
+            "storage_backend_id": id(controller.storage_backend),
+        }
+
+    def shutdown(self) -> None:
+        """Drain persistent writes and stop storage workers for cache-plane swap.
+
+        Runtime PD role switching discards the local UnifiedRadixCache object,
+        but the external L3 namespace must remain intact. This internal
+        lifecycle hook closes only this process's controller/client; a promoted
+        Prefill creates a fresh controller against the same backend.
+        """
+        controller = self.cache_controller
+        if controller is None:
+            return
+        if self.enable_storage or bool(
+            getattr(controller, "enable_storage", False)
+        ):
+            if bool(getattr(controller, "_storage_io_suspended", False)):
+                controller.resume_storage_io()
+                self.enable_storage = True
+            self.writing_check(write_back=True)
+            controller.detach_storage_backend()
+        self.enable_storage = False
 
     def clear_storage_backend(self) -> bool:
         try:
@@ -2326,6 +2391,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.dec_lock_ref(node, lock_params)
             finish_count -= 1
 
+    def is_load_back_event_done(self, consumer_ticket: int) -> bool:
+        """Return True after the generation-stamped load-back completes."""
+        if consumer_ticket < 0 or self.cache_controller is None:
+            return True
+
+        counter = self.cache_controller.layer_done_counter
+        if counter.is_ticket_superseded(consumer_ticket):
+            # A slot can only be reused after its preceding CUDA event has
+            # completed, so an older ticket is already safe to consume.
+            self.loading_check()
+            return True
+        consumer_index = counter.ticket_index(consumer_ticket)
+        if not counter.events[consumer_index].finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
     # ---- HiCache: Scheduler Entry Points ----
 
     def init_load_back(
@@ -2402,6 +2485,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def ready_to_load_host_cache_with_ticket(self) -> int:
+        """Start loading and return a generation-stamped completion ticket."""
+        if self.cache_controller is not None:
+            return self.cache_controller.start_loading(return_ticket=True)
+        return -1
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

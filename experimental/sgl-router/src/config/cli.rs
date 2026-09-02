@@ -35,7 +35,6 @@ pub struct Cli {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = 30000)]
     pub port: u16,
-
     // ---- model (exactly one) ----
     /// Model id this router serves (the OpenAI `model` field).
     #[arg(long)]
@@ -48,6 +47,14 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
+    /// Policy used for Prefill selection in PD mode. When omitted, falls back
+    /// to the legacy `--policy` value.
+    #[arg(long, value_enum)]
+    pub prefill_policy: Option<PolicyKind>,
+    /// Policy used for Decode selection in PD mode. When omitted, preserves
+    /// the historical same-host Decode affinity behavior.
+    #[arg(long, value_enum)]
+    pub decode_policy: Option<PolicyKind>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -144,6 +151,9 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+        let pd_flip_router_admin_api_key =
+            load_pd_flip_router_admin_key(|name| std::env::var(name))?;
+        let prefill_policy = self.prefill_policy.unwrap_or(self.policy);
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -158,10 +168,13 @@ impl Cli {
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some();
-        if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
+        if tuned_cache_aware
+            && prefill_policy != PolicyKind::CacheAwareZmq
+            && self.decode_policy != Some(PolicyKind::CacheAwareZmq)
+        {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                 require a cache_aware Prefill or Decode policy"
             ));
         }
 
@@ -169,7 +182,10 @@ impl Cli {
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
             || self.sticky_eviction_interval_secs.is_some();
-        if tuned_sticky && self.policy != PolicyKind::Sticky {
+        if tuned_sticky
+            && prefill_policy != PolicyKind::Sticky
+            && self.decode_policy != Some(PolicyKind::Sticky)
+        {
             return Err(anyhow!(
                 "--routing-key-header / --sticky-fallback-policy / --sticky-idle-secs / \
                  --sticky-eviction-interval-secs require --policy sticky"
@@ -181,7 +197,9 @@ impl Cli {
         // name so a typo fails at startup rather than silently never
         // matching any request header; the fallback must be a
         // dependency-free policy the factory can build standalone.
-        let sticky = if self.policy == PolicyKind::Sticky {
+        let sticky = if prefill_policy == PolicyKind::Sticky
+            || self.decode_policy == Some(PolicyKind::Sticky)
+        {
             let d = StickyConfig::default();
             let header_name = self.routing_key_header.unwrap_or(d.header_name);
             axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
@@ -253,6 +271,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
+                pd_flip_router_admin_api_key,
             },
             observability: ObservabilityConfig {
                 log_level: self.log_level,
@@ -263,7 +282,8 @@ impl Cli {
                 // HuggingFace repo id) when --tokenizer-path is omitted.
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 id: self.model_id,
-                policy: self.policy,
+                policy: prefill_policy,
+                decode_policy: self.decode_policy,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -338,6 +358,29 @@ impl Cli {
     }
 }
 
+fn load_pd_flip_router_admin_key(
+    read_env: impl FnOnce(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<crate::config::SecretString>> {
+    match read_env("PD_FLIP_ROUTER_ADMIN_API_KEY") {
+        Ok(value) => {
+            if value.is_empty()
+                || value.starts_with("replace-with-")
+                || matches!(value.as_str(), "changeme" | "CHANGE_ME")
+                || value.bytes().any(|byte| byte.is_ascii_whitespace())
+            {
+                return Err(anyhow!(
+                    "PD_FLIP_ROUTER_ADMIN_API_KEY must be a non-placeholder Bearer token without whitespace"
+                ));
+            }
+            Ok(Some(crate::config::SecretString::new(value)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(anyhow!("PD_FLIP_ROUTER_ADMIN_API_KEY is not valid UTF-8"))
+        }
+    }
+}
+
 /// Join space/repeated `key=value` selector terms into the single
 /// comma-joined string the k8s backend's `labels_match_selector`
 /// expects. `None` for an empty term list so [`resolve_mode`] can apply
@@ -388,9 +431,66 @@ mod tests {
         assert_eq!(c.server.host, "127.0.0.1");
         assert_eq!(c.server.port, 30000);
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
+        assert_eq!(c.model.decode_policy, None);
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.server.pd_flip_router_admin_api_key, None);
+    }
+
+    #[test]
+    fn accepts_independent_prefill_and_decode_policies() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--prefill-policy",
+            "cache_aware",
+            "--decode-policy",
+            "power_of_two",
+            "--balance-abs-threshold",
+            "1",
+            "--balance-rel-threshold",
+            "1.1",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::CacheAwareZmq);
+        assert_eq!(c.model.decode_policy, Some(PolicyKind::PowerOfTwo));
+    }
+
+    #[test]
+    fn pd_flip_router_admin_key_is_env_only_and_redacted() {
+        let secret = "never-print-router-secret";
+        let argv = with_model(&["--worker-urls", "http://x:30000"]);
+        let cli = Cli::try_parse_from(
+            std::iter::once("sgl-router").chain(argv.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert!(!format!("{cli:?}").contains(secret));
+        let key = load_pd_flip_router_admin_key(|name| {
+            assert_eq!(name, "PD_FLIP_ROUTER_ADMIN_API_KEY");
+            Ok(secret.to_string())
+        })
+        .unwrap();
+        let mut config = cli.into_config().unwrap();
+        config.server.pd_flip_router_admin_api_key = key;
+        assert!(!format!("{config:?}").contains(secret));
+        assert_eq!(
+            config
+                .server
+                .pd_flip_router_admin_api_key
+                .as_ref()
+                .map(|key| key.expose()),
+            Some(secret)
+        );
+        let rejected = into_config(&[
+            "--model-id",
+            "qwen3",
+            "--worker-urls",
+            "http://x:30000",
+            "--pd-flip-router-admin-api-key",
+            secret,
+        ]);
+        assert!(rejected.is_err(), "secret-bearing CLI flag must not exist");
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the
@@ -769,7 +869,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("require --policy cache_aware_zmq"),
+            err.contains("require a cache_aware Prefill or Decode policy"),
             "got: {err}"
         );
     }

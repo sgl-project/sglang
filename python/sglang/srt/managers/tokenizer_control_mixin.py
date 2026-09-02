@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import fastapi
 
 from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+    get_kv_class,
+)
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -48,6 +54,34 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationReqOutput,
+    PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetActivateReq,
+    PDFlipMigrationTargetAbortReq,
+    PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
+    PDFlipMigrationTargetPrepareReq,
+    PDFlipPrefillHandoffAbortReq,
+    PDFlipPrefillHandoffDecodeRebindReq,
+    PDFlipPrefillHandoffSourceFinishReq,
+    PDFlipPrefillHandoffSourceStartReq,
+    PDFlipPrefillHandoffStatusReq,
+    PDFlipPrefillHandoffTargetActivateReq,
+    PDFlipPrefillHandoffTargetPrepareReq,
+    PDFlipPrefillDonorAbortReq,
+    PDFlipPrefillDonorStartReq,
+    PDFlipPrefillDonorStatusReq,
+    PDRuntimePrefillPeerInvalidateReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleReqOutput,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -111,6 +145,8 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("pd_flip_migration", PDFlipMigrationReqOutput),
+    ("pd_runtime_role", PDRuntimeRoleReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("get_loads", GetLoadsReqOutput, "watching"),
@@ -133,6 +169,52 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    @staticmethod
+    def _pd_flip_resolve_effective_session_id(
+        requested_session_id: Optional[str], responses
+    ) -> Optional[str]:
+        if requested_session_id is not None:
+            return str(requested_session_id)
+        resolved = {
+            str(session_id)
+            for response in responses or []
+            for session_id in [
+                (getattr(response, "status", None) or {}).get("session_id")
+            ]
+            if session_id is not None
+        }
+        return next(iter(resolved)) if len(resolved) == 1 else None
+
+    def _ensure_pd_flip_migration_bootstrap_server(self: TokenizerManager) -> None:
+        if (
+            DisaggregationMode(self.server_args.disaggregation_mode)
+            != DisaggregationMode.DECODE
+        ):
+            return
+        if getattr(self, "pd_flip_migration_bootstrap_server", None) is not None:
+            return
+
+        # Runtime role switching starts the regular disaggregation bootstrap
+        # server on decode nodes as well. Reuse it instead of binding the same
+        # bootstrap port a second time.
+        if getattr(self, "bootstrap_server", None) is not None:
+            self.pd_flip_migration_bootstrap_server = self.bootstrap_server
+            return
+
+        transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        if transfer_backend == TransferBackend.FAKE:
+            return
+
+        kv_bootstrap_server_class = get_kv_class(
+            transfer_backend, KVClassType.BOOTSTRAP_SERVER
+        )
+        self.pd_flip_migration_bootstrap_server = kv_bootstrap_server_class(
+            host=self.server_args.host,
+            port=self.server_args.disaggregation_bootstrap_port,
+        )
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -802,6 +884,319 @@ class TokenizerControlMixin:
             await self.set_internal_state_communicator(obj)
         )
         return [res.updated for res in responses]
+
+    async def start_pd_flip_migration_source(
+        self: TokenizerManager, obj: PDFlipMigrationSourceStartReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        responses = await self.pd_flip_migration_communicator(obj)
+        last_seen = getattr(self, "pd_flip_last_relay_seq_by_key", None)
+        if last_seen is None:
+            last_seen = {}
+            self.pd_flip_last_relay_seq_by_key = last_seen
+        for response in responses:
+            for manifest in response.manifests or []:
+                rid = manifest.get("rid")
+                session_id = manifest.get("pd_flip_session_id") or obj.session_id
+                if rid is not None and session_id is not None:
+                    last_seen[(str(session_id), str(rid))] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
+                    self.pd_flip_relay_session_by_rid[str(rid)] = str(session_id)
+        return responses
+
+    async def start_pd_flip_prefill_handoff_source(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffSourceStartReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        last_seen = getattr(self, "pd_flip_last_relay_seq_by_key", None)
+        if last_seen is None:
+            last_seen = {}
+            self.pd_flip_last_relay_seq_by_key = last_seen
+        for response in responses:
+            for manifest in response.manifests or []:
+                rid = manifest.get("rid")
+                session_id = manifest.get("pd_flip_session_id") or obj.session_id
+                if rid is not None and session_id is not None:
+                    relay_key = (str(session_id), str(rid))
+                    last_seen[relay_key] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
+                    self.pd_flip_relay_session_by_rid[str(rid)] = str(session_id)
+                    receive_keys = getattr(
+                        self, "pd_flip_prefill_handoff_receive_keys", None
+                    )
+                    if receive_keys is None:
+                        receive_keys = set()
+                        self.pd_flip_prefill_handoff_receive_keys = receive_keys
+                    receive_keys.add(relay_key)
+        return responses
+
+    async def prepare_pd_flip_prefill_handoff_target(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffTargetPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        if obj.source_url and all(res.success for res in responses):
+            targets = getattr(self, "pd_flip_output_relay_targets", None)
+            if targets is None:
+                targets = {}
+                self.pd_flip_output_relay_targets = targets
+            baselines = getattr(self, "pd_flip_output_relay_baseline", None)
+            if baselines is None:
+                baselines = {}
+                self.pd_flip_output_relay_baseline = baselines
+            for manifest in obj.manifests or []:
+                rid = manifest.get("rid") if isinstance(manifest, dict) else None
+                session_id = (
+                    manifest.get("pd_flip_session_id")
+                    if isinstance(manifest, dict)
+                    else None
+                ) or obj.session_id
+                if rid is not None and session_id is not None:
+                    relay_key = (str(session_id), str(rid))
+                    # Preserve a request-scoped HTTP stream owner across
+                    # repeated Prefill and Decode handoffs.
+                    targets[relay_key] = (
+                        manifest.get("pd_flip_output_relay_url")
+                        if isinstance(manifest, dict)
+                        else None
+                    ) or obj.source_url
+                    baselines[relay_key] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
+        return responses
+
+    async def rebind_pd_flip_prefill_handoff_decode(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffDecodeRebindReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def activate_pd_flip_prefill_handoff_target(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffTargetActivateReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def finish_pd_flip_prefill_handoff_source(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffSourceFinishReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        if session_id:
+            receive = getattr(self, "pd_flip_last_relay_seq_by_key", {})
+            for key in [
+                key
+                for key in receive
+                if key[0] == str(session_id) and key[1] not in self.rid_to_state
+            ]:
+                receive.pop(key, None)
+                getattr(
+                    self, "pd_flip_prefill_handoff_receive_keys", set()
+                ).discard(key)
+                if self.pd_flip_relay_session_by_rid.get(key[1]) == key[0]:
+                    self.pd_flip_relay_session_by_rid.pop(key[1], None)
+        return responses
+
+    async def abort_pd_flip_prefill_handoff(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffAbortReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        if all(res.success for res in responses):
+            self._pd_flip_clear_session_relay_state(session_id)
+        return responses
+
+    async def get_pd_flip_prefill_handoff_status(
+        self: TokenizerManager, obj: PDFlipPrefillHandoffStatusReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def start_pd_flip_prefill_donor(
+        self: TokenizerManager, obj: PDFlipPrefillDonorStartReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def get_pd_flip_prefill_donor_status(
+        self: TokenizerManager, obj: PDFlipPrefillDonorStatusReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def abort_pd_flip_prefill_donor(
+        self: TokenizerManager, obj: PDFlipPrefillDonorAbortReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        if obj.source_url and all(res.success for res in responses):
+            targets = getattr(self, "pd_flip_output_relay_targets", None)
+            if targets is None:
+                targets = {}
+                self.pd_flip_output_relay_targets = targets
+            baselines = getattr(self, "pd_flip_output_relay_baseline", None)
+            if baselines is None:
+                baselines = {}
+                self.pd_flip_output_relay_baseline = baselines
+            for manifest in obj.manifests or []:
+                rid = manifest.get("rid") if isinstance(manifest, dict) else None
+                session_id = (
+                    manifest.get("pd_flip_session_id")
+                    if isinstance(manifest, dict)
+                    else None
+                ) or obj.session_id
+                if rid is not None and session_id is not None:
+                    relay_key = (str(session_id), str(rid))
+                    # The old Decode owns KV state, but in disaggregated
+                    # serving the client stream normally belongs to the
+                    # original Prefill.  Relay directly to that request-scoped
+                    # owner instead of assuming both owners are the same.
+                    targets[relay_key] = (
+                        manifest.get("pd_flip_output_relay_url")
+                        if isinstance(manifest, dict)
+                        else None
+                    ) or obj.source_url
+                    baselines[relay_key] = int(
+                        manifest.get("last_emitted_output_seq", 0) or 0
+                    )
+        return responses
+
+    async def commit_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetCommitReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def activate_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetActivateReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def abort_pd_flip_migration_target(
+        self: TokenizerManager, obj: PDFlipMigrationTargetAbortReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        self._pd_flip_clear_session_relay_state(session_id, keep_receive=True)
+        return responses
+
+    async def get_pd_flip_migration_status(
+        self: TokenizerManager, obj: PDFlipMigrationStatusReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def finish_pd_flip_migration_source(
+        self: TokenizerManager, obj: PDFlipMigrationSourceFinishReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        if session_id:
+            receive = getattr(self, "pd_flip_last_relay_seq_by_key", {})
+            for key in [
+                key
+                for key in receive
+                if key[0] == str(session_id) and key[1] not in self.rid_to_state
+            ]:
+                receive.pop(key, None)
+                if self.pd_flip_relay_session_by_rid.get(key[1]) == key[0]:
+                    self.pd_flip_relay_session_by_rid.pop(key[1], None)
+        return responses
+
+    async def start_pd_flip_migration_source_delta(
+        self: TokenizerManager, obj: PDFlipMigrationSourceDeltaReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def start_pd_flip_migration_source_fallback(
+        self: TokenizerManager, obj: PDFlipMigrationSourceFallbackReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        self._ensure_pd_flip_migration_bootstrap_server()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target_fallback(
+        self: TokenizerManager, obj: PDFlipMigrationTargetFallbackPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def prepare_pd_flip_migration_target_delta(
+        self: TokenizerManager, obj: PDFlipMigrationTargetDeltaPrepareReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_flip_migration_communicator(obj)
+
+    async def abort_pd_flip_migration(
+        self: TokenizerManager, obj: PDFlipMigrationAbortReq
+    ) -> List[PDFlipMigrationReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_flip_migration_communicator(obj)
+        session_id = self._pd_flip_resolve_effective_session_id(
+            obj.session_id, responses
+        )
+        self._pd_flip_clear_session_relay_state(session_id)
+        return responses
+
+    async def set_pd_runtime_role(
+        self: TokenizerManager, obj: PDRuntimeRoleSetReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        responses = await self.pd_runtime_role_communicator(obj)
+        if all(res.success for res in responses):
+            # Keep the tokenizer-side request metadata in sync with the
+            # scheduler runtime role. New request timing objects are created
+            # from self.disaggregation_mode, not directly from server_args.
+            # Without this update, a decode -> prefill hot switch executes as
+            # prefill in the scheduler but continues to emit
+            # ReqTimeStats(type=decode).
+            self.disaggregation_mode = DisaggregationMode(obj.role)
+            self.server_args.disaggregation_mode = obj.role
+        return responses
+
+    async def get_pd_runtime_role_status(
+        self: TokenizerManager, obj: PDRuntimeRoleStatusReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_runtime_role_communicator(obj)
+
+    async def invalidate_pd_runtime_prefill_peer(
+        self: TokenizerManager, obj: PDRuntimePrefillPeerInvalidateReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_runtime_role_communicator(obj)
+
+    async def set_pd_runtime_admission(
+        self: TokenizerManager, obj: PDRuntimeRoleAdmissionReq
+    ) -> List[PDRuntimeRoleReqOutput]:
+        self.auto_create_handle_loop()
+        return await self.pd_runtime_role_communicator(obj)
 
     async def dumper_control(
         self: TokenizerManager, obj: DumperControlReqInput
