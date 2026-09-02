@@ -7,6 +7,7 @@ use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::buckets::BucketSelector;
 use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::BlockSizeOracle;
+use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
@@ -34,6 +35,7 @@ pub struct AppContext {
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
     pub engine_load: Arc<EngineLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
@@ -90,6 +92,7 @@ impl AppContext {
             active_load,
             metrics,
             prefix_index: None,
+            radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),
@@ -144,6 +147,7 @@ impl AppContext {
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
+            radix_tree_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             engine_load: EngineLoadTable::new(),
             ready: AtomicBool::new(false),

@@ -95,7 +95,7 @@ pub enum PolicyKind {
     /// Selects a worker from session affinity.
     #[value(name = "session_aware")]
     SessionAware,
-    /// Selects cache-affine prefill candidates from external indexer data.
+    /// Selects cache-affine prefill candidates from the configured prefix provider.
     #[value(name = "cache_aware")]
     CacheAware,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
@@ -302,7 +302,7 @@ pub struct ModelConfig {
     /// 可选静态 Bucket 配置；`None` 使用全局 domain。
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
-    /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
+    /// Cache-Aware-ZMQ tuning and Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
@@ -376,7 +376,17 @@ fn parse_fuse_weight(name: &str, raw: &str) -> Result<f32, String> {
     Ok(w)
 }
 
-/// Per-model cache-aware tuning.
+/// Cache-Aware prefix-match source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CachePrefixProvider {
+    #[default]
+    #[value(name = "radix_tree")]
+    RadixTree,
+    #[value(name = "indexer")]
+    Indexer,
+}
+
+/// Per-model Cache-Aware configuration.
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
     /// Lower bound on `matched_blocks / total_blocks` for the tree match
@@ -393,7 +403,9 @@ pub struct CacheAwareConfig {
     /// that the absolute check is gated on. Default 1.1 — 10 % relative
     /// difference triggers re-balancing.
     pub balance_rel_threshold: f32,
-    /// Optional external KV Indexer client configuration.
+    /// Prefix-match source for native Cache-Aware.
+    pub prefix_provider: CachePrefixProvider,
+    /// External Indexer configuration when `prefix_provider = indexer`.
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
@@ -403,6 +415,7 @@ impl Default for CacheAwareConfig {
             cache_threshold: default_cache_threshold(),
             balance_abs_threshold: default_balance_abs(),
             balance_rel_threshold: default_balance_rel(),
+            prefix_provider: CachePrefixProvider::default(),
             kv_indexer_endpoint: None,
         }
     }
@@ -631,9 +644,13 @@ pub enum K8sDiscoveryMode {
 /// invalid.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set")]
+    #[error(
+        "discovery.k8s requires either `label_selector` (plain) or both `prefill_selector` and `decode_selector` (PD); none were set"
+    )]
     NoSelector,
-    #[error("discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both")]
+    #[error(
+        "discovery.k8s: `label_selector` (plain) and `prefill_selector`/`decode_selector` (PD) are mutually exclusive — set one or the other, not both"
+    )]
     MixedModes,
     #[error("discovery.k8s: PD mode requires BOTH `prefill_selector` and `decode_selector`")]
     PartialPdSelectors,

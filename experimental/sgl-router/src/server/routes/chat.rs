@@ -298,7 +298,11 @@ pub async fn chat_completions(
                 query_blocks,
             })
         }
-        _ => None,
+        _ => ctx
+            .radix_tree_prefix_provider
+            .as_ref()
+            .zip(request_tokens.as_ref())
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
     };
 
     // Prefer exact ingress tokens; otherwise use the conservative estimate.
@@ -1199,7 +1203,7 @@ fn build_outgoing_body(
         _ => {
             return Err(ApiError::BadRequest(
                 "invalid request: body must be a JSON object".to_string(),
-            ))
+            ));
         }
     };
     if let Some(ids) = input_ids {

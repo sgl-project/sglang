@@ -12,10 +12,10 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    CachePrefixProvider, CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend,
+    EligibilityConfig, FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig,
+    LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -92,6 +92,9 @@ pub struct Cli {
     /// `--kv-indexer-endpoint`; defaults to 32.
     #[arg(long)]
     pub kv_indexer_query_max_inflight: Option<usize>,
+    /// Prefix-match source for native Cache-Aware.
+    #[arg(long, value_enum)]
+    pub cache_prefix_provider: Option<CachePrefixProvider>,
 
     // ---- session-affinity tuning ----
     /// Header carrying the session ID for `--policy session_aware`.
@@ -260,6 +263,18 @@ impl Cli {
                 "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
+        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
+            if self.kv_indexer_endpoint.is_some() {
+                CachePrefixProvider::Indexer
+            } else {
+                CachePrefixProvider::RadixTree
+            }
+        });
+        if self.cache_prefix_provider.is_some() && self.policy != PolicyKind::CacheAware {
+            return Err(anyhow!(
+                "--cache-prefix-provider requires --policy cache_aware"
+            ));
+        }
         if self.kv_indexer_query_timeout_ms == Some(0) {
             return Err(anyhow!(
                 "--kv-indexer-query-timeout-ms must be greater than zero"
@@ -280,22 +295,29 @@ impl Cli {
                 "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
             ));
         }
+        let cache_aware_uses_indexer = self.policy == PolicyKind::CacheAware
+            && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some()
-            && !matches!(
-                self.policy,
-                PolicyKind::CacheAware | PolicyKind::CacheAwareZmq
-            )
+            && !cache_aware_uses_indexer
+            && self.policy != PolicyKind::CacheAwareZmq
         {
+            if self.policy == PolicyKind::CacheAware {
+                return Err(anyhow!(
+                    "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
+                ));
+            }
             return Err(anyhow!(
                 "--kv-indexer-endpoint requires --policy cache_aware or cache_aware_zmq"
             ));
         }
-        if self.policy == PolicyKind::CacheAware && self.kv_indexer_endpoint.is_none() {
+        if cache_aware_uses_indexer && self.kv_indexer_endpoint.is_none() {
             return Err(anyhow!(
-                "--policy cache_aware requires --kv-indexer-endpoint"
+                "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
             ));
         }
-        let tuned_cache_aware = tuned_legacy_cache_aware || self.kv_indexer_endpoint.is_some();
+        let tuned_cache_aware = tuned_legacy_cache_aware
+            || self.policy == PolicyKind::CacheAware
+            || self.kv_indexer_endpoint.is_some();
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -454,7 +476,9 @@ impl Cli {
             let d = AffinityConfig::default();
             let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
             axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
-                anyhow!("--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}")
+                anyhow!(
+                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+                )
             })?;
             let pressure_rel_threshold = self
                 .pressure_rel_threshold
@@ -578,6 +602,7 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                prefix_provider: cache_prefix_provider,
                 kv_indexer_endpoint,
             })
         } else {
@@ -635,13 +660,13 @@ impl Cli {
             (true, true) => {
                 return Err(anyhow!(
                     "--worker-urls and --service-discovery are mutually exclusive; pass exactly one"
-                ))
+                ));
             }
             (false, false) => {
                 return Err(anyhow!(
                     "no discovery backend selected; pass --worker-urls <URL...> (static) \
                      or --service-discovery (kubernetes)"
-                ))
+                ));
             }
             (true, false) => {
                 if self.service_discovery_namespace.is_some()
@@ -1868,14 +1893,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_affinity_options_that_cannot_affect_the_selected_policy() {
-        let missing_indexer = cfg_of("--policy cache_aware")
-            .expect_err("cache_aware without an indexer can only behave like P2")
-            .to_string();
-        assert!(
-            missing_indexer.contains("--kv-indexer-endpoint"),
-            "got: {missing_indexer}"
-        );
+    fn cache_aware_defaults_to_router_radix_tree() {
+        let config = cfg_of("--policy cache_aware")
+            .expect("native cache-aware should not require an Indexer endpoint");
+        let cache = config
+            .model
+            .cache_aware
+            .expect("native cache-aware needs its default configuration");
+        assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
+        assert!(cache.kv_indexer_endpoint.is_none());
     }
 
     #[test]
