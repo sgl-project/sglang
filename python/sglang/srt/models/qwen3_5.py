@@ -2174,6 +2174,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            if self.visual is None and "visual" in name:
+                # --language-model-only: no vision tower was built.
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
