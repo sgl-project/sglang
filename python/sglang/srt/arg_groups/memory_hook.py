@@ -24,7 +24,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
-def dllm_prefill_graph_alignment(server_args: Any) -> Optional[int]:
+# Above this many captured buckets, capture time and graph memory stop being
+# a rounding error on startup and deserve saying out loud.
+_DLLM_PREFILL_BUCKET_COUNT_WARN_THRESHOLD = 64
+
+
+def dllm_prefill_graph_alignment(
+    server_args: Any, *, dllm_config: Any = None
+) -> Optional[int]:
     """Token granularity every pure dLLM prefill batch is a multiple of.
 
     ``PrefillAdder._get_dllm_extend_len`` rounds each pure-prefill extend down
@@ -33,6 +40,10 @@ def dllm_prefill_graph_alignment(server_args: Any) -> Optional[int]:
 
     The page size is resolved rather than read: this runs at memory sizing,
     before ``_page_size_default`` and the backend page constraints declare it.
+
+    ``dllm_config`` lets a caller that already built one pass it in;
+    ``DllmConfig.from_server_args`` loads the HF config, so building a second
+    one per call is not free.
     """
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
@@ -46,7 +57,8 @@ def dllm_prefill_graph_alignment(server_args: Any) -> Optional[int]:
     )
     from sglang.srt.dllm.config import DllmConfig
 
-    dllm_config = DllmConfig.from_server_args(server_args)
+    if dllm_config is None:
+        dllm_config = DllmConfig.from_server_args(server_args)
     page_size = resolve_dllm_page_size(
         page_size=resolve_default_page_size(cfg),
         block_size=dllm_config.block_size,
@@ -72,14 +84,22 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     ``quiet`` suppresses the summary line for callers that only re-derive the
     list to compare against what is already installed.
     """
-    alignment = dllm_prefill_graph_alignment(server_args)
-    if alignment is None:
+    cfg = resolving_view(server_args)
+    # Both guards are the ones `dllm_prefill_graph_alignment` applies. Repeating
+    # them keeps `DllmConfig.from_server_args` -- which loads the HF config --
+    # off the path that has no dLLM prefill graph to size.
+    if cfg.dllm_algorithm is None:
+        return None
+    if cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
         return None
 
     from sglang.srt.dllm.config import DllmConfig
 
-    cfg = resolving_view(server_args)
     dllm_config = DllmConfig.from_server_args(server_args)
+    alignment = dllm_prefill_graph_alignment(server_args, dllm_config=dllm_config)
+    if alignment is None:
+        return None
+
     max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
     if cfg.max_prefill_tokens is not None:
         max_tokens = min(max_tokens, cfg.max_prefill_tokens)
@@ -97,6 +117,18 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
                 alignment,
                 max_tokens,
             )
+            if len(capture_bs) > _DLLM_PREFILL_BUCKET_COUNT_WARN_THRESHOLD:
+                # Every reachable aligned total gets its own graph, so a small
+                # block size over a large prefill budget captures a lot of them.
+                logger.warning(
+                    "%d dLLM prefill CUDA graphs will be captured (alignment=%d, "
+                    "max_tokens=%d). Lower --max-running-requests, "
+                    "--max-prefill-tokens or --cuda-graph-max-bs-prefill to cut "
+                    "startup time and graph memory.",
+                    len(capture_bs),
+                    alignment,
+                    max_tokens,
+                )
         else:
             # An empty list leaves the breakable prefill graph with nothing to
             # capture, so every pure dLLM prefill stays eager.

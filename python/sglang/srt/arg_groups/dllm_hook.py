@@ -91,14 +91,21 @@ def _disable_dllm_prefill_graph_on_deepep_misalignment(server_args: Any) -> None
 
 
 def _reconcile_dllm_prefill_graph_buckets(server_args: Any) -> None:
-    """Rebuild the prefill buckets if the page size moved after memory sizing.
+    """Rebuild the prefill buckets if their inputs moved after memory sizing.
 
-    Memory sizing predicts the page size with `resolve_default_page_size`,
-    because `_page_size_default` and the backend page constraints have not run
-    at its slot. Every pass that can move it afterwards caps at the dLLM block
-    size, so the alignment normally lands identically -- but nothing enforces
-    that, and a mismatch would capture buckets the scheduler can never emit,
-    silently keeping every pure dLLM prefill eager.
+    The motivating input is the page size: memory sizing predicts it with
+    `resolve_default_page_size`, because `_page_size_default` and the backend
+    page constraints have not run at its slot. Every pass that can move it
+    afterwards caps at the dLLM block size, so the alignment normally lands
+    identically -- but nothing enforces that, and a mismatch would capture
+    buckets the scheduler can never emit, silently keeping every pure dLLM
+    prefill eager.
+
+    The re-derivation reads the other bucket inputs too (`prefill.max_bs`,
+    `max_prefill_tokens`, `max_running_requests`), so a late move in any of
+    them lands here as well. That is intended -- the installed list must match
+    what the scheduler can emit whatever moved it -- which is why the log names
+    the inputs rather than blaming the page size.
 
     Capture correctness wins over the reserve: `reserve_for_graph_mb` already
     consumed the earlier list, but that reserve is a heuristic for
@@ -122,10 +129,10 @@ def _reconcile_dllm_prefill_graph_buckets(server_args: Any) -> None:
         return
 
     logger.warning(
-        "dLLM prefill graph buckets were sized against a different page size "
-        "than the resolution settled on; replacing %d captured buckets with "
-        "%d. The graph reserve in mem_fraction_static was computed from the "
-        "former.",
+        "dLLM prefill graph buckets were sized before resolution settled their "
+        "inputs (page size, prefill max_bs, max_prefill_tokens, "
+        "max_running_requests); replacing %d captured buckets with %d. The "
+        "graph reserve in mem_fraction_static was computed from the former.",
         len(prefill_config.bs or []),
         len(final_bs),
     )

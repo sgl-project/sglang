@@ -66,6 +66,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
@@ -494,7 +495,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     # Diffusion LLM config and scheduler-selected pure-prefill phase.
-    dllm_config: Optional[object] = None
+    dllm_config: Optional[DllmConfig] = None
     is_dllm_prefill: bool = False
 
     # === Per-forward overrides passed explicitly to init_new ===

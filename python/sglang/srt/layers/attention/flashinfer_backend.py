@@ -484,12 +484,23 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
-        # FlashInfer 0.6.12 resolves backend="auto" only on the first plan and
-        # then keeps that backend. On SM90, an unmasked first plan selects FA3,
-        # which does not support a later custom mask. Keep a dedicated FA2
-        # wrapper so masked and unmasked plans cannot poison each other's state.
-        self.prefill_wrapper_ragged_custom_mask = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend="fa2"
+        # Only pure dLLM prefill plans a ragged custom mask, and it needs a
+        # wrapper of its own for two independent reasons:
+        #   1. FlashInfer resolves backend="auto" on the first plan and then
+        #      keeps it. On SM90 an unmasked first plan selects FA3, which does
+        #      not support a later custom mask -- hence the pinned "fa2".
+        #   2. The ragged plan() only *assigns* `_custom_mask_buf`; unlike the
+        #      paged plan() it never resets it to None when no mask is passed.
+        #      A masked plan would therefore leak its mask into every later
+        #      unmasked plan on the same wrapper.
+        # Both are about cross-plan state, so the mask never shares a wrapper
+        # with anything else. Non-dLLM runs allocate nothing.
+        self.prefill_wrapper_ragged_custom_mask = (
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer, "NHD", backend="fa2"
+            )
+            if self.is_dllm_model
+            else None
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -708,11 +719,12 @@ class FlashInferAttnBackend(AttentionBackend):
     def _select_prefill_ragged_wrapper(
         self, custom_mask: Optional[torch.Tensor]
     ) -> BatchPrefillWithRaggedKVCacheWrapper:
-        return (
-            self.prefill_wrapper_ragged_custom_mask
-            if custom_mask is not None
-            else self.prefill_wrapper_ragged
-        )
+        # A ragged custom mask is only ever built for pure dLLM prefill, which
+        # is exactly when the dedicated wrapper exists.
+        if custom_mask is None:
+            return self.prefill_wrapper_ragged
+        assert self.prefill_wrapper_ragged_custom_mask is not None
+        return self.prefill_wrapper_ragged_custom_mask
 
     def init_forward_metadata_out_graph(
         self,
@@ -2244,6 +2256,7 @@ class FlashInferIndicesUpdaterPrefill:
         # full->swa translate below must not run on top of them.
         use_swa_source = use_sliding_window_kv_pool and kv_view.is_translated
         if use_ragged and self_attention_custom_mask is not None:
+            assert self.prefill_wrapper_ragged_custom_mask is not None
             wrapper_ragged = self.prefill_wrapper_ragged_custom_mask
         if spec_info is None:
             assert prefix_lens is not None

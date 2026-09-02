@@ -940,9 +940,7 @@ class PrefillAdder:
         )
 
         # Retained incomplete-block KV is reused by alloc_for_extend; skip KV budget.
-        reuse_retained_kv = req.kv.req_pool_idx is not None and bool(
-            req.dllm_incomplete_ids
-        )
+        reuse_retained_kv = req.kv.holds_kv and bool(req.dllm_incomplete_ids)
         if reuse_retained_kv:
             return max(0, non_kv_budget)
 
@@ -1014,6 +1012,13 @@ class PrefillAdder:
         if req.dllm_incomplete_ids and cand_extend_input_len > new_len:
             return AddReqResult.NO_TOKEN
         truncated = cand_extend_input_len > new_len
+        # Both dLLM phases keep `new_len` under the available fill ids -- decode
+        # is classified only once a whole block is present, and pure prefill
+        # stops one block short of the appended mask block. Clamp anyway so a
+        # future phase cannot silently extend past `full_untruncated_fill_ids`.
+        new_len = min(new_len, cand_extend_input_len)
+        if new_len <= 0:
+            return AddReqResult.NO_TOKEN
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
 

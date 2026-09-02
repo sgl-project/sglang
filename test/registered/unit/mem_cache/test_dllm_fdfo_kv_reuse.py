@@ -75,6 +75,10 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         last_node=None,
+        # `_make_abort_req` reads these to build the weight-version spans that
+        # every abort output carries.
+        output_ids=array("q"),
+        weight_version_events=[],
         # The real record, so the scheduler reads the same fields and defaults
         # it does in production.
         kv=ReqKvInfo(
@@ -356,6 +360,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         self.assertEqual(len(outputs), 1)
         self.assertEqual(outputs[0][0].rid, "job_1")
         self.assertIs(outputs[0][1], req)
+        # Built through `_make_abort_req` like every other abort path, so the
+        # tokenizer manager sees the same payload it does elsewhere.
+        self.assertIsNotNone(outputs[0][0].weight_versions)
 
 
 if __name__ == "__main__":
