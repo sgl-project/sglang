@@ -476,6 +476,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_streaming_session(self) -> bool:
         return False
 
+    def has_reusable_streaming_session_slot(self, session_id: str) -> bool:
+        return False
+
     def release_session(self, session_id: str) -> None:
         pass
 

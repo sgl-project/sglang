@@ -2945,6 +2945,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_streaming_session(self) -> bool:
         return True
 
+    def has_reusable_streaming_session_slot(self, session_id: str) -> bool:
+        return self.session.has_reusable_streaming_session_slot(session_id)
+
     def release_session(self, session_id: str) -> None:
         self.session.release_session(session_id)
 
