@@ -364,18 +364,16 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
     ) -> None:
-        tokens = batch_next_token_ids.to(torch.int32).cpu().tolist()
-        masks = []
-        logprobs = []
-        for i, should_return in enumerate(sampling_info.return_sampling_masks or []):
-            if should_return:
-                masks.append([int(tokens[i])])
-                logprobs.append(0.0)
-            else:
-                masks.append(None)
-                logprobs.append(None)
-        logits_output.next_token_sampling_mask_idx = masks
-        logits_output.next_token_sampling_logprobs = logprobs
+        batch_size = batch_next_token_ids.shape[0]
+        logits_output.next_token_sampling_mask_idx = batch_next_token_ids.to(
+            torch.int32
+        ).view(batch_size, 1)
+        logits_output.next_token_sampling_mask_len = torch.ones(
+            batch_size, dtype=torch.int32, device=batch_next_token_ids.device
+        )
+        logits_output.next_token_sampling_logprobs = torch.zeros(
+            batch_size, dtype=torch.float32, device=batch_next_token_ids.device
+        )
 
     def _attach_sampling_mask_to_output(
         self,
@@ -387,15 +385,11 @@ class Sampler(nn.Module):
         ],
     ) -> None:
         probs_idx, probs_sort, keep_mask, probs = sampling_mask_data
-        return_sampling_masks = sampling_info.return_sampling_masks or []
-        if not return_sampling_masks:
-            logits_output.next_token_sampling_mask_idx = []
-            logits_output.next_token_sampling_logprobs = []
-            return
 
         sampled_tokens = batch_next_token_ids.view(-1, 1)
         sampled_matches_all = probs_idx == sampled_tokens
         sampled_in_idx = sampled_matches_all.any(dim=-1)
+        sampled_in_support = (sampled_matches_all & keep_mask).any(dim=-1)
 
         # The sampler is the source of truth for the rollout action space. If a
         # backend/numeric edge chooses a token just outside the reconstructed
@@ -407,41 +401,44 @@ class Sampler(nn.Module):
             effective_keep_mask, probs_sort, torch.zeros_like(probs_sort)
         ).sum(dim=-1)
         support_mass = support_mass + torch.where(
-            sampled_in_idx, torch.zeros_like(selected_raw_probs), selected_raw_probs
+            sampled_in_idx,
+            torch.zeros_like(selected_raw_probs),
+            selected_raw_probs,
         )
         selected_logprobs = torch.log(
             selected_raw_probs.float()
             / support_mass.float().clamp_min(torch.finfo(torch.float32).tiny)
         )
 
-        flat_rows, flat_cols = effective_keep_mask.nonzero(as_tuple=True)
-        flat_ids = probs_idx[flat_rows, flat_cols].to(torch.int32)
-        mask_lengths = effective_keep_mask.sum(dim=-1, dtype=torch.int32)
+        keep_lengths = keep_mask.sum(dim=-1, dtype=torch.int32)
+        missing = ~sampled_in_support
 
-        flat_ids_cpu = flat_ids.cpu().tolist()
-        mask_lengths_cpu = mask_lengths.cpu().tolist()
-        sampled_in_idx_cpu = sampled_in_idx.cpu().tolist()
-        sampled_tokens_cpu = batch_next_token_ids.to(torch.int32).cpu().tolist()
-        selected_logprobs_cpu = selected_logprobs.cpu().tolist()
+        # keep_mask is a prefix because candidates are probability-sorted and
+        # top-k/top-p/min-p each retain a prefix. Keep a guard column for a
+        # sampled token that backend numerics place just outside that prefix.
+        # This fixed-size scatter avoids nonzero(), whose dynamic output size
+        # synchronizes CUDA with the host.
+        candidate_count = probs_idx.shape[1]
+        packed_ids = torch.zeros(
+            (probs.shape[0], candidate_count + 1),
+            dtype=torch.int32,
+            device=probs.device,
+        )
+        packed_ids[:, :candidate_count] = probs_idx.to(torch.int32)
+        append_values = torch.where(
+            missing,
+            batch_next_token_ids.to(torch.int32),
+            torch.zeros_like(batch_next_token_ids, dtype=torch.int32),
+        )
+        packed_ids.scatter_(
+            1, keep_lengths.to(torch.long).view(-1, 1), append_values.view(-1, 1)
+        )
 
-        masks = []
-        logprobs = []
-        cursor = 0
-        for i, should_return in enumerate(return_sampling_masks):
-            mask_len = int(mask_lengths_cpu[i])
-            row_ids = flat_ids_cpu[cursor : cursor + mask_len]
-            cursor += mask_len
-            if not sampled_in_idx_cpu[i]:
-                row_ids.append(int(sampled_tokens_cpu[i]))
-            if should_return:
-                masks.append(row_ids)
-                logprobs.append(float(selected_logprobs_cpu[i]))
-            else:
-                masks.append(None)
-                logprobs.append(None)
-
-        logits_output.next_token_sampling_mask_idx = masks
-        logits_output.next_token_sampling_logprobs = logprobs
+        logits_output.next_token_sampling_mask_idx = packed_ids
+        logits_output.next_token_sampling_mask_len = keep_lengths + missing.to(
+            torch.int32
+        )
+        logits_output.next_token_sampling_logprobs = selected_logprobs
 
     def _sample_from_logprobs(
         self,
