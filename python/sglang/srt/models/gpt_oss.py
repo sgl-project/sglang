@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_npu,
+    is_xpu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -217,6 +218,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         experts_type = get_moe_impl_class(quant_config)
         extra_kwargs = {}
+        moe_intermediate_size = config.intermediate_size
         if experts_type.__name__ == "FusedMoE":
             quant_config_name = (
                 quant_config.get_name() if quant_config is not None else None
@@ -226,6 +228,45 @@ class GptOssSparseMoeBlock(nn.Module):
                 "use_weight_loader_fused": quant_config_name
                 != "mxfp4"
             }
+            if quant_config_name == "mxfp4" and is_xpu():
+                # gpt-oss-120b-dedicated fix (deliberately scoped to this
+                # model, not a shared Mxfp4MoEMethod/quantization change):
+                # SGLang's XPU MXFP4 MoE kernel
+                # (sgl_kernel.fused_experts(..., use_mxfp4_w4a16=True) ->
+                # moe_grouped_mm_nt_xe20_w4a16) requires each rank's
+                # intermediate size to be a multiple of the MXFP4 group size
+                # (mxfp4_block=32). This model's `intermediate_size=2880`
+                # isn't evenly divisible into a 32-aligned chunk for every
+                # `tp_size`/`ep_size` combo (e.g. `tp_size=8`: `2880/8=360`,
+                # `360/32=11.25`), which used to crash `FusedMoE`'s weight
+                # loader with a tensor-shape mismatch as soon as
+                # `intermediate_size // moe_tp_size` came out unaligned.
+                #
+                # `_load_mxfp4_experts_weights` below already computes each
+                # rank's *loaded* shard width with exactly this alignment
+                # (`per_rank_intermediate_size = ceil(intermediate_size /
+                # mxfp4_block / moe_tp_size) * mxfp4_block`) when slicing the
+                # checkpoint. The mismatch was that `FusedMoE.__init__`
+                # allocates its weight/scale/bias buffers from the *raw*
+                # `intermediate_size // moe_tp_size` (no rounding). Passing
+                # an already-padded `intermediate_size` here (matching the
+                # loader's own formula) makes the two agree, so the buffer is
+                # always >= what the loader ever tries to write into it.
+                # `_load_mxfp4_experts_weights` still slices the real
+                # checkpoint using the unpadded `self.config.intermediate_size`,
+                # so the extra padded rows/columns are simply left at their
+                # zero-initialized default and contribute nothing through
+                # down_proj -- real (unpadded) experts are unaffected.
+                mxfp4_block = 32
+                moe_tp_size = get_parallel().moe_tp_size
+                intermediate_size_block = config.intermediate_size // mxfp4_block
+                per_rank_intermediate_size_block = math.ceil(
+                    intermediate_size_block / moe_tp_size
+                )
+                per_rank_intermediate_size = (
+                    per_rank_intermediate_size_block * mxfp4_block
+                )
+                moe_intermediate_size = per_rank_intermediate_size * moe_tp_size
 
         self.experts = experts_type(
             num_experts=config.num_local_experts
@@ -233,7 +274,7 @@ class GptOssSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
+            intermediate_size=moe_intermediate_size,
             quant_config=quant_config,
             activation=self.activation,
             gemm1_alpha=self.gemm1_alpha,

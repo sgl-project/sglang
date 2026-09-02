@@ -61,10 +61,12 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_triton_kernels_available,
+    is_xpu,
     next_power_of_2,
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -615,6 +617,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if is_xpu():
+            return
+
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -1382,6 +1387,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if is_xpu():
+            return
+
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
@@ -1577,6 +1585,32 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_output,
                     self.moe_runner_config,
                 )
+            return StandardCombineInput(hidden_states=output)
+
+        if is_xpu():
+            if not use_intel_xpu_backend():
+                raise RuntimeError("MXFP4 on Intel XPU requires SGLANG_USE_SGL_XPU=1.")
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            from sgl_kernel import fused_experts
+
+            topk_weights, topk_ids, _ = topk_output
+            output = fused_experts(
+                x,
+                layer.w13_weight.view(torch.int8),
+                layer.w2_weight.view(torch.int8),
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_mxfp4_w4a16=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=self.moe_runner_config.activation,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_limit=self.moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
+            )
             return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:
