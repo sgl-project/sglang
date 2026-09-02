@@ -409,12 +409,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     b,
     A_log,
     dt_bias,
+    lower_bound,
     o,
     h0,
     ht,
     ssm_state_indices,
     scale,
-    lower_bound,
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -434,8 +434,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     """KDA packed decode: same shape as the GDN packed decode kernel, but
     with a per-K gate (``a`` is ``[B, HV*K]`` and ``dt_bias`` is ``[HV*K]``),
     so the state decay is a per-K vector ``exp(g)`` rather than a scalar."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_v, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_h = i_hv // (HV // H)
 
     o_k = tl.arange(0, BK)
@@ -533,6 +532,8 @@ def fused_recurrent_kda_packed_decode(
         out: ``[B, 1, HV, V]`` contiguous output buffer.
         ssm_state_indices: ``[B]`` per-request state slot indices (-1 = skip).
         use_qk_l2norm_in_kernel: apply per-head L2 norm to Q/K inside the kernel.
+        lower_bound: enable KDA safe gate when set, matching
+            ``fused_sigmoid_gating_delta_rule_update``.
     """
     if mixed_qkv.ndim != 2:
         raise ValueError(
@@ -672,19 +673,19 @@ def fused_recurrent_kda_packed_decode(
     stride_indices_seq = ssm_state_indices.stride(0)
 
     NV = triton.cdiv(V, BV)
-    grid = (NV, B * HV)
+    grid = (NV, B, HV)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
         A_log=A_log,
         dt_bias=dt_bias,
+        lower_bound=lower_bound,
         o=out,
         h0=initial_state,
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
-        lower_bound=lower_bound if lower_bound is not None else 0.0,
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,

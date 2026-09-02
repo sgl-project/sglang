@@ -226,7 +226,7 @@ jobs:
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
-      runs_on: 1-gpu-5090
+      runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -333,7 +333,7 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
+      run_timeout_minutes: '60'
       timeout_per_file: '1800'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
@@ -471,21 +471,20 @@ jobs:
       skip_prebuilt_rust_ext: true
     secrets: inherit
 
-  # Temporarily disabled.
-  # base-c-test-8-gpu-b300:
-  #   needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
-  #   if: ${{ !failure() && !cancelled() }}
-  #   uses: ./.github/workflows/_pr-test-stage.yml
-  #   with:
-  #     self_name: base-c-test-8-gpu-b300
-  #     runner_config: 8-gpu-b300
-  #     check_changes: ${{ toJson(needs.check-changes.outputs) }}
-  #     caller_inputs: ${{ toJson(inputs) }}
-  #     partitions: ${{ needs.check-changes.outputs.partitions }}
-  #     run_timeout_minutes: '60'
-  #     timeout_per_file: '3600'
-  #     rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
-  #   secrets: inherit
+  base-c-test-8-gpu-b300:
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-c-test-8-gpu-b300
+      runner_config: 8-gpu-b300
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '3600'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
 
   # List every build and test job: `skipped` passes here, so an omission turns that
   # job's failure into a green run with no tests.
@@ -519,7 +518,7 @@ jobs:
         base-c-test-8-gpu-h200,
         base-c-test-4-gpu-b200,
         base-c-test-4-gpu-gb300,
-        # base-c-test-8-gpu-b300,  # Temporarily disabled.
+        base-c-test-8-gpu-b300,
       ]
     if: always()
     runs-on: ubuntu-latest
