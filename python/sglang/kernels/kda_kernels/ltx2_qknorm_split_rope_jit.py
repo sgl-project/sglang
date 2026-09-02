@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 def _jit_ltx2_qknorm_split_rope_module() -> Module:
     return load_jit(
         "diffusion_ltx2_qknorm_split_rope",
-        cuda_files=["diffusion/ltx2_qknorm_split_rope.cuh"],
+        cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
         cuda_wrappers=[
             (
                 "ltx2_qknorm_split_rope_pair",
