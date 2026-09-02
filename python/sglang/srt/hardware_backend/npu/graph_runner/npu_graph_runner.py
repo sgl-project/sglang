@@ -160,6 +160,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
     def _get_update_attr_name(self):
         if self.if_use_v2:
             return self.attr_name["TARGET_VERIFY"]
+        if (
+            self.use_fia
+            and self.model_runner.is_hybrid_swa
+            and self.model_runner.model_config.attention_arch == AttentionArch.MHA
+        ):
+            return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
