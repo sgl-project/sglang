@@ -270,6 +270,7 @@ class TestCPUReference(CustomTestCase):
             is_mla_dcp_lse_base_on_e,
         )
 
+        self.assertTrue(is_mla_dcp_lse_base_on_e("fa3"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("flashmla"))
         self.assertTrue(is_mla_dcp_lse_base_on_e("cutedsl_mla"))
         self.assertFalse(is_mla_dcp_lse_base_on_e("flashinfer_mla"))

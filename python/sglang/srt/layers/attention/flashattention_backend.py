@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import (
+    create_mla_kv_page_table_for_dcp,
+)
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,
@@ -21,6 +24,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
@@ -85,6 +89,10 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # True when page_table already contains kernel-facing physical page ids.
+    # The regular eager path starts from virtual token ids and converts them at
+    # the end of init_forward_metadata; DCP builds physical ids directly.
+    page_table_is_kernel_ready: bool = False
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
 
@@ -401,6 +409,82 @@ class FlashAttentionBackend(AttentionBackend):
             has_softcap=self.has_softcap,
             num_splits=self.num_splits,
         )
+
+    def _use_mla_dcp(self) -> bool:
+        return self.use_mla and self.fa_impl_ver == 3 and get_parallel().dcp_enabled
+
+    @staticmethod
+    def _dcp_local_seq_lens(seq_lens: torch.Tensor) -> torch.Tensor:
+        parallel = get_parallel()
+        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
+            torch.int32
+        )
+
+    @staticmethod
+    def _dcp_local_max_seq_len(max_seq_len: int) -> int:
+        parallel = get_parallel()
+        return max(
+            max_seq_len // parallel.dcp_size
+            + int(parallel.dcp_rank < max_seq_len % parallel.dcp_size),
+            1,
+        )
+
+    def _fill_mla_dcp_decode_page_table(
+        self,
+        page_table: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        local_seq_lens: torch.Tensor,
+    ) -> None:
+        """Build FA3's physical page table for this rank's cyclic KV shard."""
+        parallel = get_parallel()
+        pages_per_block = 128
+        max_local_pages = (
+            self._dcp_local_max_seq_len(self.max_context_len) + self.page_size - 1
+        ) // self.page_size
+        num_page_blocks = max(
+            1,
+            (min(page_table.shape[1], max_local_pages) + pages_per_block - 1)
+            // pages_per_block,
+        )
+        create_mla_kv_page_table_for_dcp[(page_table.shape[0], num_page_blocks)](
+            self.req_to_token,
+            req_pool_indices,
+            local_seq_lens,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            PHYSICAL_PAGE_SIZE=self.page_size,
+            DCP_SIZE=parallel.dcp_size,
+            DCP_RANK=parallel.dcp_rank,
+            PAGES_PER_BLOCK=pages_per_block,
+        )
+
+    @staticmethod
+    def _build_mla_dcp_extend_page_table(
+        forward_batch: ForwardBatch, max_seq_len_k: int
+    ) -> torch.Tensor:
+        """Unpack the gathered DCP prefix/extend indices into FA3 row tables."""
+        dcp_metadata = forward_batch.attn_dcp_metadata
+        kv_indptr = dcp_metadata.dcp_kv_indptr
+        kv_indices = dcp_metadata.dcp_kv_indices
+        batch_size = forward_batch.batch_size
+        page_table = torch.zeros(
+            (batch_size, max_seq_len_k),
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+        if kv_indices.numel() == 0 or max_seq_len_k == 0:
+            return page_table
+
+        positions = torch.arange(
+            max_seq_len_k, dtype=torch.int32, device=kv_indices.device
+        ).unsqueeze(0)
+        kv_lens = kv_indptr[1 : batch_size + 1] - kv_indptr[:batch_size]
+        valid = positions < kv_lens.unsqueeze(1)
+        flat_offsets = kv_indptr[:batch_size].unsqueeze(1) + positions
+        safe_offsets = flat_offsets.clamp(max=kv_indices.numel() - 1).to(torch.long)
+        page_table.copy_(torch.where(valid, kv_indices[safe_offsets], 0))
+        return page_table
 
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
@@ -797,17 +881,42 @@ class FlashAttentionBackend(AttentionBackend):
                     self.forward_metadata_spec_decode_expand = metadata_expand
             else:
                 # Normal Decode
-                metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = eager_max_k
+                if self._use_mla_dcp():
+                    metadata.cache_seqlens_int32 = self._dcp_local_seq_lens(
+                        seqlens_in_batch
+                    )
+                    metadata.max_seq_len_k = self._dcp_local_max_seq_len(eager_max_k)
+                else:
+                    metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+                    metadata.max_seq_len_k = eager_max_k
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+                    torch.cumsum(
+                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                    ),
+                    (1, 0),
                 )
-                metadata.page_table = self.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                if self._use_mla_dcp():
+                    max_local_pages = (
+                        metadata.max_seq_len_k + self.page_size - 1
+                    ) // self.page_size
+                    metadata.page_table = torch.zeros(
+                        (batch_size, max_local_pages),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    self._fill_mla_dcp_decode_page_table(
+                        metadata.page_table,
+                        forward_batch.req_pool_indices,
+                        metadata.cache_seqlens_int32,
+                    )
+                    metadata.page_table_is_kernel_ready = True
+                else:
+                    metadata.page_table = self.req_to_token_pool.req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
 
                 if self.is_prefill_aware_swa and self.has_swa:
                     pa_max_len = min(
@@ -1012,9 +1121,15 @@ class FlashAttentionBackend(AttentionBackend):
                 if pad_delta > 0:
                     metadata.max_seq_len_k += pad_delta
 
-            metadata.page_table = self.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
+            if self._use_mla_dcp() and forward_batch.attn_dcp_metadata is not None:
+                metadata.page_table = self._build_mla_dcp_extend_page_table(
+                    forward_batch, metadata.max_seq_len_k
+                )
+                metadata.page_table_is_kernel_ready = True
+            else:
+                metadata.page_table = self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                ]
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # Fixed-q window (num_draft_tokens, widened by num_front_tokens
@@ -1094,7 +1209,9 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Safe to rebind: every eager branch above produced a fresh tensor.
         _unified_read = (
-            self.kv_index_translator.is_translating and metadata.page_table is not None
+            self.kv_index_translator.is_translating
+            and metadata.page_table is not None
+            and not metadata.page_table_is_kernel_ready
         )
         if _unified_read:
             kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
@@ -1125,7 +1242,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
         # Convert the page table to a strided format which is needed by FA3 API
-        if self.page_size > 1 and not _unified_read:
+        if (
+            self.page_size > 1
+            and not _unified_read
+            and not metadata.page_table_is_kernel_ready
+        ):
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -1675,29 +1796,49 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                    q.dtype
+                dcp_metadata = forward_batch.attn_dcp_metadata
+                use_dcp_kv_buffer = (
+                    self._use_mla_dcp()
+                    and dcp_metadata is not None
+                    and dcp_metadata.dcp_kv_buffer is not None
                 )
-                k_rope = kv_cache[:, :, layer.v_head_dim :]
+                if use_dcp_kv_buffer:
+                    kv_cache = dcp_metadata.dcp_kv_buffer.to(q.dtype)
+                    kv_page_size = 1
+                else:
+                    kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                        q.dtype
+                    )
+                    kv_page_size = self.page_size
+
+                rope_head_dim = layer.head_dim - layer.v_head_dim
+                only_qv = self.fa_impl_ver == 3 and rope_head_dim == 0
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
-                k_rope_cache = k_rope.view(
-                    -1,
-                    self.page_size,
-                    layer.tp_k_head_num,
-                    layer.head_dim - layer.v_head_dim,
-                )
                 c_kv_cache = c_kv.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    -1, kv_page_size, layer.tp_v_head_num, layer.v_head_dim
                 )
+                if only_qv:
+                    k_rope_cache = None
+                else:
+                    k_rope_cache = kv_cache[:, :, layer.v_head_dim :].view(
+                        -1,
+                        kv_page_size,
+                        layer.tp_k_head_num,
+                        rope_head_dim,
+                    )
                 if q_rope is not None:
                     q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                    q_rope = q_rope.view(
-                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    q_rope = (
+                        None
+                        if only_qv
+                        else q_rope.view(
+                            -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                        )
                     )
                 else:
                     q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                     q_nope = q_all[:, :, : layer.v_head_dim]
-                    q_rope = q_all[:, :, layer.v_head_dim :]
+                    q_rope = None if only_qv else q_all[:, :, layer.v_head_dim :]
 
                 if is_cp_mode:
                     # MLA CP: q is rank-local zigzag-split; run the
@@ -1710,7 +1851,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert (
                         not use_cascade_attn
                     ), "Cascade attention under MLA CP is not supported in v1."
-                    q_fused = torch.cat([q_nope, q_rope], dim=-1)
+                    q_fused = q_nope if only_qv else torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
                         q_chunk,
@@ -1718,12 +1859,16 @@ class FlashAttentionBackend(AttentionBackend):
                         cache_seqlens_cp,
                         max_seqlen_q_cp,
                     ):
-                        q_nope_chunk = q_chunk[..., : layer.v_head_dim]
-                        q_rope_chunk = q_chunk[..., layer.v_head_dim :]
+                        if only_qv:
+                            q_nope_chunk = q_chunk
+                            q_rope_chunk = None
+                        else:
+                            q_nope_chunk = q_chunk[..., : layer.v_head_dim]
+                            q_rope_chunk = q_chunk[..., layer.v_head_dim :]
                         return flash_attn_with_kvcache(
-                            q=q_rope_chunk,
+                            q=None if only_qv else q_rope_chunk,
                             qv=q_nope_chunk,
-                            k_cache=k_rope_cache,
+                            k_cache=None if only_qv else k_rope_cache,
                             v_cache=c_kv_cache,
                             page_table=page_table,
                             cache_seqlens=cache_seqlens_cp,
@@ -1737,6 +1882,7 @@ class FlashAttentionBackend(AttentionBackend):
                             softcap=layer.logit_cap,
                             k_descale=fa_k_descale,
                             v_descale=fa_v_descale,
+                            only_qv=only_qv,
                             num_splits=self.num_splits,
                             ver=self.fa_impl_ver,
                         )
@@ -1757,8 +1903,8 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                 else:
                     result = flash_attn_with_kvcache(
-                        q=q_rope,
-                        k_cache=k_rope_cache,
+                        q=None if only_qv else q_rope,
+                        k_cache=None if only_qv else k_rope_cache,
                         v_cache=c_kv_cache,
                         qv=q_nope,
                         page_table=page_table,
@@ -1771,6 +1917,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softcap=layer.logit_cap,
                         k_descale=fa_k_descale,
                         v_descale=fa_v_descale,
+                        only_qv=only_qv,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
                         ver=self.fa_impl_ver,
@@ -1779,8 +1926,8 @@ class FlashAttentionBackend(AttentionBackend):
                         o, softmax_lse, *rest = result
                         o_expand, softmax_lse_expand, *rest_expand = (
                             flash_attn_with_kvcache(
-                                q=q_rope,
-                                k_cache=k_rope_cache,
+                                q=None if only_qv else q_rope,
+                                k_cache=None if only_qv else k_rope_cache,
                                 v_cache=c_kv_cache,
                                 qv=q_nope,
                                 page_table=self.forward_metadata_spec_decode_expand.page_table,
@@ -1794,6 +1941,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 softcap=layer.logit_cap,
                                 k_descale=fa_k_descale,
                                 v_descale=fa_v_descale,
+                                only_qv=only_qv,
                                 return_softmax_lse=True,
                                 num_splits=self.num_splits,
                                 ver=self.fa_impl_ver,
@@ -1931,6 +2079,7 @@ class FlashAttentionBackend(AttentionBackend):
         if fa_k_descale is not None:
             kwargs["k_descale"] = fa_k_descale
             kwargs["v_descale"] = fa_v_descale
+        needs_dcp_lse = False
         if not self.use_mla:
             # Do multi-head attention
 
@@ -2080,32 +2229,41 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             # Do absorbed multi-latent attention
             kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
-            k_rope = kv_cache[:, :, layer.v_head_dim :]
+            rope_head_dim = layer.head_dim - layer.v_head_dim
+            only_qv = self.fa_impl_ver == 3 and rope_head_dim == 0
             c_kv = kv_cache[:, :, : layer.v_head_dim]
-            k_rope_cache = k_rope.view(
-                -1,
-                self.page_size,
-                layer.tp_k_head_num,
-                layer.head_dim - layer.v_head_dim,
-            )
             c_kv_cache = c_kv.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
             )
+            if only_qv:
+                k_rope_cache = None
+            else:
+                k_rope_cache = kv_cache[:, :, layer.v_head_dim :].view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    rope_head_dim,
+                )
 
             if q_rope is not None:
                 q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                q_rope = (
+                    None
+                    if only_qv
+                    else q_rope.view(-1, layer.tp_q_head_num, rope_head_dim)
                 )
             else:
                 q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 q_nope = q_all[:, :, : layer.v_head_dim]
-                q_rope = q_all[:, :, layer.v_head_dim :]
+                q_rope = None if only_qv else q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
+            needs_dcp_lse = (
+                self._use_mla_dcp() and forward_batch.forward_mode.is_decode()
+            )
 
             result = flash_attn_with_kvcache(
-                q=q_rope,
-                k_cache=k_rope_cache,
+                q=None if only_qv else q_rope,
+                k_cache=None if only_qv else k_rope_cache,
                 v_cache=c_kv_cache,
                 qv=q_nope,
                 page_table=metadata.page_table,
@@ -2118,15 +2276,16 @@ class FlashAttentionBackend(AttentionBackend):
                 softcap=layer.logit_cap,
                 k_descale=fa_k_descale,
                 v_descale=fa_v_descale,
-                return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
+                only_qv=only_qv,
+                return_softmax_lse=use_cascade_attn or needs_dcp_lse,
                 num_splits=self.num_splits,
                 ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q_rope,
-                    k_cache=k_rope_cache,
+                    q=None if only_qv else q_rope,
+                    k_cache=None if only_qv else k_rope_cache,
                     v_cache=c_kv_cache,
                     qv=q_nope,
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
@@ -2140,6 +2299,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softcap=layer.logit_cap,
                     k_descale=fa_k_descale,
                     v_descale=fa_v_descale,
+                    only_qv=only_qv,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     ver=self.fa_impl_ver,
@@ -2150,10 +2310,23 @@ class FlashAttentionBackend(AttentionBackend):
                     o_expand,
                     softmax_lse_expand.T.contiguous(),
                 )
+            elif needs_dcp_lse:
+                o, softmax_lse, *rest = result
             else:
                 o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        output = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if self.use_mla and needs_dcp_lse:
+            output_by_head = output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            lse = softmax_lse.transpose(0, 1).contiguous()
+
+            # A rank may own no KV token for short requests. Make that partial
+            # state neutral so the model-side cross-rank merge ignores it.
+            zero_kv = metadata.cache_seqlens_int32 == 0
+            output_by_head.masked_fill_(zero_kv[:, None, None], 0)
+            lse.masked_fill_(zero_kv[:, None], float("-inf"))
+            return output, lse
+        return output
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
@@ -2571,6 +2744,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                metadata.page_table_is_kernel_ready = self._use_mla_dcp()
                 if self.is_prefill_aware_swa:
                     metadata.pa_swa_page_table = metadata.page_table
                     metadata.pa_swa_cache_seqlens = metadata.cache_seqlens_int32
@@ -2857,7 +3031,28 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata = self.decode_cuda_graph_metadata[bs]
-                if self.is_prefill_aware_swa:
+                if self._use_mla_dcp():
+                    local_seq_lens = self._dcp_local_seq_lens(seq_lens)
+                    metadata.cache_seqlens_int32.copy_(local_seq_lens)
+                    metadata.cu_seqlens_k[0].zero_()
+                    metadata.cu_seqlens_k[1:].copy_(
+                        torch.cumsum(local_seq_lens, dim=0, dtype=torch.int32)
+                    )
+                    global_max_seq_len = (
+                        seq_lens_cpu.max().item()
+                        if seq_lens_cpu is not None
+                        else self.max_context_len
+                    )
+                    metadata.max_seq_len_k = self._dcp_local_max_seq_len(
+                        global_max_seq_len
+                    )
+                    self._fill_mla_dcp_decode_page_table(
+                        metadata.page_table,
+                        req_pool_indices,
+                        local_seq_lens,
+                    )
+                    metadata.page_table_is_kernel_ready = True
+                elif self.is_prefill_aware_swa:
                     # Prefill-aware SWA still needs a host max to bound the
                     # per-batch page table built below.
                     max_len = self._host_max_seq_len(seq_lens_cpu, seq_lens)
