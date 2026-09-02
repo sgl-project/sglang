@@ -649,6 +649,7 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
     server_args = SimpleNamespace(
         base_gpu_id=0,
         rl_on_policy_target=None,
+        mm_preprocessing_device="auto",
         tp_size=1,
     )
     with get_context().override_server_args(
