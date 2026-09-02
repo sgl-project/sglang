@@ -143,7 +143,6 @@ class ComponentLoader(ABC):
     # source stays component-specific because its streaming ABI is loader-owned.
     supports_direct_gpu_weight_loading = False
     supports_fsdp_inference = False
-
     _loaders_registered = False
 
     def __init_subclass__(cls, **kwargs):
@@ -195,10 +194,56 @@ class ComponentLoader(ABC):
             )
         return None
 
-    def supports_direct_gpu_weight_loading_for_component(
-        self, _component_name: str
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        """Return the consumed weights-only override or reject it."""
+        override = server_args.component_weights_paths.get(component_name)
+        if override is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support a weights-only override; "
+                f"use --component-paths.{component_name} to replace its config "
+                "and weights together"
+            )
+        return None
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        """Return the consumed online quantization override or reject it."""
+        quantization = server_args.component_quantizations.get(component_name)
+        if quantization is not None:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support an explicit quantization "
+                "override; use a self-describing quantized component checkpoint "
+                "when supported"
+            )
+        return None
+
+    def resolve_component_direct_gpu_loading(
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return self.supports_direct_gpu_weight_loading
+        """Return whether this load consumes the exact direct-GPU request."""
+        requested = server_args.should_direct_gpu_weight_load_component(component_name)
+        if requested:
+            raise ComponentCheckpointUnsupportedError(
+                f"{component_name!r} does not support direct GPU weight loading"
+            )
+        return False
+
+    def component_attention_backend_context(
+        self,
+        attn_backend: Any,
+        component_attn_name: str | None,
+        require_backend_selection: bool,
+    ):
+        """Build the attention-selection context used by this loader."""
+        return component_attn_backend_context_manager(
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=True,
+            require_backend_selection=require_backend_selection,
+        )
 
     def is_native_only_component(
         self, server_args: ServerArgs, component_name: str
@@ -224,15 +269,6 @@ class ComponentLoader(ABC):
         """Validate that fallback preserves the exact component's runtime contract."""
         pass
 
-    def disable_unsupported_component_fsdp(
-        self, server_args: ServerArgs, component_name: str
-    ) -> None:
-        if (
-            not self.supports_fsdp_inference
-            and server_args.should_use_fsdp_for_component(component_name)
-        ):
-            server_args.disable_fsdp_for_component(component_name)
-
     def _load_customized_with_context(
         self,
         component_model_path: str,
@@ -240,14 +276,12 @@ class ComponentLoader(ABC):
         component_name: str,
         attn_backend: Any,
         component_attn_name: str | None,
-        allow_global_backend_fallback: bool,
         require_backend_selection: bool,
     ) -> AutoModel:
-        with component_attn_backend_context_manager(
+        with self.component_attention_backend_context(
             attn_backend,
-            component_name=component_attn_name,
-            allow_global_backend_fallback=allow_global_backend_fallback,
-            require_backend_selection=require_backend_selection,
+            component_attn_name,
+            require_backend_selection,
         ):
             load_kwargs = self.customized_load_kwargs_for_component(
                 server_args, component_name
@@ -264,14 +298,12 @@ class ComponentLoader(ABC):
         transformers_or_diffusers: str,
         attn_backend: Any,
         component_attn_name: str | None,
-        allow_global_backend_fallback: bool,
         require_backend_selection: bool,
     ) -> AutoModel:
-        with component_attn_backend_context_manager(
+        with self.component_attention_backend_context(
             attn_backend,
-            component_name=component_attn_name,
-            allow_global_backend_fallback=allow_global_backend_fallback,
-            require_backend_selection=require_backend_selection,
+            component_attn_name,
+            require_backend_selection,
         ):
             component = self.load_native(
                 component_model_path,
@@ -301,23 +333,12 @@ class ComponentLoader(ABC):
         """
         self._native_load_manages_placement = False
         self.component_load_precision(server_args, component_name)
-        if server_args.should_direct_gpu_weight_load_component(
-            component_name
-        ) and not self.supports_direct_gpu_weight_loading_for_component(component_name):
-            raise ComponentCheckpointUnsupportedError(
-                f"{component_name!r} does not support direct GPU weight loading"
-            )
-        self.disable_unsupported_component_fsdp(server_args, component_name)
-        component_quantization = server_args.component_quantizations.get(component_name)
-        if (
-            component_quantization is not None
-            and not self.supports_online_quantization_override
-        ):
-            raise ValueError(
-                f"{component_name!r} does not support an explicit quantization "
-                "override; "
-                "use a self-describing quantized component checkpoint when supported"
-            )
+        component_weight_override = self.resolve_component_weight_override(
+            server_args, component_name
+        )
+        self.resolve_component_quantization_override(server_args, component_name)
+        self.resolve_component_direct_gpu_loading(server_args, component_name)
+        fsdp_requested = server_args.should_use_fsdp_for_component(component_name)
 
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
@@ -362,7 +383,6 @@ class ComponentLoader(ABC):
                 component_name,
                 component_attn_backend,
                 component_attn_name,
-                self.allow_global_attention_backend_fallback,
                 require_backend_selection,
             )
             source = "sgl-diffusion"
@@ -376,9 +396,26 @@ class ComponentLoader(ABC):
             if require_backend_selection:
                 raise
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)
-            if self.should_raise_customized_load_error(server_args, component_name):
+            if native_loader_required and component_weight_override is not None:
+                raise ComponentCheckpointUnsupportedError(
+                    f"{component_name!r} requires its library loader, which cannot "
+                    "consume a weights-only override; use "
+                    f"--component-paths.{component_name} to replace its config "
+                    "and weights together"
+                ) from e
+            if (
+                component_weight_override is not None
+                or self.should_raise_customized_load_error(server_args, component_name)
+            ):
                 if native_loader_required:
                     raise
+                if component_weight_override is not None:
+                    raise RuntimeError(
+                        f"Failed to load the weights-only override for "
+                        f"{component_name!r}; fallback would ignore it. Use "
+                        f"--component-paths.{component_name} when the checkpoint "
+                        "also requires a different config or library loader."
+                    ) from e
                 traceback.print_exc()
                 raise RuntimeError(
                     f"Failed to load customized {component_name}; native fallback "
@@ -404,7 +441,6 @@ class ComponentLoader(ABC):
                 transformers_or_diffusers,
                 component_attn_backend,
                 component_attn_name,
-                self.allow_global_attention_backend_fallback,
                 require_backend_selection,
             )
             source = "native"
@@ -418,6 +454,13 @@ class ComponentLoader(ABC):
             logger.error("Load %s failed", component_name)
             consumed = 0.0
         else:
+            if fsdp_requested and (
+                not isinstance(component, nn.Module)
+                or not is_fsdp_managed_module(component)
+            ):
+                # The returned module is the source of truth. Loaders do not need
+                # a parallel capability declaration for FSDP support.
+                server_args.disable_fsdp_for_component(component_name)
             if isinstance(component, nn.Module):
                 component = component.eval()
                 if (
@@ -493,11 +536,6 @@ class ComponentLoader(ABC):
                     resolved_component_name,
                     feature_name="Transformers quantized component",
                 )
-                if server_args.should_use_fsdp_for_component(resolved_component_name):
-                    raise ComponentCheckpointUnsupportedError(
-                        "Transformers-managed quantized components do not support "
-                        "SGLang FSDP loading"
-                    )
                 load_kwargs["device_map"] = {
                     "": self.target_device(component_starts_on_cpu=False)
                 }
@@ -649,7 +687,42 @@ class ComponentLoader(ABC):
         return loader
 
 
-class PlainStateDictComponentLoader(ComponentLoader):
+class WeightOverrideComponentLoader(ComponentLoader):
+    """Base for loaders that consume an exact weights-only override."""
+
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_weights_paths.get(component_name)
+
+    def validate_component_weight_override(self, _override: str) -> None:
+        pass
+
+    def resolve_component_weights_path(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+    ) -> str:
+        override = self.resolve_component_weight_override(server_args, component_name)
+        if override is None:
+            return component_model_path
+        self.validate_component_weight_override(override)
+        weights_path = materialize_weight(resolve_weight(override))
+        logger.info("Using weight override for %s: %s", component_name, weights_path)
+        return weights_path
+
+
+class OnlineQuantizationComponentLoader(WeightOverrideComponentLoader):
+    """Base for loaders that also consume an online quantization override."""
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_quantizations.get(component_name)
+
+
+class PlainStateDictComponentLoader(WeightOverrideComponentLoader):
     """Base for native loaders whose current materializer expects plain weights."""
 
     def component_load_precision(
@@ -682,19 +755,6 @@ class PlainStateDictComponentLoader(ComponentLoader):
         config = get_diffusers_component_config(component_path=component_model_path)
         self.ensure_plain_state_dict_checkpoint(config, component_name)
         return config
-
-    def resolve_component_weights_path(
-        self,
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        override = server_args.component_weights_paths.get(component_name)
-        if override is None:
-            return component_model_path
-        weights_path = materialize_weight(resolve_weight(override))
-        logger.info("Using weight override for %s: %s", component_name, weights_path)
-        return weights_path
 
 
 class ImageProcessorLoader(ComponentLoader):
@@ -770,16 +830,27 @@ class TokenizerLoader(ComponentLoader):
 class GenericComponentLoader(ComponentLoader):
     """Generic loader for components that don't have a specific loader."""
 
-    # An unknown out-of-tree component may itself be the primary transformer.
-    # Require it to opt into fallback through a registered component loader.
-    allow_global_attention_backend_fallback = False
-
     def __init__(
         self, library="transformers", component_architecture: str | None = None
     ) -> None:
         super().__init__()
         self.library = library
         self.component_architecture = component_architecture
+
+    def component_attention_backend_context(
+        self,
+        attn_backend: Any,
+        component_attn_name: str | None,
+        require_backend_selection: bool,
+    ):
+        # An unknown out-of-tree component may itself be the primary transformer.
+        # Require it to opt into fallback through a registered component loader.
+        return component_attn_backend_context_manager(
+            attn_backend,
+            component_name=component_attn_name,
+            allow_global_backend_fallback=False,
+            require_backend_selection=require_backend_selection,
+        )
 
 
 class PipelineComponentLoader:
