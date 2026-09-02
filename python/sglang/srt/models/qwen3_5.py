@@ -1768,7 +1768,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     f"native={use_native_final_norm}",
                     flush=True,
                 )
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 print(
                     "SGLANG_TRACE_QWEN35_FINAL_NORM stage=pre_sync_returned",
                     flush=True,
@@ -1790,7 +1790,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_enter",
                     flush=True,
                 )
-                torch.cuda.synchronize()
+                current_platform.synchronize()
                 print(
                     "SGLANG_TRACE_QWEN35_FINAL_NORM stage=post_sync_returned",
                     flush=True,

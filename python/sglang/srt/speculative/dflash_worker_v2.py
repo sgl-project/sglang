@@ -38,6 +38,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_schedule,
@@ -513,7 +514,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_logits: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> int:
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         torch.cuda.reset_peak_memory_stats()
         base_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         compute_dflash_sampling_correct_drafts_and_bonus(
@@ -523,7 +524,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             max_top_k=None,
             uniform_top_k_value=None,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return torch.cuda.memory_stats()["allocated_bytes.all.peak"] - base_bytes
 
     def prewarm_sampling(self) -> SamplingPrewarmResult:

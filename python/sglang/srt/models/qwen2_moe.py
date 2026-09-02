@@ -123,6 +123,7 @@ if is_npu():
     )
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -559,7 +560,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"stage={stage}_sync_enter tokens={hidden_states.shape[0]}",
                 flush=True,
             )
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             print(
                 "SGLANG_TRACE_QWEN_MOE_DEEPEP_E2E "
                 f"stage={stage}_sync_returned tokens={hidden_states.shape[0]}",

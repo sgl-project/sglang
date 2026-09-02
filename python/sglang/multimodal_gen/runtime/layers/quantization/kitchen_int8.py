@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 __all__ = ["KitchenInt8Config", "KitchenInt8LinearMethod"]
@@ -161,7 +162,7 @@ class KitchenInt8LinearMethod(LinearMethodBase):
         )
         self.quant_config.note_quantized(weight.numel() * weight.element_size())
         del qdata, params
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def apply(
         self,

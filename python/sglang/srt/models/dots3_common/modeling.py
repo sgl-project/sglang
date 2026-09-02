@@ -114,6 +114,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -2566,8 +2567,8 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)

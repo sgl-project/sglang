@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -182,7 +183,7 @@ class FlashInferMNNVLCuteDSLARFusion:
 
             # Publish only after the mailbox barrier; older FlashInfer workspace
             # classes may not provide it and would desynchronize Lamport stages.
-            torch.cuda.synchronize(self.device)
+            current_platform.synchronize(self.device)
             dist.barrier(group=process_group)
 
     def supports(self, m: int) -> bool:

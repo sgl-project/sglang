@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -369,7 +370,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
         )
         if trace_deepep_v2_contig:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 expanded contig gateup GEMM returned")
 
         dispose_tensor(hidden_states)
@@ -489,7 +490,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del down_input
         if trace_deepep_v2_contig:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
@@ -516,7 +517,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
         )
         if trace_deepep_v2_contig:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 expanded contig down GEMM returned")
 
         return down_output
@@ -689,7 +690,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
         )
         if trace_deepep_v2_masked:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 masked runner gateup GEMM returned")
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -732,7 +733,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 num_real_tokens=num_real_tokens,
             )
         if trace_deepep_v2_masked:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 masked runner activation returned")
         del gateup_output
 
@@ -793,7 +794,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             **gemm_overlap_args_dict,
         )
         if trace_deepep_v2_masked:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             logger.warning("DeepEP v2 masked runner down GEMM returned")
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;

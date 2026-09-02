@@ -114,7 +114,7 @@ def test_transfer_embedding_ranges_direct(direction: str):
         )
         src_starts, dst_starts = contiguous_starts, fragmented_starts
 
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     copy_stream = torch.cuda.Stream()
     assert copy_stream.cuda_stream != torch.cuda.default_stream().cuda_stream
     with torch.cuda.stream(copy_stream):

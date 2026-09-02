@@ -5216,7 +5216,7 @@ class Scheduler(
             current_platform.empty_cache()
             after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"[continue_generation] current_platform.empty_cache() called: "
                 f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
                 f"(freed {before_mb - after_mb:.1f} MB)"
             )
