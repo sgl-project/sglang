@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from array import array
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
@@ -49,6 +51,23 @@ class _RestoreLease:
     generation: int
     req: Req
     device_indices: torch.Tensor
+
+
+@dataclass
+class _PendingStoreLaunch:
+    store_key: str
+    sglang_req_id: str
+    node: Any
+    dec_params: DecLockRefParams
+    token_ids: list[int]
+    kv_indices: torch.Tensor
+
+
+@dataclass
+class _PendingStoreCopy:
+    launch: _PendingStoreLaunch
+    cpu_indices: Optional[torch.Tensor]
+    ready_event: Optional[torch.cuda.Event]
 
 
 class FlexKVHybridRadixCache(BasePrefixCache):
@@ -115,6 +134,22 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._restore_generation = 0
         self._inflight_store_nodes: dict[str, tuple[Any, DecLockRefParams]] = {}
         self._store_generation = 0
+        self._profile_store_stages = os.getenv(
+            "FLEXKV_PROFILE_STORE_STAGES", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._async_store_slot_mapping = bool(
+            getattr(
+                self.flexkv_connector,
+                "supports_async_store_slot_mapping",
+                False,
+            )
+        )
+        logger.info(
+            "[FlexKV] hybrid store slot-mapping mode: %s",
+            "async" if self._async_store_slot_mapping else "sync",
+        )
+        self._pending_store_launches: dict[str, _PendingStoreLaunch] = {}
+        self._pending_store_copies: dict[str, _PendingStoreCopy] = {}
         self._node_lock = threading.Lock()
 
     def reset(self) -> None:
@@ -127,6 +162,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         self._load_markers.clear()
         with self._node_lock:
             self._inflight_store_nodes.clear()
+            if hasattr(self, "_pending_store_launches"):
+                self._pending_store_launches.clear()
+            if hasattr(self, "_pending_store_copies"):
+                self._pending_store_copies.clear()
 
     def shutdown(self) -> None:
         # Prefer token_to_kv_pool_host.destroy() (HiCache path); keep this alias.
@@ -443,13 +482,20 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         with self._node_lock:
             store_key = f"{req.rid}:flexkv-store:{self._store_generation}"
             self._store_generation += 1
+        pending = _PendingStoreLaunch(
+            store_key=store_key,
+            sglang_req_id=req.rid,
+            node=node,
+            dec_params=lock_result.to_dec_params(),
+            token_ids=token_ids,
+            kv_indices=indices,
+        )
+        if self.__dict__.get("_async_store_slot_mapping", False):
+            with self._node_lock:
+                self._pending_store_launches[store_key] = pending
+            return
         try:
-            task_id = self.flexkv_connector.store_kv(
-                store_key,
-                token_ids,
-                indices,
-                sglang_req_id=req.rid,
-            )
+            task_id = self._launch_store(pending)
         except Exception:
             self._inner_cache.dec_lock_ref(node, lock_result.to_dec_params())
             raise
@@ -461,6 +507,131 @@ class FlexKVHybridRadixCache(BasePrefixCache):
                 node,
                 lock_result.to_dec_params(),
             )
+
+    def _launch_store(
+        self,
+        pending: _PendingStoreLaunch,
+        *,
+        kv_indices: Optional[torch.Tensor] = None,
+        mapping_already_on_cpu: bool = False,
+        skip_mapping_validation: bool = False,
+    ) -> int:
+        indices = pending.kv_indices if kv_indices is None else kv_indices
+        store_stream = getattr(self.flexkv_connector, "store_stream", None)
+        if store_stream is None:
+            store_stream = torch.cuda.current_stream()
+        if not mapping_already_on_cpu and not skip_mapping_validation:
+            producer_stream = torch.cuda.current_stream()
+            with self._store_profile_scope("flexkv.store.wait_producer_stream"):
+                store_stream.wait_stream(producer_stream)
+        with torch.cuda.stream(store_stream):
+            if self.page_size > 1 and not skip_mapping_validation:
+                with self._store_profile_scope("flexkv.store.slot_mapping_to_cpu"):
+                    page_reps = indices[:: self.page_size]
+                    if not mapping_already_on_cpu:
+                        page_reps = page_reps.to(device="cpu", dtype=torch.int64)
+                with self._store_profile_scope("flexkv.store.slot_mapping_validate"):
+                    page_ids = page_reps // self.page_size
+                    unique_pages = torch.unique(page_ids)
+                    aligned = bool((page_reps % self.page_size == 0).all())
+                if not aligned or unique_pages.numel() != page_ids.numel():
+                    raise RuntimeError(
+                        "FlexKV D2H received an invalid GPU slot mapping: "
+                        f"rid={pending.store_key}, pages={page_ids.numel()}, "
+                        f"unique_pages={unique_pages.numel()}, aligned={aligned}"
+                    )
+            with self._store_profile_scope("flexkv.store.connector_store_kv"):
+                return self.flexkv_connector.store_kv(
+                    pending.store_key,
+                    pending.token_ids,
+                    indices,
+                    sglang_req_id=pending.sglang_req_id,
+                )
+
+    def _store_profile_scope(self, name: str):
+        if not self.__dict__.get("_profile_store_stages", False):
+            return nullcontext()
+        return torch.profiler.record_function(name)
+
+    def _stage_store_copy(self, pending: _PendingStoreLaunch) -> None:
+        cpu_indices: Optional[torch.Tensor] = None
+        ready_event: Optional[torch.cuda.Event] = None
+        if bool(getattr(self.flexkv_connector, "is_store_sync_leader", True)):
+            store_stream = getattr(self.flexkv_connector, "store_stream", None)
+            if store_stream is None:
+                store_stream = torch.cuda.current_stream()
+            store_stream.wait_stream(torch.cuda.current_stream())
+            cpu_indices = torch.empty(
+                pending.kv_indices.shape,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+            ready_event = torch.cuda.Event()
+            with torch.cuda.stream(store_stream):
+                cpu_indices.copy_(pending.kv_indices, non_blocking=True)
+                ready_event.record(store_stream)
+        self._pending_store_copies[pending.store_key] = _PendingStoreCopy(
+            launch=pending,
+            cpu_indices=cpu_indices,
+            ready_event=ready_event,
+        )
+
+    def _launch_ready_store_copies(self) -> None:
+        local_ready: list[str] = []
+        if bool(getattr(self.flexkv_connector, "is_store_sync_leader", True)):
+            for store_key, pending in self._pending_store_copies.items():
+                if pending.ready_event is None or not pending.ready_event.query():
+                    break
+                local_ready.append(store_key)
+        ready_keys = self.flexkv_connector.sync_ready_store_rids(local_ready)
+        for store_key in ready_keys:
+            pending_copy = self._pending_store_copies.pop(store_key, None)
+            if pending_copy is None:
+                raise RuntimeError(
+                    "FlexKV async store-ready key is not locally pending: "
+                    f"{store_key}"
+                )
+            pending = pending_copy.launch
+            indices = (
+                pending_copy.cpu_indices
+                if pending_copy.cpu_indices is not None
+                else pending.kv_indices
+            )
+            try:
+                task_id = self._launch_store(
+                    pending,
+                    kv_indices=indices,
+                    mapping_already_on_cpu=pending_copy.cpu_indices is not None,
+                    skip_mapping_validation=pending_copy.cpu_indices is None,
+                )
+            except Exception:
+                self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                raise
+            if task_id < 0:
+                self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                continue
+            with self._node_lock:
+                self._inflight_store_nodes[store_key] = (
+                    pending.node,
+                    pending.dec_params,
+                )
+
+    def _launch_pending_stores(self) -> None:
+        if not hasattr(self, "_pending_store_launches"):
+            return
+        while True:
+            with self._node_lock:
+                if not self._pending_store_launches:
+                    break
+                store_key = next(iter(self._pending_store_launches))
+                pending = self._pending_store_launches.pop(store_key)
+            try:
+                self._stage_store_copy(pending)
+            except Exception:
+                self._inner_cache.dec_lock_ref(pending.node, pending.dec_params)
+                raise
+        self._launch_ready_store_copies()
 
     @staticmethod
     def _apply_restore_swa_boundary(req: Req) -> None:
@@ -480,6 +651,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         self._drain_completed_stores()
         self.flexkv_connector.drain_launched_loads()
+        self._launch_pending_stores()
 
     def _drain_completed_stores(self) -> None:
         completed = self.flexkv_connector.check_completed_stores()
@@ -590,6 +762,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         return self._inner_cache.ready_to_load_host_cache()
 
     def flush_write_through_acks(self) -> None:
+        self._launch_pending_stores()
         self._drain_completed_stores()
         self._inner_cache.flush_write_through_acks()
 

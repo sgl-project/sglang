@@ -23,9 +23,10 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 def _load_hybrid_cache_class():
     """Load the wrapper without requiring the optional FlexKV package."""
     module_name = "_flexkv_hybrid_radix_cache_under_test"
-    connector_name = "sglang.srt.mem_cache.storage.flexkv.flexkv_connector"
+    connector_name = "flexkv.integration.sglang.connector"
     connector_stub = ModuleType(connector_name)
     connector_stub.FlexKVConnector = object
+    connector_stub.FlexKVHostReleaseShim = object
 
     module_path = (
         Path(__file__).resolve().parents[4]
@@ -296,7 +297,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     inner.is_eagle = False
     inner.root_node = object()
     node = object()
-    indices = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    indices = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
     inner.match_prefix.return_value = SimpleNamespace(
         last_device_node=node,
         device_indices=indices,
