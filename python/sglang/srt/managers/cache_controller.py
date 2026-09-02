@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
-    count_pool_hits,
+    count_expected_pool_hits,
 )
 
 if TYPE_CHECKING:
@@ -1170,9 +1170,11 @@ class HiCacheController:
                 for transfer in kv_derived_transfers
             ]
             sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers
+                current_kv_derived_transfers, extra_info
             )
-            sidecar_hits = count_pool_hits(sidecar_results)
+            sidecar_hits = count_expected_pool_hits(
+                sidecar_results, current_kv_derived_transfers
+            )
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])

@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    count_expected_pool_hits,
     count_pool_hits,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -684,8 +685,11 @@ class HybridCacheController(BaseHiCacheController):
                 transfers_nonkv, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(transfers_nonkv)
-            pool_hits = count_pool_hits(results)
+            extra_info = HiCacheStorageExtraInfo(
+                extra_info=_router_hint_extra_info(operation)
+            )
+            results = self.storage_backend.batch_get_v2(transfers_nonkv, extra_info)
+            pool_hits = count_expected_pool_hits(results, transfers_nonkv)
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
