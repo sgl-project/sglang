@@ -29,10 +29,11 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # deposit() copies engine host KV into slots carved from this region.
     local_dram_bytes: int = 1 << 30  # 1 GiB placeholder
 
-    # Number of slots the local DRAM region is divided into. slot_size =
-    # local_dram_bytes // local_dram_slots and MUST equal the host KV page byte
-    # size, so this is validated against the real page size at registration.
-    local_dram_slots: int = 0  # 0 => derive from page size at registration
+    # Number of slots the local DRAM region is divided into. For a hybrid pool,
+    # this is the total component-slot budget; only complete logical-page sets
+    # are allocated across the size-classed arenas. Zero derives capacity from
+    # local_dram_bytes and the probed page geometry.
+    local_dram_slots: int = 0
 
     # Control-plane (ZMQ peer channel) bind host/port for cross-worker P2P.
     # control_port 0 means "ask the OS", which is fine local-only and refused
