@@ -366,10 +366,10 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
       TensorView counter,                  // [num_blocks]
       intptr_t mc_workspace_ptr);
 
-  uint32_t num_blocks;  // bound to the counter array, hence not tunable
-  int64_t slot_bytes;   // per-slot bytes, one size for both regions
-  bool has_scatter;     // workspaces carry 4 * world_size rows, not 2 *
-  Counter* counter;     // rank-local memory
+  uint32_t num_blocks;                             // bound to the counter array, hence not tunable
+  int64_t slot_bytes;                              // per-slot bytes, one size for both regions
+  bool has_scatter;                                // workspaces carry 4 * world_size rows, not 2 *
+  Counter* counter;                                // rank-local memory
   std::array<uint8_t*, kMaxWorldSize> workspaces;  // symmetric memory
   uint8_t* mc_workspace;                           // multicast VA of the local workspace (may be null)
 
@@ -393,8 +393,7 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
   PushWorkSpace<N> get_scatter_workspace(int64_t size) const {
     CHECK_HOST(N == world_size) << "Plane holds " << world_size << " ranks, asked for " << N;
     CHECK_HOST(has_scatter) << "This push plane has no scatter region";
-    CHECK_HOST(size >= 0 && size <= slot_bytes)
-        << size << " bytes escape the " << slot_bytes << "-byte scatter slot";
+    CHECK_HOST(size >= 0 && size <= slot_bytes) << size << " bytes escape the " << slot_bytes << "-byte scatter slot";
     CHECK_HOST(2 * N * slot_bytes <= std::numeric_limits<uint32_t>::max())
         << 2 * N * slot_bytes << " bytes of scatter region exceeds the 32-bit offset range";
     const int64_t region_offset = 2 * N * slot_bytes;  // past the shared rows

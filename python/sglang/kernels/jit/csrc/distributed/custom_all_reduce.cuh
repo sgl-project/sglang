@@ -71,7 +71,7 @@ struct AllReduce2ShotPushParams {
   void* __restrict__ output;
   uint32_t num_vecs;
   uint32_t rank;
-  uint32_t slot_vecs;  // div_ceil(num_vecs, kWorldSize): shard slot stride
+  uint32_t slot_vecs;                 // div_ceil(num_vecs, kWorldSize): shard slot stride
   PushWorkSpace<kWorldSize> scatter;  // one shard slot per source
   PushWorkSpace<kWorldSize> gather;   // the shared push plane, flat per half
 };
@@ -286,8 +286,8 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
 ///      gather half of the shared push plane, restore the scatter markers;
 ///   C: drain my gather half into the output, restoring its markers.
 template <typename T, uint32_t kWorldSize, bool kUsePDL, bool kUseMc = false>
-ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(
-    const __grid_constant__ AllReduce2ShotPushParams<kWorldSize> params) {
+ALL_REDUCE_KERNEL void
+all_reduce_2shot_push_kernel(const __grid_constant__ AllReduce2ShotPushParams<kWorldSize> params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
   using vec_t = AlignedVector<packed_t<T>, kVecSize>;
@@ -448,9 +448,7 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(
-        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push")
-        << algo;
+    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
     const auto num_elems_int64 = in.numel();
@@ -497,9 +495,8 @@ struct AllReduceKernel {
       };
       CHECK_HOST(!use_multicast || params.gather.mc_workspace != nullptr)
           << "multicast needs a push plane with an mc workspace";
-      const auto kernel = use_multicast
-          ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
-          : all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>;
+      const auto kernel = use_multicast ? all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL, /*kUseMc=*/true>
+                                        : all_reduce_2shot_push_kernel<T, kWorldSize, kUsePDL>;
       LaunchKernel(push.num_blocks, choose_block_size(num_vecs), stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
       return out;

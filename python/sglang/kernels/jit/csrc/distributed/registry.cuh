@@ -142,9 +142,7 @@ inline void register_communicator() {
       .def_ro("num_bytes", &dist::PullPlaneObj::num_bytes);
 
   refl::ObjectDef<dist::CommunicatorObj>()
-      .def(
-          refl::init<dist::Optional<dist::PushPlaneRef>, dist::Optional<dist::PullPlaneRef>>(),
-          "__init__")
+      .def(refl::init<dist::Optional<dist::PushPlaneRef>, dist::Optional<dist::PullPlaneRef>>(), "__init__")
       .def("get_rank", &dist::CommunicatorObj::get_rank)
       .def("get_world_size", &dist::CommunicatorObj::get_world_size)
       .def("get_push", &dist::CommunicatorObj::get_push)
