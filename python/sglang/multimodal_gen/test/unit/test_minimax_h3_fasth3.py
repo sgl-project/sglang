@@ -120,6 +120,5 @@ def test_fasth3_gates_stay_bf16_under_runtime_quantization() -> None:
     assert not isinstance(attn.qkv_proj.quant_method, UnquantizedLinearMethod)
     assert isinstance(attn.to_gate_compress.quant_method, UnquantizedLinearMethod)
     assert attn.to_gate_compress.weight.dtype == torch.bfloat16
-    # A trained gate is required checkpoint content, never synthesized.
     assert attn.to_gate_compress.weight.missing_param_init == "error"
     assert model.token_refiner.blocks[0].attn.to_gate_compress is None
