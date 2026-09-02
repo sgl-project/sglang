@@ -900,10 +900,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
             metadata = self.forward_metadata
+            # `cache_seqlens_int32` is what the attention kernels bound their
+            # page-table reads by, and the fused metadata call above wrote it.
+            # A target verify reads `draft_token_num` further than `seq_lens`
+            # goes, so filling to `seq_lens` leaves those columns untranslated.
             self.kv_index_translator.fill_read_table(
                 out=metadata.page_table,
                 req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
+                seq_lens=metadata.cache_seqlens_int32,
                 sliding_window_out=metadata.swa_page_table,
             )
             # A capture batch carries no prepared write loc; zeros are the

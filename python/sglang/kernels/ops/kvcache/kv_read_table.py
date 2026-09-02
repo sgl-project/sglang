@@ -80,8 +80,8 @@ def build_kv_read_indices_kernel(
     bid = tl.program_id(0)
     req = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
     seqlen = tl.load(seq_lens_ptr + bid)
-    # The delivery form sets what an item is; deriving it here keeps the page
-    # count off the host, where it costs a launch of its own per call.
+    # Derived here, not on the host: one elementwise op there costs a whole
+    # launch, which a captured graph then replays every step.
     if EMIT_PER_TOKEN:
         n_items = seqlen
     else:
