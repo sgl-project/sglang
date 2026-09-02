@@ -1,3 +1,4 @@
+// KDA provenance: BBuf/KDA-Pilot, merged in SGLang PR #29708.
 // CUDA fast path for LTX2 Q/K RMSNorm + split RoPE.
 //
 // Developed with MIT HAN Lab Kernel Design Agents:
