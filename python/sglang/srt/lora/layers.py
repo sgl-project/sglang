@@ -332,7 +332,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         (chunked logprobs), _lm_head_pass_idx selects a precomputed
         per-pass batch_info.  Otherwise the full-pruned batch_info is used.
 
-        Returns None when no lm_head pruning applies (decode, no LoRA, etc.).
+        Returns None when no separate lm_head routing applies.
         """
         pass_idx = self.lora_backend._lm_head_pass_idx
         if (
@@ -354,9 +354,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                 raise RuntimeError(
                     f"lm_head LoRA input token count mismatch: got "
                     f"{num_tokens} tokens but lm_head_batch_info expects "
-                    f"{batch_info.expected_tokens}. This likely means "
-                    f"a pruning step in LogitsProcessor._get_pruned_states is "
-                    f"not reflected in get_lm_head_pruned_lens()."
+                    f"{batch_info.expected_tokens}. This likely means the "
+                    f"routing metadata does not match the rows gathered by "
+                    f"LogitsProcessor."
                 )
 
         return batch_info

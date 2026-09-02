@@ -153,18 +153,25 @@ def gather_dp_attention_lora_batch_info(
         global_batch_info = graph_batch_info
     global_batch_info.has_active_lora = has_global_active_lora
 
-    if global_batch_info.use_cuda_graph or not forward_batch.is_extend_in_batch:
+    if local_batch_info.use_cuda_graph and not getattr(
+        forward_batch, "is_extend_in_batch", False
+    ):
         return local_batch_info, global_batch_info, None
 
-    global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
+    global_num_tokens = getattr(
+        forward_batch, "global_num_tokens_for_logprob_cpu", None
+    )
     if global_num_tokens is None or len(global_num_tokens) <= 1:
         return local_batch_info, global_batch_info, None
 
-    assert forward_batch.global_num_tokens_for_logprob_gpu is not None
+    global_num_tokens_gpu = getattr(
+        forward_batch, "global_num_tokens_for_logprob_gpu", None
+    )
+    assert global_num_tokens_gpu is not None
     routing_forward_batch = dataclasses.replace(
         forward_batch,
         global_num_tokens_cpu=global_num_tokens,
-        global_num_tokens_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+        global_num_tokens_gpu=global_num_tokens_gpu,
         dp_padding_mode=DpPaddingMode.SUM_LEN,
         dp_local_start_pos=None,
         dp_local_num_tokens=None,

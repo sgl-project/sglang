@@ -152,5 +152,59 @@ def test_prepare_global_routing_gathers_pruned_lm_head_routes(
     assert _routes(backend.lm_head_batch_info) == [1, 2, 0, 2, 2]
 
 
+def test_prepare_global_routing_gathers_unpadded_decode_lm_head_routes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = TritonLoRABackend(3, torch.device("cpu"))
+    backend.batch_info = _batch_info([1, 2, 0], [1, 1, 1])
+    backend.has_global_active_lora = True
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
+    )
+
+    gather_count = 0
+
+    def gather(
+        output: torch.Tensor,
+        local: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        nonlocal gather_count
+        if gather_count == 0:
+            assert local.tolist() == [1, 2, 0]
+            output.copy_(torch.tensor([1, 2, 0, 2, 0, 0], dtype=torch.int32))
+        else:
+            assert local.tolist() == [1, 2]
+            assert forward_batch.dp_padding_mode is DpPaddingMode.SUM_LEN
+            output.copy_(torch.tensor([1, 2, 2], dtype=torch.int32))
+        gather_count += 1
+
+    monkeypatch.setattr(
+        "sglang.srt.lora.backend.triton_backend.dp_gather_replicate", gather
+    )
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
+        batch_size=3,
+        input_ids=torch.zeros(3, dtype=torch.int64),
+        req_pool_indices=torch.zeros(3, dtype=torch.int64),
+        seq_lens=torch.zeros(3, dtype=torch.int64),
+        out_cache_loc=torch.zeros(3, dtype=torch.int64),
+        seq_lens_sum=0,
+        global_num_tokens_cpu=[3, 3],
+        global_num_tokens_gpu=torch.tensor([3, 3]),
+        global_num_tokens_for_logprob_cpu=[2, 1],
+        global_num_tokens_for_logprob_gpu=torch.tensor([2, 1]),
+        is_extend_in_batch=False,
+    )
+
+    backend.prepare_global_lora_batch(forward_batch)
+
+    assert gather_count == 2
+    assert backend.global_batch_info is not None
+    assert _routes(backend.global_batch_info) == [1, 2, 0, 2, 0, 0]
+    assert backend.lm_head_batch_info is not None
+    assert _routes(backend.lm_head_batch_info) == [1, 2, 2]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
