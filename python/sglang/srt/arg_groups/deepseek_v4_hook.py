@@ -11,7 +11,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -162,10 +161,9 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     if not cfg.enable_prefill_cp:
         return
 
-    if cfg.cp_strategy not in ("interleave", "zigzag"):
+    if cfg.cp_strategy != "interleave":
         raise ValueError(
-            "DeepSeekV4 only supports interleave/zigzag CP strategy, "
-            f"got {cfg.cp_strategy}"
+            "DeepSeekV4 only supports interleave CP strategy, " f"got {cfg.cp_strategy}"
         )
 
     declare_resolution(
@@ -181,9 +179,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     declare_resolution(
         server_args,
         "validate_deepseek_v4_cp",
-        dsa_prefill_cp_mode=(
-            "round-robin-split" if cfg.cp_strategy == "interleave" else "in-seq-split"
-        ),
+        dsa_prefill_cp_mode="round-robin-split",
     )
     declare_resolution(
         server_args,
@@ -200,13 +196,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    if not is_npu():
-        assert (
-            cfg.dp_size == 1
-        ), "For round-robin split mode, dp attention is not supported."
-        assert (
-            cfg.tp_size <= 8
-        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    assert (
+        cfg.dp_size == 1
+    ), "For round-robin split mode, dp attention is not supported."
+    assert (
+        cfg.tp_size <= 8
+    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
@@ -220,7 +215,6 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.set(False)
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
-        f"strategy={cfg.cp_strategy}, "
         f"dp_size={cfg.dp_size}, moe_dense_tp_size={cfg.moe_dense_tp_size}, "
         f"attn_cp_size={cfg.attn_cp_size}, ep_size={cfg.ep_size}, tp_size={cfg.tp_size}"
     )
