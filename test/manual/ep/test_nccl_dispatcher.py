@@ -60,9 +60,9 @@ class TestNcclDispatcher(unittest.TestCase):
         num_tokens, hidden_size, top_k = 257, 128, 2
         token = torch.arange(num_tokens, device="cuda")
         feature = torch.arange(hidden_size, device="cuda")
-        hidden_states = (
-            rank + token[:, None] / 512.0 + feature[None, :] / 4096.0
-        ).to(torch.bfloat16)
+        hidden_states = (rank + token[:, None] / 512.0 + feature[None, :] / 4096.0).to(
+            torch.bfloat16
+        )
 
         destinations = torch.stack(
             [
@@ -104,9 +104,7 @@ class TestNcclDispatcher(unittest.TestCase):
         for slot in range(top_k):
             scale = 1.0 + local_experts[:, slot].float() / 8.0
             reference += (
-                hidden_states.float()
-                * topk_weights[:, slot, None]
-                * scale[:, None]
+                hidden_states.float() * topk_weights[:, slot, None] * scale[:, None]
             )
         torch.testing.assert_close(combined, reference, rtol=1e-5, atol=1e-5)
 
@@ -128,9 +126,7 @@ class TestNcclDispatcher(unittest.TestCase):
         topk_ids = torch.full(
             (num_tokens, 1), target * 4, dtype=torch.int32, device="cuda"
         )
-        topk_weights = torch.ones(
-            (num_tokens, 1), dtype=torch.float32, device="cuda"
-        )
+        topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32, device="cuda")
         dispatcher = self._create_dispatcher(hidden_size)
         dispatch_output = dispatcher.dispatch(
             hidden_states, StandardTopKOutput(topk_weights, topk_ids, None)
@@ -154,9 +150,7 @@ class TestNcclDispatcher(unittest.TestCase):
         if world_size < 2:
             self.skipTest("requires at least two ranks")
 
-        hidden_states = torch.empty(
-            (0, 16), dtype=torch.bfloat16, device="cuda"
-        )
+        hidden_states = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
         topk_ids = torch.empty((0, 1), dtype=torch.int32, device="cuda")
         topk_weights = torch.empty((0, 1), dtype=torch.float32, device="cuda")
         dispatcher = self._create_dispatcher(hidden_size=16)
@@ -175,9 +169,10 @@ class TestNcclDispatcher(unittest.TestCase):
         hidden_states = torch.randn(
             (num_records, hidden_size), dtype=torch.bfloat16, device="cuda"
         )
-        token_indices = torch.arange(
-            num_records, dtype=torch.int64, device="cuda"
-        ) % num_input_tokens
+        token_indices = (
+            torch.arange(num_records, dtype=torch.int64, device="cuda")
+            % num_input_tokens
+        )
         route_order = torch.arange(num_records, dtype=torch.int64, device="cuda")
 
         first = NcclDispatcher._deterministic_combine(

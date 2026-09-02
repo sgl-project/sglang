@@ -152,9 +152,9 @@ class NcclDispatcher(BaseDispatcher):
 
         order = torch.argsort(destination, stable=True)
         destination = destination[order]
-        send_counts = torch.bincount(
-            destination, minlength=self.world_size
-        ).to(torch.int64)
+        send_counts = torch.bincount(destination, minlength=self.world_size).to(
+            torch.int64
+        )
         recv_counts = self._exchange_counts(send_counts)
         send_splits = send_counts.cpu().tolist()
         recv_splits = recv_counts.cpu().tolist()
@@ -171,9 +171,11 @@ class NcclDispatcher(BaseDispatcher):
         recv_expert_idx = self._exchange(send_expert_idx, send_splits, recv_splits)
         recv_weight = self._exchange(send_weight, send_splits, recv_splits)
 
-        local_expert_idx = torch.remainder(
-            recv_expert_idx, self.num_local_experts
-        ).to(torch.int32).unsqueeze(1)
+        local_expert_idx = (
+            torch.remainder(recv_expert_idx, self.num_local_experts)
+            .to(torch.int32)
+            .unsqueeze(1)
+        )
         local_weight = recv_weight.unsqueeze(1)
         local_topk_output = StandardTopKOutput(
             topk_weights=local_weight,
@@ -283,8 +285,8 @@ class NcclDispatcher(BaseDispatcher):
         for slot in range(int(counts.max().item())):
             active_tokens = torch.nonzero(counts > slot, as_tuple=False).flatten()
             sorted_rows = starts[active_tokens] + slot
-            updates = combined.index_select(0, active_tokens) + sorted_hidden_states.index_select(
-                0, sorted_rows
-            )
+            updates = combined.index_select(
+                0, active_tokens
+            ) + sorted_hidden_states.index_select(0, sorted_rows)
             combined.index_copy_(0, active_tokens, updates)
         return combined
