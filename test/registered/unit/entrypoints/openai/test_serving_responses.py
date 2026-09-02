@@ -246,6 +246,44 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(request_prompts, [[4, 5, 6]])
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
+    def test_multimodal_kimi_k3_request_uses_prompt_ids(self):
+        serving = make_serving(is_multimodal=True)
+        serving.chat_encoding_spec = "kimi_k3"
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="",
+                prompt_ids=[4, 5, 6],
+                image_data=["http://example.com/cat.png"],
+                audio_data=None,
+                video_data=None,
+                modalities=["image"],
+                stop=[],
+            )
+        )
+        request = ResponsesRequest(
+            model="x",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "describe it"},
+                        {
+                            "type": "input_image",
+                            "image_url": "http://example.com/cat.png",
+                        },
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        _, request_prompts, engine_prompts, _ = asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertEqual(request_prompts, [[4, 5, 6]])
+        self.assertEqual(engine_prompts, [[4, 5, 6]])
+
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
