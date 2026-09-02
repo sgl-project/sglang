@@ -14,4 +14,14 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="embeddings.host_embedding_gather",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.embeddings.host_embedding_gather:host_embedding_gather"
+        ),
+    )
+)
+
 __all__ = []

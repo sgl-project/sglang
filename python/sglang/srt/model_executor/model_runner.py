@@ -1142,6 +1142,38 @@ class ModelRunner:
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
 
+    def _offload_input_embeddings_to_host(self) -> None:
+        """``--offload-embedding-to-host``: make sure the input embedding
+        table(s) live in pinned host memory. They are normally placed there at
+        construction; this moves any table that still sits on the device (built
+        on a meta device, materialised at load) before the free-memory
+        measurement that sizes the KV pool."""
+        if self.device != "cuda":
+            raise ValueError("--offload-embedding-to-host requires a CUDA device")
+        from sglang.srt.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            VocabParallelEmbedding,
+            offload_input_embeddings_to_host,
+        )
+
+        moved = offload_input_embeddings_to_host(self.model)
+        for name, nbytes in moved:
+            logger.info(
+                f"Offloaded input embedding {name} ({nbytes / (1 << 30):.2f} GB) "
+                "to pinned host memory after loading"
+            )
+        on_host = [
+            name
+            for name, module in self.model.named_modules()
+            if isinstance(module, VocabParallelEmbedding)
+            and not isinstance(module, ParallelLMHead)
+            and module.weight.device.type == "cpu"
+        ]
+        if not on_host:
+            logger.warning(
+                "--offload-embedding-to-host: no eligible input embedding table found"
+            )
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1202,6 +1234,8 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             get_offloader().post_init()
+            if get_exec().offload.offload_embedding_to_host:
+                self._offload_input_embeddings_to_host()
 
         self.maybe_precompile_model_kernels_after_loading()
 
