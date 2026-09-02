@@ -7,7 +7,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax_only,
+    draft_topk1_postprocess,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -114,7 +117,7 @@ class TestSpecTopk1Triton(CustomTestCase):
                     )
                     expected_index = torch.argmax(expected_logits, dim=-1, keepdim=True)
 
-                    topk_p, topk_index = draft_topk1_postprocess(logits, positions=None)
+                    topk_p, topk_index = draft_topk1_argmax_only(logits)
 
                     torch.testing.assert_close(
                         topk_index, expected_index, rtol=0, atol=0

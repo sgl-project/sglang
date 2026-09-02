@@ -6,7 +6,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax_only,
+    draft_topk1_postprocess,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -1014,9 +1017,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info.temperatures,
             )
         elif self.topk == 1 and _is_hip:
-            ret_topk_p, ret_topk_index = draft_topk1_postprocess(
-                draft_logits_output.next_token_logits,
-                positions=None,
+            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                draft_logits_output.next_token_logits
             )
             ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
