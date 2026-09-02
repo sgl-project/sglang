@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -120,3 +122,7 @@ def test_qwen4_ple_fused_kernels_are_bitwise_exact(num_tokens):
 def test_qwen4_ple_fusion_is_enabled_by_default(monkeypatch):
     monkeypatch.delenv("SGLANG_ENABLE_QWEN4_PLE_FUSION", raising=False)
     assert envs.SGLANG_ENABLE_QWEN4_PLE_FUSION.get()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
