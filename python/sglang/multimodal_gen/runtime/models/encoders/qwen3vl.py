@@ -694,7 +694,16 @@ class Qwen3VLModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.visual = Qwen3VLVisionTransformer(config.vision_config)
+        vision_quant_config = (
+            quant_config
+            if quant_config is not None and quant_config.supports_srt_linear_layers
+            else None
+        )
+        self.visual = Qwen3VLVisionTransformer(
+            config.vision_config,
+            quant_config=vision_quant_config,
+            prefix=add_prefix("visual", prefix),
+        )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
             quant_config=quant_config,
@@ -1212,6 +1221,12 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+        if getattr(config, "tie_word_embeddings", False) or getattr(
+            config.text_config, "tie_word_embeddings", False
+        ):
+            # Tied checkpoints may omit lm_head.weight, as Hugging Face does.
+            # Keep one registered parameter so strict native loading stays safe.
+            self.lm_head.weight = self.model.get_input_embeddings().weight
 
     @torch.no_grad()
     def forward(

@@ -40,6 +40,7 @@ class BaseDiT(nn.Module, ABC):
     _supported_attention_backends: set[AttentionBackendEnum] = {
         AttentionBackendEnum.SLIDING_TILE_ATTN,
         AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SPARGE_ATTN,
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
@@ -101,6 +102,12 @@ class BaseDiT(nn.Module, ABC):
     def post_load_weights(self) -> None:
         """Run model-specific post-load weight fixups after all parameters are materialized."""
         return None
+
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Apply model-specific LoRA transforms after names are normalized."""
+        return adapter
 
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:

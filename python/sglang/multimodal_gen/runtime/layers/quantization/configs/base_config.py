@@ -36,6 +36,9 @@ class QuantizationConfig(SRTQuantizationConfig):
     # for quantization frameworks with a separate quantized model provided, e.g. Nunchaku
     quantized_model_path: str | None = None
     checkpoint_uses_native_qkv_layout: bool = False
+    checkpoint_uses_comfy_quantization: bool = False
+    supports_srt_linear_layers: bool = False
+    supports_quantized_embeddings: bool = False
 
     def get_scaled_act_names(self) -> list[str]:
         return []

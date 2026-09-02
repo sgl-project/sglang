@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -125,6 +126,11 @@ class BaseTpWorker(ABC):
     def weight_load_time(self) -> float:
         runners = self.model_runner_list or [self.model_runner]
         return sum(runner.weight_load_time for runner in runners)
+
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        runners = self.model_runner_list or [self.model_runner]
+        return sum(runner.preloaded_weights_bytes for runner in runners)
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
@@ -319,6 +325,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
+        random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -378,8 +385,11 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
-        # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        # Elastic joiners and last-stage-only draft workers cannot enter the WORLD
+        # broadcast, so they reuse the target's already-broadcast seed.
+        if random_seed is not None:
+            self.random_seed = random_seed
+        elif server_args.is_ep_joiner:
             self.random_seed = get_device().random_seed
         else:
             self.random_seed = broadcast_pyobj(
@@ -536,7 +546,9 @@ class TpModelWorker(BaseTpWorker):
             - 1,
         )
         return (
-            self.model_runner.max_total_num_tokens,
+            self.model_runner.req_to_token_pool.schedulable_token_capacity(
+                self.model_runner.max_total_num_tokens
+            ),
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
@@ -625,6 +637,8 @@ class TpModelWorker(BaseTpWorker):
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
             )
+
+            capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.

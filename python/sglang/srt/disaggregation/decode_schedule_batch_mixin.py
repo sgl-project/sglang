@@ -43,10 +43,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # Fill the tensor in one pass
         offset = 0
         for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
+            req_pool_indices.append(req.kv.req_pool_idx)
             pre_len = len(req.prefix_indices)
 
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
+            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
                 pre_len : pre_len + req.extend_range.length
             ]
             assert (

@@ -1,7 +1,6 @@
 ---
 title: Qwen3.8-27B
 description: "Deploy Qwen3.8-27B with SGLang — dense hybrid GDN vision-language model with BF16/FP8/NVFP4 W4A4 checkpoints and in-checkpoint MTP, single-GPU on H200, RTX PRO 6000, RTX 5090 and DGX Spark."
-tag: NEW
 ---
 
 ## Deployment
@@ -168,14 +167,25 @@ context from earlier messages.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/Qwen/Qwen3.8-27B-FP8">Qwen/Qwen3.8-27B-FP8</a></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4 W4A4 + FP8 projections</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4 (FP4 head)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4 W4A4 + FP8 projections, `lm_head` packed to FP4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4">RadixArk/Qwen3.8-27B-NVFP4</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.8-27B-NVFP4 (BF16 head)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same body, `lm_head` left dense in BF16</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead">RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead</a></td>
     </tr>
   </tbody>
 </table>
 
-The NVFP4 checkpoint declares `kv_cache_quant_algo: FP8`; SGLang's default
+The two NVFP4 exports differ only in the `lm_head`: one packs it to FP4, the
+other leaves it dense in BF16. The dense head is ~1.7 GB larger on disk and
+~3.2 GB larger at runtime, so it is the harder of the two to fit — every
+recipe on this page was measured against it, and the FP4-head cells reuse
+those pins unchanged.
+
+Both NVFP4 checkpoints declare `kv_cache_quant_algo: FP8`; SGLang's default
 `--kv-cache-dtype auto` honors it, so the KV pool runs in `fp8_e4m3` with the
 checkpoint's calibration scales automatically.
 
@@ -251,12 +261,14 @@ checkpoint's calibration scales automatically.
   the only cell on this page needing a smaller prefill chunk, because at 0.91
   the pools fit but a 2048-token chunk's activations do not — DSpark at 0.88,
   EAGLE at 0.93 (bfloat16) and 0.94 (float32), and no-speculation at 0.90.
-  float32 is greyed out for both draft-model picks on that card: an fp32 state
-  slot costs 154 MB against bfloat16's 78 MB, so below ~0.92 the state pool
-  never reaches the tier's slot count, while at or above it prefill graph
-  capture or the first request runs out of memory. That was verified across
-  0.86–0.96 at both chunk sizes and with balanced-ratio overrides up to 20.
-  bfloat16 is also the faster choice: DFlash2 posts 4.92 ms median TPOT at an
+  Whether float32 is available with a draft model depends on the `lm_head`: on
+  the BF16-head export it is greyed out for both DSpark and DFlash2, since the
+  dense head's ~3.2 GB leave no fp32 state pool that also clears prefill graph
+  capture. The FP4-head export frees that headroom back — DSpark serves at 0.89
+  and DFlash2 High-Throughput at 0.895 with `--mamba-full-memory-ratio 10`
+  overriding the balanced value — and only DFlash2 Low-Latency stays out of
+  reach, where five fp32 slots and a full request's KV never coexist. bfloat16
+  remains the faster choice regardless: DFlash2 posts 4.92 ms median TPOT at an
   accept length of 4.29, the best result on this card.
 - **Hardware fit**: FP8 weights ~28.5GB (not serviceable beyond bs≤2 on
   32GB cards); NVFP4 weights ~16.5GB (recommended for RTX 5090-class GPUs).
