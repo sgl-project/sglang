@@ -1,15 +1,8 @@
 #!/bin/bash
 # Shared `git clone` helper for CI install scripts.
-#
-# - Retries transient network failures (3 attempts, shallow clone).
-# - When GH_TOKEN or GITHUB_TOKEN is set, authenticates github.com requests.
-#   Anonymous git-over-HTTPS is rate limited per source IP, and shared
-#   self-hosted runner egress trips it as "fatal: could not read Username
-#   for 'https://github.com'". Authenticated requests are limited per token
-#   instead. The token is passed via GIT_CONFIG_* env so it never lands in
-#   `set -x` traces or in the cloned repo's .git/config.
-#
-# Usage: git_clone_with_retry <repo_url> <dest_dir> ["--branch <ref>"]
+# GitHub rate limits anonymous git-over-HTTPS per source IP; shared runner egress
+# trips it as "could not read Username for 'https://github.com'". With GH_TOKEN
+# or GITHUB_TOKEN set, github.com requests are authenticated instead.
 
 _git_with_github_auth() {
   # Disable xtrace before touching the token so neither it nor its base64
