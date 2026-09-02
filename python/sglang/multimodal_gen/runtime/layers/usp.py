@@ -95,6 +95,20 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     return output.reshape(x_shape)
 
 
+def _usp_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """Concatenate ``x`` from every Ulysses rank along dim 0, rank order."""
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x = x.contiguous()
+    output = torch.empty(
+        (get_ulysses_parallel_world_size() * x.shape[0], *x.shape[1:]),
+        dtype=x.dtype,
+        device=x.device,
+    )
+    dist.all_gather_into_tensor(output, x, group=ulysses_pg)
+    return output
+
+
 def _usp_all_to_all_single_varlen(
     x: torch.Tensor,
     output_split_sizes: list[int],

@@ -17,6 +17,7 @@ padded tile layout the attention kernel reads and pools each tile in the same
 pass; ``vsa_h3_untile`` scatters the attention output back to packed rows and
 folds in the gated compression branch. Both replace chains of index copies
 and transposes that otherwise cost more than the attention kernel itself.
+``vsa_h3_gate_add`` folds the same branch after the caller's collectives.
 """
 
 import math
@@ -338,6 +339,72 @@ def vsa_h3_untile(
         seq_pad,
         seq_pad // VSA_H3_KERNEL_BLOCK,
         HAS_GATE=has_gate,
+        HEAD_DIM=head_dim,
+        BLOCK=VSA_H3_KERNEL_BLOCK,
+    )
+
+
+@triton.jit
+def _gate_add_kernel(
+    Out,
+    Gate,
+    Compress,
+    tile_index,
+    num_rows,
+    stride_o_row,
+    stride_o_head,
+    stride_g_row,
+    stride_g_head,
+    N_TILES,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_block = tl.program_id(0)
+    h = tl.program_id(1)
+    rows = row_block * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, HEAD_DIM)
+    in_rows = rows < num_rows
+    tile = tl.load(tile_index + rows, mask=in_rows, other=-1)
+    valid = (tile >= 0)[:, None]
+    o_off = (
+        rows.to(tl.int64)[:, None] * stride_o_row + h * stride_o_head + cols[None, :]
+    )
+    g_off = (
+        rows.to(tl.int64)[:, None] * stride_g_row + h * stride_g_head + cols[None, :]
+    )
+    o = tl.load(Out + o_off, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(Gate + g_off, mask=valid, other=0.0).to(tl.float32)
+    c = tl.load(
+        Compress + (h * N_TILES + tile)[:, None] * HEAD_DIM + cols[None, :],
+        mask=valid,
+        other=0.0,
+    )
+    o = o + c * g
+    tl.store(Out + o_off, o.to(Out.type.element_ty), mask=valid)
+
+
+def vsa_h3_gate_add(
+    out: torch.Tensor,
+    gate: torch.Tensor,
+    out_compress: torch.Tensor,
+    tile_index: torch.Tensor,
+) -> None:
+    """In place: ``out[t, h] += out_compress[h, tile_index[t]] * gate[t, h]``
+    where ``tile_index[t] >= 0``; same fp32 arithmetic as ``vsa_h3_untile``."""
+    num_rows, heads, head_dim = out.shape
+    assert out.stride(-1) == 1 and gate.stride(-1) == 1
+    assert out_compress.is_contiguous() and out_compress.shape[0] == heads
+    _gate_add_kernel[(triton.cdiv(num_rows, VSA_H3_KERNEL_BLOCK), heads)](
+        out,
+        gate,
+        out_compress,
+        tile_index,
+        num_rows,
+        out.stride(0),
+        out.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        out_compress.shape[1],
         HEAD_DIM=head_dim,
         BLOCK=VSA_H3_KERNEL_BLOCK,
     )

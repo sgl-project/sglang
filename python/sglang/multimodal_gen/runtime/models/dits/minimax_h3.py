@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+    vsa_h3_fold_gate,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     claim_deferred_component_attn_backend,
     get_attn_backend,
@@ -616,14 +619,12 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_input_all_to_all,
+            _usp_all_gather,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
-        if gate_compress is not None:
-            gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -641,6 +642,27 @@ def _minimax_h3_attention_core_impl(
             if attention.prefix.startswith("blocks.")
             else None
         )
+        if ulysses_active and gate_compress is not None:
+            out, out_compress = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+                attn_metadata=attn_metadata,
+                return_compress=True,
+            )
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+            _, ulysses_rank = get_ulysses_ctx()
+            vsa_h3_fold_gate(
+                out,
+                gate_compress,
+                _usp_all_gather(out_compress),
+                attn_metadata,
+                row_start=ulysses_rank * out.shape[0],
+            )
+            return out
         out = attention._attention_impl.forward_varlen(
             q,
             k,

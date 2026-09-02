@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h
     VideoSparseAttentionH3Impl,
     VideoSparseAttentionH3MetadataBuilder,
     _topk_tile_lists,
+    vsa_h3_fold_gate,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -213,6 +214,35 @@ def test_sparse_gated_matches_masked_dense_reference() -> None:
         diff = (out[:used].float() - reference).abs().max().item()
         assert diff < 2e-2, f"exempt={exempt}: sparse+gate vs reference {diff}"
         assert torch.all(out[used:] == 0)
+
+
+@requires_cuda
+def test_return_compress_fold_on_row_shards_is_bit_identical() -> None:
+    """The deferred row-shard fold (Ulysses) must reproduce the in-kernel fold
+    bit for bit: same tile index derivation, same fp32 FMA order."""
+    device = torch.device("cuda")
+    meta = _build_metadata(0.5, device)
+    used, total, (q, k, v) = _packed_qkv(device)
+    gate = (torch.randn_like(q) * 0.1).to(torch.bfloat16)
+    impl = _impl()
+
+    folded = _run(impl, meta, used, total, q, k, v, gate=gate)
+    cu = torch.tensor([0, used, total], dtype=torch.int32, device=device)
+    out, out_compress = impl.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens=cu,
+        max_seqlen=used,
+        cu_seqlens_host=(0, used, total),
+        attn_metadata=meta,
+        return_compress=True,
+    )
+    shard = total // 2
+    for row_start in (0, shard):
+        rows = slice(row_start, row_start + shard)
+        vsa_h3_fold_gate(out[rows], gate[rows], out_compress, meta, row_start)
+    assert torch.equal(out, folded)
 
 
 def test_metadata_tile_geometry_accounts_every_row() -> None:
