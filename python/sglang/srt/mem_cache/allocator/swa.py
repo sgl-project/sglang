@@ -319,15 +319,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         # NOTE: the API is not idempotent.
-        if self.free_group is None:
-            self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
-        assert (
-            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
-        )
-        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        # SWA first: it reads the mapping, and a cache action later in this group
+        # can re-point free_index at a different SWA slot.
+        self.free_swa(free_index)
+        self.free_full(free_index)
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
@@ -365,7 +360,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping_indices = self._expand_to_full_pages(free_index)
 
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
-        swa_indices = swa_indices[swa_indices > 0]
         self.clear_full_to_swa_mapping(mapping_indices)
 
         if self.free_group is not None:
@@ -374,7 +368,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_free_group.append(swa_indices)
             return
 
-        self.swa_attn_allocator.free(swa_indices)
+        self._release_swa(swa_indices)
+
+    def _release_swa(self, swa_indices: torch.Tensor):
+        # One filter per group: its data-dependent shape costs a sync, and
+        # filtering the batch selects the same slots as filtering per call.
+        self.swa_attn_allocator.free(swa_indices[swa_indices > 0])
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_full(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -400,11 +400,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
-            self.swa_attn_allocator.free(torch.cat(swa_free_group))
+            self._release_swa(torch.cat(swa_free_group))
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
             self.free_full(torch.cat(full_free_group))
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         # Duplicates are kept: deduplicating would be a torch.unique whose
@@ -516,6 +520,19 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         return kv_indices
 
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        # Registered with the KV pool and read by the attention kernels.
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to rewrite"
+        )
+
+    def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator has no full->SWA mapping to clear"
+        )
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
@@ -560,7 +577,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # Not inherited: the SWA parent's hooks drive swa_free_group and
     # full_free_group, which this pure-SWA variant does not have.
     def free_group_begin(self):
-        self.free_group = []
+        BaseTokenToKVPoolAllocator.free_group_begin(self)
 
     def free_group_end(self):
         pending, self.free_group = self.free_group, None

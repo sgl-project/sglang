@@ -425,6 +425,33 @@ MODELS = {
             "num-inference-steps",
         },
     },
+    # H3 rejects a 1-step warmup request, hence --warmup-steps=2.
+    "fasth3-t2va-vsa": {
+        "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "prompt": (
+            "A curious raccoon peers through a vibrant field of yellow "
+            "sunflowers, its eyes wide with interest."
+        ),
+        "seed": 1000,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 10.0,
+            },
+            "num_inference_steps": 5,
+        },
+        "extra_args": [
+            "--num-gpus=4",
+            "--attention-backend=video_sparse_attn_h3",
+            '--attention-backend-config={"VSA_sparsity": 0.9}',
+            "--enable-torch-compile=false",
+            "--warmup-steps=2",
+        ],
+        "force_eager": True,
+    },
     # Source-tracked extras from current registry / GPU test coverage.
     "longcat-image": {
         "path": "meituan-longcat/LongCat-Image",

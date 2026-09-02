@@ -15,9 +15,9 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestRustServerDpLocalPorts(CustomTestCase):
-    def test_two_nodes_reuse_the_same_http_ports(self):
+    def _launch_rust_servers(self, nnodes, ranks):
         server_cls = MagicMock()
-        server_args = SimpleNamespace(nnodes=2)
+        server_args = SimpleNamespace(nnodes=nnodes)
 
         with (
             patch(
@@ -39,24 +39,31 @@ class TestRustServerDpLocalPorts(CustomTestCase):
                 return_value="{}",
             ),
         ):
-            for global_rank in range(4):
+            for tp_rank, dp_rank, attn_tp_size, dp_size in ranks:
                 scheduler = SimpleNamespace(
                     server_args=server_args,
-                    ps=SimpleNamespace(attn_dp_rank=global_rank, dp_size=4),
+                    ps=SimpleNamespace(
+                        tp_rank=tp_rank,
+                        tp_size=4,
+                        pp_size=1,
+                        attn_tp_size=attn_tp_size,
+                        attn_cp_size=1,
+                        attn_dp_rank=dp_rank,
+                        dp_size=dp_size,
+                    ),
                     model_config=SimpleNamespace(is_multimodal=False),
                 )
                 RustServer.launch(scheduler)
 
-        offsets = [call.kwargs["port_offset"] for call in server_cls.call_args_list]
-        self.assertEqual(offsets, [0, 1, 0, 1])
+        return [call.kwargs["port_offset"] for call in server_cls.call_args_list]
 
-    def test_nonzero_node_does_not_start_dummy_server_for_rust_dp(self):
+    def _launch_nonzero_node(self, *, nnodes, node_rank, tp_size, dp_size):
         server_args = ServerArgs(
             model_path="dummy",
-            nnodes=2,
-            node_rank=1,
-            tp_size=4,
-            dp_size=4,
+            nnodes=nnodes,
+            node_rank=node_rank,
+            tp_size=tp_size,
+            dp_size=dp_size,
             enable_dp_attention=True,
         )
         server_args.check_server_args = MagicMock()
@@ -68,7 +75,6 @@ class TestRustServerDpLocalPorts(CustomTestCase):
             block_until_scheduler_exits=MagicMock(),
             engine_info_bootstrap_server=None,
         )
-
         with (
             envs.SGLANG_RUST_SERVER.override(True),
             patch.object(engine_module, "configure_logger"),
@@ -89,9 +95,44 @@ class TestRustServerDpLocalPorts(CustomTestCase):
                 port_args=SimpleNamespace(),
             )
 
-        launch.assert_not_called()
         scheduler_init_result.wait_for_ready.assert_called_once_with()
         scheduler_init_result.block_until_scheduler_exits.assert_called_once_with()
+        return launch, server_args
+
+    def test_two_nodes_reuse_the_same_http_ports(self):
+        offsets = self._launch_rust_servers(
+            nnodes=2,
+            ranks=(
+                (0, 0, 1, 4),
+                (1, 1, 1, 4),
+                (2, 2, 1, 4),
+                (3, 3, 1, 4),
+            ),
+        )
+        self.assertEqual(offsets, [0, 1, 0, 1])
+
+    def test_more_nodes_than_dp_ranks_reuse_the_base_port(self):
+        offsets = self._launch_rust_servers(
+            nnodes=4,
+            ranks=((0, 0, 2, 2), (2, 1, 2, 2)),
+        )
+        self.assertEqual(offsets, [0, 0])
+
+    def test_nonzero_node_does_not_start_dummy_server_for_rust_dp(self):
+        launch, _ = self._launch_nonzero_node(
+            nnodes=2, node_rank=1, tp_size=4, dp_size=4
+        )
+
+        launch.assert_not_called()
+
+    def test_non_server_node_starts_dummy_server_for_rust_dp(self):
+        launch, server_args = self._launch_nonzero_node(
+            nnodes=4, node_rank=1, tp_size=4, dp_size=2
+        )
+
+        launch.assert_called_once_with(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
 
 
 if __name__ == "__main__":
