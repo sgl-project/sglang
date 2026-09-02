@@ -422,6 +422,5 @@ class PromptCacheKeyTestCase(CustomTestCase):
         self.assertEqual(request.prompt_cache_key, "task-a")
 
 
-
 if __name__ == "__main__":
     unittest.main()

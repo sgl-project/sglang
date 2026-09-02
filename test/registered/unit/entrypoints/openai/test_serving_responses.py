@@ -1060,6 +1060,5 @@ class PromptCacheKeyForwardingTestCase(CustomTestCase):
         self.assertEqual(adapted.cache_salt, "native")
 
 
-
 if __name__ == "__main__":
     unittest.main()
