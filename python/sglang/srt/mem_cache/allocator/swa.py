@@ -403,12 +403,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             msg="caller wants free",
         )
         if self.free_group is None:
-            self._release_full(free_index)
+            self.full_attn_allocator.free(free_index)
         else:
             self.full_free_group.append(self._copy_for_free_group(free_index))
-
-    def _release_full(self, free_index: torch.Tensor):
-        self.full_attn_allocator.free(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -427,7 +424,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
-            self._release_full(torch.cat(full_free_group))
+            self.full_attn_allocator.free(torch.cat(full_free_group))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
