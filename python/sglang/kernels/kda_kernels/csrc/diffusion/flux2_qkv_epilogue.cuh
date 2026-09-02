@@ -1,3 +1,4 @@
+// KDA provenance: Humanize2 / Kernel Design Agents, SGLang PR #37162.
 #pragma once
 
 #include <sgl_kernel/tensor.h>
