@@ -153,9 +153,9 @@ def torch_expand_qsa_block_indices(
 
     result = torch.cat([expanded, tail], dim=1)
     # Keep all valid entries contiguous. This is required by the FA2 packing path.
-    # Ascend dispatches int32/int64 argsort to AiCpu.  These bounded positional
-    # keys are exactly representable in float32, which keeps NPU sorting on
-    # AiCore without changing the gathered integer token indices.
+    # Integer argsort falls back to a host-side implementation on NPU. These
+    # bounded positional keys are exactly representable in float32, which keeps
+    # sorting on device without changing the gathered integer token indices.
     order = (
         torch.arange(final_topk, device=device, dtype=torch.float32)
         .unsqueeze(0)
@@ -336,12 +336,12 @@ def qsa_sparse_attention(
 
 
 def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
-    """Expose flat physical slots from NHD or Ascend paged KV storage."""
+    """Expose flat physical slots from NHD or NPU paged KV storage."""
 
     if cache.ndim == 3:
         return cache
     if cache.ndim == 4:
-        # Ascend stores each layer as [pages, page_size, heads, dim], or as
+        # NPU stores each layer as [pages, page_size, heads, dim], or as
         # [slots, 1, heads, dim] with FIA. In both cases physical slot ids are
         # the row-major flattening of the first two dimensions.
         return cache.flatten(0, 1)
