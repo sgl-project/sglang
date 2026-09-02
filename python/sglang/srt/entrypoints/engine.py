@@ -105,7 +105,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_model,
     get_parallel,
     get_serving,
@@ -849,8 +848,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        # Elastic-EP offset joiners always route through DPC (primary owns tokenizer/router).
         use_dp_controller = (
-            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or server_args.is_ep_offset_joiner
         )
 
         if not use_dp_controller:

@@ -88,6 +88,19 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+# WORLD active_ranks handle (WORLD PG has no GroupCoordinator wrapper).
+_WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_WORLD_BACKEND_RANKS: List[int] = []
+
+
+def get_world_backend_active_ranks() -> Optional[torch.Tensor]:
+    return _WORLD_BACKEND_ACTIVE_RANKS
+
+
+def get_world_backend_ranks() -> List[int]:
+    return list(_WORLD_BACKEND_RANKS)
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -342,6 +355,10 @@ class GroupCoordinator:
                         f"group size ({len(ranks)})"
                     )
                     pg_active_size = max_world_size
+                elif recovered_rank and max_world_size is not None:
+                    # Recover: attach to the existing pool with the full mask.
+                    pg_active_size = max(max_world_size, len(ranks))
+                pass_max_ws = pg_active_size == max_world_size
 
                 pg_active_ranks = torch.zeros(
                     pg_active_size, dtype=torch.int32, device=self.device
@@ -350,7 +367,7 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if not recovered_rank and max_world_size is not None:
+                if pass_max_ws:
                     dev_opts = MooncakeBackendOptions(
                         pg_active_ranks, recovered_rank, max_world_size
                     )
@@ -2283,6 +2300,9 @@ def init_distributed_environment(
             from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
+            # Recover path also uses max_ws when equal to world_size (attach to pool).
+            if not use_max_ws and recovered_rank and max_world_size == world_size:
+                use_max_ws = True
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
@@ -2304,6 +2324,12 @@ def init_distributed_environment(
             timeout=timeout,
             pg_options=pg_options,
         )
+
+        # Publish WORLD active_ranks handle for elastic-EP mask flips (no wrapper).
+        if backend == "mooncake":
+            global _WORLD_BACKEND_ACTIVE_RANKS, _WORLD_BACKEND_RANKS
+            _WORLD_BACKEND_ACTIVE_RANKS = active_ranks
+            _WORLD_BACKEND_RANKS = list(range(ar_size))
 
         # Create a global TCPStore for coordination (used by NIXL)
         if moe_a2a_backend == "nixl":
@@ -2732,6 +2758,9 @@ def initialize_model_parallel(
             backend,
             use_custom_allreduce=False,
             group_name="self_pp",
+            # A joiner's world_size is its local layout, so the singletons come out
+            # in local rank space and none of them would match its global rank.
+            rank_offset=rank_offset,
         )
 
     get_parallel().stamp_derived_widths(**derived_widths)
