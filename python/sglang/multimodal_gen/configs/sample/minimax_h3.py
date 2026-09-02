@@ -302,4 +302,26 @@ class MiniMaxH3SamplingParams(SamplingParams):
             req.extra.update(self.build_request_extra())
 
 
-__all__ = ["MiniMaxH3SamplingParams"]
+@dataclass
+class FastH3SamplingParams(MiniMaxH3SamplingParams):
+    """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
+
+    num_inference_steps: int = 5
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps != 5:
+            raise ValueError(
+                "FastH3 is distilled for exactly five sigma grid points (four DiT "
+                f"forwards); got num_inference_steps={self.num_inference_steps}. "
+                "Use MiniMaxAI/MiniMax-H3 for other schedules."
+            )
+        if self.task is not None and self.task.strip().lower() != "t2va":
+            raise ValueError(
+                "FastH3 is distilled for t2va only; fl2va and ref2va were not "
+                f"distilled (got task={self.task!r}). Use MiniMaxAI/MiniMax-H3 "
+                "for those tasks."
+            )
+
+
+__all__ = ["FastH3SamplingParams", "MiniMaxH3SamplingParams"]
