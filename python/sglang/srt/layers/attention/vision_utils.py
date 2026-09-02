@@ -60,6 +60,8 @@ def pad_vit_attn_dummy_heads(config, name: str, loaded_weight: torch.Tensor):
         )
         loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
     elif "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
+        if loaded_weight.numel() == head_dim:
+            return loaded_weight
         padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
         loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
     return loaded_weight
