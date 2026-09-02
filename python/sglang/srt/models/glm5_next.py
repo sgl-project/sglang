@@ -1229,11 +1229,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        vision_utils.update_vit_attn_dummy_heads_config(config)
         self.mm_config = config
         text_config = config.text_config
         self.encoder_only = bool(getattr(config, "encoder_only", False))
-        self.language_only = bool(getattr(config, "language_only", False))
+        vision_config = getattr(config, "vision_config", None)
+        self.language_only = bool(
+            getattr(config, "language_only", False) or vision_config is None
+        )
+        if not self.language_only:
+            vision_utils.update_vit_attn_dummy_heads_config(config)
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
@@ -1307,7 +1311,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.visual = None
         if not self.language_only:
             self.visual = Glm5NextVisionModel(
-                config.vision_config,
+                vision_config,
                 quant_config=quant_config,
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,

@@ -17,6 +17,88 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+@pytest.mark.parametrize(
+    ("language_only", "vision_config", "expects_visual"),
+    [
+        (True, SimpleNamespace(), False),
+        (False, None, False),
+        (False, SimpleNamespace(), True),
+    ],
+)
+def test_glm5_next_initializes_vision_only_with_vision_config(
+    monkeypatch, language_only, vision_config, expects_visual
+):
+    text_config = SimpleNamespace(
+        q_lora_rank=None,
+        tie_word_embeddings=False,
+        vocab_size=16,
+        hidden_size=8,
+        mhc=False,
+        rope_scaling=None,
+    )
+    config = SimpleNamespace(
+        text_config=text_config,
+        vision_config=vision_config,
+        encoder_only=False,
+        language_only=language_only,
+    )
+    pp_group = SimpleNamespace(is_last_rank=False, world_size=1)
+    parallel = SimpleNamespace(tp_size=1)
+    mm = SimpleNamespace(mm_enable_dp_encoder=False)
+    attn_tp_context = SimpleNamespace(init_context=lambda *_args: None)
+    language_model = nn.Module()
+    language_model.layers = []
+    visual = nn.Identity()
+    update_calls = []
+
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.vision_utils.update_vit_attn_dummy_heads_config",
+        update_calls.append,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.Glm5NextVisionModel",
+        lambda *_args, **_kwargs: visual,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.Glm5NextModel",
+        lambda *_args, **_kwargs: language_model,
+    )
+    monkeypatch.setattr(
+        Glm5NextForConditionalGeneration,
+        "determine_num_fused_shared_experts",
+        lambda self: setattr(self, "num_fused_shared_experts", 0),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.LogitsProcessor",
+        lambda *_args, **_kwargs: nn.Identity(),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.PPMissingLayer", nn.Identity
+    )
+    monkeypatch.setattr("sglang.srt.models.glm5_next.get_pp_group", lambda: pp_group)
+    monkeypatch.setattr("sglang.srt.models.glm5_next.get_parallel", lambda: parallel)
+    monkeypatch.setattr("sglang.srt.models.glm5_next.get_mm", lambda: mm)
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.get_attn_tp_context", lambda: attn_tp_context
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.is_deepseek_dsa", lambda _config: False
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.is_dsa_enable_prefill_cp", lambda: False
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.is_prefill_context_parallel_enabled",
+        lambda: False,
+    )
+
+    model = Glm5NextForConditionalGeneration(config)
+
+    assert model.language_only == (language_only or vision_config is None)
+    assert model.visual is (visual if expects_visual else None)
+    assert update_calls == ([config] if expects_visual else [])
+
+
 def test_glm5_next_dflash_contracts_mhc_hidden_state():
     model = Glm5NextModel.__new__(Glm5NextModel)
     nn.Module.__init__(model)
