@@ -3017,39 +3017,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
-    def _c128_pages_required_next_decode(
-        self, selected_indices: Optional[List[int]] = None
-    ) -> int:
-        allocator = self.token_to_kv_pool_allocator
-        if not hasattr(allocator, "c128_num_pages_needed"):
-            return 0
-
-        requests = (
-            self.reqs
-            if selected_indices is None
-            else [self.reqs[i] for i in selected_indices]
-        )
-        prefix_lens = []
-        seq_lens = []
-        reserve = None
-        if not self.spec_algorithm.is_none():
-            reserve = get_alloc_reserve_per_decode()
-        for req in requests:
-            current_len = req.kv.kv_allocated_len
-            if reserve is None:
-                next_len = current_len + 1
-            else:
-                num_new_tokens = max(
-                    0, req.kv_committed_len + reserve - current_len
-                )
-                next_len = current_len + num_new_tokens
-            prefix_lens.append(current_len)
-            seq_lens.append(next_len)
-
-        prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
-        seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        return allocator.c128_num_pages_needed(prefix_lens_cpu, seq_lens_cpu)
-
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
         the capacity gate (eviction + any per-step reservations of its own) —
@@ -3057,16 +3024,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         shortfalls retract gracefully instead of tripping fail-loud alloc
         errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-        allocator = self.token_to_kv_pool_allocator
-        if hasattr(allocator, "ensure_c128_capacity"):
-            c128_num_pages = self._c128_pages_required_next_decode(selected_indices)
-            c128_ok = allocator.ensure_c128_capacity(
-                self.tree_cache, c128_num_pages
-            )
-            full_swa_ok = allocator.full_swa_available_size() >= num_tokens
-            return full_swa_ok and c128_ok
-        return allocator.available_size() >= num_tokens
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            num_tokens=num_tokens, tree_cache=self.tree_cache
+        )
 
     def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""

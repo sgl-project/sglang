@@ -31,9 +31,6 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla_pf_lf,
     )
 
-if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
-
 logger = logging.getLogger(__name__)
 
 
@@ -218,15 +215,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; a torch.device key silently falls back to
-        # cudaHostRegister, which fails on NPU. Resolve the alloc func by type str.
-        _alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
-        )
-        alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -286,11 +275,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             if self.data_refs
             else None
         )
-        # Split-buffer support for NPU C4 indexer (int8 K + fp16 scale).
-        # Populated via attach_scale_buffers(); None means no scale buffer.
-        self.scale_device_buffers: list[torch.Tensor] | None = None
-        self.scale_kv_buffer = None
-        self.scale_item_bytes: int = 0
         self.can_use_jit = False
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
@@ -309,97 +293,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             (staging_page_capacity, self.layer_num, self.item_bytes),
             dtype=self.dtype,
             device=self.gpu_device,
-        )
-
-    def attach_scale_buffers(
-        self,
-        scale_device_buffers: list,
-        scale_item_bytes: int,
-    ) -> None:
-        """Attach fp16 scales shaped ``(pages, slot_page_size, 1, scale_dim)``.
-
-        For example, ``scale_item_bytes = slot_page_size * scale_dim * 2``."""
-        if self.scale_kv_buffer is not None:
-            raise RuntimeError(f"{self.pool_name}: scale buffers already attached")
-        if len(scale_device_buffers) != self.layer_num:
-            raise ValueError(
-                f"{self.pool_name}: scale_device_buffers has "
-                f"{len(scale_device_buffers)} layers, expected {self.layer_num}"
-            )
-
-        self.scale_device_buffers = scale_device_buffers
-        self.scale_item_bytes = scale_item_bytes
-
-        _alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
-        )
-        alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
-        logger.info(
-            "Attaching %.2f MB host memory for V4 indexer scale pool '%s' "
-            "(layers=%d, pages=%d, scale_item_bytes=%d, layout=%s).",
-            self.layer_num * self.num_host_pages * scale_item_bytes / 1e6,
-            self.pool_name,
-            self.layer_num,
-            self.num_host_pages,
-            scale_item_bytes,
-            self.layout,
-        )
-        if self.layout == "layer_first":
-            self.scale_kv_buffer = [
-                alloc_func(
-                    (self.num_host_pages, scale_item_bytes),
-                    dtype=self.dtype,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
-                )
-                for _ in range(self.layer_num)
-            ]
-        elif self.layout in ["page_first", "page_first_direct"]:
-            self.scale_kv_buffer = alloc_func(
-                (self.num_host_pages, self.layer_num, 1, scale_item_bytes),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
-        else:
-            raise ValueError(
-                f"{self.pool_name} attach_scale_buffers: "
-                f"unsupported layout {self.layout!r}"
-            )
-
-    def _host_page_view(self, l: int, *, is_scale: bool) -> torch.Tensor:
-        """View a host KV or scale layer as ``[pages, 1, P, 1, dim]``."""
-        if is_scale:
-            host_buffer = self.scale_kv_buffer
-            device_buffer = self.scale_device_buffers[l]
-            supported_layouts = ["layer_first", "page_first", "page_first_direct"]
-            layout_desc = "layer_first/page_first/page_first_direct"
-        else:
-            host_buffer = self.kv_buffer
-            device_buffer = self.device_buffers[l]
-            supported_layouts = ["layer_first", "page_first_direct"]
-            layout_desc = "layer_first or page_first_direct"
-
-        if self.layout not in supported_layouts:
-            raise ValueError(
-                f"{self.pool_name} _host_page_view: kernel_ascend requires "
-                f"{layout_desc} layout, got {self.layout!r}"
-            )
-        layer_buffer = (
-            host_buffer[l]
-            if self.layout == "layer_first"
-            else host_buffer[:, l, 0, :]
-        )
-        return layer_buffer.view(device_buffer.dtype).view(
-            self.num_host_pages,
-            1,
-            self.slot_page_size,
-            1,
-            device_buffer.shape[-1],
         )
 
     def get_contiguous_buf_infos(self):
@@ -537,42 +430,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=host_rows,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            # Ascend transfers whole pages one layer at a time using token indices.
-            # The operator computes page = index // slot_page_size; V stays empty.
-            for l in range(self.layer_num):
-                dev_view = self.device_buffers[l].unsqueeze(0)
-                # dev_view: [1, dev_pages, slot_page_size, 1, kv_dim]
-                host_view = self._host_page_view(l, is_scale=False)
-                # host_view: [num_host_pages, 1, slot_page_size, 1, kv_dim]
-                transfer_kv_dim_exchange(
-                    device_k=dev_view,
-                    host_k=host_view,
-                    device_v=torch.empty(0, device=dev_view.device),
-                    host_v=torch.empty(0, device="cpu"),
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    page_size=self.slot_page_size,
-                    direction=TransferDirection.D2H,
-                )
-                # Scale buffer: separate transfer (element_size differs from K;
-                # cannot pass scale as device_v because the op sizes V using K's
-                # element_size, which would corrupt scale data).
-                if self.scale_device_buffers is not None:
-                    scale_dev_view = self.scale_device_buffers[l].unsqueeze(0)
-                    # scale_dev_view: [1, dev_pages, slot_page_size, 1, scale_dim]
-                    scale_host_view = self._host_page_view(l, is_scale=True)
-                    # scale_host_view: [num_host_pages, 1, slot_page_size, 1, scale_dim]
-                    transfer_kv_dim_exchange(
-                        device_k=scale_dev_view,
-                        host_k=scale_host_view,
-                        device_v=torch.empty(0, device=scale_dev_view.device),
-                        host_v=torch.empty(0, device="cpu"),
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        page_size=self.slot_page_size,
-                        direction=TransferDirection.D2H,
-                    )
         else:
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
@@ -641,39 +498,6 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            # NPU whole-page H2D via Ascend dim-exchange op, for layer_id only.
-            dev_view = self.device_buffers[layer_id].unsqueeze(0)
-            # dev_view: [1, dev_pages, slot_page_size, 1, kv_dim]
-            host_view = self._host_page_view(layer_id, is_scale=False)
-            # host_view: [num_host_pages, 1, slot_page_size, 1, kv_dim]
-            transfer_kv_dim_exchange(
-                device_k=dev_view,
-                host_k=host_view,
-                device_v=torch.empty(0, device=dev_view.device),
-                host_v=torch.empty(0, device="cpu"),
-                device_indices=device_indices,
-                host_indices=host_indices,
-                page_size=self.slot_page_size,
-                direction=TransferDirection.H2D,
-            )
-            # Scale buffer: separate H2D transfer after K completes.
-            # Completing scale marks this layer as fully loaded (single residency).
-            if self.scale_device_buffers is not None:
-                scale_dev_view = self.scale_device_buffers[layer_id].unsqueeze(0)
-                # scale_dev_view: [1, dev_pages, slot_page_size, 1, scale_dim]
-                scale_host_view = self._host_page_view(layer_id, is_scale=True)
-                # scale_host_view: [num_host_pages, 1, slot_page_size, 1, scale_dim]
-                transfer_kv_dim_exchange(
-                    device_k=scale_dev_view,
-                    host_k=scale_host_view,
-                    device_v=torch.empty(0, device=scale_dev_view.device),
-                    host_v=torch.empty(0, device="cpu"),
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    page_size=self.slot_page_size,
-                    direction=TransferDirection.H2D,
-                )
         else:
             raise ValueError(
                 f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
@@ -796,14 +620,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
-        # not torch.device objects; resolve the key the same way PagedHostPool does.
-        _state_alloc_key = (
-            self.gpu_device.type
-            if isinstance(self.gpu_device, torch.device)
-            else str(self.gpu_device)
-        )
-        alloc_func = ALLOC_MEMORY_FUNCS[_state_alloc_key]
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -921,38 +738,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
         return indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
 
-    def _ring_op_indices(self, rows: torch.Tensor) -> torch.Tensor:
-        """Expand each SWA page row into ``ring_size`` operator indices.
-
-        For example, row ``r`` maps to ``r * ring_size + arange(ring_size)``."""
-        R = self.ring_size
-        ar = torch.arange(R, device=rows.device, dtype=rows.dtype)
-        return (rows.reshape(-1, 1) * R + ar).reshape(-1)
-
-    def _state_host_page_view(self, l: int) -> torch.Tensor:
-        """View host state layer ``l`` as ``[pages, 1, R, 1, last_dim]``.
-
-        ``last_dim = state_page_bytes // R // state_dtype.itemsize``."""
-        state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
-        R = self.ring_size
-        last_dim = self.state_page_bytes // R // state_dtype.itemsize
-        if self.layout == "layer_first":
-            # [pages, state_page_bytes] uint8 -> [pages, R * last_dim]
-            # -> [pages, 1, R, 1, last_dim].
-            return self.kv_buffer[l].view(state_dtype).view(
-                self.num_host_pages, 1, R, 1, last_dim
-            )
-        if self.layout == "page_first_direct":
-            # Slice ``[:, l, 0, :]`` to [pages, state_page_bytes].
-            # The operator accepts this non-contiguous layer slice.
-            return self.kv_buffer[:, l, 0, :].view(state_dtype).view(
-                self.num_host_pages, 1, R, 1, last_dim
-            )
-        raise ValueError(
-            f"{self.pool_name} _state_host_page_view: kernel_ascend requires "
-            f"layer_first or page_first_direct layout, got {self.layout!r}"
-        )
-
     def get_size_per_token(self):
         return self.state_page_bytes
 
@@ -1039,35 +824,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=host_rows,
                 page_size=1,
             )
-        elif io_backend == "kernel_ascend":
-            # Ascend copies ring_size state slots for each page-aligned SWA row.
-            # _ring_op_indices expands device and host rows into operator indices.
-            R = self.ring_size
-            dev_op_indices = self._ring_op_indices(device_rows)
-            host_op_indices = self._ring_op_indices(host_rows)
-            for l in range(self.layer_num):
-                state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
-                last_dim = self.state_page_bytes // R // state_dtype.itemsize
-                num_dev_pages = self.device_page_views[l].shape[0]
-                dev_view = (
-                    self.device_page_views[l]
-                    .view(state_dtype)
-                    .view(num_dev_pages, R, 1, last_dim)
-                    .unsqueeze(0)
-                )
-                # dev_view: [1, num_dev_pages, R, 1, last_dim]
-                host_view = self._state_host_page_view(l)
-                # host_view: [num_host_pages, 1, R, 1, last_dim]
-                transfer_kv_dim_exchange(
-                    device_k=dev_view,
-                    host_k=host_view,
-                    device_v=torch.empty(0, device=dev_view.device),
-                    host_v=torch.empty(0, device="cpu"),
-                    device_indices=dev_op_indices,
-                    host_indices=host_op_indices,
-                    page_size=R,
-                    direction=TransferDirection.D2H,
-                )
         else:
             raise ValueError(
                 f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
@@ -1121,35 +877,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=device_rows,
                 layer_id=layer_id,
                 page_size=1,
-            )
-        elif io_backend == "kernel_ascend":
-            # NPU whole-page H2D via Ascend dim-exchange op, for layer_id only.
-            # See backup_from_device_all_layer: indices must be ring-row indices
-            # (ring_size entries per SWA page), not raw SWA locs.
-            R = self.ring_size
-            dev_op_indices = self._ring_op_indices(device_rows)
-            host_op_indices = self._ring_op_indices(host_rows)
-            state_dtype = self.state_pools[layer_id].kv_score_buffer.kv_score.dtype
-            last_dim = self.state_page_bytes // R // state_dtype.itemsize
-            num_dev_pages = self.device_page_views[layer_id].shape[0]
-            dev_view = (
-                self.device_page_views[layer_id]
-                .view(state_dtype)
-                .view(num_dev_pages, R, 1, last_dim)
-                .unsqueeze(0)
-            )
-            # dev_view: [1, num_dev_pages, R, 1, last_dim]
-            host_view = self._state_host_page_view(layer_id)
-            # host_view: [num_host_pages, 1, R, 1, last_dim]
-            transfer_kv_dim_exchange(
-                device_k=dev_view,
-                host_k=host_view,
-                device_v=torch.empty(0, device=dev_view.device),
-                host_v=torch.empty(0, device="cpu"),
-                device_indices=dev_op_indices,
-                host_indices=host_op_indices,
-                page_size=R,
-                direction=TransferDirection.H2D,
             )
         else:
             raise ValueError(

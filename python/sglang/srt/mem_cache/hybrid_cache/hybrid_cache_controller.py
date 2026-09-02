@@ -324,12 +324,6 @@ class HybridCacheController(BaseHiCacheController):
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
             return None
-        # resolve_host_transfers assigns raw anchor indices to KV-derived pools
-        # without ratio conversion; fix them up now.
-        if pool_transfers:
-            for pool in pool_transfers:
-                if pool.indices_from_pool == PoolName.KV:
-                    self._apply_kv_anchor_ratio(pool, pool.device_indices, pool.host_indices)
 
         self.write_queue.append(
             CacheOperation(
@@ -833,29 +827,6 @@ class HybridCacheController(BaseHiCacheController):
                 )
                 transfer.host_indices = transfer.host_indices[:needed]
 
-    def _apply_kv_anchor_ratio(
-        self,
-        pool: PoolTransfer,
-        device_indices: torch.Tensor,
-        host_indices: torch.Tensor,
-    ) -> None:
-        """Assign KV-anchor indices to pool, scaled by the pool's compression ratio.
-
-        C4/C128 compressed pools derive their token indices from the FULL-pool
-        anchor but use a smaller slot_page_size; the transfer op requires indices
-        already divided by the ratio (page_size // slot_page_size).
-        """
-        entry = self.mem_pool_host.entry_map.get(pool.name)
-        ratio = 1
-        if entry is not None and self.page_size % entry.host_pool.slot_page_size == 0:
-            ratio = self.page_size // entry.host_pool.slot_page_size
-        if ratio > 1:
-            pool.device_indices = device_indices // ratio
-            pool.host_indices = host_indices // ratio
-        else:
-            pool.device_indices = device_indices
-            pool.host_indices = host_indices
-
     def _resolve_device_transfers(
         self,
         extra_pools: Optional[list[PoolTransfer]],
@@ -903,7 +874,8 @@ class HybridCacheController(BaseHiCacheController):
         # Assign indices to deferred pools from their source.
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
-                self._apply_kv_anchor_ratio(pool, kv_device_indices, kv_host_indices)
+                pool.host_indices = kv_host_indices
+                pool.device_indices = kv_device_indices
                 continue
 
             source = next(
