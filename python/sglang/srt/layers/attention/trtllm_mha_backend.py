@@ -987,6 +987,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             out_cache_loc=forward_batch.out_cache_loc,
         )
 
+    def draft_extend_rereads_shared_state_in_graph(self) -> bool:
+        # init_forward_metadata_in_graph is recorded into the draft-extend
+        # capture (_apply_cuda_graph_metadata ->
+        # update_trtllm_mha_graph_metadata), so every replay re-reads
+        # req_to_token on device. That rebuild does not satisfy
+        # draft_extend_metadata_captured_in_graph()'s contract (replay still
+        # needs the eager init_forward_metadata_out_graph call to rebind
+        # forward_metadata per step, so multi-layer single-graph draft modes
+        # must stay gated off); declare only the WAR read-done deferral.
+        return True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 

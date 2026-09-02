@@ -2019,6 +2019,9 @@ class TritonAttnBackend(AttentionBackend):
         )
         return o
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class TritonMultiStepDraftBackend:
     """

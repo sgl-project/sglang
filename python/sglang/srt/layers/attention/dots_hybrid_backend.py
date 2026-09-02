@@ -163,6 +163,9 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         return self.backend.draft_extend_metadata_captured_in_graph()
 
+    def draft_extend_rereads_shared_state_in_graph(self) -> bool:
+        return self.backend.draft_extend_rereads_shared_state_in_graph()
+
     def selected_backend(self, forward_batch: ForwardBatch) -> AttentionBackend:
         return (
             self.backend._select_backend(forward_batch.forward_mode)

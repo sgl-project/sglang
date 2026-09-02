@@ -74,6 +74,15 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
+def read_done_publishes_after_replay(draft_extend_attn_backend) -> bool:
+    """Position of the scheduler WAR read-done record relative to the replay
+    launch: after it when the backend's captured draft-extend graph re-reads
+    scheduler-shared state (req_to_token) during replay itself, before it
+    otherwise (keeping the legacy scheduler overlap). Module-level so tests
+    can pin the runner's ordering decision against the backend capability."""
+    return draft_extend_attn_backend.draft_extend_rereads_shared_state_in_graph()
+
+
 class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     """EAGLE draft-extend cuda-graph runner.
 
@@ -469,6 +478,30 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _publish_read_done(self):
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.shared_read_done_event = read_done
+
+    def _replay_and_publish_read_done(self, shape_key, forward_batch):
+        """Launch the captured graph and publish the read-done event the
+        scheduler's WAR barrier waits on before its next shared-buffer write
+        (draft extend is the EAGLE-family last shared-read phase; last write
+        wins the mailbox). Backends whose captured graph re-reads req_to_token
+        during replay itself (an in-graph metadata rebuild, or a recorded
+        kernel gathering from the shared table) must have their event recorded
+        after the replay launch; all other backends retain the legacy early
+        publication and its scheduler overlap. This method owns that ordering;
+        tests pin it via spies."""
+        publish_after = read_done_publishes_after_replay(self.draft_extend_attn_backend)
+        if not publish_after:
+            self._publish_read_done()
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
+            out = self._replay_graph(shape_key, forward_batch)
+        if publish_after:
+            self._publish_read_done()
+        return out
+
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
@@ -593,18 +626,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
-        # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
-        read_done = self.device_module.Event()
-        read_done.record()
-        self.model_runner.shared_read_done_event = read_done
-
         self.raw_bs = raw_bs
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
-            out = self._replay_graph(shape_key, forward_batch)
+        out = self._replay_and_publish_read_done(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
             next_token_logits=out.next_token_logits[:num_tokens],

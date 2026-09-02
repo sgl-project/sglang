@@ -578,6 +578,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def supports_draft_extend_cuda_graph(self) -> bool:
+        return True
+
 
 class FlashMLAMultiStepDraftBackend:
     # Read by decide_needs_cpu_seq_lens (getattr defaults missing flags to True).
