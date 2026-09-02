@@ -1309,9 +1309,7 @@ class IndexerKPool(MultiPlatformOp):
 
         def _compress_write() -> None:
             score = self._compute_gate_score_if_missing(x, gate_score_maybe)
-            real_num_tokens = getattr(
-                forward_batch, "num_token_non_padded_cpu", None
-            )
+            real_num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
             if real_num_tokens is None:
                 real_num_tokens = key.shape[0]
             assert 0 <= real_num_tokens <= key.shape[0], (

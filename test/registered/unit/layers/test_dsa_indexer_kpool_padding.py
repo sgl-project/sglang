@@ -5,8 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
-from sglang.srt.layers.attention.dsa import kpool_fp8_index
+from sglang.srt.layers.attention.dsa import dsa_indexer_kpool, kpool_fp8_index
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -52,9 +51,7 @@ class TestDSAIndexerKPoolTargetVerifyPadding(CustomTestCase):
             write_loc=torch.tensor([[29], [-1]]),
             effective_n_per_batch=torch.tensor([6, 0], dtype=torch.int32),
         )
-        metadata = SimpleNamespace(
-            attn_metadata=SimpleNamespace(kpool_write_plan=plan)
-        )
+        metadata = SimpleNamespace(attn_metadata=SimpleNamespace(kpool_write_plan=plan))
         forward_batch = SimpleNamespace(
             num_token_non_padded_cpu=6,
             spec_info=SimpleNamespace(ragged_verify_layout=None),
@@ -102,9 +99,7 @@ class TestDSAIndexerKPoolTargetVerifyPadding(CustomTestCase):
         indexer = self._indexer(num_tokens=4)
         pool = self._pool()
         plan = SimpleNamespace(num_draft_tokens=3)
-        metadata = SimpleNamespace(
-            attn_metadata=SimpleNamespace(kpool_write_plan=plan)
-        )
+        metadata = SimpleNamespace(attn_metadata=SimpleNamespace(kpool_write_plan=plan))
         forward_batch = SimpleNamespace(
             num_token_non_padded_cpu=4,
             out_cache_loc=torch.arange(4),
