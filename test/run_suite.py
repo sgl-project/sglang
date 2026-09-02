@@ -23,6 +23,7 @@ HW_MAPPING = {
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
+    "mps": HWBackend.MPS,
 }
 
 # Per-commit test suites (run on every PR).
@@ -116,6 +117,11 @@ PER_COMMIT_SUITES = {
     HWBackend.MLX: [
         "stage-a-unit-test-mlx",
         "stage-b-e2e-mlx",
+    ],
+    HWBackend.MPS: [
+        "stage-a-unit-test-mps",
+        # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
+        "stage-b-e2e-mps",
     ],
 }
 
@@ -213,6 +219,7 @@ _SUITE_CHECKED_BACKENDS = {
     HWBackend.MUSA,
     HWBackend.XPU,
     HWBackend.MLX,
+    HWBackend.MPS,
 }
 
 
