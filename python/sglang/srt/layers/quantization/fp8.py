@@ -1083,6 +1083,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         quant_config: The quantization config.
     """
 
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        """Load W13 as [up, gate] for FlashInfer's fused gated GEMM."""
+        return get_moe_runner_backend().is_flashinfer_cutlass()
+
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
@@ -1107,6 +1112,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_platform().is_sm90
                 or get_platform().is_sm120
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
+        if get_moe_runner_backend().is_flashinfer_cutlass():
+            assert (
+                is_sm120_supported()
+            ), "blockwise FP8 with flashinfer_cutlass requires an SM120/SM121 GPU"
+            assert (
+                not self.is_fp4_expert and self.block_quant
+            ), "flashinfer_cutlass FP8 MoE requires blockwise FP8 weights"
+            assert tuple(self.weight_block_size) == (
+                128,
+                128,
+            ), "flashinfer_cutlass FP8 MoE requires weight_block_size=[128, 128]"
+            assert get_moe_a2a_backend().is_none(), (
+                "flashinfer_cutlass blockwise FP8 currently supports only "
+                "--moe-a2a-backend none"
+            )
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled(
@@ -1441,9 +1461,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if (
             not self.is_fp4_expert
             and self.block_quant
-            and get_moe_runner_backend().is_cutlass()
+            and (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_cutlass()
+            )
         ):
-            self._ensure_cutlass_buffers_initialized(layer)
+            if get_moe_runner_backend().is_cutlass():
+                self._ensure_cutlass_buffers_initialized(layer)
+            else:
+                self._ensure_flashinfer_sm120_buffers_initialized(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
@@ -1757,6 +1783,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
+                    )
+
+                if get_moe_runner_backend().is_flashinfer_cutlass():
+                    # FlashInfer consumes B scales as [E, K_blocks, N_blocks].
+                    layer.register_buffer(
+                        "flashinfer_w13_weight_scale",
+                        layer.w13_weight_scale_inv.transpose(1, 2).contiguous(),
+                        persistent=False,
+                    )
+                    layer.register_buffer(
+                        "flashinfer_w2_weight_scale",
+                        layer.w2_weight_scale_inv.transpose(1, 2).contiguous(),
+                        persistent=False,
                     )
 
     def _convert_mxfp8_moe_to_block_fp8(self, layer: Module) -> None:
@@ -2387,8 +2426,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_flashinfer_cutlass()
             or moe_runner_backend.is_hpc_ops()
         ):
+            if moe_runner_backend.is_flashinfer_cutlass():
+                import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+                assert (
+                    moe_runner_config.params_dtype == torch.bfloat16
+                ), "flashinfer_cutlass blockwise FP8 requires bfloat16 model dtype"
+                assert (
+                    moe_runner_config.is_gated
+                    and moe_runner_config.activation == "silu"
+                    and moe_runner_config.gemm1_alpha is None
+                    and moe_runner_config.gemm1_clamp_limit is None
+                ), "flashinfer_cutlass blockwise FP8 supports SwiGLU only"
+                # The native SM120 grouped GEMM consumes local expert IDs.
+                moe_runner_config.accepts_global_expert_ids = False
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
         else:
@@ -2544,6 +2598,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 enable_es=(use_mxfp8, use_mxfp8),
             )
             return StandardCombineInput(hidden_states=output)
+
+        if self.runner.runner_backend.is_flashinfer_cutlass():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferSm120Fp8MoeQuantInfo,
+            )
+
+            quant_info = FlashInferSm120Fp8MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.flashinfer_w13_weight_scale,
+                w2_weight_scale=layer.flashinfer_w2_weight_scale,
+                expert_offsets=self.expert_offsets,
+                problem_sizes1=self.problem_sizes1,
+                problem_sizes2=self.problem_sizes2,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.runner.runner_backend.is_deep_gemm():
 
@@ -2706,6 +2776,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         self._cutlass_buffers_ready = True
+
+    def _ensure_flashinfer_sm120_buffers_initialized(self, layer: Module) -> None:
+        if getattr(self, "_flashinfer_sm120_buffers_ready", False):
+            return
+
+        device = layer.w13_weight.device
+        num_experts = layer.w13_weight.shape[0]
+        self.expert_offsets = torch.empty(
+            num_experts + 1, device=device, dtype=torch.int32
+        )
+        self.problem_sizes1 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self.problem_sizes2 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self._flashinfer_sm120_buffers_ready = True
 
     def maybe_get_hip_aiter_quant_info(
         self,

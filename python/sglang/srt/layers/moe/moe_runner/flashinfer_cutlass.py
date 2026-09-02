@@ -1,6 +1,6 @@
 """FlashInfer CUTLASS MoE fused funcs.
 
-This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
+This module owns FlashInfer CUTLASS MoE calls used by blockwise FP8,
 unquantized, ModelOpt FP8, ModelOpt NVFP4, and MXFP4 MoE paths.
 Quantization methods prepare a small quant_info payload and route through
 ``MoeRunner``.
@@ -59,6 +59,19 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+
+
+@dataclass
+class FlashInferSm120Fp8MoeQuantInfo(MoeQuantInfo):
+    """Payload for FlashInfer's native SM120 blockwise-FP8 grouped GEMM."""
+
+    w13_weight: torch.Tensor  # FP8 [E, 2*N, K], loaded as [up, gate]
+    w2_weight: torch.Tensor  # FP8 [E, K, N]
+    w13_weight_scale: torch.Tensor  # FP32 [E, K/128, 2*N/128]
+    w2_weight_scale: torch.Tensor  # FP32 [E, N/128, K/128]
+    expert_offsets: torch.Tensor  # int32 [E + 1]
+    problem_sizes1: torch.Tensor  # int32 [E, 3]
+    problem_sizes2: torch.Tensor  # int32 [E, 3]
 
 
 @dataclass
@@ -256,6 +269,137 @@ def _run_flashinfer_cutlass(
     return output
 
 
+def _run_flashinfer_sm120_fp8(
+    *,
+    dispatch_output,
+    quant_info: FlashInferSm120Fp8MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> torch.Tensor:
+    """Run the SM120-only FlashInfer blockwise-FP8 grouped-GEMM path."""
+    if not is_flashinfer_available():
+        raise RuntimeError(
+            "flashinfer_cutlass blockwise FP8 requires flashinfer to be installed"
+        )
+    from flashinfer.grouped_mm import moe_gemm_fp8_nt_groupwise
+    from sgl_kernel import apply_shuffle_mul_sum, prepare_moe_input
+
+    from sglang.kernels.ops.moe.pack_flashinfer_scales import (
+        pack_flashinfer_moe_scales,
+        shuffle_rows_and_pack_flashinfer_moe_scales,
+        silu_and_mul_quant_pack_flashinfer_moe,
+    )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    x = dispatch_output.hidden_states
+    topk_weights = dispatch_output.topk_output.topk_weights
+    topk_ids = dispatch_output.topk_output.topk_ids
+    assert x.dtype == torch.bfloat16, "SM120 FlashInfer FP8 MoE requires BF16 input"
+    assert runner_config.is_gated and runner_config.activation == "silu"
+    assert not runner_config.apply_router_weight_on_input
+    assert runner_config.gemm1_alpha is None
+    assert runner_config.gemm1_clamp_limit is None
+    assert topk_weights.shape == topk_ids.shape
+
+    w13_weight = quant_info.w13_weight
+    w2_weight = quant_info.w2_weight
+    assert w13_weight.dtype == w2_weight.dtype == torch.float8_e4m3fn
+    assert w13_weight.shape[0] == w2_weight.shape[0]
+    assert quant_info.w13_weight_scale.dtype == torch.float32
+    assert quant_info.w2_weight_scale.dtype == torch.float32
+
+    num_experts = w13_weight.shape[0]
+    hidden_size = x.shape[1]
+    intermediate_size = w2_weight.shape[2]
+    total_rows = topk_ids.numel()
+    assert total_rows > 0
+
+    # topk_ids have already been mapped to local expert IDs by the standard
+    # dispatcher. Non-local EP routes use -1 and are redirected to a zero sink.
+    a_map = torch.zeros(total_rows, dtype=torch.int32, device=x.device)
+    # Keep a dedicated zero row outside the GEMM output. Reusing the last GEMM
+    # row as the sink corrupts an actual route when every selected expert is
+    # local (for example EP=1).
+    c_map = torch.full((total_rows,), total_rows, dtype=torch.int32, device=x.device)
+    prepare_moe_input(
+        topk_ids,
+        quant_info.expert_offsets,
+        quant_info.problem_sizes1,
+        quant_info.problem_sizes2,
+        a_map,
+        c_map,
+        num_experts,
+        intermediate_size,
+        hidden_size,
+    )
+
+    x_q, x_scale = sglang_per_token_group_quant_fp8(x, 128)
+    repeated_x_q, packed_x_scale = shuffle_rows_and_pack_flashinfer_moe_scales(
+        x_q, x_scale, a_map, quant_info.expert_offsets
+    )
+
+    swiglu_limit = runner_config.swiglu_limit
+    gate_up = torch.empty(
+        (
+            total_rows,
+            intermediate_size if swiglu_limit is None else 2 * intermediate_size,
+        ),
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    moe_gemm_fp8_nt_groupwise(
+        repeated_x_q,
+        w13_weight,
+        packed_x_scale,
+        quant_info.w13_weight_scale,
+        quant_info.expert_offsets,
+        out=gate_up,
+        is_gated=swiglu_limit is None,
+    )
+
+    if swiglu_limit is None:
+        intermediate_q, intermediate_scale = sglang_per_token_group_quant_fp8(
+            gate_up, 128
+        )
+        packed_intermediate_scale = pack_flashinfer_moe_scales(
+            intermediate_scale, quant_info.expert_offsets
+        )
+    else:
+        intermediate_q, packed_intermediate_scale = (
+            silu_and_mul_quant_pack_flashinfer_moe(
+                gate_up,
+                quant_info.expert_offsets,
+                swiglu_limit,
+            )
+        )
+    expert_output_with_sink = torch.empty(
+        (total_rows + 1, hidden_size), dtype=torch.bfloat16, device=x.device
+    )
+    expert_output = expert_output_with_sink[:total_rows]
+    expert_output_with_sink[-1].zero_()
+    moe_gemm_fp8_nt_groupwise(
+        intermediate_q,
+        w2_weight,
+        packed_intermediate_scale,
+        quant_info.w2_weight_scale,
+        quant_info.expert_offsets,
+        out=expert_output,
+        is_gated=False,
+    )
+
+    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
+        output = torch.empty_like(x)
+    apply_shuffle_mul_sum(
+        expert_output_with_sink, output, c_map, topk_weights.to(torch.bfloat16)
+    )
+    # Keep the same runner contract as Triton: CUDA MoE runners own the routed
+    # scaling factor rather than leaving it to the model wrapper.
+    if runner_config.routed_scaling_factor is not None:
+        output.mul_(runner_config.routed_scaling_factor)
+    return output
+
+
 @register_fused_func("none", "flashinfer_cutlass")
 def fused_experts_none_to_flashinfer_cutlass(
     dispatch_output: StandardDispatchOutput,
@@ -263,6 +407,14 @@ def fused_experts_none_to_flashinfer_cutlass(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    if isinstance(quant_info, FlashInferSm120Fp8MoeQuantInfo):
+        output = _run_flashinfer_sm120_fp8(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     assert isinstance(
         quant_info, FlashInferCutlassMoeQuantInfo

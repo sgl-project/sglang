@@ -64,6 +64,9 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    # None preserves the backend default. Quantization methods can override it
+    # when one backend exposes kernels with different expert-ID contracts.
+    accepts_global_expert_ids: Optional[bool] = None
 
 
 @dataclass

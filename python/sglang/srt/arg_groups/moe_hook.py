@@ -43,11 +43,12 @@ def handle_moe_kernel_config(server_args: Any):
     view = resolved_view(server_args)
     if view.moe_runner_backend == "flashinfer_cutlass":
         assert view.quantization in [
+            "fp8",
             "modelopt_fp4",
             "modelopt_fp8",
             "modelopt_mixed",
             None,
-        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'fp8', 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
         assert view.ep_size in [
             1,
             cfg.tp_size,
