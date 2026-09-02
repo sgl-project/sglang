@@ -11,7 +11,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_fp16.h>
 
 namespace sglang {
 namespace {
@@ -37,13 +36,12 @@ struct FastTopKParams {
   int64_t input_stride;
 };
 
-__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
-  __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-  return static_cast<uint8_t>(key >> 8);
-}
-
+// Monotone 32-bit key: for any floats a < b, key(a) < key(b). Stage 1, the
+// overflow descent, and the refine rounds all partition on bytes of this key.
+// Scores must be finite (the indexer feeds FP32 relu-weighted FP8 dot
+// products; -inf padding lies outside [row_start, row_start + length)).
+// NaN ordering is unspecified: the sign bit places a NaN above +inf or below
+// -inf, which is not torch.topk's canonicalization of every NaN to the top.
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -53,6 +51,7 @@ template <int K>
 __device__ void
 fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // We assume length > K here, or it will crash
+  static_assert(K < static_cast<int>(kSmem / (2 * sizeof(int))), "selection slots must fit one stash round");
   int topk = K;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
@@ -68,11 +67,18 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
 
   const int tx = threadIdx.x;
 
+  // Selection slots start at -1: if any slot is ever left unfilled by a
+  // degenerate path, the expansion emits a -1 pad column instead of
+  // feeding a garbage group id into the page-table arithmetic.
+  for (int i = tx; i < K; i += BLOCK_SIZE)
+    index[i] = -1;
+  __syncthreads();
+
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
 
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
+    const auto bin = static_cast<int>((convert_to_uint32(input[idx + row_start]) >> 24) & 0xFF);
     ::atomicAdd(&s_histogram[bin], 1);
   }
   __syncthreads();
@@ -95,10 +101,18 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   };
 
   run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
+  // Unconditional state init: every selection-structure variable must have
+  // a defined value even when no thread satisfies the threshold condition
+  // below. A missing finder then degrades to a bounded, defined path
+  // instead of consuming stale shared state.
+  if (tx == 0) {
+    s_threshold_bin_id = -1;
     s_num_input[0] = 0;
     s_counter = 0;
+  }
+  __syncthreads();
+  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+    s_threshold_bin_id = tx;
   }
   __syncthreads();
 
@@ -107,38 +121,151 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
+      const auto bin = static_cast<int>((convert_to_uint32(input[idx + row_start]) >> 24) & 0xFF);
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (pos < K) index[pos] = idx;
       }
     }
     __syncthreads();
     return;
   } else {
-    __syncthreads();
-    if (tx < RADIX + 1) {
-      s_histogram[tx] = 0;
-    }
-    __syncthreads();
+    // Threshold-bin population (the descending cumsum is still live).
+    // threshold_bin < 0 (no finder) is provably unreachable under the
+    // caller contract, but guard the shared read anyway so the defined
+    // degradation below never depends on that reachability argument:
+    // pop 0 takes the fast path, where no entry matches bin == -1 and
+    // everything classifies above into the guarded s_counter fills.
+    const auto bin_pop = threshold_bin < 0 ? 0 : s_histogram[threshold_bin] - s_histogram[threshold_bin + 1];
+    if (bin_pop <= static_cast<int>(SMEM_INPUT_SIZE)) {
+      __syncthreads();
+      if (tx < RADIX + 1) {
+        s_histogram[tx] = 0;
+      }
+      __syncthreads();
 
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      } else if (bin == threshold_bin) {
-        const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-          s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
+      for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        const auto bin = static_cast<int>((convert_to_uint32(raw_input) >> 24) & 0xFF);
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          if (pos < K) index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          const auto pos = ::atomicAdd(&s_num_input[0], 1);
+          if (C10_LIKELY(pos < int(SMEM_INPUT_SIZE))) {
+            s_input_idx[0][pos] = idx;
+            const auto bin = convert_to_uint32(raw_input);
+            const auto sub_bin = (bin >> 24) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+      __syncthreads();
+    } else {
+      // Overflow path: the threshold bin holds more candidates than the
+      // stash capacity. A bin that does not fit cannot be stashed whole,
+      // and stashing an arrival-order subset drops candidates that may
+      // belong to the top K. Descend the remaining radix bytes along the
+      // chosen byte path until the bin fits. At full 32-bit key equality
+      // every remaining candidate is tied, so a capacity clip of the
+      // final bin is exact.
+      int p0 = threshold_bin, p1 = -1, p2 = -1;
+      const auto key_participates = [&](uint32_t key, int level) -> bool {
+        if (static_cast<int>((key >> 24) & 0xFF) != p0) return false;
+        if (level >= 2 && static_cast<int>((key >> 16) & 0xFF) != p1) return false;
+        if (level >= 3 && static_cast<int>((key >> 8) & 0xFF) != p2) return false;
+        return true;
+      };
+      // Fill the definite members above the stage-1 threshold bin.
+      for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+        const auto raw_input = input[idx + row_start];
+        const auto bin = static_cast<int>((convert_to_uint32(raw_input) >> 24) & 0xFF);
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          if (pos < K) index[pos] = idx;
+        }
+      }
+      __syncthreads();
+      for (int level = 1; level <= 3; ++level) {
+        const int shift = 24 - 8 * level;
+        if (tx < RADIX + 1) {
+          s_histogram[tx] = 0;
+        }
+        __syncthreads();
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto key = convert_to_uint32(input[idx + row_start]);
+          if (key_participates(key, level)) {
+            ::atomicAdd(&s_histogram[(key >> shift) & 0xFF], 1);
+          }
+        }
+        __syncthreads();
+        run_cumsum();
+        if (tx == 0) {
+          s_threshold_bin_id = -1;
+        }
+        __syncthreads();
+        if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+          s_threshold_bin_id = tx;
+        }
+        __syncthreads();
+        const int thr = s_threshold_bin_id;
+        const int above = s_histogram[thr + 1];
+        // Guard the shared read for the (provably unreachable) no-finder
+        // case, mirroring the stage-1 bin_pop guard: pop 0 stashes
+        // nothing and the rounds degrade to a defined no-op.
+        const int pop = thr < 0 ? 0 : s_histogram[thr] - above;
+        // Fill this level's definite members (participating && byte >
+        // thr) via s_counter. Every level must contribute its above
+        // entries: s_counter fills index[] from the bottom while the
+        // final round's last_remain fills from the top, and the two meet
+        // exactly at K - needed only if no level's above entries are
+        // dropped.
+        for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+          const auto key = convert_to_uint32(input[idx + row_start]);
+          if (key_participates(key, level) && static_cast<int>((key >> shift) & 0xFF) > thr) {
+            const auto pos = ::atomicAdd(&s_counter, 1);
+            if (pos < K) index[pos] = idx;
+          }
+        }
+        __syncthreads();
+        topk -= above;
+        if (topk == 0) {
+          // Everything still needed was above the bin: already filled.
+          return;
+        }
+        if (pop <= static_cast<int>(SMEM_INPUT_SIZE) || level == 3) {
+          // Stash this bin for the refine rounds. At level 3 all stashed
+          // keys are fully resolved, so the capacity clip below only ever
+          // drops exact ties (any subset is a valid answer).
+          if (tx < RADIX + 1) {
+            s_histogram[tx] = 0;
+          }
+          __syncthreads();
+          if (tx == 0) {
+            s_num_input[0] = 0;
+          }
+          __syncthreads();
+          for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
+            const auto key = convert_to_uint32(input[idx + row_start]);
+            if (!key_participates(key, level)) continue;
+            if (static_cast<int>((key >> shift) & 0xFF) == thr) {
+              const auto pos = ::atomicAdd(&s_num_input[0], 1);
+              if (C10_LIKELY(pos < int(SMEM_INPUT_SIZE))) {
+                s_input_idx[0][pos] = idx;
+                ::atomicAdd(&s_histogram[(key >> 24) & 0xFF], 1);
+              }
+            }
+          }
+          __syncthreads();
+          break;
+        }
+        if (level == 1) {
+          p1 = thr;
+        } else if (level == 2) {
+          p2 = thr;
         }
       }
     }
-    __syncthreads();
   }
 
 #pragma unroll 4
@@ -150,9 +277,22 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
     const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
 
     run_cumsum();
+    // Invariant: the stash target s_num_input[r_idx ^ 1], s_last_remain
+    // and s_threshold_bin_id are reset every round, before the finder and
+    // independently of it. The stash store below is bounded only when the
+    // counter it increments started at zero this round; a reset that
+    // depended on the finder firing would leave a carried-over count in
+    // the round where it does not.
+    // Every stash member shares key byte 24, so round 0 finds the common
+    // top byte and copies the stash without narrowing it.
+    if (tx == 0) {
+      s_num_input[r_idx ^ 1] = 0;
+      s_last_remain = 0;
+      s_threshold_bin_id = -1;
+    }
+    __syncthreads();
     if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
       s_threshold_bin_id = tx;
-      s_num_input[r_idx ^ 1] = 0;
       s_last_remain = topk - s_histogram[tx + 1];
     }
     __syncthreads();
@@ -167,7 +307,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          if (pos < K) index[pos] = idx;
         }
       }
       __syncthreads();
@@ -185,11 +325,11 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          if (pos < K) index[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
+            if (pos > 0 && pos <= K) {
               index[K - pos] = idx;
             }
           } else {
@@ -274,6 +414,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
       const auto group_rank = col / pool_size;
       const auto group_id = s_indices[group_rank];
       const auto slot = col % pool_size;
+      if (group_id < 0) {
+        // Unfilled selection slot from a degenerate path: emit a pad
+        // column rather than dereference an invalid group id.
+        dst[col] = -1;
+        continue;
+      }
       const auto raw_token = group_id * pool_size + slot;
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
     } else if (append_tail && col < history_len + tail_count) {
