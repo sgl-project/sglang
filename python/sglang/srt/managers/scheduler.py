@@ -5018,10 +5018,16 @@ class Scheduler(
                     # The rebootstrap payload only carries token ids (see
                     # Req.build_rebootstrap_payload), so the prefill recompute
                     # would silently rebuild the prefix KV without the image.
-                    # Abort instead of serving silently-wrong output.
+                    # Abort with a client-visible error instead of serving
+                    # silently-wrong output.
                     req.set_finish_with_abort(
                         "Multimodal requests are not supported by PD "
                         "rebootstrap (retraction + weight update)."
+                    )
+                    # retract_all already released this request's KV; emit
+                    # the abort to the client directly (no re-run).
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        _make_abort_req(req), req
                     )
                     continue
                 if req.output_ids:
