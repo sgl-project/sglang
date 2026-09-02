@@ -133,6 +133,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             seq_lens_cpu=[1534, 161, 353],
             extend_seq_lens_cpu=[1534, 161, 353],
             extend_prefix_lens_cpu=[0, 0, 0],
+            dllm_config=None,
         )
 
     def _enable_zigzag(self):

@@ -443,6 +443,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             global_num_tokens_cpu=None,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
+            dllm_config=None,
         )
 
         # Prefix hits in BCG/TC-piecewise and ordinary non-MLA FullCG use the
