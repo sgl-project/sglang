@@ -1633,6 +1633,37 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestDFlashCompactCacheArgs(CustomTestCase):
+    def test_compact_cache_cli_round_trip(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-dflash-compact-cache",
+                "--speculative-draft-window-size",
+                "2048",
+            ]
+        )
+        self.assertTrue(args.speculative_dflash_compact_cache)
+        self.assertEqual(args.speculative_draft_window_size, 2048)
+
+    def test_compact_cache_requires_dflash(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_dflash_compact_cache = True
+        args.speculative_draft_window_size = 2048
+        with self.assertRaisesRegex(ValueError, "requires.*DFLASH"):
+            handle_speculative_decoding(args)
+
+    def test_compact_cache_requires_window(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "DFLASH"
+        args.speculative_dflash_compact_cache = True
+        args.speculative_draft_window_size = None
+        with self.assertRaisesRegex(ValueError, "requires.*draft-window-size"):
+            handle_speculative_decoding(args)
+
+
 class TestDecoupledSpecArgs(CustomTestCase):
     """Decoupled speculative-decoding CLI flags.
 

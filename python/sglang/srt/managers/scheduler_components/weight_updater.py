@@ -209,14 +209,32 @@ class SchedulerWeightUpdaterManager:
             )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        assert (
-            self.is_fully_idle()
-        ), "release_memory_occupation should be called only when server is idle."
+        if not self.is_fully_idle():
+            raise RuntimeError(
+                "release_memory_occupation should be called only when server is "
+                "idle."
+            )
 
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+
+        # Preflight before changing offload_tags or pausing any allocation.  The
+        # scheduler idle predicate is the normal gate; this queue-local check is
+        # deliberately redundant so a forced/mocked caller still fails closed
+        # instead of forgetting an active compact owner.
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            scheduler = self.scheduler
+            if (
+                scheduler is not None
+                and scheduler.disaggregation_mode == DisaggregationMode.DECODE
+            ):
+                transfer_queue = getattr(
+                    scheduler, "disagg_decode_transfer_queue", None
+                )
+                if transfer_queue is not None:
+                    transfer_queue.assert_memory_release_safe()
 
         for tag in tags:
             self.offload_tags.add(tag)

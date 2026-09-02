@@ -3317,6 +3317,9 @@ class Scheduler(
             req_pool_indices, dtype=torch.int64, device=device
         )
         batch.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        is_dflash = getattr(self.spec_algorithm, "is_dflash", None)
+        if is_dflash is not None and is_dflash():
+            batch.set_req_pool_owner_metadata([True] * len(reqs))
         seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
@@ -4019,6 +4022,13 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    @staticmethod
+    def _complete_req_pool_owner_acquisition(batch: ScheduleBatch) -> None:
+        """Consume one-shot compact owner binding authority after a forward."""
+        acquire_owner_mask = getattr(batch, "acquire_owner_mask", None)
+        if acquire_owner_mask is not None:
+            batch.acquire_owner_mask = torch.zeros_like(acquire_owner_mask)
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -4245,6 +4255,7 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        self._complete_req_pool_owner_acquisition(batch)
         self._maybe_report_active_ranks()
 
         return ret
@@ -4602,7 +4613,13 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
+                # Queue-removed aborts can still own KV pages / a compact draft
+                # request row while waiting for the remote drain ack.  Treat the
+                # visible transfers and those deferred holds as one ownership
+                # domain for every destructive idle consumer (flush/release).
+                idle &= not (
+                    self.disagg_decode_transfer_queue.has_pending_kv_ownership()
+                )
                 if self.decode_offload_manager is not None:
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 

@@ -34,6 +34,8 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Mori early-send: CUDA event to synchronize before RDMA (optional).
     wait_event: Optional[object] = None
+    # Optional compact DFlash state-only transfer capability.
+    draft_swa_suffix: bool = False
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

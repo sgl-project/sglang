@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -15,7 +16,12 @@ import numpy.typing as npt
 import zmq
 from prometheus_client import Counter
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.base.conn import (
+    KVArgs,
+    KVPoll,
+    KVTransferMetric,
+    StateType,
+)
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -154,6 +160,15 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    # Optional trailing wire capability. Older peers omit these frames.
+    draft_swa_suffix_enabled: bool = False
+    draft_swa_window_size: int = 0
+    draft_swa_page_size: int = 0
+    # Exact registered byte ranges for fail-closed main/draft isolation. These
+    # are optional trailing frames so legacy peers still deserialize, but a peer
+    # advertising the suffix protocol must provide them.
+    dst_kv_data_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -198,8 +213,28 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
-            # Note: always put the staging field at the final
+            # Keep the upstream staging capability at frame 18 so an older
+            # peer can ignore the compact-suffix extension safely.
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
+            draft_swa_suffix_enabled=(
+                msg[19] == b"1" if len(msg) > 19 and msg[19] != b"" else False
+            ),
+            draft_swa_window_size=(
+                int(msg[20].decode("ascii")) if len(msg) > 20 and msg[20] != b"" else 0
+            ),
+            draft_swa_page_size=(
+                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] != b"" else 0
+            ),
+            dst_kv_data_lens=(
+                list(struct.unpack(f"{len(msg[22]) // 8}Q", msg[22]))
+                if len(msg) > 22 and msg[22] != b""
+                else []
+            ),
+            dst_state_data_lens=(
+                unpack_int_lists(msg[23], "Q")
+                if len(msg) > 23 and msg[23] != b""
+                else []
+            ),
         )
 
 
@@ -270,6 +305,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ),
                     daemon=True,
                 ).start()
+            if self.enable_deferred_decode_kv_release:
+                threading.Thread(
+                    target=self._deferred_ack_retry_loop,
+                    name="MooncakeDeferredAbortAckRetry",
+                    daemon=True,
+                ).start()
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -290,8 +331,132 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._staging_handler = None
             self.start_decode_thread()
 
+    def can_use_draft_swa_suffix(self, info: KVArgsRegisterInfo) -> bool:
+        """Whether one decode rank has the exact DFlash draft state layout."""
+        if not (
+            getattr(self.kv_args, "draft_swa_suffix_enabled", False)
+            and info.draft_swa_suffix_enabled
+            and info.dst_attn_tp_size == self.attn_tp_size
+            and self.dcp_size == 1
+            and info.dst_dcp_size == 1
+            and info.draft_swa_window_size == self.kv_args.draft_swa_window_size
+            and info.draft_swa_page_size == self.kv_args.page_size
+        ):
+            return False
+        try:
+            component = self.kv_args.state_types.index(StateType.DRAFT_SWA)
+        except ValueError:
+            return False
+        if (
+            component >= len(self.kv_args.state_data_ptrs)
+            or component >= len(self.kv_args.state_data_lens)
+            or component >= len(self.kv_args.state_item_lens)
+            or component >= len(self.kv_args.state_layer_ids)
+            or component >= len(info.dst_state_data_ptrs)
+            or component >= len(info.dst_state_data_lens)
+            or component >= len(info.dst_state_item_lens)
+            or component >= len(info.dst_state_layer_ids)
+        ):
+            return False
+
+        src_ptrs = self.kv_args.state_data_ptrs[component]
+        src_lens = self.kv_args.state_data_lens[component]
+        dst_ptrs = info.dst_state_data_ptrs[component]
+        dst_lens = info.dst_state_data_lens[component]
+        num_entries = len(src_ptrs)
+        return (
+            num_entries > 0
+            and num_entries == len(dst_ptrs)
+            and num_entries == len(src_lens)
+            and num_entries == len(dst_lens)
+            and self.kv_args.state_item_lens[component]
+            == info.dst_state_item_lens[component]
+            and self.kv_args.state_layer_ids[component]
+            == info.dst_state_layer_ids[component]
+            # Draft suffix rows must be state-only.  Main KV and draft KV have
+            # independent buffer ownership even when legacy DFlash happens to
+            # use target allocator indices for both physical pools.
+            and self._buffer_regions_are_disjoint(
+                self.kv_args.kv_data_ptrs,
+                self.kv_args.kv_data_lens,
+                src_ptrs,
+                src_lens,
+            )
+            and self._buffer_regions_are_disjoint(
+                info.dst_kv_ptrs,
+                info.dst_kv_data_lens,
+                dst_ptrs,
+                dst_lens,
+            )
+        )
+
+    @staticmethod
+    def _buffer_regions_are_disjoint(
+        left_ptrs: List[int],
+        left_lens: List[int],
+        right_ptrs: List[int],
+        right_lens: List[int],
+    ) -> bool:
+        """Check exact half-open byte ranges, rejecting missing/invalid metadata."""
+        if (
+            not left_ptrs
+            or not right_ptrs
+            or len(left_ptrs) != len(left_lens)
+            or len(right_ptrs) != len(right_lens)
+        ):
+            return False
+        left = []
+        right = []
+        for ptr, length in zip(left_ptrs, left_lens):
+            ptr, length = int(ptr), int(length)
+            if ptr <= 0 or length <= 0:
+                return False
+            left.append((ptr, ptr + length))
+        for ptr, length in zip(right_ptrs, right_lens):
+            ptr, length = int(ptr), int(length)
+            if ptr <= 0 or length <= 0:
+                return False
+            right.append((ptr, ptr + length))
+        return all(
+            left_end <= right_start or right_end <= left_start
+            for left_start, left_end in left
+            for right_start, right_end in right
+        )
+
+    def room_has_draft_swa_suffix_peer(self, room: int) -> bool:
+        """Whether any non-dummy decode peer advertises the suffix wire layout."""
+        for transfer_info in self.transfer_infos.get(room, {}).values():
+            if transfer_info.is_dummy:
+                continue
+            registration = self.decode_kv_args_table.get(
+                transfer_info.mooncake_session_id
+            )
+            if registration is not None and registration.draft_swa_suffix_enabled:
+                return True
+        return False
+
+    def can_use_draft_swa_suffix_for_room(self, room: int) -> bool:
+        """Negotiate across every non-dummy destination rank in one room."""
+        infos = self.transfer_infos.get(room, {})
+        found_peer = False
+        for transfer_info in infos.values():
+            if transfer_info.is_dummy:
+                continue
+            found_peer = True
+            registration = self.decode_kv_args_table.get(
+                transfer_info.mooncake_session_id
+            )
+            if registration is None or not self.can_use_draft_swa_suffix(registration):
+                return False
+        return found_peer
+
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _deferred_ack_retry_loop(self) -> None:
+        while True:
+            time.sleep(1.0)
+            self.retry_deferred_abort_acks()
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -849,10 +1014,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         still drain the running ones before returning (no write may outlive this
         call, which the drain-ack relies on). Off: original early-return."""
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
+                continue
+            except Exception as exc:
+                if first_exception is None:
+                    first_exception = exc
+                    for pending in futures:
+                        pending.cancel()
+                # as_completed still waits for every already-running future.
+                # Only after that drain may the worker decrement outstanding
+                # and publish an abort ack for owner reuse.
                 continue
             if status != 0 and ret == 0:
                 ret = status
@@ -860,6 +1035,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     f.cancel()
                 if not self.enable_deferred_decode_kv_release:
                     return ret
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -1280,6 +1457,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
+            StateType.DRAFT_SWA,
             StateType.DSA,
             StateType.SWA_RING,
             StateType.C128_STATE,
@@ -1289,7 +1467,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         """State types whose page lists are positional and must not be truncated."""
-        return st in (StateType.SWA_RING, StateType.C128_STATE)
+        return st in (StateType.DRAFT_SWA, StateType.SWA_RING, StateType.C128_STATE)
 
     def maybe_send_extra(
         self,
@@ -1451,6 +1629,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        force_flat=st == StateType.DRAFT_SWA,
+                        src_layer_ids=(
+                            src_state_layer_ids if st == StateType.DRAFT_SWA else None
+                        ),
+                        dst_layer_ids=(
+                            dst_state_layer_ids if st == StateType.DRAFT_SWA else None
+                        ),
                     )
                     or rc
                 )
@@ -1642,6 +1827,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _finish_outstanding_chunk(self, kv_chunk: TransferKVChunk) -> None:
+        """Mark one dequeued chunk terminal and publish a possible drain ack."""
+        if not getattr(kv_chunk, "staging_counted", False):
+            return
+        room = kv_chunk.room
+        remaining = self._staging_outstanding.get(room, 0) - 1
+        if remaining > 0:
+            self._staging_outstanding[room] = remaining
+        else:
+            self._staging_outstanding.pop(room, None)
+        kv_chunk.staging_counted = False
+        if self.enable_deferred_decode_kv_release:
+            self._maybe_ack_drained_abort(room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1658,6 +1857,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1688,10 +1888,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
-                    if self.enable_deferred_decode_kv_release:
-                        # Skipped => nothing written for this aborted room; ack.
-                        self._maybe_ack_drained_abort(kv_chunk.room)
+                    # Skipped => nothing written for this aborted room; ack.
+                    self._finish_outstanding_chunk(kv_chunk)
                     continue
 
                 if (
@@ -1739,6 +1937,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        if (
+                            kv_chunk.draft_swa_suffix
+                            and not self.can_use_draft_swa_suffix(
+                                target_rank_registration_info
+                            )
+                        ):
+                            raise RuntimeError(
+                                "draft SWA suffix capability changed after room negotiation"
+                            )
                         is_dcp_transfer = (
                             target_rank_registration_info.requires_dcp_relayout
                         )
@@ -1921,6 +2128,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     )
                                     break
 
+                            if (
+                                req.room not in self.request_status
+                                or self.check_status(req.room) == KVPoll.Failed
+                            ):
+                                # Decode abort raced the already-running KV/state
+                                # copy. Drain accounting below will publish ACK;
+                                # do not send aux or a stale Success meanwhile.
+                                break
+
                             # Only the last chunk we need to send the aux data
                             ret = self.send_aux(
                                 req,
@@ -1934,8 +2150,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                status = (
+                                    KVPoll.Failed
+                                    if self.check_status(req.room) == KVPoll.Failed
+                                    else (
+                                        KVPoll.Success if all(polls) else KVPoll.Failed
+                                    )
+                                )
                                 self.update_status(req.room, status)
+                                # Failed is sticky; publish the authoritative
+                                # post-update value if ABORT raced this block.
+                                status = self.check_status(req.room)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -1967,11 +2192,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
-                if self.enable_deferred_decode_kv_release:
-                    # In-flight write finished; if aborted and nothing outstanding,
-                    # the pages are idle -> release the held ack.
-                    self._maybe_ack_drained_abort(kv_chunk.room)
+                # In-flight write finished; if aborted and nothing outstanding,
+                # the pages are idle and this publishes the held ack.
+                self._finish_outstanding_chunk(kv_chunk)
                 # Tear down only when no chunk is still outstanding and the room
                 # has concluded: already cleared, Success, or a Failed *last*
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
@@ -1998,6 +2221,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
+                # No exceptional path may leave the source owner appearing
+                # in-flight forever. The sender still observes Failed/timeout,
+                # but drain accounting is terminal before the worker exits.
+                if kv_chunk is not None:
+                    self._finish_outstanding_chunk(kv_chunk)
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -2028,32 +2256,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     )
                     if self.enable_deferred_decode_kv_release:
-                        # Mark Failed FIRST (stops add_transfer_request enqueuing
-                        # new chunks), THEN register the ack target: registering
-                        # first would let the worker drain+ack while the room is
-                        # not yet Failed, so a newly enqueued chunk could still
-                        # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
-                        if room_active:
-                            self.update_status(room_to_be_aborted, KVPoll.Failed)
-                            self.register_deferred_ack_target(
-                                room_to_be_aborted, decode_ip, decode_port
-                            )
-                            # Try once: the room may already be quiescent and
-                            # never revisited by the worker.
-                            self._maybe_ack_drained_abort(room_to_be_aborted)
-                            logger.debug(
-                                f"Received abort notification for room {room_to_be_aborted}, "
-                                f"marked as Failed; ACK deferred until transfer drains"
-                            )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
-                            self._send_abort_ack(
-                                decode_ip, decode_port, room_to_be_aborted
-                            )
+                        room_active = self.handle_deferred_abort_notification(
+                            room_to_be_aborted, decode_ip, decode_port
+                        )
+                        logger.debug(
+                            "Received abort notification for room %s; active=%s, "
+                            "ACK retained until transfer drain and delivery",
+                            room_to_be_aborted,
+                            room_active,
+                        )
                         continue
                     # No need to abort the room if it has already succeeded
                     if room_active:
@@ -2220,6 +2431,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        draft_swa_suffix: bool = False,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -2259,6 +2471,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                draft_swa_suffix=draft_swa_suffix,
                 trace_ctx=trace_ctx,
             )
         )
@@ -2359,7 +2572,53 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        self._draft_swa_suffix_active: Optional[bool] = None
+        self._full_draft_indices_omitted = 0
+        self._draft_swa_suffix_state_indices_sent = 0
+        self._draft_swa_suffix_completion_logged = False
         self._init_trace_ctx()
+
+    def can_send_draft_swa_suffix(self) -> bool:
+        local_required = bool(
+            getattr(self.kv_mgr.kv_args, "draft_swa_suffix_enabled", False)
+        )
+        if self._draft_swa_suffix_active is None:
+            self._draft_swa_suffix_active = (
+                self.kv_mgr.can_use_draft_swa_suffix_for_room(self.bootstrap_room)
+            )
+            if local_required:
+                logger.info(
+                    "DFLASH_PD_SUFFIX_JSON %s",
+                    json.dumps(
+                        {
+                            "event": "negotiated",
+                            "active": self._draft_swa_suffix_active,
+                            "bootstrap_room": self.bootstrap_room,
+                            "window_size": self.kv_mgr.kv_args.draft_swa_window_size,
+                            "page_size": self.kv_mgr.kv_args.page_size,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+        peer_required = self.kv_mgr.room_has_draft_swa_suffix_peer(self.bootstrap_room)
+        if peer_required and not local_required:
+            raise RuntimeError(
+                "DFlash PD decode peer requires the draft SWA suffix protocol "
+                "but prefill has it disabled; refusing incompatible full-pool "
+                "transfer"
+            )
+        if local_required and not self._draft_swa_suffix_active:
+            raise RuntimeError(
+                "DFlash PD peer did not negotiate the required "
+                "draft SWA suffix protocol; refusing legacy full-pool transfer"
+            )
+        return bool(self._draft_swa_suffix_active)
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        # Draft suffix buffers are absent from the main KV registration, so
+        # CommonKVSender already accounts target rows plus exact state rows.
+        return super().get_transfer_metric()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -2368,11 +2627,29 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
     ):
+        draft_swa_suffix_active = self.can_send_draft_swa_suffix()
         kv_indices, index_slice, is_last_chunk, should_skip = (
             self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             return
+
+        if draft_swa_suffix_active:
+            # These are the rows that the legacy full-draft route would have
+            # addressed once for every draft K/V entry.
+            self._full_draft_indices_omitted += len(kv_indices)
+            if is_last_chunk:
+                component = self.kv_mgr.kv_args.state_types.index(StateType.DRAFT_SWA)
+                if state_indices is None or component >= len(state_indices):
+                    raise RuntimeError(
+                        "DFlash PD final chunk is missing draft SWA state"
+                    )
+                draft_indices = state_indices[component]
+                if draft_indices is None:
+                    raise RuntimeError(
+                        "DFlash PD final chunk has no draft SWA suffix indices"
+                    )
+                self._draft_swa_suffix_state_indices_sent += len(draft_indices)
 
         if not is_last_chunk:
             self.kv_mgr.add_transfer_request(
@@ -2381,6 +2658,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 index_slice,
                 False,
                 num_kv_tokens=num_kv_tokens,
+                draft_swa_suffix=draft_swa_suffix_active,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
@@ -2392,23 +2670,56 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
+                draft_swa_suffix=draft_swa_suffix_active,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
+        if getattr(self.kv_mgr, "enable_deferred_decode_kv_release", False):
+            self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+        if (
+            self.conclude_state in (KVPoll.Success, KVPoll.Failed)
+            and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
+        ):
+            # abort() can latch Failed locally before the transfer worker stops
+            # reading source rows. Do not publish any terminal state until the
+            # owner is no longer in flight.
+            return KVPoll.Transferring
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             # Hold Success until all staging chunks transferred: a deferred
             # chunk can still be pending, and concluding now would drop it.
             if (
-                status == KVPoll.Success
+                status in (KVPoll.Success, KVPoll.Failed)
                 and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
             ):
                 return KVPoll.Transferring
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
                 self.trace_ctx.trace_req_finish()
+                if (
+                    status == KVPoll.Success
+                    and self._draft_swa_suffix_active
+                    and not self._draft_swa_suffix_completion_logged
+                ):
+                    self._draft_swa_suffix_completion_logged = True
+                    metric = self.get_transfer_metric()
+                    logger.info(
+                        "DFLASH_PD_SUFFIX_JSON %s",
+                        json.dumps(
+                            {
+                                "event": "completed",
+                                "active": True,
+                                "bootstrap_room": self.bootstrap_room,
+                                "draft_state_indices": self._draft_swa_suffix_state_indices_sent,
+                                "full_draft_indices_omitted": self._full_draft_indices_omitted,
+                                "transfer_total_bytes": metric.transfer_total_bytes,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
             elif status == KVPoll.Bootstrapping:
                 timeout_result = self._check_bootstrap_timeout()
                 if timeout_result is not None:
@@ -2470,6 +2781,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             packed_state_layer_ids = pack_int_lists(
                 self.kv_mgr.kv_args.state_layer_ids, "I"
             )
+            packed_kv_data_lens = b"".join(
+                struct.pack("Q", length) for length in self.kv_mgr.kv_args.kv_data_lens
+            )
+            packed_state_data_lens = pack_int_lists(
+                self.kv_mgr.kv_args.state_data_lens, "Q"
+            )
             packed_kv_layer_ids = b"".join(
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
@@ -2528,6 +2845,25 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            (
+                                b"1"
+                                if getattr(
+                                    self.kv_mgr.kv_args,
+                                    "draft_swa_suffix_enabled",
+                                    False,
+                                )
+                                else b"0"
+                            ),
+                            str(
+                                getattr(
+                                    self.kv_mgr.kv_args,
+                                    "draft_swa_window_size",
+                                    0,
+                                )
+                            ).encode("ascii"),
+                            str(self.kv_mgr.kv_args.page_size).encode("ascii"),
+                            packed_kv_data_lens,
+                            packed_state_data_lens,
                         ]
                     )
             except zmq.ZMQError:

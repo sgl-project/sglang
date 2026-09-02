@@ -2174,6 +2174,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
     # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
+    # Exact request-slot generations captured when this batch was prepared.
+    # acquire_owner_mask grants one-shot authority to bind newly allocated rows.
+    expected_req_generations_cpu: Optional[torch.Tensor] = None  # [b], int64 CPU
+    acquire_owner_mask: Optional[torch.Tensor] = None  # [b], bool CPU
 
     # Forward-pass metrics
     fpm_start_time: float = 0.0
@@ -2363,6 +2367,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def batch_size(self):
         return len(self.reqs)
 
+    def uses_dflash_owner_metadata(self) -> bool:
+        """Whether this batch needs compact DFlash owner-generation checks."""
+        is_dflash = getattr(self.spec_algorithm, "is_dflash", None)
+        return bool(is_dflash is not None and is_dflash())
+
+    def set_req_pool_owner_metadata(self, acquire_mask) -> None:
+        """Snapshot exact pool generations for compact request-owned caches."""
+        if self.req_pool_indices_cpu is None:
+            raise RuntimeError("request pool owner metadata requires CPU indices")
+        indices = self.req_pool_indices_cpu.to(dtype=torch.int64, device="cpu").reshape(
+            -1
+        )
+        if indices.numel() != len(self.reqs):
+            raise RuntimeError(
+                "request pool owner metadata shape mismatch: "
+                f"indices={indices.numel()}, requests={len(self.reqs)}"
+            )
+        generations = self.req_to_token_pool.req_generation[indices].to(
+            dtype=torch.int64, device="cpu"
+        )
+        if bool(torch.any(generations <= 0)):
+            raise RuntimeError(
+                "request pool owner metadata requires positive generations: "
+                f"generations={generations.tolist()}"
+            )
+        mask = torch.as_tensor(acquire_mask, dtype=torch.bool, device="cpu").reshape(-1)
+        if mask.numel() != len(self.reqs):
+            raise RuntimeError(
+                "request pool acquire mask shape mismatch: "
+                f"mask={mask.numel()}, requests={len(self.reqs)}"
+            )
+        self.expected_req_generations_cpu = generations.clone()
+        self.acquire_owner_mask = mask.clone()
+
     def is_empty(self):
         return len(self.reqs) == 0
 
@@ -2509,6 +2547,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
+        fresh_req_slots = [r.req_pool_idx is None for r in reqs]
         input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [r.extend_range.end for r in reqs]
@@ -2697,6 +2736,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefill_input_ids_cpu = pinned_input_ids
         self.req_pool_indices = req_pool_indices_tensor
         self.req_pool_indices_cpu = req_pool_indices_cpu
+        if self.uses_dflash_owner_metadata():
+            self.set_req_pool_owner_metadata(fresh_req_slots)
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
@@ -3183,6 +3224,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices_cpu = torch.empty(0, dtype=torch.int64)
+        self.expected_req_generations_cpu = torch.empty(0, dtype=torch.int64)
+        self.acquire_owner_mask = torch.empty(0, dtype=torch.bool)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -3395,6 +3438,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            if self.expected_req_generations_cpu is not None:
+                self.expected_req_generations_cpu = torch.empty(0, dtype=torch.int64)
+            if self.acquire_owner_mask is not None:
+                self.acquire_owner_mask = torch.empty(0, dtype=torch.bool)
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
@@ -3418,6 +3465,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
+        if self.expected_req_generations_cpu is not None:
+            self.expected_req_generations_cpu = self.expected_req_generations_cpu[
+                keep_indices
+            ].clone()
+        if self.acquire_owner_mask is not None:
+            self.acquire_owner_mask = self.acquire_owner_mask[keep_indices].clone()
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -3478,6 +3531,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
+        if (
+            self.expected_req_generations_cpu is None
+            or other.expected_req_generations_cpu is None
+            or self.acquire_owner_mask is None
+            or other.acquire_owner_mask is None
+        ):
+            if not (
+                self.expected_req_generations_cpu is None
+                and other.expected_req_generations_cpu is None
+                and self.acquire_owner_mask is None
+                and other.acquire_owner_mask is None
+            ):
+                raise RuntimeError(
+                    "cannot merge partially populated request pool owner metadata"
+                )
+        else:
+            self.expected_req_generations_cpu = torch.cat(
+                [
+                    self.expected_req_generations_cpu,
+                    other.expected_req_generations_cpu,
+                ]
+            )
+            self.acquire_owner_mask = torch.cat(
+                [self.acquire_owner_mask, other.acquire_owner_mask]
+            )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
@@ -3540,6 +3618,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=(
+                self.req_pool_indices_cpu.clone()
+                if self.req_pool_indices_cpu is not None
+                else None
+            ),
+            expected_req_generations_cpu=(
+                self.expected_req_generations_cpu.clone()
+                if self.expected_req_generations_cpu is not None
+                else None
+            ),
+            acquire_owner_mask=(
+                self.acquire_owner_mask.clone()
+                if self.acquire_owner_mask is not None
+                else None
+            ),
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,

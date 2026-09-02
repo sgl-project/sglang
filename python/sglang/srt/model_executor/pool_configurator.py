@@ -113,6 +113,31 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     return int(cell_size) * get_parallel().attn_dcp_size
 
 
+def _dflash_draft_fixed_bytes(kvc: KVCacheConfigurator) -> int:
+    """Fixed per-rank DFlash allocation removed before target KV solving."""
+    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+        return 0
+    fixed_bytes = getattr(kvc.spec_aux_config, "dflash_draft_fixed_bytes", 0)
+    if fixed_bytes is None:
+        return 0
+    fixed_bytes = int(fixed_bytes)
+    if fixed_bytes < 0:
+        raise ValueError(f"DFlash fixed-pool bytes must be nonnegative: {fixed_bytes}")
+    return fixed_bytes
+
+
+def _subtract_fixed_pool_bytes(available_bytes: int, fixed_bytes: int) -> int:
+    if fixed_bytes == 0:
+        return available_bytes
+    remaining = int(available_bytes) - int(fixed_bytes)
+    if remaining <= 0:
+        raise RuntimeError(
+            "DFlash fixed draft pool leaves no memory for target KV: "
+            f"available_bytes={available_bytes}, fixed_draft_bytes={fixed_bytes}"
+        )
+    return remaining
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -160,6 +185,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._fixed_bytes = _dflash_draft_fixed_bytes(kvc)
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -241,13 +267,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=self._cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers)
-                    * get_parallel().attn_dcp_size,
-                    draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
-                )
+                draft_cell_size = _dflash_draft_cell_size(kvc)
+                # A resolved zero selects the fixed compact pool.  None/unknown
+                # retains the upstream layer-count fallback.
+                if draft_cell_size != 0:
+                    self._cell_size = scale_kv_cell_size_per_token_for_dflash(
+                        target_cell_size_per_token=self._cell_size,
+                        target_num_layers=int(num_layers),
+                        draft_num_layers=int(draft_num_layers)
+                        * get_parallel().attn_dcp_size,
+                        draft_cell_size_per_token=draft_cell_size or None,
+                    )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -431,6 +461,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = _subtract_fixed_pool_bytes(available_bytes, self._fixed_bytes)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
@@ -455,6 +486,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._fixed_bytes = _dflash_draft_fixed_bytes(kvc)
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
@@ -634,6 +666,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes = _subtract_fixed_pool_bytes(available_bytes, self._fixed_bytes)
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
@@ -714,6 +747,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
+        available_bytes = _subtract_fixed_pool_bytes(available_bytes, self._fixed_bytes)
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = (
             swa_tokens

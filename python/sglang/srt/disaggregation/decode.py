@@ -54,8 +54,11 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    get_dflash_draft_kv_transfer_locs,
+    get_dflash_draft_kv_transfer_spec,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_legacy_draft_kv_buf_infos,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -214,7 +217,8 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # Generations are lifetime-monotonic. Resetting here creates an ABA
+        # collision for request-owned side pools after a global clear.
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -363,6 +367,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.draft_kv_transfer_spec = get_dflash_draft_kv_transfer_spec(
+            scheduler, draft_token_to_kv_pool, transfer_backend
+        )
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -539,25 +546,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
+        draft_kv_pool = None
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        legacy_draft_infos = get_legacy_draft_kv_buf_infos(
+            self.draft_token_to_kv_pool, self.draft_kv_transfer_spec
+        )
+        if legacy_draft_infos is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                legacy_draft_infos
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
+            draft_kv_pool = self.draft_token_to_kv_pool
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.draft_swa_suffix_enabled = bool(
+            self.draft_kv_transfer_spec and self.draft_kv_transfer_spec.suffix_enabled
+        )
+        kv_args.draft_swa_window_size = (
+            self.draft_kv_transfer_spec.window_size
+            if self.draft_kv_transfer_spec
+            else 0
+        )
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
@@ -573,6 +593,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_args,
             self.token_to_kv_pool,
             self.draft_token_to_kv_pool,
+            draft_kv_transfer_spec=self.draft_kv_transfer_spec,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
@@ -603,7 +624,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_layer_ids=kv_args.kv_layer_ids,
                     num_draft_entries=num_draft_entries,
                     kv_pool=kv_pool,
-                    draft_kv_pool=self.draft_token_to_kv_pool,
+                    draft_kv_pool=draft_kv_pool,
                 )
                 if staging_slots is not None:
                     k_buffers, v_buffers, slot_layer_ids = staging_slots
@@ -1407,6 +1428,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _draft_swa_payload():
+                spec = self.draft_kv_transfer_spec
+                if spec is None:
+                    raise RuntimeError(
+                        "draft SWA state was registered without a local transfer spec"
+                    )
+                draft_indices = get_dflash_draft_kv_transfer_locs(
+                    self.scheduler.draft_worker,
+                    int(decode_req.req.req_pool_idx),
+                    seq_len,
+                    spec,
+                    page_size,
+                )
+                return kv_to_page_indices(draft_indices, page_size)
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1444,6 +1480,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.C128_STATE: _c128_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DRAFT_SWA: _draft_swa_payload,
             }
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -2050,6 +2087,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
+        self.require_drain_ack_for_deferred_release = bool(
+            scheduler.spec_algorithm.is_dflash()
+            and envs.SGLANG_DFLASH_PD_DRAFT_SWA_SUFFIX.get()
+        )
         # Aborted-mid-transfer requests whose KV pages/slot are held until drained
         # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
@@ -2414,9 +2455,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
+    def has_pending_kv_ownership(self) -> bool:
+        """Whether this queue still owns KV pages or reusable request slots.
+
+        Entries in ``queue`` may still be transfer destinations.  Entries in
+        ``_deferred_releases`` have left the visible transfer queue, but retain
+        the same ownership until every required drain ack arrives.  Both states
+        must block cache flushes and KV-memory teardown.
+        """
+        return bool(self.queue) or self.has_pending_deferred_releases()
+
+    def assert_memory_release_safe(self) -> None:
+        """Fail closed if releasing the decode KV pool could race an RDMA write."""
+        active_transfers = len(self.queue)
+        deferred_holds = len(self._deferred_releases)
+        if active_transfers or deferred_holds:
+            raise RuntimeError(
+                "Cannot release decode KV memory while transfer destinations "
+                "are still owned: "
+                f"active_transfers={active_transfers}, "
+                f"deferred_drain_ack_holds={deferred_holds}."
+            )
+
     def resolve_deferred_releases(self) -> None:
-        """Release held requests once every prefill rank acks the drain, or the
-        hold times out."""
+        """Release held requests after drain ack (or legacy timeout policy)."""
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -2426,10 +2488,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             room = decode_req.req.bootstrap_room
             kv_mgr = decode_req.kv_receiver.kv_mgr
             drained = kv_mgr.is_abort_release_safe(room, required_acks)
-            if not drained and now < deadline:
+            if drained:
+                to_release.append((decode_req, idx, room, True))
+            elif now < deadline:
                 still_held.append((decode_req, deadline, idx, required_acks))
+            elif getattr(self, "require_drain_ack_for_deferred_release", False):
+                # A draft suffix row is owned by a reusable request slot in both
+                # compact and legacy-physical layouts.  An old RDMA write after
+                # timeout could corrupt the next owner, so timeout is diagnostic
+                # only; extend it for periodic logging.
+                logger.error(
+                    f"Deferred KV release for DFlash suffix room {room} timed "
+                    f"out after {self.deferred_kv_release_timeout}s without a "
+                    "full drain ack from prefill; continuing to hold."
+                )
+                still_held.append(
+                    (
+                        decode_req,
+                        now + self.deferred_kv_release_timeout,
+                        idx,
+                        required_acks,
+                    )
+                )
             else:
-                to_release.append((decode_req, idx, room, drained))
+                to_release.append((decode_req, idx, room, False))
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
@@ -2447,13 +2529,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 logger.exception(f"Deferred KV release failed for room {room}")
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
-        self.queue.clear()
-        # Pool is being torn down; drop held entries without per-request release.
-        self._deferred_releases.clear()
+        """Validate that the decode KV pool can be released safely.
+
+        Active transfers and deferred drain-ack holds own physical destinations;
+        clearing either collection would only forget that ownership while remote
+        writes can still arrive.  The scheduler's idle gate normally guarantees
+        both are empty, and this second check protects forced/exceptional callers.
+        """
+        self.assert_memory_release_safe()
 
     def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
+        """No transfer-queue state is discarded while memory is released."""
         pass
 
 

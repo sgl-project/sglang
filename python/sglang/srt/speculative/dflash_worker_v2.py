@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
+    rebuild_compact_physical_draft_req_to_token_func,
 )
 from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -40,6 +41,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_memory,
     get_schedule,
     get_spec,
     mamba_track_grid,
@@ -47,6 +49,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_compact_physical_layout import (
+    CompactDFlashPhysicalLayout,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -186,6 +191,73 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _compact_prefill_visible_segments(
+    prefix_lens, extend_lens, window_size: int
+) -> List[Tuple[int, int, int, int]]:
+    """Return packed slices of newly-prefilled tokens still visible in the window.
+
+    Each tuple is ``(batch_row, packed_start, packed_end, absolute_start)``.
+    ``packed_start:packed_end`` indexes the packed extend tensors. Keeping this
+    arithmetic on host inputs makes chunked-prefill behavior explicit without a
+    device synchronization; physical ring wrap is handled later from the absolute
+    token positions.
+    """
+    if len(prefix_lens) != len(extend_lens):
+        raise ValueError(
+            "DFLASH compact prefill length mismatch: "
+            f"prefix_lens={len(prefix_lens)}, extend_lens={len(extend_lens)}."
+        )
+    window_size = int(window_size)
+    if window_size <= 0:
+        raise ValueError(
+            f"DFLASH compact prefill window must be positive, got {window_size}."
+        )
+
+    segments = []
+    packed_offset = 0
+    for row, (prefix_len, extend_len) in enumerate(zip(prefix_lens, extend_lens)):
+        prefix_len, extend_len = int(prefix_len), int(extend_len)
+        if prefix_len < 0 or extend_len < 0:
+            raise ValueError(
+                "DFLASH compact prefill lengths must be nonnegative: "
+                f"row={row}, prefix_len={prefix_len}, extend_len={extend_len}."
+            )
+        total_len = prefix_len + extend_len
+        absolute_start = max(prefix_len, total_len - window_size)
+        packed_start = packed_offset + absolute_start - prefix_len
+        packed_end = packed_offset + extend_len
+        if packed_end > packed_start:
+            segments.append((row, packed_start, packed_end, absolute_start))
+        packed_offset += extend_len
+    return segments
+
+
+def _compact_verify_committed_locs(
+    layout: CompactDFlashPhysicalLayout,
+    req_pool_indices: torch.Tensor,
+    positions_2d: torch.Tensor,
+) -> torch.Tensor:
+    """Map every dense verify position to its owner-local committed ring row."""
+    if req_pool_indices.ndim != 1:
+        raise ValueError(
+            "DFLASH compact verify owners must be 1D, "
+            f"got shape={tuple(req_pool_indices.shape)}."
+        )
+    if positions_2d.ndim != 2:
+        raise ValueError(
+            "DFLASH compact verify positions must be 2D, "
+            f"got shape={tuple(positions_2d.shape)}."
+        )
+    if int(req_pool_indices.shape[0]) != int(positions_2d.shape[0]):
+        raise ValueError(
+            "DFLASH compact verify batch mismatch: "
+            f"owners={tuple(req_pool_indices.shape)}, "
+            f"positions={tuple(positions_2d.shape)}."
+        )
+    owners_2d = req_pool_indices.to(torch.int64)[:, None].expand_as(positions_2d)
+    return layout.committed_locs(owners_2d, positions_2d)
+
+
 def _resolve_dflash_embedding_module(draft_model, target_model):
     if getattr(draft_model, "is_nemotron_35_draft", False):
         embed_module = draft_model.get_input_embeddings()
@@ -304,8 +376,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
-        self.use_compact_draft_cache = self.draft_window_size is not None
+        self.use_draft_window = self.draft_window_size is not None
+        self.use_compact_draft_cache = bool(get_spec().speculative_dflash_compact_cache)
         self.device = target_worker.device
+        self._compact_physical_layout: Optional[CompactDFlashPhysicalLayout] = None
+        self._compact_owner_generation: Optional[torch.Tensor] = None
+        if self.use_compact_draft_cache and not self.use_draft_window:
+            raise RuntimeError(
+                "Compact DFlash cache requires --speculative-draft-window-size"
+            )
+        if self.use_compact_draft_cache and self.page_size != 1:
+            raise RuntimeError(
+                "Compact DFlash cache requires page_size=1; larger pages "
+                "can expose two absolute positions that alias one modulo-ring row"
+            )
+        if self.use_compact_draft_cache and not get_memory().disable_radix_cache:
+            raise RuntimeError(
+                "Compact DFlash cache requires --disable-radix-cache; "
+                "owner-local draft rings do not preserve target prefix-cache state"
+            )
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
@@ -389,6 +478,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_physical_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
@@ -441,6 +533,63 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.attn_backend,
         )
 
+    def compact_physical_transfer_locs(
+        self, req_pool_idx: int, start: int, end: int
+    ) -> torch.Tensor:
+        """Resolve absolute draft positions to this role's compact KV rows."""
+        if self._compact_physical_layout is None:
+            raise RuntimeError("compact DFlash physical layout is not active")
+        if start < 0 or end < start:
+            raise ValueError(f"invalid transfer range: start={start}, end={end}")
+        positions = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        owners = torch.full_like(positions, int(req_pool_idx))
+        return self._compact_physical_layout.committed_locs(owners, positions)
+
+    def legacy_physical_transfer_locs(
+        self, req_pool_idx: int, start: int, end: int
+    ) -> torch.Tensor:
+        """Resolve absolute draft positions in the legacy full physical pool.
+
+        Non-compact DFlash materializes draft K/V at the target allocator's
+        physical indices.  Prefill and decode request-slot/allocator choices are
+        role-local, so each peer must gather its own ``req_to_token`` suffix;
+        sending either role's raw indices to the other would address unrelated
+        rows.  Slot zero is the padding sentinel and is never a valid transfer
+        destination.
+        """
+        if self._compact_physical_layout is not None:
+            raise RuntimeError(
+                "legacy DFlash transfer locations requested while compact physical "
+                "layout is active"
+            )
+        if start < 0 or end < start:
+            raise ValueError(f"invalid transfer range: start={start}, end={end}")
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        num_owners, table_width = req_to_token.shape
+        if req_pool_idx <= 0 or req_pool_idx >= int(num_owners):
+            raise ValueError(
+                "invalid DFlash transfer owner: "
+                f"owner={req_pool_idx}, valid=[1,{int(num_owners) - 1}]"
+            )
+        if end > int(table_width):
+            raise ValueError(
+                "DFlash transfer range exceeds req_to_token width: "
+                f"end={end}, width={int(table_width)}"
+            )
+
+        locations = req_to_token[int(req_pool_idx), start:end].to(torch.int64)
+        if int(locations.numel()) != end - start:
+            raise RuntimeError(
+                "DFlash legacy suffix length mismatch: "
+                f"expected={end - start}, actual={int(locations.numel())}"
+            )
+        if bool(torch.any(locations <= 0).item()):
+            raise RuntimeError(
+                "DFlash legacy suffix contains an unallocated/padding KV slot"
+            )
+        return locations
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -452,12 +601,68 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
+        if self.use_compact_draft_cache:
+            if memory_pool_config is None or req_to_token_pool is None:
+                raise RuntimeError(
+                    "Compact DFlash cache needs target pool config and request pool"
+                )
+            owner_count = int(req_to_token_pool.req_to_token.shape[0]) - 1
+            self._compact_physical_layout = CompactDFlashPhysicalLayout.build(
+                owner_count=owner_count,
+                window_size=int(self.draft_window_size),
+                block_size=int(self.block_size),
+                page_size=int(self.page_size),
+            )
+            self._compact_owner_generation = torch.zeros(
+                owner_count + 1, dtype=torch.int64, device="cpu"
+            )
+            compact_config = replace(
+                memory_pool_config,
+                max_total_num_tokens=self._compact_physical_layout.physical_tokens,
+                full_max_total_num_tokens=None,
+                swa_max_total_num_tokens=None,
+            )
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=compact_config,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+            )
+            physical_bytes = self._pool_bytes(self.draft_model_runner.token_to_kv_pool)
+            budgeted_fixed_bytes = int(
+                getattr(
+                    self._target_worker.model_runner.spec_aux_config,
+                    "dflash_draft_fixed_bytes",
+                    0,
+                )
+            )
+            if budgeted_fixed_bytes <= 0 or physical_bytes != budgeted_fixed_bytes:
+                raise RuntimeError(
+                    "Compact DFlash fixed-pool budget mismatch: "
+                    f"budgeted={budgeted_fixed_bytes}, allocated={physical_bytes}"
+                )
+            logger.info(
+                "Allocated bounded DFlash draft cache: owners=%d, owner_span=%d, "
+                "physical_rows=%d, bytes=%d",
+                owner_count,
+                self._compact_physical_layout.owner_span,
+                self._compact_physical_layout.physical_tokens,
+                physical_bytes,
+            )
+            return
+
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
-            req_to_token_pool=(
-                None if self.use_compact_draft_cache else req_to_token_pool
-            ),
+            req_to_token_pool=(None if self.use_draft_window else req_to_token_pool),
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    @staticmethod
+    def _pool_bytes(pool) -> int:
+        raw_bytes = pool.get_kv_size_bytes()
+        return (
+            sum(int(value) for value in raw_bytes)
+            if isinstance(raw_bytes, tuple)
+            else int(raw_bytes)
         )
 
     def init_attention_backends(self):
@@ -797,6 +1002,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        self._draft_physical_out_cache_loc_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
+        )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -953,10 +1161,58 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
         block_size: int,
-    ) -> None:
+    ) -> torch.Tensor:
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        if self._compact_physical_layout is not None:
+            if self._use_triton_compact_rebuild:
+                assert self._draft_physical_out_cache_loc_buf is not None
+                physical_out_cache_loc_2d = self._draft_physical_out_cache_loc_buf[:bs]
+                rebuild_compact_physical_draft_req_to_token_func(
+                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    suffix_start=suffix_start,
+                    draft_prefix_lens=draft_prefix_lens,
+                    physical_out_cache_loc_2d=physical_out_cache_loc_2d,
+                    batch_size=bs,
+                    block_size=block_size,
+                    owner_span=self._compact_physical_layout.owner_span,
+                    guard_rows=self._compact_physical_layout.guard_rows,
+                    window_size=self._compact_physical_layout.window_size,
+                )
+                return physical_out_cache_loc_2d
+            max_len = int(draft_prefix_lens.max().item()) if bs else 0
+            offsets = torch.arange(max_len, device=self.device, dtype=torch.int64)
+            absolute_positions = suffix_start[:, None] + offsets[None, :]
+            mask = offsets[None, :] < draft_prefix_lens.to(torch.int64)[:, None]
+            owners = req_pool_indices.to(torch.int64)[:, None].expand(-1, max_len)
+            committed = self._compact_physical_layout.committed_locs(
+                owners, absolute_positions
+            )
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                committed[mask],
+                bs,
+            )
+            scratch = self._compact_physical_layout.scratch_locs(
+                req_pool_indices, block_size
+            )
+            assert self._draft_block_end_buf is not None
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(draft_prefix_lens, block_size, out=block_end)
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                draft_prefix_lens,
+                block_end,
+                scratch.reshape(-1),
+                bs,
+            )
+            return scratch
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -995,6 +1251,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+        return verify_out_cache_loc_2d
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -1875,8 +2132,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
+        is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
+        if self._compact_physical_layout is not None:
+            assert self._compact_owner_generation is not None
+            if (
+                batch.expected_req_generations_cpu is None
+                or batch.acquire_owner_mask is None
+            ):
+                raise RuntimeError(
+                    "compact DFlash requires request-pool generation metadata"
+                )
+            self._compact_physical_layout.bind_first_use_or_assert_generation(
+                (
+                    batch.req_pool_indices_cpu
+                    if batch.req_pool_indices_cpu is not None
+                    else batch.req_pool_indices
+                ),
+                self._compact_owner_generation,
+                self.model_runner.req_to_token_pool.req_generation,
+                batch.expected_req_generations_cpu,
+                batch.acquire_owner_mask,
+            )
 
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+        if is_extend:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -1924,11 +2202,39 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            self._append_target_hidden_to_draft_kv_by_loc(
-                target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
-            )
+            if self._compact_physical_layout is not None:
+                hidden_parts = []
+                position_parts = []
+                owner_parts = []
+                for row, part_start, part_end, _ in _compact_prefill_visible_segments(
+                    batch.prefix_lens,
+                    batch.extend_lens,
+                    int(self.draft_window_size),
+                ):
+                    owner = batch.req_pool_indices[row]
+                    hidden_parts.append(
+                        logits_output.hidden_states[part_start:part_end]
+                    )
+                    position_parts.append(positions[part_start:part_end])
+                    owner_parts.append(owner.expand(part_end - part_start))
+                if hidden_parts:
+                    compact_hidden = torch.cat(hidden_parts)
+                    compact_positions = torch.cat(position_parts)
+                    compact_owners = torch.cat(owner_parts)
+                    compact_locs = self._compact_physical_layout.committed_locs(
+                        compact_owners, compact_positions
+                    )
+                    self._append_target_hidden_to_draft_kv_by_loc(
+                        target_hidden=compact_hidden,
+                        cache_loc=compact_locs,
+                        positions=compact_positions,
+                    )
+            else:
+                self._append_target_hidden_to_draft_kv_by_loc(
+                    target_hidden=logits_output.hidden_states,
+                    cache_loc=batch.out_cache_loc,
+                    positions=positions,
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -1998,6 +2304,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
         assert self._draft_verify_out_cache_loc_buf is not None
+        assert self._draft_physical_out_cache_loc_buf is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
 
@@ -2070,7 +2377,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-        if self.use_compact_draft_cache:
+        if self.use_draft_window:
             # Rebuild the draft-local sliding-window view from committed target state.
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
@@ -2079,7 +2386,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
-            self._rebuild_compact_draft_cache(
+            draft_out_cache_loc_2d = self._rebuild_compact_draft_cache(
                 req_pool_indices=batch.req_pool_indices,
                 prefix_lens=prefix_lens,
                 draft_prefix_lens=draft_prefix_lens,
@@ -2087,6 +2394,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs=bs,
                 block_size=block_size,
             )
+            physical_out_cache_loc_2d = self._draft_physical_out_cache_loc_buf[:bs]
+            if (
+                draft_out_cache_loc_2d.data_ptr()
+                != physical_out_cache_loc_2d.data_ptr()
+            ):
+                physical_out_cache_loc_2d.copy_(draft_out_cache_loc_2d)
+            draft_out_cache_loc_2d = physical_out_cache_loc_2d
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
@@ -2106,6 +2420,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
+            draft_out_cache_loc_2d = verify_out_cache_loc_2d
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -2113,7 +2428,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_out_cache_loc_2d.reshape(-1),
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -2314,10 +2629,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
 
+        committed_cache_loc_2d = verify_out_cache_loc_2d
+        if self._compact_physical_layout is not None:
+            committed_cache_loc_2d = _compact_verify_committed_locs(
+                self._compact_physical_layout,
+                batch.req_pool_indices,
+                positions_2d,
+            )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=committed_cache_loc_2d.reshape(-1),
+            cache_loc_2d=committed_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )

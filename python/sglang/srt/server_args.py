@@ -2210,6 +2210,14 @@ class ServerArgs:
         "Sliding window size for the draft model. Honored by Llama EAGLE-3 (`LlamaForCausalLMEagle3`) and DFLASH only; other EAGLE-3 backends (e.g. MLA-based drafters) silently ignore it. For Llama EAGLE-3, the drafter only attends to the most recent N keys (verifier hidden states + its own outputs); the verifier is unaffected. For DFLASH, the draft worker keeps a recent target-token window in its local KV cache (paged backends may retain up to one extra page on the left for alignment). Default is full attention/context.",
         NS("spec"),
     ] = None
+    speculative_dflash_compact_cache: A[
+        bool,
+        "Allocate a bounded physical draft KV cache for DFLASH. Requires "
+        "--speculative-draft-window-size, page size 1, and radix cache disabled. "
+        "The committed visible suffix and verify scratch use disjoint rows, and "
+        "the fixed allocation is deducted from target-KV capacity solving.",
+        NS("spec"),
+    ] = False
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
