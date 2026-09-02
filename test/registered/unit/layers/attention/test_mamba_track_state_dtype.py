@@ -13,8 +13,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # Above the fp16 midpoint 1 + 2^-11 (single-rounds up to 1 + 2^-10) but below
 # the bf16 midpoint 1 + 2^-8 (rounds to 1.0, which then stays 1.0 in fp16):
-# any fp32 -> bf16 -> fp16 double rounding loses the increment.
-DOUBLE_ROUND_PROBE = 1.0 + 2.0**-11 + 2.0**-24
+# any fp32 -> bf16 -> fp16 double rounding loses the increment. The 2^-23 tail
+# is the last fp32 mantissa bit at 1.x, so the probe is fp32-exact (a 2^-24
+# tail would round back to the midpoint itself).
+DOUBLE_ROUND_PROBE = 1.0 + 2.0**-11 + 2.0**-23
 
 
 class TestTrackMambaStateDtype(CustomTestCase):
@@ -38,6 +40,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
             track_ssm_h_batch_src=torch.tensor(batch_rows),
             track_ssm_final_src=torch.empty(0, dtype=torch.long),
             track_ssm_final_dst=torch.empty(0, dtype=torch.long),
+            # Required by the dataclass; unused on this path.
+            query_start_loc=torch.zeros(1, dtype=torch.int32),
+            mamba_cache_indices=torch.zeros(1, dtype=torch.long),
         )
         ssm_states = torch.zeros(8, *h_track_buf.shape[1:], dtype=pool_dtype)
         # The method touches no `self` state; call it unbound so this stays a
