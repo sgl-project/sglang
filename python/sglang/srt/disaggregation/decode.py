@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections import deque
@@ -188,14 +189,10 @@ class DecodeReqToTokenPool:
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv.kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -204,14 +201,14 @@ class DecodeReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         offset = 0
         for r in reqs:
-            if r.kv.req_pool_idx is None:
+            if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
                 self.req_generation[r.kv.req_pool_idx] += 1
                 offset += 1
         return [r.kv.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
-        assert req.kv.req_pool_idx is not None, "request must have req_pool_idx"
+        assert req.kv.holds_kv, "request must have req_pool_idx"
         self.free_slots.append(req.kv.req_pool_idx)
         req.kv.req_pool_idx = None
 
@@ -2016,6 +2013,22 @@ def alloc_for_decode_prealloc(
     return kv_loc
 
 
+def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
+    """Generate a deterministic synthetic handoff token for fake-PD requests.
+
+    Fake-PD skips prefill and KV transfer, so its allocated prompt KV has no
+    request-specific state and its metadata output token remains zero. Reusing
+    token 0 for every request can unrealistically correlate decode workloads.
+    Hash the request ID so every TP rank gets the same request-diverse token.
+    """
+    if req.vocab_size is None or req.vocab_size <= 0:
+        raise ValueError("Fake-PD requests require a positive vocabulary size")
+    digest = hashlib.blake2b(
+        req.rid.encode(), digest_size=8, person=b"fake-pd"
+    ).digest()
+    return int.from_bytes(digest, byteorder="little") % req.vocab_size
+
+
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
@@ -2146,6 +2159,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
+        elif _is_fake_transfer(decode_req.req):
+            committed_output_id = _generate_fake_prefill_handoff_output_id(
+                decode_req.req
+            )
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
