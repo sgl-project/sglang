@@ -10,9 +10,10 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def _cache_details_if_enabled(
+        count: int, enable_cache_report: bool
+    ) -> Optional[PromptTokensDetails]:
+        return PromptTokensDetails(cached_tokens=count) if enable_cache_report else None
 
     @staticmethod
     def calculate_response_usage(
@@ -36,13 +37,13 @@ class UsageProcessor:
             r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
-        cached_details = None
-        if enable_cache_report:
-            cached_total = sum(
-                responses[i]["meta_info"].get("cached_tokens", 0)
-                for i in range(0, len(responses), n_choices)
-            )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+        cached_total = sum(
+            responses[i]["meta_info"].get("cached_tokens", 0)
+            for i in range(0, len(responses), n_choices)
+        )
+        cached_details = UsageProcessor._cache_details_if_enabled(
+            cached_total, enable_cache_report
+        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -73,12 +74,9 @@ class UsageProcessor:
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
-            )
-            if enable_cache_report
-            else None
+        cached_details = UsageProcessor._cache_details_if_enabled(
+            sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0),
+            enable_cache_report,
         )
 
         return UsageProcessor.calculate_token_usage(
