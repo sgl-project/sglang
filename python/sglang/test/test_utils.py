@@ -34,6 +34,7 @@ from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.lang.global_config import global_config
+from sglang.srt.configs.device_config import SUPPORTED_DEVICES
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -290,8 +291,12 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         "--device",
         type=str,
         default="auto",
-        choices=["auto", "cuda", "rocm", "cpu"],
-        help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
+        choices=["auto"] + SUPPORTED_DEVICES,
+        help=(
+            "Device type ("
+            + "/".join(["auto"] + SUPPORTED_DEVICES)
+            + "). 'auto' detects the available platform."
+        ),
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
     parser.add_argument("--raw-result-file", type=str)
@@ -692,7 +697,7 @@ def popen_launch_server(
         other_args: Additional command line arguments
         env: Environment dict for subprocess
         return_stdout_stderr: Optional tuple for output capture
-        device: Device type ("auto", "cuda", "rocm" or "cpu")
+        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu")
         pd_separated: Whether to use PD separated mode
         num_replicas: Number of replicas for mixed PD mode
 
@@ -1379,11 +1384,9 @@ def run_bench_one_batch(model, other_args):
     """Launch a offline process with automatic device detection.
 
     Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
+        device: Device type ("auto", "cuda", "rocm", "xpu" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
-    # Auto-detect device if needed
-
     device = auto_config_device()
     print(f"Auto-configed device: {device}", flush=True)
     other_args += ["--device", str(device)]
