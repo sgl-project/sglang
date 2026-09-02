@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host import HostKVCache, PoolEntry
 
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -550,12 +550,20 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    def _register_storage_backend_pools(
+        self, host_pools: Optional[list["PoolEntry"]] = None
+    ) -> None:
+        """Register the initial pool topology before storage threads start."""
+        self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+        self.storage_backend.finalize_mem_pool_registration()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
+        host_pools: Optional[list["PoolEntry"]] = None,
     ):
         """Attach (enable) storage backend at runtime.
 
@@ -597,7 +605,7 @@ class HiCacheController:
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.storage_host_pool
             )
-            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            self._register_storage_backend_pools(host_pools)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching

@@ -442,9 +442,13 @@ class KVCRStore(HiCacheStorage):
         )
         self._pinning = NoFrameworkPinning()
         self._key_hint_adapter = StrKeyHintAdapter()
+        self.registered_pools: Dict[PoolName, HostKVCache] = {}
+        self._logical_anchor = False
 
-        # KVCR is constructed lazily in register_mem_pool_host(), once we know
-        # the engine host KV region to register with NIXL as framework_dram.
+        # Single-pool layouts construct KVCR in register_mem_pool_host(). A
+        # hybrid layout first presents a bufferless logical anchor, then its
+        # physical pools, so construction is deferred to the registration
+        # finalizer where the complete topology is available.
         self._kvcr: Optional[KVCR] = None
         self._control: Optional[ZmqPeerControlChannel] = None
         # Local DRAM slot geometry, learned by probing the host pool at
@@ -518,34 +522,32 @@ class KVCRStore(HiCacheStorage):
         super().register_mem_pool_host(mem_pool_host)
         if self._kvcr is not None:
             return
+        if mem_pool_host.kv_buffer is None:
+            self._logical_anchor = True
+            return
+        self._logical_anchor = False
         self._build_kvcr(mem_pool_host)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name) -> None:
-        """Accept the KV pool; refuse every sidecar pool.
-
-        Hybrid stacks (DSA/MiniMax indexer, Mamba, SWA) hand each pool to the
-        backend separately, and a backend that keeps them has to address each
-        one's own buffer. This one cannot yet: ``_host_descriptors`` reads
-        ``self.mem_pool_host``, which for a hybrid stack is a ``HostPoolGroup``
-        whose ``get_page_buffer_meta`` forwards to the *anchor* (KV) pool. A
-        sidecar transfer would therefore be handed KV addresses, report success,
-        and leave the sidecar's host pool untouched -- wrong data with no error.
-
-        Two KVCR constraints have to lift before that can be fixed, so this
-        refuses at startup rather than degrading: ``framework_dram`` is a single
-        region while a sidecar buffer is a separate allocation, and the local
-        DRAM tier is one global slot size while KV and indexer segments differ.
-        """
-        if host_pool_name != PoolName.KV:
-            raise RuntimeError(
-                f"KVCRStore does not support the '{host_pool_name}' host pool. "
-                "This model needs a hybrid KV stack (e.g. the DSA/MiniMax "
-                "indexer), and KVCR can only address the primary KV pool, so "
-                "sidecar pages would be silently filled with KV data. Run this "
-                "model without --hicache-storage-backend kvcr, or use a backend "
-                "with hybrid-pool support (e.g. mooncake)."
-            )
+        """Record one physical pool without enabling its transfer path yet."""
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def finalize_mem_pool_registration(self) -> None:
+        """Construct KVCR only after the initial host-pool topology is known."""
+        if self._kvcr is not None:
+            return
+        if self.mem_pool_host is None:
+            raise RuntimeError("KVCRStore cannot finalize without a host-pool anchor.")
+        if self._logical_anchor:
+            pool_names = ", ".join(
+                sorted(str(pool_name) for pool_name in self.registered_pools)
+            )
+            raise RuntimeError(
+                "KVCRStore collected a logical host-pool anchor and physical "
+                f"pools [{pool_names}], but hybrid physical-pool region "
+                "planning is not implemented yet."
+            )
+        self._build_kvcr(self.mem_pool_host)
 
     def _control_port(self) -> int:
         """Bind port for this rank's KVCR control channel.
@@ -940,9 +942,9 @@ class KVCRStore(HiCacheStorage):
     def _is_kv_transfer(self, transfer: PoolTransfer) -> bool:
         """Whether this backend may serve ``transfer``; log once if it may not.
 
-        ``register_mem_host_pool_v2`` already refuses a hybrid stack at startup,
-        so reaching here means a sidecar transfer arrived on a pool that was
-        never registered. Scoring it a miss is what keeps that fail-closed:
+        Pool registration records the topology but does not authorize a data
+        path. Until pool-specific descriptors and keys are implemented, scoring
+        every non-KV transfer as a miss is what keeps this fail-closed:
         ``update_extra_pool_hit_pages`` records 0 for the pool and
         ``_sync_and_clamp_prefetch_result`` clamps the usable prefix to 0, so
         HiCache recomputes instead of reading a page this backend never wrote.

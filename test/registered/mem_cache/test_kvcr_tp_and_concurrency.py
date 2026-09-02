@@ -386,6 +386,49 @@ class DPColocationTest(unittest.TestCase):
 class UnusableHostPoolTest(unittest.TestCase):
     """Host pool layouts the backend cannot run against must fail at startup."""
 
+    def test_logical_anchor_defers_core_construction(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+
+        with mock.patch.object(store, "_build_kvcr") as build_kvcr:
+            store.register_mem_pool_host(anchor)
+
+        self.assertIs(store.mem_pool_host, anchor)
+        self.assertTrue(store._logical_anchor)
+        self.assertIsNone(store._kvcr)
+        build_kvcr.assert_not_called()
+
+    def test_finalize_reports_the_complete_unimplemented_pool_plan(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+        c4_pool = SimpleNamespace()
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(c4_pool, PoolName.DEEPSEEK_V4_C4)
+
+        with self.assertRaises(RuntimeError) as raised:
+            store.finalize_mem_pool_registration()
+
+        self.assertIn(str(PoolName.KV), str(raised.exception))
+        self.assertIn(str(PoolName.DEEPSEEK_V4_C4), str(raised.exception))
+        self.assertIn("region planning", str(raised.exception))
+        self.assertIsNone(store._kvcr)
+
+    def test_single_pool_finalization_does_not_rebuild_an_eager_core(self):
+        store = _store(0, 1)
+        pool = SimpleNamespace(kv_buffer=object())
+
+        def build_once(mem_pool_host):
+            self.assertIs(mem_pool_host, pool)
+            store._kvcr = object()
+
+        with mock.patch.object(store, "_build_kvcr", side_effect=build_once) as build:
+            store.register_mem_pool_host(pool)
+            store.finalize_mem_pool_registration()
+            store.finalize_mem_pool_registration()
+
+        build.assert_called_once_with(pool)
+
     def test_a_per_layer_pool_refuses_to_start_the_backend(self):
         """A pool with no single kv_buffer tensor cannot be NIXL-registered.
 
@@ -438,8 +481,9 @@ class SidecarPoolTest(unittest.TestCase):
     anchor pool -- so a sidecar transfer moves KV bytes into KV pages, reports
     success, and leaves the sidecar untouched. ``True`` for a page never written
     makes ``_sync_and_clamp_prefetch_result`` skip the clamp and the model attends
-    over an indexer page holding KV bytes. Every entry point -- registration, get,
-    set, exists -- must score the pool a miss on its own.
+    over an indexer page holding KV bytes. Registration now records the topology
+    for deferred construction. The data entry points must still score the pool as
+    a miss until they can address its own memory and key namespace.
     """
 
     def _store_with_core(self) -> KVCRStore:
@@ -459,14 +503,18 @@ class SidecarPoolTest(unittest.TestCase):
             ),
         ]
 
-    def test_registering_a_sidecar_pool_refuses_to_start_the_backend(self):
-        """Rejecting at startup is what turns wrong output into a failed launch."""
+    def test_registering_a_sidecar_records_it_without_enabling_io(self):
         store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+        sidecar = SimpleNamespace()
+        store.register_mem_pool_host(anchor)
 
-        with self.assertRaises(RuntimeError) as raised:
-            store.register_mem_host_pool_v2(SimpleNamespace(), PoolName.INDEXER)
+        with mock.patch.object(store, "_build_kvcr") as build_kvcr:
+            store.register_mem_host_pool_v2(sidecar, PoolName.INDEXER)
 
-        self.assertIn("indexer", str(raised.exception))
+        self.assertIs(store.registered_pools[PoolName.INDEXER], sidecar)
+        self.assertIsNone(store._kvcr)
+        build_kvcr.assert_not_called()
 
     def test_a_sidecar_get_is_a_miss_and_never_reaches_the_core(self):
         """Asserting the deliver never ran separates this guard from

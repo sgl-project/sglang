@@ -163,6 +163,15 @@ class HybridCacheController(BaseHiCacheController):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()
 
+    def _register_storage_backend_pools(
+        self, host_pools: Optional[list[PoolEntry]] = None
+    ) -> None:
+        self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+        pools = self.mem_pool_host.entries if host_pools is None else host_pools
+        for entry in pools:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.storage_backend.finalize_mem_pool_registration()
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -176,10 +185,8 @@ class HybridCacheController(BaseHiCacheController):
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
+            host_pools=host_pools,
         )
-
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
