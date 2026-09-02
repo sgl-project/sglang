@@ -14,7 +14,10 @@ from PIL import Image
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import (
     _build_cosmos3_param_names_mapping,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+    Cosmos3Config,
+    is_nano_checkpoint,
+)
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
@@ -840,6 +843,44 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
 
 class TestCosmos3ModelResolution(unittest.TestCase):
     """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
+
+    def test_nano_architecture_detection_does_not_depend_on_model_path(self):
+        cases = (
+            (
+                {
+                    "hidden_size": 4096,
+                    "num_hidden_layers": 36,
+                    "num_attention_heads": 32,
+                },
+                True,
+            ),
+            (
+                {
+                    "hidden_size": 5120,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 64,
+                },
+                False,
+            ),
+            (
+                {
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 28,
+                    "num_attention_heads": 16,
+                },
+                False,
+            ),
+        )
+        for index, (transformer_config, expected) in enumerate(cases):
+            with self.subTest(transformer_config=transformer_config):
+                is_nano_checkpoint.cache_clear()
+                with mock.patch(
+                    "sglang.multimodal_gen.configs.pipeline_configs.cosmos3._transformer_config",
+                    return_value=transformer_config,
+                ):
+                    self.assertEqual(
+                        is_nano_checkpoint(f"/models/checkpoint-{index}"), expected
+                    )
 
     def test_hf_checkpoint_uses_registered_native_pipeline_config(self):
         for model_path in (

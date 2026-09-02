@@ -22,7 +22,11 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
 from sglang.srt.utils.network import get_local_ip_by_remote
 
 # -------------------------------------- config base ------------------------------------------
@@ -1693,8 +1697,6 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         info = {}
 
-        from sglang.srt.runtime_context import get_parallel
-
         try:
             parallel = get_parallel()
             info["tp_rank"] = parallel.tp_rank
@@ -1764,7 +1766,6 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.runtime_context import get_server_args
 
             args = get_server_args()
             if args is None:

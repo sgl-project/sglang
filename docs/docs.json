@@ -1111,6 +1111,7 @@
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
@@ -1133,7 +1134,9 @@
                         "pages": [
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash",

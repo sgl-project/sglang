@@ -483,8 +483,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = [node.target]
             elif (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_declare"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
             ):
                 targets |= {
                     kw.arg
@@ -622,7 +622,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
             source = path.read_text(encoding="utf-8-sig")
-            if "_late_resolution" not in source:
+            if "declare_late_resolution" not in source:
                 continue
             try:
                 tree = ast.parse(source)

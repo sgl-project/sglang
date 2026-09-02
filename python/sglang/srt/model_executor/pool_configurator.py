@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
+    get_dsv4_indexer_bytes_per_token,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -44,13 +45,17 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_hip,
     spec_decode_alloc_len_per_request,
 )
+
+_is_hip = is_hip()
 
 
 @dataclass
@@ -69,6 +74,13 @@ class MemoryPoolConfig:
     c128_state_pool_size: int = 0
 
     mem_fraction_static: Optional[float] = None
+
+    # Unified pool only: the PROFILED byte budget for the token-granular
+    # sub-pools. Set, the factories size the buffer from it directly instead of
+    # re-summing ratio-derived token counts, which keeps the re-sum's floor
+    # losses out of the buffer; the token counts stay boot labels / conserve
+    # caps. None on the token-capped path -- a user token cap IS the budget.
+    unified_total_bytes: Optional[int] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -372,7 +384,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if memory_config.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+            indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -766,6 +778,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        # HIP takes the FP4-accurate byte count here. The NVIDIA FP4 path
+        # keeps the FP8 estimate.
+        self.indexer_bytes_per_token = get_dsv4_indexer_bytes_per_token(
+            self.indexer_head_dim,
+            _is_hip and kvc.server_args.enable_deepseek_v4_fp4_indexer,
+        )
         self.context_len = kvc.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
@@ -780,9 +798,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = get_schedule().swa_full_tokens_ratio
         self.is_speculative = get_spec().speculative_algorithm is not None
-        self.online_c128_mtp_max_draft_tokens = (
-            kvc.server_args.max_speculative_num_draft_tokens or 0
-        )
+        self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.requested_max_running_requests_per_worker = (
             get_schedule().max_running_requests // kvc.ps.attn_dp_size
             if get_schedule().max_running_requests is not None
@@ -795,9 +811,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
@@ -814,7 +828,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.is_speculative:
             # Ring is sized once here, so it must serve the largest adaptive tier.
             self._assert_ring_serves_draft_tokens(
-                kvc.server_args.max_speculative_num_draft_tokens or 0
+                max_speculative_num_draft_tokens() or 0
             )
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
@@ -880,11 +894,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
 
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
-
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (
             _get_dsv4_compress_state_dtype_sizes()
@@ -910,7 +919,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.swa_ratio * kv_bytes * self.num_layers_total
             + c4_frac * kv_bytes * self.num_layers_ca4
             + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
+            + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
             + self.swa_ratio
