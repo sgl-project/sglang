@@ -2204,47 +2204,51 @@ class UnifiedRadixCacheSuite:
         """Regression: SWA eviction must not assert on a Mamba lock that was
         taken while the node's SWA was missing.
 
-        unified_kv + HiCache keeps SWA in a per-request ring with no host pool,
-        so a load-back restores Full and Mamba but never SWA.  The match still
-        selects that node and the request lock takes Mamba while skipping SWA.
-        A later overlapping insert restores SWA under the request's Full lock,
-        leaving SWA evictable while Mamba is still locked.  The fixture has no
-        SWA host pool, so ``set_hicache_enabled()`` is exactly that layout.
+        The node reaches that state through the cache API alone.  The layout is
+        HiCache with Mamba but no SWA host pool (unified_kv keeps SWA in a
+        per-request ring): a load-back then restores Full and Mamba but never
+        SWA, the match still selects the node, and the request lock takes Mamba
+        while skipping SWA.  A later overlapping insert restores SWA under the
+        request's Full lock, leaving SWA evictable while Mamba is still locked.
         """
         if not self.cfg.has_swa or not self.cfg.has_mamba:
             self.skipTest("requires SWA and Mamba components")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        # Production write-through backs up on the first insert.
+        cache.write_through_threshold = 1
+        # No stack builds this layout with Mamba today, so declare it: SWA has
+        # no host pool, exactly as the unified_kv assembler leaves it.
+        cache.components[ComponentType.SWA]._swa_kv_pool_host = None
+        cache.tree_core.has_swa_host_pool = False
+
+        def finish_pending_writes():
+            for ack in list(cache.cache_controller.ack_write_queue):
+                ack.finish_event.synchronize()
+            cache.writing_check()
+
         ps = self.cfg.page_size
         seq = self._make_seq(1, (self.cfg.sliding_window_size + ps - 1) // ps)
         key = RadixKey(array("q", seq))
 
         # 1. One window-sized leaf holding Full, SWA and Mamba.  Write-through
-        #    backs up Full and Mamba; SWA has no host pool in this layout.
+        #    backs up Full and Mamba; there is no SWA host pool to back up to.
         self._insert(cache, allocator, req_to_token_pool, seq)
         node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
-        for ct in (ComponentType.FULL, ComponentType.MAMBA):
-            cache.tree_core.set_component_host_value_raw(
-                node, ct, _device_value(cache, node, ct).clone()
-            )
-        cache.tree_core.update_duplicate_tracking(node)
+        finish_pending_writes()
+        self.assertIsNotNone(_host_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
 
         # 2. Full pressure demotes the leaf; its SWA is simply freed.
         cache.evict(EvictParams(num_tokens=len(seq)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+        self.assertIsNone(_device_value(cache, node, ComponentType.FULL))
 
-        # 3. A prefix reuse loads the node back.  This is what load_back() does;
-        #    without an SWA host pool there is no SWA transfer to restore.
-        cache.tree_core.set_hicache_enabled()
-        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(node)
-        self.assertNotIn(ComponentType.SWA, comp_xfers)
-        full_allocator = getattr(allocator, "full_attn_allocator", allocator)
-        kv_indices = full_allocator.alloc(len(kv_xfer.host_indices))
-        comp_xfers[ComponentType.MAMBA][0].device_indices = (
-            req_to_token_pool.mamba_allocator.alloc(1)
-        )
-        cache._apply_cache_actions(
-            cache.tree_core.commit_load_back(node, kv_indices, kv_xfer, comp_xfers)
-        )
+        # 3. A prefix reuse loads the node back: Full and Mamba return, SWA does
+        #    not, because nothing holds it on host.
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(match.best_match_node, node)
+        self.assertTrue(cache.load_back(match.best_match_node))
+        self._finish_pending_loads(cache)
         self.assertIsNotNone(_device_value(cache, node, ComponentType.MAMBA))
         self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
 
@@ -2259,6 +2263,7 @@ class UnifiedRadixCacheSuite:
         # 5. Another request re-prefills its window through the node: the
         #    overlapping insert restores SWA under the held Full lock, unlocked.
         self._insert(cache, allocator, req_to_token_pool, seq)
+        finish_pending_writes()
         self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
         self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
 
