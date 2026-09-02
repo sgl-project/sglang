@@ -254,23 +254,29 @@ export const DiffusionModelCatalog = ({ category }) => {
   const models = MODEL_CATALOG[category] || [];
 
   return (
-    <div className="not-prose sgd-model-catalog">
+    <div className="not-prose sgd-model-catalog" role="list">
       {models.map((model) => (
-        <article key={model.name} className="sgd-model-entry">
-          <header className="sgd-model-entry-header">
+        <article key={model.name} className="sgd-model-entry" role="listitem">
+          <div className="sgd-model-entry-meta">
             <h3>{model.name}</h3>
-          </header>
+            {model.cookbook && (
+              <a
+                className="sgd-model-entry-link"
+                href={model.cookbook}
+                aria-label={`${model.name} cookbook`}
+              >
+                Cookbook <span aria-hidden="true">&rarr;</span>
+              </a>
+            )}
+          </div>
           <div className="sgd-model-entry-ids">
             {model.modelIds.map((modelId) => (
-              <code key={modelId}>{modelId}</code>
+              <div key={modelId} className="sgd-model-id">
+                <code>{modelId}</code>
+              </div>
             ))}
+            {model.note && <p className="sgd-model-entry-note">{model.note}</p>}
           </div>
-          {model.note && <p className="sgd-model-entry-note">{model.note}</p>}
-          {model.cookbook && (
-            <a className="sgd-model-entry-link" href={model.cookbook}>
-              Open cookbook <span aria-hidden="true">&rarr;</span>
-            </a>
-          )}
         </article>
       ))}
     </div>

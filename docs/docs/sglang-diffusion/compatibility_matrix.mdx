@@ -5,18 +5,11 @@ description: "Browse model families and public checkpoints supported by SGLang D
 
 import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
 
-Use the model ID shown below as `--model-path` with `sglang generate` or
-`sglang serve`. Python API users can pass the same ID to the model-loading
-helpers.
-
-The catalog follows the native model registry. Detector-based families and
-local directories may also work when their model metadata matches a supported
-pipeline, so the list is intentionally a set of known public entry points rather
-than an exhaustive list of every compatible checkpoint.
-
-Use the linked [Diffusion Cookbook](/cookbook/diffusion/intro) recipes for model
-behavior, launch commands, optimizations, adapters, and hardware-specific
-guidance.
+Use a listed checkpoint as `--model-path` with `sglang generate` or
+`sglang serve`. This registry-backed list contains known public entry points;
+family detection may also support compatible local directories. Open the linked
+Cookbook recipe for launch commands, optimizations, adapters, and model-specific
+notes.
 
 <Tabs>
   <Tab title="Image and 3D">
