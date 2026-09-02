@@ -116,7 +116,7 @@ def _reconcile_dllm_prefill_graph_buckets(server_args: Any) -> None:
 
     prefill_config = cfg.cuda_graph_config.prefill
     final_bs = generate_dllm_prefill_cuda_graph_batch_sizes(
-        server_args, prefill_config.max_bs
+        server_args, prefill_config.max_bs, quiet=True
     )
     if final_bs is None or final_bs == list(prefill_config.bs or []):
         return

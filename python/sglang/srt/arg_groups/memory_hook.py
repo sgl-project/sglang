@@ -56,7 +56,7 @@ def dllm_prefill_graph_alignment(server_args: Any) -> Optional[int]:
 
 
 def generate_dllm_prefill_cuda_graph_batch_sizes(
-    server_args: Any, max_bs: int
+    server_args: Any, max_bs: int, *, quiet: bool = False
 ) -> Optional[list[int]]:
     """Generate exact aggregate-token buckets for pure dLLM prefill.
 
@@ -68,6 +68,9 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     This is not multi-block-specific: the scheduler emits aligned totals for
     single-block runs too, and the runner's exact-bucket gate applies to every
     pure dLLM prefill.
+
+    ``quiet`` suppresses the summary line for callers that only re-derive the
+    list to compare against what is already installed.
     """
     alignment = dllm_prefill_graph_alignment(server_args)
     if alignment is None:
@@ -85,22 +88,23 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     capture_bs = (
         list(range(alignment, max_tokens + 1, alignment)) if max_tokens > 0 else []
     )
-    if capture_bs:
-        logger.info(
-            "Configured %d exact dLLM prefill CUDA graph buckets: "
-            "alignment=%d, max_tokens=%d",
-            len(capture_bs),
-            alignment,
-            max_tokens,
-        )
-    else:
-        # An empty list leaves the breakable prefill graph with nothing to
-        # capture, so every pure dLLM prefill stays eager.
-        logger.warning(
-            "No dLLM prefill CUDA graph bucket fits alignment=%d within the "
-            "prefill budget; pure dLLM prefill will run eager.",
-            alignment,
-        )
+    if not quiet:
+        if capture_bs:
+            logger.info(
+                "Configured %d exact dLLM prefill CUDA graph buckets: "
+                "alignment=%d, max_tokens=%d",
+                len(capture_bs),
+                alignment,
+                max_tokens,
+            )
+        else:
+            # An empty list leaves the breakable prefill graph with nothing to
+            # capture, so every pure dLLM prefill stays eager.
+            logger.warning(
+                "No dLLM prefill CUDA graph bucket fits alignment=%d within "
+                "the prefill budget; pure dLLM prefill will run eager.",
+                alignment,
+            )
     return capture_bs
 
 
