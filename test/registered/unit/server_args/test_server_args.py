@@ -1083,7 +1083,9 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
 
     def test_hyv4_mxfp8_defaults_deep_gemm_backends(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
 
         for quantization in (
             {"quant_algo": "MXFP8", "kv_cache_quant_algo": None},
@@ -1113,7 +1115,9 @@ class TestContextParallelServerArgs(CustomTestCase):
                 self.assertEqual(result["fp8_gemm_runner_backend"], "deep_gemm")
 
     def test_hyv4_mxfp8_explicit_backend_choice_is_preserved(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
 
         hf_config = SimpleNamespace(
             architectures=["HYV4ForCausalLM"],
@@ -1130,7 +1134,9 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertNotIn("fp8_gemm_runner_backend", result)
 
     def test_hyv4_bf16_keeps_auto_backends(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
 
         hf_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
         server_args = self._new_cp_args(
@@ -1141,7 +1147,9 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertNotIn("fp8_gemm_runner_backend", result)
 
     def test_hyv4_legacy_prefill_cp_aliases_are_rejected(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
 
         hf_config = SimpleNamespace(architectures=["HYV4ForCausalLM"])
         for alias in (
