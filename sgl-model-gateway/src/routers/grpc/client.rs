@@ -133,11 +133,11 @@ impl GrpcClient {
         match (self, req) {
             (Self::Sglang(client), ProtoGenerateRequest::Sglang(boxed_req)) => {
                 let stream = client.generate(*boxed_req).await?;
-                Ok(ProtoStream::Sglang(stream))
+                Ok(ProtoStream::sglang(stream))
             }
             (Self::Vllm(client), ProtoGenerateRequest::Vllm(boxed_req)) => {
                 let stream = client.generate(*boxed_req).await?;
-                Ok(ProtoStream::Vllm(stream))
+                Ok(ProtoStream::vllm(stream))
             }
             _ => panic!("Mismatched client and request types"),
         }
