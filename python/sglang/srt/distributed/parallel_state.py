@@ -2173,8 +2173,9 @@ def get_default_distributed_backend(device: str) -> str:
     # ``from ... import current_platform``) so each call resolves through the
     # platforms package's lazy ``__getattr__`` and picks up runtime overrides
     # of ``_current_platform`` (e.g. in tests).
-    if device == platforms.current_platform.device_type:
-        return platforms.current_platform.get_torch_distributed_backend_str()
+    platform = platforms.current_platform
+    if device in (platform.device_type, platform.device_name):
+        return platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 

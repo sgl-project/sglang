@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -219,7 +220,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.staging_token_capacity = 0
         self.staging_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm

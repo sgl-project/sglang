@@ -11,12 +11,9 @@ could silently break:
 - static-dispatch caching and per-call ``backend_eligible`` gating;
 - the torch.compile enter/leave protocol (idempotency, TopK / FusedMoE
   special paths);
-- the deprecated ``MultiPlatformOp`` alias and its OOT plugin surface.
 
 Platform detection is mocked, so everything here runs on a CPU-only box.
 """
-
-import warnings
 
 import pytest
 import torch
@@ -458,60 +455,6 @@ def test_trace_labels_platform_and_backend(monkeypatch):
     assert explicit_rec.backend == "torch"
 
 
-# --- deprecated MultiPlatformOp alias --------------------------------------------
-
-
-def test_deprecated_alias_contract(monkeypatch):
-    from sglang.srt.layers.utils import MultiPlatformOp
-
-    assert issubclass(MultiPlatformOp, BaseFusedOp)
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-
-        class _LegacyOp(MultiPlatformOp):
-            # Old-style subclass: platform forwards only, no forward_native.
-            def forward_cuda(self, x):
-                return "cuda"
-
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
-
-    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
-    op = _LegacyOp()  # instantiable without forward_native (lenient alias)
-    assert op(torch.zeros(1)) == "cuda"
-    with pytest.raises(NotImplementedError):
-        op.forward_native(torch.zeros(1))
-
-    # register_oot_forward via the alias lands in the shared registry.
-    MultiPlatformOp.register_oot_forward(_LegacyOp, lambda self, x: "oot", "aliasplat")
-    _mock_platform(monkeypatch, key="", oot_key="aliasplat")
-    assert _LegacyOp()(torch.zeros(1)) == "oot"
-
-
-def test_deprecated_alias_keeps_legacy_platform_defaults(monkeypatch):
-    """Old MultiPlatformOp defined per-platform default methods (hip/musa ->
-    cuda, npu/xpu/cpu -> native); plugin code may call them directly, and a
-    subclass without forward_cuda must still raise on CUDA like before."""
-    from sglang.srt.layers.utils import MultiPlatformOp
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-
-        class _NativeOnlyLegacy(MultiPlatformOp):
-            def forward_native(self, x):
-                return "native"
-
-    op = _NativeOnlyLegacy()
-    assert op.forward_cpu(torch.zeros(1)) == "native"
-    assert op.forward_npu(torch.zeros(1)) == "native"
-    with pytest.raises(NotImplementedError):
-        op.forward_hip(torch.zeros(1))  # chains to the raising forward_cuda
-
-    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
-    with pytest.raises(NotImplementedError):
-        _NativeOnlyLegacy()(torch.zeros(1))  # old CUDA behavior preserved
-
-
 # --- migration completeness -------------------------------------------------------
 
 _MIGRATED_OPS = [
@@ -541,15 +484,11 @@ _MIGRATED_OPS = [
 
 @pytest.mark.parametrize("module_name, cls_name", _MIGRATED_OPS)
 def test_migrated_ops_subclass_base_fused_op(module_name, cls_name):
-    """Production ops must extend BaseFusedOp directly, never the deprecated
-    MultiPlatformOp alias (which exists only for out-of-tree users)."""
+    """Production ops must extend BaseFusedOp directly."""
     import importlib
-
-    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 
     cls = getattr(importlib.import_module(module_name), cls_name)
     assert issubclass(cls, BaseFusedOp)
-    assert MultiPlatformOp not in cls.__mro__
 
 
 if __name__ == "__main__":

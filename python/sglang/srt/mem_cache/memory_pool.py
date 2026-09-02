@@ -2163,6 +2163,11 @@ class MHATokenToKVPool(KVCache):
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
+    def _kv_tokens_per_row(self) -> int:
+        # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
+        # a single token slot for the plain NHD [slots, ...] layout.
+        return 1 if self.kv_cache_layout == "nhd" else self.page_size
+
     def _build_kv_buffer_descs(self):
         """Per-buffer layout descriptors, k0..k(L-1) then v0..v(L-1). Drives both the
         CUDA-VMM post-capture backing and PD-transfer registration
@@ -2176,12 +2181,17 @@ class MHATokenToKVPool(KVCache):
             v_shape = tuple(self.v_buffer[0].shape)
         else:
             k_shape, v_shape = self._kv_buffer_shapes()
-        # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
-        # a single token slot for the plain NHD [slots, ...] layout.
         num_slots = self.size + self.page_size
-        tokens_per_row = (
-            self.page_size if k_shape[0] * self.page_size == num_slots else 1
-        )
+        tokens_per_row = self._kv_tokens_per_row()
+        expected_rows = num_slots // tokens_per_row
+        for shape in (k_shape, v_shape):
+            if shape[0] != expected_rows:
+                raise ValueError(
+                    f"KV buffer shape {shape} does not lead with {expected_rows} rows of "
+                    f"{tokens_per_row} token(s) ({self.kv_cache_layout!r} layout); a pool "
+                    "whose leading axis is not tokens or pages must override "
+                    "_build_kv_buffer_descs."
+                )
         descs = []
         for prefix, shape in (("k", k_shape), ("v", v_shape)):
             row_bytes = int(np.prod(shape[1:])) * itemsize
@@ -3664,9 +3674,7 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Pre-built full-attention pool: the unified-memory path's
-            # UnifiedMHATokenToKVPool aliasing the shared byte buffer, or a
-            # platform-provided pool (NPU / out-of-tree) resolved by
-            # KVCacheConfigurator._build_platform_hybrid_full_kv_pool.
+            # UnifiedMHATokenToKVPool aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
             # In-tree default; ``full_kv_pool_class`` carries the
@@ -3694,7 +3702,12 @@ class HybridLinearKVPool(KVCache):
                 **post_capture_kwargs,
             )
         else:
-            self.full_kv_pool = MLATokenToKVPool(
+            MLAPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else MLATokenToKVPool
+            )
+            self.full_kv_pool = MLAPoolClass(
                 size=size,
                 page_size=self.page_size,
                 dtype=dtype,

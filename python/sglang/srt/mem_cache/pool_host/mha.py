@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -208,7 +209,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         # The staged write-back JIT kernel builds with hipcc and has a ROCm
@@ -1036,7 +1040,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         self.staging_k_buffer = None
         self.staging_v_buffer = None
         self.can_use_write_back_jit = False
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         # K and V have different element sizes. Use the single-buffer staged

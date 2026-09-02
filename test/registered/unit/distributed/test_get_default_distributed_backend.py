@@ -26,11 +26,22 @@ class _DefaultPlatform(SRTPlatform):
     device_type = "cuda"
 
 
+# A PrivateUse1 backend: torch names the device type "privateuseone" while
+# ServerArgs.device carries the platform's own name.
+class _PrivateUseOnePlatform(SRTPlatform):
+    device_name = "neuron"
+    device_type = "privateuseone"
+
+    def get_torch_distributed_backend_str(self) -> str:
+        return "neuron_ccl"
+
+
 class TestGetDefaultDistributedBackend(CustomTestCase):
     """Cover all paths of get_default_distributed_backend.
 
-    When ``device == current_platform.device_type`` the dispatcher asks
-    ``current_platform.get_torch_distributed_backend_str()``; otherwise it
+    When ``device`` is the platform's ``device_type`` or ``device_name`` the
+    dispatcher asks ``current_platform.get_torch_distributed_backend_str()``;
+    otherwise it
     looks up ``_DEVICE_TO_DISTRIBUTED_BACKEND[device]`` for cross-device
     queries (e.g. auxiliary "cpu"/gloo groups on a CUDA process).
 
@@ -71,6 +82,14 @@ class TestGetDefaultDistributedBackend(CustomTestCase):
     def test_unknown_device_returns_gloo_default(self):
         self._install(_DefaultPlatform())
         self.assertEqual(get_default_distributed_backend("unobtanium"), "gloo")
+
+    def test_device_name_matches_when_torch_type_is_privateuseone(self):
+        """ServerArgs.device is the platform's device_name; an override keyed only
+        on the torch device_type silently fell back to gloo for such a platform."""
+        self._install(_PrivateUseOnePlatform())
+        self.assertEqual(get_default_distributed_backend("neuron"), "neuron_ccl")
+        self.assertEqual(get_default_distributed_backend("privateuseone"), "neuron_ccl")
+        self.assertEqual(get_default_distributed_backend("cpu"), "gloo")
 
 
 if __name__ == "__main__":

@@ -246,11 +246,7 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
+        if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(

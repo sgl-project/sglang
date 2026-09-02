@@ -518,7 +518,7 @@ def alloc_paged_token_slots_decode(
     return out_cache_loc
 
 
-def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     """
     Allocate KV cache for decode batch and write to req_to_token_pool.
 
@@ -619,6 +619,17 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+ALLOC_FOR_DECODE_FUNCS = defaultdict(lambda: alloc_for_decode_default)
+
+
+def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+    return ALLOC_FOR_DECODE_FUNCS[_device_type(batch)](batch, token_per_req)
+
+
+def _device_type(batch: ScheduleBatch) -> str:
+    return torch.device(batch.device).type
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -682,10 +693,7 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+            out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
                 tree_cache,
                 cur_kv_lens,
                 cur_kv_lens_cpu,

@@ -211,7 +211,7 @@ class WeightUpdater:
             or self.device == "musa"
             or (
                 current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
+                and current_platform.capabilities.graph_capture
             )
         ):
             self.recapture_cuda_graph()

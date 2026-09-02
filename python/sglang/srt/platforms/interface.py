@@ -3,8 +3,8 @@ SGLang SRT Hardware Platform Abstraction.
 
 Defines SRTPlatform — the base class for SRT (LLM inference) platform
 backends.  SRTPlatform inherits DeviceMixin for shared device operations
-and adds SRT-specific subsystem factory methods, capability flags, and
-configuration lifecycle hooks.
+and adds SRT-specific subsystem factory methods, a capability declaration,
+and configuration lifecycle hooks.
 
 Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
@@ -12,22 +12,54 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+import functools
+import inspect
+from typing import TYPE_CHECKING, Literal, Optional, Type
+
+import msgspec
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
-    from sglang.srt.mem_cache.kv_pool_request import KVPoolRequest
-    from sglang.srt.mem_cache.memory_pool import KVCache
 
 # Re-export for convenience
 __all__ = [
+    "KVPoolKind",
+    "PlatformCapabilities",
     "SRTPlatform",
     "PlatformEnum",
     "require_out_of_tree_impl",
     "reject_out_of_tree_path",
 ]
+
+KVPoolKind = Literal["mha", "mla", "dsa"]
+
+
+class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
+    """What the platform can do.
+
+    Core reads these before it constructs anything and picks a code path
+    the platform can serve, instead of announcing a decision and asking the
+    platform to honor it. Every field defaults to the conservative answer.
+
+    ``supports_triton``: Triton kernels can launch on this device. When
+    False, core uses the torch-native allocator and req-to-token writers.
+    ``supports_fp8``: fp8 quantization is served. ``graph_capture``: the
+    decode graph runner (``get_graph_runner_cls``) runs. ``piecewise_graph``:
+    the prefill piecewise compilation backend runs.
+    ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
+    kernels are available; otherwise the host pools skip their staging
+    buffers.
+    """
+
+    supports_triton: bool = False
+    supports_fp8: bool = False
+    graph_capture: bool = False
+    piecewise_graph: bool = False
+    hicache_device_kernels: bool = False
 
 
 class SRTPlatform(DeviceMixin):
@@ -35,14 +67,24 @@ class SRTPlatform(DeviceMixin):
     Base class for SRT hardware platform backends.
 
     Inherits device identity queries and operations from DeviceMixin.
-    Adds SRT-specific factory methods, capability flags, and lifecycle hooks.
+    Adds SRT-specific factory methods, a capability declaration, and
+    lifecycle hooks.
 
-    OOT platforms should subclass SRTPlatform and override the methods
-    relevant to their hardware.
+    OOT platforms subclass SRTPlatform and override the methods relevant to
+    their hardware. Every public name a subclass defines must exist on this
+    base with a compatible signature; the check runs at class-definition
+    time so a renamed or removed hook fails loudly instead of silently
+    never being called. Vendor-private helpers go under a leading
+    underscore.
     """
 
-    # SRT-specific class-level attribute
+    # SRT-specific class-level attributes
     supported_quantization: list[str] = []
+    capabilities: PlatformCapabilities = PlatformCapabilities()
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        _check_platform_subclass(cls)
 
     # ------------------------------------------------------------------
     # Configuration lifecycle
@@ -71,57 +113,29 @@ class SRTPlatform(DeviceMixin):
         """
         return None
 
-    def build_kv_pool(self, *, request: KVPoolRequest) -> Optional[KVCache]:
-        """Build this platform's KV pool for ``request``, or return None.
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        """Return this platform's KV pool class for ``kind``, or None.
 
-        This is the single KV-pool seam. The platform sees the full request
-        (kind, sizes, layout, dtype, attention backend) and constructs the
-        pool itself, so pool ``__init__`` signatures stay private to the
-        platform and new request fields never break existing platforms.
-        ``None`` means "no platform opinion" — the configurator builds the
-        in-tree default (including any caller-selected layout variant). Out-of-tree
-        platforms get an actionable error instead of the in-tree default.
-
-        The returned object's contract is wider than the ``KVCache`` ABC:
-        in-tree callers (PD transfer, hicache, the attention backends) reach
-        for concrete attributes and use ``isinstance`` against the in-tree
-        pool classes. Subclass ``MHATokenToKVPool`` / ``MLATokenToKVPool`` /
-        ``DSATokenToKVPool`` rather than implementing ``KVCache`` directly.
-        """
-        return None
-
-    def get_mha_kv_pool_cls(self) -> Optional[type]:
-        """Deprecated: override :meth:`build_kv_pool` instead.
-
-        Legacy class hook, honored only for out-of-tree platforms when
-        ``build_kv_pool`` returns None. The returned class is instantiated
-        by the caller with a fixed kwargs set, which couples every
-        platform's pool signature to the call site — the reason this hook
-        is deprecated. ``None`` (the default) means "no platform opinion".
-        """
-        return None
-
-    def get_mla_kv_pool_cls(self) -> Optional[type]:
-        """Deprecated: override :meth:`build_kv_pool` instead.
-
-        Legacy class hook; see :meth:`get_mha_kv_pool_cls`.
-        """
-        return None
-
-    def get_dsa_kv_pool_cls(self) -> Optional[type]:
-        """Deprecated: override :meth:`build_kv_pool` instead.
-
-        Legacy class hook (DeepSeek V3.2); see :meth:`get_mha_kv_pool_cls`.
+        The class must subclass the in-tree pool for that kind
+        (``MHATokenToKVPool`` / ``MLATokenToKVPool`` / ``DSATokenToKVPool``)
+        and is constructed by the configurator with exactly the keyword
+        arguments the in-tree class receives, at every site the in-tree
+        class is built (standalone, the SWA composite, the hybrid-linear
+        full-attention leaf). Override ``_create_buffers`` to change how the
+        backing storage is carved; the rest of the pool (addressing, index
+        translation, PD registration) stays core's. ``None`` (the default)
+        means the in-tree class, which allocates on ``device`` and is
+        correct for any torch device.
         """
         return None
 
     def get_paged_allocator_cls(self) -> Optional[type]:
         """Return the paged allocator class, or None for the in-tree default.
 
-        Unlike the KV pools, allocator constructor signatures are uniform
-        across implementations, so a class hook is sufficient here. A
-        non-None class is honored at every paged-allocator construction
-        site, including inside ``SWATokenToKVPoolAllocator``.
+        Honored at every paged-allocator construction site, including
+        inside ``SWATokenToKVPoolAllocator``. The in-tree allocator already
+        falls back to torch-native kernels when ``capabilities.supports_triton``
+        is False, so most platforms need no override.
         """
         return None
 
@@ -146,34 +160,19 @@ class SRTPlatform(DeviceMixin):
         return None
 
     # ------------------------------------------------------------------
-    # Capability flags (safe conservative defaults)
-    # ------------------------------------------------------------------
-
-    def supports_fp8(self) -> bool:
-        """Whether this platform supports FP8 quantization."""
-        return False
-
-    def support_cuda_graph(self) -> bool:
-        """Whether this platform supports device graph capture and replay.
-        Controls CUDA graph (CudaGraphRunner) for the decode path.
-        OOT platforms that support graph-style capture should return True.
-        """
-        return False
-
-    def support_piecewise_cuda_graph(self) -> bool:
-        """Whether this platform supports piecewise CUDA graph.
-
-        Controls PiecewiseCudaGraphRunner for the prefill/extend path
-        (torch.compile backend).
-        """
-        return False
-
-    # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
         """One-time backend initialization.  Called in each worker."""
+        pass
+
+    def post_load_model(self, model: torch.nn.Module) -> None:
+        """Called once after the model's weights are loaded, in the worker.
+
+        The place to relocate parameters, swap quant methods, or install
+        forward hooks on an in-tree model class; mutate ``model`` in place.
+        """
         pass
 
     # ------------------------------------------------------------------
@@ -190,6 +189,83 @@ class SRTPlatform(DeviceMixin):
         this key take precedence over the method lookup.
         """
         return "native"
+
+
+def _unwrap_callable(attr):
+    if isinstance(attr, (classmethod, staticmethod)):
+        return attr.__func__
+    if isinstance(attr, (property, functools.cached_property)):
+        return None
+    if inspect.isfunction(attr):
+        return attr
+    return None
+
+
+_NAMED = (
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    inspect.Parameter.KEYWORD_ONLY,
+)
+_VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+
+
+def _signature_mismatch(*, base_attr, override) -> Optional[str]:
+    base_fn = _unwrap_callable(base_attr)
+    override_fn = _unwrap_callable(override)
+    if base_fn is None or override_fn is None:
+        return None
+    base_params = list(inspect.signature(base_fn).parameters.values())[1:]
+    override_params = list(inspect.signature(override_fn).parameters.values())[1:]
+    override_names = {p.name for p in override_params}
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in override_params
+    )
+    for p in base_params:
+        if p.kind in _NAMED and p.name not in override_names and not accepts_var_kw:
+            return f"does not accept {p.name!r}"
+    base_names = {p.name for p in base_params}
+    for p in override_params:
+        if (
+            p.kind not in _VARIADIC
+            and p.default is inspect.Parameter.empty
+            and p.name not in base_names
+        ):
+            return f"requires {p.name!r}, which core never passes"
+    return None
+
+
+def _check_platform_subclass(cls: type) -> None:
+    contract = set(SRTPlatform.__mro__)
+    base_public = {n for n in dir(SRTPlatform) if not n.startswith("_")}
+    unknown: list[str] = []
+    incompatible: list[str] = []
+    for klass in cls.__mro__:
+        if klass in contract:
+            continue
+        for name, attr in vars(klass).items():
+            if name.startswith("_"):
+                continue
+            if name not in base_public:
+                unknown.append(f"{klass.__name__}.{name}")
+                continue
+            reason = _signature_mismatch(
+                base_attr=inspect.getattr_static(SRTPlatform, name), override=attr
+            )
+            if reason is not None:
+                incompatible.append(f"{klass.__name__}.{name} {reason}")
+    if not unknown and not incompatible:
+        return
+    lines = [f"{cls.__name__} does not match the SRTPlatform contract."]
+    if unknown:
+        lines.append(
+            "Public names that are not on SRTPlatform (core never calls them; "
+            "prefix vendor-private helpers with an underscore): "
+            + ", ".join(sorted(unknown))
+        )
+    if incompatible:
+        lines.append(
+            "Overrides with incompatible signatures: " + "; ".join(incompatible)
+        )
+    raise TypeError("\n".join(lines))
 
 
 def require_out_of_tree_impl(

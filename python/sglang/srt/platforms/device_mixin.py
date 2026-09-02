@@ -29,6 +29,7 @@ import enum
 import random
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import cached_property
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -245,6 +246,10 @@ class DeviceMixin:
     def verify_quantization(self, quant: str) -> None:
         """[Planned] Validate that a quantization method is supported. No-op by default."""
         pass
+
+    @cached_property
+    def cpu_arch(self) -> "CpuArchEnum":
+        return self.get_cpu_architecture()
 
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
