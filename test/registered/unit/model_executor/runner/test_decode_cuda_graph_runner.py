@@ -28,6 +28,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -287,6 +294,182 @@ class TestOriginalTraceExport(CustomTestCase):
                 self.assertEqual(
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
+                )
+
+
+class TestCanRunGraphEncoderLensGate(CustomTestCase):
+    """The mixed-batch (encoder_len = 0) admission gate must read the CPU
+    mirror instead of bool(torch.all(device_tensor > 0)), whose implicit
+    __bool__ forces a D2H copy + stream sync on every encoder-decoder decode
+    step (draining the previous step's replay before this step's launches
+    can be queued).
+
+    The mirror is generated together with the tensor (ScheduleBatch builds
+    both from one Python list and co-updates them in filter_batch /
+    merge_batch), so the mirror predicate must return exactly what the device
+    predicate returns in every reachable batch state. Both admission paths
+    (can_run_graph, _can_run_ragged_verify_graph) are exercised through the
+    real methods on a stand-in runner whose other gates are forced True, so
+    the return value isolates the encoder-lens gate.
+    """
+
+    _CASES = (
+        ([5, 3, 7], "all positive"),
+        ([0, 5, 3], "zero first"),
+        ([5, 3, 0], "zero last"),
+        ([0, 0, 0], "all zero"),
+        ([7], "single positive"),
+        ([0], "single zero"),
+    )
+
+    def _make_forward_batch(self, encoder_lens, encoder_lens_cpu):
+        bs = encoder_lens.numel()
+        return ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=torch.zeros(bs, dtype=torch.int64),
+            req_pool_indices=torch.arange(bs, dtype=torch.int64),
+            seq_lens=torch.full((bs,), 32, dtype=torch.int64),
+            out_cache_loc=torch.arange(bs, dtype=torch.int64),
+            seq_lens_sum=32 * bs,
+            encoder_lens=encoder_lens,
+            encoder_lens_cpu=encoder_lens_cpu,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+    def _make_runner(self, **overrides):
+        runner = SimpleNamespace(
+            ragged_verify_mode=False,
+            require_mlp_tp_gather=False,
+            enable_pdmux=False,
+            disable_padding=False,
+            max_bs=16,
+            require_mlp_sync=False,
+            is_encoder_decoder=True,
+            enable_two_batch_overlap=False,
+            model_runner=SimpleNamespace(
+                spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+            ),
+        )
+        for name in (
+            "_make_graph_key",
+            "_resolve_lora_variant",
+            "_ragged_capture_slots",
+            "_encoder_lens_all_positive",
+            "can_run_graph",
+            "_can_run_ragged_verify_graph",
+        ):
+            setattr(runner, name, getattr(DecodeCudaGraphRunner, name).__get__(runner))
+        for key, value in overrides.items():
+            setattr(runner, key, value)
+        return runner
+
+    def _device_predicate(self, lens):
+        # The pre-fix expression, kept verbatim as the oracle.
+        return bool(torch.all(torch.tensor(lens, dtype=torch.int64) > 0))
+
+    def test_can_run_graph_matches_device_predicate(self):
+        for lens, desc in self._CASES:
+            with self.subTest(desc):
+                fb = self._make_forward_batch(
+                    torch.tensor(lens, dtype=torch.int64), list(lens)
+                )
+                self.assertIs(
+                    self._make_runner().can_run_graph(fb), self._device_predicate(lens)
+                )
+
+    def test_can_run_graph_none_mirror_falls_back_to_device_tensor(self):
+        for lens, desc in self._CASES:
+            with self.subTest(desc):
+                fb = self._make_forward_batch(
+                    torch.tensor(lens, dtype=torch.int64), None
+                )
+                self.assertIs(
+                    self._make_runner().can_run_graph(fb), self._device_predicate(lens)
+                )
+
+    def test_mirror_wins_when_disagreeing_with_device_tensor(self):
+        # Mutation-proof: every other test in this class feeds mirror ==
+        # device tensor, so predicate equality holds either way and a helper
+        # reverted to always read the device tensor still passes them. Here
+        # the two inputs deliberately disagree, and each subtest asserts the
+        # answer the old device predicate would NOT give -- reverting the
+        # helper to the device read fails all three subtests, pinning that
+        # the CPU mirror is the input actually consulted.
+        ragged_layout = SimpleNamespace(graph_num_tokens=4)
+        for mirror, device_lens, desc in (
+            ([5, 3, 7], [0, 5, 3], "mirror all-positive, device tensor mixed"),
+            ([0, 5, 3], [5, 3, 7], "mirror mixed, device tensor all-positive"),
+        ):
+            with self.subTest(f"can_run_graph: {desc}"):
+                # Precondition: the disagreement is real, only one input wins.
+                self.assertNotEqual(
+                    self._device_predicate(mirror), self._device_predicate(device_lens)
+                )
+                fb = self._make_forward_batch(
+                    torch.tensor(device_lens, dtype=torch.int64), list(mirror)
+                )
+                self.assertIs(
+                    self._make_runner().can_run_graph(fb),
+                    self._device_predicate(mirror),
+                )
+        with self.subTest("_can_run_ragged_verify_graph: mirror decides both ways"):
+            for mirror, device_lens in (
+                ([5, 3, 7], [0, 5, 3]),
+                ([0, 5, 3], [5, 3, 7]),
+            ):
+                fb = self._make_forward_batch(
+                    torch.tensor(device_lens, dtype=torch.int64), list(mirror)
+                )
+                runner = self._make_runner(
+                    attn_backend=SimpleNamespace(supports_ragged_verify_graph=True),
+                    capture_num_tokens=[2, 8],
+                    captured_req_width=1,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                self.assertIs(
+                    runner._can_run_ragged_verify_graph(fb, ragged_layout),
+                    self._device_predicate(mirror),
+                )
+
+    def test_non_encoder_decoder_skips_gate(self):
+        # Pure-LM batches short-circuit to True without reading encoder_lens,
+        # exactly like the pre-fix expression.
+        fb = self._make_forward_batch(torch.tensor([0, 0], dtype=torch.int64), [0, 0])
+        self.assertTrue(self._make_runner(is_encoder_decoder=False).can_run_graph(fb))
+
+    def test_ragged_verify_gate_matches_device_predicate(self):
+        ragged_layout = SimpleNamespace(graph_num_tokens=4)
+        for lens, desc in self._CASES:
+            with self.subTest(desc):
+                fb = self._make_forward_batch(
+                    torch.tensor(lens, dtype=torch.int64), list(lens)
+                )
+                runner = self._make_runner(
+                    attn_backend=SimpleNamespace(supports_ragged_verify_graph=True),
+                    capture_num_tokens=[2, 8],
+                    captured_req_width=1,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                self.assertIs(
+                    runner._can_run_ragged_verify_graph(fb, ragged_layout),
+                    self._device_predicate(lens),
+                )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "no CUDA device")
+    def test_can_run_graph_matches_device_predicate_on_gpu(self):
+        # Mirror and device tensor built the way ScheduleBatch does: one Python
+        # list, one tensor().to(device). Asserts the mirror equals the tensor
+        # contents and that the real admission path agrees with the device
+        # predicate when the gate is evaluated from host data.
+        for lens, desc in self._CASES:
+            with self.subTest(desc):
+                mirror = list(lens)
+                gpu_lens = torch.tensor(mirror, dtype=torch.int64, device="cuda")
+                self.assertTrue(torch.equal(gpu_lens.cpu(), torch.tensor(mirror)))
+                fb = self._make_forward_batch(gpu_lens, mirror)
+                self.assertIs(
+                    self._make_runner().can_run_graph(fb), self._device_predicate(lens)
                 )
 
 
