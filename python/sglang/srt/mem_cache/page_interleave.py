@@ -32,9 +32,13 @@ therefore can be striped without extra compute-time communication:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 import msgspec
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -84,3 +88,26 @@ class PageInterleavePlacement:
     def filter_local(self, loc: torch.Tensor, rank: int) -> torch.Tensor:
         """Logical slots -> this rank's physical pool rows, order-preserving."""
         return self.local_index(loc[self.local_mask(loc, rank)])
+
+
+def get_kv_shard_group(use_mla_backend: bool) -> GroupCoordinator:
+    """The group KV pages are striped across — the axis that replicates KV
+    at rest, chosen by topology:
+
+    - An active attention-CP group takes precedence: prefill CP replicates
+      KV storage across CP ranks for every attention type (GQA via the
+      full-chunk allgather, MLA via rebuild_cp_kv_cache).
+    - Without CP, MLA latent KV is still replicated across attention-TP
+      (ReplicatedLinear projection), so the attn-TP group is the shard axis.
+    - GQA without CP has no replicated axis (KV is head-sharded across TP);
+      the returned trivial CP group has world_size 1, which disables
+      sharding in get_kv_shard_group_info.
+    """
+    from sglang.srt.runtime_context import get_parallel
+
+    cp_group = get_parallel().attn_cp_group
+    if cp_group.world_size > 1:
+        return cp_group
+    if use_mla_backend:
+        return get_parallel().attn_tp_group
+    return cp_group
