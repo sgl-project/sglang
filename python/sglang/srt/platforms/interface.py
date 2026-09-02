@@ -22,7 +22,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 # Re-export for convenience
-__all__ = ["SRTPlatform", "PlatformEnum", "require_out_of_tree_impl"]
+__all__ = [
+    "SRTPlatform",
+    "PlatformEnum",
+    "require_out_of_tree_impl",
+    "reject_out_of_tree_path",
+]
 
 
 class SRTPlatform(DeviceMixin):
@@ -74,7 +79,14 @@ class SRTPlatform(DeviceMixin):
         pool itself, so pool ``__init__`` signatures stay private to the
         platform and new request fields never break existing platforms.
         ``None`` means "no platform opinion" — the configurator builds the
-        in-tree default (including any caller-selected layout variant).
+        in-tree default (including any caller-selected layout variant). Out-of-tree
+        platforms get an actionable error instead of the in-tree default.
+
+        The returned object's contract is wider than the ``KVCache`` ABC:
+        in-tree callers (PD transfer, hicache, the attention backends) reach
+        for concrete attributes and use ``isinstance`` against the in-tree
+        pool classes. Subclass ``MHATokenToKVPool`` / ``MLATokenToKVPool`` /
+        ``DSATokenToKVPool`` rather than implementing ``KVCache`` directly.
         """
         return None
 
@@ -191,4 +203,15 @@ def require_out_of_tree_impl(
         f"{platform.device_name!r}) provides no {subsystem}. Override "
         f"{hook} on your SRTPlatform subclass: the in-tree fallback is "
         f"device-keyed and would hand this device the CUDA implementation."
+    )
+
+
+def reject_out_of_tree_path(platform: SRTPlatform, *, subsystem: str) -> None:
+    """Reject an in-tree-only path that has no platform seam; no-op in-tree."""
+    if not platform.is_out_of_tree():
+        return
+    raise NotImplementedError(
+        f"Out-of-tree platform {type(platform).__name__} (device "
+        f"{platform.device_name!r}) reached {subsystem}, which has no platform "
+        f"seam yet and would otherwise build in-tree classes that assume CUDA."
     )

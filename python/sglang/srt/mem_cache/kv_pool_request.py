@@ -15,21 +15,30 @@ or ``ServerArgs`` so platforms stay decoupled from their internals.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 import msgspec
 import torch
+
+# Closed domains: a platform that matches exhaustively gets a compile-time
+# (and reviewable) signal when a new member lands, instead of an ``else``
+# arm that silently serves a new family as an old one.
+PoolKind = Literal["mha", "mha_sparse_index", "mla", "dsa"]
+PoolLayout = Literal["contiguous", "page_major"]
+QuantScheme = Literal["none", "fp4", "mxfp8"]
 
 
 class KVPoolRequest(msgspec.Struct, frozen=True, kw_only=True):
     """What the requested KV pool must hold, plus selection context.
 
-    ``kind`` names the pool family the in-tree default would use:
-    ``"mha"``, ``"mla"``, or ``"dsa"``. A platform returns ``None`` from
-    ``build_kv_pool`` for any request it has no opinion on.
+    ``kind`` names the pool family the in-tree default would use. A platform
+    returns ``None`` from ``build_kv_pool`` for any request it cannot serve
+    exactly -- including any ``kind`` or ``quant_scheme`` it does not
+    recognize. Returning an approximation is never correct: the in-tree
+    callers type-check the pool they get back.
     """
 
-    kind: str
+    kind: PoolKind
     # Pool shape.
     size: int  # token capacity
     page_size: int
@@ -59,11 +68,16 @@ class KVPoolRequest(msgspec.Struct, frozen=True, kw_only=True):
     # raise; silently building another layout is how the old class-getter
     # priority chain went wrong. Only plain-MHA requests are ever
     # "page_major"; MLA/DSA and mxfp8 have no page-major variant.
-    layout: str = "contiguous"  # "contiguous" | "page_major"
+    layout: PoolLayout = "contiguous"
+    # Block-scaled KV quantization the pool must implement; "none" is a
+    # plain dtype pool. Not inferable from ``dtype`` alone for mxfp8.
+    quant_scheme: QuantScheme = "none"
     kv_cache_dtype_str: str = ""
     attention_backend: str = ""
     # When is_hybrid_swa, size is the combined budget: the full-attention
-    # side takes full_size and the sliding side swa_size.
+    # side takes full_size and the sliding side swa_size. The seam cannot
+    # yet describe the sliding/full layer-id split a composite needs, so a
+    # platform that cannot build one from its own config must return None.
     is_hybrid_swa: bool = False
     full_size: Optional[int] = None
     swa_size: Optional[int] = None

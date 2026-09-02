@@ -50,7 +50,11 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.mem_cache.kv_pool_request import KVPoolRequest
+from sglang.srt.mem_cache.kv_pool_request import (
+    KVPoolRequest,
+    PoolKind,
+    QuantScheme,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -68,7 +72,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
-from sglang.srt.platforms.interface import require_out_of_tree_impl
+from sglang.srt.platforms.interface import (
+    reject_out_of_tree_path,
+    require_out_of_tree_impl,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -425,6 +432,10 @@ class KVCacheConfigurator:
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if get_memory().enable_unified_memory and req_to_token_pool is None:
+            reject_out_of_tree_path(
+                current_platform,
+                subsystem="the unified memory pool (--enable-unified-memory)",
+            )
             pd_enabled = get_disagg().disaggregation_mode != "null"
             is_dsv4 = is_deepseek_v4(self.model_config.hf_config)
             # Order matters: an Inkling-class model is BOTH mambaish and
@@ -1157,6 +1168,9 @@ class KVCacheConfigurator:
         )
 
         if is_dsv4_model:
+            reject_out_of_tree_path(
+                current_platform, subsystem="the DeepSeek-V4 KV pool"
+            )
             token_to_kv_pool = self._build_dsv4_kv_pool(
                 max_running_requests=sizes.max_running_requests,
                 swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
@@ -1319,12 +1333,21 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _kv_pool_kind(self, *, is_dsa_model: bool) -> str:
+    def _kv_pool_kind(self, *, is_dsa_model: bool) -> PoolKind:
         if self.use_mla_backend and is_dsa_model:
             return "dsa"
         if self.use_mla_backend:
             return "mla"
+        if is_minimax_sparse(self.model_config.hf_config):
+            return "mha_sparse_index"
         return "mha"
+
+    def _kv_pool_quant_scheme(self) -> QuantScheme:
+        if self.kv_cache_dtype_str == "mxfp8":
+            return "mxfp8"
+        if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            return "fp4"
+        return "none"
 
     def _page_major_enabled(self) -> bool:
         enable_page_major = get_memory().enable_page_major_kv_layout
@@ -1343,7 +1366,7 @@ class KVCacheConfigurator:
     def _make_kv_pool_request(
         self,
         *,
-        kind: str,
+        kind: PoolKind,
         size: int,
         layer_num: int,
         start_layer: int,
@@ -1390,6 +1413,7 @@ class KVCacheConfigurator:
             layout=(
                 "page_major" if self._page_major_applies(kind=kind) else "contiguous"
             ),
+            quant_scheme=self._kv_pool_quant_scheme(),
             kv_cache_dtype_str=self.kv_cache_dtype_str or "",
             attention_backend=get_exec().kernel.attention_backend,
             is_hybrid_swa=self.is_hybrid_swa,
@@ -1424,7 +1448,7 @@ class KVCacheConfigurator:
             swa_size=sizes.swa_max_total_num_tokens,
             post_capture_active=(
                 self.post_capture_kv_active
-                and not (kind == "mha" and is_float4_e2m1fn_x2(self.kv_cache_dtype))
+                and not (kind == "mha" and self._kv_pool_quant_scheme() == "fp4")
             ),
         )
         token_to_kv_pool = current_platform.build_kv_pool(request=request)
@@ -1443,7 +1467,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_legacy_oot_kv_pool(
-        self, *, kind: str, max_total_num_tokens: int, is_dsa_model: bool
+        self, *, kind: PoolKind, max_total_num_tokens: int, is_dsa_model: bool
     ) -> Optional[KVCache]:
         """Deprecated get_*_kv_pool_cls path for out-of-tree platforms that
         have not adopted build_kv_pool yet. Returns None when the platform

@@ -503,27 +503,32 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     </tr>
     <tr>
       <td><code>get_graph_runner_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
+      <td><code>return None</code></td>
       <td>Graph Runner class</td>
     </tr>
     <tr>
+      <td><code>build_kv_pool(request)</code></td>
+      <td><code>return None</code></td>
+      <td>Build this platform&#39;s KV cache pool for a <code>KVPoolRequest</code>. The single KV pool seam: the platform reads the request and calls its own constructor, so pool <code>__init__</code> signatures stay private to the platform. Return <code>None</code> for any request you cannot serve exactly (including an unrecognized <code>kind</code> or <code>quant_scheme</code>) -- out-of-tree platforms then get an actionable error rather than an in-tree CUDA pool. Subclass <code>MHATokenToKVPool</code> / <code>MLATokenToKVPool</code> / <code>DSATokenToKVPool</code> rather than implementing <code>KVCache</code> directly: in-tree callers reach for concrete attributes and use <code>isinstance</code>.</td>
+    </tr>
+    <tr>
       <td><code>get_mha_kv_pool_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
-      <td>MHA KV cache pool class</td>
+      <td><code>return None</code></td>
+      <td><b>Deprecated</b> — override <code>build_kv_pool()</code>. Honored for out-of-tree platforms that have not migrated; warns once.</td>
     </tr>
     <tr>
       <td><code>get_mla_kv_pool_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
-      <td>MLA KV cache pool class</td>
+      <td><code>return None</code></td>
+      <td><b>Deprecated</b> — see above.</td>
     </tr>
     <tr>
       <td><code>get_dsa_kv_pool_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
-      <td>DSA KV cache pool class (DeepSeek V3.2)</td>
+      <td><code>return None</code></td>
+      <td><b>Deprecated</b> — see above.</td>
     </tr>
     <tr>
       <td><code>get_paged_allocator_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
+      <td><code>return None</code></td>
       <td>Paged allocator class</td>
     </tr>
     <tr>
@@ -533,7 +538,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     </tr>
     <tr>
       <td><code>get_piecewise_backend_cls()</code></td>
-      <td><code>raise NotImplementedError</code></td>
+      <td><code>return None</code></td>
       <td>Piecewise compilation backend class</td>
     </tr>
     <tr>

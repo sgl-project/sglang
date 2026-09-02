@@ -21,7 +21,7 @@ import torch
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.kv_pool_request import KVPoolRequest
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import SRTPlatform, reject_out_of_tree_path
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,6 +69,7 @@ def _fake_configurator(
     is_hybrid_swa=False,
     page_major=False,
     kv_cache_dtype_str=None,
+    minimax_sparse=False,
 ):
     """A configurator double for the seam methods, bound to the real logic
     under test and MagicMocks for the heavyweight collaborators."""
@@ -94,7 +95,13 @@ def _fake_configurator(
         kv_lora_rank=8,
         qk_rope_head_dim=16,
     )
-    for name in ("_kv_pool_kind", "_make_kv_pool_request", "_page_major_applies"):
+    fake._minimax_sparse = minimax_sparse
+    for name in (
+        "_kv_pool_kind",
+        "_kv_pool_quant_scheme",
+        "_make_kv_pool_request",
+        "_page_major_applies",
+    ):
         setattr(fake, name, getattr(KVCacheConfigurator, name).__get__(fake))
     fake._page_major_enabled = lambda: page_major
     fake._build_legacy_oot_kv_pool = MagicMock(return_value=None)
@@ -119,6 +126,7 @@ def _runtime_context(*, attention_backend="fa3"):
             f"{_CONFIGURATOR_MODULE}.get_parallel",
             return_value=SimpleNamespace(attn_tp_size=1, attn_dcp_size=1),
         ),
+        patch(f"{_CONFIGURATOR_MODULE}.is_minimax_sparse", return_value=False),
     ):
         yield
 
@@ -143,12 +151,33 @@ class TestPlatformInterfaceDefaults(CustomTestCase):
 
 
 class TestKVPoolKind(CustomTestCase):
+    def _kind(self, fake, *, is_dsa_model=False):
+        with patch(
+            f"{_CONFIGURATOR_MODULE}.is_minimax_sparse",
+            side_effect=lambda cfg: fake._minimax_sparse,
+        ):
+            return fake._kv_pool_kind(is_dsa_model=is_dsa_model)
+
     def test_kind_mapping(self):
         fake = _fake_configurator(use_mla_backend=True)
-        self.assertEqual(fake._kv_pool_kind(is_dsa_model=True), "dsa")
-        self.assertEqual(fake._kv_pool_kind(is_dsa_model=False), "mla")
+        self.assertEqual(self._kind(fake, is_dsa_model=True), "dsa")
+        self.assertEqual(self._kind(fake, is_dsa_model=False), "mla")
         fake = _fake_configurator(use_mla_backend=False)
-        self.assertEqual(fake._kv_pool_kind(is_dsa_model=False), "mha")
+        self.assertEqual(self._kind(fake), "mha")
+
+    def test_minimax_sparse_is_not_reported_as_plain_mha(self):
+        """The in-tree dispatcher routes MiniMax-sparse to MiniMaxSparseKVPool
+        *after* the seam, so reporting it as "mha" lets a platform return a
+        plain MHA pool that the sparse attention backend then rejects."""
+        fake = _fake_configurator(use_mla_backend=False, minimax_sparse=True)
+        self.assertEqual(self._kind(fake), "mha_sparse_index")
+
+    def test_quant_scheme_covers_the_block_scaled_pools(self):
+        self.assertEqual(_fake_configurator()._kv_pool_quant_scheme(), "none")
+        self.assertEqual(
+            _fake_configurator(kv_cache_dtype_str="mxfp8")._kv_pool_quant_scheme(),
+            "mxfp8",
+        )
 
 
 class TestBuildPlatformKVPool(CustomTestCase):
@@ -314,6 +343,25 @@ class TestKVPoolRequestFields(CustomTestCase):
     def test_index_head_dim_is_dsa_only(self):
         self.assertIsNone(self._request(kind="mla").index_head_dim)
         self.assertEqual(self._request(kind="dsa").index_head_dim, 128)
+
+
+class TestNoSeamPathsRejectOutOfTree(CustomTestCase):
+    """Unified memory and DSV4 run before/around the seam with no hook of
+    their own; silently building their in-tree CUDA-assuming pools for a
+    device main does not know about is the same defect the seam exists to
+    remove."""
+
+    def test_reject_is_a_no_op_in_tree(self):
+        self.assertIsNone(
+            reject_out_of_tree_path(_fake_platform(out_of_tree=False), subsystem="x")
+        )
+
+    def test_reject_names_the_subsystem_out_of_tree(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            reject_out_of_tree_path(
+                _fake_platform(out_of_tree=True), subsystem="the unified memory pool"
+            )
+        self.assertIn("the unified memory pool", str(ctx.exception))
 
 
 class TestPlatformAllocatorPreemption(CustomTestCase):
