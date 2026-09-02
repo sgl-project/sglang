@@ -400,9 +400,9 @@ class GroupCoordinator:
             and not custom_ar.disabled
             and custom_ar.should_custom_ar(input_)
         ):
-            if custom_ar._IS_CAPTURING:
-                return custom_ar.custom_all_reduce(input_)
-            return custom_ar._all_reduce_impl(input_, registered=False)
+            output = custom_ar.custom_all_reduce(input_)
+            if output is not None:
+                return output
         if current_platform.is_cpu() and self.device_communicator is not None:
             return self.device_communicator.all_reduce(
                 input_,
@@ -410,38 +410,10 @@ class GroupCoordinator:
                 group=self.device_group,
                 async_op=async_op,
             )
+
         torch.distributed.all_reduce(
-            input_,
-            op=op,
-            group=self.device_group,
-            async_op=async_op,
+            input_, op=op, group=self.device_group, async_op=async_op
         )
-        else:
-            custom_ar = self.srt_custom_allreduce
-            if (
-                not async_op
-                and custom_ar is not None
-                and op == torch.distributed.ReduceOp.SUM
-                and not input_.is_cpu
-                and not custom_ar.disabled
-                and custom_ar.should_custom_ar(input_)
-            ):
-                output = custom_ar.custom_all_reduce(input_)
-                if output is not None:
-                    return output
-            if (
-                current_platform.is_cpu()
-                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
-                and op is torch.distributed.ReduceOp.SUM
-            ):
-                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, int(torch.distributed.ReduceOp.SUM)
-                )
-            else:
-                torch.distributed.all_reduce(
-                    input_, op=op, group=self.device_group, async_op=async_op
-                )
         return input_
 
     def all_gather(
