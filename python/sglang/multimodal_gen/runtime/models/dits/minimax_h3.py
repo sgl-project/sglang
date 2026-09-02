@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     claim_deferred_component_attn_backend,
     get_attn_backend,
+    get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
