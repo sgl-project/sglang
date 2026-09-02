@@ -63,6 +63,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -91,6 +92,18 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 logger = init_logger(__name__)
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
+
+_NON_LORA_DELTA_SUFFIXES = (".diff", ".diff_b", ".set_weight")
+
+
+def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
+    offending = sorted(key for key in adapter if key.endswith(_NON_LORA_DELTA_SUFFIXES))
+    if offending:
+        raise ValueError(
+            f"LoRA adapter carries {len(offending)} non-LoRA tensors "
+            f"(.diff/.diff_b/.set_weight, e.g. {offending[0]}) that no MiniMax-H3 "
+            "LoRA mapping rule applies; serve a checkpoint with them merged instead."
+        )
 
 
 def _diffusers_h3_checkpoint(
@@ -599,6 +612,7 @@ def _minimax_h3_attention_core_impl(
     ulysses_active: bool,
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
+    gate_compress: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -609,11 +623,14 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if gate_compress is not None:
+            gate_compress = _usp_input_all_to_all(gate_compress[None], head_dim=2)[0]
 
     if attention._attention_impl is None:
         attention._set_attention_backend(
@@ -624,6 +641,26 @@ def _minimax_h3_attention_core_impl(
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
+
+    if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+        attn_metadata = (
+            get_forward_context().attn_metadata
+            if attention.prefix.startswith("blocks.")
+            else None
+        )
+        out = attention._attention_impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+            attn_metadata=attn_metadata,
+            gate_compress=gate_compress,
+        )
+        if ulysses_active:
+            out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        return out
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
@@ -774,6 +811,18 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # VSA compression gate; stays bf16 and unquantized (zero gate == pure sparse).
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        if arch.has_gate_compress and prefix.startswith("blocks."):
+            self.to_gate_compress = ColumnParallelLinear(
+                arch.hidden_size,
+                self.inner_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=None,
+                prefix=f"{prefix}.to_gate_compress",
+            )
 
     def _set_attention_backend(self, backend) -> None:
         if (
@@ -1039,6 +1088,14 @@ class MiniMaxH3Attention(nn.Module):
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
+        gate_compress = None
+        if (
+            self._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.to_gate_compress is not None
+        ):
+            gate_flat, _ = self.to_gate_compress(x)
+            gate_compress = gate_flat.view(total, self.num_heads, self.head_dim)
+
         attention_core = (
             _minimax_h3_attention_core_bcg
             if self.bcg_breakpoint
@@ -1055,6 +1112,7 @@ class MiniMaxH3Attention(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -1508,6 +1566,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self, adapter: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Project released-checkpoint AdaLN LoRAs onto pruned coordinates."""
+        _reject_non_lora_delta_tensors(adapter)
         if self._adaln_precomputed:
             _reject_adaln_lora(list(adapter))
         full_width = self.arch.adaln_affine_input_dim
@@ -1912,6 +1971,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             get_global_forced_attn_backend()
             or self._component_attention_backend_override
         )
+        if selected_backend is None:
+            selected_backend = next(
+                (
+                    module._selected_attention_backend
+                    for module in self.modules()
+                    if isinstance(module, MiniMaxH3Attention)
+                    and module._selected_attention_backend is not None
+                ),
+                None,
+            )
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,

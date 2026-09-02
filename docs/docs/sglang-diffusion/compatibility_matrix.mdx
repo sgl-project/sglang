@@ -138,6 +138,12 @@ Rows are grouped when a family shares the same runtime path or optimization supp
             <td><span className="sgd-chip">Cache-DiT</span><span className="sgd-chip">Sage</span><span className="sgd-chip">Online FP8</span><span className="sgd-chip">GGUF</span></td>
           </tr>
           <tr>
+            <td>FastH3</td>
+            <td><div className="sgd-id-list"><code>FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree</code></div></td>
+            <td>T2VA only, 4-step distilled, 768p at 24 fps with synchronized audio</td>
+            <td><span className="sgd-chip">VSA-H3</span></td>
+          </tr>
+          <tr>
             <td>Wan2.1 Fun</td>
             <td><div className="sgd-id-list"><code>weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers</code></div></td>
             <td>480p inpainting</td>
@@ -622,6 +628,21 @@ Optimization columns are abbreviated to keep the matrix readable:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>FastH3 4-step (T2VA only)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree</code></td>
+      <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>768p · 24 fps</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>LTX-2.3 (one/two-stage/TI2V/HQ)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>Lightricks/LTX-2.3</code></td>
       <td style={{padding: "9px 8px", backgroundColor: "rgba(255,255,255,0.02)"}}>768×512<br />1536×1024<br />1920×1088 (HQ default)</td>
@@ -704,6 +725,11 @@ Optimization columns are abbreviated to keep the matrix readable:
    difference is transformer depth and width, picked up from
    `transformer/config.json` at load time. A single checkpoint serves T2V,
    I2V (`--image-path`), and T2I (`--num-frames 1`).
+6. FastH3's VSA column refers to the dedicated `video_sparse_attn_h3` (VSA-H3)
+   backend. Dense backends that run on base MiniMax-H3 also run on the FastH3
+   weights.
+   FastH3 serves `t2va` only and rejects `--model-variant` and
+   `quality: "high"`.
 
 </Accordion>
 
