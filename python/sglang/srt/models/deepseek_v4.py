@@ -2862,6 +2862,10 @@ class DeepseekV4Model(nn.Module):
             # MTP target-verify also reports is_extend(); only real prefill
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
+            # TBO child batches drop mm metadata (the split sets mm_inputs=None),
+            # which would silently degrade image-span visible-window attention
+            # to causal. Fall back to the normal path for mm batches.
+            and not forward_batch.contains_mm_inputs()
             and path_ok
             and self.pp_group.world_size == 1
         )

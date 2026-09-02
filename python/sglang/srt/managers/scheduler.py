@@ -5025,9 +5025,11 @@ class Scheduler(
                         "rebootstrap (retraction + weight update)."
                     )
                     # retract_all already released this request's KV; emit
-                    # the abort to the client directly (no re-run).
+                    # the abort to the client directly (no re-run), with the
+                    # finish reason attached so the client gets a structured
+                    # 400 (BadRequestError) instead of a bare abort.
                     self.ipc_channels.send_to_tokenizer.send_output(
-                        _make_abort_req(req), req
+                        _make_abort_req(req, req.to_finish.to_json()), req
                     )
                     continue
                 if req.output_ids:

@@ -91,12 +91,18 @@ def _iter_visible_window_spans(
             if not _is_dsv4_sentinel_item(item):
                 continue
             for span_start, span_end_incl in item.offsets:
-                if span_start >= prefix and span_end_incl < extend_end:
-                    yield req_idx, int(span_start), int(span_end_incl) + 1
-                elif span_start < prefix <= span_end_incl and span_start >= prefix - (
+                # item.offsets start at the first compress-pad token, but the
+                # reference's bidirectional span starts at IMAGE_START. The
+                # compress pads (0-3 tokens) keep the plain causal window, so
+                # skip them here to avoid widening the span.
+                compress_pad = 3 - span_start % 4
+                image_start = span_start + compress_pad
+                if image_start >= prefix and span_end_incl < extend_end:
+                    yield req_idx, int(image_start), int(span_end_incl) + 1
+                elif image_start < prefix <= span_end_incl and image_start >= prefix - (
                     swa_window - 1
                 ):
-                    yield req_idx, int(span_start), int(span_end_incl) + 1
+                    yield req_idx, int(image_start), int(span_end_incl) + 1
                 elif span_start < extend_end and span_end_incl >= prefix:
                     _warn_degraded_span_once()
 
