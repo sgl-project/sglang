@@ -803,6 +803,10 @@ def build_hybrid_mamba_stack(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
+        # Host rows must have the device pool's row geometry. A packed DSA
+        # row is wider than kv_lora_rank + qk_rope_head_dim, the width the
+        # MLA host pool assumes without the override.
+        override_kv_cache_dim=kv_pool.kv_cache_dim if use_mla else None,
         host_size=kv_host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
