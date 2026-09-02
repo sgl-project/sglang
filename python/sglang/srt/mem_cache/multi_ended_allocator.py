@@ -267,6 +267,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         sub_pool_name: str,
         device: str,
         is_id_owner: bool,
+        virtual_num_pages: Optional[int] = None,
         page_size: int = 1,
         shards_under_dcp: bool = False,
         need_sort: bool = False,
@@ -332,10 +333,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ) // self.pool_page_size
         self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
-        # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
-        # the -1 sentinel.
+        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A
+        # non-owner consumes the owner's ids, so its v2p spans the owner's
+        # count; the two are unrelated and either can be the larger.
+        self.num_virtual_ids = (
+            self.num_pages if virtual_num_pages is None else virtual_num_pages
+        )
+        # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
         self.virtual_to_physical = torch.full(
-            (self.num_pages + 1,),
+            (self.num_virtual_ids + 1,),
             -1,
             dtype=torch.int64,
             device=device,
@@ -346,8 +352,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
-        self.num_virtual_ids = self.num_pages
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
@@ -540,7 +544,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
         virt_page = slot // self.page_size
-        if virt_page < 0 or virt_page >= self.num_pages:
+        if virt_page < 0 or virt_page >= self.num_virtual_ids:
             return False
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
@@ -3212,6 +3216,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            # swa binds the virtual pages full mints, so it must address
+            # full's whole id space.
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
         )
         self._wire_peers()
 
