@@ -26,7 +26,11 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_flags, get_spec
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -41,8 +45,6 @@ if TYPE_CHECKING:
 import logging
 
 import numpy as np
-
-from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
@@ -89,6 +91,9 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
+    # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
+    # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
+    actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
@@ -607,7 +612,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
-            self.swa_out_cache_loc_buf = torch.zeros(
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
                 device=self.device,
@@ -638,7 +643,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
-            metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -712,8 +717,8 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.swa_out_cache_loc_buf[n:].zero_()
-            self.swa_out_cache_loc_buf[:n].copy_(
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()
@@ -1587,7 +1592,9 @@ class AscendAttnBackend(AttentionBackend):
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                         )
                     else:
-                        attn_output = torch.empty_like(q)
+                        attn_output = torch.empty_like(
+                            q, memory_format=torch.contiguous_format
+                        )
 
                     use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -1810,7 +1817,7 @@ class AscendAttnBackend(AttentionBackend):
                         torch.ops.npu.npu_fused_infer_attention_score(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k[None, q_len_offset : q_len_offset + q_len],
-                            v[None, q_len_offset : q_len_offset + q_len],
+                            v[None, q_len_offset : q_len_offset + q_len].contiguous(),
                             num_heads=layer.tp_q_head_num,
                             num_key_value_heads=layer.tp_k_head_num,
                             input_layout="BSND",  # todo, TND not supports q_heads!=k_heads
@@ -1869,10 +1876,10 @@ class AscendAttnBackend(AttentionBackend):
 
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q_nope,
-                    k_nope,
-                    v,
+                    k_nope.contiguous(),
+                    v.contiguous(),
                     query_rope=q_rope,
-                    key_rope=k_rope,
+                    key_rope=k_rope.contiguous(),
                     num_heads=layer.tp_q_head_num,
                     input_layout="TND",
                     atten_mask=self.fia_mask,
@@ -2746,7 +2753,9 @@ class AscendAttnBackend(AttentionBackend):
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                     )
                 else:
-                    attn_output = torch.empty_like(q)
+                    attn_output = torch.empty_like(
+                        q, memory_format=torch.contiguous_format
+                    )
 
                 use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 

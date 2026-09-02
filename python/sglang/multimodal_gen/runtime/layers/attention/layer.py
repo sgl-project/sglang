@@ -12,9 +12,10 @@ import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.varlen_pack_pad import (
+from sglang.kernels.ops.diffusion import (
     build_inv_indices,
     fused_pack_qkv,
+    fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
@@ -284,6 +285,41 @@ class DynamicVarlenMaskMeta:
         return self._meta
 
 
+def prepare_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum
+) -> None:
+    """Build and cache the impl for ``target``; may raise, mutates nothing."""
+    if target in layer._attn_impl_by_backend:
+        return
+    backend_cls = get_attn_backend(
+        layer.head_size,
+        layer.dtype,
+        supported_attention_backends=layer._supported_attention_backends,
+        selected_attention_backend=target,
+    )
+    resolved = backend_cls.get_enum()
+    if resolved is not target:
+        raise ValueError(
+            f"Attention backend override '{target}' resolved to '{resolved}' on "
+            f"{type(layer).__name__}; refusing the request instead of silently "
+            "falling back."
+        )
+    impl = backend_cls.get_impl_cls()(**layer._attn_impl_ctor_kwargs)
+    wrap_attention_impl_forward(impl)
+    layer._attn_impl_by_backend[target] = impl
+
+
+def apply_attention_backend_override(
+    layer: nn.Module, target: AttentionBackendEnum | None
+) -> None:
+    """Flip to a prepared impl (None = construction default); cannot fail."""
+    target = target or layer._default_attn_backend
+    if target is layer.backend:
+        return
+    layer.attn_impl = layer._attn_impl_by_backend[target]
+    layer.backend = target
+
+
 class UlyssesAttention(nn.Module):
     """Ulysses-style SequenceParallelism attention layer."""
 
@@ -321,7 +357,7 @@ class UlyssesAttention(nn.Module):
         )
         impl_cls = attn_backend.get_impl_cls()
 
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -330,11 +366,15 @@ class UlyssesAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -558,6 +598,8 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
+        is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
         **extra_impl_args,
     ) -> None:
@@ -571,11 +613,15 @@ class LocalAttention(nn.Module):
 
         dtype = compute_dtype or get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=self.softmax_scale,
@@ -583,11 +629,15 @@ class LocalAttention(nn.Module):
             causal=causal,
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
 
     def forward(
@@ -697,7 +747,8 @@ class USPAttention(nn.Module):
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
             default_attention_backend:
-              fallback used only when no global or component override is active.
+              preferred fallback when the global backend is incompatible with
+              this layer. Explicit component overrides otherwise remain strict.
             is_cross_attention:
               sparse backend preferences may select a compatible dense backend
               for cross-attention while remaining strict for self-attention.
@@ -729,7 +780,7 @@ class USPAttention(nn.Module):
                 )
         impl_cls: Type[AttentionImpl] = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
-        self.attn_impl = impl_cls(
+        self._attn_impl_ctor_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,
@@ -738,11 +789,15 @@ class USPAttention(nn.Module):
             prefix=f"{prefix}.impl",
             **extra_impl_args,
         )
+        self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
+        self._default_attn_backend = self.backend
+        self._attn_impl_by_backend = {self.backend: self.attn_impl}
+        self._supported_attention_backends = supported_attention_backends
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
@@ -773,6 +828,9 @@ class USPAttention(nn.Module):
         attn_mask_meta: dict | None = None,
         qkv_pre_all_to_all: bool = False,
         seq_lens: list[int] | None = None,
+        q_prefix: torch.Tensor | None = None,
+        k_prefix: torch.Tensor | None = None,
+        v_prefix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -834,6 +892,18 @@ class USPAttention(nn.Module):
 
         if isinstance(attn_mask_meta, DynamicVarlenMaskMeta):
             attn_mask_meta = attn_mask_meta.resolve(attn_mask)
+
+        segmented_prefix = q_prefix is not None
+        if segmented_prefix != (k_prefix is not None) or segmented_prefix != (
+            v_prefix is not None
+        ):
+            raise ValueError("q_prefix, k_prefix, and v_prefix must be set together")
+        if segmented_prefix and not (
+            effective_skip_sp or get_sequence_parallel_world_size() == 1
+        ):
+            raise NotImplementedError(
+                "Segmented QKV input currently supports only the local attention path."
+            )
 
         # Tail-pad meta alone (sp_shard.tail_attn_meta; mask derivable from the
         # pad span) also opts into the masked SP branch. gap_* = legacy alias.
@@ -937,9 +1007,20 @@ class USPAttention(nn.Module):
                     and q.device.type == "cuda"
                     and attn_mask.device == q.device
                     and q.dtype in (torch.float16, torch.bfloat16)
-                    and q.shape[:2] == attn_mask.shape == k.shape[:2] == v.shape[:2]
+                    and (
+                        (q.shape[0], q.shape[1] + q_prefix.shape[1])
+                        if segmented_prefix
+                        else q.shape[:2]
+                    )
+                    == attn_mask.shape
+                    and q.shape == k.shape == v.shape
+                    and (
+                        not segmented_prefix
+                        or q_prefix.shape == k_prefix.shape == v_prefix.shape
+                    )
                 ):
-                    bs, seq = q.shape[0], q.shape[1]
+                    bs = q.shape[0]
+                    seq = q.shape[1] + (q_prefix.shape[1] if segmented_prefix else 0)
                     indices = attn_mask_meta["indices"]
                     cu_seqlens = attn_mask_meta["cu_seqlens"]
                     max_seqlen = attn_mask_meta["max_seqlen"]
@@ -954,7 +1035,46 @@ class USPAttention(nn.Module):
                     # (Joint attention with an image side is always non-empty
                     # in practice, so this only guards malformed inputs.)
                     if indices.shape[0] > 0:
-                        q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
+                        all_valid = indices.shape[0] == bs * seq
+                        if segmented_prefix:
+                            q_unpad, k_unpad, v_unpad = fused_pack_segmented_qkv(
+                                q_prefix,
+                                k_prefix,
+                                v_prefix,
+                                q,
+                                k,
+                                v,
+                                indices,
+                            )
+                        else:
+                            if all_valid:
+                                q_unpad, k_unpad, v_unpad = q, k, v
+                            else:
+                                q_unpad, k_unpad, v_unpad = fused_pack_qkv(
+                                    q, k, v, indices
+                                )
+                        if bs == 1 or all_valid:
+                            # Empty cu_seqlens selects FA3's faster static
+                            # persistent scheduler. A single packed sequence is
+                            # dense even when its BCG bucket contains padding.
+                            dense_seq = indices.shape[0] if bs == 1 else seq
+                            out_dense = flash_attn_varlen_func(
+                                q=q_unpad.reshape(bs, dense_seq, *q_unpad.shape[-2:]),
+                                k=k_unpad.reshape(bs, dense_seq, *k_unpad.shape[-2:]),
+                                v=v_unpad.reshape(bs, dense_seq, *v_unpad.shape[-2:]),
+                                cu_seqlens_q=None,
+                                cu_seqlens_k=None,
+                                max_seqlen_q=dense_seq,
+                                max_seqlen_k=dense_seq,
+                                softmax_scale=self.softmax_scale,
+                                causal=False,
+                                ver=_fa_backend.fa_ver,
+                            )
+                            if all_valid:
+                                return out_dense
+                            return fused_scatter_to_padded(
+                                out_dense.flatten(0, 1), inv_indices, bs, seq
+                            )
                         out_unpad = flash_attn_varlen_func(
                             q=q_unpad,
                             k=k_unpad,
@@ -968,6 +1088,11 @@ class USPAttention(nn.Module):
                             ver=_fa_backend.fa_ver,
                         )
                         return fused_scatter_to_padded(out_unpad, inv_indices, bs, seq)
+
+                if segmented_prefix:
+                    q = torch.cat([q_prefix, q], dim=1)
+                    k = torch.cat([k_prefix, k], dim=1)
+                    v = torch.cat([v_prefix, v], dim=1)
 
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
@@ -1249,7 +1374,7 @@ class USPAttention(nn.Module):
             q.squeeze(0),
             k.squeeze(0),
             v.squeeze(0),
-            softmax_scale=self.softmax_scale,
+            attn_impl=self.attn_impl,
             real_seq_len=int(attn_mask_meta["pad_start"]),
             ring_ws=get_ring_parallel_world_size(),
         )

@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -384,6 +385,8 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
+    USE_GDC: tl.constexpr = False,
+    GDC_EARLY: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -412,6 +415,11 @@ def fused_moe_kernel(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        if GDC_EARLY:
+            tl.extra.cuda.gdc_launch_dependents()
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -706,6 +714,9 @@ def fused_moe_kernel(
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
+    if USE_GDC and not GDC_EARLY:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 # -----------------------------------------------------------------------------
 # TMA allocator: set once per process (avoid per-call triton.set_allocator)
@@ -980,6 +991,11 @@ def invoke_fused_moe_kernel(
         else:
             b_desc = None
 
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
+            if is_arch_support_pdl()
+            else {}
+        )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1028,9 +1044,10 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
-            FUSE_SWIGLU=fuse_swiglu,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            FUSE_SWIGLU=fuse_swiglu,
+            **pdl_kwargs,
             **config,
         )
 
@@ -1177,6 +1194,7 @@ def _moe_sum_reduce_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     input_stride_0 = tl.cast(input_stride_0, dtype=tl.int64)
     input_stride_1 = tl.cast(input_stride_1, dtype=tl.int64)
@@ -1194,6 +1212,10 @@ def _moe_sum_reduce_kernel(
     base_ptrs = input_ptr + offs_token[:, None] * input_stride_0 + offs_dim[None, :]
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_DIM), dtype=tl.float32)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
     for i in tl.range(0, topk_num, num_stages=NUM_STAGE):
         tile = tl.load(
@@ -1232,6 +1254,7 @@ def moe_sum_reduce_triton(
         triton.cdiv(hidden_dim, BLOCK_DIM),
     )
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     _moe_sum_reduce_kernel[grid](
         input,
         *input.stride(),
@@ -1245,6 +1268,7 @@ def moe_sum_reduce_triton(
         BLOCK_DIM=BLOCK_DIM,
         NUM_STAGE=NUM_STAGE,
         num_warps=num_warps,
+        **pdl_kwargs,
     )
     return
 
@@ -1259,6 +1283,8 @@ def _fused_append_shared_experts_kernel(
     scale_factor,  # runtime scalar
     K: tl.constexpr,
     S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1276,20 +1302,25 @@ def _fused_append_shared_experts_kernel(
     out_ids_row_ptr = pid * (K + S)
     out_w_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k)
+    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
+    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
+    # next-pow2 block and mask the tail (mirrors the _with_weights sibling).
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
 
-    offs_s = tl.arange(0, S)
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
@@ -1315,6 +1346,8 @@ def fused_append_shared_experts(
         scale_factor=scale_factor,
         K=k,
         S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1329,8 +1362,13 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
     num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
     scale_factor,  # runtime scalar: shared-expert weight
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
+    pad_fill_id,  # runtime scalar: routed-id fill for padded rows
     K: tl.constexpr,
     S: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1339,7 +1377,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
-    Routed IDs:   e -> e + e // num_local_routed   (insert gaps for shared slots)
+    Routed IDs:   e -> e + (e // num_local_routed) * S  (insert S-wide gaps for
+                  the shared slots that precede this id's rank)
     Shared IDs:   shared_id_base + arange(S)        (one id per shared slot)
     Shared wgt:   scale_factor                     (1.0 on aiter; 1/rsf otherwise)
     """
@@ -1348,23 +1387,43 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     ids_row_ptr = pid * K
     out_ids_row_ptr = pid * (K + S)
 
-    offs_k = tl.arange(0, K)
-    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k)
-    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k)
+    # tl.arange requires a power-of-2 range, but K (topk) and S (num shared
+    # experts) need not be pow2 -- DeepSeek-V4 uses top-6. Iterate over the
+    # next-pow2 block and mask the tail (mirrors the _append/_with_weights
+    # siblings), otherwise K=6 fails with "arange's range must be a power of 2".
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < K
+    ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
+    ws = tl.load(topk_weights_ptr + ids_row_ptr + offs_k, mask=mask_k)
 
-    # DeepEP interleaved layout: shift each routed id past the shared slots that
-    # precede it. Matches `routed + routed // num_local_routed` exactly.
-    ids = ids + ids // num_local_routed
+    # DeepEP interleaved layout: shift each routed id past ALL shared slots that
+    # precede its rank. Rank r == id // num_local_routed contributes r*S shared
+    # slots ahead of the id, so the gap is (id // num_local_routed) * S -- not a
+    # single slot. With S == 1 this reduces to the old `id // num_local_routed`,
+    # but S > 1 (e.g. multiple fused shared experts) needs the full S-wide gap or
+    # routed ids collide with an earlier rank's shared slots.
+    ids = ids + (ids // num_local_routed) * S
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
-    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
+    if HAS_PADDING:
+        # Fold the padded-topk_ids fill (previously a separate _fill_padded_rows
+        # launch): rows >= num_token_non_padded get pad_fill_id in every routed
+        # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
+        # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
+        # whole tile and let the masked store below drop the tail.
+        n_valid = tl.load(num_token_non_padded_ptr)
+        if pid >= n_valid:
+            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
 
-    offs_s = tl.arange(0, S)
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
+
+    offs_s = tl.arange(0, BLOCK_S)
+    mask_s = offs_s < S
     shared_ids = tl.cast(shared_id_base + offs_s, ids.dtype)
-    shared_ws = tl.full([S], scale_factor, dtype=ws.dtype)
+    shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids)
-    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws)
+    tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
+    tl.store(out_weights_ptr + out_ids_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_remap_shared_experts_deepep(
@@ -1374,6 +1433,8 @@ def fused_append_remap_shared_experts_deepep(
     scale_factor,
     shared_id_base,
     num_local_routed,
+    num_token_non_padded=None,
+    pad_fill_id=0,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
@@ -1391,6 +1452,9 @@ def fused_append_remap_shared_experts_deepep(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    # Placeholder pointer when no padding (never dereferenced: HAS_PADDING False).
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_remap_shared_experts_deepep_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1399,8 +1463,13 @@ def fused_append_remap_shared_experts_deepep(
         shared_id_base,
         num_local_routed,
         scale_factor,
+        ntnp_ptr,
+        pad_fill_id,
         K=k,
         S=s,
+        BLOCK_K=triton.next_power_of_2(k),
+        BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights

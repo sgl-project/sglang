@@ -12,14 +12,23 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    mamba_track_grid,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -60,13 +69,19 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     TargetVerifyExecutor,
     verify_logits_adjustments_are_noop,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
+from sglang.srt.utils import (
+    is_cuda,
+    is_cuda_alike,
+    is_npu,
+    is_pin_memory_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +97,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
+        draft_worker_cls: type[TpModelWorker] = TpModelWorker,
     ):
         super().__init__()
 
@@ -94,16 +110,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
 
-        self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
+        self._draft_is_moe = draft_is_deepseek_v4()
         self._draft_dp_context_enabled = (
-            server_args.enable_dp_attention and not self._draft_is_moe
+            get_parallel().enable_dp_attention and not self._draft_is_moe
         )
-        self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
+        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            and not self._is_pd_prefill
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
         ):
@@ -117,13 +134,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                draft_worker_cls=draft_worker_cls,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -147,23 +165,39 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
-            speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
+        self.sample_from_anchor = bool(self.draft_model.sample_from_anchor)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+
+        parallel = get_parallel()
+        self._tp_sync = SpecTpSync(
+            parallel.attn_tp_group
+            if parallel.enable_dp_attention
+            else parallel.tp_group
+        )
+        self._draft_graph_group = (
+            parallel.attn_tp_group
+            if self._draft_dp_context_enabled
+            else parallel.tp_group
+        )
 
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
-                "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
-                "markov_head=%s",
+                "gamma=%s, verify_num_draft_tokens=%s, query_token_num=%s, "
+                "sample_from_anchor=%s, mask_token_id=%s, markov_head=%s",
                 bundle.resolved_attention_backend,
                 self.draft_model.__class__.__name__,
                 self.gamma,
                 self.verify_num_draft_tokens,
+                self.query_token_num,
+                self.sample_from_anchor,
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
@@ -172,7 +206,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(self.query_token_num), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -182,13 +216,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         else:
             target_model = self.target_worker.model_runner.model
-            lm_head = getattr(target_model, "lm_head", None)
+            lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
             if lm_head is None or not hasattr(lm_head, "weight"):
                 raise RuntimeError(
                     "DSpark requires the target model to expose `lm_head` with `weight`."
                 )
             self.draft_model.attach_shared_modules(
-                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                embed_tokens=unwrap_lora_layer(
+                    self._resolve_target_embed_tokens(target_model)
+                ),
                 lm_head=lm_head,
             )
 
@@ -198,11 +234,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
             device=self.device,
             tp_rank=self.ps.tp_rank,
-            server_args=self.server_args,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
+            tp_sync=self._tp_sync,
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
@@ -228,7 +264,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            tp_sync=self._tp_sync,
+            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
         if (
@@ -240,6 +277,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
+                tp_sync=self._tp_sync,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -278,6 +316,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
+            tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
         )
@@ -337,12 +376,6 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         with self._draft_context():
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                    initialize_dspark_sparse_attn_ops,
-                )
-
-                initialize_dspark_sparse_attn_ops()
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
@@ -353,8 +386,13 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = self._decode_graph_allowed
-        if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        available_mem = self._tp_sync.available_memory_gb(
+            SpecTpSyncSite.DSPARK_MEM,
+            self.device,
+            self.gpu_id,
+            group=self._draft_graph_group,
+        )
+        if is_cuda_alike() and capture_decode_cuda_graph:
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
@@ -371,7 +409,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 # from being the intended precision fallback, skipping the
                 # unused hook avoids paying for two proposal computations.
                 if envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get():
-                    self._draft_sampler = self._maybe_build_draft_sampler()
+                    self._draft_sampler = self._maybe_build_draft_sampler(
+                        available_memory_gb=available_mem
+                    )
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
                             make_draft_sampler_capture_hook(self._draft_sampler)
@@ -381,13 +421,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             device=self.device,
             tp_rank=self.ps.tp_rank,
+            tp_sync=self._tp_sync,
+            available_memory_gb=available_memory_gb,
             confidence_fn=(
                 self._verify_planner.compute_confidence_tensor
                 if self._verify_planner.carries_confidence
@@ -447,7 +489,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
-        batch_output.new_seq_lens = batch.seq_lens
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
+        new_seq_lens = batch.seq_lens
+        batch_output.new_seq_lens = new_seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
 
@@ -466,10 +510,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        pin_memory = is_pin_memory_available(device)
+        ctx_lens = torch.tensor(
+            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
-        )
+            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
@@ -501,7 +548,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
+            new_seq_lens=new_seq_lens,
         )
         return batch_output
 
@@ -813,7 +860,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
-            mamba_track_interval = get_exec().mamba.mamba_track_interval
+            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
             to_track_mask = (
                 seq_lens_pre_verify // mamba_track_interval
                 != seq_lens_post_verify // mamba_track_interval
