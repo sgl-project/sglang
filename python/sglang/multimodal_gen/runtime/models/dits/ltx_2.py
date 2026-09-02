@@ -735,7 +735,7 @@ class LTX2Attention(nn.Module):
         apply_gated_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        fixed_attention_backend: AttentionBackendEnum | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -838,7 +838,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
-                fixed_attention_backend=fixed_attention_backend,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
@@ -854,7 +854,7 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
-                fixed_attention_backend=fixed_attention_backend,
+                required_attention_backend=required_attention_backend,
                 is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
@@ -1200,7 +1200,7 @@ class LTX2TransformerBlock(nn.Module):
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=supported_attention_backends,
-            fixed_attention_backend=(
+            required_attention_backend=(
                 AttentionBackendEnum.TORCH_SDPA
                 if force_sdpa_v2a_cross_attention
                 else None

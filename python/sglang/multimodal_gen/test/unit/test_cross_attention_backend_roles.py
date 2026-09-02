@@ -75,7 +75,7 @@ def test_ltx2_derives_cross_attention_role_from_context(use_local_attention):
 
 
 @pytest.mark.parametrize("use_local_attention", [False, True])
-def test_ltx2_forwards_fixed_attention_backend(use_local_attention):
+def test_ltx2_forwards_required_attention_backend(use_local_attention):
     selected_layer = "LocalAttention" if use_local_attention else "USPAttention"
     with (
         mock.patch.object(ltx_2, "get_tp_world_size", return_value=1),
@@ -89,11 +89,11 @@ def test_ltx2_forwards_fixed_attention_backend(use_local_attention):
             heads=1,
             dim_head=8,
             use_local_attention=use_local_attention,
-            fixed_attention_backend=AttentionBackendEnum.TORCH_SDPA,
+            required_attention_backend=AttentionBackendEnum.TORCH_SDPA,
         )
 
     assert (
-        attention.call_args.kwargs["fixed_attention_backend"]
+        attention.call_args.kwargs["required_attention_backend"]
         is AttentionBackendEnum.TORCH_SDPA
     )
 

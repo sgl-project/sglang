@@ -289,7 +289,7 @@ def prepare_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum
 ) -> None:
     """Build and cache the impl for ``target``; may raise, mutates nothing."""
-    if layer._fixed_attention_backend is not None:
+    if layer._required_attention_backend is not None:
         return
     if target in layer._attn_impl_by_backend:
         return
@@ -315,7 +315,7 @@ def apply_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum | None
 ) -> None:
     """Flip to a prepared impl (None = construction default); cannot fail."""
-    if layer._fixed_attention_backend is not None:
+    if layer._required_attention_backend is not None:
         return
     target = target or layer._default_attn_backend
     if target is layer.backend:
@@ -335,7 +335,7 @@ class UlyssesAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        fixed_attention_backend: AttentionBackendEnum | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
@@ -361,7 +361,7 @@ class UlyssesAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
-            selected_attention_backend=fixed_attention_backend,
+            selected_attention_backend=required_attention_backend,
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -383,7 +383,7 @@ class UlyssesAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
-        self._fixed_attention_backend = fixed_attention_backend
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -607,7 +607,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        fixed_attention_backend: AttentionBackendEnum | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         default_attention_backend: AttentionBackendEnum | None = None,
         is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
@@ -626,7 +626,7 @@ class LocalAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
-            selected_attention_backend=fixed_attention_backend,
+            selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
         )
@@ -649,7 +649,7 @@ class LocalAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
-        self._fixed_attention_backend = fixed_attention_backend
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
 
     def forward(
@@ -743,7 +743,7 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
-        fixed_attention_backend: AttentionBackendEnum | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
@@ -780,7 +780,7 @@ class USPAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
-            selected_attention_backend=fixed_attention_backend,
+            selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
         )
@@ -812,7 +812,7 @@ class USPAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
-        self._fixed_attention_backend = fixed_attention_backend
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
