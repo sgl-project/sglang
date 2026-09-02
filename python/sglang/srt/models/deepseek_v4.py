@@ -179,6 +179,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -757,17 +758,53 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
-    def _local_attn_sink(self) -> torch.Tensor:
+    def _kernel_num_heads(self, num_tokens: int) -> int:
+        if self.attn_tp_size == 1:
+            return self.n_local_heads
+
+        use_exact_num_heads = False
+        if (
+            is_sm120_supported()
+            and envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "flashinfer"
+        ):
+            from sglang.kernels.ops.attention.flash_mla_sm120 import (
+                flashinfer_dsv4_decode_supports_num_heads,
+            )
+
+            use_exact_num_heads = flashinfer_dsv4_decode_supports_num_heads(
+                self.n_local_heads, num_tokens
+            )
+
+        if use_exact_num_heads:
+            return self.n_local_heads
+
+        # Other FlashMLA implementations retain their existing padded shape.
+        return 64 if self.n_local_heads <= 64 else self.n_heads
+
+    def _local_attn_sink(self, kernel_num_heads: Optional[int] = None) -> torch.Tensor:
         if self.attn_tp_size == 1:
             return self.attn_sink
+
+        rank = self.attn_tp_rank
+        num_heads = self.n_local_heads
+        padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+        if kernel_num_heads is None:
+            # Preserve the legacy contract for subclasses such as DSpark that
+            # always pad their attention query independently of this helper.
+            kernel_num_heads = padded_num_heads
+        assert kernel_num_heads >= num_heads
+
+        # Keep one fallback-width allocation and return an exact-width view for
+        # decode. Prefill and decode can alternate, and CUDA graphs can retain
+        # the decode view, so replacing this tensor when the path changes would
+        # both reallocate every transition and risk invalidating a captured
+        # pointer.
+        sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
-            rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
-            sink = self.attn_sink.new_zeros(padded_num_heads)
+            sink = self.attn_sink.new_zeros(sink_num_heads)
             sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
             self._attn_sink_local = sink
-        return self._attn_sink_local
+        return self._attn_sink_local[:kernel_num_heads]
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1572,23 +1609,21 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+        kernel_num_heads = self._kernel_num_heads(x.shape[0])
+        if kernel_num_heads != self.n_local_heads:
+            # Backends without an exact-head specialization retain the existing
+            # padded shape. attn_sink is sliced to this rank and padded to match.
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
             if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
             else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+                q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
+        attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
