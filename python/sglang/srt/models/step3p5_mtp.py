@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -17,6 +16,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3p5 import Step3p5DecoderLayer, Step3p5ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -148,7 +148,7 @@ class Step3p5MTP(Step3p5ForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.draft_model_idx = draft_model_idx
 

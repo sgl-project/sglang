@@ -21,7 +21,6 @@ GPU dependency. State is stored in a mock centralized pool that mirrors the
 ``HybridReqToTokenPool`` / ``MambaPool`` interface used at serving time.
 """
 
-import os
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,56 +29,24 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized() -> None:
-    """Set up a minimal single-rank gloo distributed environment plus the
-    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
-    ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
-    inside ``__init__`` to size its head-parallel projections, so the world
-    group and model parallel groups must both be initialized before any CCA
-    construction.
+def _ensure_dist_initialized(cls) -> None:
+    """CCA reads the TP rank / world size inside ``__init__`` to size its
+    head-parallel projections. The rank is the live group's, so the groups must
+    exist before construction; the size answers from the published ``parallel``
+    bag, so the case has to publish a context as well.
     """
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29632")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", "0")
-
-    from sglang.srt.distributed.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-        model_parallel_is_initialized,
-    )
-
-    if not torch.distributed.is_initialized():
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            backend="gloo",
-        )
-
-    if not model_parallel_is_initialized():
-        # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
-        # forwards positional ``backend`` into the ``attention_data_parallel_size``
-        # slot of ``initialize_model_parallel``, which then explodes on
-        # ``int // str``. Using kwargs avoids that footgun.
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            backend="gloo",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Mock centralized pool
-# ---------------------------------------------------------------------------
+    init_single_process_dist()
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    cls.addClassCleanup(override.restore)
 
 
 @dataclass(frozen=True)
@@ -127,26 +94,79 @@ class _MockReqToTokenPool:
         return req_pool_indices.to(torch.int32)
 
 
+class _MockShortConvBackend:
+    """Stand-in for ``ShortConvHybridAttnBackend`` in the CPU unit tests.
+
+    The CCA module reaches the conv-state plumbing via
+    ``get_attn_backend().conv_state_metadata(...)`` and runs its own conv
+    kernel. This mock exposes that accessor over a ``_MockReqToTokenPool``,
+    mirroring ``ShortConvAttnBackend``: the req -> slot mapping (and, for extend,
+    its host ``.tolist()`` mirror) is resolved once per step and shared across
+    all conv layers, while the decode path stays entirely on-device.
+    """
+
+    def __init__(self, pool: "_MockReqToTokenPool"):
+        self.req_to_token_pool = pool
+        self.token_to_kv_pool = None
+        # Per-forward-step memoization keyed on the ForwardBatch identity,
+        # mirroring ShortConvAttnBackend.init_forward_metadata.
+        self._step_indices = {}  # id(forward_batch) -> device index tensor
+        self._step_slot_ids = {}  # id(forward_batch) -> host list (extend only)
+
+    def _resolve_indices(self, forward_batch):
+        key = id(forward_batch)
+        indices = self._step_indices.get(key)
+        if indices is None:
+            indices = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            ).to(torch.long)
+            self._step_indices[key] = indices
+        return indices
+
+    def _resolve_slot_ids(self, forward_batch, indices):
+        key = id(forward_batch)
+        slot_ids = self._step_slot_ids.get(key)
+        if slot_ids is None:
+            slot_ids = indices.tolist()
+            self._step_slot_ids[key] = slot_ids
+        return slot_ids
+
+    def conv_state_metadata(self, layer_id, forward_batch):
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvMetadata,
+        )
+
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        indices = self._resolve_indices(forward_batch)  # already int64
+        if forward_batch.forward_mode.is_decode_or_idle():
+            return ShortConvMetadata(layer_cache=layer_cache, cache_indices=indices)
+
+        slot_ids = self._resolve_slot_ids(forward_batch, indices)
+        has_prefix = [int(p) > 0 for p in forward_batch.extend_prefix_lens_cpu]
+        return ShortConvMetadata(
+            layer_cache=layer_cache,
+            cache_indices=indices,
+            slot_ids_cpu=slot_ids,
+            has_prefix_cpu=has_prefix,
+        )
+
+
 @contextmanager
 def _mock_pool_context(pool: _MockReqToTokenPool):
-    """Install a mock ``ForwardContext`` whose ``req_to_token_pool`` is ``pool``."""
+    """Install a mock ``ForwardContext`` whose ``attn_backend`` exposes both
+    ``req_to_token_pool`` and ``conv_state_metadata`` over ``pool``."""
     from sglang.srt.model_executor.forward_context import (
         ForwardContext,
         set_forward_context,
     )
 
-    backend = SimpleNamespace(req_to_token_pool=pool, token_to_kv_pool=None)
+    backend = _MockShortConvBackend(pool)
     ctx = ForwardContext(attn_backend=backend)
     prev = set_forward_context(ctx)
     try:
-        yield pool
+        yield backend
     finally:
         set_forward_context(prev)
-
-
-# ---------------------------------------------------------------------------
-# Helper factories
-# ---------------------------------------------------------------------------
 
 
 def _make_forward_batch(
@@ -230,7 +250,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -457,17 +477,17 @@ class TestZayaCCA(CustomTestCase):
             )
 
         pool = _CountingPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool):
+        with _mock_pool_context(pool) as backend:
             fb = _fresh_fb()
             cca0.forward(hs, fb)
             cca2.forward(hs, fb)
 
             # Two CCA layers, one forward step -> one shared lookup, both the
-            # device tensor and its host mirror memoized on the ForwardBatch.
+            # device tensor and its host mirror memoized once per step on the
+            # backend (ShortConvAttnBackend does this in init_forward_metadata).
             self.assertEqual(pool.get_mamba_indices_calls, 1)
-            self.assertTrue(hasattr(fb, "_zaya_mamba_indices"))
-            self.assertTrue(hasattr(fb, "_zaya_mamba_indices_cpu"))
-            self.assertEqual(fb._zaya_mamba_indices_cpu, [0])
+            self.assertIn(id(fb), backend._step_indices)
+            self.assertEqual(backend._step_slot_ids[id(fb)], [0])
 
             # A new forward step (fresh ForwardBatch) resolves the mapping again.
             cca0.forward(hs, _fresh_fb())
@@ -479,16 +499,20 @@ class TestZayaCCA(CustomTestCase):
         cca, config = _make_tiny_cca(seed=7)
 
         pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
-        with _mock_pool_context(pool):
+        with _mock_pool_context(pool) as backend:
+            # Keep a reference to the extend batch so its id() cannot be recycled
+            # by the later decode batch (the mock keys its per-step memo on
+            # id(forward_batch); a GC'd-then-reused address would false-collide).
+            fb_extend = _make_forward_batch(
+                is_decode=False,
+                extend_seq_lens_cpu=[3],
+                extend_prefix_lens_cpu=[0],
+                req_pool_indices=[0],
+                input_ids=torch.arange(3, dtype=torch.int64),
+            )
             cca.forward(
                 torch.randn(3, config.hidden_size, dtype=torch.float32) * 0.1,
-                _make_forward_batch(
-                    is_decode=False,
-                    extend_seq_lens_cpu=[3],
-                    extend_prefix_lens_cpu=[0],
-                    req_pool_indices=[0],
-                    input_ids=torch.arange(3, dtype=torch.int64),
-                ),
+                fb_extend,
             )
             fb_decode = _make_forward_batch(
                 is_decode=True,
@@ -502,10 +526,11 @@ class TestZayaCCA(CustomTestCase):
                 fb_decode,
             )
 
-        # Device indices are memoized, but the host ``.tolist()`` mirror is only
-        # built by the extend path.
-        self.assertTrue(hasattr(fb_decode, "_zaya_mamba_indices"))
-        self.assertFalse(hasattr(fb_decode, "_zaya_mamba_indices_cpu"))
+            # Decode resolves device indices, but the host ``.tolist()`` mirror
+            # is only built by the extend path -- so the decode step stays
+            # entirely on-device (CUDA-graph friendly).
+            self.assertIn(id(fb_decode), backend._step_indices)
+            self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
 class TestZayaCCATensorParallel(CustomTestCase):
@@ -522,7 +547,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized()
+        _ensure_dist_initialized(cls)
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the

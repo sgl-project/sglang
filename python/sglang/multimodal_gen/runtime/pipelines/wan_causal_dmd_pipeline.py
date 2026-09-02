@@ -10,7 +10,7 @@ This module wires the causal DMD denoising stage into the modular pipeline.
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
@@ -18,11 +18,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # isort: on
-
-logger = init_logger(__name__)
 
 
 class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):

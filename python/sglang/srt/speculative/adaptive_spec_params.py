@@ -12,6 +12,10 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import (
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -19,7 +23,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: add step=0 (nospec fallback) for BS>=8 once supported.
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
         "candidate_steps": [1, 3, 7],
@@ -28,13 +31,19 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
         "ceiling_coeff": 0,
     },
     "8": {
-        "candidate_steps": [1, 3],
+        "candidate_steps": [0, 1, 3],
         "up_hysteresis": 0.0,
         "down_hysteresis": 0.0,
         "ceiling_coeff": 0,
     },
     "32": {
-        "candidate_steps": [1],
+        "candidate_steps": [0, 1],
+        "up_hysteresis": 0.0,
+        "down_hysteresis": 0.0,
+        "ceiling_coeff": 0,
+    },
+    "64": {
+        "candidate_steps": [0],
         "up_hysteresis": 0.0,
         "down_hysteresis": 0.0,
         "ceiling_coeff": 0,
@@ -44,35 +53,35 @@ DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+
+    cfg = resolving_view(server_args)
+
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
         return (
-            f"speculative_algorithm={server_args.speculative_algorithm} "
+            f"speculative_algorithm={cfg.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
-    if (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk != 1
-    ):
+    if cfg.speculative_eagle_topk is not None and cfg.speculative_eagle_topk != 1:
         return (
-            f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
+            f"speculative_eagle_topk={cfg.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if server_args.enable_dp_attention:
+    if resolved_view(server_args).enable_dp_attention:
         return (
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
         )
-    if server_args.enable_multi_layer_eagle:
+    if resolved_view(server_args).enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "
             "(MultiLayerEagleWorkerV2 does not implement adaptive)"
         )
-    if server_args.enable_two_batch_overlap:
+    if cfg.enable_two_batch_overlap:
         return (
             "enable_two_batch_overlap=True is not supported "
             "(adaptive state swap would discard the TboAttnBackend wrapper)"
         )
-    if server_args.enable_pdmux:
+    if cfg.enable_pdmux:
         return (
             "enable_pdmux=True is not supported "
             "(adaptive state swap does not update decode_attn_backend_group)"
@@ -102,10 +111,11 @@ def _load_adaptive_config(
         if (
             not isinstance(steps, list)
             or not steps
-            or not all(isinstance(s, int) and s > 0 for s in steps)
+            or not all(isinstance(s, int) and s >= 0 for s in steps)
         ):
             raise ValueError(
-                f"BS {key}: candidate_steps must be a list of positive ints, got {steps!r}"
+                f"BS {key}: candidate_steps must be a list of non-negative ints, "
+                f"got {steps!r}"
             )
         bs_entries[int(key)] = entry
 
@@ -172,10 +182,13 @@ class AdaptiveStepSlot:
         if not num_correct_drafts_per_req:
             return False
 
-        batch_avg = sum(num_correct_drafts_per_req) / len(num_correct_drafts_per_req)
-        self.ema_accept_len = (
-            1 - self.ema_alpha
-        ) * self.ema_accept_len + self.ema_alpha * batch_avg
+        if self.current_steps > 0:
+            batch_avg = sum(num_correct_drafts_per_req) / len(
+                num_correct_drafts_per_req
+            )
+            self.ema_accept_len = (
+                1 - self.ema_alpha
+            ) * self.ema_accept_len + self.ema_alpha * batch_avg
 
         self._batch_count += 1
         if self._batch_count <= self.warmup_batches:
@@ -190,23 +203,39 @@ class AdaptiveStepSlot:
         """Recompute steps from EMA. Returns True if params changed."""
         old_steps = self.current_steps
         current_idx = self.candidate_steps.index(old_steps)
+        old_idx = current_idx
+
+        # Probe the smallest positive step after a zero-step nospec interval.
+        if old_steps == 0:
+            current_idx = min(current_idx + 1, len(self.candidate_steps) - 1)
+            target = self.candidate_steps[current_idx]
+            if target > 0 and self.ema_accept_len < 0:
+                # A slot initialized at steps=0 has no draft acceptance history;
+                # start the first positive-step probe from that step's neutral EMA.
+                self.ema_accept_len = float(target - 1)
+            return self._apply_target_steps(old_steps, target)
 
         # TODO: Consider limiting step changes to avoid overshooting.
         while current_idx > 0:
             prev_step = self.candidate_steps[current_idx - 1]
-            drop_threshold = prev_step - 0.5 + self.down_hysteresis
+            # A zero-step candidate disables drafting. Treat zero accepted drafts
+            # as low enough to reach it when it is the floor candidate.
+            drop_threshold = 0.5 if prev_step == 0 else prev_step - 0.5
+            drop_threshold += self.down_hysteresis
             if self.ema_accept_len <= drop_threshold:
                 current_idx -= 1
             else:
                 break
 
-        while current_idx < len(self.candidate_steps) - 1:
-            current_step = self.candidate_steps[current_idx]
-            rise_threshold = current_step - 0.5 + self.up_hysteresis
-            if self.ema_accept_len > rise_threshold:
-                current_idx += 1
-            else:
-                break
+        moved_down = current_idx < old_idx
+        if not moved_down:
+            while current_idx < len(self.candidate_steps) - 1:
+                current_step = self.candidate_steps[current_idx]
+                rise_threshold = current_step - 0.5 + self.up_hysteresis
+                if self.ema_accept_len > rise_threshold:
+                    current_idx += 1
+                else:
+                    break
 
         target = self.candidate_steps[current_idx]
         # EMA ceiling: only caps downward — never blocks step-ups, so the
@@ -218,6 +247,9 @@ class AdaptiveStepSlot:
                     current_idx -= 1
                 target = self.candidate_steps[current_idx]
 
+        return self._apply_target_steps(old_steps, target)
+
+    def _apply_target_steps(self, old_steps: int, target: int) -> bool:
         if target != old_steps:
             self.current_steps = target
             log_info_on_rank0(

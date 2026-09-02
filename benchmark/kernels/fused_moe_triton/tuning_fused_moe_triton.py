@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
+import json
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -242,14 +243,15 @@ def benchmark_config(
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
-        # on the respective GPU.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        # on the respective GPU. Ray isolates each worker to a single visible
+        # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
+        # ROCm using the global ray gpu id here raises "invalid device ordinal".
+        self.device_id = 0 if is_hip() else int(ray.get_gpu_ids()[0])
         set_global_server_args_for_scheduler(server_args)
 
     def benchmark(
@@ -396,10 +398,12 @@ def main(args: argparse.Namespace):
     use_int4_w4a16 = args.dtype == "int4_w4a16"
     per_channel_quant = args.per_channel_quant
 
-    if args.batch_size is None:
-        batch_sizes = get_default_batch_sizes()
-    else:
+    if args.batch_sizes is not None:
+        batch_sizes = args.batch_sizes
+    elif args.batch_size is not None:
         batch_sizes = [args.batch_size]
+    else:
+        batch_sizes = get_default_batch_sizes()
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
@@ -417,9 +421,19 @@ def main(args: argparse.Namespace):
         return ray.get(outputs)
 
     if args.tune:
-        search_space = get_configs_compute_bound()
+        if args.search_space_file:
+            with open(args.search_space_file) as f:
+                search_space = json.load(f)
+            if not isinstance(search_space, list) or not all(
+                isinstance(config, dict) for config in search_space
+            ):
+                raise ValueError(
+                    "--search-space-file must contain a JSON list of configs"
+                )
+        else:
+            search_space = get_configs_compute_bound()
         if block_shape is not None:
-            block_n, block_k = block_shape[0], block_shape[1]
+            block_k = block_shape[1]
             search_space = [
                 config
                 for config in search_space
@@ -520,7 +534,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
+    parser.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        help="Tune or benchmark an explicit set of token counts in parallel.",
+    )
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument(
+        "--search-space-file",
+        type=str,
+        help="JSON file containing an explicit list of Triton configs to evaluate with --tune.",
+    )
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 

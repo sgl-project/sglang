@@ -5,9 +5,10 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200 via nightly-8-gpu-common suite
+# Runs on both H200 and B200: registered once per runner_config below
 # Higher est_time due to 6 variants with both performance and accuracy tests
-register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=690, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=690, stage="nightly", runner_config="8-gpu-b200")
 
 GPT_OSS_120B_MXFP4_MODEL_PATH = "openai/gpt-oss-120b"
 GPT_OSS_120B_EAGLE3_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
@@ -26,14 +27,14 @@ class TestGptOss120B(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=200",
+            "--cuda-graph-max-bs-decode=200",
             "--mem-fraction-static=0.93",
         ]
         # Lower batch size for EAGLE3 variants to avoid OOM
         base_args_eagle3 = [
             "--tp=8",
             "--trust-remote-code",
-            "--cuda-graph-max-bs=100",
+            "--cuda-graph-max-bs-decode=100",
             "--mem-fraction-static=0.85",
         ]
         parser_args = [
@@ -74,7 +75,7 @@ class TestGptOss120B(unittest.TestCase):
             test_name="GPT-OSS-120B",
             accuracy_params=None,
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gpt_oss_120b",
+                result_dir="performance_results_gpt_oss_120b",
             ),
         )
 

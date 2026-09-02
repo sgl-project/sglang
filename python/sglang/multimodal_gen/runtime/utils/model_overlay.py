@@ -17,6 +17,7 @@ from huggingface_hub.errors import (
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.utils import load_diffusion_overlay_registry_from_env
@@ -28,6 +29,10 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
         "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
+    },
+    "jdopensource/JoyAI-Echo": {
+        "overlay_repo_id": "Niehen6174/JoyAI-Echo-overlay",
+        "overlay_revision": "0a19f315c96532b7a5f61bcd765d1fefdd83dc7d",
     },
     "Efficient-Large-Model/SANA-WM_bidirectional": {
         "overlay_repo_id": "sjmshsh/SANA-WM_bidirectional-overlay",
@@ -102,9 +107,7 @@ def _resolve_bundled_overlay_dir(overlay_spec: dict[str, Any]) -> str | None:
 
 
 def get_diffusion_cache_root() -> str:
-    return os.path.expanduser(
-        os.getenv("SGLANG_DIFFUSION_CACHE_ROOT", "~/.cache/sgl_diffusion")
-    )
+    return envs.SGLANG_DIFFUSION_CACHE_ROOT
 
 
 def clear_model_overlay_registry_cache() -> None:

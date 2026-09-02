@@ -30,12 +30,15 @@ def print_deprecated_warning(message: str):
 
 
 class DeprecatedAction(argparse.Action):
-    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+    def __init__(self, option_strings, dest, error_message=None, nargs=0, **kwargs):
+        self.error_message = error_message
         super(DeprecatedAction, self).__init__(
             option_strings, dest, nargs=nargs, **kwargs
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if self.error_message is not None:
+            parser.error(self.error_message)
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )

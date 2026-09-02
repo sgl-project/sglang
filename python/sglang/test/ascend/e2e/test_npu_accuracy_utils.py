@@ -1,0 +1,728 @@
+import glob
+import inspect
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from urllib.parse import urlparse
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    SERVICE_PORT,
+    check_role,
+    kill_process_group,
+    launch_pd_mix_node,
+    launch_pd_separation_node,
+    launch_router,
+    wait_server_ready,
+)
+from sglang.test.test_utils import (
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    dump_metric,
+    popen_launch_server,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+EVALSCOPE = "evalscope"
+BENCHMARK_TOOL_DEFAULT = EVALSCOPE
+
+PYTHON_FOR_TEST_TOOL = "test_env_transformers_tool/bin/python"
+if not os.path.exists(PYTHON_FOR_TEST_TOOL) or not os.access(
+    PYTHON_FOR_TEST_TOOL, os.X_OK
+):
+    PYTHON_FOR_TEST_TOOL = "python3"
+logger.info(f"PYTHON_FOR_TEST_TOOL: {PYTHON_FOR_TEST_TOOL}")
+
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
+MAX_SERVER_KEEP_ALIVE_TIME = 3600
+
+ACCURACY_TOLERANCE = 0.99
+
+# Dataset total question counts and allowed fluctuation (in questions)
+DATASET_QUESTION_COUNTS = {
+    "aime25": 30,
+    "aime26": 30,
+    "gpqa_diamond": 198,
+}
+
+DATASET_FLUCTUATION = {
+    "aime25": 2,
+    "aime26": 2,
+    "gpqa_diamond": 5,
+    "gsm8k": 3,
+}
+
+MAX_RETRY_COUNT = 3
+
+SERVER_INITIALIZATION_DELAY = 120
+
+if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
+    DEFAULT_SERVER_PORT_FOR_TEST = (
+        20000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
+    )
+else:
+    DEFAULT_SERVER_PORT_FOR_TEST = (
+        20000 + int(os.environ.get("ASCEND_VISIBLE_DEVICES", "0")[0]) * 100
+    )
+DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_SERVER_PORT_FOR_TEST + 66}"
+
+
+def get_accuracy_threshold(datasets, baseline_accuracy):
+    """Calculate accuracy threshold based on dataset fluctuation tolerance.
+
+    For datasets with defined fluctuation (aime*, gpqa_diamond), use absolute
+    question count tolerance. For others (e.g. mmmu), use percentage tolerance.
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION and dataset in DATASET_QUESTION_COUNTS:
+        fluctuation = DATASET_FLUCTUATION[dataset] / DATASET_QUESTION_COUNTS[dataset]
+        return baseline_accuracy - fluctuation
+    return baseline_accuracy * ACCURACY_TOLERANCE
+
+
+def get_max_retries(datasets):
+    """Return max retry count for accuracy tests.
+
+    gpqa and aime datasets support up to MAX_RETRY_COUNT retries.
+    mmmu and others use 1 attempt (no retry).
+    """
+    dataset = datasets[0] if datasets else None
+    if dataset in DATASET_FLUCTUATION:
+        return MAX_RETRY_COUNT
+    return 1
+
+
+def run_evalscope(
+    host,
+    port,
+    model,
+    datasets,
+    dataset_args=None,
+    eval_batch_size=16,
+    limit=100000,
+    generation_config=None,
+    dataset_dir=None,
+    timeout=60000,
+    stream=True,
+    eval_type="openai_api",
+):
+
+    metrics_path = os.getenv("METRICS_DATA_FILE")
+    result_path = "./evalscope_result" if not metrics_path else metrics_path
+    logger.info(f"The metrics result file: {result_path}")
+
+    api_url = f"http://{host}:{port}/v1/chat/completions"
+
+    if generation_config is None:
+        generation_config = {"max_tokens": 512}
+
+    config_dict = {
+        "model": model,
+        "api_url": api_url,
+        "eval_type": eval_type,
+        "datasets": datasets,
+        "eval_batch_size": eval_batch_size,
+        "generation_config": generation_config,
+        "timeout": timeout,
+        "stream": stream,
+        "limit": limit,
+        "work_dir": result_path,
+    }
+    if dataset_args:
+        config_dict["dataset_args"] = dataset_args
+    if dataset_dir:
+        config_dict["dataset_dir"] = dataset_dir
+
+    config_json = json.dumps(config_dict, ensure_ascii=False, indent=2)
+    config_json_escaped = config_json.replace("\\", "\\\\").replace("'''", "\\'\\'\\'")
+
+    script_content = "import json\n"
+    script_content += "from evalscope import TaskConfig, run_task\n\n"
+    script_content += f"config = json.loads('''{config_json_escaped}''')\n"
+    script_content += "task_cfg = TaskConfig(**config)\n"
+    script_content += "run_task(task_cfg=task_cfg)\n"
+
+    script_path = f"/tmp/evalscope_run_{model}_{'_'.join(datasets)}.py"
+    with open(script_path, "w") as f:
+        f.write(script_content)
+
+    logger.info(f"Generated evalscope script: {script_path}")
+
+    install_cmd = (
+        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    )
+    subprocess.run(install_cmd, shell=True, check=True)
+
+    python_bin = "test_env_evalscope/bin/python"
+    cmd = f"{python_bin} {script_path}"
+
+    logger.info(f"Command: {cmd}")
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        shell=True,
+        start_new_session=True,
+    )
+
+    logger.info(
+        f"run_evalscope spawned: pid={process.pid} "
+        f"pgid={os.getpgid(process.pid)} cmd={cmd}"
+    )
+
+    output_lines = []
+    try:
+        for line in iter(process.stdout.readline, ""):
+            if line.strip():
+                print(line, end="")
+            output_lines.append(line.strip())
+
+        process.wait()
+
+        logger.info(
+            f"run_evalscope finished: pid={process.pid} "
+            f"returncode={process.returncode}"
+        )
+
+        kill_process_group(process)
+
+        if process.returncode != 0:
+            logger.error(f"Command failed with return code: {process.returncode}")
+            raise subprocess.CalledProcessError(process.returncode, cmd)
+
+        logger.info("Command executed successfully")
+
+        metrics = {}
+        full_output = "\n".join(output_lines)
+
+        report_match = re.search(r"Dump report to:\s*(\S+)", full_output)
+        if report_match:
+            report_path = report_match.group(1)
+            logger.info(f"Found evalscope report file: {report_path}")
+            try:
+                with open(report_path, "r") as rf:
+                    report_data = json.load(rf)
+                score = report_data.get("score")
+                if score is not None:
+                    metrics["accuracy"] = float(score)
+                    logger.info(f"The Final Accuracy from report: {score}")
+            except Exception as e:
+                logger.warning(f"Failed to read report file {report_path}: {e}")
+
+        if "accuracy" not in metrics:
+            accuracy_patterns = [
+                # Add adaptation for evalscope 1.11+ table format
+                r"Accuracy\s*[↑↓]?\s*│\s*[^│]*│\s*\d+\s*│\s*([\d.]+)%?\s*│",
+                r"mean_acc\s*.*?│\s*\d+\s*│\s*([\d.]+)\s*│",
+                r"│\s+([\d.]+)\s+│\s+\S+\s+│\s*$",
+                r"accuracy\s*[:=]?\s*([\d.]+)",
+                # Keep compatibility with legacy evalscope 1.10 table format
+                r"Accuracy\s*[:=]?\s*([\d.]+)",
+                r"score\s*[:=]?\s*([\d.]+)",
+            ]
+
+            for pattern in accuracy_patterns:
+                matches = list(re.finditer(pattern, full_output))
+                if matches:
+                    final_accuracy = float(matches[-1].group(1))
+                    # evalscope 1.11+ reports accuracy as a percentage (e.g. 66.67%);
+                    # normalize it to a 0-1 fraction to compare against the baseline.
+                    if "%" in matches[-1].group(0):
+                        final_accuracy /= 100.0
+                    metrics["accuracy"] = final_accuracy
+                    logger.info(f"The Final Accuracy from output: {final_accuracy}")
+                    break
+
+        if "accuracy" not in metrics:
+            logger.info("Can Not Find The Accuracy in evalscope output")
+
+        return metrics
+
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received, terminating process...")
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+            logger.info("Process terminated")
+        except subprocess.TimeoutExpired:
+            logger.warning("Process did not terminate gracefully, killing it...")
+            process.kill()
+            logger.info("Process killed")
+        kill_process_group(process)
+        raise
+
+    except Exception as e:
+        logger.error(f"Error executing command: {e}")
+        process.terminate()
+        process.wait(timeout=5)
+        kill_process_group(process)
+        raise
+
+
+def assert_metrics(self, metrics):
+    if not metrics:
+        raise Exception("No metrics obtained from benchmark")
+
+    if self.accuracy is not None:
+        threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+        dump_metric(
+            "accuracy",
+            float(metrics["accuracy"]),
+            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+        )
+        dump_metric(
+            "accuracy_baseline",
+            float(self.accuracy),
+            labels={"test_case": self.__class__.__name__, "type": "accuracy"},
+        )
+        self.assertGreaterEqual(
+            float(metrics["accuracy"]),
+            threshold,
+            f"Accuracy check failed. Expected >= {threshold}, Got: {metrics['accuracy']}",
+        )
+
+
+class TestNpuAccuracyTestCaseBase(CustomTestCase):
+    model = None
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    backend = "sglang"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 16
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
+    other_args = None
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    envs = None
+    accuracy = 0.1
+    test_type = "accuracy"
+
+    @classmethod
+    def _get_tc_name(cls):
+        """Derive the test case name from the test file (filename without
+        extension). Mirrors the workflow's ``tc_name=${test_case##*/}`` logic
+        so each case in a suite writes to its own output path."""
+        try:
+            tc_file = inspect.getfile(cls)
+        except (TypeError, OSError):
+            tc_file = getattr(sys.modules.get(cls.__module__), "__file__", "")
+        return os.path.splitext(os.path.basename(tc_file))[0]
+
+    @classmethod
+    def _setup_per_case_output(cls):
+        """Set up per-case output directories and env vars.
+
+        When the workflow sets METRICS_DATA_FILE to a suite-level directory
+        (e.g. .../output/{branch_label}-{create_date}-{run_id}-{run_attempt}/
+        {workflow_name}/{test_type}/{suite}), each case in the suite
+        writes to its own subdirectory under it, so results stay in the
+        structured layout and are keyed by the case id. Falls back to the
+        legacy per-case layout when the env var is not set.
+        """
+        cls.tc_name = cls._get_tc_name()
+        suite_output = os.environ.get("METRICS_DATA_FILE")
+        if suite_output:
+            # Append the case id under the suite output prefix.
+            cls.metrics_data_file = os.path.join(suite_output, cls.tc_name)
+            # Mirror the output prefix to the plog location (drop the test_type/suite tail).
+            suite_plog = suite_output.replace("/output/", "/logs/plog/", 1)
+            cls.plog_base = os.path.dirname(os.path.dirname(suite_plog))
+        else:
+            current_date = datetime.now().strftime("%Y%m%d")
+            test_type = getattr(cls, "test_type", "accuracy")
+            base_output = f"/root/.cache/tests/output/{test_type}/{current_date}"
+            cls.metrics_data_file = os.path.join(base_output, cls.tc_name)
+            cls.plog_base = f"/root/.cache/tests/logs/plog"
+        os.makedirs(cls.metrics_data_file, exist_ok=True)
+        # Override env vars so evalscope/dump_metric write to per-case paths.
+        os.environ["METRICS_DATA_FILE"] = cls.metrics_data_file
+        os.environ["SGLANG_TEST_METRICS_OUTPUT"] = os.path.join(
+            cls.metrics_data_file, "metrics"
+        )
+        logger.info(
+            "Per-case output: tc_name=%s metrics_data_file=%s",
+            cls.tc_name,
+            cls.metrics_data_file,
+        )
+
+    @classmethod
+    def _save_metrics_json(cls):
+        """Write per-case ``metrics.json`` from ``dump_metric`` JSONL files.
+
+        Replaces the workflow's stdout-parsing + ``dump_metrics.py`` logic so
+        each case in a suite persists its own metrics snapshot.
+        """
+        if not getattr(cls, "metrics_data_file", None):
+            return
+        metrics = {}
+        baselines = {}
+        pattern = os.path.join(cls.metrics_data_file, "metrics.*.jsonl")
+        for jsonl_path in glob.glob(pattern):
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        name = record.get("metric_name")
+                        value = record.get("value")
+                        if name is None:
+                            continue
+                        if name.endswith("_baseline"):
+                            baselines[name[: -len("_baseline")]] = value
+                        else:
+                            metrics[name] = value
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", jsonl_path, e)
+        out_path = os.path.join(cls.metrics_data_file, "metrics.json")
+        payload = {
+            "test_case": cls.tc_name,
+            "test_type": getattr(cls, "test_type", "accuracy"),
+            "metrics": metrics,
+            "baselines": baselines,
+        }
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            logger.info("Saved per-case metrics to %s", out_path)
+        except Exception as e:
+            logger.warning("Failed to write metrics.json: %s", e)
+        # Remove the intermediate JSONL records, keeping only the final metrics.json.
+        for jsonl_path in glob.glob(pattern):
+            try:
+                os.remove(jsonl_path)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", jsonl_path, e)
+
+    @classmethod
+    def _backup_plog(cls):
+        """Backup Ascend plog files to a per-case path.
+
+        Replaces the workflow's ``Backup plog`` step so each case in a suite
+        gets its own plog snapshot instead of all cases sharing the suite name.
+        """
+        plog_path = "/root/ascend/log/debug/plog"
+        if not os.path.isdir(plog_path):
+            return
+        tc_name = getattr(cls, "tc_name", None)
+        if not tc_name:
+            return
+        hostname = os.getenv("HOSTNAME", "unknown")
+        plog_base = getattr(cls, "plog_base", "/root/.cache/tests/logs/plog")
+        target = os.path.join(plog_base, tc_name, hostname)
+        os.makedirs(target, exist_ok=True)
+        for name in os.listdir(plog_path):
+            src = os.path.join(plog_path, name)
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, os.path.join(target, name))
+                except Exception as e:
+                    logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog to %s", target)
+
+    @classmethod
+    def setUpClass(cls):
+        cls._setup_per_case_output()
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        env = os.environ.copy()
+        for key, value in env.items():
+            logger.info(f"ENV_VAR_SYS {key}:{value}")
+        if cls.envs:
+            for key, value in cls.envs.items():
+                logger.info(f"ENV_VAR_CASE {key}:{value}")
+                env[key] = value
+
+        other_args = list(cls.other_args)
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=cls.server_timeout,
+            other_args=other_args,
+            env=env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+        cls._save_metrics_json()
+        cls._backup_plog()
+
+    def run_accuracy(self):
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model)
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
+
+
+class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
+    model_config = None
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    backend = "sglang"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 16
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
+    other_args = None
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    envs = None
+    accuracy = 0.1
+
+    @classmethod
+    def setUpClass(cls):
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = "master" if cls.hostname.endswith("sglang-node-0") else "worker"
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_mix_master_node()
+        cls.start_pd_mix_worker_node()
+
+    @classmethod
+    def tearDownClass(cls):
+        pass
+
+    @classmethod
+    @check_role(allowed_roles=["master"])
+    def start_pd_mix_master_node(cls):
+        sglang_thread = threading.Thread(
+            target=launch_pd_mix_node, args=(cls.model_config,)
+        )
+        sglang_thread.start()
+
+        wait_server_ready(f"{cls.base_url}/health")
+
+        logger.info(
+            f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
+        )
+        time.sleep(SERVER_INITIALIZATION_DELAY)
+
+    @classmethod
+    @check_role(allowed_roles=["worker"])
+    def start_pd_mix_worker_node(cls):
+        sglang_thread = threading.Thread(
+            target=launch_pd_mix_node, args=(cls.model_config,)
+        )
+        sglang_thread.start()
+
+        logger.info(
+            f"{cls.role} node started, keeping test alive for {MAX_SERVER_KEEP_ALIVE_TIME} seconds"
+        )
+        time.sleep(MAX_SERVER_KEEP_ALIVE_TIME)
+
+    @check_role(allowed_roles=["master", "worker"])
+    def run_accuracy(self):
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model_config.get("model_path"))
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=self.host,
+                    port=self.port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)
+
+
+class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
+    model_config = None
+    benchmark_tool = BENCHMARK_TOOL_DEFAULT
+    backend = "sglang"
+    datasets = ["gsm8k"]
+    dataset_args = None
+    eval_batch_size = 16
+    limit = 100000
+    generation_config = None
+    dataset_dir = None
+    stream = True
+    timeout = 60000
+    eval_type = "openai_api"
+    other_args = None
+    server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    accuracy = 0.1
+
+    @classmethod
+    def setUpClass(cls):
+        cls.process = None
+        cls.local_ip = "127.0.0.1"
+        cls.host = os.getenv("POD_IP")
+        cls.port = SERVICE_PORT
+        cls.base_url = f"http://{cls.host}:{cls.port}"
+        cls.hostname = os.getenv("HOSTNAME")
+        cls.role = (
+            "router"
+            if "router" in cls.hostname
+            else "prefill" if "prefill" in cls.hostname else "decode"
+        )
+        logger.info(f"Init {cls.host} {cls.role=}!")
+
+        cls.start_pd_server()
+        cls.start_router_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.process:
+            try:
+                kill_process_tree(cls.process.pid)
+            except Exception as e:
+                logger.error(f"Error during tearDown: {e}")
+
+    @classmethod
+    @check_role(allowed_roles=["router"])
+    def start_router_server(cls):
+        logger.info(f"Starting router in thread...")
+        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
+        sglang_thread.daemon = True
+        sglang_thread.start()
+
+        health_check_url = f"{cls.base_url}/health"
+        logger.info(f"Waiting for router to be ready at {health_check_url}")
+        wait_server_ready(health_check_url)
+
+        logger.info(
+            f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."
+        )
+        time.sleep(SERVER_INITIALIZATION_DELAY)
+
+    @classmethod
+    @check_role(allowed_roles=["prefill", "decode"])
+    def start_pd_server(cls):
+        logger.info(f"Starting pd separation node...")
+        cls.process = launch_pd_separation_node(cls.model_config)
+        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
+
+        while True:
+            if cls.process.poll() is None:
+                time.sleep(30)
+            else:
+                exit_code = cls.process.poll()
+                raise Exception(
+                    f"Sglang process exited on node {cls.host} {cls.hostname} with exit code: {exit_code}"
+                )
+
+    @check_role(allowed_roles=["router"])
+    def run_accuracy(self):
+        parsed_url = urlparse(self.base_url)
+        host = parsed_url.hostname
+        port = parsed_url.port
+        if self.benchmark_tool == EVALSCOPE:
+            model_name = os.path.basename(self.model_config.get("model_path"))
+            max_retries = get_max_retries(self.datasets)
+            best_metrics = None
+            for attempt in range(max_retries):
+                metrics = run_evalscope(
+                    host=host,
+                    port=port,
+                    model=model_name,
+                    datasets=self.datasets,
+                    dataset_args=self.dataset_args,
+                    eval_batch_size=self.eval_batch_size,
+                    limit=self.limit,
+                    generation_config=self.generation_config,
+                    dataset_dir=self.dataset_dir,
+                    stream=self.stream,
+                    timeout=self.timeout,
+                    eval_type=self.eval_type,
+                )
+                if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
+                    best_metrics.get("accuracy", 0)
+                ):
+                    best_metrics = metrics
+                threshold = get_accuracy_threshold(self.datasets, self.accuracy)
+                if float(best_metrics.get("accuracy", 0)) >= threshold:
+                    break
+                if attempt < max_retries - 1:
+                    logger.info(
+                        f"Accuracy {best_metrics.get('accuracy')} below threshold "
+                        f"{threshold}, retrying ({attempt + 1}/{max_retries - 1})..."
+                    )
+            assert_metrics(self, best_metrics)

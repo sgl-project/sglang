@@ -10,10 +10,12 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
+    split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 FP8_WEIGHT_DTYPE = torch.float8_e4m3fn
 W8A8_FP8_GEMM_ENV = "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
@@ -74,6 +76,11 @@ def _apply_weight_only_fp8_linear(
     compute_dtype: torch.dtype,
     enable_fused_w8a8: bool,
 ) -> torch.Tensor:
+    if weight.dtype != FP8_WEIGHT_DTYPE:
+        # Weight was dequantized to the compute dtype once at load time
+        # (see dequantize_weight_only_fp8_linears_at_load).
+        bias = bias.to(weight.dtype) if bias is not None else None
+        return F.linear(x.to(weight.dtype), weight, bias)
     x = x.to(compute_dtype)
     bias = bias.to(compute_dtype) if bias is not None else None
     if enable_fused_w8a8 and _can_apply_fused_w8a8_fp8_linear(
@@ -115,6 +122,7 @@ class WeightOnlyFP8Linear(nn.Module):
         self.out_features = out_features
         self.compute_dtype = compute_dtype
         self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
+        self._fp8_dequant_decided = False
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
             requires_grad=False,
@@ -135,6 +143,8 @@ class WeightOnlyFP8Linear(nn.Module):
             self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
         compute_dtype = self.compute_dtype or x.dtype
         return _apply_weight_only_fp8_linear(
             x,
@@ -169,6 +179,7 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         self.tp_size = get_group_size(self.tp_group)
         self.tp_rank = get_group_rank(self.tp_group)
         self.out_features_per_partition = divide(out_features, self.tp_size)
+        self._fp8_dequant_decided = False
         self.weight = nn.Parameter(
             torch.empty(
                 self.out_features_per_partition,
@@ -229,6 +240,8 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
         compute_dtype = self.compute_dtype or x.dtype
         output_parallel = _apply_weight_only_fp8_linear(
             x,
@@ -240,6 +253,159 @@ class WeightOnlyFP8ColumnParallelLinear(nn.Module):
         )
         if self.gather_output:
             return tensor_model_parallel_all_gather(
+                output_parallel, tp_group=self.tp_group
+            )
+        return output_parallel
+
+
+class WeightOnlyFP8MergedColumnParallelLinear(WeightOnlyFP8ColumnParallelLinear):
+    """Column-parallel storage-only FP8 packed linear."""
+
+    def __init__(
+        self,
+        in_features: int,
+        output_sizes: list[int],
+        bias: bool = True,
+        compute_dtype: torch.dtype | None = None,
+        gather_output: bool = False,
+        tp_group=None,
+        enable_fused_w8a8: bool | None = None,
+    ) -> None:
+        self.output_sizes = output_sizes
+        super().__init__(
+            in_features,
+            sum(output_sizes),
+            bias=bias,
+            compute_dtype=compute_dtype,
+            gather_output=gather_output,
+            tp_group=tp_group,
+            enable_fused_w8a8=enable_fused_w8a8,
+        )
+        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
+
+    def weight_loader(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None:
+            shards = []
+            current_offset = 0
+            for output_size in self.output_sizes:
+                loaded_shard = loaded_weight.narrow(
+                    output_dim, current_offset, output_size
+                )
+                shard_size = output_size // self.tp_size
+                loaded_shard = loaded_shard.narrow(
+                    output_dim, self.tp_rank * shard_size, shard_size
+                )
+                shards.append(loaded_shard)
+                current_offset += output_size
+            loaded_weight = torch.cat(shards, dim=output_dim)
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+
+class WeightOnlyFP8RowParallelLinear(nn.Module):
+    """Row-parallel storage-only e4m3 FP8 linear."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        compute_dtype: torch.dtype | None = None,
+        input_is_parallel: bool = True,
+        reduce_results: bool = True,
+        tp_group=None,
+        enable_fused_w8a8: bool | None = None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.compute_dtype = compute_dtype
+        self.input_is_parallel = input_is_parallel
+        self.reduce_results = reduce_results
+        self.enable_fused_w8a8 = _resolve_enable_fused_w8a8(enable_fused_w8a8)
+        self.tp_group = tp_group or get_tp_group()
+        self.tp_size = get_group_size(self.tp_group)
+        self.tp_rank = get_group_rank(self.tp_group)
+        self.in_features_per_partition = divide(in_features, self.tp_size)
+        self._fp8_dequant_decided = False
+        self.weight = nn.Parameter(
+            torch.empty(
+                out_features,
+                self.in_features_per_partition,
+                dtype=FP8_WEIGHT_DTYPE,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            self.weight,
+            {
+                "input_dim": 1,
+                "weight_loader": self.weight_loader,
+            },
+        )
+        self.weight_scale = nn.Parameter(
+            torch.empty(out_features, dtype=torch.float32),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            self.weight_scale,
+            {
+                "missing_param_init": "error",
+                "weight_loader": self.weight_loader,
+            },
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(
+                    out_features, dtype=compute_dtype or torch.get_default_dtype()
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(self.bias, {"weight_loader": self.weight_loader})
+        else:
+            self.register_parameter("bias", None)
+
+    def weight_loader(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+    ) -> None:
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is not None:
+            shard_size = param.data.shape[input_dim]
+            loaded_weight = loaded_weight.narrow(
+                input_dim, self.tp_rank * shard_size, shard_size
+            )
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_is_parallel:
+            input_parallel = x
+        else:
+            input_parallel = split_tensor_along_last_dim(
+                x, num_partitions=self.tp_size
+            )[self.tp_rank].contiguous()
+
+        if not self._fp8_dequant_decided:
+            _maybe_promote_fp8_weight(self, x_dtype=x.dtype)
+        compute_dtype = self.compute_dtype or x.dtype
+        bias = None if self.tp_rank > 0 else self.bias
+        output_parallel = _apply_weight_only_fp8_linear(
+            input_parallel,
+            self.weight,
+            self.weight_scale,
+            bias,
+            compute_dtype,
+            self.enable_fused_w8a8,
+        )
+        if self.reduce_results and self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         return output_parallel
@@ -262,6 +428,68 @@ def _log_w8a8_fp8_gemm_warning_once() -> None:
         W8A8_FP8_GEMM_ENV,
     )
     _w8a8_fp8_gemm_warning_logged = True
+
+
+# Free-memory headroom to preserve when caching dequantized weights; the
+# activation workspace and NCCL buffers still grow after the first forward.
+_DEQUANT_CACHE_RESERVE_BYTES = 4 << 30
+_dequant_cache_logged = False
+_dequant_low_memory_logged = False
+
+
+def _maybe_promote_fp8_weight(module: nn.Module, x_dtype: torch.dtype) -> None:
+    """Dequantize the FP8 weight once, on the first device-resident forward.
+
+    Every later forward then runs a plain compute-dtype GEMM instead of
+    re-materializing the full weight matrix per call; outputs are
+    bit-identical because the same dequantized values feed the same GEMM.
+    The weight stays FP8-resident (per-forward dequant) when the flag is off,
+    under the W8A8 GEMM path, or when free device memory is low; the decision
+    is remembered per module. Runs on host weights leave the decision open so
+    CPU-offloaded modules decide once they land on the device.
+    """
+    global _dequant_cache_logged, _dequant_low_memory_logged
+    weight = module.weight
+    if weight.dtype != FP8_WEIGHT_DTYPE:
+        module._fp8_dequant_decided = True
+        return
+    if weight.device.type != "cuda":
+        return
+    if torch.cuda.is_current_stream_capturing():
+        # Never allocate inside a CUDA graph capture; retry on an eager call.
+        return
+    module._fp8_dequant_decided = True
+    if not envs.SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE:
+        return
+    if module.enable_fused_w8a8:
+        # The W8A8 GEMM path consumes the FP8 weight directly.
+        return
+    dtype = module.compute_dtype or x_dtype
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return
+    needed_bytes = weight.numel() * dtype.itemsize
+    free_bytes, _ = torch.cuda.mem_get_info(weight.device)
+    if free_bytes < needed_bytes + _DEQUANT_CACHE_RESERVE_BYTES:
+        if not _dequant_low_memory_logged:
+            logger.warning(
+                "Keeping weight-only FP8 linear weights FP8-resident (low "
+                "free device memory); they dequantize on every forward."
+            )
+            _dequant_low_memory_logged = True
+        return
+    # Server warmup commonly runs under inference_mode. A cached inference
+    # tensor has no version counter, so Dynamo cannot later guard it.
+    with torch.inference_mode(False), torch.no_grad():
+        dequant = dequantize_rowwise_fp8_weight(weight, module.weight_scale, dtype)
+    module.weight = nn.Parameter(dequant, requires_grad=False)
+    if not _dequant_cache_logged:
+        logger.info(
+            "Dequantizing weight-only FP8 linear weights once at first use "
+            "(bit-identical outputs; set "
+            "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE=0 to keep weights "
+            "FP8-resident)."
+        )
+        _dequant_cache_logged = True
 
 
 def swap_linears_to_weight_only_fp8(module: nn.Module) -> None:

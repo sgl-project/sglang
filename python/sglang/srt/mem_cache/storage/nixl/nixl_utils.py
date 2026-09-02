@@ -3,9 +3,20 @@ import os
 from typing import Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.nixl.nixl_routing import route_key
+from sglang.srt.mem_cache.storage.nixl.nixl_routing import (
+    _BUCKET_MASK,
+    BUCKET_HEX_CHARS,
+    route_key,
+)
 
 logger = logging.getLogger(__name__)
+
+_SGLANG_NIXL_CONFIG_KEYS = {
+    "use_direct_io",
+    "l3_cleaner_enabled",
+    "l3_cleaner_high_watermark",
+    "l3_cleaner_low_watermark",
+}
 
 
 class NixlBackendConfig:
@@ -34,6 +45,27 @@ class NixlBackendConfig:
         if "use_direct_io" in self.config:
             return bool(self.config["use_direct_io"])
         return envs.SGLANG_HICACHE_NIXL_USE_DIRECT_IO.get()
+
+    def get_l3_cleaner_config(self) -> dict:
+        """Return typed NIXL FILE L3 cleaner options from top-level config."""
+        config = {
+            "enabled": True,
+            "high_watermark": 80.0,
+            "low_watermark": 70.0,
+        }
+        if "l3_cleaner_enabled" in self.config:
+            enabled = self.config["l3_cleaner_enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("l3_cleaner_enabled must be a boolean")
+            config["enabled"] = enabled
+        key_map = {
+            "l3_cleaner_high_watermark": ("high_watermark", float),
+            "l3_cleaner_low_watermark": ("low_watermark", float),
+        }
+        for raw_key, (cleaner_key, parser) in key_map.items():
+            if raw_key in self.config:
+                config[cleaner_key] = parser(self.config[raw_key])
+        return config
 
     def get_specified_plugin(self) -> str:
         """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
@@ -75,6 +107,9 @@ class NixlBackendConfig:
             config_data = self.config
 
         for key, value in config_data.items():
+            # These keys are consumed by SGLang itself, not by NIXL plugins.
+            if key in _SGLANG_NIXL_CONFIG_KEYS:
+                continue
             initparams[key] = str(value)
 
         return initparams
@@ -193,6 +228,7 @@ class NixlFileManager:
         else:
             for base in self.base_dirs:
                 os.makedirs(base, exist_ok=True)
+            self.ensure_all_bucket_dirs()
             logger.debug(
                 f"Initialized file manager with base directories: {self.base_dirs}. Direct I/O: {use_direct_io}"
             )
@@ -215,6 +251,19 @@ class NixlFileManager:
             except Exception as e:
                 logger.error(f"Failed to clear base directory {base}: {e}")
         logger.debug(f"Cleared all files in base directories: {self.base_dirs}")
+
+    def ensure_all_bucket_dirs(self) -> None:
+        """Pre-create every possible bucket directory under each base dir.
+
+        Called once when path mode is active so NIXL O_CREAT writes never
+        fail due to a missing parent directory.
+        """
+        for base in self.base_dirs:
+            for i in range(_BUCKET_MASK + 1):
+                os.makedirs(
+                    os.path.join(base, f"{i:0{BUCKET_HEX_CHARS}x}"),
+                    exist_ok=True,
+                )
 
     def iter_all_base_dirs(self) -> list[str]:
         """Return base directories that may contain NIXL FILE cache entries."""

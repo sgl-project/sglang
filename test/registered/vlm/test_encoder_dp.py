@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
 from sglang.test.test_utils import is_in_ci
 
-register_cuda_ci(est_time=500, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=510, stage="nightly", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="nightly-amd-4-gpu", nightly=True)
 
 MODELS = [
@@ -19,11 +19,11 @@ MODELS = [
 
 
 class TestVLMEncoderDP(MMMUMultiModelTestBase):
-    # --cuda-graph-max-bs 32 last-wins over the kit's default 64.
+    # --cuda-graph-max-bs-decode 32 last-wins over the kit's default 64.
     other_args = [
         "--mm-enable-dp-encoder",
         "--tp=4",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "32",
     ]
 
