@@ -337,9 +337,36 @@ export const benchmarks = [
   {
     match: { hw: "h100", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 361.64,
+        tpot_ms: 4.38,
+        tokens_per_sec_per_gpu: 237.68,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 16,
+          num_prompts: 32,
+        },
+        ttft_ms: 2985.08,
+        tpot_ms: 10.35,
+        tokens_per_sec_per_gpu: 1356.87,
+      },
+    ],
     accuracy: { gsm8k_pct: 97.27 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by a teammate on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.00 at c1, 2.99 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 211.27 aggregate output tok/s at concurrency 1 (8 requests) and 1,206.11 at concurrency 16 (32 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers. The retokenized-token count in these runs is about a quarter of the generated tokens because reasoning_content is not retokenized (benign).",
   },
   {
     match: { hw: "h100", strategy: "high-throughput" },
@@ -379,9 +406,36 @@ export const benchmarks = [
   {
     match: { hw: "b300", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 235.38,
+        tpot_ms: 2.85,
+        tokens_per_sec_per_gpu: 365.9,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 16,
+          num_prompts: 8,
+        },
+        ttft_ms: 1687.94,
+        tpot_ms: 4.64,
+        tokens_per_sec_per_gpu: 1350.38,
+      },
+    ],
     accuracy: { gsm8k_pct: 96.82 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.82% for the recommended selection; 96.82-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.82% for the recommended selection; 96.82-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by a teammate on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.89 at c1, 3.58 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 325.24 aggregate output tok/s at concurrency 1 (8 requests) and 1,200.34 at concurrency 16 (8 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers.",
   },
   {
     match: { hw: "b300", strategy: "high-throughput" },
