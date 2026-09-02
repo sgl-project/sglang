@@ -143,6 +143,16 @@ Sparse backends selected for self-attention similarly fall back to a compatible
 dense backend for cross-attention. Explicit component overrides are otherwise
 strict.
 
+Model and layer backend sets guide automatic selection; they are not positive
+allowlists for explicit requests. A backend selected with
+`--attention-backend` or `--component-attention-backends` can therefore be used
+without first adding it to every model's set. It still fails closed when the
+platform cannot resolve it or when it lacks a required operation such as dense
+cross-attention, packed variable-length attention, or ring-attention LSE.
+Model paths that require one backend for correctness declare it as required;
+those layers keep that backend even when the surrounding component is
+overridden.
+
 ## Configuration
 
 Some backends require additional configuration. You can pass these parameters via `--attention-backend-config`. This argument accepts:
