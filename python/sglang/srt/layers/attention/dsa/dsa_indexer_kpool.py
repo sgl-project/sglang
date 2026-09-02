@@ -29,16 +29,9 @@ if is_npu():
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import (
-    cp_zigzag_full_plan_rows,
-    dsa_use_prefill_cp,
-    is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_in_seq_split,
-)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -46,7 +39,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.runtime_context import get_device
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -84,8 +77,6 @@ class IndexerKPool(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.compress_gate_stream = None
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.cp_size = get_parallel().attn_cp_size if self.dsa_enable_prefill_cp else 1
         self.skip_rope = skip_rope
 
         self.index_kpool = config.index_kpool
@@ -165,35 +156,6 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
-
-    @staticmethod
-    def _cp_gather_concat(
-        tensors: List[torch.Tensor],
-        cp_size: int,
-        forward_batch: ForwardBatch,
-    ) -> List[torch.Tensor]:
-        if not tensors:
-            return []
-        n_local = tensors[0].shape[0]
-        flats = []
-        feature_sizes = []
-        tails = []
-        for tensor in tensors:
-            assert tensor.shape[0] == n_local
-            assert tensor.dtype == tensors[0].dtype
-            tails.append(tensor.shape[1:])
-            flat = tensor.reshape(n_local, -1).contiguous()
-            feature_sizes.append(flat.shape[1])
-            flats.append(flat)
-        combined = flats[0] if len(flats) == 1 else torch.cat(flats, dim=1)
-        gathered = cp_all_gather_rerange_output(
-            combined,
-            cp_size,
-            forward_batch,
-            torch.cuda.current_stream(),
-        )
-        parts = torch.split(gathered, feature_sizes, dim=1)
-        return [part.reshape(part.shape[0], *tail) for part, tail in zip(parts, tails)]
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -311,7 +273,6 @@ class IndexerKPool(MultiPlatformOp):
             import os
 
             from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-                all_gather_and_scatter_pool_slots,
                 kpool_assemble_softmax_rotate_write_cache,
                 scatter_kpool_tail_updates,
             )
@@ -320,19 +281,14 @@ class IndexerKPool(MultiPlatformOp):
             if hasattr(pool, "invalidate_index_buffer_for_layer"):
                 pool.invalidate_index_buffer_for_layer(layer_id)
 
-            writes, tails, cp = plan.writes, plan.tails, plan.cp
+            writes, tails = plan.writes, plan.tails
             if writes.is_empty and tails.is_empty:
                 return None
 
             tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
-            cache_cp = cp
             if os.environ.get("SGLANG_DSA_KPOOL_DEBUG_BOUNDS") == "1":
                 if not writes.is_empty:
-                    active = (
-                        cache_cp.local_write_mask
-                        if cache_cp is not None
-                        else torch.ones_like(writes.req, dtype=torch.bool)
-                    )
+                    active = torch.ones_like(writes.req, dtype=torch.bool)
                     if bool(active.any().item()):
                         active_req = writes.req[active]
                         active_write_loc = writes.write_loc[active]
@@ -368,9 +324,7 @@ class IndexerKPool(MultiPlatformOp):
                                 f"{key.shape=}, {gate_score.shape=}, {tail_k_buf.shape=}, "
                                 f"{pool.get_index_k_with_scale_buffer(layer_id=layer_id).shape=}, "
                                 f"{min_chunk=}, {max_chunk=}, {min_req=}, {max_req=}, "
-                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}, "
-                                f"cp_rank={cache_cp.rank if cache_cp is not None else None}, "
-                                f"cp_size={cache_cp.size if cache_cp is not None else None}"
+                                f"{min_loc=}, {max_loc=}, {pool.slots_per_page=}"
                             )
                 if not tails.is_empty:
                     tail_chunk_max = tails.chunk_src.to(torch.long) + torch.clamp(
@@ -407,20 +361,8 @@ class IndexerKPool(MultiPlatformOp):
                     tail_logical_base=writes.tail_logical_base,
                     ape=self.index_kpool_compress_ape,
                     loc=writes.write_loc,
-                    write_mask=(
-                        cache_cp.local_write_mask if cache_cp is not None else None
-                    ),
                     round_scale=self.scale_fmt is not None,
                 )
-                if cache_cp is not None and write_cache:
-                    all_gather_and_scatter_pool_slots(
-                        buf=buf,
-                        local_locs=writes.write_loc,
-                        owner_rank=cache_cp.owner_rank,
-                        cp_size=cache_cp.size,
-                        cp_rank=cache_cp.rank,
-                        slots_per_page=pool.slots_per_page,
-                    )
 
             if not tails.is_empty:
                 scatter_kpool_tail_updates(
@@ -956,15 +898,6 @@ class IndexerKPool(MultiPlatformOp):
         total_k_rows = plan.ragged_total_k_rows
 
         n_real = seq_lens_expanded.shape[0]
-        row_select = None
-        if n_real > total_q:
-            row_select = cp_zigzag_full_plan_rows(forward_batch, device)
-            if row_select is not None:
-                seq_lens_expanded = seq_lens_expanded.index_select(0, row_select)
-                pool_lens = pool_lens.index_select(0, row_select)
-                ks_per_q = ks_per_q.index_select(0, row_select)
-                ke_per_q = ke_per_q.index_select(0, row_select)
-                n_real = seq_lens_expanded.shape[0]
         assert (
             n_real <= total_q
         ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
@@ -1003,16 +936,8 @@ class IndexerKPool(MultiPlatformOp):
             if topk_method == TopkTransformMethod.PAGED:
                 page_table_all = plan.ragged_paged_page_table
                 page_table_row_index_all = plan.ragged_paged_page_table_row_index
-                if page_table_row_index_all is not None and row_select is not None:
-                    page_table_row_index_all = page_table_row_index_all.index_select(
-                        0, row_select
-                    )
-                elif page_table_all is not None and row_select is not None:
-                    page_table_all = page_table_all.index_select(0, row_select)
             elif topk_method == TopkTransformMethod.RAGGED:
                 topk_offsets_all = attn_metadata.topk_indices_offset
-                if topk_offsets_all is not None and row_select is not None:
-                    topk_offsets_all = topk_offsets_all.index_select(0, row_select)
 
         return self._topk_from_kpool_logits(
             logits,
@@ -1023,114 +948,6 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
-        )
-
-    def _get_topk_ragged_with_cp(
-        self,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        metadata: BaseIndexerMetadata,
-        kv_len: int,
-        actual_seq_q: int,
-        cp_index: Optional[List[Tuple[int, int, int]]] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            build_pooled_page_table_64,
-            gather_index_k_scale_prefix_into,
-        )
-
-        assert cp_index is None, "DSA kpool CP topk currently supports batch size 1"
-        assert forward_batch.batch_size == 1
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(-1)
-
-        pool = get_token_to_kv_pool()
-        pool_size = self.index_kpool
-        slots_per_page = pool.slots_per_page
-        device = q_fp8.device
-        out_rows = q_fp8.shape[0]
-        actual_seq_q = int(actual_seq_q)
-
-        assert forward_batch.seq_lens_cpu is not None
-        assert forward_batch.extend_seq_lens_cpu is not None
-        kv_len_token = int(
-            forward_batch.seq_lens_cpu[0].item()
-            - forward_batch.extend_seq_lens_cpu[0]
-            + kv_len
-        )
-        pool_kv_len = kv_len_token // pool_size
-
-        q_work = q_fp8[:actual_seq_q].contiguous()
-        weights_work = weights[:actual_seq_q].contiguous()
-        tail_tokens = torch.arange(
-            kv_len_token - actual_seq_q + 1,
-            kv_len_token + 1,
-            dtype=torch.int32,
-            device=device,
-        )
-
-        if pool_kv_len > 0 and actual_seq_q > 0:
-            block_tables = metadata.get_page_table_64()
-            bt_row = block_tables[0]
-            n_pages = (pool_kv_len + slots_per_page - 1) // slots_per_page
-            packed_page_indices = (
-                build_pooled_page_table_64(bt_row, pool_size)[:n_pages]
-                .to(torch.int32)
-                .contiguous()
-            )
-            k_u8 = torch.empty(
-                (pool_kv_len, self.head_dim), dtype=torch.uint8, device=device
-            )
-            k_scale = torch.empty((pool_kv_len,), dtype=torch.float32, device=device)
-            gather_index_k_scale_prefix_into(
-                pool=pool,
-                buf=self._get_index_k_read_buffer(pool, layer_id),
-                page_indices=packed_page_indices,
-                seq_len=pool_kv_len,
-                k_out=k_u8,
-                scale_out=k_scale,
-            )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
-            ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
-                torch.int32
-            )
-            logits = deep_gemm.fp8_mqa_logits(
-                q_work,
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights_work,
-                ks,
-                ke,
-                clean_logits=True,
-            )
-            pool_lens = ke
-        else:
-            logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
-            pool_lens = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
-            ks = torch.zeros((actual_seq_q,), dtype=torch.int32, device=device)
-
-        page_table_local = None
-        topk_method = metadata.topk_transform_method
-        if envs.SGLANG_DSA_FUSE_TOPK.get() and topk_method == TopkTransformMethod.PAGED:
-            req_pool_idx = int(forward_batch.req_pool_indices[0].item())
-            page_table_local = (
-                get_req_to_token_pool()
-                .req_to_token[req_pool_idx, :kv_len_token]
-                .to(torch.int32)
-                .unsqueeze(0)
-                .expand(actual_seq_q, -1)
-            )
-
-        return self._topk_from_kpool_logits(
-            logits,
-            pool_lens,
-            seq_lens=tail_tokens,
-            page_table=page_table_local,
-            topk_offsets=None,
-            row_starts=ks,
-            out_rows=out_rows,
         )
 
     def _get_topk_ragged_kpool(
@@ -1593,7 +1410,7 @@ class IndexerKPool(MultiPlatformOp):
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
-        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+        if skip_logits_computation:
             return self._forward_cuda_skip_logits(
                 x,
                 positions,
@@ -1619,13 +1436,6 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
         )
-        use_cp = dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-        if use_cp:
-            if gate_score is None:
-                gate_score = self._compute_gate_score_if_missing(x, gate_score)
-            key, gate_score = self._cp_gather_concat(
-                [key, gate_score], self.cp_size, forward_batch
-            )
 
         weights = None
         kpool_extend_cache = None
@@ -1688,45 +1498,7 @@ class IndexerKPool(MultiPlatformOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
             else:
-                if (
-                    forward_batch.attn_cp_metadata is not None
-                    and self.dsa_enable_prefill_cp
-                    and is_dsa_prefill_cp_in_seq_split()
-                ):
-                    kv_len_prev = forward_batch.attn_cp_metadata.kv_len_prev_list[0]
-                    kv_len_next = forward_batch.attn_cp_metadata.kv_len_next_list[0]
-                    actual_seq_q_prev = (
-                        forward_batch.attn_cp_metadata.actual_seq_q_prev_list[0]
-                    )
-                    actual_seq_q_next = (
-                        forward_batch.attn_cp_metadata.actual_seq_q_next_list[0]
-                    )
-                    q_fp8_prev, q_fp8_next = torch.split(
-                        q_fp8, (q_fp8.shape[0] + 1) // 2, dim=0
-                    )
-                    weights_prev, weights_next = torch.split(
-                        weights, (weights.shape[0] + 1) // 2, dim=0
-                    )
-                    topk_result_prev = self._get_topk_ragged_with_cp(
-                        forward_batch,
-                        layer_id,
-                        q_fp8_prev,
-                        weights_prev,
-                        metadata,
-                        kv_len_prev,
-                        actual_seq_q_prev,
-                    )
-                    topk_result_next = self._get_topk_ragged_with_cp(
-                        forward_batch,
-                        layer_id,
-                        q_fp8_next,
-                        weights_next,
-                        metadata,
-                        kv_len_next,
-                        actual_seq_q_next,
-                    )
-                    topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
-                elif has_kpool_extend_plan:
+                if has_kpool_extend_plan:
                     topk_result = self._get_topk_ragged_kpool_plan(
                         forward_batch,
                         layer_id,

@@ -2474,27 +2474,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         comp_notif,
                     )
             elif st == StateType.DSA:
-                if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
-                    skipped_replicated_state = True
-                    h = None
-                else:
-                    if len(src_indices) != len(dst_indices):
-                        raise RuntimeError(
-                            f"State index length mismatch at component {i}: "
-                            f"prefill={len(src_indices)}, dst={len(dst_indices)}"
-                        )
-                    h = self._send_kvcache_generic(
-                        peer_name=peer_name,
-                        src_data_ptrs=src_ptrs,
-                        dst_data_ptrs=dst_ptrs,
-                        item_lens=src_lens,
-                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
-                        dst_data_indices=np.array(dst_indices, dtype=np.int32),
-                        dst_gpu_id=dst_gpu_id,
-                        notif=comp_notif,
-                        state_type=st,
-                        force_flat=True,
+                if len(src_indices) != len(dst_indices):
+                    raise RuntimeError(
+                        f"State index length mismatch at component {i}: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices)}"
                     )
+                h = self._send_kvcache_generic(
+                    peer_name=peer_name,
+                    src_data_ptrs=src_ptrs,
+                    dst_data_ptrs=dst_ptrs,
+                    item_lens=src_lens,
+                    prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                    dst_data_indices=np.array(dst_indices, dtype=np.int32),
+                    dst_gpu_id=dst_gpu_id,
+                    notif=comp_notif,
+                    state_type=st,
+                    force_flat=True,
+                )
             elif st in (StateType.SWA, StateType.SWA_RING, StateType.C128_STATE):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
