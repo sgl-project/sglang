@@ -108,12 +108,12 @@ _EXCLUDE_FIELDS = frozenset(
 )
 
 # SamplingParams fields that are reconstructed locally or not JSON-safe.
+# teacache_params carries callables; the rest cross as plain data.
 _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     {
         "data_type",
         "supported_resolutions",
         "teacache_params",
-        "seacache_params",
     }
 )
 
@@ -127,6 +127,8 @@ def _is_tensor_like(value) -> bool:
 
 
 def _to_json_serializable(value):
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
     if isinstance(value, (torch.Tensor, np.ndarray)):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -1311,7 +1313,9 @@ class SchedulerDisaggMixin:
             with self._disagg_trace_dispatch(req):
                 self.worker.execute_forward([req])
 
-    def _build_disagg_req(self: Scheduler, scalar_fields: dict, tensors: dict) -> Req:
+    def _build_disagg_req(
+        self: Scheduler | None, scalar_fields: dict, tensors: dict
+    ) -> Req:
         """Reconstruct a Req from transfer scalar fields and loaded GPU tensors.
 
         Initializes all dataclass field defaults first, then overlays
@@ -1328,14 +1332,25 @@ class SchedulerDisaggMixin:
                 object.__setattr__(req, f.name, f.default)
             elif f.default_factory is not dataclasses.MISSING:
                 object.__setattr__(req, f.name, f.default_factory())
-        # Ensure sampling_params is not None so __getattr__ delegation works
-        object.__setattr__(req, "sampling_params", SamplingParams())
+        # Model subclass, not the base: only fields differing from the
+        # subclass defaults are transferred. self is None in unit tests.
+        if self is not None:
+            from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                get_model_sampling_defaults,
+            )
+
+            base_sampling_params = get_model_sampling_defaults(self.server_args)
+        else:
+            base_sampling_params = SamplingParams()
+        object.__setattr__(req, "sampling_params", base_sampling_params)
         # Restore _extra_* prefixed fields into req.extra dict
         extra_keys = [k for k in scalar_fields if k.startswith("_extra_")]
         for key in extra_keys:
             req.extra[key[len("_extra_") :]] = scalar_fields.pop(key)
         for key, value in scalar_fields.items():
             setattr(req, key, value)
+        # Re-finalize so cache-param dicts get rehydrated.
+        req.sampling_params.__post_init__()
         # Set tensor fields
         for key, value in tensors.items():
             setattr(req, key, value)

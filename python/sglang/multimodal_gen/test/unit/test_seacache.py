@@ -3,6 +3,7 @@
 
 import contextlib
 import dataclasses
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,12 @@ from sglang.multimodal_gen.runtime.cache.seacache import (
     apply_sea_filter,
     sea_filter_response,
 )
+from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+    SchedulerDisaggMixin,
+    extract_transfer_fields,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import pack_tensors
+from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 _GRID = (8, 8)
 _CHANNELS = 4
@@ -332,6 +339,53 @@ class TestSeaCacheParamsValidation(unittest.TestCase):
         for name in ("enable_seacache", "seacache_params"):
             with self.subTest(field=name):
                 self.assertFalse(fields[name].metadata.get("batch_sig_exclude"))
+
+
+class TestSeaCacheDisaggTransfer(unittest.TestCase):
+    """Dropped params at the disagg hop silently disable SeaCache."""
+
+    @staticmethod
+    def _scheduler():
+        # Resolves FluxSamplingParams via the registry, no model files.
+        return SimpleNamespace(
+            server_args=SimpleNamespace(
+                pipeline_class_name="ComfyUIFluxPipeline",
+                model_path="/nonexistent",
+                backend="auto",
+                model_id=None,
+            )
+        )
+
+    def test_non_default_threshold_round_trips(self) -> None:
+        req = Req(
+            request_id="seacache-disagg",
+            prompt="x",
+            sampling_params=SamplingParams(
+                enable_seacache=True,
+                seacache_params=SeaCacheParams(thresh=0.42, norm_mode="peak"),
+            ),
+        )
+
+        _, scalar_fields = extract_transfer_fields(req)
+        # pack_tensors is the RDMA metadata frame's json path
+        metadata_bytes, _ = pack_tensors({}, scalar_fields)
+        decoded = json.loads(metadata_bytes.decode("utf-8"))["scalar_fields"]
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(
+            self._scheduler(), dict(decoded), {}
+        )
+
+        self.assertIsInstance(rebuilt.seacache_params, SeaCacheParams)
+        self.assertEqual(rebuilt.seacache_params.thresh, 0.42)
+        self.assertEqual(rebuilt.seacache_params.norm_mode, "peak")
+
+    def test_model_subclass_defaults_are_reconstructed(self) -> None:
+        """num_inference_steps equals the subclass default, so it is never
+        transferred."""
+        rebuilt = SchedulerDisaggMixin._build_disagg_req(
+            self._scheduler(), {"request_id": "t", "prompt": "x"}, {}
+        )
+
+        self.assertEqual(rebuilt.num_inference_steps, 50)
 
 
 if __name__ == "__main__":
