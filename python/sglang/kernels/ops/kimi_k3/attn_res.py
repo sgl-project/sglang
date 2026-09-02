@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+import os
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -12,15 +14,61 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
     override_jit_cuda_arch,
 )
+from sglang.kernels.ops.kimi_k3 import comm as k3_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-    from sglang.kernels.ops.communication.all_reduce import Communicator
 
 _DIM: int = 7168  # K3 hidden size, template parameter of the TMA kernel
 _MAX_BANK_ROWS: int = 8  # K3 has <= 8 snapshots, upper bound of the nvb dispatch tables
+
+
+class FusionDispatch(NamedTuple):
+    strategy: str
+    max_blocks: int
+
+
+_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "attn_res")
+_TABLES: dict[str, Optional[dict]] = {}
+
+
+def _device_name(device: torch.device) -> str:
+    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
+
+
+def get_fusion_dispatch(
+    kind: str,
+    world_size: int,
+    hidden_size: int,
+    num_tokens: int,
+    device: torch.device,
+) -> Optional[FusionDispatch]:
+    """Return a measured fused strategy, or None for the separate path."""
+    path = os.path.join(
+        _CONFIG_DIR,
+        f"world={world_size},H={hidden_size},device_name={_device_name(device)}.json",
+    )
+    if path not in _TABLES:
+        _TABLES[path] = json.load(open(path)) if os.path.exists(path) else None
+    table = _TABLES[path]
+    if table is None:
+        return None
+    raw = table["configs"].get(kind)
+    if raw is None:
+        return None
+    configs = {int(k): v for k, v in raw.items()}
+    bucket = min(configs)
+    for candidate in sorted(configs):
+        if candidate <= num_tokens:
+            bucket = candidate
+        else:
+            break
+    config = configs[bucket]
+    if config["strategy"] == "separate":
+        return None
+    return FusionDispatch(config["strategy"], config["max_blocks"])
 
 
 def _make_name(*args):
@@ -98,22 +146,6 @@ def _tuning(nvb: int, num_tokens: int) -> tuple[int, int, int]:
     return best
 
 
-_COMM_MAP: dict[int, Communicator] = {}
-
-
-def register_comm(comm: Communicator) -> None:
-    # One communicator per world_size per process -- see the note in
-    # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
-    # overwrite here would hand the old group's callers the new group's peer
-    # pointers.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
-
-
 @register_custom_op(mutates_args=["out", "prefix_out"])
 def _attn_res_fused_pull_rs_op(
     world_size: int,
@@ -133,7 +165,7 @@ def _attn_res_fused_pull_rs_op(
     consumer_regs: int,
 ) -> None:
     _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_pull_rs(
-        _COMM_MAP[world_size],
+        k3_comm.get(world_size),
         input,
         residual,
         bank,
@@ -206,7 +238,7 @@ def _attn_res_fused_direct_ag_op(
     consumer_regs: int,
 ) -> None:
     _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
-        _COMM_MAP[world_size],
+        k3_comm.get(world_size),
         prefix_sum,
         bank,
         cw,

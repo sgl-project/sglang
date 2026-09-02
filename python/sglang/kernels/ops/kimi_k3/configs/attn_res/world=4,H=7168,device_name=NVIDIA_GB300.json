@@ -1,0 +1,134 @@
+{
+ "source": {
+  "code_commits": [
+   "c4ad2e84b",
+   "5bf69bd32"
+  ],
+  "date": "2026-07-25",
+  "device": "NVIDIA GB300",
+  "nodes": 1,
+  "gpus_per_node": 4,
+  "push_slot_bytes": 33554432,
+  "raw_results": [
+   "standalone-c4ad2e84b-run3.log",
+   "standalone-large-c4ad2e84b.json",
+   "standalone-8192-tiebreak-c4ad2e84b.json",
+   "fused-small-5bf69bd32.json",
+   "fused-medium-5bf69bd32.json",
+   "fused-8192-5bf69bd32.json"
+  ]
+ },
+ "selection": {
+  "rule": "nearest global-token bucket at or below the workload",
+  "fallback": "separate"
+ },
+ "configs": {
+  "reduce_scatter_attn_res": {
+   "4": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "8": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "16": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "32": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "64": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "128": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "256": {
+    "strategy": "fused_pull",
+    "max_blocks": 64
+   },
+   "512": {
+    "strategy": "separate"
+   },
+   "1024": {
+    "strategy": "separate"
+   },
+   "2048": {
+    "strategy": "separate"
+   },
+   "4096": {
+    "strategy": "separate"
+   },
+   "8192": {
+    "strategy": "separate"
+   },
+   "9364": {
+    "strategy": "separate"
+   },
+   "16384": {
+    "strategy": "separate"
+   }
+  },
+  "attn_res_all_gather": {
+   "4": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "8": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "16": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "32": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "64": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "128": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "256": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "512": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "1024": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "2048": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "4096": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "8192": {
+    "strategy": "fused_direct",
+    "max_blocks": 64
+   },
+   "9364": {
+    "strategy": "separate"
+   },
+   "16384": {
+    "strategy": "separate"
+   }
+  }
+ }
+}

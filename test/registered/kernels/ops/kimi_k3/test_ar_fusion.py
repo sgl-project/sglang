@@ -3,8 +3,8 @@
 Compares the 1shot multicast-push and the in-place low-SM NVLS 2shot pull
 (with and without the fused residual) against
 NCCL, bit-exact on small-int bf16 inputs; the fused-RMSNorm pull against a
-torch reference; the pull tuning knobs (num_blocks, unroll) on sizes whose
-shard split is uneven; plus a CUDA-graph capture/replay pass and a mixed
+torch reference; the pull block-count knob on sizes whose shard split is
+uneven; plus a CUDA-graph capture/replay pass and a mixed
 stress loop exercising the push phase double-buffering and the pull
 semaphore window cycling.
 
@@ -27,6 +27,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.kernels.ops.kimi_k3 import all_reduce
+from sglang.kernels.ops.kimi_k3 import comm as k3_comm
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -104,7 +105,7 @@ def _init_comm() -> CustomAllReduceV2:
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("ar_fusion requires CustomAllReduceV2 with multicast")
-    all_reduce.register_comm(comm.obj)
+    k3_comm.register(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -187,22 +188,21 @@ def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_blocks", [1, 2, 4, 8])
-@pytest.mark.parametrize("unroll", [4, 8])
+@pytest.mark.parametrize("num_blocks", [0, 1, 2, 4, 8])
 @torch.inference_mode()
-def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
-    """Every (num_blocks, unroll) combination must agree with NCCL on a size
-    whose 16B-vector count is not divisible by the world size (uneven shards)
-    and whose per-thread range leaves an unrolled-loop tail."""
+def test_ar_fusion_pull_block_grid(num_blocks: int):
+    """Every block count must agree with NCCL on a size whose 16B-vector count
+    is not divisible by the world size (uneven shards) and whose per-thread
+    range leaves an unrolled-loop tail. 0 is the collective sizing its own."""
     _init_comm()
     world = dist.get_world_size()
     buf, mc = _init_pool_buf()
-    n = (3 * H + 7) * 8  # 21511 vecs: % 8 ranks != 0, small vs blocks*512*unroll
+    n = (3 * H + 7) * 8  # 21511 vecs: % 8 ranks != 0, and small vs the grid
     x = buf[:n]
-    x.copy_(_int_input(n, num_blocks * 10 + unroll, per_rank=True))
+    x.copy_(_int_input(n, num_blocks * 10, per_rank=True))
     ref = _nccl_ref(x, None)
     all_reduce.all_reduce_pull_res(
-        world, x, None, input_mc_ptr=mc, num_blocks=num_blocks, unroll=unroll
+        world, x, None, input_mc_ptr=mc, num_blocks=num_blocks
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(x, ref, atol=0, rtol=0)

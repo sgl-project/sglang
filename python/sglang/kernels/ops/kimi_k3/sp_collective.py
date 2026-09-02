@@ -1,194 +1,80 @@
-"""K3 SP-MoE bf16 reduce-scatter and all-gather over MNNVL push memory."""
+"""K3 SP-MoE reduce-scatter and all-gather.
+
+The kernels are the shared NVLink collectives; this module is only the K3
+facing edge of them, and carries the two things the kernel module does not: the
+custom-op declarations, and the table saying which strategy to run at a given
+size. The communicator they resolve through lives in `comm`.
+"""
 
 from __future__ import annotations
 
-import json
-import os
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import Literal, NamedTuple, Optional, TypeAlias
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    is_arch_support_pdl,
-    load_jit,
-    make_cpp_args,
-)
+from sglang.kernels.jit.utils import cache_once
+from sglang.kernels.ops.communication import nvlink_comm as nvl
+from sglang.kernels.ops.kimi_k3 import comm as k3_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
-
-    from sglang.kernels.ops.communication.all_reduce import Communicator
+_Strategy: TypeAlias = Literal["push", "pull", "nccl"]
 
 
-class Tuning(NamedTuple):
-    num_blocks: int
-    block_size: int
+class Boundaries(NamedTuple):
+    pull_from: Optional[int]  # None: only when the push workspace is too small
+    nccl_from: Optional[int]  # None: never hand back to NCCL
 
 
-class Dispatch(NamedTuple):
-    strategy: str
-    tuning: Tuning
+# Measured at H=7168 bf16 on a single-node 8xB200
+_BOUNDARIES: dict[tuple[int, int, str], Boundaries] = {
+    (100, 8, "reduce_scatter"): Boundaries(pull_from=3072, nccl_from=None),
+    (100, 8, "all_gather"): Boundaries(pull_from=3072, nccl_from=16384),
+    (100, 4, "reduce_scatter"): Boundaries(pull_from=None, nccl_from=None),
+    (100, 4, "all_gather"): Boundaries(pull_from=3072, nccl_from=6144),
+}
 
-
-class FusionDispatch(NamedTuple):
-    strategy: str
-    max_blocks: int
-
-
-# Safe seed values. GB300 production values are loaded by the layer glue from
-# the checked-in JSON after the sweep settles.
-DEFAULT_TUNING = Tuning(num_blocks=16, block_size=256)
-_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs", "sp_collective")
-_TABLES: dict[str, Optional[dict]] = {}
-
-
-def _device_name(device: torch.device) -> str:
-    return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
-
-
-def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
-    path = os.path.join(
-        _CONFIG_DIR,
-        (
-            f"world={world_size},H={hidden_size},"
-            f"device_name={_device_name(device)}.json"
-        ),
-    )
-    if path not in _TABLES:
-        if os.path.exists(path):
-            with open(path) as f:
-                _TABLES[path] = json.load(f)
-        else:
-            _TABLES[path] = None
-    return _TABLES[path]
-
-
-def get_dispatch(
-    kind: str,
-    world_size: int,
-    hidden_size: int,
-    num_tokens: int,
-    device: torch.device,
-) -> Optional[Dispatch]:
-    """Return the tuned strategy, or None when the table selects NCCL."""
-    table = _table(world_size, hidden_size, device)
-    if table is None:
-        return None
-    raw_configs = table["configs"].get(kind)
-    if raw_configs is None:
-        return None
-    configs = {int(k): v for k, v in raw_configs.items()}
-    bucket = min(configs)
-    for candidate in sorted(configs):
-        if candidate <= num_tokens:
-            bucket = candidate
-        else:
-            break
-    config = configs[bucket]
-    if config["strategy"] == "nccl":
-        return None
-    return Dispatch(
-        config["strategy"],
-        Tuning(config["num_blocks"], config["block_size"]),
-    )
-
-
-def get_tuning(
-    kind: str,
-    world_size: int,
-    hidden_size: int,
-    num_tokens: int,
-    device: torch.device,
-) -> Optional[Tuning]:
-    """Compatibility helper for callers that only support staging push."""
-    dispatch = get_dispatch(kind, world_size, hidden_size, num_tokens, device)
-    if dispatch is None or dispatch.strategy != "push":
-        return None
-    return dispatch.tuning
-
-
-def get_fusion_dispatch(
-    kind: str,
-    world_size: int,
-    hidden_size: int,
-    num_tokens: int,
-    device: torch.device,
-) -> Optional[FusionDispatch]:
-    """Return a measured fused strategy, or None for the separate path."""
-    table = _table(world_size, hidden_size, device)
-    if table is None:
-        return None
-    raw_configs = table["configs"].get(kind)
-    if raw_configs is None:
-        return None
-    configs = {int(k): v for k, v in raw_configs.items()}
-    bucket = min(configs)
-    for candidate in sorted(configs):
-        if candidate <= num_tokens:
-            bucket = candidate
-        else:
-            break
-    config = configs[bucket]
-    if config["strategy"] == "separate":
-        return None
-    return FusionDispatch(config["strategy"], config["max_blocks"])
+# GB300 -> B200
+_ARCH_ALIASES = {103: 100}
 
 
 @cache_once
-def _jit_module(world_size: int) -> Module:
-    args = make_cpp_args(world_size, is_arch_support_pdl())
-    cls = f"SPCollectiveKernel<{args}>"
-    return load_jit(
-        "kimi_k3_sp_collective",
-        *args,
-        cuda_files=["kimi_k3/comm/sp_collective.cuh"],
-        cuda_wrappers=[
-            ("reduce_scatter_res", f"{cls}::reduce_scatter_res"),
-            ("reduce_scatter_pull", f"{cls}::reduce_scatter_pull"),
-            ("all_gather", f"{cls}::all_gather"),
-            ("all_gather_direct", f"{cls}::all_gather_direct"),
-        ],
-        extra_cuda_cflags=["-O3"],
-    )
+def _arch(device: torch.device) -> int:
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = major * 10 + minor
+    return _ARCH_ALIASES.get(arch, arch)
 
 
-_COMM_MAP: dict[int, Communicator] = {}
+def supported(world_size: int, device: torch.device) -> bool:
+    """Whether this arch and world size have measured boundaries."""
+    return (_arch(device), world_size, "reduce_scatter") in _BOUNDARIES
 
 
-def register_comm(comm: Communicator) -> None:
-    # One communicator per world_size per process -- see the note in
-    # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
-    # overwrite here would hand the old group's callers the new group's peer
-    # pointers.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
+def choose_strategy(
+    op: str,
+    world_size: int,
+    num_tokens: int,
+    device: torch.device,
+    *,
+    push_fits: bool,
+) -> _Strategy:
+    bounds = _BOUNDARIES[(_arch(device), world_size, op)]
+    if bounds.nccl_from is not None and num_tokens >= bounds.nccl_from:
+        return "nccl"
+    if not push_fits:
+        return "pull"
+    if bounds.pull_from is not None and num_tokens >= bounds.pull_from:
+        return "pull"
+    return "push"
 
 
 @register_custom_op(mutates_args=["output"])
-def _reduce_scatter_res_op(
+def _reduce_scatter_push_op(
     world_size: int,
     input: torch.Tensor,
     output: torch.Tensor,
     residual: Optional[torch.Tensor],
-    residual_is_local: bool,
-    num_blocks: int,
-    block_size: int,
 ) -> None:
-    _jit_module(world_size).reduce_scatter_res(
-        _COMM_MAP[world_size],
-        input.view(-1),
-        output.view(-1),
-        None if residual is None else residual.view(-1),
-        residual_is_local,
-        num_blocks,
-        block_size,
-    )
+    nvl.reduce_scatter_push(k3_comm.get(world_size), input, output, residual)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -197,77 +83,41 @@ def _reduce_scatter_pull_op(
     input: torch.Tensor,
     output: torch.Tensor,
     residual: Optional[torch.Tensor],
-    residual_is_local: bool,
     input_mc_ptr: int,
-    num_blocks: int,
-    block_size: int,
 ) -> None:
-    _jit_module(world_size).reduce_scatter_pull(
-        _COMM_MAP[world_size],
-        input.view(-1),
-        output.view(-1),
-        None if residual is None else residual.view(-1),
-        residual_is_local,
-        input_mc_ptr,
-        num_blocks,
-        block_size,
+    nvl.reduce_scatter_pull(
+        k3_comm.get(world_size), input, output, residual, in_mc_ptr=input_mc_ptr
     )
 
 
 @register_custom_op(mutates_args=["output"])
-def _all_gather_op(
-    world_size: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    num_blocks: int,
-    block_size: int,
+def _all_gather_push_op(
+    world_size: int, input: torch.Tensor, output: torch.Tensor
 ) -> None:
-    _jit_module(world_size).all_gather(
-        _COMM_MAP[world_size],
-        input.view(-1),
-        output.view(-1),
-        num_blocks,
-        block_size,
-    )
+    nvl.all_gather_push(k3_comm.get(world_size), input, output)
 
 
 @register_custom_op(mutates_args=["output"])
-def _all_gather_direct_op(
-    world_size: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    output_mc_ptr: int,
-    num_blocks: int,
-    block_size: int,
+def _all_gather_pull_op(
+    world_size: int, input: torch.Tensor, output: torch.Tensor, output_mc_ptr: int
 ) -> None:
-    _jit_module(world_size).all_gather_direct(
-        _COMM_MAP[world_size],
-        input.view(-1),
-        output.view(-1),
-        output_mc_ptr,
-        num_blocks,
-        block_size,
+    nvl.all_gather_pull(
+        k3_comm.get(world_size), input, output, out_mc_ptr=output_mc_ptr
     )
 
 
-def reduce_scatter_res(
+def local_tokens(world_size: int, num_tokens: int) -> int:
+    """This rank's share of a possibly ragged split, as the kernels route it."""
+    return nvl.get_token_partion(num_tokens, k3_comm.get(world_size)).num_local_tokens
+
+
+def reduce_scatter_push(
     world_size: int,
     input: torch.Tensor,
     output: torch.Tensor,
     residual: Optional[torch.Tensor] = None,
-    *,
-    tuning: Tuning = DEFAULT_TUNING,
 ) -> torch.Tensor:
-    residual_is_local = residual is not None and residual.numel() == output.numel()
-    _reduce_scatter_res_op(
-        world_size,
-        input,
-        output,
-        residual,
-        residual_is_local,
-        tuning.num_blocks,
-        tuning.block_size,
-    )
+    _reduce_scatter_push_op(world_size, input, output, residual)
     return output
 
 
@@ -278,53 +128,20 @@ def reduce_scatter_pull(
     residual: Optional[torch.Tensor] = None,
     *,
     input_mc_ptr: int,
-    tuning: Tuning = DEFAULT_TUNING,
 ) -> torch.Tensor:
-    residual_is_local = residual is not None and residual.numel() == output.numel()
-    _reduce_scatter_pull_op(
-        world_size,
-        input,
-        output,
-        residual,
-        residual_is_local,
-        input_mc_ptr,
-        tuning.num_blocks,
-        tuning.block_size,
-    )
+    _reduce_scatter_pull_op(world_size, input, output, residual, input_mc_ptr)
     return output
 
 
-def all_gather(
-    world_size: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    tuning: Tuning = DEFAULT_TUNING,
+def all_gather_push(
+    world_size: int, input: torch.Tensor, output: torch.Tensor
 ) -> torch.Tensor:
-    _all_gather_op(
-        world_size,
-        input,
-        output,
-        tuning.num_blocks,
-        tuning.block_size,
-    )
+    _all_gather_push_op(world_size, input, output)
     return output
 
 
-def all_gather_direct(
-    world_size: int,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    *,
-    output_mc_ptr: int,
-    tuning: Tuning = DEFAULT_TUNING,
+def all_gather_pull(
+    world_size: int, input: torch.Tensor, output: torch.Tensor, *, output_mc_ptr: int
 ) -> torch.Tensor:
-    _all_gather_direct_op(
-        world_size,
-        input,
-        output,
-        output_mc_ptr,
-        tuning.num_blocks,
-        tuning.block_size,
-    )
+    _all_gather_pull_op(world_size, input, output, output_mc_ptr)
     return output
