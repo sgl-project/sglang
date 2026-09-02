@@ -1,7 +1,9 @@
 """Public interface of sglang.kernels.jit.utils."""
 
 from sglang.kernels.jit.utils.arch import (
+    get_device_properties,
     get_jit_cuda_arch,
+    get_max_vector_bytes,
     is_arch_support_pdl,
     override_jit_cuda_arch,
 )
@@ -28,6 +30,8 @@ __all__ = [
     "load_jit",
     "override_jit_cuda_arch",
     "get_jit_cuda_arch",
+    "get_max_vector_bytes",
+    "get_device_properties",
     "is_arch_support_pdl",
     "KERNEL_PATH",
 ]
