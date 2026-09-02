@@ -200,48 +200,50 @@ def evict_from_tree_cache(
             swa_evictable_tokens=swa_evictable,
         ):
             return
-
-        def minimum_reclaim(max_tokens: int, fits) -> int:
-            lo, hi = 0, max_tokens // page_size
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if fits(mid * page_size):
-                    hi = mid
-                else:
-                    lo = mid + 1
-            return lo * page_size
-
-        swa_reclaim = minimum_reclaim(
-            swa_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                required_swa,
-                full_evictable_tokens=full_evictable,
-                swa_evictable_tokens=value,
-            ),
+        full_min_tokens, swa_first_tokens, reclaim_bytes = allocator.reclaim_budget(
+            num_tokens, required_swa
         )
-        full_reclaim = minimum_reclaim(
-            full_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                required_swa,
-                full_evictable_tokens=value,
-                swa_evictable_tokens=swa_reclaim,
-            ),
-        )
-        # FULL owns the virtual IDs for this allocation. Reclaim SWA only when
-        # all evictable FULL plus compaction cannot satisfy the shared demand.
-        evicted = tree_cache.evict_for_alloc(
-            EvictParams(
-                num_tokens=full_reclaim,
-                swa_num_tokens=swa_reclaim,
+        swa_first_tokens = min(swa_first_tokens, swa_evictable)
+        full_token_bytes = allocator.full_attn_allocator.entry_bytes
+        swa_token_bytes = allocator.swa_attn_allocator.entry_bytes
+        # A FULL victim may retain all, some, or none of its SWA pages. Measure
+        # allocator live deltas instead of assuming a fixed FULL:SWA ratio.
+        full_tokens_before = allocator.full_attn_allocator.allocated_count()
+        swa_tokens_before = allocator.swa_attn_allocator.allocated_count()
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        assert isinstance(tree_cache, UnifiedRadixCache)
+
+        def enough() -> bool:
+            full_evicted = max(
+                0,
+                full_tokens_before - allocator.full_attn_allocator.allocated_count(),
             )
+            swa_evicted = max(
+                0,
+                swa_tokens_before - allocator.swa_attn_allocator.allocated_count(),
+            )
+            if full_evicted < full_min_tokens:
+                return False
+            actual_reclaimed_bytes = (
+                full_evicted * full_token_bytes + swa_evicted * swa_token_bytes
+            )
+            if actual_reclaimed_bytes < reclaim_bytes:
+                return False
+            return allocator.ensure_capacity(num_tokens, required_swa)
+
+        evicted = tree_cache.evict_swa_tombstones_then_full(
+            swa_num_tokens=swa_first_tokens,
+            full_num_tokens=full_evictable,
+            stop_full=enough,
         )
         if not allocator.ensure_capacity(num_tokens, required_swa):
             logger.warning(
-                "Unified SWA eviction did not satisfy the planned reservation: "
+                "Unified SWA eviction did not satisfy the reservation: "
                 f"requested=({num_tokens}, {required_swa}), "
-                f"planned=({full_reclaim}, {swa_reclaim}), "
+                f"budget=(full_min={full_min_tokens}, "
+                f"swa_first={swa_first_tokens}, bytes={reclaim_bytes}), "
                 f"evicted=({evicted.num_tokens_evicted}, "
                 f"{evicted.swa_num_tokens_evicted})"
             )

@@ -6,7 +6,15 @@ import threading
 import time
 from dataclasses import replace
 from queue import Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeVar,
+)
 
 import torch
 
@@ -624,6 +632,46 @@ class UnifiedRadixCache(BasePrefixCache):
             available_size_targets=available_size_targets,
         )
 
+        return self._finish_eviction(tracker, start_time)
+
+    def evict_swa_tombstones_then_full(
+        self,
+        *,
+        swa_num_tokens: int,
+        full_num_tokens: int,
+        stop_full: Callable[[], bool],
+    ) -> EvictResult:
+        """Evict SWA-only tombstones before falling back to FULL eviction.
+
+        The SWA cursor tombstones independent candidates inline and returns
+        coupled leaves to its caller. Skipping those returned leaves makes the
+        first pass incapable of cascading into FULL. The second pass uses the
+        normal FULL eviction policy; ``stop_full`` observes allocator state
+        after each victim, including partially present SWA freed with a FULL node.
+        """
+        if self.disable:
+            return EvictResult()
+        start_time = time.perf_counter()
+        tracker = {ct: 0 for ct in self.tree_components}
+
+        if swa_num_tokens > 0:
+            self._evict_swa_tombstones(swa_num_tokens, tracker)
+        if not stop_full():
+            self._evict_components(
+                self._evict_request_by_type(EvictParams(num_tokens=full_num_tokens)),
+                tracker,
+                stop=stop_full,
+            )
+
+        return self._finish_eviction(tracker, start_time)
+
+    def _finish_eviction(
+        self,
+        tracker: dict[ComponentType, int],
+        start_time: float,
+    ) -> EvictResult:
+        """Finish write-back bookkeeping and build the public result."""
+
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
@@ -698,12 +746,15 @@ class UnifiedRadixCache(BasePrefixCache):
         request_by_type: dict[ComponentType, int],
         tracker: dict[ComponentType, int],
         available_size_targets: Optional[dict[ComponentType, int]] = None,
+        stop: Optional[Callable[[], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
 
         def target_reached(component_type: ComponentType) -> bool:
+            if stop is not None and stop():
+                return True
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
@@ -757,6 +808,26 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _evict_swa_tombstones(
+        self,
+        request_cnt: int,
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Evict SWA-only candidates, skipping leaves coupled to FULL."""
+        self.tree_core.evict_device_start(ComponentType.SWA, request_cnt)
+        try:
+            while tracker[ComponentType.SWA] < request_cnt:
+                node_id, made_progress = self._evict_device_next_node(
+                    ComponentType.SWA, tracker
+                )
+                if node_id is not None:
+                    # The cursor advanced but the coupled leaf is still intact.
+                    continue
+                if not made_progress:
+                    break
+        finally:
+            self.tree_core.evict_device_end(ComponentType.SWA)
 
     def _record_dropped_tokens(
         self,
