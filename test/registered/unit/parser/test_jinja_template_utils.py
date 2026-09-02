@@ -28,13 +28,20 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         select_template = (
             "{{ messages | selectattr('tool_call_id', 'equalto', 'call-a') | list }}"
         )
-        sort_template = "{{ messages | sort(attribute='tool_call_id') }}"
 
         self.assertTrue(jinja_template_may_reorder_tool_results(attribute_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(item_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(get_template))
         self.assertTrue(jinja_template_may_reorder_tool_results(select_template))
-        self.assertTrue(jinja_template_may_reorder_tool_results(sort_template))
+
+    def test_sort_by_tool_call_id_value_is_not_association(self):
+        # sort/groupby order by the id string value, which message-order
+        # canonicalization cannot reproduce, so they must not activate it.
+        sort_template = "{{ messages | sort(attribute='tool_call_id') }}"
+        groupby_template = "{{ messages | groupby('tool_call_id') }}"
+
+        self.assertFalse(jinja_template_may_reorder_tool_results(sort_template))
+        self.assertFalse(jinja_template_may_reorder_tool_results(groupby_template))
 
     def test_tool_call_id_text_does_not_enable_order_recovery(self):
         self.assertFalse(

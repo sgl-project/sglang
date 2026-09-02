@@ -121,7 +121,13 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
 
 
 def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
-    """Detect call-ID use so rendered media can be realigned without model-specific allowlists."""
+    """Detect templates that associate tool results with tool_calls by tool_call_id.
+
+    Such templates may emit media placeholders in tool_calls order rather than
+    request message order. Templates that sort/group by the tool_call_id string
+    value are intentionally excluded: their order cannot be reproduced from
+    message order alone.
+    """
     if not isinstance(chat_template, str):
         return False
 
@@ -151,7 +157,7 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
         ):
             return True
 
-    attribute_filters = {"groupby", "map", "rejectattr", "selectattr", "sort"}
+    attribute_filters = {"map", "rejectattr", "selectattr"}
     for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
         if filter_node.name not in attribute_filters:
             continue
