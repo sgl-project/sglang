@@ -13,7 +13,10 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
-from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.fixup_zero_kv import (
+    _jit_fixup_module,
+    fixup_zero_kv_rows,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -237,6 +240,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        # Prebuild: the first zero-KV prefix chunk otherwise JITs ~6s mid-serving.
+        _jit_fixup_module(self.q_data_type)
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
