@@ -72,6 +72,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    filter_duplicate_precision_variant_safetensors,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
@@ -610,6 +611,9 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                 hf_folder,
                 index_file,
                 key_filter=key_filter,
+            )
+            hf_weights_files = filter_duplicate_precision_variant_safetensors(
+                hf_weights_files
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)

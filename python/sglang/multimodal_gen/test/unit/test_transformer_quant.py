@@ -96,7 +96,6 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
-    _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
     _needs_device_weight_postprocess,
     _resolve_quant_config,
@@ -109,6 +108,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     hf_to_custom_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    filter_duplicate_precision_variant_safetensors,
+)
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     Flux2Transformer2DModel,
@@ -1142,7 +1144,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             "/tmp/transformer/other.safetensors",
         ]
 
-        resolved = _filter_duplicate_precision_variant_safetensors(files)
+        resolved = filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(
             resolved,
@@ -1158,7 +1160,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             "/tmp/transformer/diffusion_pytorch_model.fp16.safetensors",
         ]
 
-        resolved = _filter_duplicate_precision_variant_safetensors(files)
+        resolved = filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
 
