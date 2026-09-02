@@ -43,7 +43,9 @@ def collect_active_slots(
     if exclude_out_cache_loc:
         out_cache_loc = maybe_inaccurate_forward_batch.out_cache_loc
         if out_cache_loc is not None:
-            valid_num_tokens = maybe_inaccurate_forward_batch.global_num_token_non_padded_cpu
+            valid_num_tokens = (
+                maybe_inaccurate_forward_batch.global_num_token_non_padded_cpu
+            )
             if valid_num_tokens is None:
                 valid_num_tokens = int(out_cache_loc.shape[0])
             excluded = set(

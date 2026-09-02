@@ -1276,7 +1276,10 @@ class AscendAttnBackend(AttentionBackend):
                 if self.use_fia:
                     if self._can_use_tnd(layer):
                         num_token_padding = q.shape[0]
-                        if num_token_padding > forward_batch.global_num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            > forward_batch.global_num_token_non_padded_cpu
+                        ):
                             q, k, v = [
                                 data[: forward_batch.global_num_token_non_padded_cpu]
                                 for data in [q, k, v]
@@ -1320,7 +1323,10 @@ class AscendAttnBackend(AttentionBackend):
                         attn_out = attn_out.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
-                        if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
+                        if (
+                            num_token_padding
+                            != forward_batch.global_num_token_non_padded_cpu
+                        ):
                             attn_out = torch.cat(
                                 [
                                     attn_out,
@@ -1413,7 +1419,10 @@ class AscendAttnBackend(AttentionBackend):
                     """FIA supports multi-bs in the current version of CANN"""
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     num_token_padding = q.shape[0]
-                    if num_token_padding > forward_batch.global_num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        > forward_batch.global_num_token_non_padded_cpu
+                    ):
                         q, k, v = [
                             data[: forward_batch.global_num_token_non_padded_cpu]
                             for data in [q, k, v]
@@ -1441,7 +1450,10 @@ class AscendAttnBackend(AttentionBackend):
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
 
-                    if num_token_padding != forward_batch.global_num_token_non_padded_cpu:
+                    if (
+                        num_token_padding
+                        != forward_batch.global_num_token_non_padded_cpu
+                    ):
                         attn_output = torch.cat(
                             [
                                 attn_output,
@@ -1701,7 +1713,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.global_num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
                 q_nope, q_rope = q.split(
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1864,7 +1877,8 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 num_token_padding = q.shape[0]
                 q, k, v = [
-                    data[: forward_batch.global_num_token_non_padded_cpu] for data in [q, k, v]
+                    data[: forward_batch.global_num_token_non_padded_cpu]
+                    for data in [q, k, v]
                 ]
 
                 q_nope, q_rope = q.split(
@@ -2099,7 +2113,8 @@ class AscendAttnBackend(AttentionBackend):
                     [
                         attn_output,
                         attn_output.new_zeros(
-                            num_token_padding - forward_batch.global_num_token_non_padded_cpu,
+                            num_token_padding
+                            - forward_batch.global_num_token_non_padded_cpu,
                             *attn_output.shape[1:],
                         ),
                     ],

@@ -66,19 +66,25 @@ class TestTboChildrenDummyTokenMask(CustomTestCase):
     def test_masked_idle_parent_yields_zero_token_children(self):
         # An idle rank masked to 0 real tokens must split into two 0-token
         # children even though input_ids still holds the padded dummy rows.
-        batch = _make_extend_batch(padded_num_tokens=16, global_num_token_non_padded_cpu=0)
+        batch = _make_extend_batch(
+            padded_num_tokens=16, global_num_token_non_padded_cpu=0
+        )
         self.assertEqual(self._children_counts(batch), [0, 0])
 
     def test_padding_is_not_counted_as_real_tokens(self):
         # A busy rank padded up to a larger bucket must split on its real token
         # count, not on the padded input_ids length.
-        batch = _make_extend_batch(padded_num_tokens=16, global_num_token_non_padded_cpu=8)
+        batch = _make_extend_batch(
+            padded_num_tokens=16, global_num_token_non_padded_cpu=8
+        )
         self.assertEqual(self._children_counts(batch), [4, 4])
 
     def test_cpu_pair_matches_device_pair(self):
         # prepare() derives the children's CPU counts separately from the device
         # tensor; the two must not drift apart.
-        batch = _make_extend_batch(padded_num_tokens=16, global_num_token_non_padded_cpu=5)
+        batch = _make_extend_batch(
+            padded_num_tokens=16, global_num_token_non_padded_cpu=5
+        )
         cpu_pair = TboForwardBatchPreparer._split_num_token_non_padded(
             tbo_split_token_index=TboForwardBatchPreparer._compute_split_token_index(
                 batch

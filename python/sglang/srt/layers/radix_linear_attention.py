@@ -157,7 +157,9 @@ def _linear_attention_with_output_impl(
     forward_batch: ForwardBatch,
 ) -> None:
     """Run linear attention on the real prefix and initialize physical padding."""
-    real_num_tokens = min(forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0])
+    real_num_tokens = min(
+        forward_batch.global_num_token_non_padded_cpu, mixed_qkv.shape[0]
+    )
 
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
