@@ -73,6 +73,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
+            affinity: None,
             fused: None,
             eligibility: None,
         },
