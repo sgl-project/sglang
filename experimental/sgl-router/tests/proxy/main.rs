@@ -19,6 +19,7 @@ mod graceful_shutdown;
 mod header_forwarding;
 mod pd_bootstrap_injection;
 mod pd_pool_isolation;
+mod radix_tree_routing;
 mod roundrobin_input_ids;
 mod shared_prefill_admission;
 mod sticky_input_ids;

@@ -12,6 +12,7 @@ pub mod factory;
 pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
+pub mod prefix_provider;
 pub mod random;
 pub mod registry;
 pub mod round_robin;

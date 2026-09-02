@@ -12,9 +12,9 @@ use axum::http::{Request, StatusCode};
 use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use sgl_router::config::{
     ActiveLoadConfig, AffinityConfig, BucketConfig, BucketSpec, BucketStage, CacheAwareConfig,
-    Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, SloBucketPolicy,
-    StaticUrlsDiscoveryConfig,
+    CachePrefixProvider, Config, DiscoveryBackend, KvIndexerEndpointConfig, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    SloBucketPolicy, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
@@ -195,6 +195,7 @@ fn build_cache_ctx_with_affinity(
     let mut context =
         build_app_context(specs, bucket_config, PolicyKind::CacheAware, Some(affinity));
     context.config.model.cache_aware = Some(CacheAwareConfig {
+        prefix_provider: CachePrefixProvider::Indexer,
         kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
             url: "http://fake-indexer".into(),
             query_timeout_ms: 100,
