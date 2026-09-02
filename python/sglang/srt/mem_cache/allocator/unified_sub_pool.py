@@ -239,6 +239,31 @@ def _full_tokens_before_mamba_recheck(
     return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
 
 
+def install_move_gate(
+    targets,
+    *,
+    slot: str,
+    gate: Callable[[], bool],
+    feature: str,
+    lazy_compaction: bool,
+) -> None:
+    """Point every member of a composite at one compaction gate.
+
+    A gate that reaches only some members is not a weaker gate, it is no gate:
+    the ungated end relocates its own pages under the same in-flight transfer.
+    So the member list is stated once per composite (`_move_gate_targets`) and
+    every gate installs over it, rather than each setter naming the members it
+    happens to remember.
+    """
+    assert lazy_compaction, (
+        f"{feature} with the unified memory pool requires lazy compaction "
+        "(eager free-path compaction moves pages under in-flight transfers)."
+    )
+    assert slot in ("disagg_move_gate", "host_transfer_move_gate"), slot
+    for target in targets:
+        setattr(target, slot, gate)
+
+
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 

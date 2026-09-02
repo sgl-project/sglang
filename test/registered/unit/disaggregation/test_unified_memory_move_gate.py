@@ -186,5 +186,156 @@ class TestMoveGateRejectsNonPdNode(CustomTestCase):
             unified_memory_disagg_move_gate(scheduler)
 
 
+class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
+    """Every unified composite allocator must OVERRIDE the two PD hooks.
+
+    `BaseTokenToKVPoolAllocator.translate_kv_indices_for_transfer` is the
+    IDENTITY, and `set_disagg_move_gate` exists only where a composite defines
+    it. Inheriting either is silent, not loud: identity puts VIRTUAL ids on the
+    wire (they address real bytes, so the peer gets plausible garbage), and a
+    missing gate lets lazy compaction relocate pages under in-flight RDMA.
+    An AST-level check because instantiating these composites needs a GPU.
+    """
+
+    # Composites that own the full-side virtual ids and so must define the
+    # transfer translate themselves.
+    _COMPOSITES = (
+        "UnifiedMambaTokenToKVPoolAllocator",
+        "UnifiedSWATokenToKVPoolAllocator",
+    )
+    # Every composite must define the gate setter, including the tri-pool,
+    # which inherits the SWA translates (same full side) but has a THIRD
+    # member the 2-pool setter does not reach.
+    _GATE_COMPOSITES = _COMPOSITES + ("UnifiedMambaSWATokenToKVPoolAllocator",)
+
+    @staticmethod
+    def _own_methods(cls_name: str) -> Set[str]:
+        """Names this class defines ITSELF, inheritance excluded.
+
+        Resolved off the class object rather than by parsing a named module:
+        these composites have already been moved once (out of
+        `multi_ended_allocator` into `allocator/unified_*`), and a hardcoded
+        module path turns that kind of move into a test failure that says
+        nothing about the contract. `__dict__` needs no GPU -- it is the class
+        body, not an instance.
+        """
+        from sglang.srt.mem_cache.allocator import (
+            unified_hybrid_swa,
+            unified_mamba,
+        )
+
+        for mod in (unified_mamba, unified_hybrid_swa):
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                return set(vars(cls))
+        raise AssertionError(f"class {cls_name} not found in the unified allocators")
+
+    def test_transfer_translate_is_not_inherited_identity(self):
+        for name in self._COMPOSITES:
+            with self.subTest(composite=name):
+                self.assertIn(
+                    "translate_kv_indices_for_transfer",
+                    self._own_methods(name),
+                    f"{name} inherits the identity transfer translate; PD would "
+                    "ship VIRTUAL ids and corrupt KV without any error",
+                )
+
+    # Every sub-allocator attribute a composite can hold. The stub carries all
+    # of them regardless of composite, so the assertion is on what installation
+    # REACHES rather than on what the stub was given.
+    _MEMBER_ATTRS = ("full_attn_allocator", "swa_attn_allocator", "mamba_allocator")
+
+    # The members each composite's gate must reach. The tri-pool row is the one
+    # that matters: it inherits the setter, so an enumeration written inside
+    # that setter would silently leave the third member ungated.
+    _EXPECTED_COVERAGE = {
+        "UnifiedMambaTokenToKVPoolAllocator": {
+            "full_attn_allocator",
+            "mamba_allocator",
+        },
+        "UnifiedSWATokenToKVPoolAllocator": {
+            "full_attn_allocator",
+            "swa_attn_allocator",
+        },
+        "UnifiedMambaSWATokenToKVPoolAllocator": {
+            "full_attn_allocator",
+            "swa_attn_allocator",
+            "mamba_allocator",
+        },
+    }
+
+    def _members_reached(self, cls_name: str, slot: str) -> Set[str]:
+        """Install one gate on a stub composite and report which members got it.
+
+        `object.__new__` skips `__init__` (which needs a GPU); the setter reads
+        only `lazy_compaction` and the member attributes.
+        """
+        from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
+
+        cls = getattr(unified_mamba, cls_name, None) or getattr(
+            unified_hybrid_swa, cls_name
+        )
+        alloc = object.__new__(cls)
+        alloc.lazy_compaction = True
+        for attr in self._MEMBER_ATTRS:
+            member = type("_Member", (), {})()
+            member.disagg_move_gate = None
+            member.host_transfer_move_gate = None
+            setattr(alloc, attr, member)
+
+        def gate() -> bool:
+            return True
+
+        alloc.set_disagg_move_gate(gate)
+        return {
+            attr
+            for attr in self._MEMBER_ATTRS
+            if getattr(getattr(alloc, attr), slot) is gate
+        }
+
+    def test_the_gate_reaches_every_member(self):
+        """A gate that reaches only some members is not a weaker gate, it is no
+        gate: the ungated end relocates its own pages under the very transfer
+        the gate was installed for.
+        """
+        for name, expected in self._EXPECTED_COVERAGE.items():
+            with self.subTest(composite=name):
+                self.assertEqual(
+                    self._members_reached(name, "disagg_move_gate"),
+                    expected,
+                    f"{name}.disagg_move_gate does not cover every member",
+                )
+
+    def test_gate_setters_do_not_enumerate_members_themselves(self):
+        """The structural half of the rule above: a setter that names its
+        members is one a new member silently escapes. Installation must go
+        through the shared helper, which drives off `_move_gate_targets`.
+        """
+        import inspect
+
+        from sglang.srt.mem_cache.allocator import unified_hybrid_swa, unified_mamba
+
+        for name in self._EXPECTED_COVERAGE:
+            cls = getattr(unified_mamba, name, None) or getattr(
+                unified_hybrid_swa, name
+            )
+            if "set_disagg_move_gate" not in vars(cls):
+                continue  # inherited, and the inherited one is checked above
+            with self.subTest(composite=name):
+                body = inspect.getsource(cls.set_disagg_move_gate)
+                self.assertIn("install_move_gate", body)
+                self.assertNotIn("_move_gate = ", body)
+
+    def test_swa_composite_translates_the_swa_side_separately(self):
+        """The SWA sub-pool runs its OWN compaction, so a full-side physical id
+        does not name the SWA page holding the same virtual token. The read-path
+        `translate_loc_from_full_to_swa` cannot stand in either: it returns
+        kernel-facing ids, and the transfer addresses raw page envelopes."""
+        self.assertIn(
+            "translate_swa_indices_for_transfer",
+            self._own_methods("UnifiedSWATokenToKVPoolAllocator"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
