@@ -642,6 +642,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
         )
 
+    def _is_intra_node_nvlink_enabled(self) -> bool:
+        return (
+            self.enable_custom_mem_pool
+            and self.custom_mem_pool_type == "INTRA_NODE_NVLINK"
+        )
+
     def _send_kvcache_generic(
         self,
         mooncake_session_id: str,
@@ -781,7 +787,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
-        if self.enable_custom_mem_pool:
+        if self.enable_custom_mem_pool and not self._is_intra_node_nvlink_enabled():
             futures = [
                 executor.submit(
                     process_layer,
@@ -793,8 +799,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
             return self._await_transfer_futures(futures)
         else:
-            # Combining all layers' params in one batch transfer is more efficient
-            # compared to using multiple threads
+            # The default transport and INTRA_NODE_NVLINK both benefit from
+            # combining all layers into one batch transfer. Other custom memory
+            # pools retain their per-layer thread-pool submission behavior.
             return process_layers(layers_params)
 
     def _validate_envelope_kv_layout(
@@ -997,7 +1004,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
             )
 
-        if self.enable_custom_mem_pool:
+        if self.enable_custom_mem_pool and not self._is_intra_node_nvlink_enabled():
             futures = [
                 executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
@@ -1129,7 +1136,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
         )
 
-        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
+        def set_transfer_blocks_tp_aware(
+            src_layer_ptr: int, dst_layer_ptr: int
+        ) -> List[Tuple[int, int, int]]:
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
             dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
@@ -1138,13 +1147,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_addr_list = src_slice_addrs.reshape(-1).tolist()
             if not src_addr_list:
                 # Nothing to transfer for this layer.
-                return 0
+                return []
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            return list(zip(src_addr_list, dst_addr_list, length_list))
+
+        def process_layer_tp_aware(src_layer_ptr: int, dst_layer_ptr: int) -> int:
+            return self._transfer_data(
+                mooncake_session_id,
+                set_transfer_blocks_tp_aware(src_layer_ptr, dst_layer_ptr),
             )
+
+        if self._is_intra_node_nvlink_enabled():
+            transfer_blocks = []
+            for src_layer_ptr, dst_layer_ptr in layer_ptr_pairs:
+                transfer_blocks.extend(
+                    set_transfer_blocks_tp_aware(src_layer_ptr, dst_layer_ptr)
+                )
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         futures = [
             executor.submit(process_layer_tp_aware, src_layer_ptr, dst_layer_ptr)
