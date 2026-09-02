@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     ROUTER_HINT_KEY,
     SOURCE_LOCATIONS_ACTION_TYPE,
     SOURCE_LOCATIONS_ACTION_VERSION,
+    RouterHint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -401,7 +402,15 @@ class UnusableHostPoolTest(unittest.TestCase):
     def test_finalize_reports_the_complete_unimplemented_pool_plan(self):
         store = _store(0, 1)
         anchor = SimpleNamespace(kv_buffer=None)
-        c4_pool = SimpleNamespace()
+        c4_buffer = torch.empty(4, dtype=torch.uint8)
+        c4_pool = SimpleNamespace(
+            kv_buffer=c4_buffer,
+            page_size=1,
+            get_page_buffer_meta=lambda indices: (
+                [c4_buffer.data_ptr() + int(index) for index in indices],
+                [1] * len(indices),
+            ),
+        )
         store.register_mem_pool_host(anchor)
         store.register_mem_host_pool_v2(anchor, PoolName.KV)
         store.register_mem_host_pool_v2(c4_pool, PoolName.DEEPSEEK_V4_C4)
@@ -411,12 +420,20 @@ class UnusableHostPoolTest(unittest.TestCase):
 
         self.assertIn(str(PoolName.KV), str(raised.exception))
         self.assertIn(str(PoolName.DEEPSEEK_V4_C4), str(raised.exception))
-        self.assertIn("region planning", str(raised.exception))
+        self.assertIn("plural KVCR framework regions", str(raised.exception))
         self.assertIsNone(store._kvcr)
 
     def test_single_pool_finalization_does_not_rebuild_an_eager_core(self):
         store = _store(0, 1)
-        pool = SimpleNamespace(kv_buffer=object())
+        buffer = torch.empty(4, dtype=torch.uint8)
+        pool = SimpleNamespace(
+            page_size=1,
+            kv_buffer=buffer,
+            get_page_buffer_meta=lambda indices: (
+                [buffer.data_ptr() + int(index) for index in indices],
+                [1] * len(indices),
+            ),
+        )
 
         def build_once(mem_pool_host):
             self.assertIs(mem_pool_host, pool)
@@ -428,6 +445,7 @@ class UnusableHostPoolTest(unittest.TestCase):
             store.finalize_mem_pool_registration()
 
         build.assert_called_once_with(pool)
+        self.assertIs(store._pool_contexts[PoolName.KV].host_pool, pool)
 
     def test_a_per_layer_pool_refuses_to_start_the_backend(self):
         """A pool with no single kv_buffer tensor cannot be NIXL-registered.
@@ -548,6 +566,176 @@ class SidecarPoolTest(unittest.TestCase):
 
         self.assertEqual(result.kv_hit_pages, 0)
         self.assertEqual(result.extra_pool_hit_pages, {})
+
+
+class _ManifestPool:
+    """Small physical host pool with page-major component metadata."""
+
+    def __init__(self, page_size: int, component_bytes: List[int]) -> None:
+        self.page_size = page_size
+        self.buffers = [
+            torch.empty(size * 4, dtype=torch.uint8) for size in component_bytes
+        ]
+        self.kv_buffer = self.buffers if len(self.buffers) > 1 else self.buffers[0]
+        self.component_bytes = list(component_bytes)
+        self.meta_calls = 0
+        self.pointer_delta = 0
+
+    def get_hybrid_pool_buffer(self):
+        return self.buffers
+
+    def get_page_buffer_meta(self, indices):
+        self.meta_calls += 1
+        rows = indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        ptrs = []
+        sizes = []
+        for row in rows.tolist():
+            for buffer, size in zip(self.buffers, self.component_bytes):
+                ptrs.append(buffer.data_ptr() + row * size + self.pointer_delta)
+                sizes.append(size)
+        return ptrs, sizes
+
+
+@_needs_kvcr
+class HybridPoolManifestTest(unittest.TestCase):
+    """Validated pool metadata, before plural KVCR arenas are enabled."""
+
+    def setUp(self) -> None:
+        self.store = _store(0, 1)
+        self.anchor = SimpleNamespace(
+            kv_buffer=None,
+            page_size=2,
+            get_page_buffer_meta=mock.Mock(
+                side_effect=AssertionError("logical anchor")
+            ),
+        )
+        self.c4 = _ManifestPool(page_size=2, component_bytes=[8, 8])
+        self.c128 = _ManifestPool(page_size=2, component_bytes=[24])
+        self.store.register_mem_pool_host(self.anchor)
+        self.store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        self.store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        self.store.register_mem_host_pool_v2(self.c128, PoolName.DEEPSEEK_V4_C128)
+
+    def _collect(self):
+        self.store._pool_contexts = self.store._collect_pool_contexts()
+        return self.store._pool_contexts
+
+    def test_manifest_skips_the_logical_anchor_and_keeps_every_buffer(self):
+        contexts = self._collect()
+
+        self.assertEqual(
+            list(contexts),
+            [PoolName.DEEPSEEK_V4_C128, PoolName.DEEPSEEK_V4_C4],
+        )
+        self.assertEqual(
+            contexts[PoolName.DEEPSEEK_V4_C4].buffers,
+            tuple(self.c4.buffers),
+        )
+        self.assertEqual(len(contexts[PoolName.DEEPSEEK_V4_C4].regions), 2)
+        self.assertEqual(
+            contexts[PoolName.DEEPSEEK_V4_C4].component_sizes,
+            (8, 8),
+        )
+        self.anchor.get_page_buffer_meta.assert_not_called()
+
+    def test_finalizer_retains_the_manifest_at_the_next_checkpoint_boundary(self):
+        with self.assertRaisesRegex(RuntimeError, "plural KVCR framework regions"):
+            self.store.finalize_mem_pool_registration()
+
+        self.assertEqual(
+            set(self.store._pool_contexts),
+            {PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C128},
+        )
+        self.assertIsNone(self.store._kvcr)
+
+    def test_a_bufferless_side_pool_is_not_silently_omitted(self):
+        self.store.register_mem_host_pool_v2(
+            SimpleNamespace(kv_buffer=None),
+            PoolName.INDEXER,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "physical pool indexer"):
+            self.store._collect_pool_contexts()
+
+    def test_component_keys_are_pool_qualified_but_hints_still_cover_them(self):
+        self._collect()
+        page = "0123456789abcdefdeadbeef"
+
+        c4_key = self.store._segment_key(page, 0, PoolName.DEEPSEEK_V4_C4)
+        c128_key = self.store._segment_key(page, 0, PoolName.DEEPSEEK_V4_C128)
+        kv_key = self.store._segment_key(page, 0)
+        hint = RouterHint(
+            source_control_endpoint="tcp://127.0.0.1:25000",
+            block_hashes=(page[:16],),
+        )
+
+        self.assertNotEqual(c4_key, c128_key)
+        self.assertEqual(kv_key, f"{page}#0".encode())
+        self.assertTrue(self.store._key_hint_adapter.matches(c4_key, hint))
+        self.assertTrue(self.store._key_hint_adapter.matches(c128_key, hint))
+
+    def test_descriptors_resolve_the_transfer_pool_and_its_geometry(self):
+        contexts = self._collect()
+        # Ignore the one probe call made while constructing each context.
+        c4_calls = self.c4.meta_calls
+        c128_calls = self.c128.meta_calls
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        c4_descriptors, c4_pages = self.store._host_descriptors(
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                keys=["p0", "p1"],
+                host_indices=indices,
+            )
+        )
+        c128_descriptors, c128_pages = self.store._host_descriptors(
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                keys=["p0", "p1"],
+                host_indices=indices,
+            )
+        )
+
+        self.assertEqual(self.c4.meta_calls, c4_calls + 1)
+        self.assertEqual(self.c128.meta_calls, c128_calls + 1)
+        self.anchor.get_page_buffer_meta.assert_not_called()
+        self.assertEqual([len(page) for page in c4_pages], [2, 2])
+        self.assertEqual([len(page) for page in c128_pages], [1, 1])
+        self.assertEqual({desc.size for desc in c4_descriptors.values()}, {8})
+        self.assertEqual({desc.size for desc in c128_descriptors.values()}, {24})
+        self.assertTrue(all(b"#v2/deepseek_v4_c4/" in key for key in c4_descriptors))
+        self.assertTrue(
+            all(b"#v2/deepseek_v4_c128/" in key for key in c128_descriptors)
+        )
+
+    def test_descriptor_shape_or_address_drift_fails_closed(self):
+        self._collect()
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            keys=["p0"],
+            host_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+
+        self.c128.component_bytes.append(24)
+        self.c128.buffers.append(torch.empty(96, dtype=torch.uint8))
+        self.assertIsNone(self.store._host_descriptors(transfer))
+        self.c128.component_bytes.pop()
+        self.c128.buffers.pop()
+
+        self.c128.component_bytes[0] = 23
+        self.assertIsNone(self.store._host_descriptors(transfer))
+
+        self.c128.component_bytes[0] = 24
+        self.c128.pointer_delta = self.c128.buffers[0].numel()
+        self.assertIsNone(self.store._host_descriptors(transfer))
+
+        unknown = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["p0"],
+            host_indices=torch.tensor([0, 1], dtype=torch.int64),
+        )
+        self.assertIsNone(self.store._host_descriptors(unknown))
+        self.anchor.get_page_buffer_meta.assert_not_called()
 
 
 @_needs_kvcr
