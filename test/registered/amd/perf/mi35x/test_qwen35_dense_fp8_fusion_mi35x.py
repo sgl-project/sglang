@@ -3,8 +3,8 @@
 Two parallel TP4 servers on the MXFP4 checkpoint (8-GPU stage-c): --enable-dense-fp8
 (GPUs 0-3, shared_expert.down_proj -> online w8a8 FP8 with a fused SiluAndMul+quant
 kernel) vs bf16 baseline (GPUs 4-7). The fused path must hold GSM8K accuracy against
-the baseline. Default-off, so untested by a plain CI run; nightly single-server eval
-is in accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py.
+the baseline. The feature is default-off, so this is the only CI coverage that
+actually executes it.
 """
 
 import ast
@@ -43,22 +43,13 @@ QWEN35_MXFP4_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 4800
 GSM8K_NUM_QUESTIONS = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 GSM8K_NUM_SHOTS = 5
-# Submit the whole set at once and let the scheduler batch it. Measured on MI355X
-# TP4 over 1319 questions: 112s here vs 192s when capped at 128 in flight, for the
-# same accuracy -- throttling the client just starves the GPU.
+# Submit everything at once; concurrency is capped server-side anyway.
 GSM8K_PARALLEL = int(os.environ.get("GSM8K_PARALLEL", str(GSM8K_NUM_QUESTIONS)))
-# Qwen3.5 is a reasoning model: it emits a long <think> block before the final
-# answer, so the generation cap must be large enough to reach the answer line. The
-# 512-token default of benchmark/gsm8k/bench_sglang.py truncates valid answers
-# mid-reasoning and costs ~5 points here, which is why this file runs its own
-# harness instead (matching accuracy/mi35x/test_qwen35_dense_fp8_mi35x.py).
+# Reasoning model: the <think> block needs room before the answer line.
 GSM8K_MAX_NEW_TOKENS = int(os.environ.get("GSM8K_MAX_NEW_TOKENS", "8192"))
-# Measured on MI355X TP4 with the harness below: 0.973 bf16 baseline, so 0.92 leaves
-# ~5 points of headroom while still catching a real break.
+# bf16 baseline measures 0.973 here, so 0.92 leaves headroom.
 ACCURACY_THRESHOLD = 0.92
-# The actual claim under test is that promoting down_proj to FP8 is accuracy-neutral,
-# so also gate fused against baseline. GSM8K stderr at 1319 questions is ~0.006; 0.02
-# is wide enough not to flake and tight enough to catch a genuine regression.
+# Promoting down_proj to FP8 must be accuracy-neutral; GSM8K stderr is ~0.006.
 ACCURACY_DELTA_TOLERANCE = 0.02
 
 GSM8K_DATA_URL = (
@@ -66,12 +57,22 @@ GSM8K_DATA_URL = (
     "master/grade_school_math/data/test.jsonl"
 )
 
-# TP=4: TP=8 shards down_proj (K=1024) to K=128, which aiter's fp8 GEMM can't tune.
+# TP=4 matches the AMD model-card recipe. Avoid TP=8: shared_expert.down_proj is
+# row-parallel with a 1024 contraction dim, so TP=8 shards it to K=128. aiter's fp8
+# bpreshuffle GEMM has no tuned config for that shape at decode-graph batch sizes,
+# and its untuned CK fallback rejects K<=192, so cuda-graph capture crashes. That is
+# an aiter FP8-GEMM tuning gap, not a dense-FP8 issue.
+TP_SIZE = int(os.environ.get("QWEN35_TP_SIZE", "4"))
+# Two arms run concurrently: first slice is fused, second is baseline.
+DEVICE_POOL: List[str] = os.environ.get("QWEN35_DEVICE_POOL", "0,1,2,3,4,5,6,7").split(
+    ","
+)
+
 COMMON_ARGS: List[str] = [
     "--attention-backend",
     "aiter",
     "--tp",
-    "4",
+    str(TP_SIZE),
     "--trust-remote-code",
     "--disable-radix-cache",
     "--mem-fraction-static",
@@ -107,17 +108,28 @@ def _base_url_with_port_offset(offset: int) -> str:
     return f"{host}:{int(port) + offset}"
 
 
+def _device_slice(arm_index: int) -> str:
+    start = arm_index * TP_SIZE
+    devices = DEVICE_POOL[start : start + TP_SIZE]
+    if len(devices) < TP_SIZE:
+        raise ValueError(
+            f"QWEN35_DEVICE_POOL={','.join(DEVICE_POOL)} needs {2 * TP_SIZE} "
+            f"devices for two TP{TP_SIZE} arms"
+        )
+    return ",".join(devices)
+
+
 def get_dense_fp8_variants() -> List[DenseFp8Variant]:
     return [
         DenseFp8Variant(
             variant=FUSED_VARIANT,
-            hip_visible_devices="0,1,2,3",
+            hip_visible_devices=_device_slice(0),
             port_offset=0,
             extra_args=["--enable-dense-fp8"],
         ),
         DenseFp8Variant(
             variant=BASELINE_VARIANT,
-            hip_visible_devices="4,5,6,7",
+            hip_visible_devices=_device_slice(1),
             port_offset=1,
             extra_args=[],
         ),
@@ -170,17 +182,16 @@ def run_gsm8k_benchmark(
     @sgl.function
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
-        # Stop only at the next few-shot boundary ("\n\nQuestion"), not the bare
-        # word "Question", which appears inside reasoning text and would truncate
-        # valid answers early (fix from PR #29264).
+        # Stop only at the next few-shot boundary. Never "Assistant:": the model
+        # opens its turn with it, emptying 32% of answers. EOS ends generation.
         s += sgl.gen(
             "answer",
             max_tokens=GSM8K_MAX_NEW_TOKENS,
-            stop=["\n\nQuestion", "Assistant:", "<|im_end|>"],
+            stop=["\n\nQuestion"],
         )
 
-    # Both variants are evaluated concurrently from this process, so the backend is
-    # passed per call rather than through the global set_default_backend().
+    # Both arms share this process, so pass the backend per call instead of
+    # through the global set_default_backend().
     tic = time.perf_counter()
     states = few_shot_gsm8k.run_batch(
         [{"question": q} for q in questions],
