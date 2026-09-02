@@ -805,8 +805,12 @@ class LTX2Attention(nn.Module):
         self.k_norm: nn.Module | None = None
         if self.qk_norm:
             if tp_size == 1:
-                self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
-                self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                if _is_npu:
+                    self.q_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
+                else:
+                    self.q_norm = nn.torch.RMSNorm(self.inner_dim, eps=self.norm_eps)
+                    self.k_norm = nn.torch.RMSNorm(self.inner_dim, eps=self.norm_eps)                    
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
