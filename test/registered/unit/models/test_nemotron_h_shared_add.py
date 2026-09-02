@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -171,3 +172,7 @@ def test_latent_projection_preserves_lora_wrapper_path():
     output = NemotronHMoE._apply_latent_projection(moe, routed, shared)
 
     torch.testing.assert_close(output, 2 * routed + 1 + shared, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
