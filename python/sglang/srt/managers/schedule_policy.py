@@ -584,6 +584,41 @@ class PrefillAdder:
         self.dsa_prefill_cp_in_seq_split = is_dsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
+        # Logical-page KV sharding: the physical-page quantum all mid-request
+        # chunk boundaries must land on; 0 when sharding is off. A sharded
+        # batch may hold several requests, but only as many as the assembly
+        # scratch fits — _kv_shard_reserve_scratch gates each admission.
+        from sglang.srt.mem_cache.allocator.page_interleave import (
+            page_interleave_shard_size,
+        )
+
+        kv_shard_size = page_interleave_shard_size(self.token_to_kv_pool_allocator)
+        self.kv_shard_granule = (
+            self.token_to_kv_pool_allocator.page_size if kv_shard_size > 1 else 0
+        )
+        self.kv_shard_size = kv_shard_size
+        # Assembly-scratch admission budget: a sharded batch's padded prefix
+        # gather spans N * sum_i ceil(prefix_pages_i / N) pages and its
+        # ps-ceiled extends fill the chunk region — both must fit the
+        # per-batch scratch the pool provisioned (PageShardSpec), so
+        # _kv_shard_reserve_scratch gates every admission below. None when
+        # sharding is off.
+        self.kv_shard_scratch_spec = (
+            self.token_to_kv_pool_allocator.shard_spec if kv_shard_size > 1 else None
+        )
+        self.kv_shard_block_bound_pages = 0
+        self.kv_shard_chunk_pages = 0
+        # Per-request KV reserve charged at admission. Stock alloc_extend can
+        # consume up to one extra page per request beyond the extend length;
+        # under sharding the min-class admission gate needs one page per
+        # class (the ceil(K/N) rounding of cyclic class draws, phase-
+        # agnostic) — reserve N*ps so admission defers (NO_TOKEN) instead of
+        # over-committing into the alloc path's fail-loud RuntimeError.
+        self.per_req_token_overhead = (
+            kv_shard_size * self.kv_shard_granule
+            if self.kv_shard_granule
+            else self.page_size
+        )
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -843,8 +878,9 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
+        # alloc_extend reserves an extra page_size per request to make sure the
+        # budget doesn't over-commit (widened under KV sharding — see __init__).
+        page_overhead = self.per_req_token_overhead
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
@@ -931,6 +967,50 @@ class PrefillAdder:
         # carried from a previous scheduling of this req.
         req.skip_lock_node_ids = {}
 
+    def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
+        """Reserve assembly-scratch capacity for one sharded admission.
+
+        The batch's prefix gather is padded to
+        ``N * sum_i ceil(prefix_pages_i / N)`` pages (each request's chain is
+        one cyclic rotation run, so a rank owns at most ceil(K_i/N) of its
+        pages) and each extend fills ``ceil(extend_i / ps)`` chunk pages.
+        Returns False — caller defers the request to a later batch — when
+        either region would overflow; a single request always fits (the
+        regions are sized for one full-context prefix and one max chunk).
+        True (no-op) when sharding is off.
+        """
+        if self.kv_shard_scratch_spec is None:
+            return True
+        ps = self.kv_shard_granule
+        shard_size = self.kv_shard_size
+        block = self.kv_shard_block_bound_pages + -(-(prefix_len // ps) // shard_size)
+        chunk = self.kv_shard_chunk_pages + -(-extend_len // ps)
+        if (
+            shard_size * block * ps > self.kv_shard_scratch_spec.max_prefix_tokens
+            or chunk * ps > self.kv_shard_scratch_spec.chunk_tokens
+        ):
+            if self.kv_shard_block_bound_pages == 0 and self.kv_shard_chunk_pages == 0:
+                # First reservation of the pass: a single request must always
+                # fit (the regions are sized for one full-context prefix and
+                # one max chunk). Reaching here means an admission path
+                # bypassed the chunking the sizing assumes (e.g. chunked
+                # prefill silently disabled after the sharding validation) —
+                # deferring would retry the same queue head forever, a
+                # silent scheduling livelock. Fail loud instead.
+                raise RuntimeError(
+                    "request cannot fit the sharded assembly scratch even in "
+                    f"an empty batch (prefix_len={prefix_len}, extend_len="
+                    f"{extend_len}, max_prefix_tokens="
+                    f"{self.kv_shard_scratch_spec.max_prefix_tokens}, "
+                    f"chunk_tokens={self.kv_shard_scratch_spec.chunk_tokens}); "
+                    "KV sharding requires chunked prefill sized within the "
+                    "assembly scratch"
+                )
+            return False
+        self.kv_shard_block_bound_pages = block
+        self.kv_shard_chunk_pages = chunk
+        return True
+
     def add_dllm_staging_req(self, req: Req):
         assert self.dllm_config is not None
         _rem_tokens = self._get_dllm_remain_tokens()
@@ -987,6 +1067,21 @@ class PrefillAdder:
                 if self.is_hybrid_swa:
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+            if self.kv_shard_granule:
+                # Logical-page KV sharding: mid-request chunk boundaries land
+                # on the physical page so the next chunk's prefix stays
+                # page-aligned (an off-page boundary would straddle one page
+                # across the prefix/chunk scratch regions and break the
+                # stride-ps wire sampling). Floor the ABSOLUTE boundary so
+                # alignment holds regardless of where the prefix hit landed.
+                # When flooring would leave no budget, fall back to
+                # rem_chunk_tokens like the <= 0 case above — alignment then
+                # self-heals on the next chunk.
+                prefix_len = len(req.prefix_indices)
+                floored = (
+                    prefix_len + _rem_tokens
+                ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
+                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1004,6 +1099,16 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        # The continuing chunk is admitted first and a single request always
+        # fits the scratch by construction (regions sized for one
+        # full-context prefix + one max chunk). NOT inside an assert: the
+        # call carries the batch's reservation accounting and must survive
+        # python -O.
+        reserved = self._kv_shard_reserve_scratch(
+            prefix_len=len(req.prefix_indices), extend_len=new_len
+        )
+        if not reserved:
+            raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1042,7 +1147,9 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        paged_input = self.ceil_paged_tokens(cand_extend_input_len)
+        paged_input = (
+            self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
+        )
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
@@ -1093,9 +1200,7 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                cand_extend_input_len
-            )
+            cur_rem_tokens = self.cur_rem_tokens - paged_input
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
                 # tokens_left gives a reservative calculation as the last token is not stored
@@ -1137,6 +1242,11 @@ class PrefillAdder:
                 return tile_stop
 
             # Non-chunked prefill — the whole sequence is committed this iter.
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=len(req.prefix_indices),
+                extend_len=cand_extend_input_len,
+            ):
+                return AddReqResult.OTHER
             req.set_extend_range(
                 len(req.prefix_indices), len(req.full_untruncated_fill_ids)
             )
@@ -1157,6 +1267,12 @@ class PrefillAdder:
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
+
+            # Keep this after the non-mutating tile gate: reserving shard
+            # scratch updates this pass's accounting and must only happen for
+            # a request that will actually be admitted.
+            if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
+                return AddReqResult.OTHER
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1180,7 +1296,7 @@ class PrefillAdder:
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
-        if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
+        if self.dsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
@@ -1199,7 +1315,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1334,6 +1450,10 @@ class PrefillAdder:
                     return tile_stop
 
                 # Non-chunked prefill — the whole sequence is committed this iter.
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=len(req.prefix_indices), extend_len=input_tokens
+                ):
+                    return AddReqResult.OTHER
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -1372,6 +1492,14 @@ class PrefillAdder:
 
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
+                if self.kv_shard_granule:
+                    # Floor the absolute boundary to the sharding granule so
+                    # later chunks' prefixes stay aligned. Redundant while the
+                    # granule equals self.page_size, and load-bearing if it
+                    # ever widens.
+                    now_input_len = (
+                        now_input_len // self.kv_shard_granule * self.kv_shard_granule
+                    )
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
@@ -1381,6 +1509,14 @@ class PrefillAdder:
                     tile_stop := self._check_prefill_tile_budget(trunc_len)
                 ) is not None:
                     return tile_stop
+
+                # Keep this after the non-mutating tile gate: reserving shard
+                # scratch updates this pass's accounting and must only happen
+                # for a request that will actually be admitted.
+                if not self._kv_shard_reserve_scratch(
+                    prefix_len=len(req.prefix_indices), extend_len=trunc_len
+                ):
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.set_extend_range(

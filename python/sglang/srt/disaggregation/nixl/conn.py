@@ -1154,9 +1154,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_info = self.decode_kv_args_table[req.agent_name]
                     decode_tp_size = dst_info.decode_tp_size
 
+                    notif = (
+                        f"{req.room}_kv_{kv_chunk.chunk_id}"
+                        f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
+                    )
+
                     # Skip KV RDMA transfer when there are no pages to send
-                    # (e.g., decode-side radix cache matched the entire prefix).
-                    # Aux data is still sent below when is_last_chunk=True.
+                    # (decode-side radix cache matched the entire prefix, this
+                    # rank owns no page of the chunk under KV cache sharding, or
+                    # this rank holds no attention KV at all). The chunk id is
+                    # still accounted for below, and aux data is still sent when
+                    # is_last_chunk=True.
                     if (
                         len(kv_chunk.prefill_kv_indices) > 0
                         and self.kv_args.kv_data_ptrs
@@ -1184,11 +1192,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 )
 
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
-
-                        notif = (
-                            f"{req.room}_kv_{kv_chunk.chunk_id}"
-                            f"_{int(kv_chunk.is_last_chunk)}_{self.transfer_source_rank}"
-                        )
 
                         # Decide which kv send path to use:
                         #   1. Staging (heterogeneous TP, both sides have
@@ -1299,6 +1302,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_xfer_handle is not None:
                             handles.append(kv_xfer_handle)
+                    elif not kv_chunk.is_last_chunk:
+                        # Zero pages for this rank on a non-final chunk: deliver
+                        # the chunk notif standalone. chunk_id advances whenever
+                        # the request as a whole has pages to send, so a rank
+                        # that happens to own none of this chunk's pages (KV
+                        # cache sharding assigns them round-robin) still has to
+                        # claim the id -- the receiver requires every id in
+                        # [0, expected) from every source rank, and a silently
+                        # skipped id hangs it until the transfer timeout. The
+                        # final chunk instead reports its count through the aux
+                        # "nokv" marker below.
+                        self.agent.send_notif(req.agent_name, notif.encode("ascii"))
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1322,9 +1337,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
                         if kv_chunk.prefill_aux_index is None:
                             raise RuntimeError("Missing aux index for last chunk")
-                        # A no-KV notification still identifies its PP source.
-                        # Empty non-final chunks do not consume chunk IDs, so a
-                        # final no-KV chunk_id equals the prior KV chunk count.
+                        # A no-KV notification still identifies its PP source and
+                        # reports chunk_id as the expected KV-chunk count: the
+                        # final chunk carried nothing, and every earlier id was
+                        # claimed either by its RDMA transfer or by the
+                        # standalone notif above.
                         aux_notif = f"{req.room}_aux"
                         if (
                             len(kv_chunk.prefill_kv_indices) == 0

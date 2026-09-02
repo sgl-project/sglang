@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -275,6 +276,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -416,6 +418,11 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    # Factor by which KV sharding widens the allocator's index space over one
+    # rank's physical pool. Resolved in init_memory_pool_and_cache; the class
+    # default keeps readers that run before the pool exists at stock 1x units.
+    kv_shard_widening: int = 1
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -589,6 +596,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.kv_shard_widening = page_interleave_shard_size(
+            self.token_to_kv_pool_allocator
+        )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -1605,6 +1615,7 @@ class Scheduler(
         """Initialize deterministic inference configuration for different attention backends."""
         if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
+            self._apply_kv_shard_truncation_align()
             return
 
         backend_sizes = {
@@ -1618,6 +1629,21 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        self._apply_kv_shard_truncation_align()
+
+    def _apply_kv_shard_truncation_align(self):
+        # Logical-page KV sharding: every chunk boundary must land on a
+        # physical-page boundary (the allocator's working quantum) so no
+        # page straddles the prefix/chunk scratch regions and the stride-ps
+        # wire sampling stays exact. Compose with the deterministic-inference
+        # value via lcm when both are set.
+        if self.kv_shard_widening <= 1:
+            return
+        granule = self.token_to_kv_pool_allocator.page_size
+        if self.truncation_align_size is None:
+            self.truncation_align_size = granule
+        else:
+            self.truncation_align_size = math.lcm(self.truncation_align_size, granule)
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -2231,8 +2257,12 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
+            # DCP and logical-page KV sharding widen the allocator's index
+            # space; the observer's total must be in the same (logical) units
+            # as allocator.available_size() and the radix counters.
             max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            * get_parallel().attn_dcp_size
+            * self.kv_shard_widening,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2245,7 +2275,7 @@ class Scheduler(
             page_size=self.page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2301,7 +2331,9 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # KV sharding widens the allocator's index space, so the capacity
+            # reported to the router is widened too. DCP is deliberately not.
+            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2396,19 +2428,23 @@ class Scheduler(
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
         # Keep this bound consistent with PrefillAdder's admission budget:
-        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
-        # smaller than max_total_num_tokens. Otherwise a request can be accepted
-        # into the waiting queue but can never be scheduled, blocking the queue
-        # and eventually making health checks fail.
+        # ceil_page(input_len) + max_new_tokens + per-request page overhead must
+        # be strictly smaller than max_total_num_tokens. Otherwise a request can
+        # be accepted into the waiting queue but can never be scheduled, blocking
+        # the queue and eventually making health checks fail. PrefillAdder charges
+        # one page per shard, and measures the budget with
+        # allocator.available_size(), so widen both capacity and overhead here.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
                 self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
+                self.max_total_num_tokens
+                * get_parallel().attn_dcp_size
+                * self.kv_shard_widening
                 - paged_input_len
-                - self.page_size
+                - self.page_size * self.kv_shard_widening
                 - 1,
             ),
         )

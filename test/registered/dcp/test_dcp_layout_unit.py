@@ -408,6 +408,8 @@ class TestGetDcpLens(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
+                kv_shard_size=1,
+                kv_shard_spec=None,
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.

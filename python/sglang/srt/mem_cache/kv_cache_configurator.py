@@ -186,7 +186,9 @@ def _pp_local_per_request_bytes(
 
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.mem_cache.page_interleave import PageShardSpec
     from sglang.srt.mem_cache.unified_memory_pool import (
         UnifiedKVPool,
         UnifiedPoolBundle,
@@ -264,12 +266,17 @@ class KVCacheConfigurator:
     kv_cache_dtype_str: Optional[str] = None
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
+    kv_shard_rank: Optional[int] = field(init=False)
+    kv_shard_size: int = field(init=False)
+    kv_shard_spec: Optional[PageShardSpec] = field(init=False)
+    kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        self._resolve_kv_shard()
         self.is_hybrid_swa_mtp_draft = (
             self.is_draft_worker
             and self.draft_model_idx is not None
@@ -279,6 +286,40 @@ class KVCacheConfigurator:
         )
         self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
             self.draft_model_idx in self.model_config.swa_attention_layer_ids
+        )
+
+    def _resolve_kv_shard(self) -> None:
+        """Resolve the logical-page KV sharding identity: ``(rank, size)`` of
+        the shard group, or ``(None, 1)`` when sharding is off. Consumed by the
+        pool builders and by the widened allocator branch."""
+        from sglang.srt.mem_cache.page_interleave import get_kv_shard_group_info
+
+        self.kv_shard_rank, self.kv_shard_size = get_kv_shard_group_info(self)
+        self.kv_shard_spec = None
+        self.kv_shard_group = None
+        if self.kv_shard_rank is None:
+            return
+
+        from sglang.srt.mem_cache.page_interleave import (
+            PageShardSpec,
+            get_kv_shard_group,
+        )
+        from sglang.srt.utils.common import ceil_align
+
+        granule = self.kv_shard_size * self.page_size
+        self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
+        self.kv_shard_spec = PageShardSpec(
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+            page_size=self.page_size,
+            # Under rotated owner-classed allocation a K-page prefix gathers as
+            # exactly N * ceil(K / N) pages, which is bounded by
+            # ceil_align(context_len, granule). The chunk region is sized
+            # per-page because chunk boundaries are page-size floored.
+            max_prefix_tokens=ceil_align(self.model_config.context_len, granule),
+            chunk_tokens=ceil_align(
+                get_schedule().chunked_prefill_size, self.page_size
+            ),
         )
 
     def _build_fp4_quant_method(self, *, num_layers: int):
@@ -571,6 +612,17 @@ class KVCacheConfigurator:
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
+
+        if self.kv_shard_rank is not None:
+            from sglang.srt.mem_cache.page_interleave_pool import (
+                PageInterleaveKVPoolMixin,
+            )
+
+            if not isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin):
+                raise ValueError(
+                    "--enable-kv-cache-sharding does not support this model "
+                    f"family (pool {type(token_to_kv_pool).__name__})."
+                )
 
         if draft_virtual_id_space is not None:
             assert token_to_kv_pool.size >= draft_virtual_id_space, (
@@ -1627,7 +1679,17 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MLATokenToKVPool(
+        mla_pool_cls = MLATokenToKVPool
+        mla_pool_kwargs = {}
+        if self.kv_shard_rank is not None:
+            from sglang.srt.mem_cache.page_interleave_pool import (
+                PageInterleaveMLATokenToKVPool,
+            )
+
+            mla_pool_cls = PageInterleaveMLATokenToKVPool
+            mla_pool_kwargs["shard_spec"] = self.kv_shard_spec
+            mla_pool_kwargs["shard_group"] = self.kv_shard_group
+        token_to_kv_pool = mla_pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
@@ -1638,6 +1700,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **mla_pool_kwargs,
         )
         return token_to_kv_pool
 
@@ -1828,6 +1891,24 @@ class KVCacheConfigurator:
             pool_kwargs["quant_method"] = quant_method
         else:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
+        if self.kv_shard_rank is not None:
+            from sglang.srt.mem_cache.page_interleave_pool import (
+                PageInterleaveMHATokenToKVPool,
+            )
+
+            # The striped pool subclasses the plain per-layer MHA pool; the
+            # mxfp8 / NoOp / page-major variants have incompatible buffer
+            # layouts, and a quantized KV cache has no striped store path.
+            assert pool_cls is MHATokenToKVPool, (
+                "--enable-kv-cache-sharding is incompatible with "
+                f"the {pool_cls.__name__} pool"
+            )
+            assert (
+                quant_method is None
+            ), "--enable-kv-cache-sharding is incompatible with a quantized KV cache"
+            pool_cls = PageInterleaveMHATokenToKVPool
+            pool_kwargs["shard_spec"] = self.kv_shard_spec
+            pool_kwargs["shard_group"] = self.kv_shard_group
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1943,6 +2024,23 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        )
+                    elif self.kv_shard_size > 1:
+                        # Logical-page sharding: index space widened xN over
+                        # the stock 1x pool; the allocator page stays physical.
+                        from sglang.srt.mem_cache.allocator.page_interleave import (
+                            PageInterleavePoolAllocator,
+                        )
+
+                        token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+                            sizes.max_total_num_tokens,
+                            physical_page_size=self.page_size,
+                            shard_size=self.kv_shard_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                            shard_spec=self.kv_shard_spec,
                         )
                     elif (
                         get_schedule().page_size == 1 and not get_parallel().dcp_enabled

@@ -63,6 +63,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -165,8 +166,13 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
         self.scheduler = scheduler
+        # Capacity bound in the allocator's (logical) token units — widened
+        # by the shard-group size under logical-page KV sharding.
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
+            * page_interleave_shard_size(
+                self.scheduler.tp_worker.model_runner.token_to_kv_pool_allocator
+            )
         )
         self.transfer_backend = transfer_backend
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
@@ -379,6 +385,21 @@ class PrefillBootstrapQueue:
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+        if (
+            get_parallel().enable_kv_cache_sharding
+            and self.kv_manager.kv_shard_size > 1
+        ):
+            # Logical-page KV sharding: chunk starts must stay page-aligned —
+            # the sender samples one wire entry per physical page (stride
+            # ps), so an off-page start would misalign every sample.
+            # Ownership itself is value-derived (owner = logical page % N in
+            # filter_kv_indices_for_shard_rank), independent of where send
+            # position 0 sits.
+            physical_page_size = self.token_to_kv_pool.page_size
+            assert decode_prefix_len % physical_page_size == 0, (
+                f"decode-cached prefix ({decode_prefix_len}) must be "
+                f"page-aligned under KV sharding"
+            )
         req.pending_bootstrap = False
         return True
 
@@ -628,6 +649,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
 
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
@@ -680,6 +703,8 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -1145,9 +1170,9 @@ class SchedulerDisaggregationPrefillMixin:
         if cached_end <= req.start_send_idx:
             return
         if cached_end % self.token_to_kv_pool_allocator.page_size != 0:
-            # DCP radix hits can end on a logical cache-page boundary that is
-            # not a complete physical DCP page. The regular final send covers
-            # the full range; only skip this optional early-send optimization.
+            # Under DCP the allocator page is wider than the kernel page and
+            # a radix hit may end inside one. The regular final send covers the
+            # full range; only this optional early send is skipped.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
@@ -1330,6 +1355,10 @@ class SchedulerDisaggregationPrefillMixin:
                     kv_indices
                 )
             )
+            # Under logical-page KV sharding these remain logical page ids:
+            # PageInterleavePoolAllocator intentionally inherits the identity
+            # transfer translation. The sender derives ownership from each id
+            # and emits the owning rank's local page id.
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(

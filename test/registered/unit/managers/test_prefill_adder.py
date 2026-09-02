@@ -451,6 +451,39 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    @patch(
+        "sglang.srt.mem_cache.allocator.page_interleave.page_interleave_shard_size",
+        return_value=4,
+    )
+    def test_ignore_eos_reserves_all_shard_class_pages(self, _shard_size):
+        """Disabled-radix admission must charge one page per shard class."""
+        self.mock_tree_cache.disable = True
+        self.mock_token_allocator.page_size = 16
+        self.mock_token_allocator.shard_spec = SimpleNamespace(
+            max_prefix_tokens=1024, chunk_tokens=1024
+        )
+        self.mock_token_allocator.available_size.return_value = 64
+        adder = self.create_adder(self.create_running_batch(), page_size=16)
+
+        req = self.create_mock_req("ignore_eos", priority=0, max_new_tokens=1)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(16))
+        req.full_untruncated_fill_ids = list(range(16))
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        req.set_extend_range.assert_not_called()
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

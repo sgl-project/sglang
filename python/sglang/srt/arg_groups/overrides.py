@@ -1752,6 +1752,12 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
     cfg = resolving_view(server_args)
+    # Logical-page sharding always runs prefill eagerly. This predicate runs
+    # before the sharding hook disables prefill capture, so gate on the feature
+    # itself to retain eager activation headroom in the memory heuristic.
+    if cfg.enable_kv_cache_sharding:
+        return False
+
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False

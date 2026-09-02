@@ -293,6 +293,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Handle context parallelism.
     handle_context_parallelism(server_args)
 
+    # Validate logical-page KV cache sharding after its page size, attention
+    # backend, memory budget, and shard topology have all resolved.
+    from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+
+    handle_kv_cache_sharding(server_args, gpu_mem)
+
     # Handle MoE configurations.
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
@@ -362,6 +368,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
     handle_model_capability_adjustments(server_args)
+
+    # Capability adjustments can late-force a different attention backend or
+    # disable chunked prefill. Re-run the idempotent sharding gate over the
+    # final resolving view.
+    handle_kv_cache_sharding(server_args, gpu_mem)
 
     # Validate after all batch-size declarations are visible.
     validate_deepep_v2_speculative_draft(server_args)

@@ -18,6 +18,10 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -204,6 +208,12 @@ class FlashAttentionBackend(AttentionBackend):
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
             and model_runner.token_to_kv_pool.swa_layer_nums > 0
         )
+
+        self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        # begin_shard_extend builds the owner-major gather plan from host-side
+        # prefix/final lengths. Normal FA3 metadata is device-only, so opt the
+        # sharded variant back into FutureMap's CPU mirror publication.
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
 
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -1123,6 +1133,23 @@ class FlashAttentionBackend(AttentionBackend):
                         forward_batch.out_cache_loc
                     )
                 )
+
+        # Logical-page KV sharding: capture the batch's gather plan and swap the
+        # page table to scratch rows. During a sharded extend, attention reads
+        # the assembled [prefix | chunk] scratch, never the striped pool rows;
+        # the plan capture also kicks the first layer's prefix gather.
+        #
+        # Runs after KVIndexTranslator and before the `// page_size` reduction.
+        # Unified and page-interleaved pools are alternatives, so at most one
+        # translation fires.
+        if self._kv_shard_pool is not None and prepare_kv_shard_forward(
+            self._kv_shard_pool,
+            self.req_to_token,
+            forward_batch,
+        ):
+            metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                metadata.page_table
+            ).to(torch.int32)
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1 and not _unified_read:

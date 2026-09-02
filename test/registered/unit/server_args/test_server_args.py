@@ -31,6 +31,10 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
+from sglang.srt.arg_groups.kv_shard_hook import (
+    handle_kv_cache_sharding,
+    validate_kv_shard_attention_backend,
+)
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
@@ -41,7 +45,9 @@ from sglang.srt.arg_groups.moe_hook import (
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
+    declare_resolution,
     max_speculative_num_draft_tokens,
+    post_capture_kv_sizing_planned,
     resolution_result,
 )
 from sglang.srt.arg_groups.parallel_hook import (
@@ -64,6 +70,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_two_batch_overlap,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -2896,6 +2903,198 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         check_two_batch_overlap(args)
+
+
+class TestKvCacheShardingCompatibility(CustomTestCase):
+    def _args(self, **overrides):
+        model_config = overrides.pop("model_config", None)
+        args = ServerArgs(
+            model_path="dummy",
+            enable_kv_cache_sharding=True,
+            disaggregation_mode="prefill",
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        args._model_config = model_config or SimpleNamespace(
+            is_encoder_decoder=False,
+            attention_chunk_size=None,
+            attention_arch=AttentionArch.MHA,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        return args
+
+    def _rounding_args(self, *, raw_mem_fraction, resolved_mem_fraction):
+        args = self._args(
+            tp_size=2,
+            page_size=64,
+            chunked_prefill_size=2050,
+            attention_backend="fa3",
+            disaggregation_transfer_backend="mooncake",
+            mem_fraction_static=resolved_mem_fraction,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        args._model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            attention_chunk_size=None,
+            attention_arch=AttentionArch.MLA,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        args._raw_input = {"mem_fraction_static": raw_mem_fraction}
+        args._resolved_overrides = [
+            (
+                "_handle_gpu_memory_settings",
+                {"mem_fraction_static": resolved_mem_fraction},
+            )
+        ]
+        return args
+
+    def test_encoder_decoder_is_rejected_before_backend_setup(self):
+        args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
+
+        with self.assertRaisesRegex(ValueError, "does not support encoder-decoder"):
+            handle_kv_cache_sharding(args)
+
+    def test_trtllm_mla_accepts_plain_tp_with_chunked_prefix_cache(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.attention_backend = "trtllm_mla"
+
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE, "get", return_value=False
+            ),
+            patch.object(envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False),
+        ):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2176)
+
+    def test_trtllm_mla_rejects_unsupported_shard_topologies(self):
+        cases = (
+            (False, 1, False, "requires an MLA model"),
+            (True, 2, False, "only supports plain-TP MLA"),
+            (True, 1, True, "requires chunked prefix caching"),
+        )
+        for is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
+            with self.subTest(error=error):
+                args = self._args()
+                args.attention_backend = "trtllm_mla"
+                args._model_config.attention_arch = (
+                    AttentionArch.MLA if is_mla else AttentionArch.MHA
+                )
+                view = SimpleNamespace(
+                    attn_cp_size=attn_cp_size,
+                    disable_chunked_prefix_cache=disable_chunked_prefix_cache,
+                )
+
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_kv_shard_attention_backend(args, view)
+
+    def test_hisparse_allocator_is_rejected(self):
+        args = self._args(enable_hisparse=True)
+
+        with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
+            handle_kv_cache_sharding(args)
+
+    def test_post_capture_kv_sizing_keeps_eager_prefill_headroom(self):
+        prefill_graph = SimpleNamespace(backend=Backend.BREAKABLE, bs=[4096])
+        args = ServerArgs(
+            model_path="dummy",
+            enable_kv_cache_sharding=True,
+            device="cuda",
+            dcp_size=1,
+            kv_cache_dtype="auto",
+            prefill_only_disable_kv_cache=False,
+            enable_memory_saver=False,
+            disaggregation_mode="prefill",
+            cuda_graph_config=CudaGraphConfig(prefill=prefill_graph),
+            chunked_prefill_size=4096,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.overrides.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.max_prefill_buffer_tokens",
+                return_value=4096,
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+                ),
+            ),
+            patch.object(
+                envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                "get",
+                return_value=None,
+            ),
+        ):
+            self.assertFalse(post_capture_kv_sizing_planned(args))
+            args.enable_kv_cache_sharding = False
+            self.assertTrue(post_capture_kv_sizing_planned(args))
+
+    def test_chunk_rounding_expands_automatic_activation_headroom(self):
+        args = self._rounding_args(raw_mem_fraction=None, resolved_mem_fraction=0.9)
+        gpu_mem = 80 * 1024
+
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE, "get", return_value=False
+            ),
+            patch.object(envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False),
+        ):
+            handle_kv_cache_sharding(args, gpu_mem)
+
+        rounded = 2176  # ceil(2050 / (tp_size * page_size)) * 128
+        expected_fraction = 0.9 - 1.5 * (rounded - 2050) / gpu_mem
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), rounded)
+        self.assertAlmostEqual(
+            resolution_result(args, "mem_fraction_static"), expected_fraction
+        )
+
+    def test_chunk_rounding_preserves_explicit_mem_fraction(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE, "get", return_value=False
+            ),
+            patch.object(envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False),
+        ):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2176)
+        self.assertEqual(resolution_result(args, "mem_fraction_static"), 0.8)
+
+    def test_final_pass_rejects_late_model_capability_overrides(self):
+        cases = (
+            ({"attention_backend": "triton"}, "requires the fa3"),
+            ({"chunked_prefill_size": -1}, "requires chunked prefill"),
+        )
+        with (
+            patch.object(
+                envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE, "get", return_value=False
+            ),
+            patch.object(envs.SGLANG_DISAGG_STAGING_BUFFER, "get", return_value=False),
+        ):
+            for declarations, error in cases:
+                with self.subTest(declarations=declarations):
+                    args = self._rounding_args(
+                        raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                    )
+                    handle_kv_cache_sharding(args, 80 * 1024)
+                    declare_resolution(args, "late_model_capability", **declarations)
+
+                    with self.assertRaisesRegex(ValueError, error):
+                        handle_kv_cache_sharding(args, 80 * 1024)
 
 
 class TestDcpKvEventContract(CustomTestCase):

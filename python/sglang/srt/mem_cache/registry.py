@@ -18,7 +18,12 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_serving,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -100,6 +105,17 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if get_parallel().enable_kv_cache_sharding:
+        # Logical-page KV sharding stores each cached chain's rotation base on
+        # legacy TreeNode objects. The unified tree became main's default after
+        # the feature branch diverged, but it does not carry that metadata (or
+        # the cross-rotation tail-decline contract) yet. Keep the feature on
+        # the implementation that enforces its owner-cyclic page invariant.
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        logger.info("Using legacy RadixCache for logical-page KV sharding.")
+        return RadixCache(params)
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead

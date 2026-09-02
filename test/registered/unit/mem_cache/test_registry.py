@@ -42,6 +42,7 @@ def _make_ctx(
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
     full_tokens_per_layer=None,
+    enable_kv_cache_sharding=False,
 ):
     # The factory reads the published bags for the cache-backend leaves, so the
     # fixture publishes them; the instance stays for the whole-object contract
@@ -52,6 +53,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
+        enable_kv_cache_sharding=enable_kv_cache_sharding,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -183,6 +185,20 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             ChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, ChunkCache.return_value)
 
+    def test_kv_sharding_keeps_chunk_cache_when_radix_is_disabled(self):
+        ctx = _make_ctx(
+            self,
+            effective_chunked_prefill_size=512,
+            disable_radix_cache=True,
+            enable_kv_cache_sharding=True,
+        )
+        with patch("sglang.srt.mem_cache.chunk_cache.ChunkCache") as ChunkCache:
+            ChunkCache.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+
+        ChunkCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, ChunkCache.return_value)
+
     def test_swa_chunk_cache_when_chunked_prefill_disable_and_hybrid_swa(self):
         ctx = _make_ctx(
             self,
@@ -235,6 +251,15 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
                 params=ctx.params, server_args=ctx.server_args
             )
             self.assertIs(result, fake_module.RadixCacheCpp.return_value)
+
+    def test_legacy_radix_cache_for_kv_cache_sharding(self):
+        ctx = _make_ctx(self, enable_kv_cache_sharding=True)
+        with patch("sglang.srt.mem_cache.radix_cache.RadixCache") as RadixCache:
+            RadixCache.return_value = MagicMock()
+            result = default_radix_cache_factory(ctx)
+
+        RadixCache.assert_called_once_with(ctx.params)
+        self.assertIs(result, RadixCache.return_value)
 
     def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(

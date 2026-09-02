@@ -1071,6 +1071,15 @@ class ServerArgs:
         "Enable attention tensor-parallel weight slicing during decode under context parallel (cp_size>1). Slices the replicated attention linears to the local CP partition, eliminating redundant decode GEMMs.",
         NS("parallel"),
     ] = False
+    enable_kv_cache_sharding: A[
+        bool,
+        "Shard at-rest KV cache storage at page granularity across the group "
+        "that currently replicates it (attention-CP ranks for GQA models "
+        "under prefill CP; attention-TP ranks for MLA models), multiplying "
+        "the group's unique KV capacity. Prefill workers of PD "
+        "disaggregation only.",
+        NS("parallel"),
+    ] = False
     # DP attention
     enable_dp_attention: A[
         bool,
