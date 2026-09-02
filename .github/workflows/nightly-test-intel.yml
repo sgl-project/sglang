@@ -297,12 +297,87 @@ jobs:
             docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
           fi
 
+  nightly-xpu-8-gpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: intel-bmg-nightly
+    env:
+      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+    steps:
+      - name: Reset workspace ownership
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Start CI container (pull intel/sglang-dev:latest)
+        run: |
+          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          bash scripts/ci/xpu/xpu_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: HF login + install run_suite extras
+        timeout-minutes: 10
+        run: |
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "lm-eval==0.4.9"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          # Diffusion extras
+          # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          # HF /whoami-v2 is aggressively rate-limited and the three matrix
+          # jobs (1/2/4/8-GPU) all hit it at the same second under a scheduled
+          # run. Retry with linear backoff + jitter to desynchronize them.
+          docker exec ci_sglang_xpu /bin/bash -c '
+            for i in 1 2 3 4 5; do
+              /opt/venv/bin/hf auth login --token "${HF_TOKEN}" && exit 0
+              sleep_secs=$((i * 15 + RANDOM % 15))
+              echo "hf auth login failed (attempt $i), retrying in ${sleep_secs}s..."
+              sleep "${sleep_secs}"
+            done
+            exit 1
+          '
+
+      - name: Nightly Test (8-GPU XPU)
+        timeout-minutes: 480
+        run: |
+          touch github_summary.md
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
+            python3 run_suite.py --hw xpu --suite nightly-xpu-8-gpu --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md)" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/w" busybox:latest \
+            chown -R "$(id -u):$(id -g)" /w || true
+          rm -rf test/result.jsonl test/results test/.pytest_cache .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} + || true
+          find . -type f -name "*.pyc" -delete || true
+          docker rm -f ci_sglang_xpu || true
+          if [[ -n "${CI_SGLANG_XPU_IMAGE:-}" ]]; then
+            docker rmi -f "${CI_SGLANG_XPU_IMAGE}" || true
+          fi
+
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'workflow_dispatch')
     needs:
       - nightly-xpu-1-gpu
       - nightly-xpu-2-gpu
       - nightly-xpu-4-gpu
+      - nightly-xpu-8-gpu
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ def _jit_causal_conv3d_cat_pad_module(dtype: torch.dtype) -> Module:
     return load_jit(
         "diffusion_causal_conv3d_cat_pad",
         *args,
-        cuda_files=["diffusion/causal_conv3d_cat_pad.cuh"],
+        cuda_files=[_cuda_source("diffusion/causal_conv3d_cat_pad.cuh")],
         cuda_wrappers=[
             (
                 "causal_conv3d_cat_pad",

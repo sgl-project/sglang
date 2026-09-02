@@ -198,7 +198,6 @@ def _load_explicit_config(
 class UpsamplerLoader(PlainStateDictComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
-    supports_component_weight_override = True
 
     def load_customized(
         self,

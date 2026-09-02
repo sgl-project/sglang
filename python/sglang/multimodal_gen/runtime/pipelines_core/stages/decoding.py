@@ -10,6 +10,9 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -333,7 +336,10 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            with use_vae_fast_path(vae, batch.sampling_params.quality == "high"):
+            with use_vae_fast_path(
+                vae,
+                quality_allows_kernel_fusions(batch.sampling_params.quality),
+            ):
                 frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
                 # decode trajectory latents if needed
