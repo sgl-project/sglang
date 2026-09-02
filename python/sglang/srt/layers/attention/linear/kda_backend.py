@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -450,7 +450,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
-        if replayssm_d is None and deferred_f_b:
+        if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
