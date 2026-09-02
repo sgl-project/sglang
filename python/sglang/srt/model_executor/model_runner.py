@@ -1497,7 +1497,7 @@ class ModelRunner:
         Extension point for per-forward SP gating; the default behavior shards iff
         it holds a gathered buffer.
         """
-        return require_gathered_buffer(self.server_args)
+        return require_gathered_buffer()
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.

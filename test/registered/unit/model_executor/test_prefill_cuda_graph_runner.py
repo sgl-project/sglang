@@ -196,6 +196,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.buffer_registry = _FakeBatchRegistry()
+        runner.model_runner = SimpleNamespace(attn_tp_sequence_sharded=lambda _: False)
         runner.enable_cp_v2_bcg_capture = False
         runner._is_full_backend = False
         runner.backend = SimpleNamespace()
