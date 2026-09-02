@@ -471,6 +471,15 @@ class Glm4MoeDetector(BaseFormatDetector):
                 # Could be start of tool call, keep buffering
                 return StreamingParseResult(normal_text="", calls=[])
 
+        # Extract any text before the first bot_token and return it as normal_text
+        normal_text = ""
+        first_bot_token_idx = current_text.find(self.bot_token)
+        if first_bot_token_idx > 0:
+            normal_text = current_text[:first_bot_token_idx]
+            current_text = current_text[first_bot_token_idx:]
+            # Update buffer to only include from the bot token onwards
+            self._buffer = current_text
+
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
@@ -487,7 +496,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                 if func_name_raw is None or not func_name_raw.strip():
                     # If we only have the start token without a function name,
                     # continue buffering until we get more content
-                    return StreamingParseResult(normal_text="", calls=[])
+                    return StreamingParseResult(normal_text=normal_text, calls=[])
 
                 func_name = func_name_raw.strip()
                 func_args_raw = func_args_raw.strip() if func_args_raw else ""
@@ -604,7 +613,9 @@ class Glm4MoeDetector(BaseFormatDetector):
                         # Remove the completed tool call from buffer
                         self._buffer = current_text[partial_match.end(3) :]
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
@@ -612,11 +623,11 @@ class Glm4MoeDetector(BaseFormatDetector):
                         self._reset_streaming_state()
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def _parse_argument_pairs(
         self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
