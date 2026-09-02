@@ -268,22 +268,30 @@ def test_sensenova_u1_registry_does_not_route_lora_only_repositories(tmp_path):
     assert not is_registered_diffusion_model_path(str(lora_path))
 
 
-def test_sensenova_u1_known_adapter_only_repo_rejected_before_generic_resolution(
-    monkeypatch,
+@pytest.mark.parametrize("backend", ["auto", "sglang", "diffusers"])
+def test_sensenova_u1_known_adapter_only_repo_rejected_before_backend_resolution(
+    monkeypatch, backend
 ):
     def fail_model_index_download(_):
         raise AssertionError("adapter-only repo should not download model_index")
 
+    def fail_diffusers_resolution(**_kwargs):
+        raise AssertionError("adapter-only repo should not resolve diffusers info")
+
     monkeypatch.setattr(
         "sglang.multimodal_gen.registry.maybe_download_model_index",
         fail_model_index_download,
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.registry._get_diffusers_model_info",
+        fail_diffusers_resolution,
     )
     get_model_info.cache_clear()
 
     loras_repo = "sensenova/SenseNova-U1.5-8B-MoT-LoRAs"
 
     assert get_non_diffusers_pipeline_name(loras_repo) is None
-    assert get_model_info(loras_repo) is None
+    assert get_model_info(loras_repo, backend=backend) is None
     get_model_info.cache_clear()
 
 

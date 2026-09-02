@@ -685,6 +685,15 @@ def get_model_info(
     elif isinstance(backend, str):
         backend = Backend.from_string(backend)
 
+    if is_sensenova_u1_adapter_only_model(model_path):
+        logger.error(
+            "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
+            "model weights or config. Use the base checkpoint "
+            "'sensenova/SenseNova-U1.5-8B-MoT' with the adapter instead.",
+            model_path,
+        )
+        return None
+
     # Handle explicit diffusers backend
     if backend == Backend.DIFFUSERS:
         logger.info(
@@ -695,15 +704,6 @@ def get_model_info(
     # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
     _ensure_registry_initialized()
-
-    if is_sensenova_u1_adapter_only_model(model_path):
-        logger.error(
-            "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
-            "model weights or config. Use the base checkpoint "
-            "'sensenova/SenseNova-U1.5-8B-MoT' with the adapter instead.",
-            model_path,
-        )
-        return None
 
     # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
