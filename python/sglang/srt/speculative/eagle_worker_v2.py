@@ -139,21 +139,38 @@ _EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
 
 
 def _load_checkpoint_tensor(
-    model_path: str, revision, tensor_names: tuple
+    model_path: str, revision, tensor_names: tuple, load_config
 ) -> torch.Tensor:
     """Load one tensor from a checkpoint via the standard weight loader."""
-    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.load_config import LoadFormat
     from sglang.srt.model_loader.loader import DefaultModelLoader
     from sglang.srt.model_loader.weight_utils import (
         pt_weights_iterator,
         safetensors_weights_iterator,
     )
 
-    # Resolves hub ids into the local cache and picks the weight format, the
-    # same way the model itself was loaded.
-    _, weight_files, use_safetensors = DefaultModelLoader(
-        LoadConfig()
-    )._prepare_weights(model_path, revision, fall_back_to_pt=True)
+    # Streaming and cache-transport formats have no weight files this helper
+    # could reopen; the dummy format is already skipped by the caller.
+    reopenable = (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.FASTSAFETENSORS,
+        LoadFormat.MISTRAL,
+        LoadFormat.PT,
+        LoadFormat.NPCACHE,
+    )
+    if load_config.load_format not in reopenable:
+        raise ValueError(
+            "PP+spec draft embedding loading cannot re-open weights under "
+            f"load format {load_config.load_format!r}; use a disk-backed "
+            "load format or disable SGLANG_ENABLE_PP_SPEC"
+        )
+    # The target's own load config keeps --download-dir, ignore patterns and
+    # the selected format, so hub ids resolve into the same cache the model
+    # was loaded from instead of a fresh default-location download.
+    _, weight_files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
+        model_path, revision, fall_back_to_pt=True
+    )
     iterator = (
         safetensors_weights_iterator(weight_files)
         if use_safetensors
@@ -333,11 +350,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # collapses to ~1.
             embed = self.draft_runner.model.model.embed_tokens.weight
             if get_model().load_format != "dummy":
-                target_config = self.target_worker.model_runner.model_config
+                target_runner = self.target_worker.model_runner
                 loaded_embed = _load_checkpoint_tensor(
-                    model_path=target_config.model_path,
-                    revision=target_config.revision,
+                    model_path=target_runner.model_config.model_path,
+                    revision=target_runner.model_config.revision,
                     tensor_names=_EMBED_TENSOR_NAMES,
+                    load_config=target_runner.load_config,
                 )
                 embed.weight_loader(embed, loaded_embed)
             head = self.target_worker.model_runner.model.lm_head.weight
