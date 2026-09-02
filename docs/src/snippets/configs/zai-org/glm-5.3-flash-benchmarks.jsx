@@ -347,9 +347,9 @@ export const benchmarks = [
           max_concurrency: 1,
           num_prompts: 8,
         },
-        ttft_ms: 361.64,
-        tpot_ms: 4.38,
-        tokens_per_sec_per_gpu: 237.68,
+        ttft_ms: 345.66,
+        tpot_ms: 4.37,
+        tokens_per_sec_per_gpu: 239.19,
       },
       {
         workload: {
@@ -359,14 +359,14 @@ export const benchmarks = [
           max_concurrency: 16,
           num_prompts: 32,
         },
-        ttft_ms: 2985.08,
-        tpot_ms: 10.35,
-        tokens_per_sec_per_gpu: 1356.87,
+        ttft_ms: 3442.21,
+        tpot_ms: 10.24,
+        tokens_per_sec_per_gpu: 1323.44,
       },
     ],
     accuracy: { gsm8k_pct: 97.27 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by a teammate on the published image lmsysorg/sglang:glm-5.3-flash (sha256:aa9210e3…, tree fe236ea6c3), on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.00 at c1, 2.99 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 211.27 aggregate output tok/s at concurrency 1 (8 requests) and 1,206.11 at concurrency 16 (32 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers. The retokenized-token count in these runs is about a quarter of the generated tokens because reasoning_content is not retokenized (benign).",
+      "Full GSM8K (all 1,319 problems) on 8x H100 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27%. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by the Z.ai team on the published image lmsysorg/sglang:glm-5.3-flash (sha256:aa9210e3…, tree fe236ea6c3), on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.00 at c1, 2.98 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 212.61 aggregate output tok/s at concurrency 1 (8 requests) and 1,176.39 at concurrency 16 (32 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers. With HiCache L1+L2 the same protocol measured 1,206.11 at c16 (TTFT 2,985.08 ms, TPOT 10.35 ms). The retokenized-token count in these runs is about a quarter of the generated tokens because reasoning_content is not retokenized (benign).",
   },
   {
     match: { hw: "h100", strategy: "high-throughput" },
@@ -392,9 +392,36 @@ export const benchmarks = [
   {
     match: { hw: "b200", strategy: "low-latency" },
     sglang_version: "f040cc72e6",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 1,
+          num_prompts: 8,
+        },
+        ttft_ms: 352.45,
+        tpot_ms: 3.75,
+        tokens_per_sec_per_gpu: 274.8,
+      },
+      {
+        workload: {
+          dataset: "random",
+          isl: 8192,
+          osl: 1024,
+          max_concurrency: 16,
+          num_prompts: 32,
+        },
+        ttft_ms: 2456.16,
+        tpot_ms: 6.43,
+        tokens_per_sec_per_gpu: 2037.52,
+      },
+    ],
     accuracy: { gsm8k_pct: 97.27 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x B200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27% for the recommended selection; 97.12-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Accuracy only, no speed measurement.",
+      "Full GSM8K (all 1,319 problems) on 8x B200 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 97.27% for the recommended selection; 97.12-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by the Z.ai team on the published image lmsysorg/sglang:glm-5.3-flash (sha256:aa9210e3…, tree fe236ea6c3), on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.00 at c1, 2.98 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 244.27 aggregate output tok/s at concurrency 1 (8 requests) and 1,811.13 at concurrency 16 (32 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers. With HiCache L1+L2 the same protocol measured 258.05 at c1 (TTFT 245.25 ms) and 2,136.62 at c16 (TTFT 1,590.40 ms).",
   },
   {
     match: { hw: "b200", strategy: "high-throughput" },
@@ -416,9 +443,9 @@ export const benchmarks = [
           max_concurrency: 1,
           num_prompts: 8,
         },
-        ttft_ms: 235.38,
-        tpot_ms: 2.85,
-        tokens_per_sec_per_gpu: 365.9,
+        ttft_ms: 230.34,
+        tpot_ms: 3.37,
+        tokens_per_sec_per_gpu: 313.02,
       },
       {
         workload: {
@@ -426,16 +453,16 @@ export const benchmarks = [
           isl: 8192,
           osl: 1024,
           max_concurrency: 16,
-          num_prompts: 8,
+          num_prompts: 32,
         },
-        ttft_ms: 1687.94,
-        tpot_ms: 4.64,
-        tokens_per_sec_per_gpu: 1350.38,
+        ttft_ms: 1908.02,
+        tpot_ms: 5.83,
+        tokens_per_sec_per_gpu: 2338.81,
       },
     ],
     accuracy: { gsm8k_pct: 96.82 },
     notes:
-      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.82% for the recommended selection; 96.82-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by a teammate on the published image lmsysorg/sglang:glm-5.3-flash (sha256:aa9210e3…, tree fe236ea6c3), on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.89 at c1, 3.58 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 325.24 aggregate output tok/s at concurrency 1 (8 requests) and 1,200.34 at concurrency 16 (8 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers.",
+      "Full GSM8K (all 1,319 problems) on 8x B300 (TP8/EP8) with zai-org/GLM-5.3-Flash at f040cc72e6: 96.82% for the recommended selection; 96.82-97.27% across all 4 measured selections. Run with `sgl-eval run gsm8k --base-url http://localhost:30000/v1 --num-threads 32 --max-tokens 32768`; gsm8k's registered default leaves thinking off, so these are non-thinking numbers and are not directly comparable to the GB300 rows above. Speed was measured by the Z.ai team on the published image lmsysorg/sglang:glm-5.3-flash (sha256:aa9210e3…, tree fe236ea6c3), on the published Low Latency cell recipe with the BF16 KV + TileLang DSA pairing and SGLANG_SIMULATE_ACC_LEN=3 in the environment (accept 3.00 at c1, 2.98 at c16): random 8,192-input / 1,024-output requests (range ratio 1, sglang-oai backend) produced 278.24 aggregate output tok/s at concurrency 1 (8 requests) and 2,078.94 at concurrency 16 (32 requests) after two discarded warmups — simulated accept length makes these throughput-mechanism numbers. With HiCache L1+L2 the same protocol measured 278.01 at c1 (TTFT 214.12 ms) and 2,323.89 at c16 (TTFT 1,433.37 ms).",
   },
   {
     match: { hw: "b300", strategy: "high-throughput" },
