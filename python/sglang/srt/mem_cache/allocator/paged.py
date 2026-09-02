@@ -39,7 +39,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 def alloc_extend_naive(
