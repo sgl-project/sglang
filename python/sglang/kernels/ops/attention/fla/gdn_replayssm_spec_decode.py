@@ -949,9 +949,9 @@ def _advance_gdn_spec_cursors_kernel(
     cache_base_ptr,
     is_flush_ptr,
     num_accepted_ptr,
-    state_batch_indices_ptr,
+    replay_indices_ptr,
     n_rows,
-    stride_sbi: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
     stride_na: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
     MAX_SPEC_LEN: tl.constexpr,
@@ -963,7 +963,9 @@ def _advance_gdn_spec_cursors_kernel(
     offs = tl.arange(0, BLOCK)
     row_mask = offs < n_rows
     blk = tl.load(
-        state_batch_indices_ptr + offs * stride_sbi, mask=row_mask, other=NULL_BLOCK_ID
+        replay_indices_ptr + offs * stride_replay_indices,
+        mask=row_mask,
+        other=NULL_BLOCK_ID,
     ).to(tl.int64)
     valid = row_mask & (blk > NULL_BLOCK_ID)
 
@@ -1407,7 +1409,7 @@ def commit_gdn_replayssm_spec(
         num_accepted,
         replay_indices,
         n_rows,
-        stride_sbi=replay_indices.stride(0),
+        stride_replay_indices=replay_indices.stride(0),
         stride_na=num_accepted.stride(0),
         MAX_CACHE_LEN=max_cache_len,
         MAX_SPEC_LEN=max_spec_len,
