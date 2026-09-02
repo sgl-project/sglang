@@ -1,0 +1,359 @@
+# sgl-router (experimental) — PD disaggregation with transfer groups + Load Monitor.
+#
+# Topology: one model, two transfer groups (tg-a, tg-b). Each group has one
+# prefill engine and one decode engine behind its OWN Service. The
+# EndpointSlice controller copies Service labels onto the EndpointSlice, which
+# is where the router reads `sglang.ai/role` (prefill/decode classification)
+# and `sglang.ai/transfer-group` (pairing constraint). Prefill is chosen across
+# groups; the decode peer is always taken from the chosen prefill's group.
+#
+# Replace: IMAGE tags, model name/path, GPU counts, transfer backend / IB device.
+# Multi-node engines (TP across nodes) should use LeaderWorkerSet instead of
+# Deployment — only the Service labels matter to the router.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm
+# ─────────────────────────────── transfer group A ────────────────────────────
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-prefill-tg-a
+  namespace: llm
+  labels:                       # copied onto the EndpointSlice by k8s
+    app: sglang-qwen3
+    sglang.ai/role: prefill
+    sglang.ai/transfer-group: tg-a
+spec:
+  clusterIP: None               # headless: router talks to pod IPs directly
+  selector:
+    app: sglang-qwen3
+    sglang.ai/role: prefill
+    sglang.ai/transfer-group: tg-a
+  ports:
+    - name: http                # MUST be first: router uses ports[0] as the engine HTTP port
+      port: 30000
+      targetPort: 30000
+    - name: bootstrap
+      port: 8998
+      targetPort: 8998
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-prefill-tg-a
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-a }
+  template:
+    metadata:
+      labels: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-a }
+    spec:
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:latest
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=/models/Qwen3-32B
+            - --served-model-name=qwen3            # must match the router's --model-id
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp=2
+            - --disaggregation-mode=prefill
+            - --disaggregation-bootstrap-port=8998  # router reads it back from /server_info
+            # - --disaggregation-transfer-backend=mooncake
+            # - --disaggregation-ib-device=mlx5_0
+          ports:
+            - { name: http, containerPort: 30000 }
+            - { name: bootstrap, containerPort: 8998 }
+          readinessProbe:       # gates EndpointSlice readiness → router only sees ready engines
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            limits: { nvidia.com/gpu: 2 }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-weights }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-decode-tg-a
+  namespace: llm
+  labels:
+    app: sglang-qwen3
+    sglang.ai/role: decode
+    sglang.ai/transfer-group: tg-a
+spec:
+  clusterIP: None
+  selector:
+    app: sglang-qwen3
+    sglang.ai/role: decode
+    sglang.ai/transfer-group: tg-a
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-decode-tg-a
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-a }
+  template:
+    metadata:
+      labels: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-a }
+    spec:
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:latest
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=/models/Qwen3-32B
+            - --served-model-name=qwen3
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp=2
+            - --disaggregation-mode=decode
+            # - --disaggregation-transfer-backend=mooncake
+            # - --disaggregation-ib-device=mlx5_0
+          ports:
+            - { name: http, containerPort: 30000 }
+          readinessProbe:
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            limits: { nvidia.com/gpu: 2 }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-weights }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+# ─────────────────────────────── transfer group B ────────────────────────────
+# Identical to group A with `tg-b`. Add more groups the same way.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-prefill-tg-b
+  namespace: llm
+  labels: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-b }
+spec:
+  clusterIP: None
+  selector: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-b }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+    - { name: bootstrap, port: 8998, targetPort: 8998 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-prefill-tg-b
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-b }
+  template:
+    metadata:
+      labels: { app: sglang-qwen3, sglang.ai/role: prefill, sglang.ai/transfer-group: tg-b }
+    spec:
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:latest
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=/models/Qwen3-32B
+            - --served-model-name=qwen3
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp=2
+            - --disaggregation-mode=prefill
+            - --disaggregation-bootstrap-port=8998
+          ports:
+            - { name: http, containerPort: 30000 }
+            - { name: bootstrap, containerPort: 8998 }
+          readinessProbe:
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 5
+          resources:
+            limits: { nvidia.com/gpu: 2 }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-weights }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-decode-tg-b
+  namespace: llm
+  labels: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-b }
+spec:
+  clusterIP: None
+  selector: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-b }
+  ports:
+    - { name: http, port: 30000, targetPort: 30000 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-decode-tg-b
+  namespace: llm
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-b }
+  template:
+    metadata:
+      labels: { app: sglang-qwen3, sglang.ai/role: decode, sglang.ai/transfer-group: tg-b }
+    spec:
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:latest
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path=/models/Qwen3-32B
+            - --served-model-name=qwen3
+            - --host=0.0.0.0
+            - --port=30000
+            - --tp=2
+            - --disaggregation-mode=decode
+          ports:
+            - { name: http, containerPort: 30000 }
+          readinessProbe:
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 5
+          resources:
+            limits: { nvidia.com/gpu: 2 }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-weights }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 32Gi }
+# ─────────────────────────────────── router ──────────────────────────────────
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sgl-router
+  namespace: llm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sgl-router-discovery
+  namespace: llm
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sgl-router-discovery
+  namespace: llm
+subjects:
+  - kind: ServiceAccount
+    name: sgl-router
+    namespace: llm
+roleRef:
+  kind: Role
+  name: sgl-router-discovery
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sgl-router
+  namespace: llm
+  labels: { app: sgl-router }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: sgl-router }
+  template:
+    metadata:
+      labels: { app: sgl-router }
+    spec:
+      serviceAccountName: sgl-router
+      containers:
+        - name: router
+          image: <registry>/sgl-router:<tag>     # built from experimental/sgl-router
+          args:
+            - --host=0.0.0.0
+            - --port=30000
+            - --model-id=qwen3                  # == engines' --served-model-name
+            - --tokenizer-path=/models/Qwen3-32B
+            # discovery: PD mode via two label selectors + transfer group label
+            - --service-discovery
+            - --service-discovery-namespace=llm
+            - --prefill-selector
+            - app=sglang-qwen3
+            - sglang.ai/role=prefill
+            - --decode-selector
+            - app=sglang-qwen3
+            - sglang.ai/role=decode
+            - --transfer-group-label=sglang.ai/transfer-group
+            # routing: prefill by P2C, decode by least engine-reported load
+            - --policy=power_of_two
+            - --decode-policy=load_based
+            # load monitor (pull mode, GET /v1/loads)
+            - --load-monitor
+            - --load-monitor-interval-ms=1000
+            - --load-monitor-stale-after-ms=3000
+            # resilience / observability
+            - --cb-threshold=3
+            - --cb-cool-down-secs=30
+            - --request-timeout-secs=300
+            - --log-format=json
+          ports:
+            - { name: http, containerPort: 30000 }
+          readinessProbe:       # 503 until ≥1 complete transfer group is registered
+            httpGet: { path: /readyz, port: 30000 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 30000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }   # tokenizer only
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-weights }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sgl-router
+  namespace: llm
+spec:
+  selector: { app: sgl-router }
+  ports:
+    - { name: http, port: 80, targetPort: 30000 }

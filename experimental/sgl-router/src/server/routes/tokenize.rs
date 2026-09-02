@@ -120,6 +120,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                decode_policy: None,
                 sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -128,6 +129,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
+            load_monitor: crate::config::LoadMonitorConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();

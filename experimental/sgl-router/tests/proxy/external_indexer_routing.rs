@@ -83,6 +83,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: None,
+                transfer_group: None,
             })
             .unwrap();
     }

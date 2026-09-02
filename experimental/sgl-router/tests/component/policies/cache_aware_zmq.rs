@@ -42,6 +42,7 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(model.into())],
         bootstrap_port: None,
+        transfer_group: None,
     }))
 }
 
@@ -71,6 +72,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(
@@ -79,6 +81,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             },
         ),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -158,7 +161,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     // 8. Drive select until the event has been applied. The pipeline is
     //    asynchronous (publish → SUB recv → mpsc → pump → tree); a
     //    polling loop is less flaky than a fixed sleep.
-    let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
     let ctx = SelectionContext::new(&model_id, Some(&body));
 
     let start = std::time::Instant::now();

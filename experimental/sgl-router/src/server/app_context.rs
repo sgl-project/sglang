@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::load_monitor::LoadMonitor;
 
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::BlockSizeOracle;
@@ -32,6 +33,10 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
+    /// Pull-mode Load Monitor. `Some` only when `--load-monitor` is set;
+    /// the chat handler then gates candidates on report freshness and
+    /// load-aware policies score by engine-reported load.
+    pub load_monitor: Option<Arc<LoadMonitor>>,
     ready: AtomicBool,
 }
 
@@ -86,6 +91,7 @@ impl AppContext {
             metrics,
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            load_monitor: None,
             ready: AtomicBool::new(false),
         }
     }
@@ -115,6 +121,7 @@ impl AppContext {
                     policy: crate::config::PolicyKind::RoundRobin,
                     circuit_breaker: None,
                     cache_aware: None,
+                    decode_policy: None,
                     sticky: None,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -123,6 +130,7 @@ impl AppContext {
                     },
                 ),
                 proxy: crate::config::ProxyConfig::default(),
+                load_monitor: crate::config::LoadMonitorConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
@@ -133,6 +141,7 @@ impl AppContext {
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             block_size_oracle: BlockSizeOracle::new(),
+            load_monitor: None,
             ready: AtomicBool::new(false),
         }
     }

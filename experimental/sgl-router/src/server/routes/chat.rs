@@ -3,7 +3,10 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{
+    prefill_with_compatible_group, same_transfer_group, select_decode_with_affinity_outcome,
+    PdPoolResolver, PdResolveError,
+};
 use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -114,19 +117,46 @@ pub async fn chat_completions(
     // (`no_prefill_workers_available`) are surfaced as 503 with a
     // distinct error code so operators can alert independently.
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+    // Load Monitor: nudge a refresh of every worker in this model's pool
+    // (fire-and-forget; coalesced per worker) so the NEXT decision sees a
+    // report at most one pull round-trip old. This request itself reads
+    // the current snapshot below — AIgate's "read old, trigger new".
+    if let Some(lm) = &ctx.load_monitor {
+        let pool = ctx.registry.workers_for(&model_id);
+        lm.trigger(pool.iter().map(|w| w.url.as_str()));
+    }
     let workers = resolver
         .prefill_candidates(&model_id)
-        .map_err(|e| match e {
-            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+        .map_err(|e| map_resolve_error(e, &model_str))?;
+    // Freshness gate: with the Load Monitor on, a worker whose load the
+    // router cannot see (never reported / stale / unreachable) is not a
+    // candidate, even if its circuit breaker is closed.
+    let workers = gate_fresh(&ctx, &model_str, workers, "prefill")?;
+    // PD transfer groups: resolve the (freshness-gated) decode pool ONCE
+    // and keep only prefill workers whose group has a decode peer, so the
+    // policy never picks a prefill that cannot be paired. The same pool is
+    // reused for the decode pick below. Plain-mode models have no decode
+    // pool and skip this entirely.
+    let pd_mode = workers.iter().any(|w| w.mode() == WorkerMode::Prefill);
+    let decode_pool: Vec<Arc<Worker>> = if pd_mode {
+        let pool = resolver
+            .decode_candidates(&model_id)
+            .map_err(|e| map_resolve_error(e, &model_str))?;
+        gate_fresh(&ctx, &model_str, pool, "decode")?
+    } else {
+        Vec::new()
+    };
+    let workers = if pd_mode {
+        let compatible = prefill_with_compatible_group(workers, &decode_pool);
+        if compatible.is_empty() {
+            return Err(ApiError::NoCompatiblePdGroup {
                 model: model_str.clone(),
-            },
-            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
-                model: model_str.clone(),
-            },
-            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
-                model: model_str.clone(),
-            },
-        })?;
+            });
+        }
+        compatible
+    } else {
+        workers
+    };
 
     let policy = ctx
         .policies
@@ -212,7 +242,8 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref());
+        .with_external_prefix(external_prefix.as_ref())
+        .with_load_monitor(ctx.load_monitor.as_deref());
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -232,29 +263,24 @@ pub async fn chat_completions(
     // decode peer to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
-    let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
-        )
-    } else {
-        None
-    };
+    let decode_peer: Option<Arc<Worker>> = select_decode_peer(
+        &ctx,
+        &model_id,
+        &model_str,
+        &worker,
+        &decode_pool,
+        &selection_ctx,
+    )?;
+    // Local pre-deduction: count this dispatch against the chosen
+    // worker(s) until the engine's next report reflects it, so a burst of
+    // requests inside one pull interval does not all herd onto the worker
+    // that looked lightest at the last report.
+    if let Some(lm) = &ctx.load_monitor {
+        lm.note_dispatch(&worker.url);
+        if let Some(d) = &decode_peer {
+            lm.note_dispatch(&d.url);
+        }
+    }
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {
@@ -429,7 +455,18 @@ pub async fn chat_completions(
         // shutdown behaviour).
         let bootstrap_room = bootstrap_room.expect("PD dispatch implies a resolved bootstrap room");
 
+        // Prefill leg. Still a detached task (the HTTP request outlives the
+        // client connection, see the rationale above), but its outcome is
+        // reported back over a oneshot so the handler can FAIL FAST: a
+        // prefill that is unreachable or answers non-2xx means the decode
+        // side will never receive KV for this `bootstrap_room`, so the
+        // router drops the decode leg and returns 502 immediately instead
+        // of letting the client sit in the engine's bootstrap timeout.
+        // The receiver is dropped when the handler returns, so a late
+        // outcome is discarded harmlessly.
+        let (prefill_tx, prefill_rx) = tokio::sync::oneshot::channel::<PrefillOutcome>();
         let prefill_url = worker.url.clone();
+        let prefill_url_for_error = prefill_url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
@@ -439,11 +476,9 @@ pub async fn chat_completions(
             // The tuple binding extends both guards' lifetime to the
             // end of this async block, which lasts until the prefill
             // HTTP request returns (success / error / engine-side
-            // bootstrap_room timeout). The result is logged and
-            // swallowed — no channel back to the client. See the big
-            // comment above for the rationale.
+            // bootstrap_room timeout).
             let _hold = prefill_holds;
-            match prefill_proxy
+            let outcome = match prefill_proxy
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
@@ -453,57 +488,105 @@ pub async fn chat_completions(
                 )
                 .await
             {
-                Ok(_) => tracing::debug!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    "prefill side completed",
-                ),
-                Err(e) => tracing::warn!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    error = %e,
-                    "prefill request failed; decode will time out on bootstrap_room",
-                ),
-            }
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::debug!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        "prefill side completed",
+                    );
+                    PrefillOutcome::Completed
+                }
+                Ok(resp) => {
+                    tracing::warn!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        status = %resp.status(),
+                        "prefill request rejected; cancelling paired decode",
+                    );
+                    PrefillOutcome::Rejected(resp.status())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        error = %e,
+                        "prefill request failed; cancelling paired decode",
+                    );
+                    PrefillOutcome::Failed(e.to_string())
+                }
+            };
+            let _ = prefill_tx.send(outcome);
         });
 
-        // Synchronously await the decode worker. Its response is what
-        // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // Decode leg. Its response is what the client sees. The decode
+        // side gets its own LoadGuard so per-worker `active_requests`
+        // reflects decode-pool load. Boxed so both arms share one type
+        // that the race below can hold across `select!` iterations.
         let decode_guard = decode_worker.load_guard();
-        if streaming {
+        let decode_url = decode_worker.url.clone();
+        let decode_breaker = Arc::clone(&decode_worker.breaker);
+        let decode_headers = headers.clone();
+        let decode_proxy = Arc::clone(&ctx.proxy);
+        let decode_fetch: DecodeFetch = if streaming {
             let stream_guards: Box<dyn Send + 'static> =
                 Box::new((decode_guard, make_duration_guard()));
-            let fetch = ctx.proxy.forward_streaming_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                outgoing_body,
-                Some(stream_guards),
-                Some(make_ttft_hook()),
-            );
-            tokio::select! {
-                biased;
-                r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
-            }
+            let ttft = make_ttft_hook();
+            Box::pin(async move {
+                decode_proxy
+                    .forward_streaming_to(
+                        &decode_url,
+                        &decode_breaker,
+                        "/v1/chat/completions",
+                        &decode_headers,
+                        outgoing_body,
+                        Some(stream_guards),
+                        Some(ttft),
+                    )
+                    .await
+            })
         } else {
-            let _decode_hold = decode_guard;
-            let fetch = ctx.proxy.forward_json_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
-                "/v1/chat/completions",
-                &headers,
-                outgoing_body,
-            );
-            tokio::select! {
-                biased;
-                r = fetch => r,
-                _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
-            }
+            Box::pin(async move {
+                let _decode_hold = decode_guard;
+                decode_proxy
+                    .forward_json_to(
+                        &decode_url,
+                        &decode_breaker,
+                        "/v1/chat/completions",
+                        &decode_headers,
+                        outgoing_body,
+                    )
+                    .await
+            })
+        };
+
+        let (result, cancelled_decode) = race_pd_legs(
+            prefill_rx,
+            decode_fetch,
+            &stale_token,
+            &model_str,
+            &prefill_url_for_error,
+        )
+        .await;
+        if cancelled_decode {
+            ctx.metrics
+                .record_pd_peer_cancellation(WorkerModeLabel::Prefill, WorkerModeLabel::Decode);
         }
+        // The decode leg is a real per-worker dispatch too; without this
+        // the decode worker never appears in `worker_requests_total`.
+        let decode_outcome = match &result {
+            Ok(_) => RequestOutcome::Success,
+            Err(ApiError::StaleRequestExpired { .. }) => RequestOutcome::Cancelled,
+            Err(ApiError::PrefillUpstreamRejected { .. })
+            | Err(ApiError::PrefillUpstreamFailed { .. }) => RequestOutcome::Cancelled,
+            Err(_) => RequestOutcome::Error,
+        };
+        ctx.metrics.record_worker_request(
+            &decode_worker.url,
+            &metrics_model,
+            WorkerModeLabel::Decode,
+            decode_outcome,
+        );
+        result
     } else if streaming {
         // Plain mode, streaming. Both guards ride the SSE pump until
         // the body completes — see the matching comment in the
@@ -648,6 +731,211 @@ pub async fn chat_completions(
             Ok(response)
         }
         (other, _) => other,
+    }
+}
+
+fn map_resolve_error(e: PdResolveError, model: &str) -> ApiError {
+    match e {
+        PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+            model: model.to_string(),
+        },
+        PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+            model: model.to_string(),
+        },
+        PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+            model: model.to_string(),
+        },
+    }
+}
+
+/// Load Monitor freshness gate. With the monitor disabled every candidate
+/// passes. With it enabled, only workers whose latest `/v1/loads` report
+/// is `fresh` remain; an empty result is 503 `no_fresh_worker_load` with
+/// the pool `role` so operators can tell a prefill outage from a decode
+/// one.
+fn gate_fresh(
+    ctx: &AppContext,
+    model: &str,
+    workers: Vec<Arc<Worker>>,
+    role: &'static str,
+) -> Result<Vec<Arc<Worker>>, ApiError> {
+    let Some(lm) = &ctx.load_monitor else {
+        return Ok(workers);
+    };
+    let fresh: Vec<Arc<Worker>> = workers
+        .into_iter()
+        .filter(|w| lm.is_fresh(&w.url))
+        .collect();
+    if fresh.is_empty() {
+        return Err(ApiError::NoFreshWorkerLoad {
+            model: model.to_string(),
+            role,
+        });
+    }
+    Ok(fresh)
+}
+
+/// PD mode: resolve the decode peer for the chosen prefill worker.
+/// Returns `None` for plain-mode workers.
+///
+/// `decode_pool` is the freshness-gated decode pool resolved by the caller;
+/// it is narrowed to the prefill worker's transfer group (ungrouped pairs
+/// only with ungrouped). Selection is either the configured
+/// `--decode-policy` over that set (with the same [`SelectionContext`], so
+/// load-aware policies read engine-reported load), or — when no decode
+/// policy is set — the same-host affinity heuristic, whose outcome is
+/// recorded to `sgl_router_decode_affinity_total`.
+fn select_decode_peer(
+    ctx: &AppContext,
+    model_id: &ModelId,
+    model_str: &str,
+    prefill: &Worker,
+    decode_pool: &[Arc<Worker>],
+    selection_ctx: &SelectionContext<'_>,
+) -> Result<Option<Arc<Worker>>, ApiError> {
+    if prefill.mode() != WorkerMode::Prefill {
+        return Ok(None);
+    }
+    let candidates = same_transfer_group(decode_pool, prefill.transfer_group());
+    if candidates.is_empty() {
+        // The caller already filtered prefill workers to groups with a
+        // decode peer, so this only trips on a registry change between
+        // the two lookups.
+        return Err(ApiError::NoCompatiblePdGroup {
+            model: model_str.to_string(),
+        });
+    }
+    let decode = match ctx.policies.get_decode(model_id) {
+        Some(policy) => policy.select(&candidates, selection_ctx).ok_or_else(|| {
+            ApiError::PolicySelectionFailed {
+                model: model_str.to_string(),
+            }
+        })?,
+        None => {
+            let (w, outcome) = select_decode_with_affinity_outcome(&prefill.url, &candidates)
+                .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+                    model: model_str.to_string(),
+                })?;
+            ctx.metrics.record_decode_affinity(outcome);
+            w
+        }
+    };
+    tracing::debug!(
+        prefill = %prefill.url,
+        decode = %decode.url,
+        transfer_group = prefill.transfer_group().unwrap_or("-"),
+        "pd pair selected",
+    );
+    Ok(Some(decode))
+}
+
+/// Outcome of the detached prefill leg, reported back to the handler.
+#[derive(Debug)]
+enum PrefillOutcome {
+    /// 2xx from the prefill worker: KV for this `bootstrap_room` will reach
+    /// the decode side.
+    Completed,
+    /// Non-2xx from the prefill worker.
+    Rejected(axum::http::StatusCode),
+    /// Transport-level failure (unreachable / timeout / breaker / mid-body
+    /// drop), rendered for the error envelope.
+    Failed(String),
+}
+
+/// The decode-leg fetch future — one boxed type for the streaming and
+/// buffered arms so [`race_pd_legs`] can hold it across `select!` polls.
+type DecodeFetch =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response<Body>, ApiError>> + Send>>;
+
+/// Race the two PD legs (AIgate-style dual dispatch):
+///
+/// * Poll the prefill outcome and the decode fetch concurrently.
+/// * A decode **transport** error surfaces immediately (no point waiting
+///   for prefill to finish a KV transfer nobody will consume).
+/// * Once the prefill outcome arrives: `Completed` → return the decode
+///   response (awaiting it if it has not landed yet); `Rejected` /
+///   `Failed` → DROP the decode future / response (closing the upstream
+///   connection so the engine aborts the orphaned decode request) and
+///   return the matching 502.
+/// * The stale-request token cancels both legs with 504.
+///
+/// Returns the client-facing result plus whether the decode leg was
+/// cancelled because prefill failed (for the peer-cancellation metric).
+async fn race_pd_legs(
+    mut prefill_rx: tokio::sync::oneshot::Receiver<PrefillOutcome>,
+    mut decode_fetch: DecodeFetch,
+    stale_token: &tokio_util::sync::CancellationToken,
+    model: &str,
+    prefill_url: &str,
+) -> (Result<Response<Body>, ApiError>, bool) {
+    let mut decode_early: Option<Result<Response<Body>, ApiError>> = None;
+    let prefill_outcome = loop {
+        tokio::select! {
+            biased;
+            po = &mut prefill_rx => {
+                break po.unwrap_or_else(|_| {
+                    PrefillOutcome::Failed("prefill task ended without reporting".to_string())
+                });
+            }
+            dr = &mut decode_fetch, if decode_early.is_none() => {
+                if dr.is_err() {
+                    // Decode failed at transport level before prefill
+                    // finished: return that error now. The prefill task
+                    // keeps running detached (its KV transfer will time
+                    // out engine-side); nothing waits on it.
+                    return (dr, false);
+                }
+                decode_early = Some(dr);
+            }
+            _ = stale_token.cancelled() => {
+                drop(decode_early);
+                return (
+                    Err(ApiError::StaleRequestExpired {
+                        model: model.to_string(),
+                    }),
+                    false,
+                );
+            }
+        }
+    };
+    match prefill_outcome {
+        PrefillOutcome::Completed => {
+            let result = match decode_early {
+                Some(r) => r,
+                None => tokio::select! {
+                    biased;
+                    r = &mut decode_fetch => r,
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired {
+                        model: model.to_string(),
+                    }),
+                },
+            };
+            (result, false)
+        }
+        PrefillOutcome::Rejected(status) => {
+            // Dropping the pending future / the buffered or streaming
+            // response closes the decode connection.
+            drop(decode_fetch);
+            drop(decode_early);
+            (
+                Err(ApiError::PrefillUpstreamRejected {
+                    worker: prefill_url.to_string(),
+                    status,
+                }),
+                true,
+            )
+        }
+        PrefillOutcome::Failed(cause) => {
+            drop(decode_fetch);
+            drop(decode_early);
+            (
+                Err(ApiError::PrefillUpstreamFailed {
+                    worker: prefill_url.to_string(),
+                    cause,
+                }),
+                true,
+            )
+        }
     }
 }
 

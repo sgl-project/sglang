@@ -99,7 +99,21 @@ fn labels_match_selector(labels: &BTreeMap<String, String>, selector: &str) -> b
 /// `model_ids` is intentionally left empty — model membership is resolved
 /// by the worker manager via `/server_info` introspection after the
 /// `Added` event is emitted.
-fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
+fn extract_workers(
+    es: &EndpointSlice,
+    mode: WorkerMode,
+    transfer_group_label: &str,
+) -> Vec<WorkerSpec> {
+    // PD transfer group from the slice label (one Service per group is the
+    // usual LWS / RBG layout). Empty value == unlabelled == ungrouped.
+    let transfer_group = es
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(transfer_group_label))
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
     let port = es
         .ports
         .as_ref()
@@ -138,6 +152,7 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 mode,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                transfer_group: transfer_group.clone(),
             });
         }
     }
@@ -197,7 +212,10 @@ async fn emit_diff(
                     })
                     .await?;
                 }
-                if prev.url != spec.url || prev.model_ids != spec.model_ids {
+                if prev.url != spec.url
+                    || prev.model_ids != spec.model_ids
+                    || prev.transfer_group != spec.transfer_group
+                {
                     tx.send(DiscoveryEvent::Removed { id: id.clone() }).await?;
                     tx.send(DiscoveryEvent::Added(spec.clone())).await?;
                 }
@@ -239,8 +257,27 @@ async fn emit_diff(
 ///
 /// The loop returns when the input stream ends (logged at WARN) or when the
 /// consumer drops the receiving end of `tx` (logged at INFO).
-async fn process_events<S>(mut stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
+#[cfg(test)]
+async fn process_events<S>(stream: S, tx: mpsc::Sender<DiscoveryEvent>, mode: K8sDiscoveryMode)
 where
+    S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
+{
+    process_events_with_group_label(
+        stream,
+        tx,
+        mode,
+        crate::config::default_transfer_group_label(),
+    )
+    .await
+}
+
+/// [`process_events`] with an explicit transfer-group label key.
+async fn process_events_with_group_label<S>(
+    mut stream: S,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    mode: K8sDiscoveryMode,
+    transfer_group_label: String,
+) where
     S: Stream<Item = Result<watcher::Event<EndpointSlice>, watcher::Error>> + Unpin,
 {
     let mut per_slice: HashMap<String, HashMap<WorkerId, WorkerSpec>> = HashMap::new();
@@ -250,9 +287,10 @@ where
     fn workers_for_slice(
         es: &EndpointSlice,
         mode: &K8sDiscoveryMode,
+        transfer_group_label: &str,
     ) -> HashMap<WorkerId, WorkerSpec> {
         match classify_mode(es, mode) {
-            Some(wm) => extract_workers(es, wm)
+            Some(wm) => extract_workers(es, wm, transfer_group_label)
                 .into_iter()
                 .map(|w| (w.id.clone(), w))
                 .collect(),
@@ -268,7 +306,7 @@ where
             }
             Ok(watcher::Event::InitApply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, &transfer_group_label);
                 if let Some(buf) = init_buffer.as_mut() {
                     buf.insert(key, workers);
                     Ok(())
@@ -288,7 +326,7 @@ where
             }
             Ok(watcher::Event::Apply(es)) => {
                 let key = slice_key(&es);
-                let workers = workers_for_slice(&es, &mode);
+                let workers = workers_for_slice(&es, &mode, &transfer_group_label);
                 per_slice.insert(key, workers);
                 emit_diff(&tx, &per_slice, &mut prev_union).await
             }
@@ -330,7 +368,11 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // The mode was resolved + validated at construction (`resolve_mode` in
     // `Cli::build_discovery`); just destructure it here.
-    let K8sDiscoveryConfig { namespace, mode } = cfg;
+    let K8sDiscoveryConfig {
+        namespace,
+        mode,
+        transfer_group_label,
+    } = cfg;
 
     let client = Client::try_default()
         .await
@@ -386,7 +428,7 @@ pub async fn spawn(
     let handle = tokio::spawn(async move {
         let stream = watcher(api, watcher_cfg);
         tokio::pin!(stream);
-        process_events(stream, tx, mode).await;
+        process_events_with_group_label(stream, tx, mode, transfer_group_label).await;
     });
     Ok(handle)
 }
@@ -522,9 +564,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_workers_reads_transfer_group_from_slice_label() {
+        let s = make_slice_with_labels(
+            &["10.0.0.1"],
+            30000,
+            true,
+            &[("role", "prefill"), ("sglang.ai/transfer-group", "tg-a")],
+        );
+        let ws = extract_workers(&s, WorkerMode::Prefill, "sglang.ai/transfer-group");
+        assert_eq!(ws[0].transfer_group.as_deref(), Some("tg-a"));
+        // A different label key → ungrouped.
+        let ws = extract_workers(&s, WorkerMode::Prefill, "example.com/other");
+        assert_eq!(ws[0].transfer_group, None);
+        // Unlabelled slice → ungrouped.
+        let s = make_slice(&["10.0.0.1"], 30000, true);
+        let ws = extract_workers(&s, WorkerMode::Decode, "sglang.ai/transfer-group");
+        assert_eq!(ws[0].transfer_group, None);
+    }
+
+    #[test]
     fn extract_workers_emits_workers_with_supplied_mode_and_empty_model_ids() {
         let s = make_slice(&["10.0.0.1"], 30000, true);
-        let ws = extract_workers(&s, WorkerMode::Plain);
+        let ws = extract_workers(&s, WorkerMode::Plain, "sglang.ai/transfer-group");
         assert_eq!(ws.len(), 1);
         assert_eq!(ws[0].mode, WorkerMode::Plain);
         assert_eq!(ws[0].url, "http://10.0.0.1:30000");
@@ -535,16 +596,16 @@ mod tests {
         );
 
         // The mode argument flows through unchanged.
-        let ws = extract_workers(&s, WorkerMode::Prefill);
+        let ws = extract_workers(&s, WorkerMode::Prefill, "sglang.ai/transfer-group");
         assert_eq!(ws[0].mode, WorkerMode::Prefill);
-        let ws = extract_workers(&s, WorkerMode::Decode);
+        let ws = extract_workers(&s, WorkerMode::Decode, "sglang.ai/transfer-group");
         assert_eq!(ws[0].mode, WorkerMode::Decode);
     }
 
     #[test]
     fn skips_not_ready_endpoints() {
         let s = make_slice(&["10.0.0.1"], 30000, false);
-        assert!(extract_workers(&s, WorkerMode::Plain).is_empty());
+        assert!(extract_workers(&s, WorkerMode::Plain, "sglang.ai/transfer-group").is_empty());
     }
 
     /// `conditions.ready = None` must default to ready=true per EndpointSlice
@@ -553,7 +614,7 @@ mod tests {
     fn is_ready_none_defaults_to_ready() {
         let mut s = make_slice(&["10.0.0.1"], 30000, false /* overridden below */);
         s.endpoints[0].conditions.as_mut().unwrap().ready = None;
-        let ws = extract_workers(&s, WorkerMode::Plain);
+        let ws = extract_workers(&s, WorkerMode::Plain, "sglang.ai/transfer-group");
         assert_eq!(
             ws.len(),
             1,
@@ -568,7 +629,7 @@ mod tests {
         let mut s = make_slice(&["10.0.0.1"], 30000, true);
         s.metadata.namespace = Some("prod".to_string());
         s.metadata.name = Some("svc-abc-xyz".to_string());
-        let ws = extract_workers(&s, WorkerMode::Plain);
+        let ws = extract_workers(&s, WorkerMode::Plain, "sglang.ai/transfer-group");
         assert_eq!(ws[0].id.0, "prod/svc-abc-xyz/10.0.0.1:30000");
     }
 
@@ -578,7 +639,7 @@ mod tests {
     fn worker_id_handles_missing_namespace() {
         // make_slice_ns with empty ns leaves metadata.namespace = None.
         let s = make_slice_ns(&["10.0.0.1"], 30000, true, "", "my-slice");
-        let ws = extract_workers(&s, WorkerMode::Plain);
+        let ws = extract_workers(&s, WorkerMode::Plain, "sglang.ai/transfer-group");
         assert!(
             ws[0].id.0.contains("10.0.0.1:30000"),
             "id must contain addr:port"

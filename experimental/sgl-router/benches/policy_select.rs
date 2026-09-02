@@ -29,6 +29,7 @@ fn workers(n: usize, model: &str) -> Vec<Arc<Worker>> {
                 mode: WorkerMode::Plain,
                 model_ids: vec![ModelId(model.into())],
                 bootstrap_port: None,
+                transfer_group: None,
             })
             .expect("test workers are unmixed");
     }

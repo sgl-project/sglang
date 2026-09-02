@@ -34,6 +34,7 @@
 //!    — only the resolver has the cohort context to tell which is which.
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::server::metrics::DecodeAffinityOutcome;
 use crate::workers::{Worker, WorkerRegistry};
 use std::sync::Arc;
 
@@ -133,6 +134,19 @@ impl PdPoolResolver {
         let mut plain = Vec::new();
         for w in all {
             match w.mode() {
+                // A prefill worker without a bootstrap port cannot take a
+                // PD request: the router would inject `bootstrap_port:
+                // null` and the decode side could never connect for the
+                // KV transfer. Exclude it from the routable pool (it stays
+                // registered — the manager re-introspects `/server_info`
+                // until the port shows up). Mirrors AIgate's rule that a
+                // P/D endpoint with incomplete metadata is not selectable.
+                WorkerMode::Prefill if w.bootstrap_port().is_none() => {
+                    tracing::debug!(
+                        worker_url = %w.url,
+                        "prefill worker has no bootstrap_port; excluded from routing",
+                    );
+                }
                 WorkerMode::Prefill => prefill.push(w),
                 WorkerMode::Decode => decode.push(w),
                 WorkerMode::Plain => plain.push(w),
@@ -202,6 +216,35 @@ impl PdPoolResolver {
     }
 }
 
+/// Restrict a decode candidate set to the prefill worker's transfer group.
+/// Ungrouped (`None`) decode workers pair only with ungrouped prefill
+/// workers — a labelled and an unlabelled worker are never paired, since
+/// the label is the operator's statement of KV-transfer reachability.
+pub fn same_transfer_group(candidates: &[Arc<Worker>], group: Option<&str>) -> Vec<Arc<Worker>> {
+    candidates
+        .iter()
+        .filter(|w| w.transfer_group() == group)
+        .cloned()
+        .collect()
+}
+
+/// Keep only prefill workers whose transfer group has at least one decode
+/// candidate in `decode_pool`, so a prefill that could never be paired
+/// (its group's decode side is down / stale / absent) is not selected.
+pub fn prefill_with_compatible_group(
+    prefill: Vec<Arc<Worker>>,
+    decode_pool: &[Arc<Worker>],
+) -> Vec<Arc<Worker>> {
+    prefill
+        .into_iter()
+        .filter(|p| {
+            decode_pool
+                .iter()
+                .any(|d| d.transfer_group() == p.transfer_group())
+        })
+        .collect()
+}
+
 /// Pick a decode worker from `candidates` preferring the one whose URL
 /// shares a host with `prefill_url`. Falls back to lowest-load when no
 /// same-host peer exists, when the same-host peer's breaker is open,
@@ -236,6 +279,22 @@ pub fn select_decode_with_affinity(
     prefill_url: &str,
     candidates: &[Arc<Worker>],
 ) -> Option<Arc<Worker>> {
+    select_decode_with_affinity_outcome(prefill_url, candidates).map(|(w, _)| w)
+}
+
+/// [`select_decode_with_affinity`] plus WHY the pick was made, for the
+/// `sgl_router_decode_affinity_total{outcome}` counter:
+///
+/// * `SameHostPicked` — rule 1 held.
+/// * `FallbackBreaker` — a same-host peer exists but every such peer's
+///   breaker is open.
+/// * `FallbackLoadImbalance` — a same-host peer exists and is healthy but
+///   sits above the load tolerance.
+/// * `NoSameHostPeer` — no candidate shares the prefill host.
+pub fn select_decode_with_affinity_outcome(
+    prefill_url: &str,
+    candidates: &[Arc<Worker>],
+) -> Option<(Arc<Worker>, DecodeAffinityOutcome)> {
     if candidates.is_empty() {
         return None;
     }
@@ -264,25 +323,40 @@ pub fn select_decode_with_affinity(
     };
 
     // Rule 1: same-host AND healthy AND not overloaded.
+    let mut outcome = DecodeAffinityOutcome::NoSameHostPeer;
     if let Some(host) = prefill_host.as_deref() {
-        let affinity_peer = healthy.iter().find(|w| {
-            host_of(&w.url).as_deref() == Some(host)
-                && (load_tolerance == 0 || w.active_load() <= load_tolerance)
-        });
-        if let Some(w) = affinity_peer {
-            return Some(Arc::clone(w));
+        let same_host: Vec<&Arc<Worker>> = candidates
+            .iter()
+            .filter(|w| host_of(&w.url).as_deref() == Some(host))
+            .collect();
+        if !same_host.is_empty() {
+            if let Some(w) = same_host.iter().find(|w| {
+                w.breaker.would_allow()
+                    && (load_tolerance == 0 || w.active_load() <= load_tolerance)
+            }) {
+                return Some((Arc::clone(w), DecodeAffinityOutcome::SameHostPicked));
+            }
+            outcome = if same_host.iter().any(|w| w.breaker.would_allow()) {
+                DecodeAffinityOutcome::FallbackLoadImbalance
+            } else {
+                DecodeAffinityOutcome::FallbackBreaker
+            };
         }
     }
 
     // Rule 2: min-load among healthy.
     if let Some(w) = healthy.iter().min_by_key(|w| w.active_load()) {
-        return Some(Arc::clone(w));
+        return Some((Arc::clone(w), outcome));
     }
 
     // Rule 3: last-resort min-load over all candidates (every
     // breaker is open). The caller's dispatch will likely fail and
     // surface `BreakerOpen`, but the selection function stays total.
-    candidates.iter().min_by_key(|w| w.active_load()).cloned()
+    candidates
+        .iter()
+        .min_by_key(|w| w.active_load())
+        .cloned()
+        .map(|w| (w, outcome))
 }
 
 /// Parse the host portion of a worker URL. Returns `None` when the URL
@@ -307,7 +381,9 @@ mod tests {
             url: format!("http://{id}"),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
+            // Prefill workers need a bootstrap port to be routable.
+            bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+            transfer_group: None,
         }
     }
 
@@ -498,8 +574,85 @@ mod tests {
             url: url.into(),
             mode,
             model_ids: vec![ModelId(model.into())],
-            bootstrap_port: None,
+            bootstrap_port: (mode == WorkerMode::Prefill).then_some(8997),
+            transfer_group: None,
         }
+    }
+
+    /// A prefill worker that has not (yet) disclosed its bootstrap port is
+    /// registered but NOT routable: the resolver drops it from the prefill
+    /// pool so the router never injects `bootstrap_port: null`. With no
+    /// other prefill peer the pool is empty → `NoPrefillWorkersAvailable`.
+    #[test]
+    fn prefill_without_bootstrap_port_is_excluded_from_pool() {
+        let m = "m";
+        let mut portless = spec("p-noport", WorkerMode::Prefill, m);
+        portless.bootstrap_port = None;
+        let r = registry(&[portless, spec("d1", WorkerMode::Decode, m)]);
+        let resolver = PdPoolResolver::new(r.clone());
+        assert_eq!(
+            resolver.prefill_candidates(&ModelId(m.into())).unwrap_err(),
+            PdResolveError::NoPrefillWorkersAvailable,
+        );
+        // Decode pool is unaffected.
+        assert_eq!(
+            resolver
+                .decode_candidates(&ModelId(m.into()))
+                .unwrap()
+                .len(),
+            1
+        );
+        // A sibling WITH a port is the only prefill candidate.
+        let _ = r.add(spec("p-ok", WorkerMode::Prefill, m));
+        let prefill = resolver.prefill_candidates(&ModelId(m.into())).unwrap();
+        assert_eq!(prefill.len(), 1);
+        assert_eq!(prefill[0].id, WorkerId("p-ok".into()));
+    }
+
+    fn spec_in_group(id: &str, mode: WorkerMode, model: &str, group: Option<&str>) -> WorkerSpec {
+        let mut s = spec(id, mode, model);
+        s.transfer_group = group.map(str::to_string);
+        s
+    }
+
+    /// Decode candidates are restricted to the prefill's transfer group;
+    /// ungrouped only pairs with ungrouped.
+    #[test]
+    fn same_transfer_group_filters_by_exact_group() {
+        let r = registry(&[
+            spec_in_group("d-a", WorkerMode::Decode, "m", Some("a")),
+            spec_in_group("d-b", WorkerMode::Decode, "m", Some("b")),
+            spec_in_group("d-none", WorkerMode::Decode, "m", None),
+        ]);
+        let pool = r.workers_for(&ModelId("m".into()));
+        let ids = |v: Vec<Arc<Worker>>| {
+            let mut ids: Vec<String> = v.iter().map(|w| w.id.0.clone()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(same_transfer_group(&pool, Some("a"))), vec!["d-a"]);
+        assert_eq!(ids(same_transfer_group(&pool, Some("b"))), vec!["d-b"]);
+        assert_eq!(ids(same_transfer_group(&pool, None)), vec!["d-none"]);
+        assert!(same_transfer_group(&pool, Some("zzz")).is_empty());
+    }
+
+    /// A prefill whose group has no decode candidate is dropped from the
+    /// prefill candidate set; groups with both sides survive.
+    #[test]
+    fn prefill_with_compatible_group_drops_incomplete_groups() {
+        let r = registry(&[
+            spec_in_group("p-a", WorkerMode::Prefill, "m", Some("a")),
+            spec_in_group("p-b", WorkerMode::Prefill, "m", Some("b")),
+            spec_in_group("p-none", WorkerMode::Prefill, "m", None),
+            spec_in_group("d-a", WorkerMode::Decode, "m", Some("a")),
+        ]);
+        let resolver = PdPoolResolver::new(r.clone());
+        let m = ModelId("m".into());
+        let prefill = resolver.prefill_candidates(&m).unwrap();
+        let decode = resolver.decode_candidates(&m).unwrap();
+        let compatible = prefill_with_compatible_group(prefill, &decode);
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0].id, WorkerId("p-a".into()));
     }
 
     /// Same-host affinity: a request that lands on `prefill@host_a`

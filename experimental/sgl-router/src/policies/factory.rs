@@ -128,6 +128,23 @@ pub fn build_registry(
             Arc::clone(&block_size_oracle),
         ),
     );
+    // PD decode-pool policy: same tuning (cache-aware thresholds, sticky
+    // config) as the primary, only the kind differs.
+    if let Some(kind) = m.decode_policy {
+        let decode_model = ModelConfig {
+            policy: kind,
+            ..m.clone()
+        };
+        reg.insert_decode(
+            ModelId(m.id.clone()),
+            build_policy(
+                &decode_model,
+                Arc::clone(&tree),
+                Arc::clone(&tokenizers),
+                Arc::clone(&block_size_oracle),
+            ),
+        );
+    }
     Ok(reg)
 }
 
@@ -171,12 +188,14 @@ mod tests {
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,
+                decode_policy: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
             }),
             proxy: ProxyConfig::default(),
+            load_monitor: crate::config::LoadMonitorConfig::default(),
             active_load: ActiveLoadConfig::default(),
         }
     }

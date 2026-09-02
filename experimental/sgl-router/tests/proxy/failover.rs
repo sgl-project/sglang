@@ -40,12 +40,14 @@ async fn failover_when_one_worker_dies() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
     };
 

@@ -172,12 +172,29 @@ async fn main() -> Result<()> {
         .context("spawn discovery")?;
     let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
         Some(Arc::clone(&kv_index));
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
+    // Pull-mode Load Monitor (opt-in). Built before the manager so newly
+    // registered workers are tracked from their first `/server_info`.
+    let load_monitor = cfg.load_monitor.enabled.then(|| {
+        sgl_router::load_monitor::LoadMonitor::new(sgl_router::load_monitor::LoadMonitorConfig {
+            report_interval: std::time::Duration::from_millis(cfg.load_monitor.report_interval_ms),
+            stale_after: std::time::Duration::from_millis(cfg.load_monitor.stale_after_ms),
+            request_timeout: std::time::Duration::from_millis(cfg.load_monitor.request_timeout_ms),
+        })
+    });
+    if load_monitor.is_some() {
+        tracing::info!(
+            interval_ms = cfg.load_monitor.report_interval_ms,
+            stale_after_ms = cfg.load_monitor.stale_after_ms,
+            "load monitor enabled (pull mode: GET /v1/loads)",
+        );
+    }
+    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_options(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
         kv_index_opt,
         Some(Arc::clone(&active_load)),
+        load_monitor.clone(),
     ));
 
     let proxy = Arc::new(
@@ -197,6 +214,10 @@ async fn main() -> Result<()> {
     );
     app_ctx.prefix_index = prefix_index;
     app_ctx.block_size_oracle = block_size_oracle;
+    if let Some(lm) = &load_monitor {
+        lm.attach_metrics(Arc::clone(&app_ctx.metrics));
+    }
+    app_ctx.load_monitor = load_monitor.clone();
     let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
@@ -219,6 +240,9 @@ async fn main() -> Result<()> {
     // exits — useful for tracing tail logs.
     discovery_handle.abort();
     manager_handle.abort();
+    if let Some(lm) = &load_monitor {
+        lm.drain();
+    }
     janitor_handle.shutdown().await;
     server_result
 }

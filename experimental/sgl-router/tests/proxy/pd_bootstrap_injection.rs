@@ -48,12 +48,14 @@ fn config() -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
     }
 }
@@ -142,6 +144,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -149,6 +152,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -198,6 +202,7 @@ async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        transfer_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -235,6 +240,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(11111),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("pB".into()),
@@ -242,6 +248,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(22222),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -249,6 +256,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -277,15 +285,14 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
     );
 }
 
-/// Pin Pattern B's "prefill failure is invisible to the client"
-/// contract: when the spawned prefill task gets a 5xx (or any other
-/// upstream error), the decode response still reaches the client
-/// unmodified. The router intentionally does not wire fail-fast here —
-/// the decode side will eventually hang on `bootstrap_room` and time
-/// out, but the chat handler itself doesn't propagate the prefill
-/// error. Matches llm-d / aibrix behaviour.
+/// Fail-fast contract: when the spawned prefill task gets a 5xx, the
+/// router cancels the paired decode leg and answers 502
+/// `prefill_upstream_rejected` immediately, instead of returning decode's
+/// response and letting the client wait out the engine-side
+/// `bootstrap_room` timeout (30–300 s). The prefill task itself stays
+/// detached from the client connection; only its outcome is raced.
 #[tokio::test]
-async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
+async fn pd_mode_prefill_5xx_fails_fast_with_502() {
     let prefill = crate::common::mock_worker::MockWorker::start_returning_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         json!({"error": "simulated prefill failure"}),
@@ -299,6 +306,7 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -306,28 +314,101 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
 
-    // Client must see decode's 200 — the failing prefill is invisible.
-    let res = app.oneshot(chat_request()).await.unwrap();
+    let started = std::time::Instant::now();
+    let res = app.clone().oneshot(chat_request()).await.unwrap();
     assert_eq!(
         res.status(),
-        StatusCode::OK,
-        "decode response should reach the client even when prefill returned 5xx",
+        StatusCode::BAD_GATEWAY,
+        "prefill 5xx must fail the request fast instead of surfacing decode's 200",
+    );
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("prefill_upstream_rejected"),
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "fail-fast must not wait on any decode-side timeout",
     );
 
-    // Decode received its body (proves dual dispatch fired despite
-    // the prefill failure).
-    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
-    let v = parse_body(&decode_body);
-    assert_eq!(bootstrap_port(&v), Some(8997));
-
-    // Prefill also received its body — it just returned 5xx. The
-    // bootstrap fields are present so the engine WOULD have honoured
-    // the bootstrap_room if the mock had succeeded.
+    // Prefill received the injected body — the bootstrap fields were
+    // present, so a healthy engine WOULD have honoured the room.
     let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
     let pv = parse_body(&prefill_body);
     assert_eq!(bootstrap_port(&pv), Some(8997));
+
+    // The peer-cancellation counter records the fail-fast event.
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        http_body_util::BodyExt::collect(metrics.into_body())
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains(
+            "sgl_router_pd_peer_cancellations_total{trigger_role=\"prefill\",cancelled_role=\"decode\"} 1"
+        ),
+        "expected a prefill→decode peer cancellation in /metrics, got:\n{text}",
+    );
+}
+
+/// Fail-fast contract for a prefill that is unreachable at the transport
+/// level (connection refused): 502 `prefill_upstream_failed`, well before
+/// any engine-side timeout.
+#[tokio::test]
+async fn pd_mode_prefill_unreachable_fails_fast_with_502() {
+    // Reserve a loopback port, then release it so connecting is refused.
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}", dead.local_addr().unwrap());
+    drop(dead);
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: dead_url,
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+            transfer_group: None,
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+            transfer_group: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let started = std::time::Instant::now();
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("prefill_upstream_failed"),
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
 }

@@ -16,6 +16,40 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    /// Pull-mode Load Monitor (engine `GET /v1/loads` polling + freshness
+    /// gate). Disabled by default; see [`LoadMonitorConfig`].
+    pub load_monitor: LoadMonitorConfig,
+}
+
+/// Load Monitor tuning (pull mode). When `enabled`, every worker is polled
+/// on `GET /v1/loads?include=core` — immediately on registration, on
+/// every routed request (coalesced to at most one in-flight + one pending
+/// pull per worker), and on a `report_interval_ms` fallback measured from
+/// the previous pull's completion. Only workers whose latest report is
+/// younger than `stale_after_ms` are routable; load-aware policies score
+/// by the engine-reported `running + waiting` request count plus the
+/// requests this router dispatched since that report.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadMonitorConfig {
+    pub enabled: bool,
+    /// Periodic fallback pull interval. Default 1000 ms.
+    pub report_interval_ms: u64,
+    /// Report age after which a worker is `stale` (unroutable). Default
+    /// 3000 ms; must exceed `report_interval_ms`.
+    pub stale_after_ms: u64,
+    /// Per-pull HTTP timeout. Default 1000 ms.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for LoadMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            report_interval_ms: 1000,
+            stale_after_ms: 3000,
+            request_timeout_ms: 1000,
+        }
+    }
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
@@ -155,6 +189,11 @@ pub struct ModelConfig {
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+    /// PD mode: routing policy for the DECODE pool. `None` keeps the
+    /// same-host affinity heuristic (`select_decode_with_affinity`); `Some`
+    /// selects decode workers with a real policy over the (freshness-gated)
+    /// decode pool. Ignored for plain-mode models.
+    pub decode_policy: Option<PolicyKind>,
 }
 
 /// External KV Indexer client settings.
@@ -318,6 +357,15 @@ pub struct K8sDiscoveryConfig {
     pub namespace: String,
     /// Resolved + validated selector mode (plain vs PD).
     pub mode: K8sDiscoveryMode,
+    /// EndpointSlice label whose value is the worker's PD transfer group.
+    /// Slices without the label yield ungrouped workers. Default
+    /// [`default_transfer_group_label`].
+    pub transfer_group_label: String,
+}
+
+/// Default EndpointSlice label carrying the PD transfer group.
+pub fn default_transfer_group_label() -> String {
+    "sglang.ai/transfer-group".to_string()
 }
 
 /// Resolved discovery mode, produced by [`resolve_mode`] from the CLI

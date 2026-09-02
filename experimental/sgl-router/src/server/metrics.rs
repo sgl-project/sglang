@@ -31,6 +31,9 @@
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
 //! | `sgl_router_stale_requests_total` | Counter | `outcome` |
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
+//! | `sgl_router_pd_peer_cancellations_total` | Counter | `trigger_role`, `cancelled_role` |
+//! | `sgl_router_load_pulls_total` | Counter | `worker_url`, `outcome` |
+//! | `sgl_router_reported_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
@@ -133,6 +136,8 @@ pub enum DecodeAffinityOutcome {
     SameHostPicked,
     FallbackBreaker,
     FallbackLoadImbalance,
+    /// No decode worker shares the prefill worker's host; min-load fallback.
+    NoSameHostPeer,
 }
 
 impl DecodeAffinityOutcome {
@@ -141,6 +146,44 @@ impl DecodeAffinityOutcome {
             Self::SameHostPicked => "same_host_picked",
             Self::FallbackBreaker => "fallback_breaker",
             Self::FallbackLoadImbalance => "fallback_load_imbalance",
+            Self::NoSameHostPeer => "no_same_host_peer",
+        }
+    }
+}
+
+/// Outcome of one Load Monitor `GET /v1/loads` pull.
+#[derive(Debug, Clone, Copy)]
+pub enum LoadPullOutcome {
+    Ok,
+    /// Engine answered but reported zero capacity (still booting).
+    ZeroCapacity,
+    Unreachable,
+}
+
+impl LoadPullOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::ZeroCapacity => "zero_capacity",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// Engine-reported load axis exposed as `sgl_router_reported_load{kind}`.
+#[derive(Debug, Clone, Copy)]
+pub enum ReportedLoadKind {
+    RunningRequests,
+    WaitingRequests,
+    FreeTokens,
+}
+
+impl ReportedLoadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunningRequests => "running_requests",
+            Self::WaitingRequests => "waiting_requests",
+            Self::FreeTokens => "free_tokens",
         }
     }
 }
@@ -223,6 +266,13 @@ pub struct MetricsRegistry {
     active_load: Mutex<HashMap<ActiveLoadKey, Arc<AtomicI64>>>,
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    // PD fail-fast: one leg failed and the router cancelled its peer.
+    // Keyed by (trigger_role, cancelled_role).
+    pd_peer_cancellations_total: Mutex<HashMap<(&'static str, &'static str), Arc<AtomicU64>>>,
+    // Load Monitor: pull outcomes per worker, and the latest engine-reported
+    // load values (gauge semantics, replaced on every successful pull).
+    load_pulls_total: Mutex<HashMap<(String, &'static str), Arc<AtomicU64>>>,
+    reported_load: Mutex<HashMap<(String, &'static str), Arc<AtomicI64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
@@ -468,6 +518,45 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_pd_peer_cancellations_total{trigger_role,cancelled_role}`.
+    /// Recorded by the PD dispatch path when the `trigger` leg failed and
+    /// the router dropped the `cancelled` leg so the client fails fast.
+    pub fn record_pd_peer_cancellation(
+        &self,
+        trigger: WorkerModeLabel,
+        cancelled: WorkerModeLabel,
+    ) {
+        let mut guard = self.pd_peer_cancellations_total.lock();
+        let counter = guard
+            .entry((trigger.as_str(), cancelled.as_str()))
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_load_pulls_total{worker_url,outcome}`.
+    pub fn record_load_pull(&self, worker_url: &str, outcome: LoadPullOutcome) {
+        let mut guard = self.load_pulls_total.lock();
+        let counter = guard
+            .entry((worker_url.to_owned(), outcome.as_str()))
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set `sgl_router_reported_load{worker_url,kind}` (gauge).
+    pub fn set_reported_load(&self, worker_url: &str, kind: ReportedLoadKind, value: i64) {
+        let mut guard = self.reported_load.lock();
+        let gauge = guard
+            .entry((worker_url.to_owned(), kind.as_str()))
+            .or_insert_with(|| Arc::new(AtomicI64::new(0)))
+            .clone();
+        drop(guard);
+        gauge.store(value, Ordering::Relaxed);
     }
 
     /// Bump `sgl_router_sticky_total{outcome}`.
@@ -762,6 +851,67 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_decode_affinity_total{{outcome=\"{}\"}} {}\n",
                 outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // pd_peer_cancellations_total
+        out.push_str(
+            "# HELP sgl_router_pd_peer_cancellations_total PD dispatch fail-fast events: the trigger_role leg failed and the router cancelled the cancelled_role leg.\n",
+        );
+        out.push_str("# TYPE sgl_router_pd_peer_cancellations_total counter\n");
+        let guard = self.pd_peer_cancellations_total.lock();
+        let mut entries: Vec<(&(&str, &str), u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for ((trigger, cancelled), value) in entries {
+            out.push_str(&format!(
+                "sgl_router_pd_peer_cancellations_total{{trigger_role=\"{}\",cancelled_role=\"{}\"}} {}\n",
+                trigger, cancelled, value,
+            ));
+        }
+        drop(guard);
+
+        // load_pulls_total
+        out.push_str(
+            "# HELP sgl_router_load_pulls_total Load Monitor GET /v1/loads pulls per worker and outcome.\n",
+        );
+        out.push_str("# TYPE sgl_router_load_pulls_total counter\n");
+        let guard = self.load_pulls_total.lock();
+        let mut entries: Vec<(&(String, &str), u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for ((worker_url, outcome), value) in entries {
+            out.push_str(&format!(
+                "sgl_router_load_pulls_total{{worker_url=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(worker_url),
+                outcome,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // reported_load
+        out.push_str(
+            "# HELP sgl_router_reported_load Latest engine-reported load per worker from GET /v1/loads (Load Monitor).\n",
+        );
+        out.push_str("# TYPE sgl_router_reported_load gauge\n");
+        let guard = self.reported_load.lock();
+        let mut entries: Vec<(&(String, &str), i64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for ((worker_url, kind), value) in entries {
+            out.push_str(&format!(
+                "sgl_router_reported_load{{worker_url=\"{}\",kind=\"{}\"}} {}\n",
+                escape_label(worker_url),
+                kind,
+                value,
             ));
         }
         drop(guard);

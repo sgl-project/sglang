@@ -60,6 +60,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
+            .route("/v1/loads", get(serve_tiny_loads))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -392,6 +393,26 @@ impl MockWorker {
 #[allow(dead_code)] // shared across all axum variants
 async fn serve_tiny_server_info() -> Json<Value> {
     Json(serde_json::json!({"served_model_name": "tiny"}))
+}
+
+/// `/v1/loads?include=core` shaped like SGLang's `LoadSnapshot.to_dict`:
+/// one idle DP rank with positive capacity, so the router's Load Monitor
+/// marks this worker `fresh`.
+async fn serve_tiny_loads() -> Json<Value> {
+    Json(serde_json::json!({
+        "timestamp": "2026-01-01T00:00:00Z",
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 0,
+            "num_waiting_reqs": 0,
+            "num_used_tokens": 0,
+            "num_total_tokens": 0,
+            "max_total_num_tokens": 4096,
+            "max_running_requests": 32,
+            "token_usage": 0.0,
+            "gen_throughput": 0.0
+        }]
+    }))
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.

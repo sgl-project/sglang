@@ -44,6 +44,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             policy: PolicyKind::Sticky,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: Some(StickyConfig {
                 header_name: header_name.to_string(),
                 fallback_policy: PolicyKind::RoundRobin,
@@ -55,6 +56,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -66,6 +68,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         });
     }
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
@@ -293,6 +296,7 @@ async fn adding_a_worker_does_not_redistribute_existing_key() {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         })
         .unwrap();
     // Guard the premise: w2 really is an eligible candidate now, so the

@@ -332,6 +332,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(model_id.into())],
             bootstrap_port: None,
+            transfer_group: None,
         }))
     }
 
@@ -348,6 +349,7 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                decode_policy: None,
                 sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(
@@ -356,6 +358,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
+            load_monitor: crate::config::LoadMonitorConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
@@ -690,7 +693,7 @@ mod tests {
             "bigram and unigram hashes must differ for this prefix"
         );
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
 
         // Bigram-aware router (oracle.is_bigram == true): query hashes match
         // the bigram tree -> overlap > 0 and it picks the matched worker w0.

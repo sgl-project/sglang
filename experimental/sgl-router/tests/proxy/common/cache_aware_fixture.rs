@@ -28,12 +28,14 @@ pub fn config() -> Config {
             policy: PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            decode_policy: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
     }
 }

@@ -13,6 +13,7 @@ pub mod round_robin;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::load_monitor::LoadMonitor;
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -189,6 +190,9 @@ pub struct SelectionContext<'a> {
     routing_key: Option<&'a str>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    /// Engine-reported load source (Load Monitor). `None` when disabled —
+    /// load-aware policies then fall back to the local in-flight counter.
+    load_monitor: Option<&'a LoadMonitor>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -199,6 +203,7 @@ impl<'a> SelectionContext<'a> {
             routing_key: None,
             request_tokens: None,
             external_prefix: None,
+            load_monitor: None,
         }
     }
 
@@ -213,6 +218,7 @@ impl<'a> SelectionContext<'a> {
             routing_key,
             request_tokens: None,
             external_prefix: None,
+            load_monitor: None,
         }
     }
 
@@ -230,6 +236,30 @@ impl<'a> SelectionContext<'a> {
     ) -> Self {
         self.external_prefix = external_prefix;
         self
+    }
+
+    /// Attach the Load Monitor so load-aware policies score by the
+    /// engine-reported load instead of the router-local counter.
+    pub fn with_load_monitor(mut self, load_monitor: Option<&'a LoadMonitor>) -> Self {
+        self.load_monitor = load_monitor;
+        self
+    }
+
+    pub fn load_monitor(&self) -> Option<&LoadMonitor> {
+        self.load_monitor
+    }
+
+    /// Request-count load of `worker` as seen by load-aware policies:
+    /// the Load Monitor's fresh `running + waiting` (plus requests this
+    /// router dispatched since that report) when available, else the
+    /// local in-flight counter. Callers have already dropped non-fresh
+    /// workers from the candidate set when the monitor is enabled, so
+    /// the fallback only fires when the monitor is off.
+    pub fn worker_load(&self, worker: &Worker) -> usize {
+        self.load_monitor
+            .and_then(|lm| lm.load_score(&worker.url))
+            .map(|score| usize::try_from(score.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or_else(|| worker.active_load())
     }
 
     pub fn model(&self) -> &ModelId {
@@ -281,7 +311,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 
 #[derive(Debug, Default)]
 pub struct PolicyRegistry {
+    /// Primary policy: plain-mode workers, or the PREFILL pool in PD mode.
     by_model: DashMap<ModelId, Arc<dyn Policy>>,
+    /// Optional DECODE-pool policy (PD mode, `--decode-policy`). Absent →
+    /// the same-host affinity heuristic picks the decode peer.
+    decode_by_model: DashMap<ModelId, Arc<dyn Policy>>,
 }
 
 impl PolicyRegistry {
@@ -293,11 +327,22 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
+    pub fn insert_decode(&self, model: ModelId, policy: Arc<dyn Policy>) {
+        self.decode_by_model.insert(model, policy);
+    }
+
+    pub fn get_decode(&self, model: &ModelId) -> Option<Arc<dyn Policy>> {
+        self.decode_by_model.get(model).map(|p| p.clone())
+    }
+
     /// Inject the metrics registry into every registered policy. Called once
     /// at startup (after the registry is built) so metrics-emitting policies
     /// can record into the shared registry.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
+            entry.value().attach_metrics(Arc::clone(&metrics));
+        }
+        for entry in self.decode_by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
     }
