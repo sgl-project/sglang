@@ -473,18 +473,27 @@ class TokenizerControlMixin:
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        return await self._weight_update_session_call(
+        success, message = await self._weight_update_session_call(
             self.begin_weight_update_communicator, obj
         )
+        if success:
+            self._weight_update_session_open = True
+            self._weight_update_pending_version = None
+        return success, message
 
     async def end_weight_update(
         self: TokenizerManager,
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        return await self._weight_update_session_call(
+        success, message = await self._weight_update_session_call(
             self.end_weight_update_communicator, obj
         )
+        self._weight_update_session_open = False
+        if success:
+            self._update_weight_version_if_provided(self._weight_update_pending_version)
+        self._weight_update_pending_version = None
+        return success, message
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -1002,8 +1011,13 @@ class TokenizerControlMixin:
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
     ) -> None:
-        """Update weight version if provided."""
-        if weight_version is not None:
-            self.record_config_updates(
-                "tokenizer.weight_version", weight_version=weight_version
-            )
+        """Update weight version if provided; inside a weight-update session the
+        version is held until end_weight_update commits."""
+        if weight_version is None:
+            return
+        if self._weight_update_session_open:
+            self._weight_update_pending_version = weight_version
+            return
+        self.record_config_updates(
+            "tokenizer.weight_version", weight_version=weight_version
+        )

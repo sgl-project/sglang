@@ -265,3 +265,35 @@ class TestLoRAManagerStreamEntryPoints(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestWeightVersionDeferredToCommit(CustomTestCase):
+    """Inside a session the version reported by a bucket must not reach the
+    scheduler until end_weight_update commits; a failed commit drops it."""
+
+    def _manager(self):
+        mgr = _make_manager(scheduler=Mock())
+        mgr._weight_update_in_progress = True
+        return mgr
+
+    def test_bucket_version_is_held_while_the_session_is_open(self):
+        mgr = self._manager()
+        mgr.record_weight_version_after_update("7")
+        mgr.scheduler.record_weight_version_change.assert_not_called()
+        self.assertEqual(mgr._weight_update_pending_version, "7")
+
+    def test_outside_a_session_the_version_is_recorded_at_once(self):
+        mgr = _make_manager(scheduler=Mock())
+        mgr.record_weight_version_after_update("7")
+        mgr.scheduler.record_weight_version_change.assert_called_once_with(
+            new_version="7"
+        )
+
+    def test_commit_records_the_held_version(self):
+        mgr = self._manager()
+        mgr.record_weight_version_after_update("7")
+        mgr._weight_update_in_progress = False
+        mgr.record_weight_version_after_update(mgr._weight_update_pending_version)
+        mgr.scheduler.record_weight_version_change.assert_called_once_with(
+            new_version="7"
+        )

@@ -138,6 +138,9 @@ class SchedulerWeightUpdaterManager:
     # adapter's lifetime; a change means a partial stream, which the manager's
     # whole-adapter replace would silently zero.
     _lora_applied_names: Dict[str, frozenset] = field(default_factory=dict)
+    # Version reported by the buckets of the open session; recorded only when
+    # end_weight_update commits, so a version never names a half-applied update.
+    _weight_update_pending_version: Optional[str] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -162,6 +165,10 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
+        if self._weight_update_in_progress:
+            if weight_version is not None:
+                self._weight_update_pending_version = weight_version
+            return
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
@@ -396,6 +403,7 @@ class SchedulerWeightUpdaterManager:
         self._weight_update_selector = recv_req.selector
         self._weight_update_sync_base = recv_req.sync_base
         self._lora_stash = {}
+        self._weight_update_pending_version = None
         if recv_req.sync_base:
             for _, runner in self.get_model_runners(recv_req.selector):
                 runner.begin_weight_update()
@@ -417,6 +425,9 @@ class SchedulerWeightUpdaterManager:
                 runner.end_weight_update(run_post_load=run_post_load)
         success, message = self._apply_lora_stash(recv_req.expected_lora_checksums)
         self._weight_update_in_progress = False
+        if success:
+            self.record_weight_version_after_update(self._weight_update_pending_version)
+        self._weight_update_pending_version = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=success, message=message)
 
