@@ -57,12 +57,14 @@ from sglang.srt.multimodal.encoder_preprocessing import (
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
-    ensure_published,
+    assert_published,
     get_device,
     get_disagg,
     get_exec,
     get_mm,
     get_model,
+    get_parallel,
+    publish,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
@@ -448,8 +450,8 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
-        ensure_published(server_args, role="encoder")
-        logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
+        assert_published(server_args, role="encoder")
+        logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
         self.server_args = server_args
         configure_media_url_security(
             get_mm().allowed_media_domains,
@@ -469,7 +471,7 @@ class MMEncoder:
         self.load_config = LoadConfig(
             load_format=get_model().load_format,
             download_dir=server_args.download_dir,
-            model_loader_extra_config=server_args.model_loader_extra_config,
+            model_loader_extra_config=get_model().model_loader_extra_config,
             remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
@@ -490,12 +492,12 @@ class MMEncoder:
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
-            world_size=server_args.tp_size,
+            world_size=get_parallel().tp_size,
             rank=rank,
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
+        initialize_model_parallel(tensor_model_parallel_size=get_parallel().tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
         self.model = load_model(
@@ -553,7 +555,7 @@ class MMEncoder:
             )
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
-                server_args.tp_size,
+                get_parallel().tp_size,
                 embedding_store=embedding_store,
                 hidden_dims=self._embedding_dims,
                 tp_group=get_tp_group().cpu_group,
@@ -1031,7 +1033,7 @@ class MMEncoder:
         )
 
     def _broadcast_global_cache_mask(self, mask_tensor: torch.Tensor):
-        if self.server_args.tp_size > 1:
+        if get_parallel().tp_size > 1:
             torch.distributed.broadcast(
                 mask_tensor,
                 src=0,
@@ -2036,6 +2038,7 @@ async def _handle_encoder_worker_request(encoder: MMEncoder, request):
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+    publish(server_args, role="encoder")
     try:
         asyncio.run(run_encoder(server_args, schedule_path, dist_init_method, rank))
     except KeyboardInterrupt:
