@@ -1,0 +1,246 @@
+name: PR Test (HCU)
+
+on:
+  # A new commit does not inherit approval: maintainers must remove and re-add
+  # run-ci to authorize the current PR head SHA.
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "Full commit SHA to test (defaults to the selected ref)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: read # pr-gate reads workflow history for cooldown enforcement.
+  contents: read # Checkout and pr-gate read repository contents.
+  pull-requests: read # pr-gate live-fetches labels and draft state.
+
+env:
+  HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+  HCU_CI_SMOKE_MODEL: ${{ vars.HCU_CI_SMOKE_MODEL || '' }}
+  HCU_CI_PORT: "31000"
+
+concurrency:
+  group: pr-test-hcu-${{ github.event.pull_request.number || inputs.target_sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-changes:
+    name: Check HCU-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      hcu: ${{ steps.filter.outputs.hcu == 'true' || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Detect HCU-relevant changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            hcu:
+              - "python/**"
+              - "scripts/ci/**"
+              - "test/**"
+              - ".github/workflows/pr-test-hcu.yml"
+
+  plan:
+    name: Plan HCU smoke
+    needs: check-changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.plan.outputs.should_run }}
+      target_sha: ${{ steps.plan.outputs.target_sha }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Authorize target SHA
+        id: plan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
+          EVENT_LABEL: ${{ github.event.label.name || '' }}
+          HCU_RELEVANT: ${{ needs.check-changes.outputs.hcu }}
+          TARGET_SHA: ${{ github.event.pull_request.head.sha || inputs.target_sha || github.sha }}
+          HCU_ENABLED: ${{ vars.HCU_CI_ENABLED || '' }}
+          HCU_RUNNER_LABEL: ${{ vars.HCU_CI_RUNNER_LABEL || '' }}
+          HCU_IMAGE: ${{ vars.HCU_CI_IMAGE || '' }}
+          HCU_SMOKE_MODEL: ${{ vars.HCU_CI_SMOKE_MODEL || '' }}
+        run: |
+          set -euo pipefail
+
+          should_run=false
+          reason=""
+          if [[ "${HCU_RELEVANT}" != "true" ]]; then
+            reason="No HCU-relevant changes were detected."
+          elif [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ "${EVENT_ACTION}" == "labeled" && "${EVENT_LABEL}" == "run-ci" ]]; then
+              should_run=true
+            else
+              reason="The current PR head SHA has not been authorized by a run-ci label event."
+            fi
+          else
+            should_run=true
+          fi
+
+          if [[ "${should_run}" == "true" && "${HCU_ENABLED}" != "true" ]]; then
+            if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+              should_run=false
+              reason="HCU CI is not enabled in this repository."
+            else
+              echo "::error::HCU_CI_ENABLED must be true"
+              exit 1
+            fi
+          fi
+
+          if [[ "${should_run}" == "true" ]]; then
+            [[ "${TARGET_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || {
+              echo "::error::target_sha must be a full commit SHA"
+              exit 1
+            }
+            [[ -n "${HCU_RUNNER_LABEL}" && -n "${HCU_SMOKE_MODEL}" ]] || {
+              echo "::error::HCU runner label and smoke model must be configured"
+              exit 1
+            }
+            [[ "${HCU_IMAGE}" =~ ^.+@sha256:[0-9a-fA-F]{64}$ ]] || {
+              echo "::error::HCU_CI_IMAGE must use a full immutable sha256 digest"
+              exit 1
+            }
+          fi
+
+          {
+            echo "should_run=${should_run}"
+            echo "target_sha=${TARGET_SHA}"
+            echo "reason=${reason}"
+          } >> "${GITHUB_OUTPUT}"
+
+  pr-gate:
+    name: PR gate
+    needs: [check-changes, plan]
+    if: needs.plan.outputs.should_run == 'true' && github.event_name == 'pull_request'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+
+  hcu-smoke:
+    name: HCU smoke
+    needs: [check-changes, plan, pr-gate]
+    if: |
+      always() &&
+      needs.check-changes.result == 'success' &&
+      needs.plan.outputs.should_run == 'true' &&
+      (
+        (github.event_name == 'pull_request' && needs.pr-gate.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && needs.pr-gate.result == 'skipped')
+      )
+    runs-on: ${{ vars.HCU_CI_RUNNER_LABEL || 'hcu-ci-disabled' }}
+    timeout-minutes: 60
+    env:
+      HCU_CI_TARGET_SHA: ${{ needs.plan.outputs.target_sha }}
+      HCU_CI_CONTAINER_NAME: hcu_pr_${{ github.run_id }}_${{ github.run_attempt }}
+    steps:
+      - name: Reset workspace ownership
+        shell: bash
+        run: |
+          docker pull "${HCU_CI_IMAGE}"
+          docker run --rm \
+            --user root \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            "${HCU_CI_IMAGE}" \
+            bash -c 'chown -R "$1:$2" /workspace' -- "$(id -u)" "$(id -g)" || true
+
+      - name: Checkout exact target
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ env.HCU_CI_TARGET_SHA }}
+          persist-credentials: false
+          clean: true
+
+      - name: Run single-HCU smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${HCU_CI_TARGET_SHA}" ]]
+          mkdir -p .hcu-ci-logs
+          docker rm -f "${HCU_CI_CONTAINER_NAME}" >/dev/null 2>&1 || true
+          # /opt/hyhal is the Hygon host driver/runtime stack required by HCU devices.
+          docker run --rm \
+            --name "${HCU_CI_CONTAINER_NAME}" \
+            --shm-size 16g \
+            --device /dev/kfd \
+            --device /dev/dri \
+            --group-add video \
+            --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -v /opt/hyhal:/opt/hyhal:ro \
+            -v "${GITHUB_WORKSPACE}:/sglang-checkout" \
+            -v "${HCU_CI_SMOKE_MODEL}:${HCU_CI_SMOKE_MODEL}:ro" \
+            -e HCU_CI_REPO_ROOT=/sglang-checkout \
+            -e HCU_CI_LOG_DIR=/sglang-checkout/.hcu-ci-logs \
+            -e HCU_CI_SMOKE_MODEL \
+            -e HCU_CI_TARGET_SHA \
+            -e HCU_CI_PORT \
+            -e HIP_VISIBLE_DEVICES=0 \
+            -e ROCR_VISIBLE_DEVICES=0 \
+            -w /sglang-checkout \
+            "${HCU_CI_IMAGE}" \
+            bash scripts/ci/hcu/run_hcu_pr_smoke.sh
+
+      - name: Print logs on failure
+        if: failure()
+        shell: bash
+        run: tail -n 300 .hcu-ci-logs/*.log || true
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f "${HCU_CI_CONTAINER_NAME}" >/dev/null 2>&1 || true
+          docker run --rm \
+            --user root \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            "${HCU_CI_IMAGE}" \
+            bash -c 'chown -R "$1:$2" /workspace' -- "$(id -u)" "$(id -g)" || true
+
+  pr-test-hcu-finish:
+    name: PR Test (HCU) finish
+    needs: [check-changes, plan, pr-gate, hcu-smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate result
+        shell: bash
+        env:
+          CHECK_CHANGES_RESULT: ${{ needs.check-changes.result }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          SHOULD_RUN: ${{ needs.plan.outputs.should_run }}
+          GATE_RESULT: ${{ needs.pr-gate.result }}
+          SMOKE_RESULT: ${{ needs.hcu-smoke.result }}
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: |
+          if [[ "${CHECK_CHANGES_RESULT}" != "success" ]]; then
+            echo "::error::HCU change detection failed"
+            exit 1
+          fi
+          if [[ "${PLAN_RESULT}" != "success" ]]; then
+            echo "::error::HCU planning failed"
+            exit 1
+          fi
+          if [[ "${SHOULD_RUN}" == "true" && "${GATE_RESULT}" == "failure" ]]; then
+            echo "::error::HCU PR gate failed"
+            exit 1
+          fi
+          if [[ "${SHOULD_RUN}" == "true" && "${SMOKE_RESULT}" != "success" ]]; then
+            echo "::error::HCU smoke ended with ${SMOKE_RESULT}"
+            exit 1
+          fi
+          echo "${REASON:-HCU smoke passed.}"
