@@ -440,8 +440,13 @@ class SchedulerWeightUpdaterManager:
     ) -> Tuple[bool, str]:
         """Hand each streamed adapter to the LoRA manager's whole-adapter entry
         point (config from registration, upsert in place), then clear the stash."""
-        if expected_checksums is not None:
-            assert set(expected_checksums) == set(self._lora_stash)
+        if expected_checksums is not None and set(expected_checksums) != set(
+            self._lora_stash
+        ):
+            return False, (
+                f"[LORA-CHECK] streamed adapters {sorted(self._lora_stash)} do not "
+                f"match the expected manifest {sorted(expected_checksums)}"
+            )
         if not self._lora_stash:
             return True, "Success"
         # The attribute only exists when LoRA is enabled at server start.

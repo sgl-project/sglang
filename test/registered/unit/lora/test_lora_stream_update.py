@@ -174,6 +174,19 @@ class TestApplyLoraStash(CustomTestCase):
         self.assertFalse(success)
         self.assertIn("expected manifest", message)
 
+    def test_manifest_adapter_set_mismatch_fails(self):
+        """An adapter the sender promised but streamed nothing for is a sender bug
+        reported to the caller, not a scheduler kill."""
+        mgr, lora_manager = self._manager_with_lora()
+        mgr._stash_lora_tensors([(f"a:{LORA_A}", torch.zeros(1))])
+        success, message = mgr._apply_lora_stash(
+            {"a": {LORA_A: "x"}, "b": {LORA_A: "y"}}
+        )
+        self.assertFalse(success)
+        self.assertIn("expected manifest", message)
+        self.assertIn("'b'", message)
+        lora_manager.apply_streamed_adapter.assert_not_called()
+
     def test_forget_admits_a_different_tensor_set(self):
         """Without the forget on re-register/unload, a name that legitimately
         changes its tensor set is rejected as a partial stream forever."""
