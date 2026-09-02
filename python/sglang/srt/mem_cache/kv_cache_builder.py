@@ -143,6 +143,12 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     fields = {}
 
     backend = disagg.disaggregation_decode_retraction_backup
+    unified_hybrid_swa = memory.enable_unified_memory and tp_worker.is_hybrid_swa
+    if backend == "host_pool" and unified_hybrid_swa:
+        raise ValueError(
+            "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "
+            "decode retraction yet."
+        )
     if backend is None:
         kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
         full_tokens_per_layer = (
@@ -160,6 +166,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # recurrent state stays on cpu_tensor.
         supports_host_pool = (
             unified_draft_host_pool_supported
+            and not unified_hybrid_swa
             and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)

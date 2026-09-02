@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
@@ -243,9 +244,24 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 "--enable-unified-memory with decode KV offload currently "
                 "supports --hicache-storage-backend=file only."
             )
-            assert not resolved_view(server_args).uses_mamba_radix_cache, (
+            model_config = model_config_of(server_args)
+            assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory decode KV offload does not support "
                 "hybrid-Mamba models."
+            )
+            assert not model_config.is_hybrid_swa, (
+                "--enable-unified-memory decode KV offload does not support "
+                "hybrid-SWA H2D/D2H transfers yet."
+            )
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
+            model_config = model_config_of(server_args)
+            assert mambaish_config(model_config) is None, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support hybrid-Mamba models."
+            )
+            assert not model_config.is_hybrid_swa, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support hybrid-SWA H2D/D2H transfers yet."
             )
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
