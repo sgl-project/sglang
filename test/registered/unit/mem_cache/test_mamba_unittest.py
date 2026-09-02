@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -156,6 +157,50 @@ class TestMamba(unittest.TestCase):
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
+
+    def test_free_mamba_cache_clears_req_kv_extra_buffer_state(self):
+        class RecordingAllocator:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, slots):
+                self.freed.append(slots.clone())
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.enable_mamba_extra_buffer = True
+        pool.enable_mamba_extra_buffer_lazy = False
+        pool.mamba_ping_pong_track_buffer_size = 2
+        pool.mamba_allocator = RecordingAllocator()
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.tensor(
+            [[5, 6]], dtype=torch.int64
+        )
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                mamba_pool_idx=torch.tensor(4),
+                mamba_ping_pong_track_buffer=torch.tensor([5, 6]),
+                mamba_next_track_idx=0,
+                mamba_last_track_idx=1,
+                mamba_last_track_seqlen=32,
+                mamba_cow_src_index=torch.tensor(3),
+                mamba_needs_clear=True,
+            ),
+            mamba_branching_seqlen=16,
+        )
+
+        pool.free_mamba_cache(req)
+
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.kv.mamba_next_track_idx)
+        self.assertIsNone(req.kv.mamba_last_track_idx)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertFalse(req.kv.mamba_needs_clear)
+        self.assertIsNone(req.mamba_branching_seqlen)
+        self.assertEqual(len(pool.mamba_allocator.freed), 2)
+        torch.testing.assert_close(pool.mamba_allocator.freed[0], torch.tensor([4]))
+        torch.testing.assert_close(pool.mamba_allocator.freed[1], torch.tensor([5, 6]))
 
     def test_mamba_pool_deduplicated_conv_window_axis(self):
         class WindowFirstMambaPool(MambaPool):

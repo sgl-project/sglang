@@ -1142,7 +1142,7 @@ def append_state_component(
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    if getattr(pool, "use_dsa", False):
+    if hasattr(pool, "full_kv_pool"):
         pool = pool.full_kv_pool
     if not pool.kpool_use_compress:
         return []

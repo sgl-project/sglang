@@ -8,12 +8,26 @@ import torch
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import get_dsa_tail_state_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDSATailReqPoolIndex(unittest.TestCase):
+    def test_tail_indices_support_plain_and_hybrid_dsa_pools(self):
+        plain_pool = SimpleNamespace(
+            use_dsa=True,
+            kpool_use_compress=True,
+            index_kpool=8,
+            tail_extra_slots=2,
+        )
+        hybrid_pool = SimpleNamespace(use_dsa=True, full_kv_pool=plain_pool)
+        expected = [3, 6, 3, 0, 0, 10]
+
+        self.assertEqual(get_dsa_tail_state_indices(plain_pool, 3, 19), expected)
+        self.assertEqual(get_dsa_tail_state_indices(hybrid_pool, 3, 19), expected)
+
     def test_decode_preallocation_uses_kv_owned_req_pool_idx(self):
         req = SimpleNamespace(
             rid="decode-dsa-tail",
