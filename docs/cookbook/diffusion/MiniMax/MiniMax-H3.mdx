@@ -977,6 +977,59 @@ fails closed when the selected format, projection, or topology is incompatible.
 
 </Tab>
 
+<Tab title="Cube sparse attention">
+
+Cube sparse attention applies TopK sparsity only to H3's 3D visual streams.
+Text, audio, standalone reference images, and the text-only token refiner stay
+dense. It runs on pure PyTorch plus FlexAttention, so it has no third-party
+kernel dependency.
+
+Select it for the H3 transformer with
+`--component-attention-backends transformer=cube_sparse_attn` and pass
+`--attention-backend-config` with both `local_cube_size` and
+`topk_ratio_list`. Scoping the backend leaves the text encoder on its native
+backend:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 8 \
+  --ulysses-degree 8 \
+  --performance-mode speed \
+  --component-attention-backends transformer=cube_sparse_attn \
+  --attention-backend-config '{"local_cube_size": [4, 4, 4], "topk_ratio_list": [1.0, 1.0, 0.8, 0.7, 0.6, 0.5, 0.5]}' \
+  --port 30010
+```
+
+- `local_cube_size` is the `(T, H, W)` cube that groups neighboring latent
+  tokens into one attention block. It must have exactly three entries.
+- `topk_ratio_list` sets the per-step keep ratio and must have exactly one
+  entry per denoise step, each in `(0, 1]`. A ratio of `1.0` keeps a step
+  on H3's native dense attention path; smaller values select the FlexAttention
+  sparse path and drop more blocks. The example above matches a request with
+  `num_inference_steps: 8`, whose endpoint-inclusive sigma schedule has seven
+  denoise updates.
+
+Cube labeling is coordinate-driven. FL2VA keyframes share the target video's
+position grid, so a keyframe token and a target token at the same `(T, H, W)`
+coordinate receive the same semantic cube label. Duplicate coordinates do not
+extend the temporal grid; a semantic cube can therefore span multiple physical
+attention blocks. In Ref2VA, standalone reference images remain dense, while
+reference videos and the target video contribute to one global TopK candidate
+pool rather than receiving separate per-stream quotas.
+
+<Warning>
+Cube sparse attention is an approximate backend and is not a consistency
+ground-truth mode. `topk_ratio_list` length must equal the denoise step count
+or the server rejects the request. Cube sparse attention does not support Ring
+parallelism; use `--ulysses-degree` without `--ring-degree`. FlexAttention's
+routing overhead can outweigh sparse-kernel savings on short sequences, so
+benchmark latency as well as visual and audio quality on the target workload.
+</Warning>
+
+</Tab>
+
 <Tab title="Encoder scheduling">
 
 The picker explicitly writes `--encoder-parallel auto` in every single-node
