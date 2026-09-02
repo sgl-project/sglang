@@ -40,6 +40,9 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        # True once a canonical `[TOOL_CALLS] [` array has started: the rest of the
+        # array has no marker of its own, so parsing must stay on the base path.
+        self._json_array_mode = False
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -93,6 +96,7 @@ class MistralDetector(BaseFormatDetector):
         # Loop to extract all consecutive compact tool calls.
         all_calls: list = []
         remaining = tool_part
+        parsed_any = False
         while remaining:
             parsed = self._try_parse_compact_args_format(remaining)
             if not parsed:
@@ -103,9 +107,15 @@ class MistralDetector(BaseFormatDetector):
             )
             all_calls.extend(new_calls)
             remaining = remaining[consumed:].strip()
+            parsed_any = True
 
-        if not all_calls:
+        if not parsed_any:
+            # Nothing was consumed, so `remaining` is still raw markup: drop it.
             return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        if self._tool_calls_marker in remaining:
+            # A call that never finished (truncated generation) is markup, not text.
+            remaining = ""
 
         combined_normal = (
             (normal_text + " " + remaining).strip() if remaining else normal_text
@@ -121,79 +131,150 @@ class MistralDetector(BaseFormatDetector):
         For the compact format, this buffers until the JSON arguments payload is complete,
         then emits two items: tool name (with empty parameters) and a full arguments JSON
         chunk (OpenAI streaming semantics).
+
+        The buffer is drained in a loop because a single increment can carry leading
+        text, one or more complete compact calls and trailing text at once. Whatever
+        remains after a call has to be re-examined here rather than deferred to the
+        next increment -- for the last increment of a stream there is none.
         """
         self._buffer += new_text
-        current_text = self._buffer
+        normal_text_parts: List[str] = []
+        calls: List[ToolCallItem] = []
 
-        # No marker: either flush as normal text or keep buffering a partial marker.
-        if self._tool_calls_marker not in current_text:
-            if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
-                normal_text = self._buffer
+        while self._buffer:
+            current_text = self._buffer
+
+            # Inside a canonical array: its continuation (`, {...}]`) carries no
+            # marker of its own, so it has to stay on the base parsing path.
+            if self._json_array_mode:
+                self._drain_json_array(tools, normal_text_parts, calls)
+                if self._json_array_mode:
+                    break
+                continue
+
+            # No marker: either flush as normal text or keep buffering a partial marker.
+            if self._tool_calls_marker not in current_text:
+                if self._ends_with_partial_token(current_text, self._tool_calls_marker):
+                    break
                 self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=normal_text)
+                normal_text_parts.append(current_text.replace(self.eot_token, ""))
+                break
+
+            # If there's leading normal text before the marker, stream it out first.
+            marker_pos = current_text.find(self._tool_calls_marker)
+            if marker_pos > 0:
+                normal_text_parts.append(current_text[:marker_pos])
+                self._buffer = current_text[marker_pos:]
+                continue
+
+            # Build tool indices if not already built.
+            if not hasattr(self, "_tool_indices"):
+                self._tool_indices = self._get_tool_indices(tools)
+
+            # Compact format: `[TOOL_CALLS]name[ARGS]{...}`.
+            compact = self._try_parse_compact_args_format(current_text)
+            if compact:
+                func_name, args_obj, consumed = compact
+                self._buffer = current_text[consumed:]
+                if func_name not in self._tool_indices:
+                    # Drop just this call, the way parse_base_json does. Emitting
+                    # the buffer as normal text would hand the raw `[TOOL_CALLS]`
+                    # markup to the client as assistant content.
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    continue
+                calls.extend(self._emit_compact_call(func_name, args_obj))
+                continue
+
+            # Canonical format: hand the array over to the base JSON parser.
+            if self.bot_token in current_text:
+                self._json_array_mode = True
+                continue
+
+            # Otherwise, keep buffering.
+            break
+
+        return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
+
+    def _drain_json_array(
+        self,
+        tools: List[Tool],
+        normal_text_parts: List[str],
+        calls: List[ToolCallItem],
+    ) -> None:
+        """Run the BaseFormatDetector JSON streaming logic until it stalls.
+
+        The base implementation performs at most one action per call (send a tool
+        name, or send one arguments diff), relying on a later increment to carry
+        the rest. The last increment of a stream has no successor, so drive it here
+        until it stops making progress -- otherwise a name arriving in the final
+        chunk is emitted without its arguments.
+        """
+        while True:
+            # `]` closes the array: consume it here and leave array mode, so any
+            # trailing text or compact call goes back through the marker path.
+            if self.current_tool_id > 0 and self._buffer.startswith(self.eot_token):
+                self._buffer = self._buffer[len(self.eot_token) :]
+                self._json_array_mode = False
+                return
+
+            # A `, ` separator split across increments has to be held: the base
+            # parser only guards against a partial bot_token and would otherwise
+            # flush the separator, and then the whole next object, as normal text.
+            if (
+                self.current_tool_id > 0
+                and self.tool_call_separator.startswith(self._buffer)
+                and len(self._buffer) < len(self.tool_call_separator)
+            ):
+                return
+
+            before = self._buffer
+            result = super().parse_streaming_increment(new_text="", tools=tools)
+            if result.normal_text:
+                normal_text_parts.append(result.normal_text)
+            calls.extend(result.calls or [])
+            if self._buffer == before and not result.calls:
+                return
+
+    def _emit_compact_call(self, func_name: str, args_obj: Any) -> List[ToolCallItem]:
+        """Record one completed compact call and return its two streaming items."""
+        # Initialize state if this is the first tool call.
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = []
+
+        args_json = json.dumps(args_obj, ensure_ascii=False)
+        tool_id = self.current_tool_id
+
+        # Ensure arrays are large enough.
+        while len(self.prev_tool_call_arr) <= tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= tool_id:
+            self.streamed_args_for_tool.append("")
+
+        self.prev_tool_call_arr[tool_id] = {"name": func_name, "arguments": args_obj}
+        self.streamed_args_for_tool[tool_id] = args_json
+
+        self.current_tool_id += 1
+        self.current_tool_name_sent = False
+        return [
+            ToolCallItem(tool_index=tool_id, name=func_name, parameters=""),
+            ToolCallItem(tool_index=tool_id, name=None, parameters=args_json),
+        ]
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text that was held back waiting for a marker that never came.
+
+        Anything still buffered when the stream ends is either plain text kept
+        for the next increment, or an unfinished tool call. The latter is markup
+        and must not reach the client as content.
+        """
+        held, self._buffer = self._buffer, ""
+        if self._json_array_mode or self._tool_calls_marker in held:
             return StreamingParseResult()
-
-        # If there's leading normal text before the marker, stream it out first.
-        marker_pos = current_text.find(self._tool_calls_marker)
-        if marker_pos > 0:
-            normal_text = current_text[:marker_pos]
-            self._buffer = current_text[marker_pos:]
-            return StreamingParseResult(normal_text=normal_text)
-
-        # Build tool indices if not already built.
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
-        # Try compact first; JSON-array requires `] [` and often arrives later in streaming.
-        compact = self._try_parse_compact_args_format(current_text)
-        if compact:
-            func_name, args_obj, consumed = compact
-            if func_name not in self._tool_indices:
-                # Unknown tool: treat as normal text and reset state.
-                normal_text = self._buffer
-                self._buffer = ""
-                return StreamingParseResult(normal_text=normal_text)
-
-            # Initialize state if this is the first tool call.
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = []
-
-            args_json = json.dumps(args_obj, ensure_ascii=False)
-            tool_id = self.current_tool_id
-
-            # Ensure arrays are large enough.
-            while len(self.prev_tool_call_arr) <= tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= tool_id:
-                self.streamed_args_for_tool.append("")
-
-            self.prev_tool_call_arr[tool_id] = {
-                "name": func_name,
-                "arguments": args_obj,
-            }
-            self.streamed_args_for_tool[tool_id] = args_json
-
-            calls: List[ToolCallItem] = [
-                ToolCallItem(tool_index=tool_id, name=func_name, parameters=""),
-                ToolCallItem(tool_index=tool_id, name=None, parameters=args_json),
-            ]
-
-            # Consume parsed content from buffer.
-            self._buffer = current_text[consumed:]
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
-            return StreamingParseResult(normal_text="", calls=calls)
-
-        # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
-        if self.bot_token in current_text:
-            return super().parse_streaming_increment(new_text="", tools=tools)
-
-        # Otherwise, keep buffering.
-        return StreamingParseResult()
+        return StreamingParseResult(normal_text=held.replace(self.eot_token, ""))
 
     def _try_parse_compact_args_format(
         self, text: str
