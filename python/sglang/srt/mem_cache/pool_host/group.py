@@ -22,6 +22,14 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
+    # Obtain this pool's device rows FOR the anchor's ids rather than from its
+    # own id space. Set when the two pools do not have independent id spaces:
+    # under the unified memory pool the full side owns the virtual ids, so the
+    # sliding-window side cannot run its own `alloc` (that trips
+    # `assert is_id_owner`) -- it binds pages for the anchor's ids and returns
+    # their kernel-facing form. Returns None when it cannot fund them, which
+    # the caller treats like a failed alloc.
+    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 

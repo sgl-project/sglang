@@ -142,14 +142,19 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """
 
     class _Peer:
-        def __init__(self, gate):
+        def __init__(self, gate, host_gate=None):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
+            self.host_transfer_move_gate = host_gate
 
         def _is_frontier_transparent(self):
             return False
+
+        # Borrowed, not reimplemented: a hand-written predicate here would let
+        # the stub keep passing after the real one grows another gate slot.
+        moves_blocked = MultiEndedAllocator.moves_blocked
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from
@@ -163,8 +168,8 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
 
         _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
 
-    def _credit(self, gate):
-        peer = self._Peer(gate)
+    def _credit(self, gate, host_gate=None):
+        peer = self._Peer(gate, host_gate)
         owner = self._Owner(peer)
         return MultiEndedAllocator._peer_drainable_hole_bytes(owner)
 
@@ -175,6 +180,12 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         self.assertEqual(self._credit(gate=lambda: True), 4 * 512)
         # Gate closed: an urgent flush would move nothing, so credit nothing.
         self.assertEqual(self._credit(gate=lambda: False), 0)
+        # The HiCache gate is a SECOND slot, not a replacement: an in-flight
+        # host transfer freezes the mover just as a PD transfer does, and
+        # either one closed is enough.
+        self.assertEqual(self._credit(gate=None, host_gate=lambda: True), 4 * 512)
+        self.assertEqual(self._credit(gate=None, host_gate=lambda: False), 0)
+        self.assertEqual(self._credit(gate=lambda: True, host_gate=lambda: False), 0)
 
 
 class TestMoveGateRejectsNonPdNode(CustomTestCase):

@@ -126,6 +126,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
+        # HiCache indexes the full sub-pool's per-layer views directly, so it
+        # needs the kernel-facing translate. `host_capacity_tokens` is set by
+        # `init_unified_mamba_pools`, which knows the STATIC token cap; `size`
+        # here is the dynamic whole-buffer view and would size the host pool
+        # against the entire buffer rather than the configured limit.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
+
     # -- size: dynamic --
     @property
     def size(self) -> int:
@@ -315,6 +324,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_attn_allocator.disagg_move_gate = gate
         self.mamba_allocator.disagg_move_gate = gate
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the HiCache move gate on both sub-allocators.
+
+        A host transfer resolves its device rows to kernel-facing ids and then
+        reads/writes them asynchronously on the transfer stream; a relocation
+        in that window moves the bytes underneath it. The mamba end is gated
+        too even though its state is not backed up yet: the gate is about the
+        MOVER, and the two ends compact as peers.
+        """
+        assert self.lazy_compaction, (
+            "HiCache with the unified memory pool requires lazy compaction "
+            "(eager free-path compaction moves pages under in-flight host "
+            "transfers)."
+        )
+        self.full_attn_allocator.host_transfer_move_gate = gate
+        self.mamba_allocator.host_transfer_move_gate = gate
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)

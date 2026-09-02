@@ -385,8 +385,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             _STATS_INSTANCES.add(self)
             _install_signal_handlers_once()
         self.live_page_count = 0
-        # While this returns False, `_flush` must not relocate any page.
+        # While either returns False, `_flush` must not relocate any page: a
+        # page's physical address is published to a reader that does not go
+        # through the allocator (an RDMA peer, or a HiCache host transfer that
+        # resolved its device indices on another stream). Two slots rather than
+        # one composed predicate because the two are installed independently
+        # and a decode node under PD can run HiCache as well.
         self.disagg_move_gate: Optional[Callable[[], bool]] = None
+        self.host_transfer_move_gate: Optional[Callable[[], bool]] = None
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
         # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
         # write-race check. Single slot: at most ONE forward in flight per call
@@ -691,11 +697,19 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         neighbor = self._growth_side_neighbor()
         if neighbor is None or not neighbor.lazy_compaction:
             return 0
-        if neighbor.disagg_move_gate is not None and not neighbor.disagg_move_gate():
-            # Not realizable: a PD transfer blocks the neighbour's compaction, so
-            # crediting these bytes would admit work no flush can satisfy.
+        if neighbor.moves_blocked():
+            # Not realizable: an in-flight transfer blocks the neighbour's
+            # compaction, so crediting these bytes would admit work no flush
+            # can satisfy.
             return 0
         return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
+
+    def moves_blocked(self) -> bool:
+        """Whether any installed gate currently forbids relocating pages."""
+        for gate in (self.disagg_move_gate, self.host_transfer_move_gate):
+            if gate is not None and not gate():
+                return True
+        return False
 
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a neighbor urgent-flush; alloc gates use
@@ -1398,9 +1412,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending_impl(freed_physical_pages)
 
     def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
-        assert self.disagg_move_gate is None, (
-            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran with "
-            "a PD-disaggregation move gate installed; PD requires lazy_compaction."
+        assert self.disagg_move_gate is None and self.host_transfer_move_gate is None, (
+            f"_compact_pending({self.sub_pool_name!r}): eager compaction ran "
+            "with a move gate installed; PD disaggregation and HiCache both "
+            "require lazy_compaction."
         )
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
         if not freed_set:
@@ -1754,7 +1769,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not self.lazy_compaction:
             return 0
-        if self.disagg_move_gate is not None and not self.disagg_move_gate():
+        if self.moves_blocked():
             # Holes stay in the free list; the next flush picks them up.
             return 0
         self._stats_n_flush_calls += 1
@@ -2144,7 +2159,7 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             p = p.low_peer if side == "low" else p.high_peer
         if p is None or not p.lazy_compaction:
             return 0
-        if p.disagg_move_gate is not None and not p.disagg_move_gate():
+        if p.moves_blocked():
             return 0
         return len(p._free_phys_pages) * p.entry_bytes_per_page
 

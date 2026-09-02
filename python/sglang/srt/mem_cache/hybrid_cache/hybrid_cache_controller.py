@@ -853,6 +853,39 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             if pool.device_indices is not None or pool.host_indices is None:
                 continue
+            if entry.device_indices_from_anchor_fn is not None:
+                # This pool has no id space of its own -- the anchor owns the
+                # virtual ids (the unified memory pool's full/SWA pair) -- so
+                # it cannot run the ordinary `alloc_fn` below, which would trip
+                # the sub-allocator's `assert is_id_owner`. It binds its own
+                # pages FOR the anchor's ids instead.
+                if kv_device_indices is None:
+                    rollback_allocated()
+                    return None
+                # Take the anchor's TRAILING rows, as many as this pool's host
+                # side has. A sliding-window pool loads only the trailing
+                # window (`tail_keys`), not the whole prefix the anchor covers,
+                # which is exactly the count the `alloc_fn(len(host_indices))`
+                # branch below would have produced. Deriving from the full
+                # anchor instead both misaligns the transfer and hands the
+                # radix node device rows for out-of-window positions -- whose
+                # pages the per-request ratchet has already released.
+                want = len(pool.host_indices)
+                assert want <= len(kv_device_indices), (
+                    f"{pool.name}: host side wants {want} rows but the anchor "
+                    f"only loaded {len(kv_device_indices)}"
+                )
+                indices = entry.device_indices_from_anchor_fn(
+                    kv_device_indices[len(kv_device_indices) - want :]
+                )
+                if indices is None:
+                    # The side pool could not fund its rows. Same contract as a
+                    # failed alloc below: undo everything and let the caller
+                    # skip this load-back.
+                    rollback_allocated()
+                    return None
+                pool.device_indices = indices
+                continue
             # device_alloc_fn / device_free_fn override entry.device_pool's
             # methods for pools whose device_pool is a raw KV pool (layout)
             # rather than an allocator (e.g. SWA).

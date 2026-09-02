@@ -54,21 +54,42 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
+    @staticmethod
+    def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
+        """Device ids as THIS pool's buffers are indexed.
+
+        Identity for every static pool. A virtual-id pool (the unified memory
+        pool) installs `host_transfer_translate`: the controller allocates and
+        stores VIRTUAL ids, while the L2 kernels index per-layer views in
+        kernel-facing space. Resolved HERE, on the caller's stream just before
+        the transfer is queued, so it reads the live virtual->physical map --
+        translating when the operation was first enqueued would go stale under
+        a compaction. The window from here to completion is covered by the
+        host-transfer move gate, which freezes the mover.
+        """
+        # getattr: not every device pool derives from `KVCache` (the mamba
+        # state pool does not), so the attribute may be absent entirely.
+        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
+        if translate is None:
+            return transfer.device_indices
+        return translate(transfer.device_indices)
+
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        device_indices = [self._resolve_device_indices(t) for t in transfers]
         start_event = self._start_event(None)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         with device_module.stream(self.device_to_host_stream):
             start_event.wait(self.device_to_host_stream)
             ack_start.record()
-            for transfer in transfers:
+            for transfer, dev_idx in zip(transfers, device_indices):
                 transfer.host_pool.backup_from_device_all_layer(
                     transfer.device_pool,
                     transfer.host_indices,
-                    transfer.device_indices,
+                    dev_idx,
                     self.io_backend,
                 )
             ack_finish.record()
-            self._record_stream(transfers, self.device_to_host_stream)
+            self._record_stream(transfers, self.device_to_host_stream, device_indices)
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     def submit_host_to_device(
@@ -79,6 +100,7 @@ class L2TransferEngine:
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
+        device_indices = {id(t): self._resolve_device_indices(t) for t in transfers}
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
         primary = transfers[0] if transfers else None
@@ -101,7 +123,7 @@ class L2TransferEngine:
                     transfer.host_pool.load_to_device_per_layer(
                         transfer.device_pool,
                         transfer.host_indices,
-                        transfer.device_indices,
+                        device_indices[id(transfer)],
                         local_layer_id,
                         self.io_backend,
                         is_draft=transfer.is_draft,
@@ -109,7 +131,9 @@ class L2TransferEngine:
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
             ack_finish.record()
-            self._record_stream(transfers, self.host_to_device_stream)
+            self._record_stream(
+                transfers, self.host_to_device_stream, device_indices.values()
+            )
         return TransferCompletion(ack_start, ack_finish, timing_enabled)
 
     @staticmethod
@@ -120,8 +144,14 @@ class L2TransferEngine:
         return start_event
 
     @staticmethod
-    def _record_stream(transfers: list[L2Transfer], stream) -> None:
+    def _record_stream(transfers: list[L2Transfer], stream, resolved=()) -> None:
+        tensors = []
         for transfer in transfers:
-            for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
-                    indices.record_stream(stream)
+            tensors.extend((transfer.host_indices, transfer.device_indices))
+        # A translated device-index tensor is a fresh gather owned by nobody
+        # else; without this it can be freed while the transfer stream is still
+        # reading it.
+        tensors.extend(resolved)
+        for indices in tensors:
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(stream)

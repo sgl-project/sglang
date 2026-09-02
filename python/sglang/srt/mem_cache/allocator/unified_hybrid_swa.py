@@ -130,6 +130,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,
         )
+        # HiCache addresses each sub-pool's per-layer views directly, so it
+        # needs a TOKEN capacity to size the host pool against:
+        # `size` on these sub-pools is a kernel-facing ROW count.
+        kvcache.full_kv_pool.host_capacity_tokens = full_max_total_num_tokens
+        kvcache.swa_kv_pool.host_capacity_tokens = swa_max_total_num_tokens
+        # Only the FULL side needs the id translate. The controller hands the
+        # anchor transfer the tree's VIRTUAL token ids, but the SWA component's
+        # indices are produced by `UnifiedRadixCache` through
+        # `translate_loc_from_full_to_swa`, which on this allocator already
+        # returns swa KERNEL-FACING ids -- translating again would scale them a
+        # second time by the sub-pool's per-page block count and run off the
+        # end of the v2p table.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
@@ -355,6 +370,58 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
         self.full_attn_allocator.disagg_move_gate = gate
         self.swa_attn_allocator.disagg_move_gate = gate
+
+    def bind_swa_for_loaded_rows(
+        self, full_token_ids: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """HiCache load-back: give the sliding-window side real pages for rows
+        the anchor just loaded, and return their kernel-facing ids.
+
+        The static composite allocates the SWA rows outright
+        (`swa_attn_allocator.alloc(n)`), which this composite forbids -- the
+        full side owns the virtual ids. But the rows cannot merely be
+        TRANSLATED either: a restored node's virtual pages have no
+        sliding-window binding yet, and `translate_kv_loc_for_kernel` clamps an
+        unbound page to the sink instead of failing, so a translate-only
+        derivation hands back sink ids for every row. The node then owns
+        sliding-window rows the allocator never had live, which surfaces later
+        as the idle leak invariant.
+
+        So bind first, then translate. `alloc_with_virtual` is the
+        physical-holding non-owner's alloc: it takes physical pages FOR the
+        caller's virtual page ids, which is exactly the full/SWA pairing.
+        Returns None when the sliding-window side cannot fund the binding, so
+        the caller can roll the whole load-back back.
+        """
+        ids = full_token_ids.to(torch.int64)
+        if ids.numel() == 0:
+            return ids
+        ps = self.page_size
+        pages = torch.unique(ids // ps)
+        # `> 0` strict: -1 is tombstoned, 0 is the padding sink; neither is a
+        # binding, and both must be (re)bound before the rows are usable.
+        unbound = pages[self.swa_attn_allocator.virtual_to_physical[pages] <= 0]
+        need = int(unbound.numel()) * ps
+        if need:
+            if need > self.swa_available_size():
+                return None
+            self.swa_attn_allocator.alloc_with_virtual(unbound)
+        return self.translate_loc_from_full_to_swa(ids)
+
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Install the HiCache move gate on both attention sub-allocators.
+
+        A host transfer resolves its device indices to kernel-facing ids on the
+        transfer stream and then reads/writes those rows asynchronously; a
+        relocation in that window silently moves the bytes underneath it.
+        """
+        assert self.lazy_compaction, (
+            "HiCache with the unified memory pool requires lazy compaction "
+            "(eager free-path compaction moves pages under in-flight host "
+            "transfers)."
+        )
+        self.full_attn_allocator.host_transfer_move_gate = gate
+        self.swa_attn_allocator.host_transfer_move_gate = gate
 
     def translate_kv_loc_for_kernel(
         self,
