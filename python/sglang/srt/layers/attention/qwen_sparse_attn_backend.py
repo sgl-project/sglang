@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import math
 from copy import copy
+from enum import Enum
 from functools import lru_cache
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import msgspec
 import torch
@@ -45,6 +46,18 @@ logger = logging.getLogger(__name__)
 _TRTLLM_SPARSE_PAGE_SIZE = 64
 
 
+class QSASparseDecodeBackendKind(str, Enum):
+    TRTLLM = "FlashInfer TRTLLM"
+    KDA_SM121 = "Qwen3.8 KDA / SM121"
+    FA2 = "classic FlashAttention / FA2"
+    FA4_CUTE = "FlashAttention-4 / CuTe"
+
+
+class QSASparseDecodeBackend(msgspec.Struct, frozen=True):
+    kind: QSASparseDecodeBackendKind
+    kernel: Callable
+
+
 @lru_cache(maxsize=1)
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention.
@@ -68,40 +81,82 @@ def _resolve_trtllm_sparse_decode():
 
 
 @lru_cache(maxsize=1)
-def _resolve_flash_attn_varlen_func():
-    """Resolve the packed sparse-decode attention kernel.
-
-    SM121 uses the Qwen3.8 KDA kernel. Other architectures prefer classic
-    flash_attn (FA2) when installed, then flash-attn-4's cute interface.
-    """
+def _resolve_sm121_kda_sparse_decode():
     from sglang.srt.utils import is_sm121
 
-    if is_sm121():
-        from sglang.kernels.ops.attention import (
-            qwen38_qsa_sm121_varlen,
-        )
+    if not is_sm121():
+        return None
+    from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 
-        return qwen38_qsa_sm121_varlen
+    return qwen38_qsa_sm121_varlen
+
+
+@lru_cache(maxsize=1)
+def _resolve_classic_fa2_sparse_decode():
     try:
         from flash_attn import flash_attn_varlen_func
-
-        return flash_attn_varlen_func
     except ImportError:
-        pass
+        return None
+    return flash_attn_varlen_func
+
+
+@lru_cache(maxsize=1)
+def _resolve_fa4_cute_sparse_decode():
     try:
         from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
+    except ImportError:
+        return None
 
-        def flash_attn_varlen_func(*args, **kwargs):
-            output = cute_varlen_func(*args, **kwargs)
-            # The cute interface returns (out, lse); lse is None here.
-            return output[0] if isinstance(output, tuple) else output
+    def flash_attn_varlen_func(*args, **kwargs):
+        output = cute_varlen_func(*args, **kwargs)
+        # The cute interface returns (out, lse); lse is None here.
+        return output[0] if isinstance(output, tuple) else output
 
-        return flash_attn_varlen_func
-    except ImportError as exc:
-        raise ImportError(
-            "QSA decode requires flash_attn (FA2) or flash-attn-4 "
-            "(FA4 cute) for its packed varlen fallback."
-        ) from exc
+    return flash_attn_varlen_func
+
+
+def _nvidia_compute_capability() -> Optional[Tuple[int, int]]:
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability()
+
+
+@lru_cache(maxsize=1)
+def resolve_qsa_sparse_decode_backend() -> QSASparseDecodeBackend:
+    """Resolve QSA sparse decode, rejecting the invalid SM89 FA4 fallback."""
+
+    trtllm_decode = _resolve_trtllm_sparse_decode()
+    if trtllm_decode is not None:
+        return QSASparseDecodeBackend(QSASparseDecodeBackendKind.TRTLLM, trtllm_decode)
+
+    sm121_kda_decode = _resolve_sm121_kda_sparse_decode()
+    if sm121_kda_decode is not None:
+        return QSASparseDecodeBackend(
+            QSASparseDecodeBackendKind.KDA_SM121, sm121_kda_decode
+        )
+
+    fa2_decode = _resolve_classic_fa2_sparse_decode()
+    if fa2_decode is not None:
+        return QSASparseDecodeBackend(QSASparseDecodeBackendKind.FA2, fa2_decode)
+
+    capability = _nvidia_compute_capability()
+    if capability == (8, 9):
+        raise RuntimeError(
+            "QSA sparse decode on NVIDIA SM89 requires classic FlashAttention / "
+            "FA2, but it is not importable. FlashAttention-4 / CuTe is not a "
+            "validated QSA fallback on SM89/Ada. Install a compatible FA2 build "
+            "before starting SGLang."
+        )
+
+    # Every other architecture and ROCm keep the original import-based policy.
+    fa4_decode = _resolve_fa4_cute_sparse_decode()
+    if fa4_decode is not None:
+        return QSASparseDecodeBackend(QSASparseDecodeBackendKind.FA4_CUTE, fa4_decode)
+
+    raise ImportError(
+        "QSA decode requires flash_attn (FA2) or flash-attn-4 "
+        "(FA4 cute) for its packed varlen fallback."
+    )
 
 
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
@@ -265,7 +320,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if int(getattr(spec_info, "topk", 1) or 1) != 1:
             raise NotImplementedError(
-                "Qwen QSA target verification supports only " "speculative_eagle_topk=1"
+                "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
         if draft_tokens > self.compress_ratio:
@@ -1652,8 +1707,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        trtllm_decode = _resolve_trtllm_sparse_decode()
-        if trtllm_decode is not None:
+        decode_backend = resolve_qsa_sparse_decode_backend()
+        if decode_backend.kind == QSASparseDecodeBackendKind.TRTLLM:
             return self._forward_trtllm_sparse(
                 q,
                 k_buffer,
@@ -1662,10 +1717,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 forward_batch,
                 metadata,
                 topk_indices,
-                trtllm_decode,
+                decode_backend.kernel,
             )
 
-        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
+        flash_attn_varlen_func = decode_backend.kernel
         batch, topk = topk_indices.shape
         sequence_lens = metadata.sequence_lengths
         if metadata.is_cuda_graph:
@@ -1877,7 +1932,10 @@ class QwenSparseMultiStepDraftBackend:
 
 __all__ = [
     "is_qwen_qsa",
+    "QSASparseDecodeBackend",
+    "QSASparseDecodeBackendKind",
     "QwenSparseAttnMetadata",
     "QwenSparseAttnBackend",
     "QwenSparseMultiStepDraftBackend",
+    "resolve_qsa_sparse_decode_backend",
 ]
