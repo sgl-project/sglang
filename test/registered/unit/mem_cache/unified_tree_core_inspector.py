@@ -81,6 +81,10 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         """The node's pending write-through id, if any."""
         return self.node_by_id(node_id).write_through_pending_id
 
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        """Whether the node is known to be stored in the external cache."""
+        return self.node_by_id(node_id).external_cache_stored
+
     def is_node_in_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:

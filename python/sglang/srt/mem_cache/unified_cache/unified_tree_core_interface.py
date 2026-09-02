@@ -533,9 +533,9 @@ class UnifiedTreeCoreInterface(ABC):
     def build_external_linker_offload_transfers(
         self, node_id: NodeId
     ) -> Optional[list[PoolTransfer]]:
-        """Build direct device-to-external-store transfers for an unstored node.
+        """Build direct device-to-external-store transfers for an eligible node.
 
-        Return None when the node is already known to be stored externally.
+        Return None when the node is stored externally or has an offload pending.
         """
         ...
 
@@ -548,14 +548,18 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
-        """Publish an accepted external offload as pending and externally stored."""
+        """Publish an accepted external offload as pending."""
         ...
 
     @abstractmethod
     def finish_external_linker_offload(
         self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
     ) -> None:
-        """Finish one external offload for every current fragment of its node."""
+        """Finish one external offload for every current fragment of its node.
+
+        A successful write confirms external storage. A failed redundant write
+        preserves storage already confirmed independently by a concurrent load.
+        """
         ...
 
     # Order-sensitive digest of write_back duplicate-reclaim victim ids,

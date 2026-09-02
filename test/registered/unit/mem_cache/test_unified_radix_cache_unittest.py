@@ -7891,12 +7891,25 @@ class TestUnifiedCacheLinkerBackends(_InsertWalkSuite):
             _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
             1,
         )
+        self.assertFalse(
+            producer.tree_core.is_external_cache_stored(inserted.last_device_node)
+        )
+        self.assertEqual(
+            producer.tree_core.get_write_through_pending_id(inserted.last_device_node),
+            inserted.last_device_node,
+        )
+
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        self.assertEqual(len(producer_linker.offload_calls), 1)
 
         producer_linker.complete_next_offload(True)
         producer.check_hicache_events()
         self.assertEqual(
             _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
             0,
+        )
+        self.assertTrue(
+            producer.tree_core.is_external_cache_stored(inserted.last_device_node)
         )
         self._insert(producer, producer_allocator, producer_req_pool, tokens)
         self.assertEqual(len(producer_linker.offload_calls), 1)
@@ -8003,11 +8016,14 @@ class TestUnifiedCacheLinkerBackends(_InsertWalkSuite):
         )
         self.assertEqual(cache.tree_core.get_write_through_pending_id(parent), child)
         self.assertEqual(cache.tree_core.get_write_through_pending_id(child), child)
+        self.assertFalse(cache.tree_core.is_external_cache_stored(parent))
+        self.assertFalse(cache.tree_core.is_external_cache_stored(child))
 
         linker.complete_next_offload(False)
         cache.check_hicache_events()
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
+            self.assertFalse(cache.tree_core.is_external_cache_stored(node_id))
             self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
@@ -8022,6 +8038,7 @@ class TestUnifiedCacheLinkerBackends(_InsertWalkSuite):
         cache.check_hicache_events()
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
+            self.assertTrue(cache.tree_core.is_external_cache_stored(node_id))
             self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
 
         self._insert(cache, allocator, req_to_token_pool, tokens)

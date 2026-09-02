@@ -2251,16 +2251,63 @@ fn external_linker_state_follows_load_offload_and_split_lifecycle() {
             .unwrap()
             .is_none()
     );
+    assert!(matches!(
+        tc.mark_external_linker_offload_pending(leaf),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: true,
+            pending_id: None,
+        }) if node_id == leaf
+    ));
 
     let leaf_idx = tc.arena.resolve(leaf);
     tc.arena.node_mut(leaf_idx).external_cache_stored = false;
     tc.mark_external_linker_offload_pending(leaf).unwrap();
+    assert!(
+        tc.build_external_linker_offload_transfers(leaf)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        tc.mark_external_linker_offload_pending(leaf),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: false,
+            pending_id: Some(pending_id),
+        }) if node_id == leaf && pending_id == leaf
+    ));
     let (new_parent, action) = tc.split_node_(tc.arena.resolve(leaf), 1);
     let new_parent_handle = tc.arena.node(new_parent).id;
     assert!(action.is_some());
-    assert!(tc.arena.node(new_parent).external_cache_stored);
-    assert!(tc.arena.node(tc.arena.resolve(leaf)).external_cache_stored);
+    assert!(!tc.arena.node(new_parent).external_cache_stored);
+    assert!(!tc.arena.node(tc.arena.resolve(leaf)).external_cache_stored);
 
+    tc.insert(&insert_params(&vec![9], &[19]));
+    let independent = tc.match_prefix(&match_params(&vec![9])).best_match_node_id;
+    tc.mark_external_linker_offload_pending(independent)
+        .unwrap();
+    assert!(matches!(
+        tc.finish_external_linker_offload(&[independent, new_parent_handle], independent, false),
+        Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+            node_id,
+            stored: false,
+            pending_id: Some(pending_id),
+        }) if node_id == new_parent_handle && pending_id == leaf
+    ));
+    assert_eq!(
+        tc.arena
+            .node(tc.arena.resolve(independent))
+            .write_through_pending_id,
+        Some(independent)
+    );
+    for node_id in [new_parent_handle, leaf] {
+        let node = tc.arena.node(tc.arena.resolve(node_id));
+        assert_eq!(node.write_through_pending_id, Some(leaf));
+        assert!(!node.external_cache_stored);
+    }
+
+    tc.finish_external_linker_offload(&[independent], independent, false)
+        .unwrap();
     tc.finish_external_linker_offload(&[new_parent_handle, leaf], leaf, false)
         .unwrap();
     for node_id in [new_parent_handle, leaf] {
@@ -2268,6 +2315,27 @@ fn external_linker_state_follows_load_offload_and_split_lifecycle() {
         assert_eq!(node.write_through_pending_id, None);
         assert!(!node.external_cache_stored);
     }
+}
+
+#[test]
+fn failed_external_offload_preserves_independently_confirmed_state() {
+    let mut tc = core();
+    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.insert(&insert_params(&vec![1], &[10]));
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let anchor = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+
+    tc.mark_external_linker_offload_pending(leaf).unwrap();
+    tc.mark_external_cache_stored_path(leaf, anchor).unwrap();
+    tc.finish_external_linker_offload(&[leaf], leaf, false)
+        .unwrap();
+
+    let leaf = tc.arena.node(tc.arena.resolve(leaf));
+    assert_eq!(leaf.write_through_pending_id, None);
+    assert!(leaf.external_cache_stored);
 }
 
 #[test]
@@ -2353,8 +2421,9 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
 }
 
 #[test]
-fn backup_kv_action_stops_at_an_externally_stored_ancestor() {
+fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
+    tc.set_enable_external_cache_linker(true).unwrap();
     tc.insert(&insert_params(&vec![1], &[10]));
     tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
     tc.insert(&insert_params(&vec![1, 2, 3], &[10, 11, 12]));
@@ -2368,6 +2437,14 @@ fn backup_kv_action_stops_at_an_externally_stored_ancestor() {
     let a_idx = tc.arena.resolve(a);
     tc.arena.node_mut(a_idx).external_cache_stored = true;
 
+    let action = tc.build_backup_kv_action_(
+        tc.arena.node(tc.arena.resolve(c)),
+        /* write_back = */ false,
+    );
+    assert_eq!(action.node_ids, vec![b, c]);
+
+    tc.arena.node_mut(a_idx).external_cache_stored = false;
+    tc.mark_external_linker_offload_pending(a).unwrap();
     let action = tc.build_backup_kv_action_(
         tc.arena.node(tc.arena.resolve(c)),
         /* write_back = */ false,

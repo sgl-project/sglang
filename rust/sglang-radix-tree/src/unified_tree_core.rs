@@ -1276,7 +1276,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         node.hit_count += 1;
 
         if self.enable_external_cache_linker {
-            return !node.external_cache_stored && node.hit_count >= self.write_through_threshold;
+            return Self::needs_external_linker_offload_(node)
+                && node.hit_count >= self.write_through_threshold;
         }
 
         self.enable_hicache && !node.backuped() && node.hit_count >= self.write_through_threshold
@@ -3514,6 +3515,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 if ancestor_node.is_root()
                     || ancestor_node.backuped()
                     || ancestor_node.external_cache_stored
+                    || (self.enable_external_cache_linker
+                        && ancestor_node.write_through_pending_id.is_some())
                 {
                     break;
                 }
@@ -3678,13 +3681,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
-    /// Build direct device-to-external-store transfers for an unstored node.
+    /// Build transfers for a node with no stored or pending external copy.
     pub fn build_external_linker_offload_transfers(
         &self,
         node_id: NodeId,
     ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
         let node_id = self.try_resolve_node_handle_(node_id)?;
-        if self.arena.node(node_id).external_cache_stored {
+        if !Self::needs_external_linker_offload_(self.arena.node(node_id)) {
             return Ok(None);
         }
 
@@ -3694,6 +3697,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .filter_map(|component| component.build_external_linker_offload_transfer(self, node_id))
             .collect();
         Ok(Some(transfers))
+    }
+
+    fn needs_external_linker_offload_(node: &Node<K>) -> bool {
+        !node.external_cache_stored && node.write_through_pending_id.is_none()
     }
 
     /// Mark the path from `from_node_id` to, but excluding, `until_node_id` as
@@ -3724,15 +3731,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
-    /// Publish an accepted external offload as pending and externally stored.
+    /// Publish an accepted external offload as pending.
     pub fn mark_external_linker_offload_pending(
         &mut self,
         node_id: NodeId,
     ) -> Result<(), TreeCoreRuntimeError> {
         let node_idx = self.try_resolve_node_handle_(node_id)?;
-        let node = self.arena.node_mut(node_idx);
-        node.write_through_pending_id = Some(node_id);
-        node.external_cache_stored = true;
+        let node = self.arena.node(node_idx);
+        if !Self::needs_external_linker_offload_(node) {
+            return Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+                node_id,
+                stored: node.external_cache_stored,
+                pending_id: node.write_through_pending_id,
+            });
+        }
+        self.arena.node_mut(node_idx).write_through_pending_id = Some(node_id);
         Ok(())
     }
 
@@ -3747,12 +3760,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .iter()
             .map(|&node_id| self.try_resolve_node_handle_(node_id))
             .collect::<Result<Vec<_>, _>>()?;
+        for (&node_id, &node_idx) in node_ids.iter().zip(&node_indices) {
+            let node = self.arena.node(node_idx);
+            if node.write_through_pending_id != Some(ack_id) {
+                return Err(TreeCoreRuntimeError::InvalidExternalCacheOffloadState {
+                    node_id,
+                    stored: node.external_cache_stored,
+                    pending_id: node.write_through_pending_id,
+                });
+            }
+        }
         for node_id in node_indices {
             let node = self.arena.node_mut(node_id);
-            if node.write_through_pending_id == Some(ack_id) {
-                node.write_through_pending_id = None;
-            }
-            node.external_cache_stored = success;
+            node.write_through_pending_id = None;
+            node.external_cache_stored |= success;
         }
         Ok(())
     }
@@ -4397,6 +4418,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.arena
             .node(self.arena.resolve(node_id))
             .write_through_pending_id
+    }
+
+    /// Whether a node is known to be stored in the external cache.
+    pub fn inspect_is_external_cache_stored(&self, node_id: NodeId) -> bool {
+        self.arena
+            .node(self.arena.resolve(node_id))
+            .external_cache_stored
     }
 
     /// Whether a node is in a component's device LRU.

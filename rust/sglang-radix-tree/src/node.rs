@@ -749,6 +749,15 @@ pub enum TreeCoreRuntimeError {
         from_node_id: NodeId,
         until_node_id: NodeId,
     },
+    /// External offload lifecycle calls must observe valid state transitions.
+    #[error(
+        "invalid external offload state for node {node_id}: stored={stored}, pending={pending_id:?}"
+    )]
+    InvalidExternalCacheOffloadState {
+        node_id: NodeId,
+        stored: bool,
+        pending_id: Option<NodeId>,
+    },
 }
 
 // Unigram and bigram child keys.
