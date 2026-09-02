@@ -136,6 +136,17 @@ class TestLazyHostPoolRelease(CustomTestCase):
     def _make_logical_pool():
         return LogicalHostPool(size=8, page_size=2)
 
+    @staticmethod
+    def _make_transfer_pool(*, page_aligned_only):
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.pool_name = str(PoolName.DEEPSEEK_V4_C4_INDEXER)
+        pool.slot_page_size = 4
+        pool.layer_num = 1
+        pool.page_aligned_only = page_aligned_only
+        pool.device_ptrs = [0]
+        pool.data_ptrs = [0]
+        return pool
+
     def _assert_lazy_release(self, pool):
         self.assertEqual(pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(pool.num_release_slots, 0)
@@ -189,6 +200,26 @@ class TestLazyHostPoolRelease(CustomTestCase):
         # Preserve the pool's page-aligned allocation behavior.
         pool.clear()
         self.assertEqual(len(pool.alloc(1)), 2)
+
+    def test_grouped_page_rows_reject_unaligned_transfers(self):
+        # FP4 indexer rows group their slots, so a partial page has no
+        # well-defined token-granular copy and must not silently fall back.
+        pool = self._make_transfer_pool(page_aligned_only=True)
+        unaligned = torch.arange(3, dtype=torch.int64)
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
+            pool.backup_from_device_all_layer(None, unaligned, unaligned, "direct")
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
+            pool.load_to_device_per_layer(None, unaligned, unaligned, 0, "direct")
+
+    def test_fused_page_rows_keep_token_granular_transfers(self):
+        pool = self._make_transfer_pool(page_aligned_only=False)
+        unaligned = torch.arange(3, dtype=torch.int64)
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.memory_pool_host.transfer_cache_dsv4_mla"
+        ) as transfer:
+            pool.backup_from_device_all_layer(None, unaligned, unaligned, "direct")
+            pool.load_to_device_per_layer(None, unaligned, unaligned, 0, "direct")
+        self.assertEqual(transfer.call_count, 2)
 
     def test_logical_pool_lazy_release(self):
         pool = self._make_logical_pool()

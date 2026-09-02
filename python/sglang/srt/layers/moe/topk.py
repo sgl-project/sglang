@@ -986,14 +986,9 @@ def fused_topk(
                 moe_fused_gate as _jit_moe_fused_gate,
             )
 
-            zero_bias = torch.zeros(
-                gating_output.shape[1],
-                dtype=torch.float32,
-                device=gating_output.device,
-            )
             topk_weights, topk_ids = _jit_moe_fused_gate(
                 gating_output,
-                zero_bias,
+                None,
                 topk,
                 scoring_func="softmax",
                 renormalize=renormalize,
