@@ -257,6 +257,34 @@ def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) 
     messages[idx]["task"] = task
 
 
+def _flatten_content(content: Any) -> str:
+    """Flatten OpenAI content (string or list of content parts) to a plain string.
+
+    OpenAI clients may send ``content`` as a list of typed parts
+    (e.g. ``[{"type": "text", "text": "hello"}]``) instead of a plain string.
+    The DSV4 encoder works exclusively with string content, so flatten the
+    list here — extracting text from text-type parts and joining with a
+    separator. Non-text parts (images, audio) are dropped since DSV4 is
+    text-only.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+            # Non-text parts (images, audio, etc.) are silently dropped —
+            # DSV4 is text-only and has no way to represent them.
+        return "\n\n".join(parts)
+    # Unexpected type — coerce to string as a last resort.
+    return str(content)
+
+
 # ============================================================
 # Message Rendering
 # ============================================================
@@ -299,7 +327,7 @@ def render_message(
     last_user_idx = find_last_user_index(messages)
 
     role = msg.get("role")
-    content = msg.get("content")
+    content = _flatten_content(msg.get("content"))
     tools = msg.get("tools")
     response_format = msg.get("response_format")
     tool_calls = msg.get("tool_calls")
@@ -528,7 +556,10 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     }
                 )
         elif role == "user":
-            text_block = {"type": "text", "text": msg.get("content", "")}
+            text_block = {
+                "type": "text",
+                "text": _flatten_content(msg.get("content", "")),
+            }
             if (
                 merged
                 and merged[-1].get("role") == "user"
