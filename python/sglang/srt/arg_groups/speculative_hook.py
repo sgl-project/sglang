@@ -406,6 +406,16 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
+        parent_width = candidate_top_k * max(speculative_num_steps - 1, 0) + 1
+        if verify_width - 1 > parent_width:
+            raise ValueError(
+                "UNO tree mode cannot represent the requested Q in EAGLE's "
+                "parent-list ABI: "
+                f"Q-1={verify_width - 1} exceeds "
+                f"K*(F-2)+1={parent_width} for "
+                f"F={draft_width}, K={candidate_top_k}."
+            )
+
         if cfg.enable_pdmux:
             raise ValueError("UNO tree mode does not yet support PDMux.")
         if cfg.enable_two_batch_overlap:

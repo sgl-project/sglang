@@ -431,6 +431,16 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # Some internal-only backends (currently UNO) use explicit token-row
+        # routing for their adapted forwards and want all-base batches to run
+        # through the plain model path.  Clear any routing retained by the
+        # preceding adapted forward before inspecting CUDA-graph metadata.
+        if self.lora_backend.skip_inactive_lora_batches and not any(
+            uid is not None for uid in forward_batch.lora_ids
+        ):
+            self.reset_lora_batch()
+            return
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
