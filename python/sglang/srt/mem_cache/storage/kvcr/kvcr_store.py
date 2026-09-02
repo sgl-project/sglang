@@ -54,8 +54,8 @@ Hybrid pools are discovered and validated at registration finalization. Each
 physical pool keeps its own buffer regions, component geometry, and key
 namespace; the logical KV anchor is intentionally absent from that manifest.
 Local deposit, existence, and delivery use KVCR's plural framework regions and
-size-classed arenas. Hinted remote delivery remains disabled for hybrid pools
-until the source validates every component's size against its destination.
+size-classed arenas. Hinted remote delivery uses the same physical descriptors;
+the source validates every component's size against its destination before NIXL.
 """
 
 from __future__ import annotations
@@ -1487,23 +1487,23 @@ class KVCRStore(HiCacheStorage):
         The remote branch is gated on a well-formed hint having been registered
         with the core for this request_id (via ``submit_hint``); without one the
         core reports MISS for non-resident keys and we return them as failures,
-        letting HiCache fall back to recompute. Hybrid pools remain local-only
-        in this checkpoint: they are rechecked for local residency and never
-        register a router hint.
+        letting HiCache fall back to recompute. Hybrid pools use one
+        request-scoped hint across every physical transfer in this call. A
+        missing or malformed hint still permits local hits, while uncovered
+        nonlocal components fail closed in the KVCR core.
         """
         results: Dict[str, List[bool]] = {}
         if self._kvcr is None:
             return {str(t.name): [False] * len(t.keys or []) for t in transfers}
 
-        local_only = self._logical_anchor
-        request_id = None if local_only else self._register_hint(extra_info)
+        request_id = self._register_hint(extra_info)
         try:
             for transfer in transfers:
                 if not self._is_supported_transfer(transfer):
                     results[str(transfer.name)] = [False] * len(transfer.keys or [])
                     continue
                 results[str(transfer.name)] = self._deliver_transfer(
-                    transfer, request_id, local_only=local_only
+                    transfer, request_id
                 )
         finally:
             self._discard_hint(request_id)
@@ -1779,7 +1779,7 @@ class KVCRStore(HiCacheStorage):
         here.
         """
         if self._logical_anchor:
-            return self._batch_exists_hybrid_local(keys, pool_transfers or [])
+            return self._batch_exists_hybrid(keys, pool_transfers or [], extra_info)
         if self._kvcr is None or self._segments_per_page is None:
             return PoolTransferResult.empty()
         # A sidecar pool this backend cannot serve makes the whole prefix
@@ -1811,21 +1811,23 @@ class KVCRStore(HiCacheStorage):
                 self._note("exists_hint_covered_nothing")
         return PoolTransferResult(prefix, {})
 
-    def _batch_exists_hybrid_local(
+    def _batch_exists_hybrid(
         self,
         keys: List[str],
         pool_transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo],
     ) -> PoolTransferResult:
-        """Fold local component residency into valid logical-prefix endpoints.
+        """Fold local or hinted components into valid logical-prefix endpoints.
 
         The KV anchor is virtual, so every input page starts as a candidate.
-        Each physical pool then removes endpoints it cannot restore. Router
-        hints are deliberately ignored until plural-arena source serving can
-        validate source and destination component sizes.
+        Each physical pool then removes endpoints it cannot restore. A router
+        hint is advisory at this stage; delivery still verifies every component
+        and folds a missing or incompatible source entry into a page miss.
         """
         if self._kvcr is None:
             return PoolTransferResult.empty()
 
+        hint = self._parse_hint(extra_info)
         kv_pages = len(keys)
         hit_count = {PoolName.KV: kv_pages} if kv_pages else {}
         restorable = list(range(1, kv_pages + 1))
@@ -1837,6 +1839,7 @@ class KVCRStore(HiCacheStorage):
 
             page_exists = [
                 self._locally_resident(self._page_segment_keys(page_key, transfer.name))
+                or (hint is not None and hint.covers(page_key))
                 for page_key in keys
             ]
             boundary = 0

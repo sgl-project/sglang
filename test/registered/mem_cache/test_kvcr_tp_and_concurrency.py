@@ -942,7 +942,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual(len(submitted[1]), 2)
         self.assertEqual({desc.size for desc in submitted[1].values()}, {24})
 
-    def test_local_hybrid_get_never_uses_a_hint_and_skips_incomplete_pages(self):
+    def test_hybrid_get_without_hint_fails_nonresident_components(self):
         self._collect()
         page_keys = ["aaaaaaaaaaaaaaaa-p0", "0123456789abcdef-p1"]
         resident = {
@@ -975,7 +975,9 @@ class HybridPoolManifestTest(unittest.TestCase):
 
         def submit_and_complete(submit):
             handle = submit()
-            return handle, {key: True for key in submitted[-1][0]}
+            return handle, {
+                key: resident.get(key) is QueryStatus.HIT for key in submitted[-1][0]
+            }
 
         self.store._submit_and_wait = submit_and_complete
         results = self.store.batch_get_v2(
@@ -985,8 +987,7 @@ class HybridPoolManifestTest(unittest.TestCase):
                     keys=page_keys,
                     host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
                 )
-            ],
-            extra_info=_hint_extra_info("tcp://10.0.0.7:25000"),
+            ]
         )
 
         self.assertEqual(
@@ -994,7 +995,7 @@ class HybridPoolManifestTest(unittest.TestCase):
             {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
         )
         self.assertEqual(len(submitted), 1)
-        self.assertEqual(set(submitted[0][0]), set(resident) - set(page1_keys))
+        self.assertEqual(set(submitted[0][0]), set(resident))
         self.assertIsNone(submitted[0][1])
         core.submit_hint.assert_not_called()
         core.discard_hint.assert_not_called()
@@ -1036,12 +1037,66 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual(len(submitted[0][0]), 4)
         self.assertIsNone(submitted[0][1])
 
+    def test_remote_hybrid_get_shares_one_hint_across_physical_pools(self):
+        self._collect()
+        page = "0123456789abcdef-p0"
+        delivered = []
+        core = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.MISS, None)] * len(keys),
+            submit_hint=mock.Mock(),
+            discard_hint=mock.Mock(),
+        )
+
+        def deliver(destinations, request_id=None):
+            delivered.append((dict(destinations), request_id))
+            return len(delivered)
+
+        core.deliver = deliver
+        self.store._kvcr = core
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in delivered[-1][0]}
+
+        self.store._submit_and_wait = submit_and_complete
+        results = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=[page],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page],
+                    host_indices=torch.tensor([0, 1], dtype=torch.int64),
+                ),
+            ],
+            extra_info=_hint_extra_info("tcp://10.0.0.7:25000"),
+        )
+
+        self.assertEqual(
+            results,
+            {
+                str(PoolName.DEEPSEEK_V4_C4): [True],
+                str(PoolName.DEEPSEEK_V4_C128): [True],
+            },
+        )
+        self.assertEqual(len(delivered), 2)
+        request_ids = {request_id for _, request_id in delivered}
+        self.assertEqual(len(request_ids), 1)
+        request_id = request_ids.pop()
+        self.assertIsNotNone(request_id)
+        core.submit_hint.assert_called_once()
+        self.assertEqual(core.submit_hint.call_args.kwargs["request_id"], request_id)
+        core.discard_hint.assert_called_once_with(request_id)
+
     def test_short_local_query_result_is_a_miss(self):
         self.store._kvcr = SimpleNamespace(query=lambda keys: [(QueryStatus.HIT, None)])
 
         self.assertFalse(self.store._locally_resident([b"component-0", b"component-1"]))
 
-    def test_local_hybrid_exists_folds_every_component_and_ignores_hints(self):
+    def test_local_hybrid_exists_folds_every_component_without_hint(self):
         self._collect()
         page_keys = [
             "aaaaaaaaaaaaaaaa-p0",
@@ -1061,16 +1116,7 @@ class HybridPoolManifestTest(unittest.TestCase):
             PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
             PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=page_keys),
         ]
-        with mock.patch.object(
-            self.store,
-            "_parse_hint",
-            side_effect=AssertionError("hybrid local lookup parsed a remote hint"),
-        ):
-            result = self.store.batch_exists_v2(
-                page_keys,
-                transfers,
-                _hint_extra_info("tcp://10.0.0.7:25000"),
-            )
+        result = self.store.batch_exists_v2(page_keys, transfers)
 
         self.assertEqual(result.kv_hit_pages, 1)
         self.assertEqual(
@@ -1082,6 +1128,33 @@ class HybridPoolManifestTest(unittest.TestCase):
             },
         )
         self.assertEqual(result.restorable_prefix_pages, [1])
+
+    def test_remote_hint_makes_a_hybrid_page_available_in_every_pool(self):
+        self._collect()
+        page_keys = ["0123456789abcdef-p0", "bbbbbbbbbbbbbbbb-p1"]
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.MISS, None)] * len(keys)
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
+                PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=page_keys),
+            ],
+            _hint_extra_info("tcp://10.0.0.7:25000"),
+        )
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.restorable_prefix_pages, [1])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 2,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 1,
+            },
+        )
 
     def test_local_hybrid_exists_intersects_all_and_sparse_trailing_policies(self):
         self._collect()
