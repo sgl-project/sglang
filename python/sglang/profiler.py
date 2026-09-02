@@ -27,6 +27,7 @@ def run_profile(
     merge_profiles: bool = False,
     profile_prefix: Optional[str] = None,
     start_step: Optional[int] = None,
+    verify: bool = True,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -42,7 +43,7 @@ def run_profile(
     # Dump server args.
     file_path = Path(output_dir) / "server_args.json"
     if not file_path.exists():
-        response = requests.get(url + "/server_info")
+        response = requests.get(url + "/server_info", verify=verify)
         response.raise_for_status()
         server_args_data = response.json()
         with open(file_path, "w") as file:
@@ -61,7 +62,7 @@ def run_profile(
     if start_step is not None:
         json_data["start_step"] = str(start_step)
 
-    response = requests.post(url=url + "/start_profile", json=json_data)
+    response = requests.post(url=url + "/start_profile", json=json_data, verify=verify)
     response.raise_for_status()
 
     trace_link = str(output_dir)
@@ -135,6 +136,13 @@ if __name__ == "__main__":
         default=False,
         help="Whether to merge profiles from all ranks into a single trace file",
     )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Disable SSL certificate verification. Use this option when "
+        "connecting to servers with self-signed certificates.",
+    )
 
     args = parser.parse_args()
     activities = []
@@ -155,4 +163,5 @@ if __name__ == "__main__":
         profile_by_stage=args.profile_by_stage,
         profile_prefix=args.profile_prefix,
         merge_profiles=args.merge_profiles,
+        verify=not args.insecure,
     )
