@@ -33,6 +33,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -559,7 +560,8 @@ class SidecarPoolTest(unittest.TestCase):
         store = self._store_with_core()
         delivered = []
 
-        def record_and_succeed(transfer, request_id):
+        def record_and_succeed(transfer, request_id, *, local_only=False):
+            self.assertFalse(local_only)
             delivered.append(transfer.name)
             return [True] * len(transfer.keys)
 
@@ -637,6 +639,16 @@ class HybridPoolManifestTest(unittest.TestCase):
     def _collect(self):
         self.store._pool_contexts = self.store._collect_pool_contexts()
         return self.store._pool_contexts
+
+    def test_logical_anchor_v1_io_and_existence_are_virtual_successes(self):
+        self.store._kvcr = _ExplodingKVCR()
+        keys = ["p0", "p1"]
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+
+        self.assertEqual(self.store.batch_set_v1(keys, indices), [True, True])
+        self.assertEqual(self.store.batch_get_v1(keys, indices), [True, True])
+        self.assertEqual(self.store.batch_exists(keys), 2)
+        self.anchor.get_page_buffer_meta.assert_not_called()
 
     def test_manifest_skips_the_logical_anchor_and_keeps_every_buffer(self):
         contexts = self._collect()
@@ -796,6 +808,300 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertTrue(all(b"#v2/deepseek_v4_c4/" in key for key in c4_descriptors))
         self.assertTrue(
             all(b"#v2/deepseek_v4_c128/" in key for key in c128_descriptors)
+        )
+
+    def test_local_hybrid_set_folds_component_results_per_page(self):
+        self._collect()
+        submitted = []
+
+        def deposit(descriptors):
+            submitted.append(dict(descriptors))
+            return len(submitted)
+
+        self.store._kvcr = SimpleNamespace(deposit=deposit)
+        failed_key = self.store._segment_key("p1", 1, PoolName.DEEPSEEK_V4_C4)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in submitted[-1] if key != failed_key}
+
+        self.store._submit_and_wait = submit_and_complete
+        indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        results = self.store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["p0", "p1"],
+                    host_indices=indices,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=["p0", "p1"],
+                    host_indices=indices,
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            results,
+            {
+                str(PoolName.DEEPSEEK_V4_C4): [True, False],
+                str(PoolName.DEEPSEEK_V4_C128): [True, True],
+            },
+        )
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(len(submitted[0]), 4)
+        self.assertEqual({desc.size for desc in submitted[0].values()}, {8})
+        self.assertEqual(len(submitted[1]), 2)
+        self.assertEqual({desc.size for desc in submitted[1].values()}, {24})
+
+    def test_local_hybrid_get_never_uses_a_hint_and_skips_incomplete_pages(self):
+        self._collect()
+        page_keys = ["aaaaaaaaaaaaaaaa-p0", "0123456789abcdef-p1"]
+        resident = {
+            key: QueryStatus.HIT
+            for key in self.store._page_segment_keys(
+                page_keys[0], PoolName.DEEPSEEK_V4_C4
+            )
+        }
+        page1_keys = self.store._page_segment_keys(
+            page_keys[1], PoolName.DEEPSEEK_V4_C4
+        )
+        resident[page1_keys[0]] = QueryStatus.HIT
+        resident[page1_keys[1]] = QueryStatus.MISS
+        submitted = []
+
+        def query(keys):
+            return [(resident.get(key, QueryStatus.MISS), None) for key in keys]
+
+        def deliver(destinations, request_id=None):
+            submitted.append((dict(destinations), request_id))
+            return 17
+
+        core = SimpleNamespace(
+            query=query,
+            deliver=deliver,
+            submit_hint=mock.Mock(),
+            discard_hint=mock.Mock(),
+        )
+        self.store._kvcr = core
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in submitted[-1][0]}
+
+        self.store._submit_and_wait = submit_and_complete
+        results = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+                )
+            ],
+            extra_info=_hint_extra_info("tcp://10.0.0.7:25000"),
+        )
+
+        self.assertEqual(
+            results,
+            {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
+        )
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(set(submitted[0][0]), set(resident) - set(page1_keys))
+        self.assertIsNone(submitted[0][1])
+        core.submit_hint.assert_not_called()
+        core.discard_hint.assert_not_called()
+
+    def test_local_hybrid_get_missing_component_completion_fails_the_page(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        submitted = []
+
+        def deliver(destinations, request_id=None):
+            submitted.append((dict(destinations), request_id))
+            return 19
+
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [(QueryStatus.HIT, None)] * len(keys),
+            deliver=deliver,
+        )
+        missing = self.store._segment_key("p1", 1, PoolName.DEEPSEEK_V4_C4)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            return handle, {key: True for key in submitted[-1][0] if key != missing}
+
+        self.store._submit_and_wait = submit_and_complete
+        result = self.store.batch_get_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+                )
+            ]
+        )
+
+        self.assertEqual(
+            result,
+            {str(PoolName.DEEPSEEK_V4_C4): [True, False]},
+        )
+        self.assertEqual(len(submitted[0][0]), 4)
+        self.assertIsNone(submitted[0][1])
+
+    def test_short_local_query_result_is_a_miss(self):
+        self.store._kvcr = SimpleNamespace(query=lambda keys: [(QueryStatus.HIT, None)])
+
+        self.assertFalse(self.store._locally_resident([b"component-0", b"component-1"]))
+
+    def test_local_hybrid_exists_folds_every_component_and_ignores_hints(self):
+        self._collect()
+        page_keys = [
+            "aaaaaaaaaaaaaaaa-p0",
+            "0123456789abcdef-p1",
+            "bbbbbbbbbbbbbbbb-p2",
+        ]
+        missing = self.store._segment_key(page_keys[1], 1, PoolName.DEEPSEEK_V4_C4)
+
+        def query(keys):
+            return [
+                (QueryStatus.MISS if key == missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+
+        self.store._kvcr = SimpleNamespace(query=query)
+        transfers = [
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C4, keys=page_keys),
+            PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=page_keys),
+        ]
+        with mock.patch.object(
+            self.store,
+            "_parse_hint",
+            side_effect=AssertionError("hybrid local lookup parsed a remote hint"),
+        ):
+            result = self.store.batch_exists_v2(
+                page_keys,
+                transfers,
+                _hint_extra_info("tcp://10.0.0.7:25000"),
+            )
+
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 3,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 3,
+            },
+        )
+        self.assertEqual(result.restorable_prefix_pages, [1])
+
+    def test_local_hybrid_exists_intersects_all_and_sparse_trailing_policies(self):
+        self._collect()
+        page_keys = [f"p{i}" for i in range(5)]
+        missing = {
+            self.store._segment_key("p3", 0, PoolName.DEEPSEEK_V4_C4),
+            self.store._segment_key("p1", 0, PoolName.DEEPSEEK_V4_C128),
+            self.store._segment_key("p3", 0, PoolName.DEEPSEEK_V4_C128),
+        }
+
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key in missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page_keys[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 3)
+        self.assertEqual(result.restorable_prefix_pages, [1, 3])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 5,
+                PoolName.DEEPSEEK_V4_C4: 3,
+                PoolName.DEEPSEEK_V4_C128: 5,
+            },
+        )
+
+    def test_local_hybrid_trailing_window_can_have_sparse_endpoints(self):
+        self._collect()
+        page_keys = [f"p{i}" for i in range(5)]
+        missing = self.store._segment_key("p2", 0, PoolName.DEEPSEEK_V4_C128)
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key == missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=page_keys[-2:],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 5)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2, 5])
+
+    def test_local_hybrid_exists_returns_zero_without_a_common_endpoint(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        missing = {
+            self.store._segment_key("p1", 0, PoolName.DEEPSEEK_V4_C4),
+            self.store._segment_key("p0", 0, PoolName.DEEPSEEK_V4_C128),
+        }
+        self.store._kvcr = SimpleNamespace(
+            query=lambda keys: [
+                (QueryStatus.MISS if key in missing else QueryStatus.HIT, None)
+                for key in keys
+            ]
+        )
+
+        result = self.store.batch_exists_v2(
+            page_keys,
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=page_keys,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
+                ),
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=[page_keys[-1]],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ],
+        )
+
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.restorable_prefix_pages, [])
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 2,
+                PoolName.DEEPSEEK_V4_C4: 1,
+                PoolName.DEEPSEEK_V4_C128: 2,
+            },
         )
 
     def test_descriptor_shape_or_address_drift_fails_closed(self):
