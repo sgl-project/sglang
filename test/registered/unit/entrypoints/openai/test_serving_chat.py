@@ -3131,35 +3131,6 @@ class ServingChatTestCase(unittest.TestCase):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
-    def test_hunyuan_v4_reasoning_effort_normalization(self):
-        tm = _MockTokenizerManager()
-        tm.server_args.reasoning_parser = "hunyuan"
-        template_manager = _MockTemplateManager()
-        template_manager.reasoning_config = ReasoningToggleConfig(
-            special_case="hunyuan_effort"
-        )
-        chat = OpenAIServingChat(tm, template_manager)
-        cases = [
-            (None, "high", True),
-            ("none", "no_think", False),
-            ("minimal", "low", True),
-            ("low", "low", True),
-            ("medium", "high", True),
-            ("high", "high", True),
-            ("xhigh", "high", True),
-            ("max", "high", True),
-        ]
-        for effort, normalized, enabled in cases:
-            with self.subTest(effort=effort):
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[{"role": "user", "content": "hi"}],
-                    reasoning_effort=effort,
-                )
-                chat._normalize_hunyuan_reasoning_effort(req)
-                self.assertEqual(req.reasoning_effort, normalized)
-                self.assertEqual(chat._get_reasoning_from_request(req), enabled)
-
     def _setup_nemotron_super(self):
         """Drive _apply_jinja_template (chat_template_name=None) with a
         Nemotron-3 Super reasoning_config carrying effort_kwarg."""

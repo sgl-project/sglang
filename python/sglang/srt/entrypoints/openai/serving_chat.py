@@ -89,6 +89,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.hunyuan_reasoning import (
+    normalize_hunyuan_reasoning_effort,
+    uses_hunyuan_reasoning_effort,
+)
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
@@ -969,7 +973,9 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         reasoning_effort = None
-        if not self._uses_hunyuan_reasoning_effort():
+        if not uses_hunyuan_reasoning_effort(
+            self.reasoning_parser, self.template_manager.reasoning_config
+        ):
             reasoning_effort = (
                 request.chat_template_kwargs.pop("reasoning_effort", None)
                 if request.chat_template_kwargs
@@ -1112,7 +1118,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
-        self._normalize_hunyuan_reasoning_effort(request)
+        normalize_hunyuan_reasoning_effort(
+            request, self.reasoning_parser, self.template_manager.reasoning_config
+        )
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -2514,41 +2522,6 @@ class OpenAIServingChat(OpenAIServingBase):
         return (
             request.chat_template_kwargs is not None
             and request.chat_template_kwargs.get(config.toggle_param) is True
-        )
-
-    def _normalize_hunyuan_reasoning_effort(
-        self, request: ChatCompletionRequest
-    ) -> None:
-        if not self._uses_hunyuan_reasoning_effort():
-            return
-
-        effort = request.reasoning_effort
-        if effort is None and request.chat_template_kwargs is not None:
-            effort = request.chat_template_kwargs.get("reasoning_effort")
-        if effort is None:
-            normalized_effort = "high"
-        elif effort in ("none", "no_think"):
-            normalized_effort = "no_think"
-        elif effort in ("minimal", "low"):
-            normalized_effort = "low"
-        elif effort in ("medium", "high", "xhigh", "max"):
-            normalized_effort = "high"
-        else:
-            raise ValueError(
-                "Hunyuan reasoning_effort must be one of none, minimal, low, "
-                "medium, high, xhigh, or max"
-            )
-
-        request.reasoning_effort = normalized_effort
-        if request.chat_template_kwargs is not None:
-            request.chat_template_kwargs.pop("reasoning_effort", None)
-
-    def _uses_hunyuan_reasoning_effort(self) -> bool:
-        config = self.template_manager.reasoning_config
-        return (
-            self.reasoning_parser == "hunyuan"
-            and config is not None
-            and config.special_case == "hunyuan_effort"
         )
 
     async def _process_tool_call_stream(
