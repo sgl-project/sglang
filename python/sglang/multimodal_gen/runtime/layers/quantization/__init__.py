@@ -11,6 +11,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_customkernel_config import (
+    ConvRotInt8CustomKernelConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_config import (
     KitchenInt8Config,
 )
@@ -41,6 +44,7 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "kitchen_int8",
+    "convrot_int8_customkernel",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
@@ -58,6 +62,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,
     "kitchen_int8": KitchenInt8Config,
+    "convrot_int8_customkernel": ConvRotInt8CustomKernelConfig,
 }
 
 

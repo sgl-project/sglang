@@ -82,6 +82,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
+    apply_convrot_int8_gelu_input,
+    convrot_int8_fuses_gelu_input,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
     ModelOptFp8LinearMethod,
@@ -1401,6 +1405,13 @@ class QwenImageFeedForward(nn.Module):
     def forward_with_bias(
         self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Not cached at construction: LoRA mounting swaps net.2 for a wrapper.
+        if convrot_int8_fuses_gelu_input(self.net[2]):
+            # The down-projection's rotate kernel applies GELU(tanh) to its
+            # input bit-exactly, so the up-projection runs bare and the
+            # standalone activation kernel is skipped.
+            up, _ = self.net[0].proj(hidden_states)
+            return apply_convrot_int8_gelu_input(layer=self.net[2], x=up), None
         hidden_states = self.net[0](hidden_states)
         hidden_states = self.net[1](hidden_states)
         return self.net[2](hidden_states)

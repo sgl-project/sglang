@@ -130,6 +130,14 @@ backend.
       <td>Data-free INT8 ConvRot at load time via <code>comfy_kitchen.int8_linear</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires Turing+ (SM75).</td>
     </tr>
     <tr>
+      <td><code>convrot_int8_customkernel</code> (online quantization)</td>
+      <td>Unquantized BF16 checkpoint</td>
+      <td><code>--component-quantizations.&lt;component&gt; convrot_int8_customkernel</code></td>
+      <td>Qwen-Image (validated on H100, H200, GB200)</td>
+      <td><code>sgl-kernel</code> (bundled)</td>
+      <td>Data-free INT8 ConvRot W8A8 at load time via the <code>convrot_int8_*</code> ops in <code>sgl-kernel</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires CC 9.0 or CC 10.0.</td>
+    </tr>
+    <tr>
       <td><code>fp8</code> (offline quantization)</td>
       <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
       <td><code>--component-paths.&lt;component&gt;</code> or <code>--component-weights-paths.&lt;component&gt;</code></td>
@@ -441,6 +449,46 @@ Large-M GEMMs (`rows > 8192` and `out_features >= 8192`) are split by rows so
 the fused kernel stays on the data-parallel CUTLASS config. Override the
 thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
 `SGLANG_KITCHEN_INT8_MIN_SPLIT_N`.
+
+### ConvRot INT8 (sgl-kernel)
+
+`convrot_int8_customkernel` is online W8A8 INT8 for Hopper (SM90) and
+Blackwell (SM100) DiTs, built on the `convrot_int8_*` ops shipped in
+`sgl-kernel`; no extra package is needed. Every linear whose input dim is
+divisible by the Hadamard group size (256) is rotated and quantized per output
+channel after loading a stock BF16 checkpoint. Each forward call runs one fused
+op per linear: group-wise Hadamard rotation, dynamic per-row INT8 activation
+quantization, INT8 GEMM, dequantization and bias add. Where several linears
+share one input (the Q/K/V projections of a block) the activation is rotated
+and quantized once, and an FFN down-projection folds its preceding GELU(tanh)
+into the same rotate kernel; both are bitwise identical to the per-linear ops.
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --quantization convrot_int8_customkernel \
+  --quantization-ignored-layers img_mod txt_mod txt_mlp.net.2 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+The ignored-layer list above keeps the three Qwen-Image shapes in BF16 whose
+GEMMs see only a handful of rows (AdaLN modulation, text-stream FFN
+down-projection): there the rotate-quantize launch plus a CTA-starved INT8
+GEMM costs more than the BF16 GEMM it replaces.
+
+Measured end to end against BF16 on Qwen-Image (1024x1024, 50 steps, CFG 4) on
+GB200: 1.11x on one GPU and 1.07x on two GPUs with CFG parallelism. The fused op
+itself runs 1.12x-1.66x faster than the cuBLAS BF16 GEMM at the Qwen-Image
+shapes on H200. A follow-up change to the denoising loop widens these margins on
+1, 2 and 4 GPUs; its numbers are reported with that change.
+
+<Warning>
+`convrot_int8_customkernel` is approximate: same-seed outputs are visually
+equivalent to BF16 but not bit-exact, so it is not a consistency ground-truth
+mode. The ops accept CC 9.0 and CC 10.0 GPUs only; the method refuses to load
+on any other part.
+</Warning>
 
 ### Skipping Layers
 
