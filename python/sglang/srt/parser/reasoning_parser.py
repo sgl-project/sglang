@@ -1995,7 +1995,7 @@ class ReasoningParser:
         "ling3": Ling3Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
-        "k2_v3": K2V3Detector,
+        "k2_horizon": K2V3Detector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
@@ -2065,7 +2065,7 @@ class ReasoningParser:
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
 
-        if model_type.lower() == "k2_v3":
+        if model_type.lower() == "k2_horizon":
             # Template kwargs are the final values passed to Jinja and therefore
             # take precedence over the convenience fields on API requests.
             effort = chat_template_kwargs.get("reasoning_effort")

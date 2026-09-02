@@ -34,7 +34,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
     def test_k2_nested_effort_selects_streaming_reasoning_delimiter(self):
         serving = make_serving()
-        serving.reasoning_parser = "k2_v3"
+        serving.reasoning_parser = "k2_horizon"
         serving.tool_call_parser = None
         request = ResponsesRequest(
             model="IFM/K2-Horizon-7B",

@@ -616,7 +616,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(req.reasoning_effort, "high")
 
     def test_k2_selected_terminator_reaches_sampling_params(self):
-        self.tm._config_overrides["reasoning_parser"] = "k2_v3"
+        self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

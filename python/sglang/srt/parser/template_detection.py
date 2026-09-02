@@ -446,7 +446,7 @@ def _is_deepseek_r1_think_tags(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
-    DetectionRule(name="k2_v3", value="k2_v3", predicate=_is_k2_v3),
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
@@ -481,7 +481,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
-    DetectionRule(name="k2_v3", value="k2_v3", predicate=_is_k2_v3),
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),

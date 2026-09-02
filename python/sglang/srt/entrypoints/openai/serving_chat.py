@@ -1207,7 +1207,7 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
         result.skip_special_tokens = request.skip_special_tokens
-        if self.reasoning_parser == "k2_v3" and thinking_mode:
+        if self.reasoning_parser == "k2_horizon" and thinking_mode:
             parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,

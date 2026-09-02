@@ -251,7 +251,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
 
     def test_k2_output_parser_reuses_effective_template_default(self):
         serving = make_serving()
-        serving.reasoning_parser = "k2_v3"
+        serving.reasoning_parser = "k2_horizon"
         serving.default_chat_template_kwargs = {"reasoning_effort": "low"}
         serving.template_manager.chat_template_name = None
         serving.tokenizer_manager.tokenizer.apply_chat_template.return_value = [4, 5, 6]
@@ -644,7 +644,7 @@ class OutputItemsTestCase(CustomTestCase):
         )
 
     def test_k2_nested_effort_selects_non_stream_reasoning_delimiter(self):
-        self.serving.reasoning_parser = "k2_v3"
+        self.serving.reasoning_parser = "k2_horizon"
         self.serving.tool_call_parser = None
         request = ResponsesRequest(
             model="IFM/K2-Horizon-7B",

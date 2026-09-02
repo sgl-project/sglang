@@ -171,7 +171,7 @@ class TestK2V3Detector(CustomTestCase):
         wire = (
             " \n" + make_reasoning_with_tool_marker("think_fast") + "The answer is 42."
         )
-        parser = FunctionCallParser(self.tools, "k2_v3")
+        parser = FunctionCallParser(self.tools, "k2_horizon")
         normal, calls = parser.parse_non_stream(wire)
         self.assertEqual(normal, wire)
         self.assertEqual(calls, [])
@@ -182,7 +182,7 @@ class TestK2V3Detector(CustomTestCase):
             + make_reasoning_with_tool_marker("think_faster")
             + "The answer is 42."
         )
-        parser = FunctionCallParser(self.tools, "k2_v3")
+        parser = FunctionCallParser(self.tools, "k2_horizon")
         normal = ""
         calls = []
         for char in wire:
@@ -206,7 +206,7 @@ class TestK2V3Detector(CustomTestCase):
             "</ifm|tool_call>\n"
             "</ifm|tool_calls>"
         )
-        parser = FunctionCallParser(self.tools, "k2_v3")
+        parser = FunctionCallParser(self.tools, "k2_horizon")
         normal, calls = parser.parse_non_stream(wire)
         self.assertEqual(normal, reasoning)
         self.assertEqual(len(calls), 1)
@@ -220,7 +220,9 @@ class TestK2V3Detector(CustomTestCase):
             "<ifm|arg_value>Tokyo</ifm|arg_value>"
             "</ifm|tool_call></ifm|tool_calls>"
         )
-        normal, calls = FunctionCallParser(self.tools, "k2_v3").parse_non_stream(wire)
+        normal, calls = FunctionCallParser(self.tools, "k2_horizon").parse_non_stream(
+            wire
+        )
         self.assertEqual(normal, reasoning)
         self.assertEqual(len(calls), 1)
         self.assertEqual(json.loads(calls[0].parameters), {"city": "Tokyo"})
@@ -235,7 +237,7 @@ class TestK2V3Detector(CustomTestCase):
             "</ifm|tool_call>\n"
             "</ifm|tool_calls>"
         )
-        parser = FunctionCallParser(self.tools, "k2_v3")
+        parser = FunctionCallParser(self.tools, "k2_horizon")
         normal = ""
         calls = []
         for char in wire:
@@ -314,7 +316,7 @@ class TestK2V3Detector(CustomTestCase):
     def test_function_call_parser_registry(self):
         parser = FunctionCallParser(
             tools=self.tools,
-            tool_call_parser="k2_v3",
+            tool_call_parser="k2_horizon",
         )
         self.assertIsInstance(parser.detector, K2V3Detector)
 

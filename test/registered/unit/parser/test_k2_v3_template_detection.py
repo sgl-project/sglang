@@ -36,13 +36,13 @@ class TestK2V3TemplateDetection(CustomTestCase):
             detect_reasoning_parser(
                 self.TEMPLATE, _Tokenizer(), config, force_reasoning
             ),
-            "k2_v3",
+            "k2_horizon",
         )
         self.assertEqual(
             detect_tool_call_parser(
                 self.TEMPLATE, _Tokenizer(), config, force_reasoning
             ),
-            "k2_v3",
+            "k2_horizon",
         )
 
 

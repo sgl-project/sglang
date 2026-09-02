@@ -76,7 +76,7 @@ class TestK2V3ReasoningParser(CustomTestCase):
             messages=[{"role": "user", "content": "hi"}],
             reasoning_effort="low",
         )
-        parser = ReasoningParser("k2_v3", request=request)
+        parser = ReasoningParser("k2_horizon", request=request)
         self.assertIsInstance(parser.detector, K2V3Detector)
         self.assertEqual(parser.detector.think_end_token, "</ifm|think_faster>")
 
@@ -87,7 +87,7 @@ class TestK2V3ReasoningParser(CustomTestCase):
             reasoning_effort="high",
             chat_template_kwargs={"reasoning_effort": "low"},
         )
-        parser = ReasoningParser("k2_v3", request=request)
+        parser = ReasoningParser("k2_horizon", request=request)
         self.assertEqual(parser.detector.think_end_token, "</ifm|think_faster>")
 
     def test_responses_request_effort_selects_non_stream_delimiter(self):
@@ -105,7 +105,7 @@ class TestK2V3ReasoningParser(CustomTestCase):
                     store=False,
                 )
                 parser = ReasoningParser(
-                    "k2_v3", stream_reasoning=False, request=request
+                    "k2_horizon", stream_reasoning=False, request=request
                 )
                 self.assertEqual(
                     parser.parse_non_stream(f"work{end_token}\nanswer"),
@@ -120,12 +120,12 @@ class TestK2V3ReasoningParser(CustomTestCase):
             chat_template_kwargs={"reasoning_effort": "low"},
             store=False,
         )
-        parser = ReasoningParser("k2_v3", request=request)
+        parser = ReasoningParser("k2_horizon", request=request)
         self.assertEqual(parser.detector.think_end_token, "</ifm|think_faster>")
 
     def test_force_reasoning_cannot_be_disabled(self):
         with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):
-            ReasoningParser("k2_v3", force_reasoning=False)
+            ReasoningParser("k2_horizon", force_reasoning=False)
 
 
 if __name__ == "__main__":
