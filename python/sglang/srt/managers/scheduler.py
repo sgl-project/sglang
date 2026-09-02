@@ -1249,7 +1249,14 @@ class Scheduler(
             get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1
         )
         if self.enable_dynamic_chunking:
-            self.enable_dynamic_chunking = self.profile_and_init_predictor()
+            try:
+                self.profile_and_init_predictor()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
