@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::policies::admission::FreshLoadLookup;
 use crate::policies::scoring::ScoringPolicy;
 use crate::policies::SelectionContext;
 use crate::workers::Worker;
@@ -24,8 +25,9 @@ impl ScoringPolicy for LoadBasedPolicy {
     ///
     /// Purely a preference: "everybody is busy" is not a reason to refuse to
     /// route, so this term never constrains. Capacity is `--filter`'s job.
-    fn scores(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<f32> {
-        let loads: Vec<usize> = workers.iter().map(|w| w.active_load()).collect();
+    fn scores(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Vec<f32> {
+        let lookup = FreshLoadLookup::new(ctx.load_snapshot(), workers.iter());
+        let loads: Vec<usize> = workers.iter().map(|w| lookup.score_load(w)).collect();
         let lo = loads.iter().min().copied().unwrap_or(0);
         let span = (loads.iter().max().copied().unwrap_or(0) - lo) as f32;
         // `max(1.0)` is exact: a zero span means every `l - lo` is zero too.
@@ -38,8 +40,11 @@ impl ScoringPolicy for LoadBasedPolicy {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
     use crate::policies::scoring::argmax::TIE_EPSILON;
     use crate::policies::Policy;
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -84,5 +89,48 @@ mod tests {
             let got = p.select(&ws, &ctx).expect("non-empty").active_load();
             assert_eq!(got, *loads.iter().min().expect("non-empty"), "{spec}");
         }
+    }
+
+    #[test]
+    fn request_snapshot_overrides_later_router_active_load() {
+        let model = ModelId("tiny".into());
+        let w0 = worker("w0");
+        let w1 = worker("w1");
+        // After the request snapshot, local counters say w0 is lighter.
+        // The policy must still preserve the frozen Engine Load ordering.
+        let _after_snapshot: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
+        let snapshot = EngineLoadSnapshot::from_workers(
+            23,
+            HashMap::from([
+                (
+                    w0.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 50,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: Instant::now(),
+                    },
+                ),
+                (
+                    w1.url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: 1,
+                        num_waiting_reqs: 0,
+                        num_tokens: 0,
+                        max_total_num_tokens: 0,
+                        captured_at: Instant::now(),
+                    },
+                ),
+            ]),
+        );
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+
+        assert_eq!(
+            LoadBasedPolicy::new().select(&workers, &ctx).unwrap().id,
+            w1.id,
+            "load-based scoring must use the request snapshot before local active-load"
+        );
     }
 }

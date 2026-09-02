@@ -391,6 +391,25 @@ impl<'a> FreshLoadLookup<'a> {
         self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
     }
 
+    /// 为纯评分项提供与同一请求 admission 一致的队列深度：当候选集合完整
+    /// 覆盖在入口冻结的 Engine Load 快照中时，使用 `waiting + running`；否则
+    /// 整个集合一致回退到 Router 本地 active-load，避免部分新旧视图混排。
+    pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
+        self.comparable_get(&worker.id)
+            .map(|load| {
+                load.num_waiting_reqs
+                    .saturating_add(load.num_running_reqs)
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+            })
+            .unwrap_or_else(|| {
+                self.local_active_by_worker_id
+                    .get(worker.id.0.as_str())
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            })
+    }
+
     fn min_by_pressure_key(
         &self,
         candidates: Vec<Arc<Worker>>,
