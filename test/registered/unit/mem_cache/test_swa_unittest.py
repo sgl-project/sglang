@@ -996,26 +996,18 @@ class TestFreeFullPartition(CustomTestCase):
             self.allocator.swa_available_size(),
         )
 
-    def test_free_full_keeps_the_swa_peers_allocated(self):
+    def test_free_full_touches_only_the_full_pool(self):
         indices = _swa_alloc(self.allocator, 4)
+        # free_full's precondition: the SWA peers are already released.
+        self.allocator.free_swa(indices)
+        self.assertEqual(self._sizes(), (self.full_baseline - 4, self.swa_baseline))
+
         self.allocator.free_full(indices)
-
-        full_avail, swa_avail = self._sizes()
-        self.assertEqual(full_avail, self.full_baseline)
-        self.assertEqual(swa_avail, self.swa_baseline - 4)
-
-    def test_free_full_leaves_the_mapping_intact(self):
-        indices = _swa_alloc(self.allocator, 4)
-        before = self.allocator.full_to_swa_index_mapping[indices].clone()
-        self.allocator.free_full(indices)
-
-        self.assertTrue(bool((before > 0).all()))
-        self.assertTrue(
-            torch.equal(self.allocator.full_to_swa_index_mapping[indices], before)
-        )
+        self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
     def test_free_full_is_deferred_inside_a_free_group(self):
         indices = _swa_alloc(self.allocator, 4)
+        self.allocator.free_swa(indices)
 
         self.allocator.free_group_begin()
         self.allocator.free_full(indices)
@@ -1052,7 +1044,7 @@ class TestFreeKvRow(CustomTestCase):
             self.allocator.swa_available_size(),
         )
 
-    def test_floor_decides_how_much_of_the_swa_side_stays_out(self):
+    def test_floor_decides_how_much_of_the_swa_side_the_row_frees(self):
         # (start_pos, num_slots, floor, rows whose SWA peers are already gone)
         cases = [
             (0, 4, 4, 4),
@@ -1063,21 +1055,25 @@ class TestFreeKvRow(CustomTestCase):
         for start_pos, num_slots, floor, num_dead in cases:
             with self.subTest(start_pos=start_pos, floor=floor):
                 indices = _swa_alloc(self.allocator, num_slots)
+                # Window eviction already released the peers below the floor.
+                if num_dead:
+                    self.allocator.free_swa(indices[:num_dead])
+                self.assertEqual(
+                    self._sizes(),
+                    (
+                        self.full_baseline - num_slots,
+                        self.swa_baseline - num_slots + num_dead,
+                    ),
+                )
                 free_kv_row_segments(
                     self.allocator, [(indices, start_pos)], swa_evicted_seqlen=floor
                 )
-                self.assertEqual(
-                    self._sizes(),
-                    (self.full_baseline, self.swa_baseline - num_dead),
-                )
-                # Give the held-back SWA peers back, so the next case starts clean.
-                if num_dead:
-                    self.allocator.free_swa(indices[:num_dead])
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
     def test_adjacent_below_floor_pieces_release_their_shared_page_once(self):
         _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
         indices = _swa_alloc(allocator, 8)
+        allocator.free_swa(indices)
         after_alloc = allocator.full_available_size()
 
         # Rows [0, 6) and [6, 8) both sit below the floor and share page 1.
@@ -1093,12 +1089,13 @@ class TestFreeKvRow(CustomTestCase):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)
         kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=3)
+        self.allocator.free_swa(indices[:3])
 
         cache.free_kv_row(kv, [(1, 5)])
 
-        # Rows [1, 5) go back on the full side; of those, [1, 3) lost their SWA
-        # peers already, so 6 of the 8 SWA slots are still out.
-        self.assertEqual(self._sizes(), (self.full_baseline - 4, self.swa_baseline - 6))
+        # Rows [1, 5) go back on the full side; only [3, 5) still had SWA peers
+        # to give back, so rows 5-7 keep the 3 SWA slots that are still out.
+        self.assertEqual(self._sizes(), (self.full_baseline - 4, self.swa_baseline - 3))
 
     def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
         allocator = _SinglePoolAllocator()
