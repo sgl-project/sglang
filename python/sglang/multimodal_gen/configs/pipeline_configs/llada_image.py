@@ -36,7 +36,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
     postprocess_text_funcs: tuple = ()
 
     latent_scale_factor: int = 16
-    text_encoder_mem_fraction_static: float = 0.35
+    text_encoder_mem_fraction_static: float | None = None
     max_request_pixel_area: int = 2048 * 2048
     # The embedded text worker admits 8192 prefill tokens shared by the two
     # CFG sequences and each sequence appends 256 query tokens.

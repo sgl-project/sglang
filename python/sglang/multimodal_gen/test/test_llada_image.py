@@ -100,10 +100,11 @@ class TestLLaDAImage(unittest.TestCase):
             "<role>HUMAN</role> Generate an image.\n<role>ASSISTANT</role>\n<IMAGE1>",
         )
 
-    def test_pipeline_config_uses_llada_image_schedule_and_shape(self):
+    def test_pipeline_config_defaults_schedule_and_shape(self):
         config = LLaDAImagePipelineConfig()
         sigmas = config.prepare_sigmas(None, num_inference_steps=8)
 
+        self.assertIsNone(config.text_encoder_mem_fraction_static)
         self.assertEqual(len(sigmas), 8)
         self.assertTrue(all(left > right for left, right in pairwise(sigmas)))
         self.assertEqual(
@@ -468,9 +469,12 @@ class TestLLaDAImage(unittest.TestCase):
                 num_frames=1,
             )
 
-    def test_service_sampling_params_do_not_expose_vq_mode(self):
-        field_names = {field.name for field in fields(LLaDAImageSamplingParams)}
+    def test_service_sampling_params_use_few_step_defaults_without_vq_mode(self):
+        params = LLaDAImageSamplingParams()
+        field_names = {field.name for field in fields(params)}
 
+        self.assertEqual(params.num_inference_steps, 4)
+        self.assertEqual(params.guidance_scale, 1.0)
         self.assertNotIn("generation_mode", field_names)
         self.assertNotIn("vq_token_ids", field_names)
 
