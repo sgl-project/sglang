@@ -54,15 +54,24 @@ def _install_mori_stubs() -> None:
 _install_mori_stubs()
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import ABORT_TAG
+from sglang.srt.disaggregation.common.conn import (
+    ABORT_TAG,
+    AckTarget,
+    AbortNotification,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
-    MoriKVSender,
     StatusCode,
     _MoriTransferSubmissionError,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
+    DeferredAbortNotificationScenarios,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -74,6 +83,7 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager.transfer_lock = threading.Lock()
     manager._abort_ack_lock = threading.Lock()
     manager._deferred_ack_targets = {}
+    manager._deferred_ack_poisoned_rooms = set()
     manager._deferred_abort_ack_tracker = {}
     manager._staging_outstanding = defaultdict(int)
     manager._drain_queue = Queue(maxsize=1)
@@ -85,16 +95,14 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager.failure_lock = threading.Lock()
     manager.failure_records = {}
     manager._sent = []
-    manager._send_abort_ack = lambda ip, port, room: manager._sent.append(
-        (ip, port, room)
-    )
+    manager._send_abort_ack = lambda *args: manager._sent.append(args)
     manager._wait_poll_ms = 0
     manager._transfer_timeout_ms = 0
     return manager
 
 
 def _abort_message(room: int = 11) -> list[bytes]:
-    return [ABORT_TAG, str(room).encode(), b"10.0.0.3", b"6000"]
+    return AbortNotification(room, "10.0.0.3", 6000, ABORT_GENERATION).to_zmq()
 
 
 def _chunk(room: int = 11) -> TransferKVChunk:
@@ -108,64 +116,42 @@ def _chunk(room: int = 11) -> TransferKVChunk:
     )
 
 
-class TestMoriAbortAck(unittest.TestCase):
-    def test_active_write_defers_ack_until_quiescent(self):
+class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
+    room = 11
+    decode_ip = "10.0.0.3"
+    decode_port = 6000
+
+    def _make_abort_manager(self, status: KVPoll | None):
         manager = _manager()
-        manager.request_status[11] = KVPoll.Transferring
-        chunk = _chunk()
-        manager._mark_transfer_started(chunk)
+        if status is not None:
+            manager.request_status[self.room] = status
+        return manager
 
-        manager._handle_abort_message(_abort_message())
+    def _dispatch_abort(self, manager) -> None:
+        manager._handle_abort_message(self._abort_message())
 
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [])
-        self.assertEqual(manager._deferred_ack_targets[11], ("10.0.0.3", 6000))
+    def _start_test_transfer(self, manager) -> None:
+        manager._mark_transfer_started(_chunk(self.room))
 
-        manager._mark_transfer_quiescent(chunk)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
-        self.assertNotIn(11, manager._deferred_ack_targets)
-        self.assertNotIn(11, manager._staging_outstanding)
+    def _drain_test_transfer(self, manager) -> None:
+        manager._mark_transfer_quiescent(_chunk(self.room))
 
-    def test_idle_active_room_acks_immediately(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.WaitingForInput
+    def test_abort_without_valid_return_address_marks_failed_without_ack(self):
+        messages = (
+            ("missing", [ABORT_TAG, b"11"]),
+            ("malformed port", [ABORT_TAG, b"11", b"10.0.0.3", b"bad"]),
+        )
 
-        manager._handle_abort_message(_abort_message())
+        for name, message in messages:
+            with self.subTest(name=name):
+                manager = _manager()
+                manager.request_status[11] = KVPoll.WaitingForInput
 
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
+                manager._handle_abort_message(message)
 
-    def test_completed_room_acks_immediately(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.Success
-
-        manager._handle_abort_message(_abort_message())
-
-        self.assertEqual(manager.request_status[11], KVPoll.Success)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
-
-    def test_completed_room_with_outstanding_write_defers_ack(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.Success
-        chunk = _chunk()
-        manager._mark_transfer_started(chunk)
-
-        manager._handle_abort_message(_abort_message())
-
-        self.assertEqual(manager._sent, [])
-        self.assertEqual(manager._deferred_ack_targets[11], ("10.0.0.3", 6000))
-        manager._mark_transfer_quiescent(chunk)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
-
-    def test_legacy_abort_without_return_address_only_marks_failed(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.WaitingForInput
-
-        manager._handle_abort_message([ABORT_TAG, b"11"])
-
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [])
-        self.assertEqual(manager._deferred_ack_targets, {})
+                self.assertEqual(manager.request_status[11], KVPoll.Failed)
+                self.assertEqual(manager._sent, [])
+                self.assertEqual(manager._deferred_ack_targets, {})
 
     def test_feature_off_preserves_abort_without_ack(self):
         manager = _manager(enabled=False)
@@ -176,15 +162,6 @@ class TestMoriAbortAck(unittest.TestCase):
         self.assertEqual(manager.request_status[11], KVPoll.Failed)
         self.assertEqual(manager._sent, [])
         self.assertEqual(manager._deferred_ack_targets, {})
-
-    def test_invalid_return_address_still_marks_room_failed(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.WaitingForInput
-
-        manager._handle_abort_message([ABORT_TAG, b"11", b"10.0.0.3", b"bad"])
-
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [])
 
     def test_abort_after_submit_waits_for_terminal_status(self):
         manager = _manager()
@@ -212,7 +189,10 @@ class TestMoriAbortAck(unittest.TestCase):
         self.assertEqual(manager.engine.wait_all.call_count, 2)
         self.assertEqual(manager._sent, [])
         manager._mark_transfer_quiescent(chunk)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
+        self.assertEqual(
+            manager._sent,
+            [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
+        )
 
     def test_sla_failure_acks_after_status_drains(self):
         manager = _manager()
@@ -245,7 +225,10 @@ class TestMoriAbortAck(unittest.TestCase):
         manager._drain_transfer_statuses(queued_chunk, queued_statuses, failure_reason)
 
         status.Wait.assert_called_once_with()
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
+        self.assertEqual(
+            manager._sent,
+            [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
+        )
         self.assertNotIn(11, manager._staging_outstanding)
         manager._conclude_room_failure.assert_called_once_with(
             11, "KV transfer exceeded SLA 1ms"
@@ -268,22 +251,6 @@ class TestMoriAbortAck(unittest.TestCase):
 
         self.assertEqual(failure, "KV transfer exceeded SLA 1ms")
         self.assertEqual(manager.engine.wait_all.call_count, 1)
-
-    def test_sender_clear_preserves_ack_target_until_write_drains(self):
-        manager = _manager()
-        manager.request_status[11] = KVPoll.Failed
-        chunk = _chunk()
-        manager._mark_transfer_started(chunk)
-        manager._handle_abort_message(_abort_message())
-        sender = MoriKVSender.__new__(MoriKVSender)
-        sender.kv_mgr = manager
-        sender.bootstrap_room = 11
-
-        sender.clear()
-
-        self.assertEqual(manager._deferred_ack_targets[11], ("10.0.0.3", 6000))
-        manager._mark_transfer_quiescent(chunk)
-        self.assertEqual(manager._sent, [("10.0.0.3", 6000, 11)])
 
     def test_wait_event_failure_releases_outstanding_count(self):
         manager = _manager()
