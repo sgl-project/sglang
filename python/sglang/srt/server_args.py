@@ -1785,11 +1785,17 @@ class ServerArgs:
         str,
         Arg(
             help=(
-                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "DeepSeek-V4 prefill attention backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'flashmla_kv' uses the paged KV-cache kernel for prefill."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=[
+                "auto",
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+            ],
         ),
         NS("exec.kernel"),
     ] = "auto"

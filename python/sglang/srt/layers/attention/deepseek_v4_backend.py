@@ -1667,8 +1667,12 @@ class DeepseekV4AttnBackend(
 
         sparse_prefill_fwd does not support SM120. Deterministic inference
         pins the choice: the token-count threshold otherwise makes a prompt's
-        output follow the batch it was prefilled in.
+        output follow the batch it was prefilled in. ``flashmla_kv`` is an
+        explicit correctness/debug mode that keeps prefill and decode on the
+        same paged KV-cache attention kernel.
         """
+        if self.dsv4_prefill_backend == "flashmla_kv":
+            return False
         if get_platform().is_sm120:
             return False
         if is_batch_invariant_mode_enabled():
