@@ -4389,7 +4389,8 @@ class MLATokenToKVPool(KVCache):
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+            # HIP TileLang FP8 consumes the model's raw MLA layout
+            # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
@@ -4407,8 +4408,8 @@ class MLATokenToKVPool(KVCache):
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
-            # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+            # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
+            # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
