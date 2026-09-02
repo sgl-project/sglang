@@ -167,6 +167,19 @@ def _validate_weight_files(
     return weights_map, missing
 
 
+def _reject_expert_parallel_modules(
+    modules_to_update: list[tuple[str, torch.nn.Module]],
+) -> None:
+    """Reject live full-weight updates to an EP-sharded module."""
+    for name, module in modules_to_update:
+        ep_info = getattr(module, "ep_info", None)
+        if ep_info is not None and ep_info.enabled:
+            raise ValueError(
+                f"runtime weight updates are not supported for '{name}' under expert "
+                "parallelism; restart the server to load new weights"
+            )
+
+
 def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     """Load weights into a module, handling offload-managed parameters.
 
@@ -368,6 +381,7 @@ class WeightsUpdater:
 
         try:
             modules_to_update = self._collect_modules(target_modules)
+            _reject_expert_parallel_modules(modules_to_update)
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
@@ -521,6 +535,7 @@ class WeightsUpdater:
             target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
         try:
             modules_to_update = self._collect_modules(target_modules)
+            _reject_expert_parallel_modules(modules_to_update)
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)

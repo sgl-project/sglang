@@ -140,6 +140,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.tp_size is not None:
         extra_args += f" --tp-size {server_args.tp_size}"
 
+    if server_args.ep_size is not None:
+        extra_args += f" --ep-size {server_args.ep_size}"
+
     if server_args.ulysses_degree is not None:
         extra_args += f" --ulysses-degree {server_args.ulysses_degree}"
 

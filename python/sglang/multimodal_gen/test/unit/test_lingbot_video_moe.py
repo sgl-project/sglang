@@ -20,6 +20,7 @@ from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
+    MoeExpertParallelInfo,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -29,9 +30,9 @@ from sglang.multimodal_gen.runtime.models.dits import (
 )
 from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     LingBotVideoAttention,
-    LingBotVideoTransformer3DModel,
     _joint_position_ids,
     make_joint_position_ids,
+    pack_expert_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     PROMPT_TEMPLATE,
@@ -334,11 +335,16 @@ def test_grouped_experts_store_packed_w13_weight():
 
 
 def test_preprocess_packs_w1_w3_into_w13_weight():
-    pack = LingBotVideoTransformer3DModel.preprocess_loaded_state_dict
-    E, I, H = 2, 3, 4
-    w1 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H)
-    w2 = torch.arange(E * H * I, dtype=torch.float32).reshape(E, H, I)
-    w3 = torch.arange(E * I * H, dtype=torch.float32).reshape(E, I, H) + 100.0
+    E, M, H = 2, 3, 4
+    ep_info = MoeExpertParallelInfo(
+        ep_size=1,
+        ep_rank=0,
+        num_local_experts=E,
+        local_expert_start=0,
+    )
+    w1 = torch.arange(E * M * H, dtype=torch.float32).reshape(E, M, H)
+    w2 = torch.arange(E * H * M, dtype=torch.float32).reshape(E, H, M)
+    w3 = torch.arange(E * M * H, dtype=torch.float32).reshape(E, M, H) + 100.0
     # block 0: w1 before w3; block 1: w3 before w1 (order-independence).
     src = [
         ("blocks.0.ffn.experts.w1", w1),
@@ -349,7 +355,7 @@ def test_preprocess_packs_w1_w3_into_w13_weight():
         ("blocks.1.ffn.experts.w2", w2.clone()),
         ("blocks.1.ffn.experts.w1", w1.clone()),
     ]
-    out = dict(pack(None, iter(src)))
+    out = dict(pack_expert_weights(iter(src), ep_info=ep_info))
     assert set(out.keys()) == {
         "blocks.0.ffn.experts.w13_weight",
         "blocks.0.ffn.experts.w2",

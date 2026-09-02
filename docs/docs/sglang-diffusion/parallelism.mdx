@@ -9,13 +9,17 @@ different dimension of the DiT forward pass, which is exactly why they can be
 combined: the total GPU count is the product of the degrees,
 
 ```text
-num_gpus = cfg_parallel_degree × tp_size × sp_degree
+num_gpus = dp_size × cfg_parallel_degree × tp_size × sp_degree
 sp_degree = ulysses_degree × ring_degree
 ```
+
+When expert parallelism is enabled, `ep_size = sp_degree`: EP reuses the full
+SP group and is not counted a second time.
 
 This page is the map — what each axis does, which combinations are legal, and
 how to pick one. Per-axis depth lives in
 [Sequence Parallelism](./ring_sp_performance),
+[Expert Parallelism](/sglang-diffusion/expert_parallelism),
 [Encoder Parallelism](./encoder_parallel) (text/image encoders are a separate
 axis with their own knob), and the [CLI reference](./api/cli).
 
@@ -25,6 +29,7 @@ axis with their own knob), and the [CLI reference](./api/cli).
 | --- | --- | --- | --- |
 | CFG parallel | guidance branches | one combine per denoise step | `--cfg-parallel-size` |
 | Tensor parallel (TP) | weights and attention heads | all-reduce per transformer block | `--tp-size` |
+| Expert parallel (EP) | MoE experts on the SP ranks | dispatch/combine per MoE block | `--ep-size` |
 | Ulysses SP | sequence outside attention ↔ heads inside it | two all-to-alls per attention | `--ulysses-degree` |
 | Ring SP | sequence rows inside attention | neighbor-only K/V rotation, overlapped with compute | `--ring-degree` |
 | K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | `--kv-gather-degree` |
@@ -73,6 +78,8 @@ mis-mapped layout stays numerically correct and silently loses the performance
 ## Constraints
 
 - `num_attention_heads % tp_size == 0` — TP splits heads at the projections.
+- SP-aligned MoE token dispatch requires `ep_size = sp_degree`; the configured
+  Ulysses, Ring, or K/V-gather exchange keeps its existing constraints.
 - `(num_attention_heads / tp_size) % ulysses_degree == 0` — Ulysses splits the
   **TP-local** heads. `H % U == 0` alone is not sufficient: 56 heads pass with
   `tp=2, ulysses=4` (28 % 4) and fail with `tp=4, ulysses=4` (14 % 4).

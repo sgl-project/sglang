@@ -607,6 +607,7 @@ class ServerArgsAutoTuner:
         args = self.server_args
         return (
             args.tp_size is not None
+            or args.ep_size > 1
             or args.sp_degree is not None
             or args.ulysses_degree is not None
             or args.ring_degree is not None

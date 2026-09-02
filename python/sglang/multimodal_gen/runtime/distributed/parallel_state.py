@@ -336,6 +336,10 @@ def get_sp_group() -> SequenceParallelGroupCoordinator:
     return _SP
 
 
+def sequence_parallel_is_initialized() -> bool:
+    return _SP is not None
+
+
 def get_dp_group() -> GroupCoordinator:
     assert _DP is not None, "data parallel group is not initialized"
     return _DP

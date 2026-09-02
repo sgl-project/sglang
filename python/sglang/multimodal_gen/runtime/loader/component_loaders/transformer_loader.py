@@ -6,6 +6,9 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
+    LingBotVideoMoEConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -291,6 +294,8 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             raise ValueError(f"Invalid module name: {component_name}")
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
+        if isinstance(dit_config, LingBotVideoMoEConfig):
+            dit_config.ep_size = component_server_args.ep_size
 
         cls_name = config.pop("_class_name")
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
