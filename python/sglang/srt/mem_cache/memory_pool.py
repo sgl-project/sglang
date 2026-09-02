@@ -66,6 +66,7 @@ from sglang.srt.mem_cache.layout.page_major import (
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
+    set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -3657,8 +3658,9 @@ class HybridLinearKVPool(KVCache):
         self.head_num = head_num
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
-        # virtual->physical mamba-slot translate for the HiCache offload path;
-        # identity for a static pool, the allocator's `translate` for the unified pool.
+        # Identity even though the unified pool holds VIRTUAL mamba ids: its
+        # composite allocator implements neither `get_cpu_copy` nor
+        # `load_cpu_copy`, the only readers, so those ids never arrive here.
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -4078,6 +4080,32 @@ class MLATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    # Has the WRITE loc arriving here already had the DCP owner rule resolved?
+    # False: this pool takes a WIDENED loc. The unified pool resolves it in
+    # `KVIndexTranslator.rebind_write_loc` and flips this. Not derivable from
+    # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
+    # full-attention layer is translated with blocks_per_page 1.
+    write_loc_is_dcp_resolved = False
+
+    @property
+    def _write_loc_dcp_span(self) -> int:
+        """How many logical ids one stored row spans in the write-loc space."""
+        return 1 if self.write_loc_is_dcp_resolved else get_parallel().attn_dcp_size
+
+    def _scatter_mla_rows(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        if self.write_loc_is_dcp_resolved:
+            set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        else:
+            set_mla_kv_buffer_dcp_sharded_triton(
+                dst_buffer, loc, cache_k_nope, cache_k_rope
+            )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4095,12 +4123,15 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-            if not valid_mask.all():
-                loc = loc[valid_mask]
-                cache_k = cache_k[valid_mask]
+        # No DCP-aware variant is possible: the two backends reaching this door
+        # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
+        assert self.write_loc_is_dcp_resolved or not get_parallel().dcp_enabled, (
+            "MLATokenToKVPool.set_kv_buffer has no DCP-aware write path. Under "
+            "--dcp-size > 1 the MLA write must go through set_mla_kv_buffer, "
+            "whose kernel resolves the owner rule; reaching the combined-row "
+            "door means an attention backend took a write path that never "
+            "declared which loc space it emits."
+        )
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
@@ -4118,6 +4149,10 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
+        assert not (
+            self.write_loc_is_dcp_resolved
+            and (self.use_dsa or self.dsa_kv_cache_store_fp8)
+        ), "the DSA write paths have no resolved-loc variant"
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4139,12 +4174,7 @@ class MLATokenToKVPool(KVCache):
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
             # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope_fp8,
-                cache_k_rope_fp8,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -4153,12 +4183,7 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-            )
+            self._scatter_mla_rows(dst_buffer, loc, cache_k_nope, cache_k_rope)
 
     def set_mla_kv_buffer(
         self,
@@ -4168,11 +4193,11 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
         layer_id_override: Optional[int] = None,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
+        # loc is widened under DCP unless the pool declares it resolved.
         maybe_detect_oob(
             loc,
             0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
+            (self.size + self.page_size) * self._write_loc_dcp_span,
             "set_mla_kv_buffer (MLA)",
         )
         maybe_detect_kernel_facing_loc(
@@ -4379,7 +4404,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-            set_mla_kv_buffer_triton(
+            self._scatter_mla_rows(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4,

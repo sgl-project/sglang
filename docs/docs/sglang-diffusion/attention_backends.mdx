@@ -65,6 +65,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires SageAttention3 installed per upstream instructions.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparge_attn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SPARGE_ATTN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Training-free sparse SageAttention2. CUDA SM80/86/87/89/90, FP16/BF16, head dim 64/128, and square self-attention with sequence length at least 128. Other attention shapes use dense SDPA. Install <code>pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation</code>; configure retained block ratio with <code>topk</code>.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sol_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`SOL_ATTN`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires the upstream <code>sol-attn</code> package. Install with <code>pip install git+https://github.com/NVlabs/Sana.git@sol-engine#subdirectory=techniques/sparse_backends</code>. BF16, head dim 128. Configure via <code>--attention-backend-config</code>.</td>
@@ -212,6 +217,16 @@ Some backends require additional configuration. You can pass these parameters vi
     </tr>
   </tbody>
 </table>
+
+**SpargeAttention (`sparge_attn`)**
+
+| Parameter | Type | Description | Default |
+|---|---|---|---|
+| `topk` | `float` | Fraction of predicted attention blocks retained per head. Higher values preserve more attention work and generally improve quality. Must be in `(0, 1]`. | `0.5` |
+
+SpargeAttention is approximate even when `topk=1`: the recommended upstream
+kernel quantizes attention through SageAttention2. Validate output quality and
+end-to-end latency on the target model and resolution before deployment.
 
 **V-MoBA (`vmoba_attn`)**
 
@@ -495,6 +510,16 @@ Some backends require additional configuration. You can pass these parameters vi
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA-only (optional dependency).</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparge_attn`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA SM80/86/87/89/90 only. Requires <code>SpargeAttn</code>; head dim 64/128 and square self-attention with sequence length at least 128.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sol_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
@@ -677,6 +702,30 @@ attention kernel into a captured/traced graph; sparse server backends
 dense switching; under ring parallelism the target must be ring-capable. Note
 `sage_attn` / `sage_attn_3` are lossy (quantized attention) — validate quality
 on your workload.
+
+### Using SpargeAttention
+
+Install the optional CUDA extension, then select the backend explicitly:
+
+```bash
+pip install ninja
+pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
+
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "..." \
+  --attention-backend sparge_attn \
+  --attention-backend-config topk=0.5
+```
+
+`sparge_attn` applies to compatible self-attention layers. Cross-attention uses
+the existing dense fallback; short self-attention and asymmetric Q/KV also use
+dense SDPA. LTX-2, LTX-2.3, and LTX-2.5 have compatible video (128) and audio
+(64) head dimensions, so their sufficiently long, unmasked self-attention uses
+SpargeAttention while prompt and audio-video cross-attention remain dense.
+Ulysses sequence parallelism is supported, but ring attention is not because the
+upstream kernel does not expose the softmax LSE needed for ring merging. K/V-gather
+SP therefore follows the normal sparse-backend rule and uses Ulysses instead.
 
 ### Sage then Sol hybrid
 
