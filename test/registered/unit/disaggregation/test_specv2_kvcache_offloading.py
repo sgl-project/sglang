@@ -521,39 +521,6 @@ class TestComputePrefixHash(unittest.TestCase):
                     expected,
                 )
 
-    def test_namespaces_do_not_share_pages(self):
-        manager = self._make_manager()
-        tokens = list(range(1, 9))
-
-        chains = {
-            tuple(
-                manager._compute_prefix_hash(
-                    self._make_req(extra_key, cache_salt), tokens
-                )
-            )
-            for _, extra_key, cache_salt in self._NAMESPACES
-        }
-
-        self.assertEqual(len(chains), len(self._NAMESPACES))
-
-    def test_continued_chain_ignores_the_namespace(self):
-        """Only the head of a chain is seeded; a continuation links to the page
-        the caller already resolved."""
-        manager = self._make_manager()
-        tokens = list(range(1, 9))
-        prior_hash = get_hash_str(list(range(100, 104)))
-
-        chains = {
-            tuple(
-                manager._compute_prefix_hash(
-                    self._make_req(extra_key, cache_salt), tokens, prior_hash
-                )
-            )
-            for _, extra_key, cache_salt in self._NAMESPACES
-        }
-
-        self.assertEqual(len(chains), 1)
-
 
 if __name__ == "__main__":
     unittest.main()

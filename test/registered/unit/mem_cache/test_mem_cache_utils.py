@@ -376,32 +376,22 @@ class TestComputeNodeHashValues(unittest.TestCase):
     def test_extra_key_stays_out_of_event_hashes(self):
         """extra_key has no field in the KV-event schema, so a published chain
         seeded with it emits block hashes that a token-based routing consumer
-        cannot recompute. LoRA requests and every Elastic EP request carry one."""
+        cannot recompute. It still seeds the storage chain, with or without a
+        cache_salt alongside."""
         tokens = array("q", range(1, 17))
-        key = _HashKey(tokens, extra_key="lora-a")
-        unseeded = _legacy_page_hashes(_HashKey(tokens), page_size=8)
+        for cache_salt in (None, "tenant-a"):
+            with self.subTest(cache_salt=cache_salt):
+                plain = _HashKey(tokens, cache_salt=cache_salt)
+                keyed = _HashKey(tokens, extra_key="lora-a", cache_salt=cache_salt)
 
-        self.assertEqual(
-            compute_node_event_hash_values(self._make_node(key), page_size=8),
-            unseeded,
-        )
-        self.assertNotEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8), unseeded
-        )
-
-    def test_extra_key_does_not_move_salted_event_hashes(self):
-        tokens = array("q", range(1, 17))
-        salted = _HashKey(tokens, cache_salt="tenant-a")
-        both = _HashKey(tokens, extra_key="lora-a", cache_salt="tenant-a")
-
-        self.assertEqual(
-            compute_node_event_hash_values(self._make_node(salted), page_size=8),
-            compute_node_event_hash_values(self._make_node(both), page_size=8),
-        )
-        self.assertNotEqual(
-            compute_node_hash_values(self._make_node(salted), page_size=8),
-            compute_node_hash_values(self._make_node(both), page_size=8),
-        )
+                self.assertEqual(
+                    compute_node_event_hash_values(self._make_node(plain), page_size=8),
+                    compute_node_event_hash_values(self._make_node(keyed), page_size=8),
+                )
+                self.assertNotEqual(
+                    compute_node_hash_values(self._make_node(plain), page_size=8),
+                    compute_node_hash_values(self._make_node(keyed), page_size=8),
+                )
 
     def test_cache_salt_event_hashes_are_memoized(self):
         node = self._make_node(
