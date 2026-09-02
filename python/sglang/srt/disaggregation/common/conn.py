@@ -523,9 +523,9 @@ class CommonKVManager(BaseKVManager):
                     bootstrap_room, failure_reason or "KV transfer failed"
                 )
 
-        self.update_status(bootstrap_room, status)
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
+        self.update_status(bootstrap_room, status)
         self.send_kv_status_message(
             targets=targets,
             bootstrap_room=bootstrap_room,

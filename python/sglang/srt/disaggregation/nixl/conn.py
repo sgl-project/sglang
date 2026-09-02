@@ -680,6 +680,45 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
+    def _await_handles(
+        self, handles: List[Any], *, failure_seen: bool
+    ) -> Tuple[bool, bool]:
+        """Poll until every handle settled. Returns ``(settled, any_failed)``.
+
+        The wait is unbounded while every handle is still healthy, and bounded
+        to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
+        ``failure_seen`` arms that deadline up front, for a batch that raised
+        before the barrier ran. A state that cannot be read counts as running,
+        since it does not prove the write into the decode's pages is over.
+        """
+        deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        while True:
+            all_settled = True
+            any_failed = failure_seen
+            try:
+                for handle in handles:
+                    state = self.agent.check_xfer_state(handle)
+                    if state == "ERR":
+                        any_failed = True
+                    elif state != "DONE":
+                        all_settled = False
+            except Exception as e:
+                logger.warning(f"Failed to read NIXL transfer state: {e}")
+                return False, True
+            if all_settled:
+                return True, any_failed
+            if not any_failed:
+                time.sleep(0)
+                continue
+            # This room is already lost, so trade its notification for the
+            # worker's other rooms: back off, and give up waiting for the
+            # siblings once the deadline passes.
+            if deadline is None:
+                deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S
+            elif time.time() >= deadline:
+                return False, True
+            time.sleep(NIXL_ERR_SETTLE_POLL_S)
+
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -1371,37 +1410,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settle_deadline = None
-                while handles:
-                    all_settled = True
-                    any_failed = False
-                    for handle in handles:
-                        state = self.agent.check_xfer_state(handle)
-                        if state == "ERR":
-                            any_failed = True
-                        elif state != "DONE":
-                            all_settled = False
-                    if all_settled:
-                        if any_failed:
-                            raise RuntimeError(
-                                f"NIXL transfer encountered ERR room={room}"
-                            )
-                        break
-                    if not any_failed:
-                        time.sleep(0)
-                        continue
-                    # This room is already lost, so trade its notification for
-                    # the worker's other rooms: back off, and give up waiting
-                    # for the siblings once the deadline passes.
-                    if settle_deadline is None:
-                        settle_deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S
-                    elif time.time() >= settle_deadline:
-                        settle_timed_out = True
-                        raise RuntimeError(
-                            f"NIXL transfer for room {room} left a handle running "
-                            f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
-                        )
-                    time.sleep(NIXL_ERR_SETTLE_POLL_S)
+                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                if not settled:
+                    settle_timed_out = True
+                    raise RuntimeError(
+                        f"NIXL transfer for room {room} left a handle running "
+                        f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
+                    )
+                if any_failed:
+                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
 
                 self._staging_outstanding[room] -= 1
                 if self.enable_deferred_decode_kv_release:
@@ -1445,14 +1462,20 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"Unexpected transfer worker error for room {room}"
                     )
                 self.exceptions[room] = e
-                if settle_timed_out:
-                    # A sibling handle can still write into the decode's KV
-                    # pages, so leave the room to the decode's waiting timeout
-                    # rather than telling it those pages are free.
+                # An exception raised while the batch was still being built
+                # leaves the handles posted so far running, so settle here too
+                # rather than only after the barrier.
+                notify = False
+                if not settle_timed_out:
+                    notify, _ = self._await_handles(handles, failure_seen=True)
+                if notify:
+                    self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
+                else:
+                    # A handle can still write into the decode's KV pages, so
+                    # leave the room to the decode's waiting timeout rather
+                    # than telling it those pages are free.
                     self.record_failure(room, str(e))
                     self.update_status(room, KVPoll.Failed)
-                else:
-                    self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -3154,6 +3177,11 @@ class NixlKVReceiver(CommonKVReceiver):
         return True
 
     def failure_exception(self):
+        if self.conclude_state is None:
+            self.conclude_state = KVPoll.Failed
+
+        self.clear()
+
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         is_propagated = failure_reason is None
