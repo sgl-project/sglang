@@ -227,7 +227,7 @@ def _compute_lora_alignment(
 
     device = topk_ids.device
 
-    use_naive = (
+    use_naive = _is_xpu or (
         cg is None
         and M * topk_ids.shape[1] * _SPARSITY_FACTOR
         <= lora_info.num_experts * max_loras
