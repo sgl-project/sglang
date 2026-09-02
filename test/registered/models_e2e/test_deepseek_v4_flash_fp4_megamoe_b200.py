@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
