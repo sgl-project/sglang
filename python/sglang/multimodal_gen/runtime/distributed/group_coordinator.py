@@ -381,7 +381,6 @@ class GroupCoordinator:
             output = custom_ar.custom_all_reduce(input_)
             if output is not None:
                 return output
-
         if current_platform.is_cpu() and self.device_communicator is not None:
             return self.device_communicator.all_reduce(
                 input_,
@@ -391,12 +390,8 @@ class GroupCoordinator:
             )
 
         torch.distributed.all_reduce(
-            input_,
-            op=op,
-            group=self.device_group,
-            async_op=async_op,
+            input_, op=op, group=self.device_group, async_op=async_op
         )
-
         return input_
 
     def all_gather(
