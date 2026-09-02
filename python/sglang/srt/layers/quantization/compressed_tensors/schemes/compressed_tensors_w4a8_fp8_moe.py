@@ -11,7 +11,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from compressed_tensors import CompressionFormat
 
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
@@ -84,17 +83,16 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
-        self.num_bits = config.num_bits
-        self.packed_factor = 32 // config.num_bits
-        self.group_size = config.group_size
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        # Use the scheme matched for this layer rather than target_scheme_map
+        # ["Linear"]: a mixed-precision checkpoint may not carry a "Linear"
+        # target, or may use it to describe a different scheme.
+        self.num_bits = weight_quant.num_bits
+        self.packed_factor = 32 // weight_quant.num_bits
+        self.group_size = weight_quant.group_size
 
-        assert config.symmetric, "Only symmetric quantization is supported"
-        assert (
-            self.quant_config.quant_format == CompressionFormat.pack_quantized.value
-        ), f"W4AFP8MoE requires pack-quantized format, got {self.quant_config.quant_format}"
+        assert weight_quant.symmetric, "Only symmetric quantization is supported"
 
     @classmethod
     def get_min_capability(cls) -> int:

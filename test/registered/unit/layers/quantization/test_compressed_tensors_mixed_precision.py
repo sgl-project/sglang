@@ -20,6 +20,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW4AFP8MoE,
     CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -91,6 +92,53 @@ WNA16_GROUP = {
         "dynamic": False,
     },
     "input_activations": None,
+}
+
+
+# Block-FP8 attention / shared-expert / dense-MLP projections, as produced by
+# requantizing a DeepSeek-style FP8 release.
+FP8_BLOCK_TARGET = "re:.*\\.mlp\\.shared_experts\\.(gate|up|down)_proj$"
+FP8_BLOCK_GROUP = {
+    "format": "float-quantized",
+    "targets": [FP8_BLOCK_TARGET],
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "block",
+        "block_structure": [128, 128],
+        "dynamic": False,
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": True,
+    },
+}
+
+# W4A8: group-128 INT4 routed experts with dynamic per-token FP8 activations.
+W4A8_TARGET = "re:.*\\.mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"
+W4A8_GROUP = {
+    "format": "pack-quantized",
+    "targets": [W4A8_TARGET],
+    "weights": {
+        "num_bits": 4,
+        "type": "int",
+        "symmetric": True,
+        "strategy": "group",
+        "group_size": 128,
+        "dynamic": False,
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "symmetric": True,
+        "strategy": "token",
+        "dynamic": True,
+    },
 }
 
 
@@ -186,6 +234,91 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+class TestW4AFP8MixedPrecision(CustomTestCase):
+    """INT4 routed experts beside block-FP8 shared experts.
+
+    Every lookup below used to key off ``target_scheme_map["Linear"]`` or the
+    top-level format, neither of which a multi-group checkpoint has to provide.
+    """
+
+    def _config(self):
+        return CompressedTensorsConfig.from_config(
+            _mixed_precision_config(W4A8_GROUP, FP8_BLOCK_GROUP)
+        )
+
+    def test_wint4afp8_detected_from_group_format(self):
+        # The top-level format is "mixed-precision"; the INT4 group declares
+        # "pack-quantized". Reading only the former detects nothing.
+        quant_config = self._config()
+        scheme = quant_config.target_scheme_map[W4A8_TARGET]
+        self.assertTrue(
+            quant_config._is_wint4afp8(
+                scheme["weights"], scheme["input_activations"], scheme["format"]
+            )
+        )
+        self.assertFalse(
+            quant_config._is_wint4afp8(
+                scheme["weights"], scheme["input_activations"], "mixed-precision"
+            )
+        )
+
+    def test_weight_block_size_falls_back_to_any_block_group(self):
+        # No "Linear" target at all: the block size still has to be found, or
+        # block-FP8 layers cannot shard their scales.
+        quant_config = self._config()
+        self.assertNotIn("Linear", quant_config.target_scheme_map)
+        self.assertEqual(quant_config.weight_block_size, [128, 128])
+
+    def test_weight_block_size_ignores_non_block_linear_target(self):
+        # A "Linear" target that describes the group-wise INT4 experts has no
+        # block structure; the block-FP8 group's must still win.
+        groups = (dict(W4A8_GROUP, targets=["Linear"]), FP8_BLOCK_GROUP)
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(*groups)
+        )
+        self.assertIn("Linear", quant_config.target_scheme_map)
+        self.assertEqual(quant_config.weight_block_size, [128, 128])
+
+    def test_moe_scheme_reads_matched_group_not_linear(self):
+        # Top-level format stays "mixed-precision"; the scheme must still
+        # take num_bits / group_size from the matched INT4 group.
+        quant_config = self._config()
+        scheme_dict = quant_config.target_scheme_map[W4A8_TARGET]
+        self.assertEqual(quant_config.quant_format, "mixed-precision")
+
+        scheme = CompressedTensorsW4AFP8MoE(
+            quant_config,
+            weight_quant=scheme_dict["weights"],
+            input_quant=scheme_dict["input_activations"],
+        )
+        self.assertEqual(scheme.num_bits, 4)
+        self.assertEqual(scheme.group_size, 128)
+        self.assertEqual(scheme.packed_factor, 32 // 4)
+
+    def test_shared_experts_fusion_refused_on_precision_mismatch(self):
+        # Folding block-FP8 shared experts into the INT4 routed-expert kernel
+        # would load them through the wrong scheme.
+        self.assertFalse(self._config().can_fuse_shared_expert())
+
+    def test_shared_experts_fusion_allowed_when_schemes_agree(self):
+        uniform = dict(W4A8_GROUP, targets=["Linear"])
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(uniform)
+        )
+        self.assertTrue(quant_config.can_fuse_shared_expert())
+
+    def test_shared_experts_fusion_refused_when_shared_is_unquantized(self):
+        # Shared experts listed in `ignore` stay in the model dtype.
+        quant_config = CompressedTensorsConfig.from_config(
+            _mixed_precision_config(
+                W4A8_GROUP,
+                FP8_BLOCK_GROUP,
+                ignore=["re:.*\\.mlp\\.shared_experts\\..*"],
+            )
+        )
+        self.assertFalse(quant_config.can_fuse_shared_expert())
 
 
 if __name__ == "__main__":

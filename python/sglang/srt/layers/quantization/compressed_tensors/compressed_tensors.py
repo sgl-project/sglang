@@ -263,12 +263,69 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:
-        """Get the weight block size from the quantization config."""
+        """Get the weight block size from the quantization config.
+
+        A mixed-precision checkpoint may have no "Linear" target at all, or may
+        use it for a scheme that has no block structure (for example group-wise
+        INT4 routed experts alongside block-FP8 attention layers). Fall back to
+        any target that declares one so block-FP8 layers still find their block
+        size.
+        """
+        targets = list(self.target_scheme_map)
         if "Linear" in self.target_scheme_map:
-            weights_config = self.target_scheme_map["Linear"].get("weights")
-            if weights_config and hasattr(weights_config, "block_structure"):
-                return weights_config.block_structure
+            targets = ["Linear"] + [t for t in targets if t != "Linear"]
+        for target in targets:
+            scheme = self.target_scheme_map[target]
+            if not scheme:
+                continue
+            block_structure = getattr(scheme.get("weights"), "block_structure", None)
+            if block_structure:
+                return block_structure
         return None
+
+    def can_fuse_shared_expert(self) -> bool:
+        """Whether the shared experts may be folded into the routed-expert kernel.
+
+        A mixed-precision checkpoint can keep the shared experts at a higher
+        precision than the routed experts -- block-FP8 shared experts beside
+        group-wise INT4 routed experts, for example. Folding them would load the
+        shared weights through the routed-expert scheme and silently mis-read
+        them, so compare the two schemes and refuse when they differ.
+        """
+        if not self.target_scheme_map:
+            return True
+
+        lookup_stub = torch.nn.Module()
+
+        def weights_for(layer_name: str) -> Optional[QuantizationArgs]:
+            if should_ignore_layer(
+                layer_name,
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return None
+            try:
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
+                    module=lookup_stub,
+                    targets=self.target_scheme_map.keys(),
+                    fused_mapping=self.packed_modules_mapping,
+                )
+            except ValueError:
+                return None
+            scheme = self.target_scheme_map.get(matched_target)
+            return scheme.get("weights") if scheme else None
+
+        routed = weights_for("model.layers.0.mlp.experts.0.gate_proj")
+        if routed is None:
+            # Routed experts are not described here; leave the decision alone.
+            return True
+
+        for suffix in ("gate_proj", "up_proj", "down_proj"):
+            shared = weights_for(f"model.layers.0.mlp.shared_experts.{suffix}")
+            if shared is None or shared != routed:
+                return False
+        return True
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
@@ -442,12 +499,20 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_dynamic
         )
 
-    def _is_wint4afp8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+    def _is_wint4afp8(
+        self,
+        weight_quant: BaseModel,
+        input_quant: BaseModel,
+        format: Optional[str] = None,
+    ) -> bool:
         """Detect W4AFP8: packed INT4 weights + 8-bit dynamic per-token activations."""
         if weight_quant is None or input_quant is None:
             return False
+        # Prefer the matched config_group's format, as _get_scheme_from_parts
+        # does: the top-level format is "mixed-precision" when groups disagree.
+        quant_format = format if format is not None else self.quant_format
         return (
-            self.quant_format == CompressionFormat.pack_quantized.value
+            quant_format == CompressionFormat.pack_quantized.value
             and weight_quant.num_bits == 4
             and weight_quant.type == QuantizationType.INT
             and weight_quant.symmetric
@@ -818,6 +883,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
+        scheme_format = scheme_dict.get("format")
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
@@ -883,7 +949,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise NotImplementedError(
                     "The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
                 )
-        elif self._is_wint4afp8(weight_quant, input_quant):
+        elif self._is_wint4afp8(weight_quant, input_quant, scheme_format):
             # On NPU prefer the dedicated NPU W4A8Int8 path when activations are INT8.
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")

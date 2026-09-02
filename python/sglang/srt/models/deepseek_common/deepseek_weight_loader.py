@@ -78,6 +78,12 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+# Block-FP8 weight scales are called "weight_scale_inv" by the DeepSeek/GLM fp8
+# checkpoints and "weight_scale" by compressed-tensors. Both reach this loader
+# for the DSA indexer projections.
+_BLOCK_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale")
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -107,7 +113,7 @@ def _load_fused_indexer_wk(
         return False
 
     if ".indexer.weights_proj." in name:
-        is_scale = name.endswith(".weight_scale_inv")
+        is_scale = name.endswith(_BLOCK_FP8_SCALE_SUFFIXES)
         if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
             w = _clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
@@ -127,7 +133,7 @@ def _load_fused_indexer_wk(
         return True
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
-    is_scale = name.endswith(".weight_scale_inv")
+    is_scale = name.endswith(_BLOCK_FP8_SCALE_SUFFIXES)
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
