@@ -24,9 +24,10 @@ pub use client::{
 };
 pub use memory_backend::InMemoryKvIndexerBackend;
 pub use service::{
-    component_bit, server_builder, BlockComponents, KvIndexerBackend, KvIndexerService,
-    WorkerPrefixInput, COMPONENT_FULL, COMPONENT_MAMBA, COMPONENT_SWA,
-    DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS, MAX_GRPC_DECODING_MESSAGE_SIZE,
+    component_bit, server_builder, server_builder_with_max_concurrent_streams, BlockComponents,
+    KvIndexerBackend, KvIndexerService, WorkerPrefixInput, COMPONENT_FULL, COMPONENT_MAMBA,
+    COMPONENT_SWA, DEFAULT_PREFIX_QUERY_MAX_INFLIGHT, MAX_CONCURRENT_STREAMS,
+    MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can

@@ -14,7 +14,7 @@
 //! guards, or in the SSE pump's `tx.send().await` race — all of which
 //! would be silently skipped by a synthetic-handler test.
 
-use bytes::Bytes;
+use futures::future::join_all;
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
@@ -132,12 +132,11 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
     }))
     .unwrap();
 
-    let mut handles = Vec::with_capacity(N);
-    for i in 0..N {
+    let responses = join_all((0..N).map(|i| {
         let c = client.clone();
         let u = url.clone();
         let b = body.clone();
-        handles.push(tokio::spawn(async move {
+        async move {
             let resp = c
                 .post(&u)
                 .header("content-type", "application/json")
@@ -148,33 +147,34 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
             if !resp.status().is_success() {
                 return Err(format!("client {i} non-2xx: {}", resp.status()));
             }
-            let bytes: Bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| format!("client {i} body: {e}"))?;
-            Ok::<Bytes, String>(bytes)
-        }));
-    }
+            Ok::<_, String>((i, resp))
+        }
+    }))
+    .await;
+    let responses: Vec<_> = responses
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .expect("every client received response headers before shutdown");
 
-    // 4. Let every request grab a connection and start receiving data.
-    //    100 ms is past the first chunk delay (60 ms) for every stream
-    //    but well before the last chunk fires.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // 5. Trigger shutdown. axum stops accepting new connections but
-    //    MUST drain the 100 already-attached streams.
+    // 4. 每个响应头都证明对应请求已进入 Axum 的 in-flight 集合。完整 cohort
+    //    连接后才触发 shutdown，避免把尚未连接的 accept 时序误测成 drain 行为。
+    //    Axum 此时停止接收新连接，但必须 drain 这 100 条既有 stream。
     let started = Instant::now();
     shutdown_tx.send(()).unwrap();
 
-    // 6. Every in-flight request must complete with a `[DONE]` terminator
+    // 5. Every in-flight request must complete with a `[DONE]` terminator
     //    — proving the stream was NOT truncated by shutdown.
     let mut bytes_total: usize = 0;
     let mut done_count: usize = 0;
-    for h in handles {
-        let result = h
+    for result in join_all(responses.into_iter().map(|(i, response)| async move {
+        response
+            .bytes()
             .await
-            .expect("client task panicked")
-            .expect("client completed");
+            .map_err(|e| format!("client {i} body: {e}"))
+    }))
+    .await
+    {
+        let result = result.expect("client body completed");
         bytes_total += result.len();
         let body_str = String::from_utf8_lossy(&result);
         if body_str.contains("data: [DONE]") {

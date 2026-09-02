@@ -68,6 +68,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
                 hashes: hashes.clone(),
                 component_masks: Vec::new(),
                 block_sizes: Vec::new(),
+                parent_block_hash: None,
             }],
             worker_address: cached.url.clone(),
             cache_spec: None,
