@@ -3,7 +3,8 @@
 Ported from the probe validated on sm_121 (DGX Spark GB10); requires SM89+
 for fp8 tensor-core MMA. Two properties, each of which has been observed to
 fail when the path is broken:
-  1. one-hot: a single valid index per token makes softmax exactly 1.0 and
+  1. one-hot with GLM-5.3-Flash's NoPE geometry (d_tail=0): a single valid
+     index per token makes softmax exactly 1.0 and
      the fp8 prob-quant exact, so the kernel must return the gathered V row
      nearly bit-exactly (decisive for gather/mask/normalize plumbing);
   2. spread case vs an fp32 reference computed from the SAME quantized
@@ -73,6 +74,26 @@ def test_fp8_one_hot_exact():
     expect = kv_fp8.float().squeeze(1)[hot.long()].unsqueeze(1).expand(S, H, DV)
     rel = _rel_err(out.reshape(S, H, DV), expect)
     assert rel < 1e-3, f"one-hot rel err {rel:.6f} exceeds 1e-3"
+
+
+@requires_fp8_cuda
+def test_fp8_one_hot_with_rope_tail_exact():
+    tail = 64
+    g = torch.Generator(device="cuda").manual_seed(2)
+    q = torch.randn(
+        S, H, DV + tail, device="cuda", dtype=torch.float32, generator=g
+    ).to(torch.float8_e4m3fn)
+    kv = torch.randn(
+        POOL, 1, DV + tail, device="cuda", dtype=torch.float32, generator=g
+    ).to(torch.float8_e4m3fn)
+    idx_hot = torch.full((S, 1, TOPK), -1, device="cuda", dtype=torch.int32)
+    hot = torch.randint(1, POOL, (S,), device="cuda", generator=g)
+    idx_hot[:, 0, 0] = hot.to(torch.int32)
+    out = tilelang_kernel.tilelang_sparse_fwd(q, kv, idx_hot, SM_SCALE, d_v=DV)
+    torch.cuda.synchronize()
+    expect = kv.float().squeeze(1)[hot.long(), :DV].unsqueeze(1).expand(S, H, DV)
+    rel = _rel_err(out.reshape(S, H, DV), expect)
+    assert rel < 1e-3, f"one-hot tail rel err {rel:.6f} exceeds 1e-3"
 
 
 @requires_fp8_cuda
