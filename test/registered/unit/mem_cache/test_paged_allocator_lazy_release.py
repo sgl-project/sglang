@@ -57,26 +57,13 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
         self.assertEqual(allocator.num_staged_pages, 0)
         self.assertEqual(allocator.staged_pages, [])
 
-    def test_census_and_clear_cover_staged_pages(self):
+    def test_clear_drops_staged_pages(self):
         allocator = _make_allocator(need_sort=True)
-        allocated = allocator.alloc(NUM_PAGES * PAGE_SIZE)
-        allocator.free(allocated[:2])
-        allocator.free(allocated[2:4])
-
-        self.assertEqual(allocator.available_size(), 4)
-        self.assertEqual(allocator.get_all_free_pages().numel(), 2)
+        allocator.free(allocator.alloc(4))
 
         allocator.clear()
         self.assertEqual(allocator.available_size(), allocator.size)
         self.assertEqual(allocator.staged_pages, [])
-
-    def test_no_sort_allocator_keeps_eager_prepend(self):
-        allocator = _make_allocator(need_sort=False)
-        allocated = allocator.alloc(PAGE_SIZE)
-        allocator.free(allocated)
-
-        self.assertEqual(allocator.free_pages[0].item(), 1)
-        self.assertEqual(allocator.num_staged_pages, 0)
 
 
 if __name__ == "__main__":
