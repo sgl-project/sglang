@@ -13,8 +13,8 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    kill_process_tree,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 # RadixAttention server integration tests
@@ -44,7 +44,7 @@ class TestRadixCacheFCFS(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)

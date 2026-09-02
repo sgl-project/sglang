@@ -78,15 +78,22 @@ _KNOWN_ENTRIES = frozenset(
             "run_data_parallel_controller_process",
         ),
         ("srt/ray/scheduler_actor.py", "__init__"),
-        ("srt/disaggregation/encoder/server.py", "__init__"),
         ("srt/disaggregation/encoder/http_server.py", "launch_server"),
-        ("srt/managers/tokenizer_manager.py", "__init__"),
         ("srt/entrypoints/engine.py", "_launch_subprocesses"),
         (
             "srt/elastic_ep/expert_backup_manager.py",
             "run_expert_backup_manager_process",
         ),
         ("srt/weight_cache/daemon.py", "load"),
+        # The multi-tokenizer worker, the benchmark work functions (run
+        # inline or spawned per rank), and the encoder's gRPC / spawned-TP /
+        # spawned-DP entries.
+        ("srt/entrypoints/http_server.py", "init_multi_tokenizer"),
+        ("benchmark/one_batch.py", "latency_test"),
+        ("benchmark/one_batch.py", "correctness_test"),
+        ("srt/disaggregation/encoder/grpc_server.py", "serve_grpc_encoder"),
+        ("srt/disaggregation/encoder/server.py", "launch_encoder"),
+        ("srt/disaggregation/encoder/runtime.py", "launch_dp_worker"),
     }
 )
 
@@ -396,6 +403,9 @@ def _publishing_functions():
     for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
         rel = path.relative_to(_PACKAGE_ROOT).as_posix()
         if rel in _PUBLISH_HOMES:
+            continue
+        source = path.read_text(encoding="utf-8-sig")
+        if not any(name in source for name in _PUBLISH_NAMES):
             continue
         mod = _module(rel)
         if mod is None or not mod.publishers:
