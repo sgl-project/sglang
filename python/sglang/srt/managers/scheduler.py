@@ -3503,9 +3503,7 @@ class Scheduler(
         # (deducted from available_size()) and is re-counted in the adder's
         # can_run_list by add_chunked_req, so add that held slot back here to
         # avoid declaring the batch full one request early.
-        available = self.req_to_token_pool.available_size() + int(
-            chunked_req_in_batch
-        )
+        available = self.req_to_token_pool.available_size() + int(chunked_req_in_batch)
 
         active_batch = running_batch or self.running_batch
         available = max(

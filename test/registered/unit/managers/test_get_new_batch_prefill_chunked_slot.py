@@ -123,6 +123,8 @@ def _make_scheduler(
     s.load_inquirer = MagicMock()
     s.model_config = MagicMock()
     s.enable_overlap = False
+    s.beam_coordinator = MagicMock()
+    s.beam_coordinator.pending_member_rows.return_value = 0
     # A model runner with no ``extend_attention_block_m`` on its backend, so the
     # adder's tile budget takes the non-Triton fallback.
     s.tp_worker = SimpleNamespace(
@@ -140,6 +142,8 @@ def _make_scheduler(
     )
     s.chunked_req = chunked_req
     s.waiting_queue = list(waiting_queue)
+    for req in s.waiting_queue:
+        req.beam_group = None
     s._test_schedule_chunk = schedule_chunk
     s._test_chunk_continues = chunk_continues
     return s
@@ -292,6 +296,48 @@ class TestGetNewBatchPrefillChunkedSlot(CustomTestCase):
         self.assertEqual(adder.can_run_list, [q1])
         self.assertEqual(s.waiting_queue, [q2])
         self.assertTrue(s.running_batch.batch_is_full)
+
+    def test_pending_beam_rows_are_still_reserved_after_slot_credit(self):
+        s = _make_scheduler(
+            ceiling=16,
+            running_bs=14,
+            pool_avail=1,
+            chunked_req=MagicMock(name="chunked"),
+            waiting_queue=[],
+        )
+        s.beam_coordinator.pending_member_rows.return_value = 1
+
+        with get_context().override_server_args(pp_max_micro_batch_size=16):
+            num_allocatable = s.get_num_allocatable_reqs(
+                14,
+                running_batch=s.running_batch,
+                chunked_req_in_batch=True,
+            )
+
+        # One held chunk slot is credited, then one pending beam row remains
+        # reserved: available = 1 + 1 - 1 = 1.
+        self.assertEqual(num_allocatable, 1)
+
+    def test_beam_width_uses_credit_adjusted_available_rows(self):
+        s = _make_scheduler(
+            ceiling=16,
+            running_bs=12,
+            pool_avail=3,
+            chunked_req=MagicMock(name="chunked"),
+            waiting_queue=[],
+        )
+
+        with get_context().override_server_args(pp_max_micro_batch_size=16):
+            num_allocatable = s.get_num_allocatable_reqs(
+                12,
+                beam_width=2,
+                running_batch=s.running_batch,
+                chunked_req_in_batch=True,
+            )
+
+        # The chunk contributes its already-held row before beam-width
+        # accounting: min(4 ceiling rows, (3 + 1) // 2) = 2 requests.
+        self.assertEqual(num_allocatable, 2)
 
 
 if __name__ == "__main__":
