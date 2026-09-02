@@ -88,6 +88,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
@@ -1422,10 +1423,12 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indices, kv_indptr, qo_indptr, _ = (
                     forward_batch.spec_info.generate_attn_arg_prefill(
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        forward_batch.seq_lens_sum,
-                        self.req_to_token,
+                        paged_kernel_lens=forward_batch.seq_lens,
+                        paged_kernel_lens_sum=forward_batch.seq_lens_sum,
+                        index_table=KVIndexTable.passthrough(
+                            req_to_token=self.req_to_token,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                        ),
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
@@ -3238,10 +3241,12 @@ class AiterIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    index_table=KVIndexTable.passthrough(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                    ),
                 )
             )
 
@@ -3316,10 +3321,12 @@ class AiterMlaIndicesUpdaterPrefill:
         else:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    kv_lens,
-                    kv_lens_sum,
-                    self.req_to_token,
+                    paged_kernel_lens=kv_lens,
+                    paged_kernel_lens_sum=kv_lens_sum,
+                    index_table=KVIndexTable.passthrough(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices,
+                    ),
                 )
             )
 

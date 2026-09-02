@@ -726,10 +726,19 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # All flashinfer gathers run OUT-of-graph (plan time), so the
         # capture-stable read table is buffer reuse, not pointer stability.
+        # The captured verify replay reads [prefix + drafts] back from the
+        # pool, so this fill must reach cache_seqlens -- the SAME widening the
+        # eager path applies. Without it every row's last draft_token_num
+        # columns stay stale and the verify gathers garbage.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
             into=self.kv_read_tables,
+            seq_len_delta=(
+                spec_info.draft_token_num
+                if forward_mode.is_target_verify() and spec_info is not None
+                else 0
+            ),
         )
 
         if forward_mode.is_decode_or_idle():
@@ -977,6 +986,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
             )
         elif forward_batch.forward_mode.is_target_verify():
+            if self.kv_index_translator.is_translating:
+                # Whole-sequence verify reads [prefix + drafts] back from the
+                # pool; the memoized table's live prefix is seq_lens-only.
+                kv_view = self.kv_index_translator.widened_index_table(
+                    forward_batch,
+                    seq_len_delta=forward_batch.spec_info.draft_token_num,
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1762,6 +1778,10 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
+        # Plain-pool path only: a translated table's ids (and the multi-step
+        # container's translated spec kv_indices; single-space SWA under
+        # fusion) are already in this kernel's facing space, so rewriting
+        # them here would corrupt the read.
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]
@@ -2219,23 +2239,25 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
+            # The window wrapper gathers from the SWA-side array; the CSR
+            # builders are source-agnostic, so hand them the narrowed view
+            # (mirrors the non-spec branch's source_ids dispatch).
+            spec_table = kv_view.swa_view() if use_swa_source else kv_view
             if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        index_table=spec_table,
                         kv_start_idx=kv_start_idx,
                     )
                 )
             else:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
-                        req_pool_indices,
-                        paged_kernel_lens,
-                        paged_kernel_lens_sum,
-                        self.req_to_token,
+                        paged_kernel_lens=paged_kernel_lens,
+                        paged_kernel_lens_sum=paged_kernel_lens_sum,
+                        index_table=spec_table,
                     )
                 )
 
@@ -2250,6 +2272,9 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type,
             )
 
+        # Plain-pool path only: a translated batch's kv_indices were gathered
+        # from the SWA-side table above, so rewriting them here would corrupt
+        # the read.
         if use_sliding_window_kv_pool and not use_swa_source:
             assert self._swa_kv_pool is not None
             kv_last_index = kv_indptr[-1]

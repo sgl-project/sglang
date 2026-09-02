@@ -346,10 +346,19 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
         # All flashinfer gathers run OUT-of-graph (plan time), so the
         # capture-stable table is buffer reuse, not pointer stability.
+        # The captured verify replay reads [prefix + drafts] back from the
+        # pool, so this fill must reach cache_seqlens -- the SAME widening the
+        # eager path applies. Without it every row's last draft_token_num
+        # columns stay stale and the verify gathers garbage.
         kv_view = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices[:bs],
             seq_lens=seq_lens[:bs],
             into=self.kv_read_tables,
+            seq_len_delta=(
+                spec_info.draft_token_num
+                if forward_mode.is_target_verify() and spec_info is not None
+                else 0
+            ),
         )
 
         if in_capture:
@@ -438,6 +447,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         elif forward_batch.forward_mode.is_target_verify():
+            if self.kv_index_translator.is_translating:
+                # Whole-sequence verify reads [prefix + drafts] back from the
+                # pool; the memoized table's live prefix is seq_lens-only.
+                kv_view = self.kv_index_translator.widened_index_table(
+                    forward_batch,
+                    seq_len_delta=forward_batch.spec_info.draft_token_num,
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -1105,10 +1121,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
         elif fast_verify_plan_kwargs is not None:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    index_table=kv_view,
                     kv_indices_buf=fast_verify_plan_kwargs["kv_indices_buf"],
                 )
             )
@@ -1117,10 +1132,9 @@ class FlashInferMLAIndicesUpdaterPrefill:
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    index_table=kv_view,
                 )
             )
 

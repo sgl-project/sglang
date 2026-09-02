@@ -53,13 +53,14 @@ def build_kv_read_table_kernel(
     req_stride,  # runtime: req_to_token row stride (elements)
     out_stride,  # runtime: out row stride (elements)
     mult,  # runtime: kernel_page_multiplier of the target sub-pool
+    seq_len_delta,  # runtime: verify widening added to every row's live prefix
     PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     bid = tl.program_id(0)
     blk = tl.program_id(1)
     req = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
-    seqlen = tl.load(seq_lens_ptr + bid)
+    seqlen = tl.load(seq_lens_ptr + bid) + seq_len_delta
     n_pages = (seqlen + PAGE_SIZE - 1) // PAGE_SIZE
 
     cols = blk * BLOCK + tl.arange(0, BLOCK)
@@ -87,12 +88,20 @@ def build_kv_read_table(
     page_size: int,
     max_pages: int,
     out: torch.Tensor,
+    seq_len_delta: int = 0,
 ) -> torch.Tensor:
     """Fill ``out``'s live prefix with read-table entries.
 
     ``out`` is caller-owned (fresh zeros for the eager path, the module's
     capture-stable buffer for replay) and only its ``[:bs, :max_pages]``
     region's live prefix is written -- never rebound, never tail-cleared.
+
+    ``seq_len_delta`` widens every row's live prefix by a constant -- the
+    whole-sequence verify contract, where the draft tokens' KV is read back
+    from the pool and the table must cover ceil((seq + delta)/ps) columns.
+    The caller's ``max_pages`` must already account for the delta: columns
+    past it are never launched, so an unwidened width silently truncates the
+    verify tail rather than failing.
     """
     bs = int(req_pool_indices.numel())
     assert (
@@ -113,7 +122,8 @@ def build_kv_read_table(
     if not req_to_token.is_cuda:
         cols = torch.arange(max_pages, device=req_to_token.device)
         live = cols[None, :] < (
-            (seq_lens[:bs, None].to(torch.int64) + page_size - 1) // page_size
+            (seq_lens[:bs, None].to(torch.int64) + seq_len_delta + page_size - 1)
+            // page_size
         )
         tok = req_to_token[
             req_pool_indices[:bs, None].to(torch.int64), (cols * page_size)[None, :]
@@ -134,6 +144,7 @@ def build_kv_read_table(
         req_to_token.stride(0),
         out.stride(0),
         multiplier,
+        seq_len_delta,
         PAGE_SIZE=page_size,
         BLOCK=_BLOCK_COLS,
     )
