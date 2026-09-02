@@ -3076,7 +3076,11 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_hicache_storage
+            or self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.release_aborted_request(rid)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3106,8 +3110,6 @@ class Scheduler(
             )
             if abort_existing_req:
                 self._release_aborted_request(candidate_req.rid)
-                if self.enable_hierarchical_cache and not self.enable_hicache_storage:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
