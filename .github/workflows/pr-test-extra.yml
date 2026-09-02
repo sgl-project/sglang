@@ -143,7 +143,7 @@ jobs:
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
-      runs_on: 1-gpu-5090
+      runs_on: ubuntu-22.04
       artifact_name: rust-ext-x86_64-extra
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}

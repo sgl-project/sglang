@@ -253,6 +253,14 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SamplingPrewarmResult:
+    """Memory requirements observed while pre-warming a sampling path."""
+
+    sampling_input_bytes: int = 0
+    sampling_headroom_bytes: int = 0
+
+
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
@@ -377,6 +385,7 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
+        self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
 
@@ -1011,7 +1020,7 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.kv_index_translator.assert_backends_carry_translator(
+        self.kv_index_translator.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
 
@@ -1057,6 +1066,11 @@ class ModelRunner:
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
             n_prepared,
         )
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        """Warm the sampling path after graph initialization."""
+        self.sampling_prewarm_result = SamplingPrewarmResult()
+        return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
