@@ -145,6 +145,20 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
+    /// Abort an in-flight request by rid. Fans out to all workers and waits
+    /// for every one (unlike `cancel_response`, which returns on first
+    /// success) so the abort reaches the worker that owns the rid.
+    ///
+    /// Only the regular HTTP router implements this; PD/gRPC fall back to 501
+    /// (PD needs the abort fanned across prefill+decode — follow-up).
+    async fn abort_request(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &serde_json::Value,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Abort request not implemented").into_response()
+    }
+
     /// Delete a response by id
     async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
         (
