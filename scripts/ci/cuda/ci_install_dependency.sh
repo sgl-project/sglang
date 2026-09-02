@@ -539,6 +539,8 @@ install_sglang() {
 
 install_nccl() {
     if [ "$CU_MAJOR" = "13" ]; then
+        # PyTorch pins 2.29.7, so this override must run after every command
+        # that resolves Python dependencies (including lmms-eval).
         $PIP_CMD install "nvidia-nccl-cu13==2.30.7" \
             --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     else
@@ -724,8 +726,6 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     MOONCAKE_VERSION="0.3.13"
     NIXL_VERSION="1.3.0"
-    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
@@ -760,8 +760,6 @@ install_extra_deps() {
         $PIP_CMD install "nixl==${NIXL_VERSION}" "${NIXL_BIN_NAME}==${NIXL_VERSION}" \
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
-
-    $PIP_CMD install "$SGL_EVAL_SPEC" $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -827,6 +825,24 @@ verify_imports() {
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
     SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+import ctypes
+import importlib.metadata
+import os
+import sys
+
+if sys.argv[1] == "13":
+    if importlib.metadata.version("nvidia-nccl-cu13") != "2.30.7":
+        raise SystemExit("nvidia-nccl-cu13 was changed after the final CI override")
+    nccl = ctypes.CDLL("libnccl.so.2")
+    nccl_version = ctypes.c_int()
+    status = nccl.ncclGetVersion(ctypes.byref(nccl_version))
+    if status != 0 or nccl_version.value != 23007:
+        raise SystemExit(
+            f"expected NCCL runtime 2.30.7, got status={status}, "
+            f"raw_version={nccl_version.value}"
+        )
+    print("NCCL package and runtime versions are 2.30.7")
+
 import torch
 print(torch.version.cuda)
 import deep_ep
@@ -837,7 +853,7 @@ import cutlass.cute
 # A shadowed sglang still imports, so without this the failure only surfaces
 # as a missing submodule during the test step. find_spec, not import: the
 # finders alone answer this without importing sglang.
-import importlib.util, os
+import importlib.util
 want = os.environ["SGLANG_EXPECTED_INIT"]
 spec = importlib.util.find_spec("sglang")
 if spec is None:
@@ -860,7 +876,7 @@ for mod in ("server", "grpc", "multimodal"):
     except Exception as exc:
         raise SystemExit(f"{name} is present but does not load: {exc!r}")
     print(f"{name} loads")
-'
+' "$CU_MAJOR"
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -886,7 +902,6 @@ main() {
     setup_cargo_cache
     install_sglang
     release_cargo_cache_lock
-    install_nccl
     # Diffusion B200 CI imports torch inside install_sglang_kernel after removing
     # stale CUDA 12 NVIDIA wheels, so opt into one early LD_LIBRARY_PATH refresh.
     if [ "${SGLANG_CI_EARLY_LD_LIBRARY_PATH:-0}" = "1" ]; then
@@ -899,6 +914,7 @@ main() {
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
+    install_nccl
     prepare_runner
     setup_ld_library_path
     verify_imports

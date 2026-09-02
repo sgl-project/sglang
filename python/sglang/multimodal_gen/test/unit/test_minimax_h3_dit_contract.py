@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionBackend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -35,6 +38,7 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MINIMAX_H3_FP32_BUFFER_NAMES,
     MINIMAX_H3_FP32_PARAM_NAMES,
+    MiniMaxH3Attention,
     MiniMaxH3DiTBlock,
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
@@ -407,6 +411,109 @@ def test_tp_and_ulysses_admission_uses_tp_local_shapes():
             ulysses_size=1,
             ring_size=0,
         )
+
+
+def test_cube_backend_advertises_packed_varlen_capability():
+    assert CubeSparseAttentionBackend.supports_packed_varlen()
+
+
+def test_attention_retains_transformer_scoped_backend():
+    _ensure_single_process_parallel_runtime()
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_component_forced_attn_backend",
+            return_value=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        ),
+        torch.device("meta"),
+    ):
+        attention = MiniMaxH3Attention(
+            MiniMaxH3DiTArchConfig(), None, prefix="blocks.0.attn"
+        )
+
+    assert (
+        attention._selected_attention_backend is AttentionBackendEnum.CUBE_SPARSE_ATTN
+    )
+
+
+def test_model_lazy_resolver_keeps_transformer_scoped_backend():
+    _ensure_single_process_parallel_runtime()
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+            "get_component_forced_attn_backend",
+            return_value=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        ),
+        torch.device("meta"),
+    ):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=None
+        )
+
+    class FakeBackend:
+        @staticmethod
+        def get_enum():
+            return AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+            return_value=FakeBackend,
+        ) as resolve,
+        patch.object(MiniMaxH3Attention, "_set_attention_backend") as install,
+    ):
+        model._resolve_attention_backend_once()
+
+    resolve.assert_called_once_with(
+        model.arch.attention_head_dim,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    attention_count = sum(
+        isinstance(module, MiniMaxH3Attention) for module in model.modules()
+    )
+    assert install.call_count == attention_count
+    assert model._resolved_attention_backend is AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+
+def test_token_refiner_routes_cube_selection_to_exact_fa():
+    class FakeImpl:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeBackend:
+        def __init__(self, enum):
+            self.enum = enum
+
+        def get_enum(self):
+            return self.enum
+
+        def get_impl_cls(self):
+            return FakeImpl
+
+    cube = FakeBackend(AttentionBackendEnum.CUBE_SPARSE_ATTN)
+    fa = FakeBackend(AttentionBackendEnum.FA)
+    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = 128
+    attention.num_heads = 8
+    attention.softmax_scale = 128**-0.5
+    attention.prefix = "test.attn"
+    attention._cube_sparse_capable = False
+
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend",
+        return_value=fa,
+    ) as resolve:
+        attention._set_attention_backend(cube)
+
+    assert attention._attention_backend_enum is AttentionBackendEnum.FA
+    resolve.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.FA,
+    )
 
 
 def test_meta_model_captures_component_attention_override():
