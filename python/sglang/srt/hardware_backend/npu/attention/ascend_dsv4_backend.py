@@ -1638,7 +1638,7 @@ class DeepseekV4AscendAttnBackend(
 
         if _is_npu_arch35():
             ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices
+                ctx.forward_batch.req_pool_indices[: ctx.bs]
             )
 
         self._refresh_graph_seq_metadata(ctx)
