@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.utils import (
     compute_node_event_hash_values,
     compute_node_hash_values,
     hash_str_to_int64,
-    namespace_seed,
 )
 
 
@@ -90,7 +89,7 @@ class KVCacheEventRecorder:
         """Hash values to publish for ``node``, computing them if not yet set."""
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
-        if namespace_seed(node.key.extra_key, node.key.cache_salt) is None:
+        if node.key.extra_key is None and node.key.cache_salt is None:
             return node.hash_value
         return compute_node_event_hash_values(node, self.page_size)
 
@@ -104,7 +103,7 @@ class KVCacheEventRecorder:
         parent = node.parent
         if parent is None or parent.parent is None:
             return None
-        if namespace_seed(node.key.extra_key, node.key.cache_salt) is not None:
+        if node.key.extra_key is not None or node.key.cache_salt is not None:
             parent_hash_values = parent.event_hash_value
             assert parent_hash_values is not None
         else:

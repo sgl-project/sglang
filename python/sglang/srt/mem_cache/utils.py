@@ -216,7 +216,7 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     own: the storage chain is seeded with ``extra_key`` too, and only
     ``cache_salt`` reaches the consumer.
     """
-    if namespace_seed(node.key.extra_key, node.key.cache_salt) is None:
+    if node.key.extra_key is None and node.key.cache_salt is None:
         return compute_node_hash_values(node, page_size)
 
     if node.event_hash_value is not None:
