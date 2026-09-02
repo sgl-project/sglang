@@ -661,7 +661,7 @@ roughly 10 GB video VAE on first launch.
 sglang serve \
   --model-path FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree \
   --num-gpus 4 \
-  --attention-backend video_sparse_attn_h3 \
+  --component-attention-backends transformer=video_sparse_attn_h3 \
   --attention-backend-config '{"VSA_sparsity": 0.9}' \
   --port 30010
 ```
@@ -671,14 +671,18 @@ Requests use the same asynchronous video endpoint as the base model, with
 `{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}`. The
 request default is `num_inference_steps: 5`: five points on the standard
 shift-12/shift-3 sigma grid, i.e. the four distilled DiT evaluations. Any
-other step count is rejected.
+other step count is rejected. FastH3 requests default to
+`quality: "extra-high"`, which fuses the VAE decoder's per-head QK RMSNorm and
+RoPE and runs its attention on cuDNN SDPA; `quality: "lossless"` keeps the
+reference decode.
 
 `video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
 Triton block-sparse kernel (SM90 / SM100 / SM103) over segment-pure prefix
 tiles and (4, 4, 4) video tiles, driven by the checkpoint's trained
-`to_gate_compress` compression branch. Only the DiT runs sparse; the token
-refiner, text encoder, and VAEs keep their dense defaults. Ulysses sequence
-parallelism is supported. See
+`to_gate_compress` compression branch. Select it for the transformer only, as
+with cube sparse attention: the packed DiT blocks run sparse while the token
+refiner falls back to dense FA inside the backend, and the text encoder and
+VAEs keep their own backends. Ulysses sequence parallelism is supported. See
 [Attention Backends](/docs/sglang-diffusion/attention_backends) for
 `VSA_sparsity`, `vsa_mode`, `vsa_dense_first_n_steps`, and
 `vsa_dense_layers`. Every dense backend that runs on base H3 (`fa`,
@@ -743,8 +747,10 @@ levels:
 - `"lossless"` (default): the exact reference path. Output is bit-exact
   against the reference implementation and the CI ground truth.
 - `"extra-high"`: includes the global fusion-only tier but does not enable
-  Cache-DiT or another approximate optimization. MiniMax-H3 currently has no
-  request-gated fusion site, so its denoise path is the same as `lossless`.
+  Cache-DiT or another approximate optimization. The denoise path is the same
+  as `lossless`; VAE decode fuses the ViT decoder's per-head QK RMSNorm and
+  RoPE into one launch and runs its attention on cuDNN SDPA (decode
+  1.72 → 1.35 s at 10 s on 4× B300; rounding-level differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `lossless`), but output is no longer bit-identical to the reference.
@@ -792,7 +798,8 @@ omitting the field is equivalent.
 <Tab title="extra-high">
 
 The global fusion-only tier. It does not enable MiniMax-H3 Cache-DiT and
-currently follows the same H3 denoise path as `lossless`.
+follows the same H3 denoise path as `lossless`; only the VAE decoder's fused
+QK RMSNorm + RoPE and cuDNN SDPA attention differ.
 
 ```json Request field
 {
@@ -822,7 +829,7 @@ The measured trade-off is:
 | `quality` | Mean <br />inference <br />latency | Speedup | SSIM vs <br />lossless | PSNR vs <br />lossless | Expected <br />trade-off |
 | --- | ---: | ---: | ---: | ---: | --- |
 | `lossless` | 75.10 s | 1.00× | 1.000 | exact | Native reference path |
-| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; no H3-specific request-gated site yet |
+| `extra-high` | Not separately measured | — | Same H3 denoise path | Same H3 denoise path | Fusion-only tier; VAE decode fuses QK RMSNorm + RoPE and uses cuDNN SDPA (rounding-level differences) |
 | `high` | 53.70 s | 1.40× | 0.931 | 28.16 dB | Smallest same-seed visual change |
 
 These numbers use 1344×768, 124-frame, 24 fps T2VA with 50 inference steps,
@@ -1257,7 +1264,8 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
 
 The same 4× B300 host served [FastH3](#6-fasth3-4-step-distilled-preview)
 with the VSA-H3 recipe above (1344×768 at 24 fps with audio, `task: "t2va"`,
-`num_inference_steps: 5`, seed 1000, eager BF16, Ulysses4, `VSA_sparsity` 0.9).
+`num_inference_steps: 5`, the default `quality: "extra-high"`, seed 1000, eager
+BF16, Ulysses4, `VSA_sparsity` 0.9).
 E2E is the client wall clock of a `/v1/videos` request including decode,
 muxing, and file output, median of three requests after one warm request;
 the stage columns are the server timings of the same request. H3 aligns the
@@ -1266,16 +1274,17 @@ the video duration:
 
 | Requested / aligned | Encoder | Denoise (4 forwards) | Decode | Transport + MP4 | E2E | Client RTF | Peak/GPU |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 5 s / 124 | 0.07 s | 2.18 s | 0.87 s | 0.9 s | **4.1 s** | 0.79 | 95,744 MB |
-| 10 s / 243 | 0.07 s | 4.83 s | 1.71 s | 1.3 s | **8.0 s** | 0.79 | 102,666 MB |
-| 15 s / 362 | 0.07 s | 8.80 s | 2.56 s | 1.8 s | **13.3 s** | 0.88 | 110,774 MB |
+| 5 s / 124 | 0.06 s | 2.10 s | 0.70 s | 0.9 s | **3.8 s** | 0.74 | 95,212 MB |
+| 10 s / 243 | 0.06 s | 4.67 s | 1.36 s | 1.3 s | **7.4 s** | 0.73 | 101,896 MB |
+| 15 s / 362 | 0.07 s | 8.55 s | 2.03 s | 1.9 s | **12.5 s** | 0.83 | 109,376 MB |
 
-All three requests finish faster than playback. Dense FA on the same weights
-and topology takes 3.77 / 9.84 / 18.45 s (`sglang generate`, stage sum): it is
-competitive at 5 s, and VSA-H3 pulls ahead from 10 s on. At 5 s,
-TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
-online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
-peak memory.
+All three requests finish faster than playback. With `quality: "lossless"`
+the same requests take 4.0 / 7.8 / 13.0 s. Dense FA on the same weights
+and topology takes 3.63 / 9.62 / 18.52 s (`sglang generate`, stage sum) against
+2.92 / 6.16 / 10.70 s for VSA-H3, so the sparse recipe leads at every duration.
+At 5 s, TP2 + Ulysses2 (3.14 s, 61,952 MB), FSDP + Ulysses4 (3.19 s,
+50,452 MB), and online `--quantization fp8` (2.74 s, 63,672 MB) trade a little
+latency for peak memory.
 
 ### H200 topology comparison
 
