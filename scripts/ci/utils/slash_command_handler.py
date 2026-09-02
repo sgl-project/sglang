@@ -27,6 +27,7 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 
@@ -502,11 +503,16 @@ MULTIMODAL_PATH_TO_RUNNER = {
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
 
+def _load_test_groups():
+    with open(TEST_GROUPS_FILE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _known_test_groups():
-    groups = []
+    groups = set(_load_test_groups())
     for group_dir in glob.glob("test/registered/*"):
         if os.path.isdir(group_dir):
-            groups.append(os.path.basename(group_dir))
+            groups.add(os.path.basename(group_dir))
     return sorted(groups)
 
 
@@ -514,8 +520,9 @@ def resolve_test_group_specs(group_name):
     """
     Resolve a test group name into /rerun-test specs.
 
-    A group maps to a directory under test/registered/. For example,
-    "hicache" maps to all test_*.py files under test/registered/hicache/.
+    A group maps to either a named cross-directory file set or a directory
+    under test/registered/. For example, "hicache" maps to all test_*.py
+    files under test/registered/hicache/.
 
     Returns (test_specs, error_message). On success error_message is None.
     """
@@ -527,6 +534,25 @@ def resolve_test_group_specs(group_name):
         or ".." in group_name.split("/")
     ):
         return [], f"Invalid test group `{group_name}`."
+
+    test_groups = _load_test_groups()
+    if group_name in test_groups:
+        test_specs = test_groups[group_name]
+        if not isinstance(test_specs, list) or not all(
+            isinstance(test_spec, str) for test_spec in test_specs
+        ):
+            return [], f"Invalid definition for test group `{group_name}`."
+        missing = [
+            test_spec
+            for test_spec in test_specs
+            if not os.path.isfile(os.path.join("test", test_spec))
+        ]
+        if missing:
+            return [], (
+                f"Named test group `{group_name}` references missing files: "
+                + ", ".join(f"`test/{path}`" for path in missing)
+            )
+        return test_specs, None
 
     group_dir = os.path.join("test", "registered", group_name)
     if not os.path.isdir(group_dir):
