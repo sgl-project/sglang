@@ -192,7 +192,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.kv_index_translator = model_runner.kv_index_translator
-        self.kv_read_tables = None
         self.skip_prefill = skip_prefill
         self.attn_cp_size = model_runner.ps.attn_cp_size
         self._verify_mask = None
@@ -2166,12 +2165,6 @@ class FlashAttentionBackend(AttentionBackend):
         """
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
 
-        if self.kv_index_translator.is_translating:
-            # Zero-filled: slot 0 is the reserved sink in every id space.
-            self.kv_read_tables = self.kv_index_translator.make_capture_tables(
-                max_bs=max_bs, max_context_len=self.max_context_len
-            )
-
         # This is being used by normal decode and draft decode when topk == 1
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -2713,6 +2706,42 @@ class FlashAttentionBackend(AttentionBackend):
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
+    def _set_decode_page_metadata(
+        self,
+        metadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_len_delta: int,
+    ) -> None:
+        """Fill `cache_seqlens_int32`, `cu_seqlens_k` and the page table(s).
+
+        Under the unified pool the translator writes the page tables in place,
+        so the fused kernel is left with the prefix sum alone -- one pass over
+        the rows instead of a translated build plus a verbatim copy of it.
+        """
+        translated = self.kv_index_translator.reads_are_translated
+        if translated:
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                sliding_window_out=metadata.swa_page_table,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+            )
+        normal_decode_set_metadata(
+            metadata.cache_seqlens_int32,
+            metadata.cu_seqlens_k,
+            metadata.page_table,
+            self.req_to_token,
+            req_pool_indices,
+            self.max_num_pages,
+            seq_lens,
+            seq_len_delta,
+            self.page_size,
+            metadata.swa_page_table,
+            self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            skip_page_table=translated,
+        )
+
     def _apply_cuda_graph_metadata(
         self,
         bs: int,
@@ -2766,29 +2795,11 @@ class FlashAttentionBackend(AttentionBackend):
                     # is normal-decode-only).
                     # Spec is asserted off under the unified pool, so this
                     # captured view is always the passthrough (req_to_token).
-                    kv_view = self.kv_index_translator.build_index_table(
-                        req_pool_indices=req_pool_indices,
-                        seq_lens=seq_lens,
-                        into=self.kv_read_tables,
-                    )
-                    normal_decode_set_metadata(
-                        metadata.cache_seqlens_int32,
-                        metadata.cu_seqlens_k,
-                        metadata.page_table,
-                        kv_view.ids,
-                        kv_view.row_ids,
-                        self.max_num_pages,
+                    self._set_decode_page_metadata(
+                        metadata,
+                        req_pool_indices,
                         seq_lens,
                         self.speculative_step_id + 1,
-                        self.page_size,
-                        metadata.swa_page_table,
-                        (
-                            self.token_to_kv_pool
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
-                        src_is_read_table=kv_view.is_translated,
-                        swa_src_table=kv_view.sliding_window_ids,
                     )
 
                 else:
@@ -2888,29 +2899,8 @@ class FlashAttentionBackend(AttentionBackend):
                         if seq_lens_cpu is not None
                         else self.max_context_len
                     )
-                    kv_view = self.kv_index_translator.build_index_table(
-                        req_pool_indices=req_pool_indices,
-                        seq_lens=seq_lens,
-                        into=self.kv_read_tables,
-                    )
-                    normal_decode_set_metadata(
-                        metadata.cache_seqlens_int32,
-                        metadata.cu_seqlens_k,
-                        metadata.page_table,
-                        kv_view.ids,
-                        kv_view.row_ids,
-                        self.max_num_pages,
-                        seq_lens,
-                        0,
-                        self.page_size,
-                        metadata.swa_page_table,
-                        (
-                            self.token_to_kv_pool
-                            if self.use_sliding_window_kv_pool
-                            else None
-                        ),
-                        src_is_read_table=kv_view.is_translated,
-                        swa_src_table=kv_view.sliding_window_ids,
+                    self._set_decode_page_metadata(
+                        metadata, req_pool_indices, seq_lens, 0
                     )
 
                 self._maybe_update_local_attn_metadata_for_replay(

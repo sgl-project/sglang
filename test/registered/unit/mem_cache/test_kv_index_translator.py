@@ -48,7 +48,7 @@ from types import SimpleNamespace
 import torch
 from test_multi_ended_allocator import _FakeUnifiedSWAKVPool
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator, KVReadTables
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -460,10 +460,11 @@ class TestCaptureContract(unittest.TestCase):
         req_to_token[1, : 2 * ps] = v
         src = _make_source(allocator, req_to_token, ps)
 
-        tables = src.make_capture_tables(max_bs=4, max_context_len=8 * ps)
-        cap, cap_swa = tables.full, tables.sliding_window
-        self.assertTrue(bool((cap == 0).all()), "read tables must start zeroed")
-        self.assertIsNotNone(cap_swa, "the SWA composite has a second id space")
+        # A page-table consumer owns its buffers; entry 0 is the reserved sink
+        # in every id space, so zeros are what an unfilled column must read as.
+        cap = torch.zeros((4, 8), dtype=torch.int32, device=_DEV)
+        cap_swa = torch.zeros((4, 8), dtype=torch.int32, device=_DEV)
+        tables = KVReadTables(full=cap, sliding_window=cap_swa)
 
         # Poison everything, then refresh a 1-row batch: ONLY its live prefix
         # may change -- stale tails and other rows are the fa3 contract.

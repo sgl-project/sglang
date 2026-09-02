@@ -196,6 +196,7 @@ def _fused_metadata_kernel_general(
     # 1: the two table pointers carry PAGE-granular, already kernel-facing
     # read tables; emit verbatim -- no >>SHIFT, no v2p, no mapping gather.
     SRC_IS_KERNEL_PAGE_TABLE: tl.constexpr = 0,
+    SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -212,6 +213,10 @@ def _fused_metadata_kernel_general(
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
     # 2. Gather for this batch and column chunk
+    if SKIP_PAGE_TABLE:
+        # The caller filled the page table itself; only the prefix sum above
+        # was wanted, and one block did it.
+        return
     if max_seq_pages == 0:
         return
 
@@ -313,6 +318,7 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -329,6 +335,10 @@ def _fused_metadata_kernel_ps1_no_swa(
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
     # 2. Gather for this batch and column chunk
+    if SKIP_PAGE_TABLE:
+        # The caller filled the page table itself; only the prefix sum above
+        # was wanted, and one block did it.
+        return
     if max_seq_pages == 0:
         return
 
@@ -583,6 +593,7 @@ def normal_decode_set_metadata(
     token_to_kv_pool: Optional["SWAKVPool"] = None,
     src_is_read_table: bool = False,
     swa_src_table: Optional[torch.Tensor] = None,
+    skip_page_table: bool = False,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -627,6 +638,35 @@ def normal_decode_set_metadata(
     cu_seqlens_k_stride_0 = cu_seqlens_k.stride(0)
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
+
+    if skip_page_table:
+        # Steps 1-2 only: the caller wrote the page tables itself, which is
+        # what the unified pool's builder does when it fills them in place.
+        # One block does the prefix sum, so one block is the whole grid.
+        _fused_metadata_kernel_ps1_no_swa[(1, 1)](
+            seq_lens,
+            seq_lens_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            req_pool_indices,
+            req_pool_indices_stride_0,
+            cache_seqlens_int32,
+            cache_seqlens_int32_stride_0,
+            cu_seqlens_k,
+            cu_seqlens_k_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            batch_size,
+            0,
+            seq_len_delta,
+            BLOCK_COLS=256,
+            SKIP_PAGE_TABLE=1,
+            num_warps=8,
+            num_stages=3,
+        )
+        return
 
     use_swa = swa_page_table is not None and (
         token_to_kv_pool is not None or swa_src_table is not None

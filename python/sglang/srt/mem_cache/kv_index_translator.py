@@ -167,30 +167,6 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
-    def make_capture_tables(
-        self, *, max_bs: int, max_context_len: int
-    ) -> Optional[KVReadTables]:
-        """Capture-stable destinations for a backend to own, or None when this
-        pool needs no translation and the backend will never fill any.
-
-        Zero-filled: entry 0 is the reserved padding slot in every id space, so
-        a captured graph replaying before its first refresh reads padding, not
-        garbage.
-        """
-        if not self.is_translating:
-            return None
-        max_pages = -(-max_context_len // self.page_size)
-
-        def _zeros():
-            return torch.zeros(
-                (max_bs, max_pages), dtype=torch.int32, device=self.device
-            )
-
-        return KVReadTables(
-            full=_zeros(),
-            sliding_window=_zeros() if self._swa_v2p_table is not None else None,
-        )
-
     # -- per-batch view --------------------------------------------------------
 
     @property
@@ -357,18 +333,26 @@ class KVIndexTranslator:
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        sliding_window_out: Optional[torch.Tensor] = None,
     ) -> None:
         """`build_index_table(into=...)` for a caller that owns a bare block
-        table rather than a KVReadTables: trtllm_mla / flashmla consume that
+        table rather than a KVReadTables: the page-table consumers read that
         table directly, its rows already being the index table's rows.
+
+        `sliding_window_out` fills the swa twin in the same pass, for a hybrid
+        model whose kernels take two block tables.
         """
         assert (
             self.is_translating
         ), "KVIndexTranslator.fill_read_table on a pool that needs no translation"
+        assert sliding_window_out is None or self._swa_v2p_table is not None, (
+            "KVIndexTranslator.fill_read_table: asked for a sliding-window "
+            "table on a pool with no swa sub-pool"
+        )
         self.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            into=KVReadTables(full=out, sliding_window=None),
+            into=KVReadTables(full=out, sliding_window=sliding_window_out),
         )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
