@@ -47,9 +47,7 @@ def _map_flashinfer_expert_ids_to_local(
     num_experts = runner_config.num_experts
     num_local_experts = runner_config.num_local_experts
     if num_experts is None or num_local_experts is None:
-        raise ValueError(
-            "FlashInfer-to-Triton requires global and local expert counts"
-        )
+        raise ValueError("FlashInfer-to-Triton requires global and local expert counts")
 
     num_shared_experts = runner_config.num_fused_shared_experts or 0
     if num_shared_experts:

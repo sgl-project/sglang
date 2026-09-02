@@ -34,32 +34,20 @@ def _flashinfer_output(topk_ids: torch.Tensor) -> FlashinferDispatchOutput:
 
 class TestFlashInferTritonDispatch(CustomTestCase):
     def test_runner_paths_are_registered(self):
-        self.assertIn(
-            ("flashinfer", "triton"), PermuteMethodPool._pre_permute_methods
-        )
-        self.assertIn(
-            ("triton", "flashinfer"), PermuteMethodPool._post_permute_methods
-        )
+        self.assertIn(("flashinfer", "triton"), PermuteMethodPool._pre_permute_methods)
+        self.assertIn(("triton", "flashinfer"), PermuteMethodPool._post_permute_methods)
 
     def test_global_ids_are_mapped_and_invalid_routes_are_dropped(self):
         config = MoeRunnerConfig(num_experts=8, num_local_experts=4)
-        topk_ids = torch.tensor(
-            [[0, 4, 7, 8], [3, 5, -1, 2]], dtype=torch.int32
-        )
+        topk_ids = torch.tensor([[0, 4, 7, 8], [3, 5, -1, 2]], dtype=torch.int32)
         parallel = SimpleNamespace(moe_ep_size=2, moe_ep_rank=1)
 
-        with patch(
-            "sglang.srt.runtime_context.get_parallel", return_value=parallel
-        ):
-            mapped = triton_runner._map_flashinfer_expert_ids_to_local(
-                topk_ids, config
-            )
+        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+            mapped = triton_runner._map_flashinfer_expert_ids_to_local(topk_ids, config)
 
         torch.testing.assert_close(
             mapped,
-            torch.tensor(
-                [[-1, 0, 3, -1], [-1, 1, -1, -1]], dtype=torch.int32
-            ),
+            torch.tensor([[-1, 0, 3, -1], [-1, 1, -1, -1]], dtype=torch.int32),
         )
 
     def test_partition_contract_rejects_non_contiguous_layout(self):
@@ -83,18 +71,14 @@ class TestFlashInferTritonDispatch(CustomTestCase):
 
         with patch(
             "sglang.srt.runtime_context.get_parallel", return_value=parallel
-        ), self.assertRaisesRegex(
-            NotImplementedError, "fused shared experts"
-        ):
+        ), self.assertRaisesRegex(NotImplementedError, "fused shared experts"):
             triton_runner._map_flashinfer_expert_ids_to_local(
                 torch.zeros(1, 1, dtype=torch.int32), config
             )
 
     def test_decode_output_uses_standard_triton_alignment(self):
         config = MoeRunnerConfig(num_experts=8, num_local_experts=4)
-        dispatch_output = _flashinfer_output(
-            torch.tensor([[4, 7]], dtype=torch.int32)
-        )
+        dispatch_output = _flashinfer_output(torch.tensor([[4, 7]], dtype=torch.int32))
         expected_input = object()
         parallel = SimpleNamespace(moe_ep_size=2, moe_ep_rank=1)
 

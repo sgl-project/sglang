@@ -315,9 +315,9 @@ def handle_a2a_moe(server_args: Any):
                 "FlashInfer MoE A2A with the Triton runner does not support "
                 "expert-location dispatch algorithms."
             )
-            assert not view.enable_eplb, (
-                "FlashInfer MoE A2A with the Triton runner does not support EPLB."
-            )
+            assert (
+                not view.enable_eplb
+            ), "FlashInfer MoE A2A with the Triton runner does not support EPLB."
             assert view.elastic_ep_backend is None, (
                 "FlashInfer MoE A2A with the Triton runner does not support "
                 "elastic EP."
