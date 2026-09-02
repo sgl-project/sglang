@@ -115,6 +115,9 @@ class _TinyModel(nn.Module):
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
+        self.child = nn.Module()
+        self.child.register_buffer("persistent_state", torch.zeros(4))
+        self.child.register_buffer("time_weight", torch.ones(4), persistent=False)
 
 
 class _FakeModelRunner:
@@ -495,6 +498,37 @@ class TestBuildQuantizedSet(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestModelState(CustomTestCase):
+
+    def test_keeps_persistent_alias_registered_after_non_persistent_alias(self):
+        model = nn.Module()
+        shared = torch.ones(4)
+        model.register_buffer("derived_first", shared, persistent=False)
+        model.register_buffer("checkpoint_second", shared)
+        runner = _FakeModelRunner(model)
+        checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
+
+        state = dict(checker._model_state())
+
+        self.assertNotIn("derived_first", state)
+        self.assertIs(state["checkpoint_second"], shared)
+
+    def test_preserves_named_buffers_shared_module_semantics(self):
+        model = nn.Module()
+        shared_child = nn.Module()
+        shared_child.register_buffer("state", torch.ones(4))
+        shared_child.register_buffer("cache", torch.zeros(4), persistent=False)
+        model.left = shared_child
+        model.right = shared_child
+        runner = _FakeModelRunner(model)
+        checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
+
+        state = list(checker._model_state())
+
+        self.assertEqual([name for name, _ in state], ["left.state"])
+        self.assertIs(state[0][1], shared_child.state)
+
+
 class _WeightCheckerTestBase(CustomTestCase):
     """Shared fixture: fresh _TinyModel + WeightChecker per test, on CUDA.
 
@@ -523,8 +557,13 @@ class TestSnapshot(_WeightCheckerTestBase):
             "rotary_emb_cos_sin_cache",
             "rotary_emb_freqs_cis",
             "gate_proj_weight_fp32_cache",
+            "child.persistent_state",
         }
         self.assertEqual(keys, expected)
+
+    def test_excludes_non_persistent_buffers(self):
+        self.checker._snapshot()
+        self.assertNotIn("child.time_weight", self.checker._snapshot_tensors)
 
     def test_detaches_and_moves_to_cpu(self):
         self.checker._snapshot()
@@ -561,6 +600,18 @@ class TestResetTensors(_WeightCheckerTestBase):
         before = self.model.gate_proj_weight_fp32_cache.clone()
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.gate_proj_weight_fp32_cache, before)
+
+    def test_changes_persistent_buffer(self):
+        before = self.model.child.persistent_state.clone()
+        self.checker._reset_tensors()
+        self.assertFalse(torch.equal(self.model.child.persistent_state, before))
+
+    def test_preserves_non_persistent_buffer(self):
+        before = self.model.child.time_weight.clone()
+        before_ptr = self.model.child.time_weight.data_ptr()
+        self.checker._reset_tensors()
+        self.assertEqual(self.model.child.time_weight.data_ptr(), before_ptr)
+        torch.testing.assert_close(self.model.child.time_weight, before)
 
 
 class TestCompare(_WeightCheckerTestBase):
@@ -603,6 +654,19 @@ class TestCompare(_WeightCheckerTestBase):
             self.model.rotary_emb_cos_sin_cache.fill_(99.0)
         self.checker._compare()
 
+    def test_fails_when_persistent_buffer_diverges(self):
+        self.checker._snapshot()
+        with torch.no_grad():
+            self.model.child.persistent_state.fill_(99.0)
+        with self.assertRaisesRegex(Exception, "name=child.persistent_state"):
+            self.checker._compare()
+
+    def test_passes_when_non_persistent_buffer_diverges(self):
+        self.checker._snapshot()
+        with torch.no_grad():
+            self.model.child.time_weight.fill_(99.0)
+        self.checker._compare()
+
     def test_passes_after_reset_then_restoring_normal_params(self):
         # Full lifecycle: reset (skips cos_sin_cache et al.), then restore non-skip
         # params by hand. Compare must pass — proving reset+postprocess skip lists agree.
@@ -610,9 +674,7 @@ class TestCompare(_WeightCheckerTestBase):
         snapshot = {k: v.clone() for k, v in self.checker._snapshot_tensors.items()}
         self.checker._reset_tensors()
         with torch.no_grad():
-            for name, tensor in self.model.named_parameters():
-                tensor.data.copy_(snapshot[name].to(tensor.device))
-            for name, tensor in self.model.named_buffers():
+            for name, tensor in self.checker._model_state():
                 tensor.data.copy_(snapshot[name].to(tensor.device))
         self.checker._compare()
 
@@ -750,10 +812,12 @@ class TestComputeChecksum(_ChecksumTestBase):
         self.assertIn("w", names)
         self.assertIn("b", names)
         self.assertIn("running_mean", names)
+        self.assertIn("child.persistent_state", names)
         # Non-persistent buffer patterns are filtered out.
         self.assertNotIn("rotary_emb_cos_sin_cache", names)
         self.assertNotIn("rotary_emb_freqs_cis", names)
         self.assertNotIn("gate_proj_weight_fp32_cache", names)
+        self.assertNotIn("child.time_weight", names)
 
     def test_hashes_are_hex_strings(self):
         out = self.checker._compute_checksum()

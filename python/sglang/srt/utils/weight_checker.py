@@ -220,7 +220,18 @@ class WeightChecker:
     def _model_state(self):
         model = self._get_model()
         yield from model.named_parameters()
-        yield from model.named_buffers()
+        seen_buffers = set()
+        for module_name, module in model.named_modules():
+            for buffer_name, buffer in module._buffers.items():
+                if (
+                    buffer is None
+                    or buffer_name in module._non_persistent_buffers_set
+                    or id(buffer) in seen_buffers
+                ):
+                    continue
+                seen_buffers.add(id(buffer))
+                name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                yield name, buffer
 
 
 def _hash_tensor(t: torch.Tensor) -> str:
