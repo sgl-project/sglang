@@ -71,6 +71,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         self.mtp_draft_device_pools = tuple(mtp_draft_device_pools)
+        self._check_host_row_geometry(device_pool, pool_label)
         super().__init__(
             device_pool,
             host_to_device_ratio,
@@ -114,6 +115,51 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ]
         self._init_write_back_staging_buffers()
 
+    def _host_kv_cache_dim(self, device_pool) -> int:
+        """Row width, in store dtype elements, of every host row."""
+        return self.override_kv_cache_dim or (
+            device_pool.kv_lora_rank + device_pool.qk_rope_head_dim
+        )
+
+    def _check_host_row_geometry(self, device_pool, pool_label: str) -> None:
+        """Reject a host row geometry that differs from the device rows.
+
+        The host buffer has a single row width and dtype for every layer, and
+        the transfer paths address the target and packed MTP draft device
+        rows with that same geometry (the kernel paths use the host stride
+        for both sides, the direct path copies row slices). The host row must
+        therefore match the target's row, and every packed draft pool must
+        have the target's row geometry. Runs before any host allocation.
+        """
+        host_dim = self._host_kv_cache_dim(device_pool)
+        target_dtype = device_pool.store_dtype
+        # MLATokenToKVPool and its subclasses always set kv_cache_dim (a packed
+        # DSA row is wider than kv_lora_rank + qk_rope_head_dim). Duck-typed
+        # device pools that do not model row packing, such as lightweight test
+        # doubles, may omit it; only then is the host width taken on trust.
+        target_dim = getattr(device_pool, "kv_cache_dim", host_dim)
+        if host_dim != target_dim:
+            raise ValueError(
+                f"HiCache {pool_label} host pool rows must have the device "
+                f"pool's row geometry, but the host row is kv_cache_dim="
+                f"{host_dim} while the device pool has kv_cache_dim="
+                f"{target_dim}. Construct the host pool with "
+                "override_kv_cache_dim=device_pool.kv_cache_dim."
+            )
+        for draft_id, draft_pool in enumerate(self.mtp_draft_device_pools):
+            draft_dtype = draft_pool.store_dtype
+            draft_dim = draft_pool.kv_cache_dim
+            if draft_dtype != target_dtype or draft_dim != target_dim:
+                raise ValueError(
+                    f"HiCache {pool_label} host pool packs MTP draft KV layers "
+                    "next to the target layers, so every draft pool must have "
+                    f"the target's row geometry; draft pool {draft_id} has "
+                    f"store_dtype={draft_dtype}, kv_cache_dim={draft_dim} but "
+                    f"the target has store_dtype={target_dtype}, "
+                    f"kv_cache_dim={target_dim}. Use the same --kv-cache-dtype "
+                    "and --speculative-draft-kv-cache-dtype."
+                )
+
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
@@ -127,9 +173,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.target_layer_num = self._effective_host_layer_num()
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
-        self.kv_cache_dim = self.override_kv_cache_dim or (
-            self.kv_lora_rank + self.qk_rope_head_dim
-        )
+        self.kv_cache_dim = self._host_kv_cache_dim(self.device_pool)
         return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
 
     def get_ksize_per_token(self):
