@@ -229,11 +229,22 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         )
 
     if cfg.mem_fraction_static is None:
-        if post_capture_kv_sizing_planned(server_args):
+        model_config = model_config_of(server_args)
+        is_vlm = (
+            model_config.is_multimodal
+            and not cfg.language_only
+            and not cfg.language_model_only
+            and cfg.disaggregation_mode != "decode"
+        )
+        post_capture_kv_sizing = post_capture_kv_sizing_planned(server_args)
+        if post_capture_kv_sizing:
             # Post-capture sizing measures free memory after graph capture, so
             # skip the graph/activation reserve; keep only the floor + parallel slack.
             reserved_mem = 1536
             reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
+            if is_vlm:
+                reserved_mem += 8 * 1024
+            fallback_mem_fraction_static = 0.95
         else:
             # Tokens the activation working set scales with (per serving mode).
             if cfg.disaggregation_mode == "decode":
@@ -256,6 +267,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
                 reserved_mem = max(reserved_mem, 10 * 1024)
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
+            fallback_mem_fraction_static = 0.88
 
         declare_resolution(
             server_args,
@@ -263,7 +275,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             mem_fraction_static=(
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None
-                else 0.88
+                else fallback_mem_fraction_static
             ),
         )
 
@@ -271,13 +283,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         # so we adjust the mem_fraction_static accordingly. The VLM encoder
         # only runs on the prefill stage, so PD decode engines do not need
         # this headroom; prefill engines and normal (non-PD) engines do.
-        model_config = model_config_of(server_args)
-        if (
-            model_config.is_multimodal
-            and not cfg.language_only
-            and not cfg.language_model_only
-            and cfg.disaggregation_mode != "decode"
-        ):
+        if is_vlm and not post_capture_kv_sizing:
             adjust_mem_fraction_for_vlm(server_args, model_config)
 
     # If symm mem is enabled and prealloc size is not set, set it to 4GB

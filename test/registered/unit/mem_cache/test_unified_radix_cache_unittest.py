@@ -993,6 +993,34 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
+class TestBufferModePipelineIdle(CustomTestCase):
+    def test_inflight_stage_keeps_pipeline_busy(self):
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline.pending_write_queue = []
+        pipeline.staged_prefetches = []
+        pipeline.ongoing_write_through = []
+        pipeline.ongoing_backup = []
+        pipeline.ongoing_buffer_load_back = []
+        self.assertTrue(pipeline.is_idle())
+
+        pipeline.pending_write_queue = [object()]
+        self.assertFalse(pipeline.is_idle())
+        pipeline.pending_write_queue = []
+        pipeline.staged_prefetches = [object()]
+        self.assertFalse(pipeline.is_idle())
+        pipeline.staged_prefetches = []
+        pipeline.ongoing_write_through = [object()]
+        self.assertFalse(pipeline.is_idle())
+        pipeline.ongoing_write_through = []
+        pipeline.ongoing_backup = [object()]
+        self.assertFalse(pipeline.is_idle())
+        pipeline.ongoing_backup = []
+        pipeline.ongoing_buffer_load_back = [object()]
+        self.assertFalse(pipeline.is_idle())
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
