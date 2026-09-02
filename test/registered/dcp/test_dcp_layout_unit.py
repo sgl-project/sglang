@@ -70,7 +70,9 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
         return torch.cat(runs) if runs else torch.empty(0, dtype=torch.int64)
 
     def _owner_rule(self, kv, dcp_size, dcp_rank):
-        return kv[kv % dcp_size == dcp_rank] // dcp_size
+        # Selection only: the filters leave ids WIDENED and the collapse now
+        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        return kv[kv % dcp_size == dcp_rank]
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
         kv = self._build_chunk(starts, lens, dcp_size, seed)

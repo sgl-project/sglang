@@ -94,6 +94,69 @@ def _swizzled_nvfp4_scales_to_linear(scales: torch.Tensor) -> torch.Tensor:
     return linear.squeeze(0) if scale_ndim == 2 else linear
 
 
+def _prepare_nvfp4_swiglu_fusion_weights(
+    layer: torch.nn.Module,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+        interleave_linear_and_gate,
+        swizzle_blockscale_2d,
+    )
+
+    weight, weights_padding_cols = pad_nvfp4_weight(weight)
+    if weights_padding_cols != 0:
+        raise ValueError(
+            "Fused NVFP4 SwiGLU does not support K-padded weights; "
+            f"got weights_padding_cols={weights_padding_cols}."
+        )
+    if scales.ndim != 2:
+        raise ValueError(
+            "Fused NVFP4 SwiGLU expects a 2D weight scale, "
+            f"got shape={tuple(scales.shape)}."
+        )
+    if scales.shape[0] != weight.shape[0]:
+        raise ValueError(
+            "Fused NVFP4 SwiGLU does not support N padding; "
+            f"scale rows={scales.shape[0]} vs weight rows={weight.shape[0]}."
+        )
+    if weight.shape[0] % 128 != 0:
+        raise ValueError(
+            "Fused NVFP4 SwiGLU requires FC1 N % 128 == 0, " f"got N={weight.shape[0]}."
+        )
+
+    # FLUX.2 stores [gate; up].  The kernel consumes 64-row groups in
+    # [up; gate] order and applies SiLU to the gate half.
+    gate_weight, up_weight = weight.chunk(2, dim=0)
+    weight_swiglu_interleaved = interleave_linear_and_gate(
+        torch.cat((up_weight, gate_weight), dim=0), group_size=64, dim=0
+    )
+    gate_scale, up_scale = scales.chunk(2, dim=0)
+    weight_scale_swiglu_interleaved = swizzle_blockscale_2d(
+        interleave_linear_and_gate(
+            torch.cat((up_scale, gate_scale), dim=0), group_size=64, dim=0
+        )
+    )
+    for name, value in (
+        ("weight_swiglu_interleaved", weight_swiglu_interleaved),
+        ("weight_scale_swiglu_interleaved", weight_scale_swiglu_interleaved),
+    ):
+        value = value.detach()
+        existing = layer._buffers.get(name)
+        if (
+            existing is not None
+            and existing.shape == value.shape
+            and existing.dtype == value.dtype
+            and existing.device == value.device
+        ):
+            existing.copy_(value)
+        elif name in layer._buffers:
+            layer._buffers[name] = value
+        else:
+            layer.register_buffer(name, value, persistent=False)
+    layer._swiglu_fusion_ready = True
+
+
 def _require_flashinfer():
     if flashinfer is None:
         raise RuntimeError(
@@ -658,6 +721,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         ):
             scales = _swizzled_nvfp4_scales_to_linear(scales)
 
+        if getattr(layer, "_interleave_for_swiglu_fusion", False):
+            # The regular GEMM path swizzles this tensor below.  The fused
+            # GEMM+SwiGLU epilogue needs the logical row order so gate/up rows
+            # can first be paired and then swizzled as one matrix.
+            _prepare_nvfp4_swiglu_fusion_weights(
+                layer, w_swapped, scales.detach().clone()
+            )
+
         _, flashinfer_backend = _get_fp4_gemm_op()
         if flashinfer_backend == "trtllm":
             flashinfer_ops = _require_flashinfer()
@@ -730,23 +801,31 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output_dtype = x.dtype
-        input_shape = x.shape
-        x = x.view(-1, input_shape[-1])
-
         output_size = layer.output_size_per_partition
-        output_shape = list(input_shape[:-1]) + [output_size]
+        if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
+            x_fp4, x_scale_interleaved = x
+            output_dtype = layer.params_dtype
+            output_shape = [x_fp4.shape[0], output_size]
+        else:
+            if isinstance(x, tuple):
+                raise TypeError(
+                    "Prequantized NVFP4 input requires the linear layer to opt in."
+                )
+            output_dtype = x.dtype
+            input_shape = x.shape
+            x = x.view(-1, input_shape[-1])
+            output_shape = list(input_shape[:-1]) + [output_size]
 
-        fp4_quantize = _get_fp4_quantize_op()
-        if fp4_quantize is None:
-            raise RuntimeError(
-                "No FP4 quantization kernel available. Install flashinfer."
-            )
+            fp4_quantize = _get_fp4_quantize_op()
+            if fp4_quantize is None:
+                raise RuntimeError(
+                    "No FP4 quantization kernel available. Install flashinfer."
+                )
 
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
         weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
         x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
 
@@ -809,3 +888,41 @@ def apply_nvfp4_gemm_prequantized(
     )
     out = slice_nvfp4_output(out, layer.output_size_per_partition)
     return out + bias if bias is not None else out
+
+
+def apply_nvfp4_gemm_swiglu_quant(
+    linear_in: torch.nn.Module,
+    linear_out: torch.nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Run FLUX.2 FC1 GEMM + SwiGLU + FC2-input NVFP4 quantization."""
+    if not getattr(linear_in, "_swiglu_fusion_ready", False):
+        raise RuntimeError("NVFP4 SwiGLU weights were not prepared for fusion.")
+    if not getattr(linear_out, "_accepts_prequantized_fp4", False):
+        raise RuntimeError("NVFP4 output projection did not opt into packed input.")
+
+    fp4_quantize = _get_fp4_quantize_op()
+    if fp4_quantize is None:
+        raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
+
+    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+        nvfp4_gemm_swiglu_nvfp4_quant,
+    )
+
+    input_shape = x.shape
+    x_2d = x.view(-1, input_shape[-1])
+    x_fp4, x_scale_interleaved = fp4_quantize(x_2d, linear_in.input_scale_inv)
+    if x_scale_interleaved.dtype == torch.uint8:
+        x_scale_interleaved = x_scale_interleaved.view(torch.float8_e4m3fn)
+
+    out_fp4, out_scale_interleaved = nvfp4_gemm_swiglu_nvfp4_quant(
+        x_fp4,
+        x_scale_interleaved,
+        linear_in.weight_swiglu_interleaved,
+        linear_in.weight_scale_swiglu_interleaved,
+        linear_in.alpha,
+        linear_out.input_scale_inv,
+        enable_pdl=True,
+    )
+    out, _ = linear_out((out_fp4, out_scale_interleaved))
+    return out.view(*input_shape[:-1], out.shape[-1])

@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -351,6 +352,31 @@ def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
     )
 
 
+def test_extra_high_quality_does_not_enable_h3_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=False)
+    stage._cache_dit_enabled = False
+    stage._minimax_h3_cache_mode = None
+    stage._minimax_h3_quality = "lossless"
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="extra-high",
+            _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
+        )
+    )
+
+    # Even a server-wide generic Cache-DiT default must not turn an explicit
+    # fusion-only quality tier into an approximate H3 request.
+    with patch.object(DenoisingStage, "_cache_dit_requested", return_value=True):
+        stage._maybe_enable_cache_dit(50, batch)
+
+    assert stage._minimax_h3_quality == "extra-high"
+    assert stage._minimax_h3_cache_mode is None
+    assert not stage._cache_dit_enabled
+
+
 def test_quality_admission_fails_closed_outside_validated_request():
     metadata = MiniMaxH3ReleaseMetadata.from_model_index(
         {
@@ -403,6 +429,9 @@ def test_quality_admission_fails_closed_outside_validated_request():
     batch.sampling_params.quality = "lossless"
     batch.num_inference_steps = 50
     server_args.attention_backend = "sage_attn"
+    assert stage.forward(batch, server_args) is batch
+
+    batch.sampling_params.quality = "extra-high"
     assert stage.forward(batch, server_args) is batch
 
     batch.sampling_params.quality = "ultra"
