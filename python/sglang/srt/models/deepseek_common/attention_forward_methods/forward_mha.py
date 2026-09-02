@@ -7,7 +7,6 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.merge_state import merge_state
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dcp import (
@@ -474,6 +473,8 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
+        from sglang.srt.layers.attention.merge_state import merge_state
+
         backend = resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype

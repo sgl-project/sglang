@@ -230,6 +230,7 @@ def _can_use_triton_dense_fp8_prefill(attn, forward_batch) -> bool:
         and attn.v_head_dim == 128
         and attn.kv_lora_rank == 512
         and not get_parallel().dcp_enabled
+        and not mla_use_prefill_cp(forward_batch)
         and forward_batch.forward_mode.is_extend_without_speculative()
         and prefix_lens is not None
         and any(prefix_lens)
@@ -242,9 +243,6 @@ def handle_attention_triton(attn, forward_batch):
 
     # when deterministic inference is enabled, use MLA
     if get_exec().deterministic.enable_deterministic_inference:
-        return _dispatch_mla_subtype(attn, forward_batch)
-
-    if mla_use_prefill_cp(forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     # Kimi-K3 with an FP8 latent cache uses dense 192/128 K/V for cached
