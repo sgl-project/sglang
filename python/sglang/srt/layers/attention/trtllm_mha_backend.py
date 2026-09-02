@@ -1388,9 +1388,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         )
 
-    def _get_nvfp4_decode_kv_cache(
-        self, layer: RadixAttention
-    ) -> tuple[
+    def _get_nvfp4_decode_kv_cache(self, layer: RadixAttention) -> tuple[
         tuple[torch.Tensor, torch.Tensor],
         tuple[torch.Tensor, torch.Tensor],
     ]:
@@ -1610,9 +1608,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 # verify window; the spec-decode kernel is causal in-window, so
                 # run bs*L single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
-                assert not self.forward_metadata.is_ragged_verify, (
-                    "ENCODER_ONLY target_verify does not support ragged verify layouts"
-                )
+                assert (
+                    not self.forward_metadata.is_ragged_verify
+                ), "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 assert self.forward_metadata.encoder_cache_seqlens is not None, (
                     "ENCODER_ONLY target_verify requires the expanded decode "
                     "metadata (built only on the draft worker)"
