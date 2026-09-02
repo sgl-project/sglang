@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# KDA extension provenance: FLUX.2 FP8 producer fusion from SGLang PR #37162.
 """Fused LayerNorm + adaLN modulate Triton kernels for bf16 activations.
 
 Two fusions, each replacing an eager multi-kernel chain with a single

@@ -96,6 +96,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def free_group_begin(self):
+        assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
 
     def free_group_end(self):
