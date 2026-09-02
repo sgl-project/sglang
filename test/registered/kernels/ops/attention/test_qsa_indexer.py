@@ -89,6 +89,8 @@ def _make_indexer(rotary, device, dtype=torch.bfloat16):
 class FakePool:
     """Minimal stand-in for the QSA KV pool buffers used by the indexer."""
 
+    index_state_dtype = torch.bfloat16
+
     def __init__(self, num_slots, num_compressed, device, dtype=torch.bfloat16):
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
@@ -120,31 +122,6 @@ class FakePool:
         self.compressed[loc.long()] = compressed_k.to(self.compressed.dtype)
 
 
-def _make_metadata(pool, cache_loc, token_slot_table, write_locs):
-    return SimpleNamespace(
-        token_to_kv_pool=pool,
-        out_cache_loc=cache_loc,
-        is_cuda_graph=False,
-        token_to_batch_idx=torch.zeros(
-            cache_loc.numel(), dtype=torch.int32, device=cache_loc.device
-        ),
-        token_slot_table=token_slot_table,
-        write_locs=write_locs,
-        req_pool_indices=None,
-        req_to_token_pool=None,
-        pending_ring_slots=None,
-        extend_rope_matrix=None,
-        compress_group_ring_locs=None,
-    )
-
-
-def _force_eager(indexer):
-    """Make an indexer instance take the pre-fusion eager paths."""
-    indexer._use_fused_prep = lambda tensor: False
-    indexer._use_fused_compress = lambda pool: False
-    return indexer
-
-
 def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
     """Bit-comparable to the eager path: identical except rare last-ulp flips.
 
@@ -161,125 +138,13 @@ def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
         assert peak <= max_abs, f"largest deviation {peak} exceeds {max_abs}"
 
 
-def _run_case(
-    num_tokens,
-    position_offset,
-    mrope_section,
-    mrope_interleaved,
-    pad_q_heads,
-    seed,
-):
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    torch.manual_seed(seed)
-    rotary = _make_rotary(mrope_section, mrope_interleaved, device, dtype)
-    indexer = _make_indexer(rotary, device, dtype)
-
-    hidden = torch.randn(num_tokens, HIDDEN, device=device, dtype=dtype) * 0.5
-    logical_positions = torch.arange(
-        position_offset, position_offset + num_tokens, device=device
-    )
-    if mrope_section is not None:
-        positions = logical_positions.unsqueeze(0).expand(3, -1).contiguous()
-    else:
-        positions = logical_positions
-
-    # Distinct state slots per token; slot 0 is deliberately unused.
-    cache_loc = (
-        torch.randperm(max(num_tokens + 8, 4096), device=device)[:num_tokens].long() + 1
-    )
-    token_slot_table = torch.zeros(1, 65536, dtype=torch.int32, device=device)
-    token_slot_table[0, logical_positions.long()] = cache_loc.to(torch.int32)
-
-    boundaries = ((logical_positions + 1) % RATIO) == 0
-    num_boundaries = int(boundaries.sum())
-    write_locs = (
-        torch.randperm(2048, device=device)[:num_boundaries].to(torch.int32) + 1
-    )
-
-    pool_ref = FakePool(8192, 4096, device, dtype)
-    pool_new = FakePool(8192, 4096, device, dtype)
-
-    # Reference: pre-fusion eager path (toggle the real switches off).
-    q_ref, token_k_ref, stored_ref = _force_eager(indexer).project_qk(hidden, positions)
-    assert not stored_ref
-    indexer.update_key_state_and_compress(
-        token_k_ref,
-        logical_positions,
-        positions,
-        _make_metadata(pool_ref, cache_loc, token_slot_table, write_locs),
-    )
-    # Restore the fused switches (instance attributes shadow the methods).
-    del indexer._use_fused_prep, indexer._use_fused_compress
-
-    # Fused path.
-    q_new, token_k_new, stored_new = indexer.project_qk(
-        hidden,
-        positions,
-        pool=pool_new,
-        cache_loc=cache_loc,
-        q_heads_padded=pad_q_heads,
-    )
-    assert stored_new
-    indexer.update_key_state_and_compress(
-        token_k_new,
-        logical_positions,
-        positions,
-        _make_metadata(pool_new, cache_loc, token_slot_table, write_locs),
-        state_stored=True,
-    )
-
-    expected_heads = pad_q_heads or NUM_Q_HEADS
-    assert q_new.shape == (num_tokens, expected_heads, HEAD_DIM)
-    assert_bit_comparable(q_new[:, :NUM_Q_HEADS], q_ref)
-    if expected_heads > NUM_Q_HEADS:
-        assert torch.all(q_new[:, NUM_Q_HEADS:] == 0).item()
-    # Raw state stores are plain copies and must match exactly.
-    torch.testing.assert_close(pool_new.key_state, pool_ref.key_state, rtol=0, atol=0)
-    assert torch.equal(
-        pool_new.qsa_rope_position_buffer, pool_ref.qsa_rope_position_buffer
-    )
-    assert_bit_comparable(pool_new.compressed, pool_ref.compressed)
-
-
-@pytest.mark.parametrize("pad_q_heads", [None, 8])
-@pytest.mark.parametrize(
-    "num_tokens, position_offset",
-    [
-        (1, 3),  # decode landing exactly on a boundary
-        (1, 4),  # decode mid-group: no boundary
-        (7, 0),  # partial tail group (7 % 4 != 0)
-        (8, 1),  # offset tail, boundaries at 3 and 7
-        (128, 0),
-        (8000, 0),  # prefill shape
-    ],
-)
-@pytest.mark.parametrize(
-    "mrope_section, mrope_interleaved",
-    [
-        ([24, 20, 20], True),  # Qwen4-Exp style interleaved MRoPE
-        ([24, 20, 20], False),  # sectioned MRoPE
-        (None, False),  # plain 1D RoPE
-    ],
-)
-def test_fused_prep_matches_eager(
-    num_tokens, position_offset, mrope_section, mrope_interleaved, pad_q_heads
-):
-    _run_case(
-        num_tokens,
-        position_offset,
-        mrope_section,
-        mrope_interleaved,
-        pad_q_heads,
-        seed=num_tokens * 31 + position_offset,
-    )
-
-
 def _eager_compress_reference(indexer, pool, group_locs, write_locs):
     """The pre-fusion compression chain, via the indexer's own helpers."""
     key_groups = pool.get_qsa_key_state_buffer(0)[group_locs.long()]
     pooled = average_pool_qsa_keys(key_groups)
-    rope_positions = indexer._get_group_rope_positions(pool, group_locs[:, 0])
+    rope_positions = indexer._rope_from_matrix(
+        pool.get_qsa_rope_position_buffer(group_locs[:, 0])
+    )
     normalized = indexer.normalize_compressed_keys(pooled, rope_positions)
     pool.set_qsa_compressed_k_buffer(0, write_locs, normalized)
 

@@ -71,6 +71,7 @@ def _make_source_embedding(
         num_embeddings_padded=org_vocab_size + num_added_embeddings,
         shard_indices=shard_indices,
         embedding_dim=embedding_dim,
+        weight_scale=None,
         quant_method=UnquantizedEmbeddingMethod(),
         num_embeddings_per_partition=local_rows,
         num_org_embeddings_per_partition=local_rows,

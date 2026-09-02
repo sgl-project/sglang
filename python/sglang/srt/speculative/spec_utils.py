@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
 from sglang.srt.runtime_context import (
+    get_exec,
     get_spec,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
