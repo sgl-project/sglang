@@ -521,38 +521,82 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
 # Plain CP keeps rank-contiguous token slices across layers; only MLA boundaries
 # convert to/from the load-balanced layout.
-def cp_plain_split(input_tensor: torch.Tensor) -> torch.Tensor:
+def _cp_plain_shape(forward_batch, cp_size: int) -> Tuple[int, int]:
+    metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if metadata is None:
+        raise RuntimeError("Plain CP requires attn_cp_metadata.")
+
+    total_tokens = int(metadata.total_seq_lens)
+    if total_tokens < 0:
+        raise RuntimeError(
+            f"Invalid plain CP total_seq_lens={total_tokens}; expected >= 0."
+        )
+    return total_tokens, ceil_div(total_tokens, cp_size)
+
+
+def _cp_plain_pad_rows(
+    input_tensor: torch.Tensor, physical_rank_len: int
+) -> torch.Tensor:
+    if input_tensor.shape[0] > physical_rank_len:
+        raise RuntimeError(
+            "Plain CP input exceeds its physical rank extent: "
+            f"got={input_tensor.shape[0]}, physical={physical_rank_len}."
+        )
+    if input_tensor.shape[0] == physical_rank_len:
+        return input_tensor.contiguous()
+
+    pad_shape = (physical_rank_len - input_tensor.shape[0], *input_tensor.shape[1:])
+    return torch.cat([input_tensor, input_tensor.new_zeros(pad_shape)], dim=0)
+
+
+def cp_plain_split(input_tensor: torch.Tensor, forward_batch) -> torch.Tensor:
     cp_size = get_parallel().attn_cp_size
     cp_rank = get_parallel().attn_cp_rank
-    assert input_tensor.shape[0] % cp_size == 0, (
-        f"cp_plain_split expects total tokens divisible by cp_size, "
-        f"got {input_tensor.shape[0]} % {cp_size} != 0"
-    )
-    chunk = input_tensor.shape[0] // cp_size
-    return input_tensor[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
+    total_tokens, physical_rank_len = _cp_plain_shape(forward_batch, cp_size)
+    if input_tensor.shape[0] < total_tokens:
+        raise RuntimeError(
+            "Plain CP split received fewer rows than its logical token count: "
+            f"got={input_tensor.shape[0]}, logical={total_tokens}."
+        )
+
+    start = cp_rank * physical_rank_len
+    end = min(start + physical_rank_len, total_tokens)
+    local_tensor = input_tensor[:total_tokens][start:end]
+    return _cp_plain_pad_rows(local_tensor, physical_rank_len)
 
 
-def cp_plain_all_gather(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
-    # Rank-major all-gather is already in natural order under the plain layout,
-    # so no rerange is needed.
-    out_shape = (input_tensor.shape[0] * cp_size,) + tuple(input_tensor.shape[1:])
+def cp_plain_all_gather(
+    input_tensor: torch.Tensor, cp_size: int, forward_batch
+) -> torch.Tensor:
+    # Plain rank slices are padded to one physical extent for the collective.
+    # The metadata retains the logical token count so the padding is removed
+    # before a full-layout consumer sees the tensor.
+    total_tokens, physical_rank_len = _cp_plain_shape(forward_batch, cp_size)
+    input_tensor = _cp_plain_pad_rows(input_tensor, physical_rank_len)
+    out_shape = (physical_rank_len * cp_size,) + tuple(input_tensor.shape[1:])
     with use_symmetric_memory(
         get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
         output_tensor = input_tensor.new_empty(out_shape)
     attn_cp_all_gather_into_tensor(output_tensor, input_tensor)
-    return output_tensor
+    return output_tensor[:total_tokens]
 
 
-def cp_plain_reduce_scatter(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
-    # Contiguous plain layout permits one reduce-scatter and avoids a full-tensor
-    # permutation.
-    S = input_tensor.shape[0]
-    assert S % cp_size == 0, (
-        f"cp_plain_reduce_scatter expects S divisible by cp_size, "
-        f"got S={S}, cp_size={cp_size}"
+def cp_plain_reduce_scatter(
+    input_tensor: torch.Tensor, cp_size: int, forward_batch
+) -> torch.Tensor:
+    # Pad the logical full tensor so reduce-scatter emits one equal-size plain
+    # shard per rank. The final rank's synthetic rows stay zero.
+    total_tokens, physical_rank_len = _cp_plain_shape(forward_batch, cp_size)
+    if input_tensor.shape[0] < total_tokens:
+        raise RuntimeError(
+            "Plain CP reduce-scatter received fewer rows than its logical token "
+            f"count: got={input_tensor.shape[0]}, logical={total_tokens}."
+        )
+    input_tensor = _cp_plain_pad_rows(
+        input_tensor[:total_tokens], physical_rank_len * cp_size
     )
-    out_shape = (S // cp_size,) + tuple(input_tensor.shape[1:])
+    out_shape = (physical_rank_len,) + tuple(input_tensor.shape[1:])
     with use_symmetric_memory(
         get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
     ):
@@ -580,7 +624,7 @@ def cp_plain_to_scattered(
         )
         return recv.flatten(0, 1)
 
-    full = cp_plain_all_gather(input_tensor, cp_size)
+    full = cp_plain_all_gather(input_tensor, cp_size, forward_batch)
     return cp_split_and_rebuild_data(forward_batch, full)
 
 
@@ -606,9 +650,7 @@ def cp_scattered_to_plain(
     full = cp_all_gather_rerange_output(
         input_tensor, cp_size, forward_batch, torch.cuda.current_stream()
     )
-    cp_rank = get_parallel().attn_cp_rank
-    chunk = full.shape[0] // cp_size
-    return full[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
+    return cp_plain_split(full, forward_batch)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

@@ -534,7 +534,11 @@ def prepare_context_parallel_metadata(
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        return ContextParallelMetadata()
+        total_seq_lens = max(
+            int(kv_len),
+            sum(int(x) for x in extend_seqs_len or []),
+        )
+        return ContextParallelMetadata(total_seq_lens=total_seq_lens)
 
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4, single sequence):

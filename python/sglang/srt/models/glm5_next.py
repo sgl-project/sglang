@@ -522,7 +522,7 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             hidden_states = cp_plain_all_gather(
-                hidden_states, get_parallel().attn_cp_size
+                hidden_states, get_parallel().attn_cp_size, forward_batch
             )
 
         qkv, _ = self.qkv_proj(hidden_states)
@@ -543,7 +543,7 @@ class Glm5NextLinearAttention(nn.Module):
     ):
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             hidden_states = cp_plain_all_gather(
-                hidden_states, get_parallel().attn_cp_size
+                hidden_states, get_parallel().attn_cp_size, forward_batch
             )
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
@@ -596,9 +596,11 @@ class Glm5NextLinearAttention(nn.Module):
         output = self.o_proj(core_attn_out)[0]
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
             if self.dsa_enable_prefill_cp:
-                output = cp_plain_reduce_scatter(output, get_parallel().attn_cp_size)
+                output = cp_plain_reduce_scatter(
+                    output, get_parallel().attn_cp_size, forward_batch
+                )
             else:
-                output = cp_plain_split(output)
+                output = cp_plain_split(output, forward_batch)
         elif self.dsa_enable_prefill_cp:
             output = get_parallel().attn_cp_group.all_reduce(output)
         return output
@@ -1121,7 +1123,7 @@ class Glm5NextModel(nn.Module):
             forward_batch, self.dsa_enable_prefill_cp
         ) or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp):
             if self.pp_group.is_first_rank:
-                hidden_states = cp_plain_split(hidden_states)
+                hidden_states = cp_plain_split(hidden_states, forward_batch)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         normal_start_layer = self.start_layer
@@ -1203,7 +1205,9 @@ class Glm5NextModel(nn.Module):
             dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
         ):
-            hidden_states = cp_plain_all_gather(hidden_states, self.cp_size)
+            hidden_states = cp_plain_all_gather(
+                hidden_states, self.cp_size, forward_batch
+            )
         if len(aux_hidden_states) == 0:
             return hidden_states
         return hidden_states, aux_hidden_states
