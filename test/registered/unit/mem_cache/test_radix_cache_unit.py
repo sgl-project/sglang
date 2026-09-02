@@ -1053,6 +1053,104 @@ class TestRadixCache(unittest.TestCase):
         # The cache size should be within reasonable bounds of the actual allocated memory.
         self.assertLess(torch_allocated, cache_size_bytes * 2)
 
+    def test_bigram_insert_and_match(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
+        cache = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                is_eagle=True,
+            )
+        )
+
+        key = RadixKey(array("q", [1, 2, 3, 4]), is_bigram=True)
+        value = torch.tensor([10, 20, 30, 40], dtype=torch.int64)
+        cache.insert(InsertParams(key=key, value=value))
+
+        self.assertEqual(cache.total_size(), 3)
+
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 5]), is_bigram=True))
+        )
+        self.assertEqual(len(result.device_indices), 3)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+        )
+
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2]), is_bigram=True))
+        )
+        self.assertEqual(len(result.device_indices), 1)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10], dtype=torch.int64)
+        )
+
+    def test_priority_propagation_on_insert(self):
+        cache = RadixCache.create_simulated()
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3, 4])),
+                value=torch.tensor([10, 20, 30, 40], dtype=torch.int64),
+                priority=10,
+            )
+        )
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 5, 6])),
+                value=torch.tensor([50, 60, 70, 80], dtype=torch.int64),
+                priority=5,
+            )
+        )
+
+        shared = cache.root_node.children[(1,)]
+        self.assertEqual(shared.priority, 10)
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 7, 8])),
+                value=torch.tensor([90, 100, 110, 120], dtype=torch.int64),
+                priority=15,
+            )
+        )
+        self.assertEqual(shared.priority, 15)
+
+    def test_evict_skips_protected_nodes(self):
+        cache = RadixCache.create_simulated()
+
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [1, 2, 3])),
+                value=torch.tensor([10, 20, 30], dtype=torch.int64),
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", [4, 5, 6])),
+                value=torch.tensor([40, 50, 60], dtype=torch.int64),
+            )
+        )
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3])))
+        )
+        cache.inc_lock_ref(match.last_device_node)
+
+        self.assertEqual(cache.protected_size(), 3)
+        self.assertEqual(cache.evictable_size(), 3)
+
+        evict_result = cache.evict(EvictParams(num_tokens=10))
+
+        self.assertGreater(evict_result.num_tokens_evicted, 0)
+        self.assertEqual(cache.protected_size(), 3)
+
+        cache.dec_lock_ref(match.last_device_node)
+        self.assertEqual(cache.evictable_size(), 6)
+
 
 if __name__ == "__main__":
     unittest.main()
