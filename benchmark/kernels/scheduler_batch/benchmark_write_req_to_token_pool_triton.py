@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.benchmark.bench_utils import run_bench
+
 
 @triton.jit
 def write_req_to_token_pool_triton(
@@ -263,7 +265,7 @@ def get_benchmark():
         quantiles = [0.5, 0.2, 0.8]
 
         if provider == "reference":
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: write_req_to_token_pool_reference(
                     req_to_token.clone(),
                     req_pool_indices,
@@ -272,10 +274,10 @@ def get_benchmark():
                     extend_lens,
                     out_cache_loc,
                 ),
-                quantiles=quantiles,
+                quantiles=tuple(quantiles),
             )
         elif provider == "triton":
-            ms, min_ms, max_ms = triton.testing.do_bench(
+            ms, min_ms, max_ms = run_bench(
                 lambda: write_req_to_token_pool_triton[(batch_size,)](
                     req_to_token.clone(),
                     req_pool_indices,
@@ -285,7 +287,7 @@ def get_benchmark():
                     out_cache_loc,
                     max_context_len,
                 ),
-                quantiles=quantiles,
+                quantiles=tuple(quantiles),
             )
         else:
 
@@ -303,9 +305,7 @@ def get_benchmark():
                     BLOCK_SIZE=block_size,
                 )
 
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                run_optimized, quantiles=quantiles
-            )
+            ms, min_ms, max_ms = run_bench(run_optimized, quantiles=tuple(quantiles))
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 

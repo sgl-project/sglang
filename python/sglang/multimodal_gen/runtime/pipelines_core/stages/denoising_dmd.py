@@ -9,14 +9,17 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    pred_noise_to_pred_video,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 
 logger = init_logger(__name__)
 
@@ -26,8 +29,10 @@ class DmdDenoisingStage(DenoisingStage):
     Denoising stage for DMD.
     """
 
-    def __init__(self, transformer, scheduler) -> None:
-        super().__init__(transformer, scheduler)
+    def __init__(self, transformer, scheduler, transformer_2=None) -> None:
+        super().__init__(
+            transformer=transformer, scheduler=scheduler, transformer_2=transformer_2
+        )
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
@@ -63,11 +68,12 @@ class DmdDenoisingStage(DenoisingStage):
         """
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
 
-        target_dtype = prepared_vars["target_dtype"]
-        autocast_enabled = prepared_vars["autocast_enabled"]
-        num_warmup_steps = prepared_vars["num_warmup_steps"]
-        latents = prepared_vars["latents"]
+        target_dtype = prepared_vars.target_dtype
+        autocast_enabled = prepared_vars.autocast_enabled
+        num_warmup_steps = prepared_vars.num_warmup_steps
+        latents = prepared_vars.latents
         video_raw_latent_shape = latents.shape
+        scheduler = self.scheduler
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
@@ -84,14 +90,13 @@ class DmdDenoisingStage(DenoisingStage):
             self.transformer.forward,
             {
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
+        pos_cond_kwargs = prepared_vars.pos_cond_kwargs
 
         denoising_loop_start_time = time.time()
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
@@ -100,9 +105,23 @@ class DmdDenoisingStage(DenoisingStage):
                 with StageProfiler(
                     f"denoising_step_{i}",
                     logger=logger,
-                    timings=batch.timings,
+                    metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
+                    record_as_step=True,
                 ):
+                    t_int = int(t.item())
+                    if self.transformer_2 is not None:
+                        current_model, _ = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=self._handle_boundary_ratio(
+                                server_args, batch, scheduler
+                            ),
+                            server_args=server_args,
+                            batch=batch,
+                        )
+                    else:
+                        current_model = self.transformer
+                        self._manage_dit_use_site(current_model, "transformer", batch)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)
@@ -129,9 +148,9 @@ class DmdDenoisingStage(DenoisingStage):
                     )
 
                     # Predict noise residual
-                    with torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=target_dtype,
+                    with precision_autocast_context(
+                        target_dtype,
+                        server_args.disable_autocast,
                         enabled=autocast_enabled,
                     ):
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
@@ -143,7 +162,7 @@ class DmdDenoisingStage(DenoisingStage):
                             forward_batch=batch,
                         ):
                             # Run transformer
-                            pred_noise = self.transformer(
+                            pred_noise = current_model(
                                 hidden_states=latent_model_input.permute(0, 2, 1, 3, 4),
                                 timestep=t_expand,
                                 guidance=guidance_expand,
@@ -151,11 +170,14 @@ class DmdDenoisingStage(DenoisingStage):
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
-                            scheduler=self.scheduler,
+                            timestep=video_timesteps,
+                            scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
                         if i < len(timesteps) - 1:
@@ -168,7 +190,7 @@ class DmdDenoisingStage(DenoisingStage):
                                 generator=batch.generator[0],
                                 device=self.device,
                             )
-                            latents = self.scheduler.add_noise(
+                            latents = scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
                                 next_timestep,
@@ -179,7 +201,7 @@ class DmdDenoisingStage(DenoisingStage):
                         # Update progress bar
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
+                            and (i + 1) % scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()

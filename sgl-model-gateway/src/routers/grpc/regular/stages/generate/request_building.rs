@@ -18,7 +18,7 @@ use crate::routers::{
 /// Generate request building stage
 ///
 /// Extracts generate-specific request building logic from the old unified RequestBuildingStage.
-pub struct GenerateRequestBuildingStage {
+pub(crate) struct GenerateRequestBuildingStage {
     inject_pd_metadata: bool,
 }
 

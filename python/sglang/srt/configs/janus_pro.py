@@ -123,14 +123,14 @@ class SigLIPVisionCfg:
 
 class MultiModalityConfig(PretrainedConfig):
     model_type = "multi_modality"
-    vision_config: VisionConfig
-    aligner_config: AlignerConfig
+    vision_config: VisionConfig = None
+    aligner_config: AlignerConfig = None
 
-    gen_vision_config: GenVisionConfig
-    gen_aligner_config: GenAlignerConfig
-    gen_head_config: GenHeadConfig
+    gen_vision_config: GenVisionConfig = None
+    gen_aligner_config: GenAlignerConfig = None
+    gen_head_config: GenHeadConfig = None
 
-    language_config: LlamaConfig
+    language_config: LlamaConfig = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -595,12 +595,12 @@ class VLChatProcessor(ProcessorMixin):
 
 class VLMImageProcessorConfig(PretrainedConfig):
     model_type = "deepseek_vlm"
-    image_size: int
-    min_size: int
-    image_mean: Union[Tuple[float, float, float], List[float]]
-    image_std: Union[Tuple[float, float, float], List[float]]
-    rescale_factor: float
-    do_normalize: bool
+    image_size: int = None
+    min_size: int = None
+    image_mean: Union[Tuple[float, float, float], List[float]] = None
+    image_std: Union[Tuple[float, float, float], List[float]] = None
+    rescale_factor: float = None
+    do_normalize: bool = None
 
     def __init__(
         self,

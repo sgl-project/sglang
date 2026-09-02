@@ -19,12 +19,10 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import (
-    DatasetRow,
-    benchmark,
-    sample_mmmu_requests,
-    set_global_args,
-)
+from sglang.bench_serving import benchmark, set_global_args
+from sglang.benchmark.datasets import DatasetRow
+from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
+from sglang.srt.arg_groups.overrides import resolution_projection
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -83,6 +81,8 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
         disable_ignore_eos=False,
         disable_stream=False,
         return_logprob=False,
+        return_routed_experts=False,
+        plot_throughput=False,
         backend=backend,
         dataset_name="custom",
         num_prompts=None,
@@ -120,7 +120,7 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
     acc_length = results["accept_length"] or 1.0
     avg_output_token = results["total_output_tokens"] / results["completed"]
 
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     # We use 20% percentile instead of median on purpose
     step_time = np.percentile(
         server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
@@ -136,6 +136,9 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
 
 
 def main(args, server_args):
+    from sglang.srt.arg_groups.overrides import resolution_projection
+
+    server_args = SimpleNamespace(**resolution_projection(server_args))
     base_url = "http://127.0.0.1:20000"
 
     configs = []
@@ -316,5 +319,6 @@ if __name__ == "__main__":
     parser.add_argument("--is-multimodal", action="store_true", default=False)
     args = parser.parse_args()
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
+    server_args.resolve_once()
 
     main(args, server_args)

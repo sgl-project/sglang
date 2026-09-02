@@ -2,7 +2,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.int8_kernel import (
+from sglang.kernels.ops.quantization.int8_kernel import (
     per_token_group_quant_int8,
     w8a8_block_int8_matmul,
 )

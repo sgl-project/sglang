@@ -4,15 +4,14 @@ import unittest
 import torch
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Block INT8 quantization kernel tests
-register_cuda_ci(est_time=44, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=22, suite="stage-a-test-1")
+register_cuda_ci(est_time=44, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=22, suite="stage-b-test-1-gpu-small-amd")
 
 
 # For test

@@ -3,6 +3,7 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
@@ -14,7 +15,28 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_rank,
+    get_decode_parallel_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    SpatialParallelCausalConv3d,
+    SpatialParallelConv2d,
+    SpatialParallelZeroPad2d,
+    causal_conv3d_cat_pad,
+    chunk_height_for_parallel_decode,
+    disable_spatial_parallel_decode,
+    gather_and_trim_height,
+    gather_height_for_global_op,
+    split_for_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    ParallelTiledVAE,
+    can_install_spatial_shard_parallel_decode,
+    has_decode_parallel_world,
+    should_run_spatial_shard_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -66,11 +88,7 @@ class QwenImageCausalConv3d(nn.Conv3d):
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        x = causal_conv3d_cat_pad(x, cache_x, padding)
         return super().forward(x)
 
 
@@ -137,7 +155,14 @@ class QwenImageResample(nn.Module):
             - 'downsample3d': 3D downsampling with zero-padding, convolution, and causal 3D convolution.
     """
 
-    def __init__(self, dim: int, mode: str) -> None:
+    def __init__(
+        self,
+        dim: int,
+        mode: str,
+        conv2d_cls: type[nn.Conv2d] = nn.Conv2d,
+        causal_conv3d_cls: type[nn.Conv3d] = QwenImageCausalConv3d,
+        zero_pad2d_cls: type[nn.Module] = nn.ZeroPad2d,
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.mode = mode
@@ -146,26 +171,40 @@ class QwenImageResample(nn.Module):
         if mode == "upsample2d":
             self.resample = nn.Sequential(
                 QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim // 2, 3, padding=1),
+                conv2d_cls(dim, dim // 2, 3, padding=1),
             )
         elif mode == "upsample3d":
             self.resample = nn.Sequential(
                 QwenImageUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim // 2, 3, padding=1),
+                conv2d_cls(dim, dim // 2, 3, padding=1),
             )
-            self.time_conv = QwenImageCausalConv3d(
+            self.time_conv = causal_conv3d_cls(
                 dim, dim * 2, (3, 1, 1), padding=(1, 0, 0)
             )
 
         elif mode == "downsample2d":
-            self.resample = nn.Sequential(
-                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            )
+            if conv2d_cls is SpatialParallelConv2d:
+                self.resample = nn.Sequential(
+                    zero_pad2d_cls((0, 1, 0, 0)),
+                    conv2d_cls(dim, dim, 3, stride=(2, 2), height_padding=(0, 1)),
+                )
+            else:
+                self.resample = nn.Sequential(
+                    zero_pad2d_cls((0, 1, 0, 1)),
+                    conv2d_cls(dim, dim, 3, stride=(2, 2)),
+                )
         elif mode == "downsample3d":
-            self.resample = nn.Sequential(
-                nn.ZeroPad2d((0, 1, 0, 1)), nn.Conv2d(dim, dim, 3, stride=(2, 2))
-            )
-            self.time_conv = QwenImageCausalConv3d(
+            if conv2d_cls is SpatialParallelConv2d:
+                self.resample = nn.Sequential(
+                    zero_pad2d_cls((0, 1, 0, 0)),
+                    conv2d_cls(dim, dim, 3, stride=(2, 2), height_padding=(0, 1)),
+                )
+            else:
+                self.resample = nn.Sequential(
+                    zero_pad2d_cls((0, 1, 0, 1)),
+                    conv2d_cls(dim, dim, 3, stride=(2, 2)),
+                )
+            self.time_conv = causal_conv3d_cls(
                 dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0)
             )
 
@@ -254,6 +293,7 @@ class QwenImageResidualBlock(nn.Module):
         out_dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
+        causal_conv3d_cls: type[nn.Conv3d] = QwenImageCausalConv3d,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
@@ -262,12 +302,17 @@ class QwenImageResidualBlock(nn.Module):
 
         # layers
         self.norm1 = QwenImageRMS_norm(in_dim, images=False)
-        self.conv1 = QwenImageCausalConv3d(in_dim, out_dim, 3, padding=1)
+        self.conv1 = causal_conv3d_cls(in_dim, out_dim, 3, padding=1)
         self.norm2 = QwenImageRMS_norm(out_dim, images=False)
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = QwenImageCausalConv3d(out_dim, out_dim, 3, padding=1)
+        self.conv2 = causal_conv3d_cls(out_dim, out_dim, 3, padding=1)
+        shortcut_conv3d_cls = (
+            QwenImageCausalConv3d
+            if causal_conv3d_cls is SpatialParallelCausalConv3d
+            else causal_conv3d_cls
+        )
         self.conv_shortcut = (
-            QwenImageCausalConv3d(in_dim, out_dim, 1)
+            shortcut_conv3d_cls(in_dim, out_dim, 1)
             if in_dim != out_dim
             else nn.Identity()
         )
@@ -335,9 +380,10 @@ class QwenImageAttentionBlock(nn.Module):
         dim (int): The number of channels in the input tensor.
     """
 
-    def __init__(self, dim):
+    def __init__(self, dim, spatial_parallel: bool = False):
         super().__init__()
         self.dim = dim
+        self.spatial_parallel = spatial_parallel
 
         # layers
         self.norm = QwenImageRMS_norm(dim)
@@ -345,6 +391,8 @@ class QwenImageAttentionBlock(nn.Module):
         self.proj = nn.Conv2d(dim, dim, 1)
 
     def forward(self, x):
+        if self.spatial_parallel:
+            x = gather_height_for_global_op(x).contiguous()
         identity = x
         batch_size, channels, time, height, width = x.size()
 
@@ -373,7 +421,10 @@ class QwenImageAttentionBlock(nn.Module):
         x = x.view(batch_size, time, channels, height, width)
         x = x.permute(0, 2, 1, 3, 4)
 
-        return x + identity
+        x = x + identity
+        if self.spatial_parallel:
+            x = chunk_height_for_parallel_decode(x)
+        return x
 
 
 class QwenImageMidBlock(nn.Module):
@@ -392,16 +443,24 @@ class QwenImageMidBlock(nn.Module):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         num_layers: int = 1,
+        spatial_parallel: bool = False,
+        causal_conv3d_cls: type[nn.Conv3d] = QwenImageCausalConv3d,
     ):
         super().__init__()
         self.dim = dim
 
         # Create the components
-        resnets = [QwenImageResidualBlock(dim, dim, dropout, non_linearity)]
+        resnets = [
+            QwenImageResidualBlock(dim, dim, dropout, non_linearity, causal_conv3d_cls)
+        ]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(QwenImageAttentionBlock(dim))
-            resnets.append(QwenImageResidualBlock(dim, dim, dropout, non_linearity))
+            attentions.append(QwenImageAttentionBlock(dim, spatial_parallel))
+            resnets.append(
+                QwenImageResidualBlock(
+                    dim, dim, dropout, non_linearity, causal_conv3d_cls
+                )
+            )
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
@@ -449,6 +508,8 @@ class QwenImageEncoder3d(nn.Module):
         input_channels: int = 3,
     ):
         super().__init__()
+        dim_mult = list(dim_mult)
+        temperal_downsample = list(temperal_downsample)
         # dim = config.arch_config.dim
         # z_dim = config.arch_config.z_dim
         # dim_mult = config.arch_config.dim_mult
@@ -574,6 +635,9 @@ class QwenImageUpBlock(nn.Module):
         dropout: float = 0.0,
         upsample_mode: Optional[str] = None,
         non_linearity: str = "silu",
+        conv2d_cls: type[nn.Conv2d] = nn.Conv2d,
+        causal_conv3d_cls: type[nn.Conv3d] = QwenImageCausalConv3d,
+        zero_pad2d_cls: type[nn.Module] = nn.ZeroPad2d,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -585,7 +649,13 @@ class QwenImageUpBlock(nn.Module):
         current_dim = in_dim
         for _ in range(num_res_blocks + 1):
             resnets.append(
-                QwenImageResidualBlock(current_dim, out_dim, dropout, non_linearity)
+                QwenImageResidualBlock(
+                    current_dim,
+                    out_dim,
+                    dropout,
+                    non_linearity,
+                    causal_conv3d_cls,
+                )
             )
             current_dim = out_dim
 
@@ -595,7 +665,15 @@ class QwenImageUpBlock(nn.Module):
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList(
-                [QwenImageResample(out_dim, mode=upsample_mode)]
+                [
+                    QwenImageResample(
+                        out_dim,
+                        mode=upsample_mode,
+                        conv2d_cls=conv2d_cls,
+                        causal_conv3d_cls=causal_conv3d_cls,
+                        zero_pad2d_cls=zero_pad2d_cls,
+                    )
+                ]
             )
 
         self.gradient_checkpointing = False
@@ -652,8 +730,11 @@ class QwenImageDecoder3d(nn.Module):
         dropout=0.0,
         non_linearity: str = "silu",
         input_channels=3,
+        use_parallel_decode: bool = False,
     ):
         super().__init__()
+        dim_mult = list(dim_mult)
+        temperal_upsample = list(temperal_upsample)
         self.dim = dim
         self.z_dim = z_dim
         self.dim_mult = dim_mult
@@ -662,20 +743,44 @@ class QwenImageDecoder3d(nn.Module):
         self.temperal_upsample = temperal_upsample
 
         self.nonlinearity = get_activation(non_linearity)
+        self.use_parallel_decode = use_parallel_decode
+        self.upsample_count = 0
+        self.world_size = 1
+        self.rank = 0
+        if dist.is_initialized() and model_parallel_is_initialized():
+            self.world_size = get_decode_parallel_world_size()
+            self.rank = get_decode_parallel_rank()
+
+        if use_parallel_decode and self.world_size > 1:
+            CausalConv3d = SpatialParallelCausalConv3d
+            Conv2d = SpatialParallelConv2d
+            ZeroPad2d = SpatialParallelZeroPad2d
+            spatial_parallel = True
+        else:
+            CausalConv3d = QwenImageCausalConv3d
+            Conv2d = nn.Conv2d
+            ZeroPad2d = nn.ZeroPad2d
+            spatial_parallel = False
 
         # dimensions
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
         scale = 1.0 / 2 ** (len(dim_mult) - 2)
 
         # init block
-        self.conv_in = QwenImageCausalConv3d(z_dim, dims[0], 3, padding=1)
+        self.conv_in = CausalConv3d(z_dim, dims[0], 3, padding=1)
 
         # middle blocks
         self.mid_block = QwenImageMidBlock(
-            dims[0], dropout, non_linearity, num_layers=1
+            dims[0],
+            dropout,
+            non_linearity,
+            num_layers=1,
+            spatial_parallel=spatial_parallel,
+            causal_conv3d_cls=CausalConv3d,
         )
 
         # upsample blocks
+        self.upsample_count = 0
         self.up_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             # residual (+attention) blocks
@@ -695,8 +800,13 @@ class QwenImageDecoder3d(nn.Module):
                 dropout=dropout,
                 upsample_mode=upsample_mode,
                 non_linearity=non_linearity,
+                conv2d_cls=Conv2d,
+                causal_conv3d_cls=CausalConv3d,
+                zero_pad2d_cls=ZeroPad2d,
             )
             self.up_blocks.append(up_block)
+            if upsample_mode is not None:
+                self.upsample_count += 1
 
             # Update scale for next iteration
             if upsample_mode is not None:
@@ -704,11 +814,17 @@ class QwenImageDecoder3d(nn.Module):
 
         # output blocks
         self.norm_out = QwenImageRMS_norm(out_dim, images=False)
-        self.conv_out = QwenImageCausalConv3d(out_dim, input_channels, 3, padding=1)
+        self.conv_out = CausalConv3d(out_dim, input_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        expected_height = None
+        if self.use_parallel_decode and self.world_size > 1:
+            x, expected_height = split_for_parallel_decode(
+                x, self.upsample_count, self.world_size, self.rank
+            )
+
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -755,6 +871,8 @@ class QwenImageDecoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
+        if self.use_parallel_decode and self.world_size > 1:
+            x = gather_and_trim_height(x, expected_height)
         return x
 
 
@@ -788,7 +906,12 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.temperal_upsample = temperal_downsample[::-1]
         self.input_channels = config.arch_config.input_channels
         self.latents_mean = config.arch_config.latents_mean
+        self.vae_config = config
         self.config = config.arch_config
+        self.use_parallel_decode = config.use_parallel_decode
+        self._spatial_parallel_decode_enabled = (
+            can_install_spatial_shard_parallel_decode(config)
+        )
 
         self.encoder = QwenImageEncoder3d(
             base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
@@ -799,7 +922,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         self.decoder = QwenImageDecoder3d(
             base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout,
-            input_channels=self.input_channels
+            input_channels=self.input_channels,
+            use_parallel_decode=self._spatial_parallel_decode_enabled,
         )
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
@@ -821,7 +945,10 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
         self._cached_conv_counts = {
-            "decoder": sum(isinstance(m, QwenImageCausalConv3d) for m in self.decoder.modules())
+            "decoder": sum(
+                isinstance(m, (QwenImageCausalConv3d, SpatialParallelCausalConv3d))
+                for m in self.decoder.modules()
+            )
             if self.decoder is not None
             else 0,
             "encoder": sum(isinstance(m, QwenImageCausalConv3d) for m in self.encoder.modules())
@@ -829,8 +956,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             else 0,
         }
         cuda_device = get_local_torch_device()
-        # FIXME: hardcode
-        dtype = torch.bfloat16
+        dtype = torch.get_default_dtype()
         latent_channels = config.arch_config.z_dim
 
         self.shift_factor = (
@@ -840,6 +966,8 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)
         )
+
+
 
     def enable_tiling(
         self,
@@ -896,7 +1024,7 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         def _count_conv3d(model):
             count = 0
             for m in model.modules():
-                if isinstance(m, QwenImageCausalConv3d):
+                if isinstance(m, (QwenImageCausalConv3d, SpatialParallelCausalConv3d)):
                     count += 1
             return count
 
@@ -956,30 +1084,61 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
 
         return posterior
 
-    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+    def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
+        return (
+            self._spatial_parallel_decode_enabled
+            and should_run_spatial_shard_parallel_decode(self.vae_config, z)
+        )
+
+    def _decode_with_parallel_dispatch(self, z: torch.Tensor) -> DecoderOutput:
+        if self.use_parallel_decode and has_decode_parallel_world():
+            num_frame = z.shape[2]
+            num_sample_frames = (num_frame - 1) * self.temporal_compression_ratio + 1
+            mode = self.parallel_decode_mode
+
+            if self._should_use_spatial_parallel_decode(z):
+                decoded = self._decode(z)[:, :, :num_sample_frames]
+            elif self._spatial_parallel_decode_enabled:
+                with disable_spatial_parallel_decode():
+                    decoded = self._decode(z)[:, :, :num_sample_frames]
+            elif mode == "patch":
+                decoded = super().parallel_patch_decode(z)[:, :, :num_sample_frames]
+            elif mode == "tiled":
+                decoded = super().parallel_tiled_decode(z)[:, :, :num_sample_frames]
+            else:
+                decoded = self._decode(z)[:, :, :num_sample_frames]
+            return DecoderOutput(sample=decoded)
+
+        return DecoderOutput(sample=self._decode(z))
+
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
 
         if self.use_tiling and (width > tile_latent_min_width or height > tile_latent_min_height):
-            return self.tiled_decode(z, return_dict=return_dict)
+            return self.tiled_decode(z).sample
 
         self.clear_cache()
         x = self.post_quant_conv(z)
         for i in range(num_frame):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(x[:, :, i: i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
             else:
-                out_ = self.decoder(x[:, :, i: i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                out_ = self.decoder(
+                    x[:, :, i : i + 1, :, :],
+                    feat_cache=self._feat_map,
+                    feat_idx=self._conv_idx,
+                )
                 out = torch.cat([out, out_], 2)
-
         out = torch.clamp(out, min=-1.0, max=1.0)
         self.clear_cache()
-        if not return_dict:
-            return (out,)
-
-        return DecoderOutput(sample=out)
+        return out
 
     def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         r"""
@@ -996,27 +1155,44 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
                 returned.
         """
         if self.use_slicing and z.shape[0] > 1:
-            decoded_slices = [self._decode(z_slice).sample for z_slice in z.split(1)]
+            decoded_slices = [
+                self._decode_with_parallel_dispatch(z_slice).sample
+                for z_slice in z.split(1)
+            ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z).sample
+            decoded = self._decode_with_parallel_dispatch(z).sample
 
         return decoded
 
-    def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_v(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
-                y / blend_extent
-            )
+        if blend_extent <= 0:
+            return b
+        weight = (
+            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
+        ).view(1, 1, 1, blend_extent, 1)
+        b[:, :, :, :blend_extent, :] = (
+            a[:, :, :, -blend_extent:, :] * (1 - weight)
+            + b[:, :, :, :blend_extent, :] * weight
+        )
         return b
 
-    def blend_h(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+    def blend_h(
+        self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
+    ) -> torch.Tensor:
         blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
-                x / blend_extent
-            )
+        if blend_extent <= 0:
+            return b
+        weight = (
+            torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent
+        ).view(1, 1, 1, 1, blend_extent)
+        b[:, :, :, :, :blend_extent] = (
+            a[:, :, :, :, -blend_extent:] * (1 - weight)
+            + b[:, :, :, :, :blend_extent] * weight
+        )
         return b
 
     def tiled_encode(self, x: torch.Tensor) -> AutoencoderKLOutput:

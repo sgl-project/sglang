@@ -1,4 +1,4 @@
-"""Utilities for running nightly performance benchmarks with profiling."""
+"""Utilities for running nightly performance benchmarks."""
 
 import json
 import os
@@ -19,16 +19,16 @@ from sglang.test.test_utils import (
 
 
 class NightlyBenchmarkRunner:
-    """Helper class for running nightly performance benchmarks with profiling.
+    """Helper class for running nightly performance benchmarks.
 
     This class encapsulates common patterns used across nightly performance tests,
-    including profile directory management, benchmark command construction,
+    including result directory management, benchmark command construction,
     result parsing, and report generation.
     """
 
     def __init__(
         self,
-        profile_dir: str,
+        result_dir: str,
         test_name: str,
         base_url: str,
         gpu_config: str = None,
@@ -36,12 +36,12 @@ class NightlyBenchmarkRunner:
         """Initialize the benchmark runner.
 
         Args:
-            profile_dir: Directory to store performance profiles
+            result_dir: Directory to store benchmark results
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
             gpu_config: Optional GPU configuration string (e.g., "2-gpu-h100", "8-gpu-b200")
         """
-        self.profile_dir = profile_dir
+        self.result_dir = result_dir
         self.test_name = test_name
         self.base_url = base_url
         self.gpu_config = gpu_config or os.environ.get("GPU_CONFIG", "")
@@ -51,38 +51,32 @@ class NightlyBenchmarkRunner:
         if self.gpu_config:
             header += f" ({self.gpu_config})"
         header += "\n"
-        self.full_report = header + BenchmarkResult.help_str()
+        self.full_report = header
 
-    def setup_profile_directory(self) -> None:
-        """Create the profile directory if it doesn't exist."""
-        os.makedirs(self.profile_dir, exist_ok=True)
+    def setup_result_directory(self) -> None:
+        """Create the result directory if it doesn't exist."""
+        os.makedirs(self.result_dir, exist_ok=True)
 
-    def generate_profile_filename(
-        self, model_path: str, variant: str = ""
-    ) -> Tuple[str, str]:
-        """Generate unique profile filename and path for the model.
+    def generate_result_filename(self, model_path: str, variant: str = "") -> str:
+        """Generate a unique result filename for the model.
 
         Args:
             model_path: Path to the model (e.g., "deepseek-ai/DeepSeek-V3.1")
-            variant: Optional variant suffix (e.g., "basic", "mtp", "nsa")
+            variant: Optional variant suffix (e.g., "basic", "mtp", "dsa")
 
         Returns:
-            Tuple of (profile_path_prefix, json_output_file)
+            Path to the JSON result file
         """
         timestamp = int(time.time())
         model_safe_name = model_path.replace("/", "_")
 
         # Build filename with optional variant
         if variant:
-            profile_filename = f"{model_safe_name}_{variant}_{timestamp}"
             json_filename = f"results_{model_safe_name}_{variant}_{timestamp}.json"
         else:
-            profile_filename = f"{model_safe_name}_{timestamp}"
             json_filename = f"results_{model_safe_name}_{timestamp}.json"
 
-        profile_path_prefix = os.path.join(self.profile_dir, profile_filename)
-
-        return profile_path_prefix, json_filename
+        return os.path.join(self.result_dir, json_filename)
 
     def build_benchmark_command(
         self,
@@ -90,9 +84,9 @@ class NightlyBenchmarkRunner:
         batch_sizes: List[int],
         input_lens: Tuple[int, ...],
         output_lens: Tuple[int, ...],
-        profile_path_prefix: str,
         json_output_file: str,
         extra_args: Optional[List[str]] = None,
+        server_args: Optional[List[str]] = None,
     ) -> List[str]:
         """Build the benchmark command with all required arguments.
 
@@ -101,9 +95,9 @@ class NightlyBenchmarkRunner:
             batch_sizes: List of batch sizes to test
             input_lens: Tuple of input lengths to test
             output_lens: Tuple of output lengths to test
-            profile_path_prefix: Prefix for profile output files
             json_output_file: Path to JSON output file
             extra_args: Optional extra arguments to append to command
+            server_args: Optional server launch arguments to record in metrics
 
         Returns:
             List of command arguments ready for subprocess.run()
@@ -123,10 +117,6 @@ class NightlyBenchmarkRunner:
             "--output-len",
             *[str(x) for x in output_lens],
             "--show-report",
-            "--profile",
-            "--profile-by-stage",
-            "--profile-output-dir",
-            profile_path_prefix,
             f"--pydantic-result-filename={json_output_file}",
             "--no-append-to-github-summary",
             "--trust-remote-code",
@@ -134,6 +124,11 @@ class NightlyBenchmarkRunner:
 
         if extra_args:
             command.extend(extra_args)
+
+        # Record server launch arguments in metrics for tracking configurations
+        if server_args:
+            command.append("--server-args-for-metrics")
+            command.extend(server_args)
 
         return command
 
@@ -192,17 +187,14 @@ class NightlyBenchmarkRunner:
                 f"Loaded {len(benchmark_results)} benchmark results from {json_output_file}"
             )
 
-            # Clean up JSON file
-            os.remove(json_output_file)
+            # Note: JSON files are preserved for metrics collection by CI scripts
+            # They will be collected by scripts/ci/utils/save_metrics.py
 
             return benchmark_results, True
 
         except Exception as e:
             desc = model_description or "model"
             print(f"Error loading benchmark results for {desc}: {e}")
-            # Try to clean up the file anyway
-            if os.path.exists(json_output_file):
-                os.remove(json_output_file)
             return benchmark_results, False
 
     def run_benchmark_for_model(
@@ -214,12 +206,14 @@ class NightlyBenchmarkRunner:
         other_args: Optional[List[str]] = None,
         variant: str = "",
         extra_bench_args: Optional[List[str]] = None,
+        timeout: Optional[int] = None,
+        env: Optional[dict] = None,
     ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
         """Run a complete benchmark for a single model with server management.
 
         This method handles:
         - Server launch and cleanup
-        - Profile filename generation
+        - Result filename generation
         - Benchmark command construction and execution
         - Result loading and parsing
         - Fetching speculative decoding accept length (for MTP/EAGLE)
@@ -232,6 +226,8 @@ class NightlyBenchmarkRunner:
             other_args: Arguments to pass to server launch
             variant: Optional variant suffix (e.g., "basic", "mtp")
             extra_bench_args: Extra arguments for the benchmark command
+            timeout: Optional timeout for server launch (defaults to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
+            env: Environment dict for subprocess
 
         Returns:
             Tuple of (list of BenchmarkResult objects, success_bool, avg_spec_accept_length or None)
@@ -240,19 +236,23 @@ class NightlyBenchmarkRunner:
         avg_spec_accept_length = None
         model_description = f"{model_path}" + (f" ({variant})" if variant else "")
 
-        # Launch server
-        process = popen_launch_server(
-            model=model_path,
-            base_url=self.base_url,
-            other_args=other_args or [],
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        )
-
+        process = None
         try:
-            # Generate filenames
-            profile_path_prefix, json_output_file = self.generate_profile_filename(
-                model_path, variant
+            # Launch server
+            process = popen_launch_server(
+                model=model_path,
+                base_url=self.base_url,
+                other_args=other_args or [],
+                timeout=(
+                    timeout
+                    if timeout is not None
+                    else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+                ),
+                env=env,
             )
+
+            # Generate filenames
+            json_output_file = self.generate_result_filename(model_path, variant)
 
             # Build and run benchmark command
             # Prepare extra args with run_name if variant is specified
@@ -265,9 +265,9 @@ class NightlyBenchmarkRunner:
                 batch_sizes,
                 input_lens,
                 output_lens,
-                profile_path_prefix,
                 json_output_file,
                 extra_args=bench_args,
+                server_args=other_args,
             )
 
             result, cmd_success = self.run_benchmark_command(command, model_description)
@@ -287,7 +287,8 @@ class NightlyBenchmarkRunner:
 
         finally:
             # Always clean up server process
-            kill_process_tree(process.pid)
+            if process is not None:
+                kill_process_tree(process.pid)
 
     def _get_spec_accept_length(self) -> Optional[float]:
         """Query the server for avg_spec_accept_length metric.
@@ -296,7 +297,7 @@ class NightlyBenchmarkRunner:
             The average speculative decoding accept length, or None if not available.
         """
         try:
-            response = requests.get(f"{self.base_url}/get_server_info", timeout=10)
+            response = requests.get(f"{self.base_url}/server_info", timeout=10)
             if response.status_code == 200:
                 server_info = response.json()
                 internal_states = server_info.get("internal_states", [])
@@ -318,7 +319,7 @@ class NightlyBenchmarkRunner:
             results: List of BenchmarkResult objects to add to report
         """
         if results:
-            report_part = generate_markdown_report(self.profile_dir, results, variant)
+            report_part = generate_markdown_report(results, variant)
             self.full_report += report_part + "\n"
 
     def write_final_report(self) -> None:

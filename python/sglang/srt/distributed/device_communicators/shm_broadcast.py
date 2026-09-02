@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/shm_broadcast.py
 
 import logging
@@ -16,12 +18,9 @@ from torch.distributed import ProcessGroup
 from zmq import IPV6  # type: ignore
 from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 
-from sglang.srt.utils import (
-    format_tcp_address,
-    get_local_ip_auto,
-    get_open_port,
-    is_valid_ipv6_address,
-)
+from sglang.srt.environ import envs
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto, get_open_port
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
 SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
@@ -103,7 +102,9 @@ class ShmRingBuffer:
             # we are creating a buffer
             self.is_creator = True
             self.shared_memory = shared_memory.SharedMemory(
-                create=True, size=self.total_bytes_of_buffer
+                create=True,
+                size=self.total_bytes_of_buffer,
+                name=make_shm_name("mq"),
             )
             # initialize the metadata section to 0
             with memoryview(
@@ -211,10 +212,18 @@ class MessageQueue:
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
-            local_subscribe_port = get_open_port()
-            socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
-            logger.debug("Binding to %s", socket_addr)
-            self.local_socket.bind(socket_addr)
+            # Bind atomically to avoid get_open_port()'s check-then-bind race;
+            # search from SGLANG_PORT to keep the existing port range.
+            sglang_port = envs.SGLANG_PORT.get()
+            if sglang_port is not None:
+                local_subscribe_port = self.local_socket.bind_to_random_port(
+                    "tcp://127.0.0.1", min_port=sglang_port, max_port=sglang_port + 8
+                )
+            else:
+                local_subscribe_port = self.local_socket.bind_to_random_port(
+                    "tcp://127.0.0.1"
+                )
+            logger.debug("Bound to tcp://127.0.0.1:%d", local_subscribe_port)
             self.current_idx = 0
 
         else:
@@ -229,9 +238,10 @@ class MessageQueue:
             self.remote_socket = context.socket(XPUB)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
             remote_subscribe_port = get_open_port()
-            if is_valid_ipv6_address(connect_ip):
+            na = NetworkAddress(connect_ip, remote_subscribe_port)
+            if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            address = format_tcp_address(connect_ip, remote_subscribe_port)
+            address = na.to_tcp()
             logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
             self.remote_socket.bind(address)
 
@@ -292,11 +302,10 @@ class MessageQueue:
 
             self.remote_socket = context.socket(SUB)
             self.remote_socket.setsockopt_string(SUBSCRIBE, "")
-            if is_valid_ipv6_address(handle.connect_ip):
+            na = NetworkAddress(handle.connect_ip, handle.remote_subscribe_port)
+            if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            socket_addr = format_tcp_address(
-                handle.connect_ip, handle.remote_subscribe_port
-            )
+            socket_addr = na.to_tcp()
             logger.debug("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
 

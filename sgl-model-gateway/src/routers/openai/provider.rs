@@ -218,6 +218,7 @@ impl ProviderRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, provider_type: &ProviderType) -> &dyn Provider {
         self.providers
             .get(provider_type)
@@ -232,6 +233,7 @@ impl ProviderRegistry {
             .unwrap_or_else(|| Arc::clone(&self.default_provider))
     }
 
+    #[allow(dead_code)]
     pub fn get_for_model(&self, model_name: &str) -> &dyn Provider {
         match ProviderType::from_model_name(model_name) {
             Some(pt) => self.get(&pt),
@@ -239,6 +241,7 @@ impl ProviderRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub fn default_provider(&self) -> &dyn Provider {
         self.default_provider.as_ref()
     }

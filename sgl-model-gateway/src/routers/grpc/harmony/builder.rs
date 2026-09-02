@@ -113,7 +113,7 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
 /// stop tokens, and selection text for worker routing.
-pub struct HarmonyBuilder {
+pub(crate) struct HarmonyBuilder {
     encoding: &'static HarmonyEncoding,
 }
 

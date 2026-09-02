@@ -1,19 +1,43 @@
-import ast
 import json
 import logging
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-from sglang.srt.entrypoints.openai.protocol import Tool
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.function_call.base_format_detector import (
+    BaseFormatDetector,
+    StructuralTag,
+    get_model_structural_tag,
+)
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _glm47_native_structural_tag_available() -> bool:
+    # "glm_4_7" is only registered in newer xgrammar, so the import can succeed
+    # while the model name stays unknown. Probe once and fall back if absent.
+    if get_model_structural_tag is None:
+        return False
+    try:
+        get_model_structural_tag(
+            model="glm_4_7", tools=[], tool_choice="auto", reasoning=False
+        )
+        return True
+    except Exception:
+        return False
 
 
 class StreamState(str, Enum):
@@ -30,6 +54,14 @@ def get_argument_type(
     func_name: str, arg_key: str, defined_tools: List[Tool]
 ) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions.
+
+    Supports complex JSON Schema definitions including:
+    - Direct type field (including type arrays)
+    - anyOf/oneOf: parameter can be any of multiple types
+    - enum: parameter must be one of enum values
+    - allOf: parameter must satisfy all type definitions
+    - properties: inferred as object type
+    - items: inferred as array type
 
     Args:
         func_name: Name of the function/tool
@@ -48,17 +80,11 @@ def get_argument_type(
 
     # Get parameters safely using getattr
     params = getattr(tool.function, "parameters", None)
-    if not isinstance(params, dict):
-        return None
 
-    # Navigate to the type using dict.get() for safe access
-    properties = params.get("properties")
-    if not isinstance(properties, dict):
-        return None
-
-    arg_spec = properties.get(arg_key)
+    arg_spec = get_schema_properties(params).get(arg_key)
     if isinstance(arg_spec, dict):
-        return arg_spec.get("type")
+        # Use the new type inference function for complex JSON Schema support
+        return infer_type_from_json_schema(arg_spec)
 
     return None
 
@@ -117,9 +143,21 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
+    # Strategy 2.5: string-typed values that are not valid JSON (S1/S2 failed) —
+    # strip the wrapping quotes and keep the raw bytes, backslashes included.
+    # Avoids ast.literal_eval so invalid escapes neither warn nor get reinterpreted.
+    if arg_type == "string":
+        if (
+            len(json_value) >= 2
+            and json_value[0] == json_value[-1]
+            and json_value[0] in {'"', "'"}
+        ):
+            return json_value[1:-1], True
+        return json_value, True
+
     # Strategy 3: ast.literal_eval
     try:
-        parsed_value = ast.literal_eval(json_value)
+        parsed_value = safe_literal_eval(json_value)
         return parsed_value, True
     except (ValueError, SyntaxError):
         pass
@@ -243,25 +281,48 @@ class Glm47MoeDetector(BaseFormatDetector):
             tools: List of available tools
 
         Returns:
-            Type string: 'string', 'number', or 'object'
+            Type string: 'string', 'number', 'object', 'array', or 'boolean'
         """
         arg_type = get_argument_type(func_name, key, tools)
         if arg_type:
             return arg_type
 
-        # Auto-detect type from value (best effort)
-        first_chars = (
-            self._current_value.strip()[:10]
-            if self._current_value and self._current_value.strip()
-            else ""
-        )
-        if first_chars:
-            first_char = first_chars[0]
+        # Improved auto-detection type from value (best effort)
+        value_content = self._current_value.strip() if self._current_value else ""
+
+        if not value_content:
+            return "string"
+
+        # Try to parse as valid JSON first
+        try:
+            parsed = json.loads(value_content)
+            if isinstance(parsed, dict):
+                return "object"
+            elif isinstance(parsed, list):
+                return "array"
+            elif isinstance(parsed, bool):
+                return "boolean"
+            elif isinstance(parsed, (int, float)):
+                return "number"
+            # For string values, check if they look like numbers
+            elif isinstance(parsed, str):
+                if parsed.isdigit() or (
+                    parsed.startswith("-") and parsed[1:].isdigit()
+                ):
+                    return "number"
+                return "string"
+        except json.JSONDecodeError:
+            # Not valid JSON, try heuristic detection
+            first_char = value_content[0] if value_content else ""
+
             if first_char.isdigit() or first_char in ["-", "."]:
                 return "number"
             elif first_char in ["{", "["]:
                 return "object"
+            elif first_char in ['"', "'"]:
+                return "string"
 
+        # Default to string (safest fallback)
         return "string"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
@@ -546,8 +607,9 @@ class Glm47MoeDetector(BaseFormatDetector):
             self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
-        elif not self._last_arguments.endswith("}") and not self._sent_empty_object:
-            # Need to close brace
+        elif not self._is_first_param and not self._sent_empty_object:
+            # The streamed outer `{` is only closed here; a trailing "}" in
+            # _last_arguments may belong to a nested object value.
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -726,7 +788,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         arguments = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
-            arg_value = arg_value.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
@@ -749,7 +810,26 @@ class Glm47MoeDetector(BaseFormatDetector):
         return arguments
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return _glm47_native_structural_tag_available()
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        if not self.supports_structural_tag():
+            return None
+        return super().get_structural_tag(
+            tools=tools,
+            tool_choice=tool_choice,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+        )
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError()
+        raise NotImplementedError
+
+    def get_structural_tag_name(self) -> str:
+        return "glm_4_7"

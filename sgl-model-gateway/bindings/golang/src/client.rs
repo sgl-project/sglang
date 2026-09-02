@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use smg::tokenizer::create_tokenizer_from_file;
 use smg::tokenizer::traits::Tokenizer;
-use smg::grpc_client::sglang_scheduler::SglangSchedulerClient;
+use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 use smg::protocols::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
 
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
     };
 
     // Tokenize
-    let token_ids = match tokenizer.encode(&processed_messages.text) {
+    let token_ids = match tokenizer.encode(&processed_messages.text, false) {
         Ok(encoding) => encoding.token_ids().to_vec(),
         Err(e) => {
             set_error_message(error_out, &format!("Failed to tokenize: {}", e));

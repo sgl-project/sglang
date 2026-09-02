@@ -79,6 +79,7 @@ class HarmonyContext(ConversationContext):
         self.num_cached_tokens = 0
         self.num_output_tokens = 0
         self.num_reasoning_tokens = 0
+        self.finish_reason = None
 
     def append_output(self, output) -> None:
         if isinstance(output, dict) and "output_ids" in output:
@@ -97,11 +98,19 @@ class HarmonyContext(ConversationContext):
                     self.num_cached_tokens = meta_info["cached_tokens"]
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
+                self._record_finish_reason(meta_info)
 
         else:
             output_msgs = output
 
         self._messages.extend(output_msgs)
+
+    def _record_finish_reason(self, meta_info: dict) -> None:
+        # Last non-null wins: a builtin-tool continuation turn supersedes the
+        # reason recorded for the turn before it.
+        reason = meta_info.get("finish_reason")
+        if reason is not None:
+            self.finish_reason = reason
 
     @property
     def messages(self) -> list:
@@ -199,16 +208,18 @@ class StreamingHarmonyContext(HarmonyContext):
                 completion_tokens is not None
                 and len(output_token_ids) == completion_tokens
             ):
-                # Case 1: When --stream-output is not set.
+                # Case 1: When --incremental-streaming-output is not set.
                 # The output_ids contains all tokens generated so far.
                 # We only need to process the new tokens.
                 new_token_ids = output_token_ids[self.num_processed_tokens :]
                 self.num_processed_tokens = len(output_token_ids)
             else:
-                # Case 2: When --stream-output is set.
+                # Case 2: When --incremental-streaming-output is set.
                 # The output_ids contains only the new tokens.
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
+
+            self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
                 self.parser.process(token_id)

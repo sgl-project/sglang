@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -281,7 +281,7 @@ impl RouterManager {
         let workers = self.worker_registry.get_by_model(model_id);
 
         // Find the best router ID based on worker capabilities
-        // Priority: grpc-pd > http-pd > grpc-regular > http-regular
+        // Priority: external (OpenAI) > grpc-pd > http-pd > grpc-regular > http-regular
         let best_router_id = workers
             .iter()
             .map(|w| {
@@ -290,6 +290,12 @@ impl RouterManager {
                     WorkerType::Prefill { .. } | WorkerType::Decode
                 );
                 let is_grpc = matches!(w.connection_mode(), ConnectionMode::Grpc { .. });
+                let is_external = matches!(w.metadata().runtime_type, RuntimeType::External);
+
+                if is_external {
+                    // External workers should be routed via OpenAI-compatible router
+                    return (4, &router_ids::HTTP_OPENAI);
+                }
 
                 match (is_grpc, is_pd) {
                     (true, true) => (3, &router_ids::GRPC_PD),

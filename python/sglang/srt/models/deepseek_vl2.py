@@ -157,6 +157,16 @@ class DeepseekVL2MlpProjector(nn.Module):
 
 class DeepseekVL2ForCausalLM(nn.Module):
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        language_config = hf_config.language_config
+        if not language_config.use_mla:
+            return None
+        # The language model is built without a quantization config.
+        return DeepseekV2ForCausalLM.shared_experts_fusion_disable_reason(
+            language_config, None
+        )
+
     def __init__(
         self,
         config: DeepseekVL2Config,
@@ -270,9 +280,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         for item in items:
             assert item.feature.dim() == 4
             image_feature = self.vision.forward_features(
-                item.feature.type(next(self.vision.parameters()).dtype).to(
-                    device=next(self.vision.parameters()).device
-                )
+                item.feature.type(next(self.vision.parameters()).dtype)
             )
             images_embeds = self.projector(image_feature)
             _, hw, n_dim = images_embeds.shape

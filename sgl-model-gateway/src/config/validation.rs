@@ -1,10 +1,10 @@
 use super::*;
 
 /// Configuration validator
-pub struct ConfigValidator;
+pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
-    pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -309,6 +309,22 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_check_interval_secs".to_string(),
                 value: config.worker_startup_check_interval_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if config.connect_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "connect_timeout_secs".to_string(),
+                value: config.connect_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if config.tcp_keepalive_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tcp_keepalive_secs".to_string(),
+                value: config.tcp_keepalive_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
         }

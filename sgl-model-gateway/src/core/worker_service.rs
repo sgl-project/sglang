@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    core::{worker_to_info, Job, JobQueue, WorkerId, WorkerRegistry},
+    core::{worker::worker_to_info, worker_registry::WorkerId, Job, JobQueue, WorkerRegistry},
     protocols::worker_spec::{
         WorkerConfigRequest, WorkerErrorResponse, WorkerInfo, WorkerUpdateRequest,
     },

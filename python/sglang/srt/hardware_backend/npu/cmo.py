@@ -1,6 +1,7 @@
 import torch
 
 cmo_stream = None
+share_stream = None
 
 
 def get_cmo_stream():
@@ -52,3 +53,31 @@ def wait_cmo_stream():
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
+
+
+def get_share_stream():
+    global share_stream
+    return share_stream
+
+
+def set_share_stream(stream):
+    global share_stream
+    share_stream = stream
+
+
+def wait_share_stream():
+    stream = get_share_stream()
+    if stream is not None:
+        cur_stream = torch.npu.current_stream()
+        cur_stream.wait_stream(stream)
+
+
+def shared_expert_on_independent_stream(hidden_states, forward_func):
+    stream = get_share_stream()
+    if stream is None:
+        stream = torch.npu.Stream()
+        set_share_stream(stream)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        shared_output = forward_func(hidden_states)
+        return shared_output

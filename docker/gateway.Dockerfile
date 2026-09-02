@@ -16,9 +16,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 
 # install dependencies
-RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt update -y \
+RUN apt update -y \
     && apt install -y curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean

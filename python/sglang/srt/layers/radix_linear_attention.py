@@ -1,0 +1,232 @@
+# Copyright 2025-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Radix linear attention."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Tuple, Union
+
+import torch
+from torch import nn
+
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
+from sglang.srt.utils.custom_op import register_custom_op
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class RadixLinearAttention(nn.Module):
+    """
+    The Linear Attention Layer Implementation.
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_q_dim: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        # GDN KDA Shared Weights
+        conv_weights: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        bias: Optional[Union[torch.Tensor, Tuple[torch.Tensor, ...]]] = None,
+        activation: str = "silu",
+        A_log: Optional[torch.Tensor] = None,
+        dt_bias: Optional[torch.Tensor] = None,
+        lower_bound: Optional[float] = None,
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.num_q_heads = num_q_heads
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_q_dim = head_q_dim
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.q_dim = num_q_heads * head_q_dim
+        self.k_dim = num_k_heads * head_k_dim
+        self.v_dim = num_v_heads * head_v_dim
+
+        self.conv_weights = conv_weights
+        self.bias = bias
+        self.activation = activation
+
+        self.A_log = A_log
+        self.dt_bias = dt_bias
+        self.lower_bound = lower_bound
+
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        is_extend = forward_batch.forward_mode.is_extend()
+        if is_extend and get_tc_piecewise_forward_context() is not None:
+            # Output shape from linear attention: (1, seq_len, num_v_heads, head_v_dim)
+            seq_len = mixed_qkv.shape[0]
+            output = torch.empty(
+                (1, seq_len, self.num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+            if is_in_breakable_cuda_graph():
+                bcg_unified_linear_attention_with_output(
+                    mixed_qkv,
+                    a,
+                    b,
+                    output,
+                    self.layer_id,
+                )
+            else:
+                unified_linear_attention_with_output(
+                    mixed_qkv,
+                    a,
+                    b,
+                    output,
+                    self.layer_id,
+                )
+            return output
+
+        # Target verify rebuilds query_start_loc from the physical padded input,
+        # unlike ordinary extend where it retains the logical sequence ends.
+        should_trim_padded_extend = (
+            is_extend and not forward_batch.forward_mode.is_target_verify()
+        )
+        real_num_tokens = (
+            getattr(forward_batch, "num_token_non_padded_cpu", None)
+            if should_trim_padded_extend
+            else None
+        )
+        if real_num_tokens is not None and real_num_tokens < mixed_qkv.shape[0]:
+            # DP synchronization may append physical rows beyond the logical varlen
+            # layout; compute its real prefix, then restore the downstream shape.
+            output = torch.empty(
+                (1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
+            _linear_attention_with_output_impl(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                output=output,
+                attention_layer=self,
+                forward_batch=forward_batch,
+            )
+            return output
+
+        return get_attn_backend().forward(
+            layer=self,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
+
+
+def _linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    attention_layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+) -> None:
+    """Run linear attention on the real prefix and initialize physical padding."""
+    real_num_tokens = min(forward_batch.num_token_non_padded_cpu, mixed_qkv.shape[0])
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    logical_output = output[:, :real_num_tokens]
+    try:
+        ret = get_attn_backend().forward(
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv[:real_num_tokens],
+            a=a[:real_num_tokens],
+            b=b[:real_num_tokens],
+            linear_attn_output=logical_output,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    # FlashInfer GDN can write directly into the physical output's logical
+    # prefix. Other backends return their own tensor and keep the copy fallback.
+    if ret.data_ptr() != logical_output.data_ptr():
+        logical_output.copy_(ret)
+    # Physical padding participates in following residual, router, expert/MoE,
+    # and collective operations. Keep those inputs finite and deterministic.
+    output[:, real_num_tokens:].zero_()
+
+
+def _unified_linear_attention_with_output_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Eager implementation kept separate for backend-independent tests."""
+    context = get_tc_piecewise_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+    _linear_attention_with_output_impl(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        attention_layer=attention_layer,
+        forward_batch=forward_batch,
+    )
+    return
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def unified_linear_attention_with_output(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Custom op wrapper for linear attention computation only."""
+    _unified_linear_attention_with_output_impl(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        output=output,
+        layer_id=layer_id,
+    )
+
+
+bcg_unified_linear_attention_with_output = eager_on_graph(True)(
+    unified_linear_attention_with_output
+)
