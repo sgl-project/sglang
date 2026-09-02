@@ -252,6 +252,40 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+
+    # The vendored Triton tile-64 kernel is written against Hopper and
+    # Blackwell block-sparse geometry; older architectures fail closed.
+    supported_capabilities = {(9, 0), (10, 0), (10, 3)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
+                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
+                f"this device reports {found}."
+            )
+        try:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
+                VideoSparseAttentionH3Backend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3.VideoSparseAttentionH3Backend"
+        except Exception as e:
+            logger.error("Failed to import VSA-H3 attention backend: %s", str(e))
+            raise ImportError(
+                "VSA-H3 attention needs Triton and the in-tree tile-64 "
+                "block-sparse kernel."
+            ) from e
+
+
 class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
 
@@ -435,6 +469,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
+        _VideoSparseAttentionH3BackendResolver,
         _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
