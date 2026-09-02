@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    mount_flux2_nvfp4_swiglu_quant,
     mount_fused_gate_rmsnorm,
     mount_fused_linear_gelu,
     mount_fused_ln_modulate,
@@ -30,6 +31,7 @@ from sglang.kernels.ops.diffusion import (
     mount_nvfp4_bias_gelu,
     mount_qwen_image_added_qkv,
     mount_sana_video_linear_attention,
+    unmount_flux2_nvfp4_swiglu_quant,
     unmount_fused_gate_rmsnorm,
     unmount_fused_linear_gelu,
     unmount_fused_ln_modulate,
@@ -47,6 +49,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
@@ -165,6 +170,11 @@ logger = init_logger(__name__)
 _QUALITY_FUSION_HANDLERS: tuple[
     tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
 ] = (
+    (
+        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
+        mount_flux2_nvfp4_swiglu_quant,
+        unmount_flux2_nvfp4_swiglu_quant,
+    ),
     (
         "fused linear+GELU (cublasLt epilogue)",
         mount_fused_linear_gelu,
@@ -319,7 +329,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides: dict[str, Any] = {}
         # Overrides key the mounted hooks were built from; None when unmounted.
         self._cache_dit_active_key: tuple | None = None
-        # Whether request-scoped quality="high" fusions are currently mounted.
+        # Whether request-scoped extra-high-or-higher fusions are mounted.
         self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
@@ -659,17 +669,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return stage_backend
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
-        """Mount/unmount the ``quality="high"`` fusions for this batch.
+        """Mount/unmount request-gated kernel fusions for this batch.
 
         These fusions are numerically equivalent only at half-precision
-        rounding level (not bit-exact), so they are mounted for
-        ``quality="high"`` requests and unmounted otherwise. The
-        ``"lossless"`` default runs the reference path bit-for-bit. ``quality``
-        participates in the dynamic-batch signature, making this transition
-        safe at the batch boundary. Mounting is all-or-nothing per transformer
-        and fusion family; models without marked sites are no-ops.
+        rounding level (not bit-exact), so they are mounted for both
+        ``quality="extra-high"`` and ``quality="high"``. The ``"lossless"``
+        default runs the reference path bit-for-bit. ``quality`` participates
+        in the dynamic-batch signature, making this transition safe at the
+        batch boundary. Mounting is all-or-nothing per transformer and fusion
+        family; models without marked sites are no-ops.
         """
-        want = getattr(batch.sampling_params, "quality", "lossless") == "high"
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        want = quality_allows_kernel_fusions(quality)
         if want == self._quality_fusions_mounted:
             return
         mounted_fusions: set[str] = set()
@@ -687,7 +698,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     unmount(transformer)
             descriptions = ", ".join(sorted(mounted_fusions))
             raise ValueError(
-                "quality='high' cannot be used with breakable CUDA graphs for "
+                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
                 f"this model because its request-scoped DiT fusions "
                 f"({descriptions}) do not match the lossless warmup graphs. "
                 "Disable breakable CUDA graphs or use quality='lossless'."
@@ -695,7 +706,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._quality_fusions_mounted = want
         for description in sorted(mounted_fusions):
-            logger.info("Mounted %s for quality=high", description)
+            logger.info("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
