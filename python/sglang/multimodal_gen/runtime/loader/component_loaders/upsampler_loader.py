@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
 
@@ -197,7 +198,6 @@ def _load_explicit_config(
 class UpsamplerLoader(PlainStateDictComponentLoader):
     component_names = ["spatial_upsampler"]
     expected_library = "diffusers"
-    supports_component_weight_override = True
 
     def load_customized(
         self,
@@ -226,12 +226,15 @@ class UpsamplerLoader(PlainStateDictComponentLoader):
             component_name
         )
         target_device = self.target_device(component_starts_on_cpu)
+        dtype = resolve_component_precision(server_args, component_name)
+        if dtype is None:
+            dtype = torch.bfloat16
 
         with torch.device("meta"):
             model = LatentUpsampler(**config)
 
         model.load_state_dict(state_dict, assign=True)
-        model = model.to(device=target_device, dtype=torch.bfloat16).eval()
+        model = model.to(device=target_device, dtype=dtype).eval()
 
         logger.info("Loaded LatentUpsampler to %s", target_device)
         return model

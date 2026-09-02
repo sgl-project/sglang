@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
@@ -172,7 +173,6 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
         get_dp_global_num_tokens,
         get_is_extend_in_batch,
     )
-    from sglang.srt.runtime_context import get_parallel
 
     if get_is_extend_in_batch():
         return 0
