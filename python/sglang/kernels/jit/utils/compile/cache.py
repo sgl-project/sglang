@@ -304,7 +304,9 @@ def cache_root() -> pathlib.Path:
 
 
 def build_key_dir(*, module_name: str, build_key: str) -> pathlib.Path:
-    return cache_root() / _target_tag() / module_name / f"{_BUILD_KEY_PREFIX}{build_key}"
+    return (
+        cache_root() / _target_tag() / module_name / f"{_BUILD_KEY_PREFIX}{build_key}"
+    )
 
 
 # ---------------------------------------------------------------------------
