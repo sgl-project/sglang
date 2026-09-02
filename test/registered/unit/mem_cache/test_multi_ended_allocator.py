@@ -24,6 +24,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
+import contextlib
 import random
 import unittest
 
@@ -41,6 +42,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MLASubPoolSpec,
     UnifiedKVPool,
 )
+from sglang.srt.runtime_context import get_parallel
 
 _DEV = "cpu"
 
@@ -3297,6 +3299,200 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         _, sa, fla, _, _ = self._build_tri()
         with self.assertRaises(AssertionError):
             fla.bind_peer(sa)
+
+
+class TestDcpWidening(unittest.TestCase):
+    """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while
+    the pool keeps storing one row per `dcp_size` logical ids."""
+
+    @contextlib.contextmanager
+    def _dcp(self, dcp_size, dcp_rank=0):
+        """The width comes from the parallel context, not a constructor
+        argument, so one scope has to hold construction and every read."""
+        with get_parallel().override(
+            dcp_enabled=dcp_size > 1,
+            attn_dcp_size=dcp_size,
+            attn_dcp_rank=dcp_rank,
+        ):
+            yield
+
+    def _build_pair(self, *, page_size, n_full_slots=64):
+        """(full, mamba) as the composite wires them: only full shards."""
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        pool = UnifiedKVPool(
+            total_bytes=full.entry_bytes() * n_full_slots + mamba.entry_bytes() * 16,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        alloc = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("full")),
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+            page_size=page_size,
+            shards_under_dcp=True,
+        )
+        # The peer stays slot-granular: mamba state is replicated, not sharded.
+        mamba = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("mamba")),
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        alloc.bind_peer(mamba)
+        return alloc, mamba
+
+    def _build(self, *, page_size, n_full_slots=64):
+        return self._build_pair(page_size=page_size, n_full_slots=n_full_slots)[0]
+
+    def test_replicated_peer_stays_slot_granular_under_dcp(self):
+        """BUG REGRESSION. Widening every sub-allocator off the process DCP
+        width, rather than only the sharding one, makes the Mamba page size
+        dcp_size; state is allocated one slot per request, so the first request
+        fails the page-multiple check."""
+        with self._dcp(4):
+            _, mamba = self._build_pair(page_size=2)
+            self.assertEqual(mamba.page_size, 1)
+            self.assertEqual(mamba.page_size, mamba.pool_page_size)
+            self.assertIsNotNone(mamba.alloc(1))
+
+    def test_capacity_scales_but_physical_pages_do_not(self):
+        for page_size in (1, 8):
+            with self._dcp(1):
+                base = self._build(page_size=page_size)
+                base_pages = base.num_pages
+                base_page_bytes = base.entry_bytes_per_page
+                base_avail = base.available_size()
+            for dcp_size in (2, 4):
+                with self._dcp(dcp_size):
+                    a = self._build(page_size=page_size)
+                    self.assertEqual(a.page_size, page_size * dcp_size)
+                    self.assertEqual(a.pool_page_size, page_size)
+                    # Same rows, same bytes per page; only the id space grows.
+                    self.assertEqual(a.num_pages, base_pages)
+                    self.assertEqual(a.entry_bytes_per_page, base_page_bytes)
+                    self.assertEqual(a.available_size(), base_avail * dcp_size)
+
+    def test_alloc_returns_whole_widened_pages(self):
+        with self._dcp(2, 1):
+            a = self._build(page_size=4)
+            ids = a.alloc(3 * 8)  # 3 widened pages of 4*2 ids
+            self.assertIsNotNone(ids)
+            pages = ids.view(3, 8)
+            self.assertTrue(
+                torch.equal(pages[:, 1:] - pages[:, :-1], torch.ones(3, 7).long())
+            )
+            self.assertTrue(bool((pages[:, 0] % 8 == 0).all()))
+            # Freeing the widened ids releases exactly the pages they came from.
+            before = a.available_size()
+            a.free(ids)
+            self.assertEqual(a.available_size(), before + 3 * 8)
+
+    def test_every_rank_maps_a_widened_page_to_one_physical_page(self):
+        """The DCP ranks must agree on the physical page a widened page uses;
+        only the row WITHIN it differs, by `(loc % dcp) -> loc // dcp`."""
+        dcp_size = 4
+        with self._dcp(dcp_size):
+            allocs = [self._build(page_size=2) for _ in range(dcp_size)]
+            ids = [a.alloc(2 * dcp_size * 2) for a in allocs]
+            for i in ids:
+                self.assertIsNotNone(i)
+            # Same allocation order -> same widened ids on every rank.
+            for i in ids[1:]:
+                self.assertTrue(torch.equal(i, ids[0]))
+        for rank, (a, i) in enumerate(zip(allocs, ids)):
+            with self._dcp(dcp_size, rank):
+                owned = (i % dcp_size) == rank
+                self.assertEqual(int(owned.sum()), i.numel() // dcp_size)
+                phys = a.translate_kv_loc(i[owned] // dcp_size)
+                # Collapsed ids land inside this rank's physical rows,
+                # contiguously within each page, never on the reserved sink.
+                self.assertTrue(bool((phys > 0).all()))
+                self.assertTrue(bool((phys < a.max_slots).all()))
+                self.assertEqual(len(set(phys.tolist())), phys.numel())
+
+    def test_write_translate_tombstones_unowned_ids(self):
+        dcp_size = 2
+        for rank in range(dcp_size):
+            with self._dcp(dcp_size, rank):
+                a = self._build(page_size=2)
+                ids = a.alloc(2 * dcp_size * 3)
+                written = a.translate_write_loc_for_kernel(ids)
+                owned = (ids % dcp_size) == rank
+                # Owned ids agree with the read translate of the collapsed id...
+                self.assertTrue(
+                    torch.equal(
+                        written[owned],
+                        a.translate_kv_loc_for_kernel(ids[owned] // dcp_size),
+                    )
+                )
+                # ...and the rest go to the sink the write kernels skip.
+                self.assertTrue(bool((written[~owned] == 0).all()))
+                self.assertTrue(bool((written[owned] > 0).all()))
+
+    def _build_composite(self, *, page_size):
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        full_spec = _make_mha_spec("full", "up", layer_num=2)
+        mamba_spec = _make_mamba_spec("mamba", "down", layer_num=2)
+        pool = UnifiedKVPool(
+            total_bytes=16 * page_size * full_spec.entry_bytes()
+            + 8 * mamba_spec.entry_bytes(),
+            sub_pool_specs=[full_spec, mamba_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=page_size,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        mamba_kv._copy_from_physical = lambda src, dst: None
+
+        class _FakeHybridLinearKVPool:
+            full_kv_pool = full_kv
+            mamba_pool = mamba_kv
+
+        return UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_FakeHybridLinearKVPool(),
+            device=_DEV,
+            page_size=page_size,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+    def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
+        """The planner charges `mamba_slot_full_token_cost()` against a budget
+        fed by `available_size()`. Both are bytes/entry_bytes conversions, so
+        both carry `dcp_size`; if only the budget widens, every Mamba state is
+        under-reserved by that factor and a batch is admitted whose later
+        allocations cross the shared byte frontier."""
+        for page_size in (1, 8):
+            with self._dcp(1):
+                base = self._build_composite(page_size=page_size)
+                base_cost = base.mamba_slot_full_token_cost()
+                base_avail = base.available_size()
+                self.assertGreater(base_cost, 0)
+            for dcp_size in (2, 4):
+                with self._dcp(dcp_size):
+                    a = self._build_composite(page_size=page_size)
+                    self.assertEqual(a.available_size(), base_avail * dcp_size)
+                    mamba_bytes = a.mamba_allocator.entry_bytes_per_page
+                    full_entry = a.full_attn_allocator.entry_bytes
+                    cost = a.mamba_slot_full_token_cost()
+                    # A widened token is `full_entry / dcp_size` bytes, so the
+                    # reservation covers the slot...
+                    self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
+                    # ...and stays tight (rounds up by less than one token).
+                    self.assertLess((cost - 1) * full_entry, mamba_bytes * dcp_size)
+                    # The un-scaled cost -- the bug -- would not have covered it.
+                    self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
 
 
 if __name__ == "__main__":
