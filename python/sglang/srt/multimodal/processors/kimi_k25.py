@@ -10,6 +10,7 @@ from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.managers.schedule_batch import (
+    Modality,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
@@ -23,6 +24,7 @@ from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
+from sglang.srt.utils.common import load_video
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -373,6 +375,7 @@ class KimiGPUProcessorWrapper:
         self._fixed_output_tokens = fixed_output_tokens
         self._image_mean = image_mean
         self._image_std = image_std
+        self._media_proc_cfg = hf_processor.media_processor.media_proc_cfg
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
@@ -386,11 +389,131 @@ class KimiGPUProcessorWrapper:
     def __call__(self, text=None, images=None, **kwargs):
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
+        videos = kwargs.pop("videos", None)
         original_input_ids = kwargs.pop("sglang_original_input_ids", None)
 
+        if videos:
+            return self._video_call(text, images, videos)
         if images and torch.cuda.is_available():
             return self._gpu_call(text, images, original_input_ids)
         return self._cpu_call(text, images, original_input_ids, **kwargs)
+
+    @staticmethod
+    def _format_timestamp(seconds: float, mode: str) -> str:
+        total_ms = max(0, round(seconds * 1000))
+        hours, rem_ms = divmod(total_ms, 3_600_000)
+        minutes, rem_ms = divmod(rem_ms, 60_000)
+        secs, millis = divmod(rem_ms, 1000)
+        if mode == "hh:mm:ss.fff":
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+        if mode == "mm:ss.fff":
+            total_minutes = hours * 60 + minutes
+            return f"{total_minutes:02d}:{secs:02d}.{millis:03d}"
+        if mode == "mm:ss":
+            total_minutes = hours * 60 + minutes
+            return f"{total_minutes:02d}:{secs:02d}"
+        raise ValueError(f"Unsupported Kimi video timestamp mode: {mode}")
+
+    def _decode_video_chunks(self, video):
+        total_frames = len(video)
+        if total_frames <= 0:
+            raise ValueError("Kimi video input contains no frames")
+        source_fps = float(video.avg_fps)
+        if source_fps <= 0:
+            raise ValueError(f"Kimi video input has invalid fps: {source_fps}")
+
+        sample_fps = min(float(self._media_proc_cfg["sample_fps"]), source_fps)
+        sampled_nframes = max(round(total_frames * sample_fps / source_fps), 1)
+        max_frames = self._media_proc_cfg.get("max_num_frames_each_video")
+        if max_frames is not None:
+            sampled_nframes = min(sampled_nframes, int(max_frames))
+        frame_indices = (
+            np.linspace(0, total_frames - 1, sampled_nframes).round().astype(int)
+        )
+        sampled_frames = video.get_frames_at(frame_indices.tolist())
+
+        chunk_size = int(self._media_proc_cfg["temporal_merge_kernel_size"])
+        timestamp_mode = self._media_proc_cfg["timestamp_mode"]
+        chunks = []
+        prompts = []
+        for start in range(0, sampled_nframes, chunk_size):
+            frames = [
+                Image.fromarray(frame.astype("uint8"))
+                for frame in sampled_frames[start : start + chunk_size]
+            ]
+            chunks.append({"type": "video_chunk", "video_chunk": frames})
+            timestamp = self._format_timestamp(
+                float(frame_indices[start]) / source_fps, timestamp_mode
+            )
+            prompts.append(
+                self._hf_processor.media_processor.make_chunk_prompt(timestamp)
+            )
+        return chunks, "".join(prompts)
+
+    def _video_call(self, text, images, videos):
+        """Use Kimi's native temporal chunks with SGLang's decoded videos."""
+        if isinstance(text, (list, tuple)) and text and isinstance(text[0], int):
+            input_text = self.tokenizer.decode(text)
+        elif isinstance(text, torch.Tensor):
+            input_text = self.tokenizer.decode(text.flatten().tolist())
+        else:
+            input_text = text[0] if isinstance(text, list) else text
+
+        image_tag = "<|media_begin|>image<|media_content|><|media_pad|><|media_end|>"
+        video_placeholder = self._hf_processor.video_placeholder
+        decoded_videos = [self._decode_video_chunks(video) for video in videos]
+
+        image_iter = iter(images or [])
+        video_iter = iter(decoded_videos)
+        ordered_medias = []
+        expanded_parts = []
+        cursor = 0
+        visual_pattern = re.compile(
+            f"({re.escape(image_tag)}|{re.escape(video_placeholder)})"
+        )
+        for match in visual_pattern.finditer(input_text):
+            expanded_parts.append(input_text[cursor : match.start()])
+            marker = match.group(0)
+            if marker == image_tag:
+                image = next(image_iter)
+                ordered_medias.append({"type": "image", "image": image})
+                expanded_parts.append(marker)
+            else:
+                chunks, prompt = next(video_iter)
+                ordered_medias.extend(chunks)
+                expanded_parts.append(prompt)
+            cursor = match.end()
+        expanded_parts.append(input_text[cursor:])
+        expanded_text = "".join(expanded_parts)
+
+        try:
+            next(image_iter)
+            raise ValueError("Kimi image data has no matching prompt placeholder")
+        except StopIteration:
+            pass
+        try:
+            next(video_iter)
+            raise ValueError("Kimi video data has no matching prompt placeholder")
+        except StopIteration:
+            pass
+
+        vision_inputs = self.media_processor.preprocess(
+            ordered_medias, return_tensors="pt"
+        )
+        text_inputs = self.tokenizer(expanded_text, return_tensors="pt")
+        grid_thws = vision_inputs["grid_thws"]
+        chunk_token_counts = [
+            (int(grid[-2]) * int(grid[-1])) // (self._merge_kernel_size**2)
+            for grid in grid_thws
+        ]
+        text_inputs["input_ids"] = _expand_image_token_ids(
+            text_inputs["input_ids"], self._image_token_id, chunk_token_counts
+        )
+        out = {**text_inputs, **vision_inputs}
+        grid_thws = out.pop("grid_thws", None)
+        if grid_thws is not None:
+            out["image_grid_thw"] = grid_thws
+        return out
 
     def _prepare_input_ids(self, input_text, resize_configs, original_input_ids):
         if original_input_ids is not None:
@@ -518,12 +641,36 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
 
+    @classmethod
+    def _load_single_item(
+        cls,
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate=None,
+        discard_alpha_channel=True,
+    ):
+        # Kimi's CPU vision preprocessor consumes PIL frames. Avoid enabling
+        # torchcodec's optional CUDA decoder only to transfer them back to CPU.
+        if modality == Modality.VIDEO:
+            return load_video(data, use_gpu=False)
+        return super()._load_single_item(
+            data,
+            modality,
+            frame_count_limit,
+            audio_sample_rate,
+            discard_alpha_channel,
+        )
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
             image_token="<|media_pad|>",
+            video_token="<|kimi_k25_video_placeholder|>",
             # TODO: could we convert in MultimodalSpecialTokens?
             image_token_id=hf_config.media_placeholder_token_id,
+            video_token_id=hf_config.media_placeholder_token_id,
             image_token_regex=re.compile(r"(?:<\|media_pad\|>)+"),
+            video_token_regex=re.compile(r"<\|kimi_k25_video_placeholder\|>"),
         ).build(_processor)
 
         media_proc_cfg = _processor.media_processor.media_proc_cfg
@@ -552,6 +699,24 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        video_data = getattr(request_obj, "video_data", None) or []
+        if video_data:
+            base_output = await self.load_mm_data(
+                prompt=input_text,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+            )
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                base_output,
+                self.mm_tokens,
+            )
+            return MultimodalProcessorOutput(
+                input_ids=input_ids.tolist(),
+                mm_items=mm_items,
+                im_token_id=self.mm_tokens.image_token_id,
+            )
+
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(
             input_text, self.mm_tokens.image_token_id
