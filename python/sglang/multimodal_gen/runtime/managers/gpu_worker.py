@@ -81,7 +81,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     format_applied_changes,
     format_plan_summary,
     layerwise_host_pin_capacity_bytes,
+    layerwise_mapped_bytes,
     layerwise_pinned_host_bytes,
+    layerwise_streamed_mapped_bytes,
     measured_failed_workload_phase_peaks,
     plan_auto_residency,
     plan_summary_payload,
@@ -101,6 +103,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HOST_COPY_RESERVE_BYTES,
     host_memory_available_bytes,
+    shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseUsageTracker,
@@ -1667,13 +1670,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
         return OutputBatch(output={"status": PLACEMENT_STATUS_ROLLED_BACK})
 
-    def _auto_residency_budget_bytes(self) -> int:
+    def _auto_residency_budget_bytes(self, *, streamed_mapped_bytes: int = 0) -> int:
         # Free VRAM plus this process's reserved allocator pool excludes memory
         # held by unrelated processes while preserving reusable local capacity.
-        free_bytes, _ = torch.get_device_module().mem_get_info()
-        budget_bytes = int(free_bytes) + int(
-            torch.get_device_module().memory_reserved()
-        )
+        reserved_bytes = int(torch.get_device_module().memory_reserved())
+        if current_platform.device_shares_host_memory():
+            # One pool: the driver's free figure is the kernel's MemFree, which
+            # leaves out the page cache -- memory the kernel hands back on
+            # demand, so the plan may spend it -- except the part holding the
+            # layers the current layout streams: evicting those turns every
+            # denoise step into a disk read, so they stay committed.
+            budget_bytes = (
+                shared_pool_available_bytes() + reserved_bytes - streamed_mapped_bytes
+            )
+        else:
+            free_bytes, _ = torch.get_device_module().mem_get_info()
+            budget_bytes = int(free_bytes) + reserved_bytes
         test_cap_gib = envs.SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB
         if test_cap_gib is not None:
             budget_bytes = min(budget_bytes, int(test_cap_gib * GIB_BYTES))
@@ -1689,9 +1701,40 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         host_pin_headroom_bytes: int | None = None,
         request_duration_ns: int = 0,
         latency_upper_bound_ns_by_component: dict[str, int] | None = None,
+        estimated_peak_bytes: int | None = None,
     ) -> list[ResidencyTarget]:
         assert self.pipeline is not None
         modules = self._auto_residency_modules()
+        mapped_stream_cost_multiplier = 0
+        if current_platform.device_shares_host_memory():
+            # The page cache the request cycle needs is every mapped byte the
+            # layerwise components stream; what the pool can give it is what
+            # is available minus the device growth still ahead of us. Once the
+            # cycle does not fit, streaming a mapped layer costs a disk read
+            # on every pass and is priced as such.
+            device_growth = max(
+                0,
+                (estimated_peak_bytes or 0)
+                - int(torch.get_device_module().memory_allocated()),
+            )
+            cache_capacity = shared_pool_available_bytes() - device_growth
+            mapped_total = layerwise_mapped_bytes(modules)
+            if mapped_total > cache_capacity:
+                from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+                    DISK_MISS_COST_MULTIPLIER,
+                )
+
+                mapped_stream_cost_multiplier = DISK_MISS_COST_MULTIPLIER
+            logger.info(
+                "Shared pool: layerwise components map %.1f GiB, the page cache "
+                "can hold %.1f GiB (%.1f GiB available, %.1f GiB of device growth "
+                "ahead); mapped streaming is priced at %dx.",
+                mapped_total / GIB_BYTES,
+                cache_capacity / GIB_BYTES,
+                (cache_capacity + device_growth) / GIB_BYTES,
+                device_growth / GIB_BYTES,
+                mapped_stream_cost_multiplier,
+            )
         local_worker_count = max(
             1, self.server_args.num_gpus // self.server_args.nnodes
         )
@@ -1727,6 +1770,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             host_pin_headroom_bytes=host_pin_headroom_bytes,
             request_duration_ns=request_duration_ns,
             latency_upper_bound_ns_by_component=(latency_upper_bound_ns_by_component),
+            shared_memory_pool=current_platform.device_shares_host_memory(),
+            mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
         )
 
     def _build_pre_warmup_auto_residency_report(
@@ -1742,7 +1787,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 skip_reason="pipeline not initialized",
             )
 
-        budget_bytes = self._auto_residency_budget_bytes()
+        budget_bytes = self._auto_residency_budget_bytes(
+            streamed_mapped_bytes=layerwise_streamed_mapped_bytes(
+                self._auto_residency_modules()
+            )
+        )
         all_candidates = self._collect_auto_residency_targets(
             workload,
             # static weights cannot score pin placement; keep the current layout
@@ -1791,6 +1840,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         return RankResidencyReport(
             rank=self.rank,
             budget_bytes=budget_bytes,
+            host_shares_device_pool=current_platform.device_shares_host_memory(),
             estimated_peak_bytes=max(phase_peaks.values()),
             estimated_peak_bytes_by_phase=phase_peaks,
             active_components_by_phase=phase_active,
@@ -1979,7 +2029,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 or component_name in repeated_components
                 else component_stage_duration_ns or estimated_request_duration_ns
             )
-        budget_bytes = self._auto_residency_budget_bytes()
+        budget_bytes = self._auto_residency_budget_bytes(
+            streamed_mapped_bytes=layerwise_streamed_mapped_bytes(modules)
+        )
         local_worker_count = max(
             1, self.server_args.num_gpus // self.server_args.nnodes
         )
@@ -2003,6 +2055,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             candidate_started = time.perf_counter()
             candidates = self._collect_auto_residency_targets(
                 workload,
+                estimated_peak_bytes=estimated_peak_bytes,
                 used_components=(
                     measured_used_components if has_component_use_measurement else None
                 ),
@@ -2102,6 +2155,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             current_active_weight_bytes_by_component=runtime_weights_by_component,
             node_rank=self.server_args.node_rank,
+            host_shares_device_pool=current_platform.device_shares_host_memory(),
             pinned_host_bytes=pinned_host_bytes,
             host_pin_capacity_bytes=host_pin_capacity_bytes,
             host_transition_headroom_bytes=(

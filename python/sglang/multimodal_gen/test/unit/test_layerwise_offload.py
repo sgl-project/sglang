@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers import layerwise_offload
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
 )
@@ -52,6 +53,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+@pytest.fixture(autouse=True)
+def _discrete_host_for_hosting_tests(monkeypatch):
+    # Hosting tests describe a discrete GPU: on a shared host/device pool every
+    # mapped layer stays mapped regardless of the pin budget (see
+    # test_shared_memory_pool), which would invalidate the pin/copy expectations.
+    monkeypatch.setattr(layerwise_offload, "host_copies_are_redundant", lambda: False)
 
 
 class _UsageTrackedVAE(torch.nn.Module, LayerwiseOffloadableModuleMixin):

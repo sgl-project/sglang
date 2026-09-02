@@ -1,8 +1,13 @@
 import bisect
+import ctypes
+import ctypes.util
 import gc
 import math
+import mmap
+import os
 import queue
 import re
+import sys
 import threading
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
@@ -23,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
     describe_host_memory,
+    host_copies_are_redundant,
     host_copies_would_not_fit,
     host_memory_available_bytes,
     module_weight_bytes,
@@ -262,6 +268,175 @@ def _install_host_gather_hooks(
     module.register_forward_hook(_output_to_device)
 
 
+_MADV_WILLNEED = 3
+_libc = None
+if sys.platform == "linux":
+    try:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    except OSError:
+        _libc = None
+_PAGE = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+
+
+_WILLNEED_MIN_AVAILABLE = 4 << 30  # bytes of MemAvailable required to advise
+
+
+def _willneed_headroom_ok(need_bytes: int) -> bool:
+    """Advised pages need somewhere to land, or the advice backfires.
+
+    Field-measured on a 32 GB host with MemAvailable at 0.29 GiB: pages read
+    ahead were evicted before the courier reached them, so every byte was
+    read twice and effective throughput fell to 0.67x of the unadvised run
+    (0.85 vs 1.27 GB/s). Only advise when the kernel has real headroom to
+    keep the window resident until it is consumed.
+    """
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    return available >= max(_WILLNEED_MIN_AVAILABLE, 2 * need_bytes)
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def advise_willneed(tensors) -> int:
+    """Ask the kernel to read these mapped tensors' pages ahead, in bulk.
+
+    The default readahead pipeline feeds the drive in read_ahead_kb-sized
+    beats (128 KB), which holds a fast NVMe to a quarter of its sequential
+    throughput on a host too small to cache the checkpoint. MADV_WILLNEED
+    schedules the whole range at once, so the disk read for the next layer
+    runs at drive speed while the current layer computes. Best-effort and
+    Linux-only: on any failure the normal fault path still works — and on a
+    host with no free headroom the advice is withheld entirely, because a
+    window that cannot stay resident until consumed is read twice.
+    """
+    if _libc is None:
+        return 0
+    tensors = list(tensors)
+    need = 0
+    for tensor in tensors:
+        try:
+            need += tensor.untyped_storage().nbytes()
+        except Exception:
+            continue
+    if need == 0 or not _willneed_headroom_ok(need):
+        return 0
+    advised = 0
+    for tensor in tensors:
+        try:
+            storage = tensor.untyped_storage()
+            ptr = storage.data_ptr()
+            nbytes = storage.nbytes()
+        except Exception:
+            continue
+        if ptr == 0 or nbytes == 0:
+            continue
+        start = ptr & ~(_PAGE - 1)
+        length = (ptr + nbytes) - start
+        length = (length + _PAGE - 1) & ~(_PAGE - 1)
+        if (
+            _libc.madvise(
+                ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_WILLNEED
+            )
+            == 0
+        ):
+            advised += 1
+    return advised
+
+
+_MADV_COLD = 20  # Linux 5.4+: deactivate the pages; reclaimed first under pressure
+_MADV_PAGEOUT = 21  # Linux 5.4+: reclaim the pages now
+
+
+_MADV_POPULATE_READ = 22  # Linux 5.14+: fault the range in, in one sequential pass
+
+
+def populate_mapped_source(tensors) -> int:
+    """Fault a layer's mapped pages in before a parallel copy reads them.
+
+    A multi-threaded memcpy over an uncached mapping faults from many offsets
+    at once, which the kernel's readahead heuristics read as random access:
+    the drive is then fed 4 KiB at a time and a 1.1 GiB/s NVMe delivers a
+    fifth of that (a 125 s first denoise step on a GB10). One synchronous
+    MADV_POPULATE_READ per tensor keeps the read sequential and full-speed;
+    on an older kernel it fails with EINVAL and the WILLNEED path remains.
+    """
+    if _libc is None:
+        return 0
+    populated = 0
+    for tensor in tensors:
+        try:
+            ptr = tensor.data_ptr()
+            nbytes = tensor.numel() * tensor.element_size()
+        except Exception:
+            continue
+        if ptr == 0 or nbytes == 0:
+            continue
+        start = ptr & ~(_PAGE - 1)
+        length = (ptr + nbytes) - start
+        length = (length + _PAGE - 1) & ~(_PAGE - 1)
+        if (
+            _libc.madvise(
+                ctypes.c_void_p(start), ctypes.c_size_t(length), _MADV_POPULATE_READ
+            )
+            == 0
+        ):
+            populated += 1
+        else:
+            advise_willneed([tensor])
+    return populated
+
+
+def _advise_mapped_source_cold(tensor: torch.Tensor, *, reclaim: bool = False) -> None:
+    """Tell the kernel a mapped tensor's file pages are cold once a copy holds them.
+
+    MADV_COLD deactivates the pages without dropping them: under pressure the
+    kernel reclaims them ahead of anything hot, and otherwise keeps them. A
+    just-copied 45 GiB encoder otherwise looks like the hottest data on the
+    box and the kernel swaps idle anonymous memory instead -- measured on a
+    GB10 as 15 GiB of swap traffic and a wedged host.
+
+    ``reclaim`` asks for MADV_PAGEOUT instead: the pages go now. That is for
+    a permanent materialization on a shared pool, where the device grows by
+    the same bytes the source pages hold and the driver satisfies device
+    allocations from free memory without waiting for cache reclaim -- a 57 GiB
+    DiT copied with MemFree near zero ended in NVRM out-of-memory twice.
+    """
+    if not sys.platform.startswith("linux") or tensor.device.type != "cpu":
+        return
+    if _libc is None:
+        return
+    page = mmap.PAGESIZE
+    start = tensor.data_ptr()
+    end = start + tensor.numel() * tensor.element_size()
+    start -= start % page
+    if end <= start:
+        return
+    _libc.madvise(
+        ctypes.c_void_p(start),
+        ctypes.c_size_t(end - start),
+        _MADV_PAGEOUT if reclaim else _MADV_COLD,
+    )
+
+
+def _shared_pool_hosting(
+    totals: Dict[int, int], mapped: Dict[int, int]
+) -> Dict[int, str]:
+    """Hosting when host and device draw from one pool.
+
+    A mapped layer stays mapped: the device reads page-cache pages directly, so
+    a pinned or pageable copy would hold the same bytes twice. Only a layer with
+    no mapping at all -- an anonymous fused weight -- keeps a pageable copy.
+    """
+    return {
+        layer_idx: "mapped" if mapped.get(layer_idx, 0) > 0 else "pageable"
+        for layer_idx in totals
+    }
+
+
 class MappedLayerCourier:
     """Ships a mapped layer's weights to the device off the compute thread.
 
@@ -288,10 +463,18 @@ class MappedLayerCourier:
         weight_metadata: Dict[int, Dict[str, Dict[str, Any]]],
         device: torch.device,
         pin_slots: bool,
+        cold_source: Optional[Callable[[int], bool]] = None,
+        populate_source: Optional[Callable[[int], bool]] = None,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
         self._weight_metadata = weight_metadata
         self._device = device
+        # Whether a layer's file pages may go cold once its copy is staged:
+        # true for resident layers, never for layers re-read every step.
+        self._cold_source = cold_source
+        # Whether to fault the layer in sequentially before the staging copy:
+        # true on a request's first pass over the layers, when pages may be cold.
+        self._populate_source = populate_source
         slot_bytes = max(
             (
                 sum(t.numel() * t.element_size() for t in weights.values())
@@ -376,6 +559,8 @@ class MappedLayerCourier:
             previous.synchronize()
         tensors: Dict[str, torch.Tensor] = {}
         offset = 0
+        if self._populate_source is not None and self._populate_source(layer_idx):
+            populate_mapped_source(self._mapped_cpu_weights[layer_idx].values())
         with torch.inference_mode(False), torch.no_grad():
             staged = []
             for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
@@ -387,6 +572,8 @@ class MappedLayerCourier:
                     start : start + cpu_tensor.numel()
                 ].view(cpu_tensor.shape)
                 window.copy_(cpu_tensor)
+                if self._cold_source is not None and self._cold_source(layer_idx):
+                    _advise_mapped_source_cold(cpu_tensor, reclaim=True)
                 offset += cpu_tensor.numel() * width
                 staged.append((name, window))
             event = torch.get_device_module().Event()
@@ -473,6 +660,12 @@ class LayerwiseOffloadManager:
         # Armed on the first denoise forward, so that the load-time prefetch below
         # does not pin the whole resident set before the DiT is the active component.
         self._residency_active = False
+        # True while load_all_layers materializes every layer for a resident
+        # placement; every mapped source is then read exactly once.
+        self._materializing_all = False
+        # True from a request's start until its last layer has run once: the
+        # pass in which a mapped layer's pages may not be in the page cache.
+        self._first_pass = True
         # True once _initialize builds the CPU buffers; unlike `enabled` it
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
@@ -683,6 +876,19 @@ class LayerwiseOffloadManager:
         buys a whole layer's worth of per-step overlap.
         """
         totals, mapped = self._layer_byte_totals(layer_groups)
+        if host_copies_are_redundant():
+            hosting = _shared_pool_hosting(totals, mapped)
+            logger.info(
+                "Layerwise offload: %s keeps %d of %d layers on the checkpoint "
+                "mapping (host and device share one memory pool, so a pinned or "
+                "pageable copy would hold the same bytes twice); %d layers "
+                "without a mapping stay pageable.",
+                self._pin_component_name,
+                sum(1 for where in hosting.values() if where == "mapped"),
+                len(totals),
+                sum(1 for where in hosting.values() if where == "pageable"),
+            )
+            return hosting
         pinned_bytes = 0
         hosting: Dict[int, str] = {}
         pin_order: List[int] = []
@@ -1030,6 +1236,38 @@ class LayerwiseOffloadManager:
             if layer_idx not in retain:
                 self.release_layer(layer_idx)
 
+    def advise_mapped_pages_cold(self) -> None:
+        """Mark every mapped layer's file pages cold at the end of this stage.
+
+        With host and device in one pool the page cache cannot always hold the
+        whole request cycle (encoder, DiT, VAE). LRU then evicts, at each phase
+        boundary, exactly the pages the next phase needs -- a cyclic scan just
+        larger than the cache misses everywhere. Deactivating a component's
+        pages once its stage is over tells the kernel which pages to give up
+        first, so the phase that follows evicts what was just used instead of
+        what it is about to use. Measured on a GB10: ~100 GiB re-read per
+        request without this, ~30 GiB with it.
+        """
+        for weights in self._mapped_cpu_weights.values():
+            for tensor in weights.values():
+                _advise_mapped_source_cold(tensor)
+
+    def _mapped_source_may_be_cold(self, layer_idx: int) -> bool:
+        """Whether this copy is the first read of the layer in this request."""
+        return self._first_pass or self._materializing_all
+
+    def _mapped_source_is_cold(self, layer_idx: int) -> bool:
+        """Whether a mapped layer's file pages may go once its device copy lands.
+
+        Only while every layer is being materialized for a permanent resident
+        placement: those pages are not read again until a demotion. A
+        stage-scoped resident set is re-armed from the same pages on the next
+        request, and a streamed layer is re-read every step; marking either
+        cold made the kernel evict exactly what the next request needed
+        (measured on a GB10 as a 60 s first denoise step re-reading 23 GiB).
+        """
+        return self._materializing_all
+
     @torch.compiler.disable
     def _activate_residency(self) -> None:
         """Arm the resident set on the first denoise forward. The pinning itself is
@@ -1095,6 +1333,24 @@ class LayerwiseOffloadManager:
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
+                if not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED:
+                    # Schedule the disk read for this layer's pages now, in
+                    # one bulk request, so it overlaps the previous layer's
+                    # compute instead of trickling in at fault-time beats.
+                    advise_willneed(self._mapped_cpu_weights[layer_idx].values())
+                    if self._first_pass:
+                        # On the pass that may find pages cold, keep the drive
+                        # busy two layers ahead: with one layer in flight the
+                        # disk idles while that layer is staged and computed,
+                        # and a 1 GiB/s drive delivered a third of that.
+                        for ahead in self._next_streamed(after=layer_idx, count=2):
+                            if (
+                                ahead not in self._gpu_layers
+                                and ahead not in self._courier_inflight
+                            ):
+                                advise_willneed(
+                                    self._mapped_cpu_weights.get(ahead, {}).values()
+                                )
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
@@ -1124,10 +1380,16 @@ class LayerwiseOffloadManager:
                     # on the compute thread rather than ahead of it, and a page
                     # the kernel has reclaimed is faulted back in here.
                     cpu_tensor = self._mapped_cpu_weights[layer_idx][name]
+                    if not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED:
+                        # A blocking read on this thread: fault the range in
+                        # sequentially so a cold cache fills at drive speed.
+                        populate_mapped_source([cpu_tensor])
                     gpu_tensor = torch.empty(
                         meta["shape"], dtype=meta["dtype"], device=self.device
                     )
                     gpu_tensor.copy_(cpu_tensor, non_blocking=False)
+                    if self._mapped_source_is_cold(layer_idx):
+                        _advise_mapped_source_cold(cpu_tensor, reclaim=True)
                     target.data = self._wrap_for_target(target, gpu_tensor)
                     continue
 
@@ -1181,6 +1443,8 @@ class LayerwiseOffloadManager:
                 weight_metadata=self._weight_metadata,
                 device=self.device,
                 pin_slots=current_platform.is_cuda(),
+                cold_source=self._mapped_source_is_cold,
+                populate_source=self._mapped_source_may_be_cold,
             )
             logger.info(
                 "Layerwise offload: %s ships mapped layers through a courier "
@@ -1276,6 +1540,9 @@ class LayerwiseOffloadManager:
 
         for layer_idx in list(self._gpu_layers):
             self.release_layer(layer_idx, force=True)
+        # The next use starts a new request; its first pass over the layers may
+        # find their pages evicted and is the one worth faulting in sequentially.
+        self._first_pass = True
 
     @torch.compiler.disable
     def load_all_layers(self) -> None:
@@ -1285,17 +1552,21 @@ class LayerwiseOffloadManager:
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
-        for layer_idx in range(self.num_layers):
-            if layer_idx not in self._gpu_layers:
-                # Anonymous host stores can fill the copy stream without a
-                # per-layer host wait. Checkpoint mappings still use the
-                # synchronous path: the mapped courier has a bounded slot ring
-                # intended to overlap one forward, not materialize a whole
-                # model at once.
-                self.prefetch_layer(
-                    layer_idx,
-                    non_blocking=not bool(self._mapped_cpu_weights.get(layer_idx)),
-                )
+        self._materializing_all = True
+        try:
+            for layer_idx in range(self.num_layers):
+                if layer_idx not in self._gpu_layers:
+                    # Anonymous host stores can fill the copy stream without a
+                    # per-layer host wait. Checkpoint mappings still use the
+                    # synchronous path: the mapped courier has a bounded slot
+                    # ring intended to overlap one forward, not materialize a
+                    # whole model at once.
+                    self.prefetch_layer(
+                        layer_idx,
+                        non_blocking=not bool(self._mapped_cpu_weights.get(layer_idx)),
+                    )
+        finally:
+            self._materializing_all = False
         if self.copy_stream is not None:
             torch.get_device_module().current_stream().wait_stream(self.copy_stream)
 
@@ -1490,10 +1761,11 @@ class LayerwiseOffloadManager:
         total = 0
         for layer_meta in self._weight_metadata.values():
             for meta in layer_meta.values():
-                if meta.get("preserve_strides", False):
+                # Consolidated stores record their slice; strided and mapped
+                # weights only carry a shape.
+                numel = meta.get("numel")
+                if numel is None:
                     numel = math.prod(meta["shape"])
-                else:
-                    numel = meta["numel"]
                 total += int(numel) * meta["dtype"].itemsize
         return total
 
@@ -1513,6 +1785,21 @@ class LayerwiseOffloadManager:
                 tensor.numel() * tensor.element_size() for tensor in tensors.values()
             )
         return totals
+
+    def mapped_layer_bytes(self) -> dict[int, int]:
+        """Per layer, the bytes served straight from the checkpoint mapping.
+
+        Those bytes are page cache while the layer streams: not allocated by
+        this process, but memory the kernel must keep for the stream to run at
+        memory speed rather than disk speed.
+        """
+        return {
+            layer_idx: sum(
+                tensor.numel() * tensor.element_size() for tensor in weights.values()
+            )
+            for layer_idx, weights in self._mapped_cpu_weights.items()
+            if weights
+        }
 
     def layer_host_store_bytes(self) -> dict[int, int]:
         """Physical anonymous host-store bytes booked for each managed layer."""
@@ -1809,6 +2096,8 @@ class LayerwiseOffloadManager:
     def finish_layer_forward(self, layer_idx: int) -> None:
         """Release a streamed layer after its forward completes."""
         self._last_forwarded_layer = layer_idx
+        if layer_idx == self.num_layers - 1:
+            self._first_pass = False
         self.release_layer(layer_idx)
 
     def register_forward_hooks(self) -> None:

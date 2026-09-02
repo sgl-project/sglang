@@ -21,6 +21,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -106,13 +107,36 @@ def _cgroup_dirs(mount: str) -> list[str]:
     return dirs
 
 
-def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
+# memory.stat keys for the page cache a cgroup is charged for: v2, then v1.
+_CGROUP_FILE_CACHE_KEYS = ("file", "cache")
+
+
+def _cgroup_file_cache_bytes(directory: str) -> int:
+    try:
+        with open(os.path.join(directory, "memory.stat")) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                if key in _CGROUP_FILE_CACHE_KEYS:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def cgroup_memory_limit_bytes(
+    *, exclude_file_cache: bool = False
+) -> tuple[int, int] | None:
     """This process's (cap, usage) under its cgroup, or None when uncapped.
 
     The tightest cap in the chain wins. A nested cgroup -- a systemd scope with
     MemoryMax, a container started with --cgroup-parent -- holds this process
     below whatever the mount root allows, and planning against the root would
     commit memory the process cannot have.
+
+    A cgroup is charged for the page cache it touches, so its usage grows by
+    the whole checkpoint the process maps. ``exclude_file_cache`` reports the
+    anonymous share alone, for callers that may spend cache the kernel would
+    reclaim under the cap anyway.
     """
     for mount, limit_name, usage_name in _CGROUP_MOUNTS:
         tightest = None
@@ -122,7 +146,10 @@ def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
                 continue
             if tightest is not None and limit >= tightest[0]:
                 continue
-            tightest = (limit, _read_int(os.path.join(directory, usage_name)) or 0)
+            usage = _read_int(os.path.join(directory, usage_name)) or 0
+            if exclude_file_cache:
+                usage = max(0, usage - _cgroup_file_cache_bytes(directory))
+            tightest = (limit, usage)
         if tightest is not None:
             return tightest
     return None
@@ -156,6 +183,33 @@ def host_memory_available_bytes() -> int:
         return available
     limit, usage = capped
     return min(available, max(0, limit - usage))
+
+
+def shared_pool_available_bytes() -> int:
+    """Bytes a shared host/device pool can still give this process.
+
+    The device's own free figure is the kernel's MemFree, which leaves out the
+    page cache -- memory the kernel hands back on demand and a placement may
+    therefore spend. A cgroup cap is honoured on its anonymous share only, for
+    the same reason: the cache charged to the cgroup is reclaimed under the cap.
+    """
+    available = int(psutil.virtual_memory().available)
+    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
+    if capped is None:
+        return available
+    limit, anonymous = capped
+    return min(available, max(0, limit - anonymous))
+
+
+def host_copies_are_redundant() -> bool:
+    """Whether a host copy of a mapped weight buys nothing.
+
+    When host and device share one physical pool the device reads page-cache
+    pages directly, so a pinned or pageable copy holds the same bytes twice and
+    adds only pressure. The mapping is then the right home for every weight
+    that has one, whatever the free-memory reading says.
+    """
+    return current_platform.device_shares_host_memory()
 
 
 def host_copies_would_not_fit(weight_bytes: int) -> bool:
@@ -221,6 +275,10 @@ class HostPinBudget:
     def for_local_worker(cls, local_worker_count: int) -> "HostPinBudget":
         """Give one worker a non-overlapping share of the node allowance."""
         worker_count = max(1, local_worker_count)
+        if host_copies_are_redundant():
+            # Nothing to pin for: the copy would duplicate page-cache bytes,
+            # and the mapped courier already overlaps its transfers.
+            return cls(available_bytes=0, reserve_bytes=0)
         node_available = host_memory_available_bytes()
         node_spendable = max(0, node_available - host_pin_reserve_bytes(node_available))
         return cls(
