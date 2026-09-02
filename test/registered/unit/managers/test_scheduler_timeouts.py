@@ -86,6 +86,17 @@ class TestWaitingTimeout(CustomTestCase):
         self.assertEqual(len(s.waiting_queue), 1)
         s.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
+    def test_external_cache_state_is_released_for_timed_out_request(self):
+        stale = _req("stale", wait_entry=time.perf_counter() - 10)
+        s = _scheduler([stale])
+        s.enable_async_cache_io = True
+        s.tree_cache = MagicMock()
+
+        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(1.0):
+            s._abort_on_waiting_timeout()
+
+        s.tree_cache.release_aborted_request.assert_called_once_with("stale")
+
     def test_disabled_timeout_is_a_no_op(self):
         s = _scheduler([_req("stale", wait_entry=time.perf_counter() - 100)])
         with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0):

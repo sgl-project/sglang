@@ -5,12 +5,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
     create_tree_cache,
+    create_unified_radix_cache_without_hicache,
     default_radix_cache_factory,
     get_radix_cache_factory,
     register_radix_cache_backend,
@@ -121,6 +123,24 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
         factory.assert_called_once()
         self.assertIs(result, cache)
+
+    def test_unified_helper_does_not_initialize_hicache(self):
+        ctx = _make_ctx(self, enable_hierarchical_cache=True)
+        ctx.params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(),
+            component_registry_override=None,
+            tree_components=None,
+        )
+        cache = MagicMock(name="unified_cache")
+        with patch(
+            "sglang.srt.mem_cache.unified_radix_cache.UnifiedRadixCache",
+            return_value=cache,
+        ) as cache_cls:
+            result = create_unified_radix_cache_without_hicache(ctx)
+
+        self.assertIs(result, cache)
+        cache_cls.assert_called_once_with(ctx.params)
+        cache.init_hicache.assert_not_called()
 
     def test_unknown_backend_raises(self):
         with self.assertRaises(ValueError):

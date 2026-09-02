@@ -361,6 +361,71 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+def _build_plain_kv_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
+    """Expose a standard MHA K/V pool without allocating mirror buffers."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # Specialized subclasses add scale buffers, VMM ownership, page-major
+    # layouts, or no-op storage.  Exposing only their K/V lists would silently
+    # omit required state, so V1 accepts the canonical pool class exactly.
+    if type(kvcache) is not MHATokenToKVPool:
+        raise ValueError(
+            "The direct external linker V1 plain-KV adapter only supports "
+            f"the standard MHATokenToKVPool, got {type(kvcache).__name__}."
+        )
+    if hasattr(kvcache, "quant_method") and kvcache.is_quantized_kv_cache:
+        raise ValueError(
+            "The direct external linker V1 does not support quantized KV pools."
+        )
+    if getattr(kvcache, "post_capture_active", False):
+        raise ValueError(
+            "The direct external linker V1 does not support post-capture VMM pools."
+        )
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "MHA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+    if len(kvcache.k_buffer) != len(kvcache.v_buffer) or not kvcache.k_buffer:
+        raise ValueError("MHA KV pool must expose one K and V tensor per layer.")
+
+    buffers = [*kvcache.k_buffer, *kvcache.v_buffer]
+    reference = buffers[0]
+    if any(
+        buffer.shape != reference.shape
+        or buffer.stride() != reference.stride()
+        or buffer.dtype != reference.dtype
+        or buffer.device != reference.device
+        or not buffer.is_contiguous()
+        for buffer in buffers
+    ):
+        raise ValueError(
+            "The direct external linker V1 requires homogeneous contiguous K/V tensors."
+        )
+
+    total_slots = kvcache.size + page_size
+    first_rows = reference.shape[0]
+    if first_rows * page_size == total_slots:
+        rows_are_pages = True
+    elif first_rows == total_slots:
+        rows_are_pages = False
+    else:
+        raise ValueError(
+            "MHA KV tensor rows do not match the token-pool page geometry."
+        )
+    identity = {layer: layer for layer in range(kvcache.layer_num)}
+    entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=[kvcache.k_buffer, kvcache.v_buffer],
+        layer_mapping=identity,
+        page_size=page_size,
+        rows_are_pages=rows_are_pages,
+    )
+    return DevicePoolGroup([entry], kvcache.layer_num, page_size)
+
+
 def resolve_hybrid_device_pool_group(
     *,
     kvcache: Any,

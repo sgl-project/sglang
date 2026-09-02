@@ -335,6 +335,9 @@ def build_kv_cache(
             tp_size=ps.tp_size,
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
+            dp_rank=ps.dp_rank,
+            attn_dp_rank=ps.attn_dp_rank,
+            attn_cp_rank=ps.attn_cp_rank,
         )
     )
 

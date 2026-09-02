@@ -1,10 +1,12 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams, InsertResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -16,8 +18,14 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LinkerCancelOutcome,
+    PendingExternalLoad,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -126,6 +134,137 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     assert hit_pages == 2
 
 
+def test_empty_rank_intersection_releases_local_lookup_ticket():
+    cancellations = []
+
+    class _TicketLinker(_FakeLinker):
+        def cancel_request(self, rid):
+            cancellations.append(rid)
+            return LinkerCancelOutcome.LOOKUP_RELEASED
+
+    class _Component:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOOKUP
+            return PoolTransfer(name=PoolName.KV, keys=["hash"])
+
+    linker = _TicketLinker()
+    linker.restorable = [1]
+    cache = _cache_for_wrapper(
+        page_size=2,
+        _components_tuple=(_Component(),),
+        _all_reduce_attn_groups=lambda mask, op: mask.zero_(),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper._tail_hashes = lambda key, result, device_hit_len: ["hash"]
+    result = SimpleNamespace(device_indices=torch.tensor([], dtype=torch.int64))
+
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2])), SimpleNamespace(rid="rid"), result
+    )
+
+    assert matched is result
+    assert cancellations == ["rid"]
+    assert wrapper.hit_markers == {}
+
+
+def test_repeated_match_releases_unconsumed_lookup_ticket():
+    cancellations = []
+
+    class _TicketLinker(_FakeLinker):
+        def cancel_request(self, rid):
+            cancellations.append(rid)
+            return LinkerCancelOutcome.LOOKUP_RELEASED
+
+    cache = _cache_for_wrapper(page_size=2)
+    wrapper = UnifiedCacheLinkerWrapper(cache, _TicketLinker())
+    wrapper.hit_markers["rid"] = object()
+    result = SimpleNamespace(device_indices=torch.tensor([0, 1]))
+
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2])), SimpleNamespace(rid="rid"), result
+    )
+
+    assert matched is result
+    assert cancellations == ["rid"]
+    assert wrapper.hit_markers == {}
+
+
+def test_load_allocation_failure_releases_lookup_ticket():
+    cancellations = []
+
+    class _TicketLinker(_FakeLinker):
+        def cancel_request(self, rid):
+            cancellations.append(rid)
+            return LinkerCancelOutcome.LOOKUP_RELEASED
+
+    class _NoCapacityComponent:
+        def build_external_linker_transfer(self, phase, node, keys):
+            assert phase == LinkerTransferPhase.LOAD
+            return None
+
+    empty = torch.tensor([], dtype=torch.int64)
+    cache = _cache_for_wrapper(
+        page_size=2,
+        tree_core=SimpleNamespace(
+            enable_external_cache_linker=False,
+            empty_match_result=SimpleNamespace(device_indices=empty),
+        ),
+        _components_tuple=(_NoCapacityComponent(),),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _TicketLinker())
+    wrapper.hit_markers["rid"] = SimpleNamespace(
+        prefix_key=RadixKey(array("q", [1, 2])),
+        tail_hashes=["hash"],
+        tail_linker_keys=None,
+        device_hit_len=0,
+    )
+
+    indices, node = wrapper.load_back(SimpleNamespace(rid="rid", last_node=7))
+
+    assert indices is empty
+    assert node == 7
+    assert cancellations == ["rid"]
+    assert wrapper.hit_markers == {}
+
+
+def test_linker_codec_extends_only_the_device_miss_tail():
+    calls = []
+
+    class _Codec:
+        codec_id = "unit-codec"
+
+        def extend_pages(self, *, parent_key, page_tokens, page_size, key_domain):
+            calls.append((parent_key, page_tokens, page_size, key_domain))
+            return [bytes(page) for page in zip(*[iter(page_tokens)] * page_size)]
+
+    linker = _FakeLinker()
+    linker.key_codec = _Codec()
+    tree_core = SimpleNamespace(
+        enable_external_cache_linker=False,
+        set_linker_key_codec=lambda codec: calls.append(("installed", codec)),
+        get_last_linker_key_value=lambda node_id: b"parent",
+    )
+    cache = _cache_for_wrapper(page_size=2, tree_core=tree_core)
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    key = RadixKey(
+        array("q", [1, 2, 3, 4, 5, 6]),
+        extra_key="adapter-a",
+        cache_salt="tenant-a",
+    )
+
+    values = wrapper._tail_linker_keys(
+        key, SimpleNamespace(last_device_node=9), device_hit_len=2
+    )
+
+    assert values == [b"\x03\x04", b"\x05\x06"]
+    parent_key, tokens, page_size, domain = calls[1]
+    assert parent_key == b"parent"
+    assert tokens == [3, 4, 5, 6]
+    assert page_size == 2
+    assert domain.cache_salt == "tenant-a"
+    assert domain.extra_key == "adapter-a"
+
+
 def test_async_offload_pins_node_until_completion():
     class _Component:
         def build_external_linker_transfer(self, phase, node, keys):
@@ -207,12 +346,21 @@ def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
     lock_params = object()
     unlocks = []
+    rollbacks = []
     cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node, params: unlocks.append((node, params))
+        dec_lock_ref=lambda node, params: unlocks.append((node, params)),
+        rollback_external_load=lambda **kwargs: rollbacks.append(kwargs),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
+    wrapper.pending_loads["rid"] = PendingExternalLoad(
+        rid="rid",
+        inserted_node=7,
+        anchor_node=3,
+        adopted_ranges={ComponentType.FULL: [(4, 8)]},
+        allocated_component_slots={PoolName.KV: torch.tensor([10, 11, 12, 13])},
+        lock_params=lock_params,
+    )
     linker.queued_loads["rid"] = [object()]
 
     wrapper.release_request("rid")
@@ -221,6 +369,71 @@ def test_release_request_cancels_queued_load():
     assert wrapper.pending_loads == {}
     assert "rid" not in linker.queued_loads
     assert unlocks == [(7, lock_params)]
+    assert rollbacks[0]["anchor_node"] == 3
+    assert rollbacks[0]["inserted_node"] == 7
+
+
+def test_release_request_retains_submitted_load_until_completion():
+    class _SubmittedLinker(_FakeLinker):
+        def cancel_request(self, rid):
+            assert rid in self.queued_loads
+            return LinkerCancelOutcome.SUBMITTED_LOAD_RETAINED
+
+    linker = _SubmittedLinker()
+    unlocks = []
+    cache = _cache_for_wrapper(
+        inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=lambda: object()),
+        dec_lock_ref=lambda node, params: unlocks.append(node),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper._queue_load("rid", 7, [PoolTransfer(name=PoolName.KV)])
+    wrapper.start_layer_wise_loading()
+
+    wrapper.release_request("rid")
+
+    assert wrapper.pending_loads["rid"].phase == "submitted"
+    assert unlocks == []
+
+    linker.completed_loads.append(["rid"])
+    wrapper.drain_loads(1)
+    assert unlocks == [7]
+
+
+def test_tree_rollback_tombstones_adopted_full_nodes_and_returns_slots():
+    core = UnifiedTreeCore.__new__(UnifiedTreeCore)
+    root = UnifiedTreeNode((ComponentType.FULL,))
+    root.key = RadixKey(array("q"))
+    root.component_data[ComponentType.FULL].value = []
+    anchor = UnifiedTreeNode((ComponentType.FULL,))
+    anchor.key = RadixKey(array("q", [1, 2]))
+    anchor.parent = root
+    anchor.component_data[ComponentType.FULL].value = torch.tensor([1, 2])
+    inserted = UnifiedTreeNode((ComponentType.FULL,))
+    inserted.key = RadixKey(array("q", [3, 4]))
+    inserted.parent = anchor
+    inserted.component_data[ComponentType.FULL].value = torch.tensor([10, 11])
+    inserted.component_data[ComponentType.FULL].lock_ref = 1
+    core.root_node = root
+    core._node_arena = {node.id: node for node in (root, anchor, inserted)}
+    core.component_protected_size_ = {ComponentType.FULL: 2}
+    core.evictable_device_leaves = {inserted}
+    core._update_evictable_leaf_sets = lambda node: None
+    core.kv_events = SimpleNamespace(record_remove=lambda *args, **kwargs: None)
+    lock_params = DecLockRefParams()
+
+    result = core.rollback_external_load(
+        anchor.id,
+        inserted.id,
+        {ComponentType.FULL: [(2, 4)]},
+        lock_params,
+        torch.tensor([10, 11]),
+    )
+
+    assert inserted.component_data[ComponentType.FULL].value is None
+    assert inserted.component_data[ComponentType.FULL].lock_ref == 0
+    assert lock_params.skip_lock_node_ids[ComponentType.FULL] == {inserted.id}
+    assert result.device_frees[ComponentType.FULL][0].tolist() == [10, 11]
+    result.device_frees.clear()
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -352,7 +565,14 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
+    wrapper.pending_loads["rid"] = PendingExternalLoad(
+        rid="rid",
+        inserted_node=7,
+        anchor_node=7,
+        adopted_ranges={},
+        allocated_component_slots={},
+        lock_params=object(),
+    )
 
     wrapper.close()
 
@@ -408,6 +628,7 @@ def test_component_commit_keeps_only_adopted_pages():
     full = PoolTransfer(
         name=PoolName.KV,
         keys=["a", "b", "c", "d"],
+        linker_keys=[b"a", b"b", b"c", b"d"],
         device_indices=torch.tensor([100, 101, 102, 103, 104, 105, 106, 107]),
     )
     canonical_tail = torch.tensor([10, 11, 102, 103, 14, 15, 106, 107])
@@ -435,6 +656,7 @@ def test_component_commit_keeps_only_adopted_pages():
 
     assert filtered == [full, swa]
     assert full.keys == ["b", "d"]
+    assert full.linker_keys == [b"b", b"d"]
     assert full.device_indices.tolist() == [102, 103, 106, 107]
     assert swa.keys == ["b", "d"]
     assert swa.device_indices.tolist() == [202, 203, 206, 207]

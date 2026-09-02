@@ -104,6 +104,9 @@ class PoolTransfer:
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
+    # Backend-owned, stable binary keys for a direct external-cache linker.
+    # ``keys`` remains the SGLang SHA chain used by existing storage backends.
+    linker_keys: Optional[List[bytes]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None

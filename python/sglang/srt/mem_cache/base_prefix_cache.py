@@ -451,6 +451,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def has_external_cache_io(self) -> bool:
+        """Whether this cache drives asynchronous I/O outside its device pool.
+
+        This capability is intentionally independent of HiCache.  Direct cache
+        linkers do not allocate a native host tier, but still need the scheduler
+        to poll completions and start queued loads.
+        """
+        return False
+
+    def has_pending_external_cache_io(self) -> bool:
+        """Whether external cache work must drain before the cache is idle."""
+        return False
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 

@@ -72,6 +72,12 @@ class DecSwaLockOnlyResult(BaseEvictionResult):
     pass
 
 
+class RollbackExternalLoadResult(BaseEvictionResult):
+    """Device slots detached while cancelling a queued external load."""
+
+    pass
+
+
 class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     """Flat (slot, position, prev-slot) rows emitted by the KV-canary walk."""
 
@@ -195,6 +201,21 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def set_linker_key_codec(self, codec) -> None:
+        """Install the active direct-linker page-key codec."""
+        ...
+
+    @abstractmethod
+    def get_last_linker_key_value(self, node_id: NodeId) -> Optional[bytes]:
+        """Return the last linker key on a node, if present."""
+        ...
+
+    @abstractmethod
+    def get_linker_key_values(self, node_id: NodeId) -> list[bytes]:
+        """Return linker keys owned by a node, excluding ancestors."""
         ...
 
     @abstractmethod
@@ -385,6 +406,18 @@ class UnifiedTreeCoreInterface(ABC):
         self, from_node_id: NodeId, until_node_id: NodeId
     ) -> torch.Tensor:
         """Concatenate FULL device values from from_node up to (exclusive) until_node."""
+        ...
+
+    @abstractmethod
+    def rollback_external_load(
+        self,
+        anchor_node_id: NodeId,
+        inserted_node_id: NodeId,
+        adopted_ranges: dict[ComponentType, list[tuple[int, int]]],
+        lock_params: DecLockRefParams,
+        expected_full_slots: Optional[torch.Tensor],
+    ) -> RollbackExternalLoadResult:
+        """Detach ranges adopted by a queued, never-submitted external load."""
         ...
 
     @abstractmethod

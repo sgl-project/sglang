@@ -117,6 +117,7 @@ class TestDevicePoolGroup(CustomTestCase):
         transfer = PoolTransfer(
             name=PoolName.KV,
             keys=["a", "b"],
+            linker_keys=[b"a", b"b"],
             device_indices=torch.tensor([0, 1, 4, 5]),
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
@@ -128,6 +129,8 @@ class TestDevicePoolGroup(CustomTestCase):
         )
         self.assertEqual(resolved[0].host_indices.tolist(), [0, 1, 4, 5])
         self.assertEqual(resolved[1].host_indices.tolist(), [100, 101, 104, 105])
+        self.assertEqual(resolved[0].linker_keys, [b"a", b"b"])
+        self.assertEqual(resolved[1].linker_keys, [b"a", b"b"])
         self.assertTrue(
             all(item.hit_policy == PoolHitPolicy.ALL_PAGES for item in resolved)
         )
@@ -159,6 +162,81 @@ class TestDevicePoolGroup(CustomTestCase):
 
 
 class TestHybridDevicePoolAssembler(CustomTestCase):
+    def test_plain_mha_exposes_original_kv_tensors(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        kvcache = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.size = 6
+        kvcache.layer_num = 2
+        kvcache.k_buffer = [torch.zeros((8, 3)) for _ in range(2)]
+        kvcache.v_buffer = [torch.zeros((8, 3)) for _ in range(2)]
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(),
+            components={ComponentType.FULL},
+        )
+
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+        self.assertEqual(group.num_layers, 2)
+        self.assertEqual(
+            group.entry_map[PoolName.KV].get_hybrid_pool_buffer(),
+            [*kvcache.k_buffer, *kvcache.v_buffer],
+        )
+
+    def test_plain_mha_rejects_specialized_pool_subclasses(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        class SpecializedPool(MHATokenToKVPool):
+            pass
+
+        kvcache = SpecializedPool.__new__(SpecializedPool)
+        with self.assertRaisesRegex(ValueError, "standard MHATokenToKVPool"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(),
+                components={ComponentType.FULL},
+            )
+
+    @staticmethod
+    def _plain_mha_pool():
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        kvcache = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        kvcache.page_size = 2
+        kvcache.size = 6
+        kvcache.layer_num = 1
+        kvcache.k_buffer = [torch.zeros((8, 3))]
+        kvcache.v_buffer = [torch.zeros((8, 3))]
+        return kvcache
+
+    def test_plain_mha_rejects_quantized_pool(self):
+        kvcache = self._plain_mha_pool()
+        kvcache.quant_method = object()
+
+        with self.assertRaisesRegex(ValueError, "quantized KV pools"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(),
+                components={ComponentType.FULL},
+            )
+
+    def test_plain_mha_rejects_post_capture_vmm_pool(self):
+        kvcache = self._plain_mha_pool()
+        kvcache.post_capture_active = True
+
+        with self.assertRaisesRegex(ValueError, "post-capture VMM pools"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=2,
+                params=SimpleNamespace(),
+                components={ComponentType.FULL},
+            )
+
     def test_deepseek_v4_maps_sparse_sidecars(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4LayerItem,

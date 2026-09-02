@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    RollbackExternalLoadResult,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
@@ -817,6 +818,33 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         return self._binding.get_hash_values(node_id)
+
+    def set_linker_key_codec(self, codec) -> None:
+        raise RuntimeError(
+            "Direct linker key sidecars are not supported by the Rust tree core."
+        )
+
+    def get_last_linker_key_value(self, node_id: NodeId) -> Optional[bytes]:
+        raise RuntimeError(
+            "Direct linker key sidecars are not supported by the Rust tree core."
+        )
+
+    def get_linker_key_values(self, node_id: NodeId) -> list[bytes]:
+        raise RuntimeError(
+            "Direct linker key sidecars are not supported by the Rust tree core."
+        )
+
+    def rollback_external_load(
+        self,
+        anchor_node_id: NodeId,
+        inserted_node_id: NodeId,
+        adopted_ranges,
+        lock_params: DecLockRefParams,
+        expected_full_slots: Optional[torch.Tensor],
+    ) -> RollbackExternalLoadResult:
+        raise RuntimeError(
+            "Queued direct-linker rollback is not supported by the Rust tree core."
+        )
 
     def snapshot_buffer_backup(
         self, node_id: NodeId, pass_prefix_keys: bool

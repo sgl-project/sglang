@@ -571,6 +571,15 @@ class StreamingSession(BasePrefixCache):
     def check_hicache_events(self):
         return self.inner.check_hicache_events()
 
+    def has_external_cache_io(self) -> bool:
+        return self.inner.has_external_cache_io()
+
+    def has_pending_external_cache_io(self) -> bool:
+        return self.inner.has_pending_external_cache_io()
+
+    def release_host_resources(self) -> None:
+        self.inner.release_host_resources()
+
     def take_events(self):
         return self.inner.take_events()
 

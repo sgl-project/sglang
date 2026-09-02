@@ -63,6 +63,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LinkerKeyCodec,
+    LinkerKeyDomain,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -75,6 +79,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    RollbackExternalLoadResult,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
@@ -122,6 +127,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        # Stable binary page keys owned by the active direct-cache linker.
+        self.linker_key_values: Optional[list[bytes]] = None
         # Namespace-aware hashes used only for external KV events.
         self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
@@ -400,6 +407,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_hicache = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
+        self.linker_key_codec: Optional[LinkerKeyCodec] = None
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -451,6 +459,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
+        self.root_node.linker_key_values = []
         for ct in self.component_types:
             self.root_node.component_data[ct].lock_ref = 1
 
@@ -520,6 +529,53 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         """The hash values owned by this node, excluding its ancestors."""
         return self.node_by_id(node_id).hash_value or []
+
+    def set_linker_key_codec(self, codec: LinkerKeyCodec) -> None:
+        """Install one active linker codec and populate existing node sidecars."""
+        if self.linker_key_codec is not None and self.linker_key_codec is not codec:
+            raise RuntimeError("A different linker key codec is already installed.")
+        self.linker_key_codec = codec
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node is not self.root_node and node.linker_key_values is None:
+                node.linker_key_values = self._compute_linker_key_values(node)
+            stack.extend(node.children.values())
+
+    def get_last_linker_key_value(self, node_id: NodeId) -> Optional[bytes]:
+        values = self.node_by_id(node_id).linker_key_values
+        return values[-1] if values else None
+
+    def get_linker_key_values(self, node_id: NodeId) -> list[bytes]:
+        values = self.node_by_id(node_id).linker_key_values
+        return list(values) if values is not None else []
+
+    def _compute_linker_key_values(self, node: UnifiedTreeNode) -> list[bytes]:
+        codec = self.linker_key_codec
+        if codec is None:
+            return []
+        assert node.parent is not None and node.key is not None
+        parent_values = node.parent.linker_key_values
+        if parent_values is None:
+            raise RuntimeError("Missing parent linker key sidecar.")
+        values = codec.extend_pages(
+            parent_key=parent_values[-1] if parent_values else None,
+            page_tokens=list(node.key),
+            page_size=self.page_size,
+            key_domain=LinkerKeyDomain(
+                cache_salt=node.key.cache_salt,
+                extra_key=node.key.extra_key,
+            ),
+        )
+        expected = len(node.key) // self.page_size
+        if len(values) != expected or any(
+            not isinstance(value, bytes) for value in values
+        ):
+            raise RuntimeError(
+                f"Linker key codec {codec.codec_id!r} returned {len(values)} "
+                f"keys for {expected} pages."
+            )
+        return values
 
     def snapshot_buffer_backup(
         self, node_id: NodeId, pass_prefix_keys: bool
@@ -894,6 +950,96 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         prefix_chunks.reverse()
         return torch.cat(prefix_chunks)
 
+    def rollback_external_load(
+        self,
+        anchor_node_id: NodeId,
+        inserted_node_id: NodeId,
+        adopted_ranges: dict[ComponentType, list[tuple[int, int]]],
+        lock_params: DecLockRefParams,
+        expected_full_slots: Optional[torch.Tensor],
+    ) -> RollbackExternalLoadResult:
+        """Remove FULL values installed by a queued external load.
+
+        V1 intentionally supports only the homogeneous FULL component.  Each
+        adopted interval must cover complete radix nodes; a partial-node rollback
+        would risk discarding valid KV owned by an earlier request and therefore
+        fails closed.
+        """
+        unsupported = set(adopted_ranges) - {BASE_COMPONENT_TYPE}
+        if unsupported:
+            raise RuntimeError(
+                f"External-load rollback does not support components {unsupported}."
+            )
+
+        anchor = self.node_by_id(anchor_node_id)
+        node = self.node_by_id(inserted_node_id)
+        path = []
+        while node is not anchor:
+            if node is self.root_node:
+                raise RuntimeError("External-load rollback anchor is not an ancestor.")
+            path.append(node)
+            node = node.parent
+        path.reverse()
+
+        anchor_depth = 0
+        node = anchor
+        while node is not self.root_node:
+            anchor_depth += len(node.key)
+            node = node.parent
+
+        ranges = adopted_ranges.get(BASE_COMPONENT_TYPE, [])
+        selected = []
+        cursor = anchor_depth
+        for node in path:
+            end = cursor + len(node.key)
+            overlaps = any(start < end and cursor < stop for start, stop in ranges)
+            if overlaps:
+                covered = any(start <= cursor and end <= stop for start, stop in ranges)
+                if not covered:
+                    raise RuntimeError(
+                        "Queued external load adopted only part of a radix node."
+                    )
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                if value is None:
+                    raise RuntimeError("Queued external-load node is already evicted.")
+                selected.append((node, value))
+            cursor = end
+
+        selected_slots = [value for _, value in selected]
+        actual = (
+            torch.cat(selected_slots)
+            if selected_slots
+            else self._empty_match_result.device_indices
+        )
+        if expected_full_slots is not None and not torch.equal(
+            actual, expected_full_slots.to(actual.device)
+        ):
+            raise RuntimeError(
+                "Queued external-load slot ownership changed before rollback."
+            )
+
+        result = RollbackExternalLoadResult()
+        skipped = lock_params.skip_lock_node_ids.setdefault(BASE_COMPONENT_TYPE, set())
+        for node, value in selected:
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            if cd.lock_ref != 1:
+                raise RuntimeError(
+                    "Queued external-load node is referenced outside its transaction."
+                )
+            # Consume this transaction's path lock here.  The normal dec call
+            # skips these now-tombstoned nodes and releases the remaining path.
+            cd.lock_ref -= 1
+            skipped.add(node.id)
+            self.component_protected_size_[BASE_COMPONENT_TYPE] -= len(value)
+            cd.value = None
+            node.external_cache_stored = False
+            result.device_frees[BASE_COMPONENT_TYPE].append(value)
+            result.tracker[BASE_COMPONENT_TYPE] += len(value)
+            self.evictable_device_leaves.discard(node)
+            self._update_evictable_leaf_sets(node.parent)
+            self.kv_events.record_remove(node, medium=StorageMedium.GPU)
+        return result
+
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
@@ -1183,6 +1329,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        split_pages = split_len // self.page_size
+        if child.linker_key_values is not None:
+            new_node.linker_key_values = child.linker_key_values[:split_pages]
+            child.linker_key_values = child.linker_key_values[split_pages:]
         new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
             child.event_hash_value, split_len, self.page_size
         )
@@ -1232,6 +1382,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+        if self.linker_key_codec is not None:
+            new_node.linker_key_values = self._compute_linker_key_values(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)

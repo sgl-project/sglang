@@ -420,6 +420,7 @@ class Scheduler(
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
+    enable_async_cache_io: bool = False
 
     def __init__(
         self,
@@ -591,6 +592,11 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.enable_async_cache_io = (
+            self.enable_hierarchical_cache
+            or self.tree_cache.has_external_cache_io()
+            or get_memory().enable_flexkv
+        )
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -3100,8 +3106,8 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                if self.enable_async_cache_io:
+                    # Release external lookup/prefetch state for the request.
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
@@ -3131,8 +3137,8 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                if self.enable_async_cache_io:
+                    # Release external lookup/prefetch state for the request.
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(
@@ -3289,7 +3295,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
+        if self.enable_async_cache_io:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -3549,7 +3555,7 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+        if self.enable_async_cache_io:
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
@@ -3723,7 +3729,7 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if self.enable_async_cache_io:
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -3787,7 +3793,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache:
+        if self.enable_async_cache_io:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -4625,6 +4631,9 @@ class Scheduler(
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
 
+            if self.tree_cache.has_external_cache_io():
+                idle &= not self.tree_cache.has_pending_external_cache_io()
+
         return idle
 
     def _pp_microbatches_drained(self) -> bool:
@@ -4996,8 +5005,8 @@ class Scheduler(
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.beam_coordinator.retire_group(req)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
+            if self.enable_async_cache_io:
+                # Release external lookup/prefetch state for the request.
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -5029,7 +5038,7 @@ class Scheduler(
             for req in self.dllm_manager.pop_aborted_reqs(
                 recv_req.abort_all, recv_req.rid
             ):
-                if self.enable_hicache_storage:
+                if self.enable_async_cache_io:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     _make_abort_req(req), req
@@ -5050,7 +5059,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
+                    if self.enable_async_cache_io:
                         self.tree_cache.release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):

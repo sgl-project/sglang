@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_disagg, get_memory, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,9 @@ class TreeCacheBuildContext:
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
     is_dsa: bool = False
+    dp_rank: Optional[int] = None
+    attn_dp_rank: int = 0
+    attn_cp_rank: int = 0
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -149,6 +153,27 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
+    cache = create_unified_radix_cache_without_hicache(ctx)
+    if (
+        ctx.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        cache.init_hicache(server_args, params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+    return cache
+
+
+def create_unified_radix_cache_without_hicache(
+    ctx: TreeCacheBuildContext,
+) -> UnifiedRadixCache:
+    """Build the standard unified radix cache without a native host tier.
+
+    External backends use this helper so component selection remains centralized
+    while HiCache construction is kept an explicit, mutually exclusive step.
+    """
+    params = ctx.params
     if get_disagg().disaggregation_decode_retraction_backup == "host_pool":
         if ctx.is_hybrid_ssm:
             raise ValueError("Host-pool retraction does not support Mamba models.")
@@ -184,16 +209,7 @@ def _create_unified_radix_cache(
         params.component_registry_override = {
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
-    cache = UnifiedRadixCache(params)
-    if (
-        ctx.enable_hierarchical_cache
-        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-    ):
-        cache.init_hicache(server_args, params)
-        ctx.tp_worker.register_hicache_layer_transfer_counter(
-            cache.cache_controller.layer_done_counter
-        )
-    return cache
+    return UnifiedRadixCache(params)
 
 
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:

@@ -350,7 +350,25 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if (
+            getattr(self, "cache_controller", None) is not None
+            or getattr(self, "host_pool_group", None) is not None
+            or getattr(self, "_storage_attachment", None) is not None
+            or getattr(self, "buffer_pipeline", None) is not None
+            or getattr(self, "enable_storage", False)
+        ):
+            raise RuntimeError(
+                "A direct cache linker is mutually exclusive with native HiCache."
+            )
+        if self.linker is not None:
+            raise RuntimeError("A direct cache linker is already attached.")
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
+    def has_external_cache_io(self) -> bool:
+        return self.linker is not None
+
+    def has_pending_external_cache_io(self) -> bool:
+        return self.linker is not None and self.linker.has_pending_io()
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -385,6 +403,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if self.linker is not None:
+            raise RuntimeError(
+                "Native HiCache is mutually exclusive with a direct cache linker."
+            )
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
@@ -797,6 +819,25 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return DecLockRefResult()
         return self.tree_core.dec_lock_ref(node_id, params, skip_swa)
+
+    def rollback_external_load(
+        self,
+        *,
+        anchor_node: NodeId,
+        inserted_node: NodeId,
+        adopted_ranges: dict,
+        allocated_component_slots: dict[PoolName, torch.Tensor],
+        lock_params: DecLockRefParams,
+    ) -> None:
+        """Detach and free slots from a queued direct-linker transaction."""
+        result = self.tree_core.rollback_external_load(
+            anchor_node,
+            inserted_node,
+            adopted_ranges,
+            lock_params,
+            allocated_component_slots.get(PoolName.KV),
+        )
+        self._free_values(result.device_frees, result.host_frees)
 
     def _dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
         """Release the tree lock a request holds on its last_node, honoring the

@@ -19,7 +19,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LinkerCancelOutcome,
+    UnifiedCacheLinker,
+)
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -160,6 +163,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.submitted_load_rids: set[str] = set()
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -236,11 +240,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
 
+    def cancel_request(self, rid: str) -> LinkerCancelOutcome:
+        if self.cancel_queued_load(rid):
+            return LinkerCancelOutcome.QUEUED_LOAD_CANCELLED
+        if rid in self.submitted_load_rids:
+            return LinkerCancelOutcome.SUBMITTED_LOAD_RETAINED
+        return LinkerCancelOutcome.NOT_FOUND
+
+    def has_pending_operations(self) -> bool:
+        return bool(
+            self.pending_loads
+            or self.submitted_load_rids
+            or not self.completed_loads.empty()
+            or not self.offload_results.empty()
+        )
+
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
 
     def pop_completed_load(self) -> list[str]:
-        return self.completed_loads.get_nowait()
+        rids = self.completed_loads.get_nowait()
+        self.submitted_load_rids.difference_update(rids)
+        return rids
 
     def freeze_gc_once(self) -> None:
         if self.gc_frozen:
@@ -256,6 +277,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         pending = self.pending_loads
         self.pending_loads = {}
+        self.submitted_load_rids.update(pending)
 
         counter_index = self.layer_done_counter.update_producer()
         ready_event = device_module.Event()
@@ -403,6 +425,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             except Empty:
                 break
         self.layer_done_counter.reset()
+        self.submitted_load_rids.clear()
 
     def close(self) -> None:
         self.reset()
