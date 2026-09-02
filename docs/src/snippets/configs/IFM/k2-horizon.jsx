@@ -1,8 +1,8 @@
 // Single `export const config` literal — Mintlify re-evaluates this module at
 // hydration time, so keep the cookbook data self-contained.
 //
-// The serving settings in the six base recipes below were benchmarked at
-// runtime commit 70997c0fc6429162bffd4476436c398951eb1647 and the pinned model
+// The serving settings in the six base recipes below were benchmarked with the
+// K2 Horizon runtime support in sgl-project/sglang#37654 and the pinned model
 // revisions. Playground overrides remain separate from the verified commands.
 
 export const config = {
@@ -50,6 +50,33 @@ export const config = {
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
+
+  benchmarkCommands: {
+    speed:
+`python3 -m sglang.benchmark.serving \\
+  --backend sglang \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}} \\
+  --model {{MODEL_NAME}} --served-model-name {{MODEL_NAME}} \\
+  --tokenizer {{MODEL_NAME}} \\
+  --dataset-name {{DATASET}} --tokenize-prompt \\
+  --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --random-range-ratio 1.0 \\
+  --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
+  --request-rate inf --seed 20260901 \\
+  --temperature 0.0 --top-p 1.0 \\
+  --warmup-requests 64 --flush-cache \\
+  --output-file benchmark.raw.jsonl --output-details`,
+    accuracy: {
+      gsm8k_pct:
+`pip install sgl-eval
+sgl-eval run gsm8k \\
+  --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
+  --model {{MODEL_NAME}} \\
+  --num-examples 1319 --num-threads 32 --n-repeats 1 \\
+  --max-tokens 32768 --temperature 0.0 --top-p 0.95 \\
+  --seed 0 --reasoning-effort high --prompt math`,
+    },
+  },
 
   accuracyLabels: [
     ["gsm8k_pct", "GSM8K", "%"],
@@ -122,6 +149,7 @@ export const config = {
 
     parsers: {
       items: [
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser k2_v3" },
         { id: "toolCall", label: "Tool Call Parser", flag: "--tool-call-parser k2_v3" },
       ],
     },

@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Install from a source checkout that includes K2 Horizon support before using the generated commands:
+Install from a source checkout that includes the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654) before using the generated commands:
 
 ```bash Command
 pip install --upgrade pip
@@ -21,9 +21,7 @@ For general source-install guidance, see [Install → Method 2: From source](/do
 
 </Accordion>
 
-The checkpoints remain private during release preparation. Authenticate with Hugging Face before launching them.
-
-Choose a model size to generate its validated single-node H200 launch command. The serving settings in all six base recipes completed two independent H200 benchmark launches at the pinned model revisions against runtime commit `70997c0fc6429162bffd4476436c398951eb1647`.
+Choose a model size to generate its validated single-node H200 launch command. The serving settings in all six base recipes completed two independent H200 benchmark launches at the pinned model revisions using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/IFM/k2-horizon.jsx";
@@ -113,10 +111,11 @@ import { Playground } from "/src/snippets/_playground.jsx";
 - **Attention:** The verified base recipes select FlashAttention-3 with `--attention-backend fa3`.
 - **Revisions:** The recipes pin revisions `9b9ec1f7e17f62ed218df542687a144116219d84` (0.9B), `c177771836a4c460743c00002c22483f6f18d1eb` (3.7B), `69ada542b68fe13d767479db2ab9421baff88681` (7B), `e1fd0277713e4eefcd3416348fd6fedacf7f2392` (32B), `16d20c739c687c08423422d1a2fbba6c529014cd` (36B), and `12812264242a14dce44aa7ae27f931ff4584bcbf` (375B).
 - **Parsers:** The base recipes enable reasoning with `--reasoning-parser k2_v3`. Enable `--tool-call-parser k2_v3` from the **Parsers** card in the [Playground](#playground) when you need tool calling.
+- **36B router provenance:** The 36B checkpoint's source xLLM router used two GEMM partitions. `--json-model-override-args '{"xllm_source_router_gemm_partitions":2}'` preserves its BF16 partial-GEMM rounding and FP32 reduction order; SGLang does not infer this source topology from runtime TP.
 - **375B loading:** The 375B recipe disables multithreaded weight loading with `--model-loader-extra-config '{"enable_multithread_load":false}'`.
 - **Playground features:** TP, EP, NGRAM, PD disaggregation, and HiCache are optional, unverified command overrides. The tool-call parser was functionally exercised separately.
 - **Deliberate omissions:** Context parallelism is unsupported or unvalidated for xLLM. DP-attention and alternate MoE backend selectors are not exposed until they are validated.
-- **Validation:** All six recipes completed native speed and full GSM8K evaluation on H200 at runtime commit `70997c0fc6429162bffd4476436c398951eb1647`.
+- **Validation:** All six recipes completed native speed and full GSM8K evaluation on H200 using the K2 Horizon runtime support in [PR #37654](https://github.com/sgl-project/sglang/pull/37654).
 - **375B provenance:** The 375B benchmark launched a directly mounted checkpoint and passed revision `12812264242a14dce44aa7ae27f931ff4584bcbf` to the server. The other five launches used materialized Hugging Face snapshots at their pinned revisions.
 
 ## 3. Benchmark results
