@@ -1457,7 +1457,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool,
-                    decode_req.req.req_pool_idx,
+                    decode_req.req.kv.req_pool_idx,
                     seq_len,
                 )
 

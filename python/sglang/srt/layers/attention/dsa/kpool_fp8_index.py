@@ -1650,8 +1650,14 @@ def kpool_write_tail_and_maybe_compress(
     assert bn % num_draft_tokens == 0
     bs = bn // num_draft_tokens
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)
+    assert req_pool_indices.shape == (bs,), req_pool_indices.shape
+    assert write_start.shape == (bs,), write_start.shape
+    assert tail_logical_start.shape == (bs,), tail_logical_start.shape
     assert write_loc.shape == (bs, max_closed_pools), write_loc.shape
     assert write_loc.stride(1) == 1, write_loc.stride()
+    assert out_cache_loc.numel() >= bn, (out_cache_loc.shape, bn)
+    if effective_n_per_batch is not None:
+        assert effective_n_per_batch.shape == (bs,), effective_n_per_batch.shape
 
     key = key.contiguous()
     score = score.contiguous()
