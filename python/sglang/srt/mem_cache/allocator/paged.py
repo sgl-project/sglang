@@ -147,46 +147,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def available_size(self):
-        return (
-            len(self.free_pages)
-            + len(self.release_pages)
-            + self.num_pending_release_pages
-        ) * self.page_size
+        return (len(self.free_pages) + self.num_release_pages) * self.page_size
 
     def get_all_free_pages(self):
-        """Materialize all free page ids for debug and invariant checks."""
-        page_tensors = []
-        if len(self.free_pages) > 0:
-            page_tensors.append(self.free_pages)
-        if len(self.release_pages) > 0:
-            page_tensors.append(self.release_pages)
-        page_tensors.extend(self.pending_release_page_chunks)
-
-        if not page_tensors:
-            return self.free_pages
-        if len(page_tensors) == 1:
-            return page_tensors[0]
-        return torch.cat(page_tensors)
+        return torch.cat((self.free_pages, *self.release_page_chunks))
 
     def merge_and_sort_free(self):
-        if self.num_pending_release_pages == 0:
-            super().merge_and_sort_free()
+        if self.num_release_pages == 0:
             return
-
-        page_tensors = []
-        if len(self.free_pages) > 0:
-            page_tensors.append(self.free_pages)
-        if len(self.release_pages) > 0:
-            page_tensors.append(self.release_pages)
-        page_tensors.extend(self.pending_release_page_chunks)
-
-        merged_pages = (
-            page_tensors[0] if len(page_tensors) == 1 else torch.cat(page_tensors)
-        )
-        self.free_pages, _ = torch.sort(merged_pages)
-        self.release_pages = self.release_pages.new_empty((0,))
-        self.pending_release_page_chunks = []
-        self.num_pending_release_pages = 0
+        self.free_pages, _ = torch.sort(self.get_all_free_pages())
+        self.release_page_chunks = []
+        self.num_release_pages = 0
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
@@ -349,16 +320,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
-        page_ids = tuple(ids for ids in page_ids if ids.numel() > 0)
-        if not page_ids:
-            return
-
         if self.need_sort:
-            # PD allocators sort released pages before reuse. Queue each release
-            # and rebuild the sorted free-list only when allocation pressure
-            # reaches it, avoiding a growing torch.cat on every free call.
-            self.pending_release_page_chunks.extend(page_ids)
-            self.num_pending_release_pages += sum(ids.numel() for ids in page_ids)
+            # Released pages are not reused until free_pages runs dry, so stage
+            # them as-is; merge_and_sort_free pays one cat + sort instead of a
+            # growing cat on every free.
+            self.release_page_chunks.extend(page_ids)
+            self.num_release_pages += sum(ids.numel() for ids in page_ids)
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
 
@@ -384,9 +351,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.free_group = None
         self.free_page_reps_group = []
-        self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
-        self.pending_release_page_chunks = []
-        self.num_pending_release_pages = 0
+        # need_sort staging buffer; release_pages stays None on this allocator.
+        self.release_page_chunks: list[torch.Tensor] = []
+        self.num_release_pages = 0
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

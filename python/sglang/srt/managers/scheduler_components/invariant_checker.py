@@ -158,16 +158,12 @@ class SchedulerInvariantChecker:
         )
         if leak:
             # Page-level leak diagnosis for mamba. Allocator flavors without
-            # page free-lists (free_pages is None) skip the page census — the
-            # dump must never crash the watchdog thread that calls it.
-            free_pages = self.token_to_kv_pool_allocator.free_pages
-            release_pages = self.token_to_kv_pool_allocator.release_pages
-            if free_pages is None or release_pages is None:
+            # page free-lists (get_all_free_pages() is None) skip the page
+            # census — the dump must never crash the watchdog thread that calls it.
+            free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
+            if free_pages is None:
                 return leak, msg
-            if hasattr(self.token_to_kv_pool_allocator, "get_all_free_pages"):
-                free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
-                release_pages = release_pages.new_empty((0,))
-            free_full_pages = set(free_pages.tolist() + release_pages.tolist())
+            free_full_pages = set(free_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             full_page_msg = ""
             if (
@@ -375,20 +371,9 @@ class SchedulerInvariantChecker:
         if not sub_allocs:
             return
 
-        def _free_pages(a):
-            if hasattr(a, "get_all_free_pages"):
-                return a.get_all_free_pages()
-            free = a.free_pages
-            release = getattr(a, "release_pages", None)
-            return (
-                torch.cat((free, release))
-                if release is not None and len(release) > 0
-                else free
-            )
-
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
-            free = _free_pages(sub)
+            free = sub.get_all_free_pages()
             uniq = torch.unique(free)
             if uniq.numel() != free.numel():
                 raise_error_or_warn(
@@ -400,7 +385,7 @@ class SchedulerInvariantChecker:
 
         # Check A: owner pages (full-pool indices) must not be in the full free
         # set (sub_allocs[0] is the full pool, even on hybrid-SWA).
-        full_unique = torch.unique(_free_pages(sub_allocs[0]))
+        full_unique = torch.unique(sub_allocs[0].get_all_free_pages())
         stale = owner_pages[torch.isin(owner_pages, full_unique)]
         if stale.numel() > 0:
             raise_error_or_warn(

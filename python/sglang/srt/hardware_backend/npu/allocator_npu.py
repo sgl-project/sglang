@@ -144,11 +144,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.free_group is None:
             device = free_index.device
             free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
-            else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+            self._release_page_ids(free_page_indices.to(device))
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
