@@ -842,10 +842,7 @@ class FlashInferAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            if in_capture and self.kv_index_translator.is_translating:
-                # A runner-built capture batch never went through `init_new`,
-                # so there is no prepared write loc to resolve -- and zeros are the
-                # page-0 sink in every id space. Replay refills below.
+            if in_capture:
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
