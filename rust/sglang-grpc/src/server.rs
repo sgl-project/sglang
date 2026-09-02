@@ -18,6 +18,17 @@ use crate::utils::{
     build_text_generate_dict, extract_model_path,
 };
 
+fn reflection_service() -> Result<
+    tonic_reflection::server::v1::ServerReflectionServer<
+        impl tonic_reflection::server::v1::ServerReflection,
+    >,
+    tonic_reflection::server::Error,
+> {
+    tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build_v1()
+}
+
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
@@ -993,11 +1004,13 @@ pub async fn run_grpc_server(
     let svc = proto::sglang_service_server::SglangServiceServer::new(service)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size);
+    let reflection = reflection_service()?;
 
     tracing::info!("gRPC server listening on {}", addr);
 
     tonic::transport::Server::builder()
         .add_service(svc)
+        .add_service(reflection)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             tracing::info!("gRPC server shutting down");

@@ -1,10 +1,18 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
-    terminal_error_status,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, reflection_service,
+    resolve_max_message_size, terminal_error_status,
 };
 use crate::bridge::TerminalError;
-use std::collections::HashMap;
-use tonic::Code;
+use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
+use tokio::sync::oneshot;
+use tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+use tonic::transport::{Endpoint, Server};
+use tonic::{Code, Request};
+use tonic_reflection::pb::v1::{
+    ServerReflectionRequest, ServiceResponse, server_reflection_client::ServerReflectionClient,
+    server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+};
 
 #[test]
 fn openai_status_code_uses_forwarded_status_when_present() {
@@ -72,4 +80,82 @@ fn resolve_max_message_size_honors_env_var() {
     unsafe {
         std::env::remove_var(VAR);
     }
+}
+
+#[tokio::test]
+async fn reflection_service_advertises_sglang_service() {
+    let services = make_reflection_request(ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::ListServices(String::new())),
+    })
+    .await;
+
+    let MessageResponse::ListServicesResponse(services) = services else {
+        panic!("expected ListServicesResponse");
+    };
+    let names = service_names(services.service);
+
+    assert!(names.contains("grpc.reflection.v1.ServerReflection"));
+    assert!(names.contains("sglang.runtime.v1.SglangService"));
+
+    let descriptor = make_reflection_request(ServerReflectionRequest {
+        host: String::new(),
+        message_request: Some(MessageRequest::FileContainingSymbol(String::from(
+            "sglang.runtime.v1.SglangService",
+        ))),
+    })
+    .await;
+
+    let MessageResponse::FileDescriptorResponse(descriptor) = descriptor else {
+        panic!("expected FileDescriptorResponse");
+    };
+    assert!(!descriptor.file_descriptor_proto.is_empty());
+}
+
+fn service_names(services: Vec<ServiceResponse>) -> BTreeSet<String> {
+    services.into_iter().map(|service| service.name).collect()
+}
+
+async fn make_reflection_request(request: ServerReflectionRequest) -> MessageResponse {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("parse reflection bind addr");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind reflection test listener");
+    let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(reflection_service().expect("build reflection service"))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                drop(shutdown_rx.await);
+            })
+            .await
+            .expect("serve reflection test");
+    });
+
+    let channel = Endpoint::from_shared(endpoint)
+        .expect("reflection endpoint")
+        .connect()
+        .await
+        .expect("connect reflection client");
+    let mut client = ServerReflectionClient::new(channel);
+    let request = Request::new(tokio_stream::once(request));
+    let mut response = client
+        .server_reflection_info(request)
+        .await
+        .expect("reflection request")
+        .into_inner();
+    let message = response
+        .next()
+        .await
+        .expect("reflection response")
+        .expect("successful reflection response")
+        .message_response
+        .expect("reflection message response");
+
+    shutdown_tx.send(()).expect("send reflection shutdown");
+    server.await.expect("join reflection test server");
+
+    message
 }
