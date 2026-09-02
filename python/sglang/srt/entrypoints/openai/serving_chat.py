@@ -89,7 +89,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.jinja_template_utils import (
+    MEDIA_URL_PART_TYPES,
+    process_content_for_template_format,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
@@ -744,8 +747,7 @@ class OpenAIServingChat(OpenAIServingBase):
         has_media = any(
             isinstance(message.get("content"), list)
             and any(
-                isinstance(part, dict)
-                and part.get("type") in ("image_url", "video_url", "audio_url")
+                isinstance(part, dict) and part.get("type") in MEDIA_URL_PART_TYPES
                 for part in message["content"]
             )
             for message in run
@@ -1390,11 +1392,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
-            if getattr(
-                self.template_manager,
-                "jinja_template_may_reorder_tool_results",
-                False,
-            ):
+            if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:

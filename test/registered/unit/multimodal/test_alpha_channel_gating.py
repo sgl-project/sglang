@@ -7,8 +7,7 @@ from PIL import Image
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
-from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
-from sglang.srt.utils.common import load_image, smart_to_rgb
+from sglang.srt.utils.common import load_image
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
@@ -34,8 +33,8 @@ def test_load_image_preserves_rgba_fidelity():
     assert img.getpixel((0, 0)) == _RGBA_PIXEL
 
 
-def test_kimi_k3_no_discard_keeps_rgba():
-    out = KimiK3ImageProcessor._load_single_item(
+def test_no_discard_keeps_rgba():
+    out = BaseMultimodalProcessor._load_single_item(
         _rgba_png_bytes(),
         modality=Modality.IMAGE,
         discard_alpha_channel=False,
@@ -54,17 +53,16 @@ def test_default_processor_plain_convert_drops_alpha_only():
     assert out.getpixel((0, 0)) == _RGBA_PIXEL[:3]
 
 
-def test_glm4v_optin_smart_composite_matches_reference():
-    rgba = Image.open(BytesIO(_rgba_png_bytes()))
-    reference = smart_to_rgb(rgba.copy())
+def test_glm4v_optin_smart_composite_matches_expected_pixels():
+    # (10, 20, 30, 200) composited over the dark-edge background (240, 240, 240).
     out = Glm4vImageProcessor._load_single_item(
         _rgba_png_bytes(),
         modality=Modality.IMAGE,
         discard_alpha_channel=True,
     )
     assert out.mode == "RGB"
-    assert out.getpixel((0, 0)) == reference.getpixel((0, 0))
-    plain = rgba.convert("RGB")
+    assert out.getpixel((0, 0)) == (60, 67, 75)
+    plain = Image.open(BytesIO(_rgba_png_bytes())).convert("RGB")
     assert out.getpixel((0, 0)) != plain.getpixel((0, 0))
 
 

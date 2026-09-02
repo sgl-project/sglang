@@ -184,6 +184,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingChatTestCase(unittest.TestCase):
