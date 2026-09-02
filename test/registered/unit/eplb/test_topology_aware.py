@@ -16,9 +16,10 @@ from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     rebalance_experts_topology_aware,
 )
 from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm, rebalance_experts
+from sglang.test.test_utils import CustomTestCase
 
 
-class TestTopologyAwarePlacement(unittest.TestCase):
+class TestTopologyAwarePlacement(CustomTestCase):
     def test_prefers_the_cheapest_destination(self):
         # Four experts, two source/destination ranks, two slots per rank.
         # Experts 0 and 1 originate on rank 0; experts 2 and 3 on rank 1.
@@ -113,6 +114,25 @@ class TestTopologyAwarePlacement(unittest.TestCase):
                 num_nodes=1,
                 algorithm=EplbAlgorithm.topology_aware,
             )
+
+    def test_default_algorithm_remains_available_without_topology(self):
+        # The public legacy API receives [DP, layers, experts] and reduces the
+        # DP dimension before invoking the original EPLB implementation.
+        tokens_per_expert = torch.tensor([[[4, 2, 1, 0]]], dtype=torch.int64)
+
+        physical_to_logical, logical_to_physical, expert_count = rebalance_experts(
+            tokens_per_expert=tokens_per_expert,
+            num_physical_experts=4,
+            num_local_physical_experts=2,
+            num_groups=None,
+            num_nodes=1,
+            algorithm=EplbAlgorithm.deepseek,
+        )
+
+        self.assertEqual(physical_to_logical.shape, (1, 4))
+        self.assertEqual(logical_to_physical.shape, (1, 4, 1))
+        self.assertEqual(expert_count.shape, (1, 4))
+        self.assertTrue(torch.all(expert_count == 1))
 
     def test_topology_swaps_without_worsening_load_balance(self):
         # The load-balanced seed assigns [0, 1] to rank 0 and [2, 3] to rank
