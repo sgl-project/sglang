@@ -50,7 +50,14 @@ def _chunks(text: str, size: int) -> list[str]:
             "",
             "plain reply",
         ),
-        ("still going", "still going", ""),
+        # No think markers at all: the model skipped the think channel, so the
+        # bare text is content, not truncated reasoning.
+        ("still going", "", "still going"),
+        (
+            f"bare answer{RESPONSE_CLOSE}{MESSAGE_CLOSE}",
+            "",
+            "bare answer",
+        ),
     ],
 )
 def test_non_stream_reasoning_channels(text: str, reasoning: str, content: str) -> None:
@@ -87,7 +94,9 @@ def test_non_stream_recovers_missing_think_separator() -> None:
 @pytest.mark.parametrize(
     ("text", "reasoning", "content"),
     [
-        ("deep thought<|close|>", "deep thought", ""),
+        # A bare partial "<|close|>" suffix carries no think-channel signal:
+        # treated as content with the partial marker stripped.
+        ("deep thought<|close|>", "", "deep thought"),
         ("deep thought<|close|>think", "deep thought", ""),
         (f"{THINK_CLOSE}<|open|>", "", ""),
         (f"{THINK_CLOSE}<|open|>response", "", ""),
