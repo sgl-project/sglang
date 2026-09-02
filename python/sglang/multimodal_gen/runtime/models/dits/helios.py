@@ -16,6 +16,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    can_use_helios_qk_rope,
+    fused_inplace_helios_qk_rope,
+)
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import (
@@ -285,6 +289,24 @@ class HeliosSelfAttention(nn.Module):
             self.history_scale_mode = history_scale_mode
             self.max_scale = 10.0
 
+    def _apply_rotary_qk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        rotary_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.tp_rmsnorm and can_use_helios_qk_rope(q, k, rotary_emb):
+            fused_inplace_helios_qk_rope(
+                q.view(-1, q.shape[-2], q.shape[-1]),
+                k.view(-1, k.shape[-2], k.shape[-1]),
+                rotary_emb.view(-1, rotary_emb.shape[-1]),
+            )
+            return q, k
+        return (
+            apply_rotary_emb_transposed(q, rotary_emb),
+            apply_rotary_emb_transposed(k, rotary_emb),
+        )
+
     def forward(self, hidden_states, rotary_emb=None, original_context_length=None):
         q, _ = self.to_q(hidden_states)
         k, _ = self.to_k(hidden_states)
@@ -302,8 +324,7 @@ class HeliosSelfAttention(nn.Module):
         v = v.unflatten(2, (self.local_num_heads, self.head_dim))
 
         if rotary_emb is not None:
-            q = apply_rotary_emb_transposed(q, rotary_emb)
-            k = apply_rotary_emb_transposed(k, rotary_emb)
+            q, k = self._apply_rotary_qk(q, k, rotary_emb)
 
         history_seq_len = (
             hidden_states.shape[1] - original_context_length
