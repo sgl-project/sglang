@@ -831,7 +831,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # Mirror DeepSeekV4TokenToKVPool: swa_ring_size = sliding_window +
         # (speculative_num_draft_tokens - 1).
-        spec_num_draft = kvc.server_args.speculative_num_draft_tokens or 1
+        spec_num_draft = get_spec().speculative_num_draft_tokens or 1
         self._swa_ring_size = self.swa_page_size + (
             (spec_num_draft - 1) if self.is_speculative else 0
         )
