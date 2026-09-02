@@ -708,6 +708,10 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
         pass
 
+    # `rebind_write_loc` already collapsed the widened id and sent the rows this
+    # rank does not own to the padding sink.
+    write_loc_is_dcp_resolved = True
+
     def get_kv_size_bytes(self):
         return 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
@@ -1332,7 +1336,7 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
+    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
