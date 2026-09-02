@@ -93,6 +93,20 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "The weather is nice today.")
 
+    def test_no_tool_call_preserves_empty_json_object(self):
+        """Regression test for #35562: '{}' must not be stripped."""
+        text = "{}"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "{}")
+
+    def test_no_tool_call_preserves_leading_json_object(self):
+        """Regression test for #35562: leading non-tool JSON must be preserved."""
+        text = '{"a": 1} is a dict'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, '{"a": 1} is a dict')
+
     def test_multiple_json_objects(self):
         text = '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Beijing"}};{"name": "search", "arguments": {"query": "restaurants"}}'
         result = self.detector.detect_and_parse(text, self.tools)
