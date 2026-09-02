@@ -55,6 +55,29 @@ def should_ignore_layer(
     # proj_name = qkv_proj
     proj_name = layer_name.split(".")[-1]
 
+    # Some checkpoints serialize an ALREADY-FUSED module and list that exact
+    # fused name in `exclude`. OneNexus/GLM-5.3-Flash-MXFP4 does: its vision
+    # tower ships visual.blocks.N.attn.qkv_proj as one tensor and all 125 such
+    # names appear verbatim in quantization_config.exclude. The packed-mapping
+    # expansion below rewrites that to q_proj/k_proj/v_proj, none of which are
+    # in `exclude`, so the layer is quantized while the checkpoint holds it
+    # unpacked. Honor a direct match before expanding.
+    if check_equal_or_regex_match(layer_name=layer_name, targets=ignore):
+        return True
+
+    # MoE exclusions may likewise be written PER EXPERT while SGLang fuses a
+    # layer's experts into a single FusedMoE module. The same checkpoint lists
+    # model.layers.{3,5,6}.mlp.experts.{0..287}.{down,gate,up}_proj -- 1728
+    # entries -- but the module is named model.layers.N.mlp.experts, which
+    # matches none of them, so those BF16 experts get loaded as MXFP4.
+    if layer_name.endswith(".experts"):
+        expert_prefix = layer_name + "."
+        if any(
+            isinstance(target, str) and target.startswith(expert_prefix)
+            for target in ignore
+        ):
+            return True
+
     # Fused layers like gate_up_proj or qkv_proj will not be fused
     # in the safetensors checkpoint. So, we convert the name
     # from the fused version to unfused + check to make sure that
