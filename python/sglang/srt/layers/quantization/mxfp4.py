@@ -66,7 +66,6 @@ from sglang.srt.utils import (
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1588,8 +1587,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         if is_xpu():
-            if not use_intel_xpu_backend():
-                raise RuntimeError("MXFP4 on Intel XPU requires SGLANG_USE_SGL_XPU=1.")
             assert TopKOutputChecker.format_is_standard(topk_output)
             from sgl_kernel import fused_experts
 
