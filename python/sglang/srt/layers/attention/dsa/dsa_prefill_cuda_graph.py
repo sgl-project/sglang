@@ -14,10 +14,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
-
-_is_cuda = is_cuda()
 
 GRAPH_WEIGHTS_PROJ_LORA_ERROR = (
     "DSA indexer weights_proj LoRA is incompatible with "
@@ -31,58 +28,57 @@ def _is_in_piecewise_or_breakable_cuda_graph() -> bool:
     return is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph()
 
 
-if _is_cuda:
+def _scale_head_gate_graph_fake_impl(
+    weights_raw: torch.Tensor,
+    n_heads_inv_sqrt: float,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
+        dtype=torch.float32,
+        device=weights_raw.device,
+    )
 
-    def _scale_head_gate_graph_fake_impl(
-        weights_raw: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
-            dtype=torch.float32,
-            device=weights_raw.device,
-        )
+# In-graph (PCG/BCG) head gate for the fused path: weights_proj is folded
+# into wk_weights_proj, so weights_raw is precomputed and there is no GEMM.
+@register_custom_op(fake_impl=_scale_head_gate_graph_fake_impl)
+def scale_head_gate_graph(
+    weights_raw: torch.Tensor,
+    n_heads_inv_sqrt: float,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    weights = weights_raw * n_heads_inv_sqrt
+    return weights.unsqueeze(-1) * q_scale * softmax_scale
 
-    # In-graph (PCG/BCG) head gate for the fused path: weights_proj is folded
-    # into wk_weights_proj, so weights_raw is precomputed and there is no GEMM.
-    @register_custom_op(fake_impl=_scale_head_gate_graph_fake_impl)
-    def scale_head_gate_graph(
-        weights_raw: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        weights = weights_raw * n_heads_inv_sqrt
-        return weights.unsqueeze(-1) * q_scale * softmax_scale
 
-    def _logits_head_gate_graph_fake_impl(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
-            dtype=torch.float32,
-            device=x.device,
-        )
+def _logits_head_gate_graph_fake_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    n_heads_inv_sqrt: float,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+        dtype=torch.float32,
+        device=x.device,
+    )
 
-    # In-graph (PCG/BCG) head gate for the NON-prefill path
-    @register_custom_op(fake_impl=_logits_head_gate_graph_fake_impl)
-    def logits_head_gate_graph(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        n_heads_inv_sqrt: float,
-        softmax_scale: float,
-        q_scale: torch.Tensor,
-    ) -> torch.Tensor:
-        out = torch.mm(x, weight.t(), out_dtype=torch.float32)
-        weights = out * n_heads_inv_sqrt
-        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
-        return weights
+# In-graph (PCG/BCG) head gate for the NON-prefill path
+@register_custom_op(fake_impl=_logits_head_gate_graph_fake_impl)
+def logits_head_gate_graph(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    n_heads_inv_sqrt: float,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.mm(x, weight.t(), out_dtype=torch.float32)
+    weights = out * n_heads_inv_sqrt
+    weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+    return weights
 
 
 @register_custom_op(mutates_args=["topk_result"])
@@ -103,7 +99,7 @@ def pcg_dsa_indexer_prefill_split(
     # call site pre-allocates it at a static, padded shape and a downstream
     # captured graph reads it at a fixed address; eager code instead allocates
     # and returns a fresh, naturally-sized tensor each call.
-    assert _is_cuda, "Internal error: DSA graph dispatch is only supported on CUDA"
+    # HIP (ROCm): the breakable/piecewise prefill graph uses the same split-op dispatch.
     from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 
     forward_context = get_tc_piecewise_forward_context()
