@@ -193,6 +193,54 @@ def handle_cache_compatibility(server_args: Any) -> None:
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
+# Backends whose speculative verify id rails are translation-audited for the
+# unified pool (the MLA verify family + the translated MHA rails).
+_SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
+    {
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "flashmla",
+        "flashinfer",
+        "fa3",
+    }
+)
+
+
+def _assert_spec_verify_backends(
+    server_args: Any, *, algorithm: str, allowed: frozenset = None
+) -> None:
+    """Refuse spec backends whose verify id rails are not translation-audited.
+
+    Covers BOTH backends a speculative forward reaches. The target's
+    prefill/decode pair, because verify routes to either depending on
+    --speculative-attention-mode; and the DRAFT worker's own backend, which
+    resolves from `--speculative-draft-attention-backend` first and only then
+    inherits the target's -- so an unaudited draft backend is reachable even
+    when every target backend is audited."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    if allowed is None:
+        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= allowed, (
+        f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
+        f"attention backends {sorted(allowed)} for both prefill "
+        f"and decode; got {sorted(backends)}. Other backends do "
+        "not translate speculative verify indices to the unified "
+        "pool's kernel-facing space yet."
+    )
+    draft_backend = resolving_view(server_args).speculative_draft_attention_backend
+    assert draft_backend is None or draft_backend in allowed, (
+        f"--enable-unified-memory + {algorithm} requires the draft worker on a "
+        f"spec-verify-audited backend {sorted(allowed)}; got "
+        f"--speculative-draft-attention-backend={draft_backend!r}. Leave it "
+        "unset to inherit the target's."
+    )
+
+
 def handle_unified_memory_pool(server_args: Any) -> None:
 
     cfg = resolving_view(server_args)
@@ -221,12 +269,91 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    # Speculative decoding: DSPARK (chain draft, #33974) and NGRAM
+    # (draft-model-less target verify) are supported on the unified pool,
+    # and EAGLE/EAGLE3 chain drafting is supported on hybrid-SWA targets,
+    # whose draft KV rides fused inside the full pool's page envelope
+    # (DenseDraftRegion in mem_cache/unified_memory_pool.py). Other
+    # algorithms are not yet audited for the virtual/dense loc
+    # translation. The id-space choke point plugs in the same way when
+    # they are: its canonical builder takes seq_lens as a tensor
+    # (target-verify's seq_lens + num_draft plugs in), write rails
+    # resolve through the source (rebind_write_loc /
+    # sliding_window_write_loc), and verify tables consume the same
+    # KVIndexTable.
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft), DFLASH (fused block draft), and "
+        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "not yet audited for the unified pool's virtual/kernel-facing loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    # NGRAM is deliberately absent, and for the SAME reason tree verify is:
+    # a tree-shaped drafter finalizes a batch by calling
+    # `move_accept_tokens_to_target_kvcache`, which relocates INDIVIDUAL
+    # accepted tokens inside the target pool. The unified pool's
+    # `move_kv_cache` is compaction-only -- it moves whole page envelopes
+    # (that is what carries a fused draft region for free) -- so a per-token
+    # relocation either reshapes past the end (`view(-1, page_size)` on a
+    # handful of tokens) or hits the SWA composite's explicit refusal.
+    # EAGLE chain never reaches it: its only caller is the topk>1 tree path.
+    # Re-admitting NGRAM needs a per-token move primitive on the unified
+    # pools -- the same prerequisite as tree verify.
+    if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+
+        _mc = model_config_of(server_args)
+        assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
+            "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
+            "fused inside the full-attention page envelope (or falls back "
+            "to a private pool over the unified virtual id space)."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
+            "draft chain only (--speculative-eagle-topk in {None, 1}); "
+            "tree verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+        # None refuses EXPLICITLY: an unset backend would default to
+        # fa3/flashinfer later in resolution, silently leaving the audited
+        # envelope. MLA hosts verify on the MLA family; MHA hosts on the
+        # translated MHA rails.
+        eagle_allowed = (
+            _SPEC_VERIFY_AUDITED_BACKENDS
+            if use_mla_backend(server_args)
+            else {"triton", "flashinfer", "fa3"}
+        )
+        eagle_backends = set(attention_backends_of(resolved_view(server_args)))
+        assert (
+            None not in eagle_backends
+            and eagle_backends
+            and eagle_backends <= eagle_allowed
+        ), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the "
+            "spec-verify-audited attention backends "
+            f"{sorted(eagle_allowed)}, set explicitly (got "
+            f"{sorted(eagle_backends, key=str)}). Other backends do not "
+            "translate speculative verify indices to the unified pool's "
+            "dense space yet."
+        )
+        # The draft worker resolves its own backend: explicit flag first,
+        # else it inherits the target's (audited, per the assert above).
+        draft_allowed = (None,) + tuple(sorted(eagle_allowed))
+        assert cfg.speculative_draft_attention_backend in draft_allowed, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
+            f"worker on a spec-verify-audited backend {sorted(eagle_allowed)}; "
+            "got --speculative-draft-attention-backend="
+            f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
+            "to inherit the target's."
+        )
     if cfg.speculative_algorithm == "DSPARK":
         assert cfg.speculative_eagle_topk in (None, 1), (
             "--enable-unified-memory + DSPARK supports a linear draft "
@@ -234,17 +361,17 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "verify is not audited for the unified pool. Got "
             f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's kernel-facing space yet."
+        _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "DFLASH":
+        # DFLASH targets are MHA-family; verify (target and the draft's own
+        # block forward) runs on the translated MHA rails. Draft KV fuses
+        # into the target's pages when the geometry resolves, with the
+        # private-pool arm as the automatic fallback; the compact-window
+        # mode narrows reads over the same fused mapping.
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DFLASH",
+            allowed=frozenset({"triton", "fa3", "flashinfer"}),
         )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "

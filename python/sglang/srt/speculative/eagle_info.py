@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -81,13 +82,20 @@ class EagleVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
-        req_pool_indices: torch.Tensor,
+        *,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        index_table: KVIndexTable,
     ):
-        device = req_pool_indices.device
-        batch_size = len(req_pool_indices)
+        """CSR verify args from the batch's index table.
+
+        The lens are widened here (prefix + draft tokens are read back from
+        the pool), so a TRANSLATED table must arrive built with
+        ``seq_len_delta = draft_token_num`` — its live prefix has to cover the
+        widened columns this gather reads.
+        """
+        device = index_table.ids.device
+        batch_size = index_table.row_ids.numel()
         qo_indptr = torch.arange(
             0,
             (1 + batch_size) * self.draft_token_num,
@@ -108,13 +116,14 @@ class EagleVerifyInput(SpecInput):
             device=device,
         )
         create_flashinfer_kv_indices_triton[(batch_size,)](
-            req_to_token,
-            req_pool_indices,
+            index_table.ids,
+            index_table.row_ids,
             paged_kernel_lens,
             cum_kv_seq_len,
             None,
             kv_indices,
-            req_to_token.size(1),
+            index_table.row_stride,
+            ENTRY_PAGE_SIZE=index_table.entry_page_size,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -352,12 +361,14 @@ class EagleDraftExtendInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
-        req_pool_indices: torch.Tensor,
+        *,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: Optional[int],
-        req_to_token: torch.Tensor,
+        index_table: KVIndexTable,
     ):
-        device = req_pool_indices.device
+        """Draft-extend CSR args; the lens already include the window, so
+        the batch's memoized (un-widened) table is the right source."""
+        device = index_table.ids.device
         bs = self.num_correct_drafts.numel()
         # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
         qo_indptr = torch.arange(
@@ -378,12 +389,13 @@ class EagleDraftExtendInput(SpecInput):
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
+            index_table.ids,
+            index_table.row_ids,
             paged_kernel_lens,
             cum_kv_seq_len,
             None,
             kv_indices,
-            req_to_token.size(1),
+            index_table.row_stride,
+            ENTRY_PAGE_SIZE=index_table.entry_page_size,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None

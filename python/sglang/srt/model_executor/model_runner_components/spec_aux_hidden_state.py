@@ -39,6 +39,15 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
+    # EAGLE draft KV head geometry, recorded so the unified fused-draft-KV
+    # path can build the draft region and price the fused entry at TARGET boot
+    # — before the draft worker exists. `total_kv_heads` is the UNDIVIDED
+    # count: this config resolves before the attention-TP group is
+    # initialized, so consumers apply attn_tp themselves. None when no EAGLE
+    # draft config was loaded.
+    eagle_draft_total_kv_heads: Optional[int] = None
+    eagle_draft_head_dim: Optional[int] = None
+    eagle_draft_v_head_dim: Optional[int] = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
@@ -57,6 +66,7 @@ def resolve_spec_aux_hidden_state_config(
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
+        model_config=model_config,
         spec_algorithm=spec_algorithm,
         is_draft_worker=is_draft_worker,
     )
@@ -74,24 +84,38 @@ def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
     server_args: ServerArgs,
+    model_config: ModelConfig,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    if (
-        (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
-        and not is_draft_worker
-        and get_spec().speculative_draft_model_path
+    if (spec_algorithm.is_eagle() or spec_algorithm.is_standalone()) and (
+        not is_draft_worker
     ):
-        # Load draft config to get layer count for KV cache sizing
+        # Load draft config to get layer count for KV cache sizing.
+        # A path-less NEXTN run (the MTP head ships INSIDE the target
+        # checkpoint) is the same code path: `from_server_args` falls back to
+        # the target path when model_path is None, and `is_draft_model=True`
+        # is what makes ModelConfig fill in `num_nextn_predict_layers` at all
+        # -- every assignment of that field is guarded by `is_draft_model`, so
+        # reading it off the TARGET's own config always answers None and the
+        # geometry silently never resolves (eval_568: Qwen NEXTN fell back to
+        # a private draft pool instead of fusing).
+        draft_path = get_spec().speculative_draft_model_path
         draft_model_config = ModelConfig.from_server_args(
             server_args,
-            model_path=get_spec().speculative_draft_model_path,
+            model_path=draft_path,
             model_revision=get_spec().speculative_draft_model_revision,
             is_draft_model=True,
         )
         num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
         if num_nextn_predict_layers is not None:
             config.eagle_draft_num_layers = int(num_nextn_predict_layers)
+        elif draft_path is None:
+            # No draft path AND no MTP head: there is no draft geometry to
+            # record. Leave the aux unset so the pool falls back to a private
+            # draft pool rather than fusing a region sized like the whole
+            # target.
+            return
         else:
             config.eagle_draft_num_layers = int(
                 max(
@@ -99,6 +123,16 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_attention_layers,
                 )
             )
+        # TOTAL kv heads, NOT the per-GPU count: this resolver runs before
+        # `init_torch_distributed`, so the attention-TP group does not exist
+        # yet and any `get_parallel()` read asserts. Consumers divide by
+        # attn_tp themselves, at pool-build time (see
+        # KVCacheConfigurator.fused_draft_kv_region).
+        config.eagle_draft_total_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
+        )
+        config.eagle_draft_head_dim = int(draft_model_config.head_dim)
+        config.eagle_draft_v_head_dim = int(draft_model_config.v_head_dim)
 
         if (
             draft_model_config.is_hybrid_swa
@@ -201,6 +235,14 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        # Draft KV head geometry for the unified fused-draft-KV path — the
+        # same fields the EAGLE arm records (one trio serves every draft-KV
+        # algorithm); same pre-distributed-init contract: TOTAL kv heads.
+        config.eagle_draft_total_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
+        )
+        config.eagle_draft_head_dim = int(draft_model_config.head_dim)
+        config.eagle_draft_v_head_dim = int(draft_model_config.v_head_dim)
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,

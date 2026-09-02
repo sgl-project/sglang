@@ -345,6 +345,12 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 forward_batch=forward_batch,
                 mup_vector=self.mup_vector,
+                # Speculative target-verify reconstructs the intermediate conv
+                # state, which only the stride-aware Triton causal-conv supports
+                # (mamba.py asserts this). The unified / page-major path forces it
+                # implicitly; on the plain path the model must request it, as the
+                # other hybrid-mamba models (Nemotron-H, GraniteMoE-Hybrid) do.
+                use_triton_causal_conv=True,
             )
             mamba_hidden_states = mamba_hidden_states * self.ssm_out_multiplier
 

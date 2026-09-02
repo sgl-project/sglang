@@ -192,7 +192,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
         ) and not kvc.is_draft_worker:
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_full_entry_bytes()
+            if fused_full_entry is not None:
+                # Fused draft KV (unified mamba-MHA host): the draft rides
+                # inside every full-side page, so the cell is the EXACT fused
+                # entry (host + draft + lcm pad, priced through the same spec
+                # the pool factory builds) - the per-draft-layer ratio below
+                # under-reserves the pad.
+                self._cell_size = int(fused_full_entry)
+            elif (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -236,7 +244,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_full_entry_bytes()
+            if fused_full_entry is not None:
+                # Fused draft KV: the draft rides inside every full-side
+                # page, so the cell is the EXACT fused entry - the separate
+                # draft reservation below would double-charge.
+                self._cell_size = int(fused_full_entry)
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
@@ -564,6 +578,18 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # is meaningless here -- there is no full pool to relate to, and every
         # token beyond the sliding window can be evicted. So cell_size = S*ns,
         # with no ratio factor applied.
+        # Fused draft KV (unified hybrid-SWA + EAGLE): the draft rides inside
+        # every full-side page, so the full term is the EXACT fused entry
+        # (host + draft + lcm pad, priced through the same spec the pool
+        # factory builds) and the per-draft-layer approximation must not
+        # double-charge.
+        self._fused_full_entry = kvc.fused_full_entry_bytes()
+        if self._fused_full_entry is not None:
+            self._draft_full_layers_num = 0
+            # A fused DFLASH draft's KV is in the entry too; the separate
+            # per-token draft reservation would double-charge.
+            self._draft_cell_size = 0
+
         if self._full_layers_num == 0:
             self._cell_size = (
                 self._swa_per_token * self._swa_layers_num
@@ -573,9 +599,14 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 + self._draft_cell_size
             )
         else:
-            self._cell_size = (
-                self._full_per_token
+            full_term = (
+                self._fused_full_entry
+                if self._fused_full_entry is not None
+                else self._full_per_token
                 * (self._full_layers_num + self._draft_full_layers_num)
+            )
+            self._cell_size = (
+                full_term
                 + self._swa_per_token * self._draft_swa_full_layers_num
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token

@@ -5,6 +5,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -58,12 +59,15 @@ class NgramVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
-        req_pool_indices: torch.Tensor,
+        *,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        index_table: KVIndexTable,
     ):
-        bs = len(req_pool_indices)
+        """CSR verify args from the batch's index table. The lens are
+        widened here, so a TRANSLATED table must arrive built with
+        ``seq_len_delta = draft_token_num``."""
+        bs = index_table.row_ids.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
 
@@ -82,13 +86,14 @@ class NgramVerifyInput(SpecInput):
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
+            index_table.ids,
+            index_table.row_ids,
             paged_kernel_lens,
             cum_kv_seq_len,
             None,
             kv_indices,
-            req_to_token.size(1),
+            index_table.row_stride,
+            ENTRY_PAGE_SIZE=index_table.entry_page_size,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.

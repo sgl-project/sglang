@@ -197,17 +197,25 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + self.num_draft_tokens, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            create_flashmla_kv_indices_triton[
-                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-            ](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                seq_lens,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                block_kv_indices.stride(0),
-            )
+            if self.kv_index_translator.is_translating:
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_translator.fill_read_table(
+                    out=block_kv_indices,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=seq_lens,
+                )
+            else:
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    block_kv_indices.stride(0),
+                )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens.to(torch.int32),
                 self.num_draft_tokens * self.num_q_heads,
@@ -229,17 +237,25 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + window, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            create_flashmla_kv_indices_triton[
-                (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
-            ](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                seq_lens_k,
-                None,
-                block_kv_indices,
-                self.req_to_token.stride(0),
-                block_kv_indices.stride(0),
-            )
+            if self.kv_index_translator.is_translating:
+                assert self.page_size == PAGE_SIZE
+                self.kv_index_translator.fill_read_table(
+                    out=block_kv_indices,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    seq_lens=seq_lens_k,
+                )
+            else:
+                create_flashmla_kv_indices_triton[
+                    (bs, get_num_kv_index_blocks_flashmla(max_seqlen_pad, PAGE_SIZE))
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    seq_lens_k,
+                    None,
+                    block_kv_indices,
+                    self.req_to_token.stride(0),
+                    block_kv_indices.stride(0),
+                )
             mla_metadata, num_splits = get_mla_metadata(
                 seq_lens_k,
                 window * self.num_q_heads,
@@ -595,6 +611,8 @@ class FlashMLAMultiStepDraftBackend:
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        # The backend uses the translator instead of translating by itself.
+        self.kv_index_translator = model_runner.kv_index_translator
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (

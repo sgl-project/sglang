@@ -462,6 +462,9 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        translator = self.draft_model_runner.kv_index_translator
+        if translator.is_translating:
+            translator.bind_and_verify_backends([self.draft_model_runner.attn_backend])
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -1500,6 +1503,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        # The locs arrive VIRTUAL: both callers read them off the target's
+        # req_to_token (post-verify) or the ScheduleBatch (prefill), and the
+        # write rebind deliberately leaves those aliases virtual. Every pool
+        # call below is a DIRECT KVCache write, so translate here -- this is
+        # the one choke point they all pass through. Identity on a plain pool.
+        # Fresh tensors only: the callers keep using their virtual copies
+        # afterwards (the post-verify 2-D loc is a persistent buffer that the
+        # compact req_to_token rebuild re-reads as virtual ids).
+        translator = self.draft_model_runner.kv_index_translator
+        cache_loc = translator.translate_full_attn_ids(cache_loc)
+        if cache_loc_2d is not None:
+            cache_loc_2d = translator.translate_full_attn_ids(cache_loc_2d)
+
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
@@ -2122,6 +2138,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # Hand-built draft batch bypasses ForwardBatch.init_new: under the
+        # unified pool the write loc must be rebound to the draft's
+        # kernel-facing ids here (no-op on plain pools).
+        self.draft_model_runner.kv_index_translator.rebind_write_loc(forward_batch)
 
         if self.selector is not None:
             self._selector_sample = None

@@ -7,6 +7,7 @@ import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -126,15 +127,18 @@ class DFlashVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
-        req_pool_indices: torch.Tensor,
+        *,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        index_table: KVIndexTable,
         kv_start_idx: Optional[torch.Tensor] = None,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        device = req_pool_indices.device
-        bs = len(req_pool_indices)
+        """CSR verify args from the batch's index table. The lens are
+        widened here (per-row for a ragged layout), so a TRANSLATED table
+        must arrive built over the widened lens."""
+        device = index_table.ids.device
+        bs = index_table.row_ids.numel()
 
         layout = self.ragged_verify_layout
         if layout is not None and layout.bs != bs:
@@ -173,13 +177,14 @@ class DFlashVerifyInput(SpecInput):
                 device=device,
             )
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
+            index_table.ids,
+            index_table.row_ids,
             paged_kernel_lens,
             cum_kv_seq_len,
             kv_start_idx,
             kv_indices,
-            req_to_token.size(1),
+            index_table.row_stride,
+            ENTRY_PAGE_SIZE=index_table.entry_page_size,
         )
         mask = self.custom_mask
         if mask is not None:

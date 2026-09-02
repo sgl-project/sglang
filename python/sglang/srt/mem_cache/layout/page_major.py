@@ -15,7 +15,7 @@ no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
 pool's region inside the raw buffer (0 for a standalone pool).
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -47,6 +47,8 @@ def build_mha_views(
     page_size: int,
     num_pages: int,
     anchor_bytes: int = 0,
+    page_stride_blocks: Optional[int] = None,
+    region_offset_bytes: int = 0,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Per-layer K/V views over ``raw`` for uniform-row MHA.
 
@@ -62,6 +64,19 @@ def build_mha_views(
     Views overlap by ``ps`` rows per block, safe because an id always resolves
     inside its own block; the last view runs ``(2*layer_num - 1) * ps`` rows
     past the envelope, so ``raw`` needs ``UnifiedKVPool.view_tail_pad_bytes``.
+
+    FUSED pages (``page_stride_blocks`` / ``region_offset_bytes``): a page may
+    carry MORE than this family's ``2 * layer_num`` blocks -- e.g. a fused
+    draft-KV region rides after the host blocks in every page. The page
+    stride in THIS family's row units is then ``page_stride_blocks``
+    (= fused page bytes // row_bytes // ps; the caller guarantees
+    divisibility via the spec's lcm padding), and this family's block region
+    starts ``region_offset_bytes`` into each page. The id space scales with
+    the stride -- ``kernel_id(t) = (t // ps) * (ps * page_stride_blocks)
+    + t % ps`` -- which is exactly `kernel_page_multiplier` on the read/write
+    rails, so the SAME machinery serves the host family (offset 0) and the
+    draft family (offset = host region bytes) with their own multipliers.
+    Defaults reproduce the unfused layout byte-identically.
     """
     assert head_dim == v_head_dim, (
         f"build_mha_views requires uniform rows (head_dim == v_head_dim); "
@@ -72,11 +87,26 @@ def build_mha_views(
     row_elems = head_num * head_dim
     row_bytes = row_elems * itemsize
     blocks = 2 * layer_num
-    page_bytes = page_size * blocks * row_bytes
-    n_rows = num_pages * blocks * page_size
+    stride_blocks = page_stride_blocks if page_stride_blocks is not None else blocks
+    assert region_offset_bytes % itemsize == 0, (
+        f"build_mha_views: region_offset_bytes={region_offset_bytes} must "
+        f"align to the store dtype ({itemsize} B)"
+    )
+    assert region_offset_bytes + blocks * page_size * row_bytes <= (
+        stride_blocks * page_size * row_bytes
+    ), (
+        f"build_mha_views: region ({blocks} blocks at offset "
+        f"{region_offset_bytes} B) exceeds the fused page "
+        f"({stride_blocks} stride blocks)"
+    )
+    page_bytes = page_size * stride_blocks * row_bytes
+    n_rows = num_pages * stride_blocks * page_size
     assert anchor_bytes % itemsize == 0
     last_view_end = (
-        anchor_bytes + (blocks - 1) * page_size * row_bytes + n_rows * row_bytes
+        anchor_bytes
+        + region_offset_bytes
+        + (blocks - 1) * page_size * row_bytes
+        + n_rows * row_bytes
     )
     assert last_view_end <= raw.numel() * raw.itemsize, (
         f"build_mha_views: block {blocks - 1}'s view ends at byte "
@@ -89,7 +119,9 @@ def build_mha_views(
     k_buffer: List[torch.Tensor] = []
     v_buffer: List[torch.Tensor] = []
     for layer in range(layer_num):
-        k_base_bytes = anchor_bytes + (2 * layer) * page_size * row_bytes
+        k_base_bytes = (
+            anchor_bytes + region_offset_bytes + (2 * layer) * page_size * row_bytes
+        )
         v_base_bytes = k_base_bytes + page_size * row_bytes
         for base_bytes, out in ((k_base_bytes, k_buffer), (v_base_bytes, v_buffer)):
             assert base_bytes % itemsize == 0
@@ -118,6 +150,7 @@ def build_mla_views(
     page_size: int,
     num_pages: int,
     anchor_bytes: int = 0,
+    page_stride_rows: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """Per-layer views over ``raw`` for MLA in the page-major layout.
 
@@ -128,7 +161,11 @@ def build_mla_views(
     every per-layer view a plain CONTIGUOUS ``(num_pages * layer_num * ps, 1,
     kv_cache_dim)`` tensor, addressed by the layer-independent kernel-facing id
 
-        kernel_id(t) = (t // ps) * (ps * layer_num) + t % ps      (t = physical token)
+        kernel_id(t) = (t // ps) * (ps * page_stride_rows) + t % ps
+
+    (``t`` = physical token; ``page_stride_rows`` defaults to ``layer_num``
+    and grows past it when the page envelope fuses a draft region after the
+    host rows).
 
     so one shared block table (entry = page * layer_num) serves every layer, and
     kernels that require ``.view(-1, page_size, kv_cache_dim)`` (trtllm/cutlass/
@@ -143,8 +180,11 @@ def build_mla_views(
     """
     itemsize = store_dtype.itemsize
     row_bytes = kv_cache_dim * itemsize
-    page_bytes = page_size * layer_num * row_bytes
-    n_rows = num_pages * layer_num * page_size
+    if page_stride_rows is None:
+        # Unfused envelope: exactly the host's latent rows per page.
+        page_stride_rows = layer_num
+    page_bytes = page_size * page_stride_rows * row_bytes
+    n_rows = num_pages * page_stride_rows * page_size
     assert anchor_bytes % itemsize == 0
     last_view_end = (
         anchor_bytes + (layer_num - 1) * page_size * row_bytes + (n_rows * row_bytes)
