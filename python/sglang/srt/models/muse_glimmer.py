@@ -57,7 +57,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import apply_qk_norm, permute_inv
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cuda
 
@@ -784,6 +784,12 @@ class MuseGlimmerVisionAdapter(nn.Module):
 
 
 class MuseGlimmerForCausalLM(nn.Module):
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={"model.language_model.": "model."},
+        orig_to_new_substr={
+            "self_attn.gate_proj": "self_attn.output_gate_proj",
+        },
+    )
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
