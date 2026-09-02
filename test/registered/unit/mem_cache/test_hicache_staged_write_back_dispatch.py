@@ -21,10 +21,9 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
-    HostPoolGroup,
     LogicalHostPool,
-    PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
@@ -222,8 +221,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             op.pool_transfers,
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
-        controller.has_draft = False
-        controller.has_mtp_draft = False
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
         )
@@ -233,6 +230,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller._num_tokens_by_pool.return_value = {}
         controller._transfer_num_bytes.return_value = 0
         controller.l2_transfer_engine = mock.Mock()
+        controller.load_fence_stream = None
         completion = SimpleNamespace(
             start_event=object(), finish_event=object(), timing_enabled=False
         )
@@ -287,20 +285,19 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def test_packed_draft_load_is_flattened_into_l2_transfers(self):
         host_pool = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
+        entry = PoolEntry(
+            name=PoolName.KV,
+            host_pool=host_pool,
+            device_pool=mock.sentinel.target_device_pool,
+            layer_mapper={0: 0, 1: 1, 2: 2}.get,
+            is_primary_index_anchor=True,
+            packed_draft_device_pools=(mock.sentinel.draft_device_pool,),
+        )
         controller.mem_pool_host = SimpleNamespace(
-            anchor_entry=PoolEntry(
-                name=PoolName.KV,
-                host_pool=host_pool,
-                device_pool=mock.sentinel.target_device_pool,
-                layer_mapper={0: 0, 1: 1, 2: 2}.get,
-                is_primary_index_anchor=True,
-            ),
-            entry_map={},
+            anchor_entry=entry,
+            entry_map={entry.name: entry},
         )
         controller.layer_num = 2
-        controller.has_mtp_draft = True
-        controller.mtp_draft_device_pools = (mock.sentinel.draft_device_pool,)
-        controller.has_draft = False
 
         self.assertEqual(
             len(controller._l2_transfers(_indices(0, 2), _indices(2, 4))), 1
@@ -937,7 +934,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=True
         )
         controller.mem_pool_device = None
-        controller.has_draft = False
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
             side_effect=AssertionError(
@@ -972,7 +968,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             captured, can_use_write_back_jit=False
         )
         controller.mem_pool_device = None
-        controller.has_draft = False
         controller.ack_write_queue = []
         controller.move_hybrid_indices = mock.Mock(
             return_value=(op.host_indices, op.device_indices, op.pool_transfers)
@@ -1007,7 +1002,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.io_backend = "kernel"
         controller.mem_pool_host = FakeHostPool()
         controller.mem_pool_device = None
-        controller.has_draft = False
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(
@@ -1044,7 +1038,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.io_backend = "kernel"
         controller.mem_pool_host = FakeHostPool()
         controller.mem_pool_device = None
-        controller.has_draft = False
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.move_indices = mock.Mock(

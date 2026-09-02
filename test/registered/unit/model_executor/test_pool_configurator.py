@@ -12,7 +12,12 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.runtime_context import get_memory, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_server_args,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -311,7 +316,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             )
 
             cfg = create_memory_pool_configurator(mr)
-            config = cfg.calculate_pool_sizes(available_bytes, mr.server_args.page_size)
+            config = cfg.calculate_pool_sizes(available_bytes, get_schedule().page_size)
         return mr, cfg, config
 
     def test_memory_utilization(self):
@@ -413,7 +418,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         user_limit = original.full_max_total_num_tokens // 2
         with mock_cpu_env():
             config = cfg.calculate_pool_sizes_from_max_tokens(
-                user_limit, mr.server_args.page_size
+                user_limit, get_schedule().page_size
             )
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
@@ -995,7 +1000,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
                 cfg = create_memory_pool_configurator(mr)
-                config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+                config = cfg.calculate_pool_sizes(available, get_schedule().page_size)
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
