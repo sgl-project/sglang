@@ -47,6 +47,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
+def get_hybrid_cache_details(req: Req) -> Optional[CachedTokensDetails]:
+    """Build component-level accounting for a hybrid-cache request."""
+    full_attention_cached = getattr(
+        req, "hybrid_cache_full_attention_cached_tokens", None
+    )
+    recurrent_state_cached = getattr(
+        req, "hybrid_cache_recurrent_state_cached_tokens", None
+    )
+    if full_attention_cached is None or recurrent_state_cached is None:
+        return None
+
+    usable = req.cached_tokens
+    recomputed = max(0, len(req.origin_input_ids) - usable)
+    return {
+        "full_attention_cached_tokens": full_attention_cached,
+        "recurrent_state_cached_tokens": recurrent_state_cached,
+        "usable_cached_tokens": usable,
+        "trimmed_full_attention_tokens": max(0, full_attention_cached - usable),
+        # SGLang currently re-prefills the whole model from U. There is no
+        # recurrent-only C:A replay path, so both components execute for every
+        # uncached prompt token.
+        "full_attention_recomputed_tokens": recomputed,
+        "recurrent_recomputed_tokens": recomputed,
+        "recurrent_replayed_tokens": 0,
+    }
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
     has_additional_customized_info: ClassVar[bool] = False
@@ -90,6 +117,7 @@ class SchedulerOutputStreamer:
             - {"device": X, "host": Y} without storage breakdown
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
+        details = None
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
@@ -105,15 +133,19 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
-            return details
-
-        if req.cached_tokens > 0:
-            return {
+        elif req.cached_tokens > 0:
+            details = {
                 "device": req.cached_tokens,
                 "host": 0,
             }
 
-        return None
+        hybrid_details = get_hybrid_cache_details(req)
+        if hybrid_details is not None:
+            if details is None:
+                details = {"device": 0, "host": 0}
+            details.update(hybrid_details)
+
+        return details
 
     def stream_output(
         self,
