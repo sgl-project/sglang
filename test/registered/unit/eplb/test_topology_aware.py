@@ -6,10 +6,12 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 import unittest
 from tempfile import NamedTemporaryFile
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.eplb.topology import load_rank_cost_matrix
+from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
 from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     rebalance_experts_topology_aware,
 )
@@ -124,6 +126,25 @@ class TestTopologyAwarePlacement(unittest.TestCase):
         physical_to_logical, _, _ = rebalance_experts_topology_aware(counts, costs)
 
         self.assertEqual(physical_to_logical[0].tolist(), [2, 3, 0, 1])
+
+    def test_server_guard_requires_eplb(self):
+        with self.assertRaisesRegex(ValueError, "requires --enable-eplb"):
+            handle_eplb_and_dispatch(
+                SimpleNamespace(eplb_algorithm="topology_aware", enable_eplb=False)
+            )
+
+    def test_server_guard_rejects_elastic_ep(self):
+        with self.assertRaisesRegex(ValueError, "does not support elastic EP"):
+            handle_eplb_and_dispatch(
+                SimpleNamespace(
+                    eplb_algorithm="topology_aware",
+                    enable_eplb=True,
+                    eplb_topology="topology.json",
+                    ep_num_redundant_experts=0,
+                    elastic_ep_backend="mooncake",
+                    expert_distribution_recorder_mode=None,
+                )
+            )
 
     def test_rejects_replication_until_supported(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
