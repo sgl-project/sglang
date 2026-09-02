@@ -338,6 +338,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -368,8 +369,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.captured_req_width
+        self.max_num_token = (
+            max(self.capture_num_tokens)
+            if self.capture_num_tokens is not None
+            else self.max_bs * self.captured_req_width
+        )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
