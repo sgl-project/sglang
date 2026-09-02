@@ -150,6 +150,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
             explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
@@ -791,12 +792,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_model_managed_quantization_bypasses_generic_lifecycle(self):
+    def test_model_quantization_backend_bypasses_generic_lifecycle(self):
         model_config = SimpleNamespace(quant_config=None)
         with mock.patch.object(
             TextEncoder,
-            "manages_checkpoint_quantization",
-            True,
+            "checkpoint_quantization_backend",
+            "model",
         ):
             _configure_encoder_quantization(
                 model_config,

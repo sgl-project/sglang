@@ -15,11 +15,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    WeightOverrideComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    _normalize_component_type,
     checkpoint_bytes,
     keep_checkpoint_mapped,
     set_default_torch_dtype,
@@ -40,10 +41,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_enabled,
     resolve_component_precision,
     resolve_decode_precision,
-)
-from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -96,9 +93,9 @@ def _require_native_loader_for_quantized_vae(
 
 
 def _backfill_ltx2_audio_vae_latent_stats(
-    loaded: dict[str, torch.Tensor], component_name: str
+    loaded: dict[str, torch.Tensor], component_type: str
 ) -> None:
-    if component_name != "audio_vae":
+    if component_type != "audio_vae":
         return
     mean_key = "per_channel_statistics.mean-of-means"
     std_key = "per_channel_statistics.std-of-means"
@@ -128,9 +125,9 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
 
 
 def _should_use_channels_last_3d(
-    server_args: ServerArgs | None, component_name: str
+    server_args: ServerArgs | None, component_type: str
 ) -> bool:
-    if component_name not in (
+    if component_type not in (
         "vae",
         "video_vae",
     ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
@@ -232,7 +229,12 @@ def _rehome_cast_weights_to_file(
 
 
 def _hold_decoder_weights_in_decode_dtype(
-    vae, server_args: ServerArgs, component_name: str, component_model_path: str = ""
+    vae,
+    server_args: ServerArgs,
+    component_name: str,
+    component_model_path: str = "",
+    *,
+    component_type: str | None = None,
 ) -> None:
     """Round decoder weights to their decode compute dtype at load.
 
@@ -244,7 +246,8 @@ def _hold_decoder_weights_in_decode_dtype(
     restreaming a third of it per tile and holding all 36 blocks on a 12 GiB
     card for the decode.
     """
-    if component_name not in ("vae", "video_vae"):
+    component_type = component_type or _normalize_component_type(component_name)
+    if component_type not in ("vae", "video_vae"):
         return
     if envs.SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST:
         return
@@ -386,36 +389,41 @@ def _assign_direct_gpu_vae_state(
         )
 
 
-class VAELoader(ComponentLoader):
+class VAELoader(WeightOverrideComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
-    supports_direct_gpu_weight_loading = True
 
-    def supports_direct_gpu_weight_loading_for_component(
-        self, component_name: str
+    def resolve_component_direct_gpu_loading(
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return component_name in ("vae", "video_vae")
+        requested = server_args.should_direct_gpu_weight_load_component(component_name)
+        if requested and component_name not in ("vae", "video_vae"):
+            raise ComponentCheckpointUnsupportedError(
+                f"Direct GPU loading is not implemented for {component_name!r}"
+            )
+        return requested
 
-    @staticmethod
-    def resolve_model_weights_path(
+    def select_weight_files(
+        self,
+        safetensors_list: list[str],
         component_model_path: str,
         server_args: ServerArgs,
         component_name: str,
-    ) -> str:
-        weights_override = getattr(server_args, "component_weights_paths", {}).get(
-            component_name
+        vae_precision: str,
+    ) -> list[str]:
+        return server_args.pipeline_config.select_vae_weight_files(
+            safetensors_list=safetensors_list,
+            component_model_path=component_model_path,
+            component_name=self.structural_component_type(component_name),
+            vae_precision=vae_precision,
         )
-        if weights_override is None:
-            return component_model_path
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
+
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return server_args.component_precisions.get(component_name)
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
@@ -440,23 +448,17 @@ class VAELoader(ComponentLoader):
         cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
-        direct_gpu_weight_loading = server_args.should_direct_gpu_weight_load_component(
-            component_name
+        direct_gpu_weight_loading = self.resolve_component_direct_gpu_loading(
+            server_args, component_name
         )
-        if direct_gpu_weight_loading and component_name not in ("vae", "video_vae"):
-            raise ComponentCheckpointUnsupportedError(
-                f"Direct GPU loading is not implemented for {component_name!r}"
-            )
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,
         )
         config = get_diffusers_component_config(component_path=component_model_path)
         server_args.model_paths[component_name] = component_model_path
-        native_only = component_name in getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
+        native_only = self.is_native_only_component(server_args, component_name)
         _require_native_loader_for_quantized_vae(
             config,
             component_name,
@@ -469,10 +471,11 @@ class VAELoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        if component_name in ("vae", "video_vae"):
+        component_type = self.structural_component_type(component_name)
+        if component_type in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
             pipeline_vae_precision = "vae_precision"
-        elif component_name in ("audio_vae",):
+        elif component_type == "audio_vae":
             pipeline_vae_config_attr = "audio_vae_config"
             pipeline_vae_precision = "audio_vae_precision"
         else:
@@ -524,14 +527,18 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
-            if _should_use_channels_last_3d(server_args, component_name):
+            if _should_use_channels_last_3d(server_args, component_type):
                 n = _convert_conv3d_weights_to_channels_last_3d(vae)
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
             _hold_decoder_weights_in_decode_dtype(
-                vae, server_args, component_name, component_model_path
+                vae,
+                server_args,
+                component_name,
+                component_model_path,
+                component_type=component_type,
             )
             vae = current_platform.optimize_vae(vae)
             return vae
@@ -562,11 +569,12 @@ class VAELoader(ComponentLoader):
             safetensors_list = [component_weights_path]
         else:
             safetensors_list = _list_safetensors_files(component_weights_path)
-            safetensors_list = server_args.pipeline_config.select_vae_weight_files(
-                safetensors_list=safetensors_list,
-                component_model_path=component_weights_path,
-                component_name=component_name,
-                vae_precision=vae_precision,
+            safetensors_list = self.select_weight_files(
+                safetensors_list,
+                component_weights_path,
+                server_args,
+                component_name,
+                vae_precision,
             )
 
         assert (
@@ -591,7 +599,7 @@ class VAELoader(ComponentLoader):
         loaded = {}
         for sf_path in safetensors_list:
             loaded.update(safetensors_load_file(sf_path))
-        _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
+        _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         strict_load = native_only
         # `loaded` holds views into the safetensors mapping. When the component
         # starts on the CPU and the host cannot afford copies of the whole
@@ -634,13 +642,17 @@ class VAELoader(ComponentLoader):
             if unexpected_keys:
                 logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
-        if _should_use_channels_last_3d(server_args, component_name):
+        if _should_use_channels_last_3d(server_args, component_type):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
         _hold_decoder_weights_in_decode_dtype(
-            vae, server_args, component_name, component_weights_path
+            vae,
+            server_args,
+            component_name,
+            component_weights_path,
+            component_type=component_type,
         )
         vae = current_platform.optimize_vae(vae)
         return vae
