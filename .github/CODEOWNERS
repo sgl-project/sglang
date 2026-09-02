@@ -40,6 +40,7 @@
 /python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu @yuan-luo
 /python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/attention/dsa @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me
+/python/sglang/srt/layers/attention/dsa/dsa_topk_backend.py @1am9trash @hubertlu-tw @kkHuang-amd @HaiShaw @Fridge003 @YAMY1234 @rainj-me @zianglih
 /python/sglang/srt/layers/attention/vision.py @mickqian @yuan-luo @yhyang201
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @TamirBaydasov @Alisehen @mmangkad @TallMessiWu
 /python/sglang/srt/layers/quantization/nvfp4_online.py @zianglih
@@ -82,6 +83,7 @@
 /test/registered/prefill_only @sundar24295s @chanh @fortunecookiee
 /benchmark/prefill_only/bench_score.py @sundar24295s @chanh @fortunecookiee
 /test/registered/npu @ping1jing2 @ssshinigami  @e-martirosian
+/test/registered/backends/test_flashinfer_nvfp4_online_moe_backend.py @zianglih
 /test/registered/backends/test_flashinfer_trtllm_gen_moe_backend.py @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ @HaiShaw @b8zhong @OrangeRedeng @Alisehen @mmangkad @zianglih
 /test/registered/rl/test_update_weights_from_disk_blackwell.py @zianglih
 /test/srt/test_modelopt* @Edwardf0t1
