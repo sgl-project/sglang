@@ -427,7 +427,7 @@ export const Qwen35Deployment = () => {
     // fusion flag instead, handled in the AMD backend block below.
     const amdGpu = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
     if (quantization !== 'fp4' && hardware !== 'xeon' && !amdGpu) {
-      cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --flashinfer-allreduce-fusion-backend auto`;
     }
 
     // H200 FP8-specific optimizations

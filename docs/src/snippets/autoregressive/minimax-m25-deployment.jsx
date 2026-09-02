@@ -115,7 +115,7 @@ export const MiniMaxM25Deployment = () => {
     }
 
     if (useAllreduceFusion) {
-      cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
+      cmd += ` \\\n  --flashinfer-allreduce-fusion-backend auto`;
     }
 
     if (isAMD) {
