@@ -275,9 +275,15 @@ python -m sglang.launch_server \
   --eplb-topology /path/to/ep_topology.json
 ```
 
-The current implementation requires `ep_size == tp_size`,
+The current implementation requires an A2A backend, `ep_size == tp_size`,
 `--moe-data-parallel-size 1`, no redundant experts, and the `stat` or
-`stat_approx` expert-distribution recorder. It does not support elastic EP.
+`stat_approx` expert-distribution recorder. `stat_approx` is supported only
+with DeepEP normal mode; DeepEP low-latency/auto and Mori do not expose the
+source-rank counts needed by this planner. It does not support elastic EP.
+
+Rows and columns in the matrix use the SGLang MoE-EP group rank order (the
+same rank order used by the CUDA process group and `CUDA_VISIBLE_DEVICES`),
+not an independently sorted PCIe or hostname order.
 
 
 ## Ascend NPU Guidance

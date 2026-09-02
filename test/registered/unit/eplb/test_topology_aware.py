@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.eplb.topology import load_rank_cost_matrix
 from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
+from sglang.srt.eplb.topology import load_rank_cost_matrix
 from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     rebalance_experts_topology_aware,
 )
@@ -166,6 +166,59 @@ class TestTopologyAwarePlacement(CustomTestCase):
                 )
             )
 
+    def test_server_guard_requires_a2a_backend(self):
+        with self.assertRaisesRegex(ValueError, "requires an MoE A2A backend"):
+            handle_eplb_and_dispatch(
+                SimpleNamespace(
+                    eplb_algorithm="topology_aware",
+                    enable_eplb=True,
+                    eplb_topology="topology.json",
+                    ep_num_redundant_experts=0,
+                    elastic_ep_backend=None,
+                    moe_dp_size=1,
+                    expert_distribution_recorder_mode="stat",
+                    ep_size=2,
+                    tp_size=2,
+                    moe_a2a_backend="none",
+                )
+            )
+
+    def test_server_guard_rejects_deepep_low_latency(self):
+        with self.assertRaisesRegex(ValueError, "source-aware A2A path"):
+            handle_eplb_and_dispatch(
+                SimpleNamespace(
+                    eplb_algorithm="topology_aware",
+                    enable_eplb=True,
+                    eplb_topology="topology.json",
+                    ep_num_redundant_experts=0,
+                    elastic_ep_backend=None,
+                    moe_dp_size=1,
+                    expert_distribution_recorder_mode="stat",
+                    ep_size=2,
+                    tp_size=2,
+                    moe_a2a_backend="deepep",
+                    deepep_mode="low_latency",
+                )
+            )
+
+    def test_server_guard_rejects_approximate_non_deepep_stats(self):
+        with self.assertRaisesRegex(ValueError, "stat_approx requires DeepEP"):
+            handle_eplb_and_dispatch(
+                SimpleNamespace(
+                    eplb_algorithm="topology_aware",
+                    enable_eplb=True,
+                    eplb_topology="topology.json",
+                    ep_num_redundant_experts=0,
+                    elastic_ep_backend=None,
+                    moe_dp_size=1,
+                    expert_distribution_recorder_mode="stat_approx",
+                    ep_size=2,
+                    tp_size=2,
+                    moe_a2a_backend="flashinfer",
+                    deepep_mode="normal",
+                )
+            )
+
     def test_rejects_replication_until_supported(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
         costs = torch.zeros((2, 2), dtype=torch.float32)
@@ -174,10 +227,24 @@ class TestTopologyAwarePlacement(CustomTestCase):
                 counts, costs, num_physical_experts=6
             )
 
+    def test_rejects_inconsistent_physical_expert_dimension(self):
+        counts = torch.ones((1, 2, 4), dtype=torch.int64)
+        costs = torch.zeros((2, 2), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "must match"):
+            rebalance_experts_topology_aware(
+                counts, costs, num_physical_experts=2
+            )
+
     def test_rejects_nonzero_self_cost(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
         costs = torch.ones((2, 2), dtype=torch.float32)
         with self.assertRaisesRegex(ValueError, "diagonal"):
+            rebalance_experts_topology_aware(counts, costs)
+
+    def test_rejects_rank_cost_matrix_shape_mismatch(self):
+        counts = torch.ones((1, 2, 4), dtype=torch.int64)
+        costs = torch.zeros((3, 3), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "does not match"):
             rebalance_experts_topology_aware(counts, costs)
 
     def test_loads_and_validates_json_topology(self):
@@ -193,6 +260,17 @@ class TestTopologyAwarePlacement(CustomTestCase):
             file.flush()
             loaded = load_rank_cost_matrix(file.name, expected_num_ranks=2)
         self.assertEqual(loaded.tolist(), [[0.0, 2.0], [2.0, 0.0]])
+
+    def test_preserves_ep_rank_order_in_asymmetric_matrix(self):
+        topology = {
+            "rank_cost_matrix": [
+                [0, 1, 4],
+                [2, 0, 3],
+                [5, 6, 0],
+            ]
+        }
+        matrix = load_rank_cost_matrix(topology, expected_num_ranks=3)
+        self.assertEqual(matrix.tolist(), topology["rank_cost_matrix"])
 
 
 if __name__ == "__main__":

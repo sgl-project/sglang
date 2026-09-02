@@ -65,9 +65,13 @@ def _validate_inputs(
         raise TypeError("rank_cost_matrix must use a floating-point dtype")
     _validate_rank_cost_matrix(rank_cost_matrix, expected_num_ranks=num_ranks)
 
-    if num_physical_experts != num_logical_experts:
+    if num_physical_experts > num_logical_experts:
         raise NotImplementedError(
             "topology-aware placement currently requires no redundant experts"
+        )
+    if num_physical_experts != num_logical_experts:
+        raise ValueError(
+            "num_physical_experts must match the source-count expert dimension"
         )
     if num_physical_experts <= 0 or num_physical_experts % num_ranks != 0:
         raise ValueError("num_physical_experts must be positive and divisible by ranks")

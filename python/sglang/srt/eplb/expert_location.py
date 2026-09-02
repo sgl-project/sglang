@@ -229,6 +229,17 @@ class ExpertLocationMetadata:
             # planner works layer-major to match the other EPLB algorithms.
             if not isinstance(logical_count_by_rank, torch.Tensor):
                 logical_count_by_rank = torch.as_tensor(logical_count_by_rank)
+            expected_source_shape = (
+                common["ep_size"],
+                logical_count.shape[-2],
+                model_config_for_expert_location.num_logical_experts,
+            )
+            if tuple(logical_count_by_rank.shape) != expected_source_shape:
+                raise ValueError(
+                    "topology-aware EPLB source counts must have shape "
+                    f"{expected_source_shape}, got "
+                    f"{tuple(logical_count_by_rank.shape)}"
+                )
             tokens_per_source_expert = logical_count_by_rank.movedim(0, 1)
 
         physical_to_logical_map, logical_to_all_physical_map, expert_count = (

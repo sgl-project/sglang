@@ -558,6 +558,25 @@ def handle_eplb_and_dispatch(server_args: Any):
                 "topology-aware EPLB requires expert distribution recorder mode "
                 "'stat' or 'stat_approx'"
             )
+        a2a_backend = resolved_view(server_args).moe_a2a_backend
+        if a2a_backend == "none":
+            raise ValueError(
+                "topology-aware EPLB requires an MoE A2A backend; "
+                "--moe-a2a-backend none has no source-to-destination traffic"
+            )
+        if cfg.expert_distribution_recorder_mode == "stat_approx" and (
+            a2a_backend != "deepep" or cfg.deepep_mode != "normal"
+        ):
+            raise ValueError(
+                "topology-aware EPLB with stat_approx requires DeepEP normal mode"
+            )
+        if (a2a_backend == "deepep" and cfg.deepep_mode != "normal") or (
+            a2a_backend == "mori"
+        ):
+            raise ValueError(
+                "topology-aware EPLB requires a source-aware A2A path; "
+                "DeepEP low-latency/auto and Mori do not expose source counts"
+            )
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
