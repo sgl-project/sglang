@@ -49,7 +49,7 @@ class MoriTransferEngineBase(PDDisaggregationServerBase):
         cls._old_use_aiter = os.environ.get("SGLANG_USE_AITER")
         os.environ["SGLANG_USE_AITER"] = "1"
 
-        # The shared fixture defaults to Mooncake in CI; pin Mori explicitly here.
+        # The shared fixture defaults to Mooncake in CI; pin the Mori backend explicitly.
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mori"]
 
         rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
