@@ -1179,6 +1179,11 @@ class Envs:
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
     SGLANG_ENABLE_FAST_INPUT_LOGPROBS = EnvBool(True)
+    # Sample next tokens directly from temperature-scaled logits via the fused
+    # flashinfer samplers, skipping the explicit full-vocab softmax (and
+    # torch.multinomial for the filter-free case). Escape hatch only; the
+    # top-k/top-p kernel draws RNG-for-RNG identical tokens either way.
+    SGLANG_DISABLE_SAMPLING_FROM_LOGITS = EnvBool(False)
 
     # ===================================================================
     # Deterministic inference and all-reduce
