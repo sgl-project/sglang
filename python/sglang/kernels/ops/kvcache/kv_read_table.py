@@ -74,6 +74,7 @@ def build_kv_read_indices_kernel(
     item_stride,  # runtime: items one program advances per loop trip
     PAGE_SIZE: tl.constexpr,
     EMIT_PER_TOKEN: tl.constexpr,
+    OUT_INT64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -113,7 +114,10 @@ def build_kv_read_indices_kernel(
             value = entry * PAGE_SIZE + pos % PAGE_SIZE
         else:
             value = entry
-        tl.store(row_out + item, value.to(tl.int32), mask=mask)
+        if OUT_INT64:
+            tl.store(row_out + item, value, mask=mask)
+        else:
+            tl.store(row_out + item, value.to(tl.int32), mask=mask)
 
 
 def _launch(
@@ -149,6 +153,7 @@ def _launch(
         item_programs * _BLOCK_ITEMS,
         PAGE_SIZE=page_size,
         EMIT_PER_TOKEN=emit_per_token,
+        OUT_INT64=out.dtype == torch.int64,
         BLOCK=_BLOCK_ITEMS,
         num_warps=_NUM_WARPS,
     )
@@ -250,13 +255,15 @@ def build_kv_read_table_packed(
     """Fill ``out``'s CSR rows with TOKEN STREAM ids.
 
     ``seq_lens`` counts tokens per row and ``indptr`` gives each row's start, so
-    ``out`` holds ``sum(seq_lens)`` entries. ``kv_start_idx`` shifts a row's
-    window start without moving where it lands.
+    the live stream is ``sum(seq_lens)`` long; ``max_tokens`` is the capacity
+    ``out`` must have for that, and callers holding a capture-stable buffer pass
+    its size. ``kv_start_idx`` shifts a row's window start without moving where
+    it lands.
     """
     bs = int(req_pool_indices.numel())
-    assert (
-        out.dtype == torch.int32
-    ), f"build_kv_read_table_packed: out must be int32, got {out.dtype}"
+    assert out.dtype in (torch.int32, torch.int64), (
+        f"build_kv_read_table_packed: out must be int32 or int64, got " f"{out.dtype}"
+    )
     assert out.dim() == 1 and out.numel() >= max_tokens, (
         f"build_kv_read_table_packed: out {tuple(out.shape)} cannot hold "
         f"max_tokens={max_tokens}"
@@ -269,10 +276,11 @@ def build_kv_read_table_packed(
         return out
 
     if not req_to_token.is_cuda:
-        positions = torch.arange(max_tokens, device=req_to_token.device)
         for b in range(bs):
             n = int(seq_lens[b])
-            pos = positions[:n] + (0 if kv_start_idx is None else int(kv_start_idx[b]))
+            pos = torch.arange(n, device=req_to_token.device) + (
+                0 if kv_start_idx is None else int(kv_start_idx[b])
+            )
             entry = _entries(
                 req_to_token=req_to_token,
                 req=int(req_pool_indices[b]),
@@ -282,9 +290,7 @@ def build_kv_read_table_packed(
                 page_size=page_size,
             )
             start = int(indptr[b])
-            out[start : start + n] = (entry * page_size + pos % page_size).to(
-                torch.int32
-            )
+            out[start : start + n] = (entry * page_size + pos % page_size).to(out.dtype)
         return out
 
     _launch(
