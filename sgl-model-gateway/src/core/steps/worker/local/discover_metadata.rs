@@ -284,12 +284,28 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                 // /server_info reports the launch configuration; /model_info
                 // reports the model the worker is serving now. Both are read
                 // here, and a failure of one does not lose the other.
-                let server_info = get_server_info(&config.url, config.api_key.as_deref())
+                // Neither call failing is fatal here: the step is declared
+                // optional so that a slow worker still reaches create_worker.
+                // But swallowing them silently leaves an operator with no way
+                // to tell a worker that answered from one that never did, so
+                // each failure is logged.
+                let server_info = match get_server_info(&config.url, config.api_key.as_deref())
                     .await
-                    .ok();
-                let model_info = get_model_info(&config.url, config.api_key.as_deref())
-                    .await
-                    .ok();
+                {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        warn!("/server_info failed for {}: {}", config.url, e);
+                        None
+                    }
+                };
+                let model_info = match get_model_info(&config.url, config.api_key.as_deref()).await
+                {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        warn!("/model_info failed for {}: {}", config.url, e);
+                        None
+                    }
+                };
 
                 // Identity comes from /model_info, which a weight update moves;
                 // /server_info answers the launch record and is the fallback for
@@ -358,10 +374,16 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
                 // If no model name discovered yet, try /v1/models as fallback
                 if !labels.contains_key("model_path") && !labels.contains_key("served_model_name") {
-                    if let Ok(model_name) =
-                        get_model_name_from_v1_models(&config.url, config.api_key.as_deref()).await
+                    match get_model_name_from_v1_models(&config.url, config.api_key.as_deref())
+                        .await
                     {
-                        labels.insert("served_model_name".to_string(), model_name);
+                        Ok(model_name) => {
+                            labels.insert("served_model_name".to_string(), model_name);
+                        }
+                        Err(e) => warn!(
+                            "no model identity discovered for {}: /v1/models also failed: {}",
+                            config.url, e
+                        ),
                     }
                 }
 
