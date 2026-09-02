@@ -3061,7 +3061,16 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
                 trace_ctx=self.trace_ctx.copy_for_thread(),
                 wait_event=wait_event,
             )
-        self._record_transfer_indices(kv_indices, state_indices)
+        # Nonzero CP ranks still enqueue the final chunk so their completion
+        # notification is emitted, but the worker suppresses replicated state
+        # from those ranks. Keep the transfer metric aligned with the bytes
+        # that are actually sent.
+        metric_state_indices = (
+            None
+            if self.kv_mgr._should_skip_cp_replicated_state_transfer()
+            else state_indices
+        )
+        self._record_transfer_indices(kv_indices, metric_state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
