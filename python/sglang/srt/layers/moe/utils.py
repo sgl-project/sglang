@@ -44,6 +44,7 @@ class MoeA2ABackend(Enum):
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
+    NCCL = "nccl"
     CUSTOMIZED = "customized"
 
     @classmethod
@@ -87,6 +88,9 @@ class MoeA2ABackend(Enum):
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
+
+    def is_nccl(self):
+        return self == MoeA2ABackend.NCCL
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
@@ -719,6 +723,10 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     if get_moe_a2a_backend().is_pplx():
         # pplx's AllToAll.combine already sums each token's expert outputs back
         # to the source rank
+        return True
+    if get_moe_a2a_backend().is_nccl():
+        # The NCCL dispatcher's reverse all-to-all and scatter-add already
+        # restore the complete routed-expert sum on each source rank.
         return True
     return False
 

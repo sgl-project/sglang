@@ -19,6 +19,10 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.nccl import (
+        NcclCombineInput,
+        NcclDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
         StandardDispatchOutput,
@@ -332,4 +336,39 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_pre_permute("nccl", "triton")
+def pre_permute_nccl_to_triton(
+    dispatch_output: NcclDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    running_state["nccl_route_handle"] = dispatch_output.route_handle
+    standard_output = StandardDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=None,
+        topk_output=dispatch_output.topk_output,
+    )
+    return pre_permute_standard_to_triton(
+        standard_output, quant_info, runner_config, running_state
+    )
+
+
+@register_post_permute("triton", "nccl")
+def post_permute_triton_to_nccl(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> NcclCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.nccl import NcclCombineInput
+
+    return NcclCombineInput(
+        hidden_states=runner_output.hidden_states,
+        route_handle=running_state["nccl_route_handle"],
     )

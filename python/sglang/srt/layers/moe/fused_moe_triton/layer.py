@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.nccl import NcclDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
@@ -206,6 +207,11 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_experts=moe_runner_config.num_experts,
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
+            moe_runner_config=moe_runner_config,
+        )
+    elif a2a_backend.is_nccl():
+        return NcclDispatcher(
+            group=get_moe_ep_group().device_group,
             moe_runner_config=moe_runner_config,
         )
     else:

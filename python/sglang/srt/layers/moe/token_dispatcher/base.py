@@ -31,6 +31,8 @@ if TYPE_CHECKING:
         DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        NcclCombineInput,
+        NcclDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -173,6 +175,12 @@ class DispatchOutputChecker:
     ) -> TypeGuard[DeepEPv2DispatchOutput]:
         return dispatch_output.format.is_deepep_v2()
 
+    @staticmethod
+    def format_is_nccl(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[NcclDispatchOutput]:
+        return dispatch_output.format.is_nccl()
+
 
 class DispatchOutputFormat(Enum):
 
@@ -182,6 +190,7 @@ class DispatchOutputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    NCCL = "nccl"
 
     def is_standard(self) -> bool:
         return self == DispatchOutputFormat.STANDARD
@@ -206,6 +215,9 @@ class DispatchOutputFormat(Enum):
 
     def is_deepep_v2(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_V2
+
+    def is_nccl(self) -> bool:
+        return self == DispatchOutputFormat.NCCL
 
 
 @runtime_checkable
@@ -267,6 +279,12 @@ class CombineInputChecker:
     ) -> TypeGuard[DeepEPv2CombineInput]:
         return combine_input.format == CombineInputFormat.DEEPEP_V2
 
+    @staticmethod
+    def format_is_nccl(
+        combine_input: CombineInput,
+    ) -> TypeGuard[NcclCombineInput]:
+        return combine_input.format == CombineInputFormat.NCCL
+
 
 class CombineInputFormat(Enum):
     STANDARD = "standard"
@@ -275,6 +293,7 @@ class CombineInputFormat(Enum):
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
     ASCEND_TP = "ascend_tp"
+    NCCL = "nccl"
 
 
 @runtime_checkable
