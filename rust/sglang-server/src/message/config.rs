@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
+use crate::api_server::auth::AuthConfig;
+
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
 /// `Server::start` parameters.
@@ -57,6 +59,9 @@ pub struct RuntimeConfig {
     /// config-endpoint metadata). `Arc` so cloning the config (and, downstream,
     /// each `AppState`) is cheap; immutable after construction.
     pub server_args: Arc<ServerArgs>,
+    /// HTTP authorization policy, kept separate from scheduler/model arguments
+    /// so credentials never enter response shaping or scheduler messages.
+    pub(crate) auth_config: Arc<AuthConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -64,6 +69,7 @@ impl Default for RuntimeConfig {
         Self {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
+            auth_config: Arc::new(AuthConfig::default()),
         }
     }
 }

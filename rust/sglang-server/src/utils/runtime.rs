@@ -310,6 +310,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.stage_channel_cap,
                     cfg.server_args.clone(),
+                    cfg.auth_config.clone(),
                     // Response heartbeat watched by `/health_generate`.
                     response_activity,
                     shutdown_rx,
@@ -366,6 +367,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            ..Default::default()
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg).expect("start runtime");
@@ -402,6 +404,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            ..Default::default()
         };
         let rt = start(cfg).expect("start runtime");
 
@@ -447,6 +450,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            ..Default::default()
         };
         let rt = start(cfg).expect("start runtime");
 
@@ -508,6 +512,7 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            ..Default::default()
         };
         let err = match start(cfg) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),

@@ -21,6 +21,7 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
+use crate::api_server::auth::AuthConfig;
 use crate::message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RuntimeConfig, RustServerServerArgs, ServerArgs,
@@ -92,6 +93,8 @@ impl Server {
         from_scheduler_cap = 8192,
         stage_channel_cap = 8192,
         cores = None,
+        api_key = None,
+        admin_api_key = None,
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
     // surface (all optional overrides), not a call-site ergonomics problem.
@@ -103,6 +106,8 @@ impl Server {
         from_scheduler_cap: usize,
         stage_channel_cap: usize,
         cores: Option<Vec<usize>>,
+        api_key: Option<String>,
+        admin_api_key: Option<String>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -124,6 +129,7 @@ impl Server {
                 cores,
             },
             server_args: std::sync::Arc::new(server_args),
+            auth_config: std::sync::Arc::new(AuthConfig::new(api_key, admin_api_key)),
         };
         let rt = runtime::start(cfg).map_err(|e| value_error("runtime start failed", e))?;
         Ok(Server { rt })

@@ -36,6 +36,7 @@ arc-swap = "1"
 axum = { version = "0.8.9", features = ["json", "tokio"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
+constant_time_eq = "0.4"
 core_affinity = "0.8"
 # the dynamo-tokenizers is deps on hf-hub, should bump version together.
 dynamo-tokenizers = "1.7.0"
