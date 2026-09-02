@@ -128,7 +128,7 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         if base_output is None:
             return None
 
-        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids_tensor, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

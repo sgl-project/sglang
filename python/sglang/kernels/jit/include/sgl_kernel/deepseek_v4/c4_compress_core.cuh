@@ -170,7 +170,7 @@ SGL_DEVICE device::AlignedVector<float, Trait::kTileElements> c4_compress_core(
     float sum_product = 0.0f;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
-      const auto exp_score = expf(s[j] - max_value);
+      const auto exp_score = __expf(s[j] - max_value);
       sum_product += cast<float>(kv[j][i]) * exp_score;
       sum_exp_value += exp_score;
     }

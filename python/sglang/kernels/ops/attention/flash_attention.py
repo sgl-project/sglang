@@ -257,7 +257,6 @@ def flash_attn_varlen_func(
     ver=3,
     out=None,
 ):
-
     if ver == 3:
         return fa3_flash_attn_varlen_func(
             q,

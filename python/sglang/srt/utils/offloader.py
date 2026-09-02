@@ -17,7 +17,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
 from sglang.srt.utils.host_shared_memory import (
     HostSharedMemoryManager,
@@ -66,7 +65,7 @@ def set_offloader(instance: BaseOffloader):
     _instance = instance
 
 
-def create_offloader_from_server_args(server_args: ServerArgs, dp_rank: int):
+def create_offloader(dp_rank: int):
     if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
