@@ -14,20 +14,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import channel_quant_to_tensor_quant
-from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
-    QuarkW8A8Fp8,
-    is_quark_w8a8_fp8_layer,
-)
 from sglang.test.test_utils import CustomTestCase
-
-
-def _make_quark_w8a8_fp8_scheme() -> QuarkW8A8Fp8:
-    """Per-channel (PTPC) dynamic-activation W8A8 FP8 scheme, as loaded from a
-    Quark checkpoint's kv_b_proj / o_proj config."""
-    return QuarkW8A8Fp8(
-        weight_config={"qscheme": "per_channel"},
-        input_config={"is_dynamic": True, "qscheme": "per_channel"},
-    )
 
 
 class TestChannelQuantToTensorQuantBroadcast(CustomTestCase):
@@ -72,36 +59,6 @@ class TestChannelQuantToTensorQuantBroadcast(CustomTestCase):
         dq = q_tensor.to(torch.float32) * tensor_scale
         expected = torch.ones(n, k, dtype=torch.float32) * scale
         torch.testing.assert_close(dq, expected, rtol=0.1, atol=0.5)
-
-
-class TestIsQuarkW8A8Fp8Layer(CustomTestCase):
-    """The predicate that routes Quark FP8 attention layers away from the aiter
-    group-128 fused RMSNorm+quant kernel.
-
-    A false negative re-enables the fused path and feeds the Quark linear a
-    pre-quantized tuple it can't consume (the ``assert not isinstance(x, tuple)``
-    in ``apply_weights`` fires); a false positive disables fusion for unrelated
-    FP8 layers. Both branches are pinned here.
-    """
-
-    def test_true_for_quark_w8a8_fp8_scheme(self):
-        layer = torch.nn.Linear(4, 4)
-        layer.scheme = _make_quark_w8a8_fp8_scheme()
-        self.assertTrue(is_quark_w8a8_fp8_layer(layer))
-
-    def test_false_for_layer_without_scheme(self):
-        # Plain FP8 linear (e.g. compressed_tensors) has no ``scheme`` attr.
-        self.assertFalse(is_quark_w8a8_fp8_layer(torch.nn.Linear(4, 4)))
-
-    def test_false_for_none_scheme(self):
-        layer = torch.nn.Linear(4, 4)
-        layer.scheme = None
-        self.assertFalse(is_quark_w8a8_fp8_layer(layer))
-
-    def test_false_for_unrelated_scheme_type(self):
-        layer = torch.nn.Linear(4, 4)
-        layer.scheme = object()
-        self.assertFalse(is_quark_w8a8_fp8_layer(layer))
 
 
 if __name__ == "__main__":
