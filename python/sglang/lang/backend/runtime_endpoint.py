@@ -443,7 +443,9 @@ class Runtime:
         from sglang.srt.utils import kill_process_tree
 
         if self.pid is not None:
-            kill_process_tree(self.pid)
+            # Note(kpham-sgl): __del__ routes here, so the reap wait has to stay
+            # off -- blocking inside GC stalls whichever thread is allocating.
+            kill_process_tree(self.pid, wait_timeout=None)
             self.pid = None
 
     def start_profile(self):

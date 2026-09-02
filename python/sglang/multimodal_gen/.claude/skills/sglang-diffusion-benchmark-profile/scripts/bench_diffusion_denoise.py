@@ -16,8 +16,9 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
-    # Check Eager/BCG at lossless/high on one GPU set; high+BCG is invalid when
-    # request-scoped DiT fusions mount only after lossless graph capture.
+    # Check Eager/BCG at every request quality on one GPU set; extra-high/high
+    # + BCG are invalid when request-scoped DiT fusions mount only after the
+    # lossless graph capture.
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
 
     # Clean an isolated model cache even if the run fails or is interrupted
@@ -80,14 +81,14 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
-BENCHMARK_QUALITY_LEVELS = ("lossless", "high")
+BENCHMARK_QUALITY_LEVELS = ("lossless", "extra-high", "high")
 BCG_CAPTURE_SIGNAL = "[diffusion bcg] captured"
 BCG_INVALID_SIGNALS = (
     "[diffusion bcg] capture failed",
     "[diffusion bcg] disabled",
     "[diffusion bcg] serving signature missed",
     "no graph will be captured",
-    "quality='high' cannot be used with breakable cuda graphs",
+    "cannot be used with breakable cuda graphs",
 )
 BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
 QUALITY_BCG_ABBA_MATRIX = (
@@ -95,6 +96,10 @@ QUALITY_BCG_ABBA_MATRIX = (
     ("bcg-lossless-a", "lossless", True),
     ("bcg-lossless-b", "lossless", True),
     ("eager-lossless-b", "lossless", False),
+    ("eager-extra-high-a", "extra-high", False),
+    ("bcg-extra-high-a", "extra-high", True),
+    ("bcg-extra-high-b", "extra-high", True),
+    ("eager-extra-high-b", "extra-high", False),
     ("eager-high-a", "high", False),
     ("bcg-high-a", "high", True),
     ("bcg-high-b", "high", True),
@@ -121,7 +126,16 @@ MODEL_WEIGHT_SUFFIXES = {
     ".pth",
     ".safetensors",
 }
-GENERATED_OUTPUT_SUFFIXES = {".jpeg", ".jpg", ".mp4", ".png", ".wav", ".webp"}
+GENERATED_OUTPUT_SUFFIXES = {
+    ".glb",
+    ".jpeg",
+    ".jpg",
+    ".mp4",
+    ".obj",
+    ".png",
+    ".wav",
+    ".webp",
+}
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -1724,6 +1738,8 @@ def build_sglang_cmd(
             if warmup_resolutions:
                 cmd.append("--warmup-resolutions")
                 cmd.extend(warmup_resolutions)
+        if "warmup-num-frames" not in parsed_args and "num-frames" in parsed_args:
+            cmd.extend(["--warmup-num-frames", str(parsed_args["num-frames"])])
         if bcg_text_buckets is not None:
             cmd.append("--bcg-text-buckets")
             cmd.extend(str(bucket) for bucket in bcg_text_buckets)
@@ -1827,11 +1843,11 @@ def _run_benchmark_once_impl(
             if BCG_CAPTURE_SIGNAL in lower_line:
                 bcg_capture_detected = True
             if (
-                quality == "high"
+                quality in {"extra-high", "high"}
                 and breakable_cuda_graph
                 and bcg_capture_detected
                 and "mounted " in lower_line
-                and "for quality=high" in lower_line
+                and f"for quality={quality}" in lower_line
             ):
                 bcg_invalid_signals.add(BCG_LATE_QUALITY_FUSION_SIGNAL)
             bcg_invalid_signals.update(
@@ -2245,7 +2261,8 @@ def main():
         "--quality-bcg-matrix",
         action="store_true",
         help=(
-            "Run lossless/high Eager-vs-BCG as two ABBA pairs on one GPU set "
+            "Run lossless/extra-high/high Eager-vs-BCG as three ABBA pairs "
+            "on one GPU set "
             "and one task-owned model cache."
         ),
     )

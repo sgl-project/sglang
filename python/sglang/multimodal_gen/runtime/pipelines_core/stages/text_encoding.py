@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision_override,
+)
 
 logger = init_logger(__name__)
 
@@ -175,6 +178,10 @@ class TextEncodingStage(ConditionEncodingStage):
                 stage_name=stage_name,
                 component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
                 preferred_ready_after_request=i == 0,
+                target_dtype=resolve_component_precision_override(
+                    server_args,
+                    "text_encoder" if i == 0 else f"text_encoder_{i + 1}",
+                ),
             )
             for i in range(len(self.text_encoders))
         ]

@@ -11,16 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""GPU parity of the dense-view `UnifiedMLATokenToKVPool` against the stock
+"""GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
-The unified pool receives DENSE locs (dense(t) = (t//ps)*(ps*L) + t%ps); the
+The unified pool receives kernel-facing locs (kernel_id(t) = (t//ps)*(ps*L) + t%ps); the
 reference pool receives the raw token ids. Every (layer, token) cell must hold
 identical bytes afterwards. Covers:
 
   - `set_mla_kv_buffer` under BOTH kernel paths — the Triton fallback
     (n_loc < 768) and the TMA JIT fast path (n_loc >= 768, which flattens the
-    buffer via `.view(shape[0], -1)`, only legal because dense views are
+    buffer via `.view(shape[0], -1)`, only legal because per-layer views are
     contiguous);
   - `set_kv_buffer` (combined pre-concatenated write, the Triton-backend path);
   - `get_mla_kv_buffer` roundtrip;
@@ -48,7 +48,7 @@ _D = _LORA + _ROPE
 _DTYPE = torch.bfloat16
 
 
-def _dense(t: torch.Tensor, ps: int) -> torch.Tensor:
+def _kernel_id(t: torch.Tensor, ps: int) -> torch.Tensor:
     return (t // ps) * (ps * _L) + t % ps
 
 
@@ -85,7 +85,6 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         device=_DEV,
         enable_memory_saver=False,
         page_size=ps,
-        view_tail_pad_bytes=ps * full.entry_bytes(),
     )
     unified = UnifiedMLATokenToKVPool(
         unified_buffer=pool,
@@ -118,7 +117,7 @@ def _rand_locs(max_tokens: int, ps: int, n: int) -> torch.Tensor:
 class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
     def _assert_parity(self, unified, ref, locs, ps, layers=range(_L)):
         for l in layers:
-            got = unified.get_key_buffer(l)[_dense(locs, ps)]
+            got = unified.get_key_buffer(l)[_kernel_id(locs, ps)]
             want = ref.get_key_buffer(l)[locs]
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
@@ -130,7 +129,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=l)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _dense(locs, ps), nope, rope)
+            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
             ref.set_mla_kv_buffer(layer, locs, nope, rope)
         torch.cuda.synchronize()
         self._assert_parity(unified, ref, locs, ps)
@@ -156,7 +155,7 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             for l in (0, _L // 2, _L - 1):
                 layer = types.SimpleNamespace(layer_id=l)
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _dense(locs, ps), k, None)
+                unified.set_kv_buffer(layer, _kernel_id(locs, ps), k, None)
                 ref.set_kv_buffer(layer, locs, k, None)
             torch.cuda.synchronize()
             self._assert_parity(unified, ref, locs, ps, layers=(0, _L // 2, _L - 1))
@@ -170,8 +169,8 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             layer = types.SimpleNamespace(layer_id=3)
             nope = torch.randn(n_loc, 1, _LORA, dtype=_DTYPE, device=_DEV)
             rope = torch.randn(n_loc, 1, _ROPE, dtype=_DTYPE, device=_DEV)
-            unified.set_mla_kv_buffer(layer, _dense(locs, ps), nope, rope)
-            got_nope, got_rope = unified.get_mla_kv_buffer(layer, _dense(locs, ps))
+            unified.set_mla_kv_buffer(layer, _kernel_id(locs, ps), nope, rope)
+            got_nope, got_rope = unified.get_mla_kv_buffer(layer, _kernel_id(locs, ps))
             torch.cuda.synchronize()
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
@@ -188,14 +187,15 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             for l in range(_L):
                 layer = types.SimpleNamespace(layer_id=l)
                 k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _dense(src_t, ps), k, None)
+                unified.set_kv_buffer(layer, _kernel_id(src_t, ps), k, None)
             before = [
-                unified.get_key_buffer(l)[_dense(src_t, ps)].clone() for l in range(_L)
+                unified.get_key_buffer(l)[_kernel_id(src_t, ps)].clone()
+                for l in range(_L)
             ]
             unified.move_kv_cache(dst_t, src_t)
             torch.cuda.synchronize()
             for l in range(_L):
-                got = unified.get_key_buffer(l)[_dense(dst_t, ps)]
+                got = unified.get_key_buffer(l)[_kernel_id(dst_t, ps)]
                 torch.testing.assert_close(got, before[l], rtol=0, atol=0)
 
 

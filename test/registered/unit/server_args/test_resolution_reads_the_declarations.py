@@ -4,8 +4,8 @@
 nothing. The fields keep what the caller passed, so a resolver that reads a
 field another resolver may have decided reads the raw input -- silently, and
 only on the configurations where that other resolver fires. The whole pipeline
-therefore reads through `resolving_view` (or `ServerArgs._resolved()`, which is
-the same view spelled as the record's own member), and this pins that there is
+therefore reads through `resolving_view` (or `resolved_view`, which is
+the same view after resolution has finished), and this pins that there is
 nothing left reading a field directly.
 
 Subjects: every function in `arg_groups/` that takes a config, every
@@ -81,40 +81,8 @@ def _field_reads(fn, holders):
             yield node.lineno, node.attr
 
 
-def _resolution_handlers():
-    """The `ServerArgs` methods the dispatcher reaches, transitively."""
-    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
-    cls = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == "ServerArgs"
-    )
-    methods = {
-        node.name: node
-        for node in cls.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert "_run_resolution_pipeline" in methods, "the dispatcher was renamed"
-    seen, stack = set(), ["_run_resolution_pipeline"]
-    while stack:
-        name = stack.pop()
-        if name in seen or name not in methods:
-            continue
-        seen.add(name)
-        for node in ast.walk(methods[name]):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "self"
-            ):
-                stack.append(node.func.attr)
-    return {name: methods[name] for name in seen}
-
-
 _DECLARERS = frozenset(
     {
-        "_declare",
         "declare_resolution",
         "declare_late_resolution",
         "declare_direct_writes",
@@ -420,7 +388,7 @@ def reads_a_leaf_through_the_alias(runner):
 
 
 def hands_the_accessor_to_a_helper():
-    return compute_world_size(get_server_args())
+    return attention_backends_of(get_server_args())
 
 
 def reads_the_view(runner):
@@ -469,21 +437,30 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
             + "\n  ".join(offenders),
         )
 
-    def test_no_handler_reads_a_field_off_self(self):
-        handlers = _resolution_handlers()
-        self.assertGreater(
-            len(handlers), 50, f"only {len(handlers)} handlers were reached"
+    def test_the_record_hosts_no_resolution_handler(self):
+        """The pipeline and every step it runs live under `arg_groups/`.
+
+        While a step was a method, it could read a raw field off `self` and
+        `test_no_handler_reads_a_field_off_self` had to say it could not. There
+        is no such method left, so the invariant is now the stronger one: the
+        record hosts none of them. What the steps read is checked on the
+        package side, by `test_no_hook_reads_a_field_off_the_record`.
+        """
+        handlers = sorted(
+            name
+            for name, node in _record_members().items()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and (
+                name.split(".")[-1].startswith(("_handle_", "_validate_"))
+                or "resolution_pipeline" in name
+            )
         )
-        offenders = []
-        for name, fn in sorted(handlers.items()):
-            for lineno, field in _field_reads(fn, {"self"}):
-                offenders.append(f"server_args.py:{lineno} {name} reads self.{field}")
         self.assertEqual(
-            offenders,
+            handlers,
             [],
-            "a resolution handler reads its own field; the field holds the raw "
-            "input. Bind `cfg = resolving_view(self)` and read that:\n  "
-            + "\n  ".join(offenders),
+            "a resolution handler is back on the record; it belongs in an "
+            "`arg_groups` family, where the package-side guards can see it:\n  "
+            + "\n  ".join(handlers),
         )
 
     def test_no_member_recomputes_from_a_raw_field(self):
@@ -492,7 +469,9 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
             len(decided), 100, f"the declaration set derived only {len(decided)} fields"
         )
         members = _record_members()
-        self.assertGreater(len(members), 100, f"only {len(members)} members were found")
+        # The floor is here to catch the scan collapsing, not to pin the
+        # class's size.
+        self.assertGreater(len(members), 15, f"only {len(members)} members were found")
         offenders = []
         for name, fn in sorted(members.items()):
             holders = _holders(fn) | {"self"}
@@ -580,7 +559,7 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
         """
         helpers = _config_reading_helpers()
         decided = _declared_fields()
-        for name in ("m3_fp8_attn_gemm_enabled", "compute_world_size"):
+        for name in ("m3_fp8_attn_gemm_enabled", "attention_backends_of"):
             self.assertIn(name, helpers, f"the helper derivation lost {name}")
         for field in ("speculative_num_draft_tokens", "attention_backend"):
             self.assertIn(field, decided, f"the declared set lost {field}")
@@ -598,8 +577,8 @@ class TestResolutionReadsTheDeclarations(CustomTestCase):
                 "sa_local.attention_backend",
                 "self._server_args.attention_backend",
                 "engine_args.attention_backend",
-                "compute_world_size(get_server_args())"
-                " reads " + ", ".join(helpers["compute_world_size"]),
+                "attention_backends_of(get_server_args())"
+                " reads " + ", ".join(helpers["attention_backends_of"]),
             },
             "the scan lost a spelling, or started flagging a legal one:\n  "
             + "\n  ".join(sorted(flagged)),

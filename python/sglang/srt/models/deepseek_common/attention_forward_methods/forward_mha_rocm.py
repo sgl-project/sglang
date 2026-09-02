@@ -22,7 +22,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     forward_dsa_indexer_for_mha,
     resolve_attn_backend,
@@ -306,6 +309,10 @@ class DeepseekMHARocmForwardMixin:
     ):
         if _use_aiter_gfx95:
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            # Read door: the pool never translates, so the production site does.
+            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
+                kv_indices
+            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )

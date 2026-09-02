@@ -240,7 +240,7 @@ def _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().config.tp_size,
+            tp_size=get_parallel().tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
