@@ -484,6 +484,42 @@ impl PolicyRegistry {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AffinityConfig, SessionAffinityMode};
+    use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::admission::{
+        resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
+    };
+    use crate::policies::cache_aware::CacheAwarePolicy;
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// 仅用于策略测试的 #34608 `LoadStat` 聚合值。
+    #[derive(Clone, Default)]
+    struct TestEngineLoad {
+        num_running_reqs: u64,
+        num_waiting_reqs: u64,
+        num_tokens: u64,
+        max_total_num_tokens: u64,
+    }
+
+    fn worker(id: &str) -> Arc<Worker> {
+        Arc::new(Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: format!("http://{id}:30000"),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("model".into())],
+            bootstrap_port: None,
+        }))
+    }
+
     #[test]
     fn default_proposal_preserves_legacy_single_worker_selection() {
         let model = ModelId("model".into());
@@ -1175,4 +1211,352 @@ impl PolicyRegistry {
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
             .expect("a later admitted cache match must survive");
+
+        assert_eq!(decision.selected.id, winner.id);
+        assert_eq!(decision.primary.id, winner.id);
+        assert!(decision.backup.is_none());
+        assert_eq!(decision.reason, DecisionReason::CacheCandidate);
+    }
+
+    #[test]
+    fn cache_tournament_compares_every_admitted_challenger_before_finalizing() {
+        let first = worker("first");
+        let second = worker("second");
+        let final_winner = worker("final-winner");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&first, 40, 60, None),
+                cache_candidate(&second, 60, 40, None),
+                cache_candidate(&final_winner, 80, 20, None),
+            ],
+            cache_switch_margin_tokens: 0,
+        };
+        let loads = snapshot(&[
+            (
+                &first,
+                TestEngineLoad {
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &second,
+                TestEngineLoad {
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &final_winner,
+                TestEngineLoad {
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .expect("all admitted candidates must participate in the tournament");
+
+        assert_eq!(decision.selected.id, final_winner.id);
+        assert_eq!(decision.primary.id, final_winner.id);
+        assert!(decision.backup.is_none());
+    }
+
+    #[test]
+    fn cache_tournament_uses_uncached_work_for_pending_but_full_input_for_kv() {
+        let candidate = worker("candidate");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
+            cache_switch_margin_tokens: 16,
+        };
+        let pending_allows = snapshot(&[(
+            &candidate,
+            TestEngineLoad {
+                num_waiting_reqs: 5,
+                max_total_num_tokens: 1_000,
+                ..TestEngineLoad::default()
+            },
+        )]);
+        assert!(
+            resolve_cache_candidates(&proposal, 100, &pending_allows).is_some(),
+            "pending admission must project E=20, not L=100"
+        );
+
+        let kv_rejects = snapshot(&[(
+            &candidate,
+            TestEngineLoad {
+                num_tokens: 30,
+                num_waiting_reqs: 5,
+                max_total_num_tokens: 100,
+                ..TestEngineLoad::default()
+            },
+        )]);
+        assert!(
+            resolve_cache_candidates(&proposal, 100, &kv_rejects).is_none(),
+            "KV safety must conservatively project the complete input L=100"
+        );
+    }
+
+    #[test]
+    fn cache_tournament_keeps_cache_gain_when_legacy_token_guard_is_unavailable() {
+        let congested = worker("congested");
+        let idle = worker("idle");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&congested, 90, 10, None),
+                cache_candidate(&idle, 80, 20, None),
+            ],
+            cache_switch_margin_tokens: 32,
+        };
+        let loads = snapshot(&[
+            (
+                &congested,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &idle,
+                TestEngineLoad {
+                    num_waiting_reqs: 10,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(decision.selected.id, congested.id);
+    }
+
+    #[test]
+    fn cache_tournament_keeps_a_material_cache_gain_despite_pressure() {
+        let hot = worker("hot");
+        let idle = worker("idle");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![
+                cache_candidate(&hot, 90, 10, None),
+                cache_candidate(&idle, 20, 80, None),
+            ],
+            cache_switch_margin_tokens: 32,
+        };
+        let loads = snapshot(&[
+            (
+                &hot,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &idle,
+                TestEngineLoad {
+                    num_waiting_reqs: 10,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(
+            decision.selected.id, hot.id,
+            "pressure may break a near tie, but must not erase a material cache-work gain"
+        );
+    }
+
+    #[test]
+    fn cache_tournament_uses_work_order_when_legacy_token_guard_is_unavailable() {
+        let best_work = worker("best-work");
+        let near_tie = worker("near-tie");
+        let beyond_margin = worker("beyond-margin");
+        let proposal = CacheCandidateProposal {
+            // The policy supplies candidates in increasing E order. Each
+            // adjacent pair is a near tie, but the last candidate is more
+            // than one configured margin away from the global work minimum.
+            candidates: vec![
+                cache_candidate(&best_work, 100, 0, None),
+                cache_candidate(&near_tie, 80, 20, None),
+                cache_candidate(&beyond_margin, 60, 40, None),
+            ],
+            cache_switch_margin_tokens: 32,
+        };
+        let loads = snapshot(&[
+            (
+                &best_work,
+                TestEngineLoad {
+                    num_waiting_reqs: 10_000,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &near_tie,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+            (
+                &beyond_margin,
+                TestEngineLoad {
+                    num_waiting_reqs: 0,
+                    max_total_num_tokens: 10_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        assert_eq!(
+            decision.selected.id, best_work.id,
+            "without a unit-compatible token-pressure signal, cache work remains authoritative"
+        );
+    }
+
+    #[test]
+    fn admission_uses_admitted_backup_before_scanning_candidate_range() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_running_reqs: 4,
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                TestEngineLoad {
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let range = CandidateRange::global(&workers);
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot)
+            .expect("an admitted backup must be selected");
+
+        assert_eq!(decision.selected.id, backup.id);
+        assert_eq!(decision.reason, DecisionReason::BackupPrimaryAdmission);
+    }
+
+    #[test]
+    fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
+        let primary = worker("primary");
+        let workers = vec![Arc::clone(&primary)];
+        let snapshot = EngineLoadSnapshot::default();
+
+        let decision = resolve_prefill(
+            &CandidateRange::global(&workers),
+            &SelectionProposal::primary(Arc::clone(&primary)),
+            1_000_000,
+            &snapshot,
+        )
+        .expect("disabled reporting must preserve the healthy registry candidate");
+
+        assert_eq!(decision.selected.id, primary.id);
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn prefill_pair_keeps_primary_when_both_workers_fit_capacity() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_waiting_reqs: 200,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_waiting_reqs: 20,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup);
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 80, &snapshot)
+            .expect("both candidates fit capacity");
+
+        assert_eq!(decision.reason, DecisionReason::Primary);
+    }
+
+    #[test]
+    fn admission_scans_range_only_after_primary_and_backup_both_fail() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let fallback = worker("fallback");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&fallback),
+        ];
+        let snapshot = snapshot(&[
+            (
+                &primary,
+                TestEngineLoad {
+                    num_running_reqs: 4,
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    num_tokens: 990,
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+            (
+                &fallback,
+                TestEngineLoad {
+                    max_total_num_tokens: 1_000,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let proposal = SelectionProposal::with_backup(primary, backup);
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &snapshot)
+            .expect("an admitted range fallback must be selected");
+
+        assert_eq!(decision.selected.id, fallback.id);
+        assert_eq!(decision.reason, DecisionReason::RangeFallback);
+    }
 }
