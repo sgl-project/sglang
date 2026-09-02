@@ -1,6 +1,7 @@
 """Test for ComfyUIQwenImageEditPipeline with pass-through scheduler (I2I/edit mode)."""
 
 import os
+import sys
 
 import pytest
 import torch
@@ -122,7 +123,7 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
         noise_pred.dtype == torch.bfloat16
     ), f"noise_pred should be bfloat16, got {noise_pred.dtype}"
 
-    print(f"✓ Successfully retrieved noise_pred from OutputBatch (Edit Mode)!")
+    print("✓ Successfully retrieved noise_pred from OutputBatch (Edit Mode)!")
     print(f"  noise_pred shape: {noise_pred.shape}")
     print(f"  noise_pred dtype: {noise_pred.dtype}")
     print(f"  noise_pred device: {noise_pred.device}")
@@ -132,4 +133,4 @@ def test_comfyui_qwen_image_edit_pipeline_direct() -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

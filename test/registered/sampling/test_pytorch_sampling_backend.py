@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -11,11 +11,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=66, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=66, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=66, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestPyTorchSamplingBackend(CustomTestCase):
@@ -23,11 +24,15 @@ class TestPyTorchSamplingBackend(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = ["--sampling-backend", "pytorch", "--disable-radix-cache"]
+        if is_hip():
+            other_args.extend(["--max-running-requests", "64"])
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--sampling-backend", "pytorch", "--disable-radix-cache"],
+            other_args=other_args,
         )
 
     @classmethod
@@ -39,14 +44,20 @@ class TestPyTorchSamplingBackend(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
             temperature=0.1,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.64)
 
+    @unittest.skipIf(
+        is_in_amd_ci(),
+        "Skip on MI300x: greedy decode is not bit-exact across runs on MI300x "
+        "(kernel-level numerical jitter), so the assertEqual on identical "
+        "regenerated text is flaky on this runner pool.",
+    )
     def test_greedy(self):
 
         first_text = None

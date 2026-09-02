@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.srt.utils import add_prefix
 
 
 class MLP(nn.Module):
@@ -37,14 +38,18 @@ class MLP(nn.Module):
         dtype: torch.dtype | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig = None,
+        fuse_bias_gelu_tanh: bool = False,
     ):
         super().__init__()
+        self.fuse_bias_gelu_tanh = fuse_bias_gelu_tanh
         self.fc_in = ColumnParallelLinear(
             input_dim,
             mlp_hidden_dim,
             bias=True,
+            skip_bias_add=False,
             gather_output=False,
             quant_config=quant_config,
+            prefix=add_prefix("fc_in", prefix),
         )
 
         self.act = get_act_fn(act_type)
@@ -56,11 +61,31 @@ class MLP(nn.Module):
             bias=True,
             input_is_parallel=True,
             quant_config=quant_config,
+            prefix=add_prefix("fc_out", prefix),
         )
 
+    def _apply_activation(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        *,
+        use_fused_bias_gelu: bool = False,
+    ) -> torch.Tensor:
+        if self.fuse_bias_gelu_tanh and bias is not None:
+            if (
+                use_fused_bias_gelu
+                and x.is_cuda
+                and x.dtype in (torch.float16, torch.bfloat16)
+            ):
+                from sglang.kernels.ops.elementwise.bias_gelu import bias_gelu_tanh
+
+                return bias_gelu_tanh(x, bias)
+            return self.act(x + bias)
+        return self.act(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, _ = self.fc_in(x)
-        x = self.act(x)
+        x, bias = self.fc_in(x)
+        x = self._apply_activation(x, bias)
         x, _ = self.fc_out(x)
         return x
 

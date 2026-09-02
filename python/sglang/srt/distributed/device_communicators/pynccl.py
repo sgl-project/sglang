@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
@@ -14,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    ncclConfig_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -31,7 +34,7 @@ class PyNcclCommunicator:
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
-        use_current_stream: bool = False,
+        is_symmetric_memory_enabled: bool = False,
     ):
         """
         Args:
@@ -41,6 +44,7 @@ class PyNcclCommunicator:
                 it will be bind to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            is_symmetric_memory_enabled: whether symmetric memory is enabled.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -62,7 +66,6 @@ class PyNcclCommunicator:
         if self.world_size == 1:
             self.available = False
             self.disabled = True
-            self.stream = None
             return
         try:
             self.nccl = NCCLLibrary(library_path)
@@ -71,12 +74,10 @@ class PyNcclCommunicator:
             # e.g. in a non-GPU environment
             self.available = False
             self.disabled = True
-            self.stream = None
             return
 
         self.available = True
         self.disabled = False
-        self.use_current_stream = use_current_stream
 
         self.nccl_version = self.nccl.ncclGetRawVersion()
         if self.rank == 0:
@@ -110,15 +111,25 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
-            self.stream = torch.cuda.Stream()
+            if is_symmetric_memory_enabled:
+                # When symmetric memory is enabled, disable internal
+                # NCCL cuda event synchronizations to improve performance.
+                config = ncclConfig_t.create()
+                config.graphUsageMode = 1
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
+                    self.world_size, self.unique_id, self.rank, config
+                )
+            else:
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
+            warmup_stream = torch.cuda.Stream()
 
             # A small all_reduce for warmup.
-            data = torch.zeros(1, device=device)
-            self.all_reduce(data)
-            self.stream.synchronize()
+            with torch.cuda.stream(warmup_stream):
+                data = torch.zeros(1, device=device)
+                self.all_reduce(data)
+            warmup_stream.synchronize()
             del data
 
         # by default it is disabled, e.g. in profiling models and prefill phase.
@@ -126,24 +137,11 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
-    def _resolve_stream(self, stream: Optional[torch.cuda.Stream]):
-        """Return the stream to use for NCCL calls.
+    def _resolve_stream(self) -> torch.cuda.Stream:
+        """Return the current device stream used for NCCL calls."""
+        return get_current_device_stream_fast()
 
-        Behavior mirrors the previous inline logic:
-        - if an explicit stream is provided, return it
-        - if stream is None and self.use_current_stream is True, return
-          torch.cuda.current_stream()
-        - otherwise return the communicator's default stream (self.stream)
-        """
-        if stream is not None:
-            return stream
-        if self.use_current_stream:
-            return get_current_device_stream_fast()
-        return self.stream
-
-    def all_reduce(
-        self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
-    ):
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
         if self.disabled:
             return
         # nccl communicator created on a specific device
@@ -153,7 +151,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
@@ -169,7 +167,6 @@ class PyNcclCommunicator:
         in_tensor: torch.Tensor,
         out_tensor: Optional[torch.Tensor] = None,
         op: ReduceOp = ReduceOp.SUM,
-        stream=None,
     ) -> Optional[torch.Tensor]:
         if self.disabled:
             return None
@@ -181,7 +178,7 @@ class PyNcclCommunicator:
         if out_tensor is None:
             out_tensor = torch.empty_like(in_tensor)
 
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
         self.nccl.ncclAllReduce(
             buffer_type(in_tensor.data_ptr()),  # sendbuff
             buffer_type(out_tensor.data_ptr()),  # recvbuff - DIFFERENT pointer
@@ -197,7 +194,6 @@ class PyNcclCommunicator:
         self,
         output_tensor: torch.Tensor,
         input_tensor: torch.Tensor,
-        stream=None,
         sizes: Optional[list[int]] = None,
     ):
         if self.disabled:
@@ -209,7 +205,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
 
         if sizes is not None:
             split_offset = 0
@@ -238,40 +234,11 @@ class PyNcclCommunicator:
                 cudaStream_t(stream.cuda_stream),
             )
 
-    def cp_all_gather_into_tensor(
-        self,
-        output_tensor: torch.Tensor,
-        input_tensor: torch.Tensor,
-        stream=None,
-        sizes: Optional[list[int]] = None,
-    ):
-        """
-        Currently, it is mainly used in context parallelism,
-        primarily leveraging pynccl to implement non-blocking allgather communication.
-        """
-        # nccl communicator created on a specific device
-        # will only work on tensors on the same device
-        # otherwise it will cause "illegal memory access"
-        assert input_tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {input_tensor.device}"
-        )
-        stream = self._resolve_stream(stream)
-        self.nccl.ncclAllGather(
-            buffer_type(input_tensor.data_ptr()),
-            buffer_type(output_tensor.data_ptr()),
-            input_tensor.numel(),
-            ncclDataTypeEnum.from_torch(input_tensor.dtype),
-            self.comm,
-            cudaStream_t(stream.cuda_stream),
-        )
-
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
         input_tensor: torch.Tensor,
         op: ReduceOp = ReduceOp.SUM,
-        stream=None,
         sizes: Optional[list[int]] = None,
     ):
         if self.disabled:
@@ -283,7 +250,7 @@ class PyNcclCommunicator:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {input_tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
 
         if sizes is not None:
             split_offset = 0
@@ -314,14 +281,14 @@ class PyNcclCommunicator:
                 cudaStream_t(stream.cuda_stream),
             )
 
-    def send(self, tensor: torch.Tensor, dst: int, stream=None):
+    def send(self, tensor: torch.Tensor, dst: int):
         if self.disabled:
             return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -331,14 +298,14 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def recv(self, tensor: torch.Tensor, src: int, stream=None):
+    def recv(self, tensor: torch.Tensor, src: int):
         if self.disabled:
             return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -348,14 +315,68 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
+    def all_to_all_single(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+    ):
+        """All-to-All over the flattened leading dim: each rank sends the i-th
+        equal-sized chunk to rank i and receives rank i's chunk into output
+        position i. Uses ncclGroupStart/End to fuse the sends/recvs into a
+        single NCCL operation, which is CUDA-graph-capturable (used by the DCP
+        a2a communication backend)."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {output_tensor.device}"
+        )
+        stream = self._resolve_stream()
+        # Equal-split all-to-all: fail loudly instead of silently truncating the tail.
+        assert input_tensor.numel() == output_tensor.numel(), (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) != output "
+            f"numel ({output_tensor.numel()})"
+        )
+        assert input_tensor.numel() % self.world_size == 0, (
+            f"all_to_all_single: input numel ({input_tensor.numel()}) not "
+            f"divisible by world_size ({self.world_size})"
+        )
+        chunk_size = input_tensor.numel() // self.world_size
+        dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
+        self.nccl.ncclGroupStart()
+        for i in range(self.world_size):
+            send_buf = input_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclSend(
+                buffer_type(send_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            recv_buf = output_tensor.narrow(0, i * chunk_size, chunk_size)
+            self.nccl.ncclRecv(
+                buffer_type(recv_buf.data_ptr()),
+                chunk_size,
+                dtype,
+                i,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+        self.nccl.ncclGroupEnd()
+
+    def broadcast(self, tensor: torch.Tensor, src: int):
         if self.disabled:
             return
         assert tensor.device == self.device, (
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
-        stream = self._resolve_stream(stream)
+        stream = self._resolve_stream()
 
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
@@ -387,25 +408,17 @@ class PyNcclCommunicator:
         self.nccl.ncclGroupEnd()
 
     @contextmanager
-    def change_state(
-        self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None
-    ):
+    def change_state(self, enable: Optional[bool] = None):
         """
-        A context manager to change the state of the communicator.
+        A context manager to change the enabled state of the communicator.
         """
         if enable is None:
             # guess a default value when not specified
             enable = self.available
 
-        if stream is None:
-            stream = self.stream
-
         old_disable = self.disabled
-        old_stream = self.stream
-
-        self.stream = stream
         self.disabled = not enable
-        yield
-
-        self.disabled = old_disable
-        self.stream = old_stream
+        try:
+            yield
+        finally:
+            self.disabled = old_disable

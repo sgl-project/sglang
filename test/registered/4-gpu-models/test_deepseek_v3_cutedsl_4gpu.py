@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -14,7 +15,10 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, suite="stage-c-test-4-gpu-gb200")
+register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
+
+# Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
+NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 100
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
@@ -42,16 +46,20 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
             "trtllm_mla",
-            "--moe-a2a-backend",
-            "deepep",
             "--moe-runner-backend",
             "flashinfer_cutedsl",
+            "--moe-a2a-backend",
+            "deepep",
             "--deepep-mode",
             "low_latency",
+            "--deepep-dispatcher-output-dtype",
+            "bf16",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -60,7 +68,6 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
             },
@@ -72,18 +79,18 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=512,
-            parallel=512,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=512,
+            num_threads=512,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.92)
+        self.assertGreater(metrics["score"], 0.92)
 
 
 class TestDummyWithSBO(CustomTestCase):
@@ -113,16 +120,20 @@ class TestDummyWithSBO(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE + 1),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
             "trtllm_mla",
-            "--moe-a2a-backend",
-            "deepep",
             "--moe-runner-backend",
             "flashinfer_cutedsl",
+            "--moe-a2a-backend",
+            "deepep",
             "--deepep-mode",
             "low_latency",
+            "--deepep-dispatcher-output-dtype",
+            "bf16",
             "--json-model-override-args",
             '{"num_hidden_layers": 1, "first_k_dense_replace": 0, "n_routed_experts": 24}',
             "--enable-single-batch-overlap",
@@ -136,9 +147,19 @@ class TestDummyWithSBO(CustomTestCase):
             other_args=other_args,
             env={
                 **os.environ,
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
+                # Dummy random weights legitimately produce NaN logits; turn
+                # off the CI crash machinery (async assert, coredump on GPU
+                # exception, crash-time coredump) so NaN is sanitized with a
+                # warning instead of killing the scheduler.
+                "SGLANG_ENABLE_ASYNC_ASSERT": "0",
+                "SGLANG_SANITIZE_NAN_LOGITS": "1",
+                "SGLANG_CUDA_COREDUMP": "0",
+                # Already injected into os.environ by the test process when
+                # SGLANG_CUDA_COREDUMP=1, so it must be overridden explicitly.
+                "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "0",
+                "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
             },
         )
 
@@ -148,15 +169,16 @@ class TestDummyWithSBO(CustomTestCase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=512,
+            num_threads=512,
             num_shots=0,
-            data_path=None,
-            num_questions=512,
-            parallel=512,
-            max_new_tokens=16,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
 

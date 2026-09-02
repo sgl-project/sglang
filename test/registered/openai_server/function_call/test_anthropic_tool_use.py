@@ -16,7 +16,11 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -25,8 +29,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=140, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=140, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=54, suite="base-c-test-cpu")
 
 # System message to guide Llama3.2 to produce proper tool call format
 SYSTEM_MESSAGE = (

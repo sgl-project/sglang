@@ -1,26 +1,30 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=96, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=99, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 import time
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.srt.utils import is_hip
+from sglang.test.kits.eval_accuracy_kit import MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
 
 
-class TestHiCache(CustomTestCase):
+class TestHiCache(CustomTestCase, MMLUMixin):
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
+    mmlu_num_threads = 32
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -44,20 +48,8 @@ class TestHiCache(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
         time.sleep(5)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
 
 
 if __name__ == "__main__":

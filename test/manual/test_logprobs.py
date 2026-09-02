@@ -31,12 +31,12 @@ Usage
 
 Step 1: Generate Baseline (Before Code Changes)
 ```bash
-python test/srt/test_logprobs.py gen
+python test/manual/test_logprobs.py gen
 ```
 
 Step 2: Test Against Baseline (After Code Changes)
 ```bash
-python test/srt/test_logprobs.py test
+python test/manual/test_logprobs.py test
 ```
 This tests your changes against the locally generated baseline from Step 1.
 The test passes if the maximum and mean differences are within the tolerance thresholds.
@@ -242,10 +242,10 @@ class TestLogprobsDense(unittest.TestCase):
         chunk_size = kwargs.pop("chunk_size", None)
         if chunk_size is not None:
             print(f"Setting chunk size to {chunk_size}")
-            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "True"
-            os.environ["SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"] = str(chunk_size)
+            os.environ["SGLANG_ENABLE_LOGPROB_CHUNK"] = "True"
+            os.environ["SGLANG_LOGPROB_CHUNK_SIZE"] = str(chunk_size)
         else:
-            os.environ["SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"] = "False"
+            os.environ["SGLANG_ENABLE_LOGPROB_CHUNK"] = "False"
 
         # Create engine with merged configuration
         engine_config = {**DEFAULT_ENGINE_CONFIG, **kwargs}

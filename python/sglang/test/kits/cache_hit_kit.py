@@ -3,13 +3,48 @@ import json
 import time
 
 import aiohttp
+import numpy as np
 import requests
 
-from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
+
+def get_openai_chat_output_delta(delta):
+    """Return text emitted by an OpenAI-compatible chat streaming delta."""
+    if not delta:
+        return ""
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    return reasoning + (delta.get("content") or "")
+
+
+def calculate_tpot(latency, ttft, completion_tokens):
+    """Calculate request-level time per output token when inputs are valid."""
+    if ttft <= 0 or completion_tokens <= 1 or latency < ttft:
+        return None
+    return (latency - ttft) / (completion_tokens - 1)
+
+
+def calculate_tpot_statistics(tpots):
+    """Aggregate TPOT samples using the same NumPy definitions as bench_serving."""
+    if not tpots:
+        return {
+            "average_tpot": 0.0,
+            "p90_tpot": 0.0,
+            "p99_tpot": 0.0,
+            "median_tpot": 0.0,
+            "max_tpot": 0.0,
+        }
+    return {
+        "average_tpot": float(np.mean(tpots)),
+        "p90_tpot": float(np.percentile(tpots, 90)),
+        "p99_tpot": float(np.percentile(tpots, 99)),
+        "median_tpot": float(np.median(tpots)),
+        "max_tpot": float(np.max(tpots)),
+    }
 
 
 async def async_request_sglang_generate(
@@ -75,7 +110,10 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
+                    output.generated_len = len(all_output_ids)
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
+                    )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -87,6 +125,107 @@ async def async_request_sglang_generate(
     if pbar:
         pbar.update(1)
     return output
+
+
+async def async_request_openai_chat_completions(
+    payload,
+    url,
+    pbar=None,
+):
+    """Send a streaming request to an OpenAI-compatible /v1/chat/completions endpoint.
+
+    Returns a RequestFuncOutput with the same dynamic attributes as
+    async_request_sglang_generate (except output_ids, which is unavailable).
+    """
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        generated_text = ""
+        ttft = 0.0
+        latency = 0.0
+        st = time.perf_counter()
+        most_recent_timestamp = st
+        output = RequestFuncOutput()
+
+        try:
+            async with session.post(url=url, json=payload) as response:
+                if response.status == 200:
+                    prompt_tokens = 0
+                    cached_tokens = 0
+                    completion_tokens = 0
+
+                    async for chunk_bytes in response.content:
+                        chunk_bytes = chunk_bytes.strip()
+                        if not chunk_bytes:
+                            continue
+
+                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        latency = time.perf_counter() - st
+
+                        if chunk == "[DONE]":
+                            pass
+                        else:
+                            data = json.loads(chunk)
+
+                            # Streaming token chunks
+                            if data.get("choices"):
+                                raw_delta = data["choices"][0].get("delta")
+                                output_delta = get_openai_chat_output_delta(raw_delta)
+                                if output_delta:
+                                    content = raw_delta.get("content") or ""
+                                    generated_text += content
+                                    timestamp = time.perf_counter()
+
+                                    if ttft == 0.0:
+                                        ttft = time.perf_counter() - st
+                                        output.ttft = ttft
+                                    else:
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
+
+                                    most_recent_timestamp = timestamp
+
+                            # Final chunk with usage stats
+                            usage = data.get("usage")
+                            if usage:
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                                details = usage.get("prompt_tokens_details", {}) or {}
+                                cached_tokens = details.get("cached_tokens", 0)
+
+                    output.generated_text = generated_text
+                    output.output_ids = []  # Not available from OpenAI endpoint
+                    output.success = True
+                    output.latency = latency
+                    output.prompt_len = prompt_tokens
+                    output.cached_tokens = cached_tokens
+                    output.generated_len = (
+                        completion_tokens if completion_tokens else len(output.itl) + 1
+                    )
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
+                    )
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception as e:
+            output.success = False
+            output.error = str(e)
+            print(f"Request failed: {e}")
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+def gen_payload_openai(messages, output_len, model):
+    return {
+        "model": model,
+        "messages": messages,
+        "max_tokens": output_len,
+        "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
 
 
 def gen_payload(input_ids, output_len, lora_path=""):
@@ -124,7 +263,7 @@ async def _send_round(
 def _get_page_size(base_url: str) -> int:
     """Query server for page_size used by radix cache."""
     try:
-        resp = requests.get(f"{base_url}/get_server_info", timeout=10)
+        resp = requests.get(f"{base_url}/server_info", timeout=10)
         resp.raise_for_status()
         info = resp.json()
         return info.get("page_size", 1)
@@ -247,6 +386,15 @@ def run_multiturn_cache_hit_test(
             print(msg)
 
             assert resp.cached_tokens >= expected_cached
+            # Upper bound: cached tokens are a subset of the prompt, so they can
+            # never exceed prompt_len. In PD disaggregation with decode radix
+            # cache, the shared prefix was previously counted on both the prefill
+            # and the decode node, making cached_tokens exceed prompt_len.
+            assert resp.cached_tokens <= resp.prompt_len, (
+                f"Round {round_num}, client {i}: cached_tokens="
+                f"{resp.cached_tokens} exceeds prompt_len={resp.prompt_len} "
+                f"(double-counted prefix across prefill/decode)"
+            )
 
             # Record this round's prompt_len for next round's expected calc
             prev_prompt_lens[i] = resp.prompt_len

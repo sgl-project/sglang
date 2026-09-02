@@ -3,7 +3,6 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec, elasticity_aware
 
 
@@ -13,6 +12,7 @@ class EplbAlgorithm(Enum):
     deepseek_vec = auto()
     deepseek_vec_hierarchical = auto()
     elasticity_aware = auto()
+    elasticity_aware_hierarchical = auto()
     # TODO may have more algorithm later
 
 
@@ -47,14 +47,21 @@ def rebalance_experts(
             enable_hierarchical=algorithm == EplbAlgorithm.deepseek_vec_hierarchical,
         )
 
-    if algorithm == EplbAlgorithm.elasticity_aware:
+    if algorithm in [
+        EplbAlgorithm.elasticity_aware,
+        EplbAlgorithm.elasticity_aware_hierarchical,
+    ]:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
         return elasticity_aware.rebalance_experts(
             weight=tokens_per_expert.sum(dim=0),
             num_replicas=num_physical_experts,
             num_groups=num_groups,
             num_nodes=num_nodes,
             num_gpus=num_physical_experts // num_local_physical_experts,
-            enable_hierarchical=False,
+            enable_hierarchical=(
+                algorithm == EplbAlgorithm.elasticity_aware_hierarchical
+            ),
             active_ranks=(
                 ElasticEPStateManager.instance().active_ranks
                 if ElasticEPStateManager.instance() is not None

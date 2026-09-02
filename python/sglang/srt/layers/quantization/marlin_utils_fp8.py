@@ -14,11 +14,12 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -39,6 +40,22 @@ def fp8_fused_exponent_bias_into_scales(scales):
     return scales * s
 
 
+def fake_apply_fp8_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    out_shape = input.shape[:-1] + (size_n,)
+    fake_output = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    return fake_output
+
+
+@register_custom_op(fake_impl=fake_apply_fp8_marlin_linear)
 def apply_fp8_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -169,10 +186,12 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
+    # The dense FP8 Marlin wrapper adds bias after the kernel returns, so the
+    # bias must remain in logical output-channel order. Only scales need the
+    # Marlin tile permutation.
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+        layer.bias = torch.nn.Parameter(layer.bias.detach(), requires_grad=False)
 
 
 def prepare_moe_fp8_layer_for_marlin(

@@ -8,19 +8,11 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.utils import StoreBoolean
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "block" in n and str.isdigit(n.split(".")[-1])
-
-
-def _is_embeddings(n: str, m) -> bool:
-    return n.endswith("shared")
-
-
-def _is_final_layernorm(n: str, m) -> bool:
-    return n.endswith("final_layer_norm")
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_final_layer_norm,
+    is_shared,
+    is_t5_block,
+)
 
 
 @dataclass
@@ -56,9 +48,9 @@ class T5ArchConfig(TextEncoderArchConfig):
     )
     _fsdp_shard_conditions: list = field(
         default_factory=lambda: [
-            _is_transformer_layer,
-            _is_embeddings,
-            _is_final_layernorm,
+            is_t5_block,
+            is_shared,
+            is_final_layer_norm,
         ]
     )
 
@@ -86,28 +78,9 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-    # Use the SP Group of the transformer as the TP Group of T5.
-    parallel_folding: bool = False
-    # "sp" or "ulysses" or "ring"
-    parallel_folding_mode: str = "sp"
 
     @staticmethod
     def add_cli_args(
         parser: argparse.ArgumentParser, prefix: str = "t5-config"
     ) -> argparse.ArgumentParser:
-        parser.add_argument(
-            f"--{prefix}.parallel-folding",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.parallel_folding",
-            default=T5Config.parallel_folding,
-            help="Whether to use parallel folding for T5",
-        )
-        parser.add_argument(
-            f"--{prefix}.parallel-folding-mode",
-            type=str,
-            choices=["sp", "ulysses", "ring"],
-            dest=f"{prefix.replace('-', '_')}.parallel_folding_mode",
-            default=T5Config.parallel_folding_mode,
-            help="Parallel folding mode for T5",
-        )
         return parser

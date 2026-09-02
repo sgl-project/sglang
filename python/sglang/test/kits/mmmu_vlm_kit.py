@@ -7,12 +7,13 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.environ import temp_set_env
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cuda, kill_process_tree
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    dump_metric,
     popen_launch_server,
 )
 
@@ -197,11 +198,7 @@ class MMMUMixin:
             # Run evaluation
             self.run_mmmu_eval(self.model, output_path)
 
-            # Get the result file
-            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
 
             if not result_files:
                 raise FileNotFoundError(f"No JSON result files found in {output_path}")
@@ -215,6 +212,12 @@ class MMMUMixin:
             # Process the result
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(f"Model {self.model} achieved accuracy: {mmmu_accuracy:.4f}")
+
+            dump_metric(
+                "mmmu_score",
+                mmmu_accuracy,
+                labels={"model": self.model, "eval": "mmmu", "api": "lmms-eval"},
+            )
 
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
@@ -346,8 +349,11 @@ class MMMUMultiModelTestBase(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
+            # CUDA IPC multimodal-feature transport is NVIDIA-only; enabling it
+            # on ROCm/HIP makes ServerArgs raise "requires NVIDIA CUDA" and the
+            # server exits. Only opt in on CUDA so AMD exercises CPU transport.
+            if is_cuda():
+                process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -364,7 +370,7 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 api_key=self.api_key,
                 other_args=[
                     "--trust-remote-code",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "64",
                     "--enable-multimodal",
                     "--mem-fraction-static",
@@ -382,11 +388,7 @@ class MMMUMultiModelTestBase(CustomTestCase):
             # Run evaluation
             self.run_mmmu_eval(model.model, output_path)
 
-            # Get the result file
-            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
 
             if not result_files:
                 raise FileNotFoundError(f"No JSON result files found in {output_path}")
@@ -401,6 +403,12 @@ class MMMUMultiModelTestBase(CustomTestCase):
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(
                 f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
+            )
+
+            dump_metric(
+                "mmmu_score",
+                mmmu_accuracy,
+                labels={"model": model.model, "eval": "mmmu", "api": "lmms-eval"},
             )
 
             # Capture server output if requested

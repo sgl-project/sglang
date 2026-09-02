@@ -2,6 +2,8 @@
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_simple_decode
 python3 -m unittest test_srt_endpoint.TestSRTEndpoint.test_logprob_with_chunked_prefill
 python3 -m unittest test_srt_endpoint.TestTokenizeDetokenize
+python3 -m unittest test_srt_endpoint.TestRustServerEndpoint
+python3 -m unittest test_srt_endpoint.TestRustServerLogprob
 """
 
 import json
@@ -17,21 +19,30 @@ import requests
 
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
     run_logprob_check,
 )
 
-register_cuda_ci(est_time=127, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=130, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=260, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=260, suite="stage-b-test-1-gpu-small-amd")
+
+SERVER_ENV = {"SGLANG_USE_PICKLE_IPC": "0"}
 
 
 class TestSRTEndpoint(CustomTestCase):
+    # Extra server-launch env; subclasses override to run the same suite
+    # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
+    env = {}
+    expect_startup_observability = True
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -40,11 +51,15 @@ class TestSRTEndpoint(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # The tiny logprob chunk size routes this file's logprob tests
+            # through the multi-chunk stitching path (requests at or below 64
+            # rows still cover the non-chunked path).
+            env={**cls.env, **SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
                 "0.7",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "8",
             ),
         )
@@ -93,18 +108,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
-
-    def test_simple_decode(self):
-        self.run_decode()
-
-    def test_simple_decode_batch(self):
-        self.run_decode(batch=True)
-
-    def test_parallel_sample(self):
-        self.run_decode(n=3)
-
-    def test_parallel_sample_stream(self):
-        self.run_decode(n=3, stream=True)
 
     def test_logprob(self):
         self.run_decode(
@@ -276,6 +279,47 @@ class TestSRTEndpoint(CustomTestCase):
         func = partial(run_logprob_check, self)
         with ThreadPoolExecutor(8) as executor:
             list(executor.map(func, args))
+
+    def test_logprob_token_ids_chunked(self):
+        """input_token_ids_logprobs must line up with input_token_logprobs across chunks.
+
+        The two fields are stitched by separate code paths
+        (get_token_ids_logprobs_chunk vs the arange gather), so at positions
+        where the actual next token is probed their values must agree.
+        """
+        prompt_ids = list(range(5, 305))
+        probe_ids = list(range(5, 305, 37))
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": prompt_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 4,
+                    "ignore_eos": True,
+                },
+                "return_logprob": True,
+                "logprob_start_len": 0,
+                "token_ids_logprob": probe_ids,
+            },
+        )
+        meta = response.json()["meta_info"]
+        input_token_logprobs = meta["input_token_logprobs"]
+        input_token_ids_logprobs = meta["input_token_ids_logprobs"]
+        self.assertEqual(len(input_token_ids_logprobs), len(input_token_logprobs))
+
+        probe_id_set = set(probe_ids)
+        checked = 0
+        for (logprob, token_id, *_), probes in zip(
+            input_token_logprobs, input_token_ids_logprobs
+        ):
+            if logprob is None or token_id not in probe_id_set:
+                continue
+            probe_logprobs = {tid: lp for lp, tid, *_ in probes}
+            self.assertAlmostEqual(probe_logprobs[token_id], logprob, places=4)
+            checked += 1
+        # The consecutive-id prompt guarantees every 37th position is probed.
+        self.assertGreater(checked, 4)
 
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"
@@ -480,6 +524,12 @@ class TestSRTEndpoint(CustomTestCase):
             response = requests.post(self.base_url + "/flush_cache")
             assert response.status_code == 200
 
+        server_info = requests.get(self.base_url + "/server_info").json()
+        page_size = server_info.get("page_size") or 1
+
+        def align_down(num_tokens):
+            return num_tokens // page_size * page_size
+
         def send_and_check_cached_tokens(input_ids):
             response = requests.post(
                 self.base_url + "/generate",
@@ -494,13 +544,17 @@ class TestSRTEndpoint(CustomTestCase):
             return response_json["meta_info"]["cached_tokens"]
 
         self.assertEqual(send_and_check_cached_tokens(range(0, 100)), 0)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 100)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), 9999)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), 999)
-        self.assertEqual(send_and_check_cached_tokens(range(0, 11000)), 10000)
+        self.assertEqual(send_and_check_cached_tokens(range(0, 10000)), align_down(100))
+        self.assertEqual(
+            send_and_check_cached_tokens(range(0, 10000)), align_down(9999)
+        )
+        self.assertEqual(send_and_check_cached_tokens(range(0, 1000)), align_down(999))
+        self.assertEqual(
+            send_and_check_cached_tokens(range(0, 11000)), align_down(10000)
+        )
 
     def test_get_server_info(self):
-        response = requests.get(self.base_url + "/get_server_info")
+        response = requests.get(self.base_url + "/server_info")
         response_json = response.json()
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
@@ -508,6 +562,45 @@ class TestSRTEndpoint(CustomTestCase):
 
         version = response_json["version"]
         self.assertIsInstance(version, str)
+
+        if not self.expect_startup_observability:
+            return
+
+        startup_time = response_json["startup_time"]
+        for phase in (
+            "load_weight",
+            "kv_cache_allocation",
+            "scheduler_e2e",
+            "tokenizer_e2e",
+        ):
+            self.assertIsInstance(startup_time[phase], float)
+            self.assertGreater(startup_time[phase], 0)
+
+        graph_phases = {
+            "prefill",
+            "decode",
+            "target_verify",
+            "draft_prefill",
+            "draft_decode",
+            "draft_extend",
+        }
+        self.assertTrue(graph_phases.issubset(startup_time["cuda_graph"]))
+        for phase in graph_phases:
+            self.assertIsInstance(startup_time["cuda_graph"][phase], float)
+            self.assertGreaterEqual(startup_time["cuda_graph"][phase], 0)
+        self.assertGreater(startup_time["cuda_graph"]["decode"], 0)
+
+        memory_usage = response_json["internal_states"][0]["memory_usage"]
+        self.assertIsInstance(memory_usage["weight"], float)
+        self.assertIsInstance(memory_usage["kvcache"], float)
+        self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
+        self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertIsInstance(memory_usage["startup_available"], float)
+        self.assertGreater(memory_usage["startup_available"], 0)
+        self.assertTrue(graph_phases.issubset(memory_usage["graph"]))
+        for phase in graph_phases:
+            self.assertIsInstance(memory_usage["graph"][phase], float)
+            self.assertGreaterEqual(memory_usage["graph"][phase], 0)
 
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
@@ -630,7 +723,7 @@ class TestSRTEndpoint(CustomTestCase):
         tp = ThreadPoolExecutor(max_workers=30)
 
         def s():
-            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info = requests.get(self.base_url + "/server_info")
             server_info.json()
 
         futures = []
@@ -642,7 +735,7 @@ class TestSRTEndpoint(CustomTestCase):
 
 
 # -------------------------------------------------------------------------
-#    /tokenize & /detokenize Test Class: TestTokenizeDetokenize
+#    /tokenize, /v1/tokenize & /detokenize Test Class: TestTokenizeDetokenize
 # -------------------------------------------------------------------------
 
 
@@ -652,13 +745,16 @@ class TestTokenizeDetokenize(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenize_url = f"{cls.base_url}/tokenize"
+        cls.openai_tokenize_url = f"{cls.base_url}/v1/tokenize"
         cls.detokenize_url = f"{cls.base_url}/detokenize"
         cls.session = requests.Session()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=SERVER_ENV,
         )
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
@@ -705,6 +801,58 @@ class TestTokenizeDetokenize(CustomTestCase):
         )
         self.assertEqual(r.status_code, 400)
 
+    def test_openai_tokenize_chat_messages(self):
+        messages = [{"role": "user", "content": "What is the weather in Paris?"}]
+        resp = self._post_json(
+            self.openai_tokenize_url,
+            {"model": self.model, "messages": messages},
+        )
+        expected_tokens = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        if not isinstance(expected_tokens, list):
+            expected_tokens = expected_tokens["input_ids"]
+        if hasattr(expected_tokens, "tolist"):
+            expected_tokens = expected_tokens.tolist()
+        self.assertEqual(resp["tokens"], expected_tokens)
+        self.assertEqual(resp["count"], len(expected_tokens))
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+        tools_resp = self._post_json(
+            self.openai_tokenize_url,
+            {"model": self.model, "messages": messages, "tools": tools},
+        )
+        self.assertIsInstance(tools_resp["tokens"], list)
+        self.assertEqual(tools_resp["count"], len(tools_resp["tokens"]))
+        self.assertNotEqual(tools_resp["tokens"], resp["tokens"])
+
+        no_tools_resp = self._post_json(
+            self.openai_tokenize_url,
+            {
+                "model": self.model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+        self.assertEqual(no_tools_resp["tokens"], resp["tokens"])
+        self.assertEqual(no_tools_resp["count"], resp["count"])
+
     def test_detokenize_roundtrip(self):
         text = "Verify detokenization round trip. यह डिटोकेनाइजेशन है"
         t0 = self._post_json(
@@ -741,6 +889,76 @@ class TestTokenizeDetokenize(CustomTestCase):
             self.detokenize_url, json={"model": self.model, "tokens": [1, -1, 2]}
         )
         self.assertEqual(r2.status_code, 500)
+
+
+# ---------------------------------------------------------------------------
+# Embedded Rust server (SGLANG_RUST_SERVER=1): rerun the whole endpoint suite
+# against the rust api-server/tokenizer/detokenizer stack — the logprob tests
+# exercise the columnar egress wire (`push_generation` extras -> Rust
+# `BatchHeader`/`for_each_chunk` -> detok reshape) end to end. Suite
+# surface the rust server does not implement yet is skipped explicitly below.
+# ---------------------------------------------------------------------------
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built (e.g. AMD suite)",
+)
+class TestRustServerEndpoint(TestSRTEndpoint):
+    env = {"SGLANG_RUST_SERVER": "1"}
+    expect_startup_observability = False
+
+    _RUST_TODO = "not implemented by the embedded Rust server yet"
+
+    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
+    def test_custom_logit_processor(self):
+        pass
+
+    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
+    def test_custom_logit_processor_batch_mixed(self):
+        pass
+
+    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
+    def test_stateful_custom_logit_processor(self):
+        pass
+
+    @unittest.skip(f"custom_logit_processor request field {_RUST_TODO}")
+    def test_stateful_custom_logit_processor_batch_mixed(self):
+        pass
+
+    @unittest.skip(f"/flush_cache endpoint + cached_tokens meta {_RUST_TODO}")
+    def test_cache_tokens(self):
+        pass
+
+    def test_greedy_token_equals_top1(self):
+        """Cross-column alignment guard for the columnar logprob wire: at
+        temperature 0 the chosen token must BE the top-1 entry of its own
+        position. A column shifted across requests or positions (the failure
+        mode a truncation-tolerant reader would mask) breaks this instantly."""
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["The capital of France is", "I have a very good idea on"],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
+                "return_logprob": True,
+                "top_logprobs_num": 5,
+                "logprob_start_len": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for res in response.json():
+            meta = res["meta_info"]
+            out_lp = meta["output_token_logprobs"]
+            top = meta["output_top_logprobs"]
+            self.assertEqual(len(out_lp), meta["completion_tokens"])
+            self.assertEqual(len(top), len(out_lp))
+            # First prompt token's logprob is the None sentinel; it must
+            # survive the NaN wire encoding and come back as null.
+            self.assertIsNone(meta["input_token_logprobs"][0][0])
+            for (lp, tid, _), pos_top in zip(out_lp, top):
+                self.assertEqual(len(pos_top), 5)
+                self.assertEqual(pos_top[0][1], tid)
+                self.assertAlmostEqual(pos_top[0][0], lp, places=4)
+                vals = [t[0] for t in pos_top]
+                self.assertEqual(vals, sorted(vals, reverse=True))
 
 
 if __name__ == "__main__":

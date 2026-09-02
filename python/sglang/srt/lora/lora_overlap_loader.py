@@ -26,7 +26,9 @@ class LoRAOverlapLoader:
         self.load_stream_context: CudaStreamContext = self.device_module.stream(
             self.load_stream
         )
-        self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = {}
+        self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = (
+            self.lora_manager.pending_lora_load_events
+        )
 
     def try_overlap_load_lora(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]
@@ -35,6 +37,10 @@ class LoRAOverlapLoader:
         Check a LoRA adapter's asynchronous load status, and try to load it if there's capacity
         in the memory pool. Returns whether or not the adapter has been loaded.
         """
+        # Drain completed async loads before status/capacity checks so finished
+        # adapters no longer count as in-flight.
+        self._drain_completed_overlap_loads()
+
         lora_pipeline_load_status = self._check_overlap_load_status(lora_id)
         if lora_pipeline_load_status == LoRAOverlapLoadStatus.LOADING:
             return False
@@ -51,18 +57,25 @@ class LoRAOverlapLoader:
     def _check_overlap_load_status(
         self, lora_id: Optional[str]
     ) -> LoRAOverlapLoadStatus:
-        if lora_id not in self.lora_to_overlap_load_event:
-            return LoRAOverlapLoadStatus.NOT_LOADED
-
-        event = self.lora_to_overlap_load_event[lora_id]
-
-        if not event.query():
+        if lora_id in self.lora_to_overlap_load_event:
             return LoRAOverlapLoadStatus.LOADING
 
-        torch.cuda.current_stream().wait_event(event)
-        del self.lora_to_overlap_load_event[lora_id]
+        # After completed events have been drained, a memory-pool entry with no
+        # pending event is safe to use on the current stream.
+        if lora_id in self.lora_manager.memory_pool.uid_to_buffer_id:
+            return LoRAOverlapLoadStatus.LOADED
 
-        return LoRAOverlapLoadStatus.LOADED
+        return LoRAOverlapLoadStatus.NOT_LOADED
+
+    def _drain_completed_overlap_loads(self) -> None:
+        completed_loads = [
+            (lora_id, event)
+            for lora_id, event in self.lora_to_overlap_load_event.items()
+            if event.query()
+        ]
+        for lora_id, event in completed_loads:
+            torch.cuda.current_stream().wait_event(event)
+            del self.lora_to_overlap_load_event[lora_id]
 
     def _try_start_overlap_load(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]

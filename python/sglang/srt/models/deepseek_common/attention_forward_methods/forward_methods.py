@@ -17,7 +17,7 @@ class AttnForwardMethod(IntEnum):
     MHA_ONE_SHOT = auto()
 
     # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
+    MLA_FUSED_ROPE_ROCM = auto()
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()
@@ -30,3 +30,12 @@ class AttnForwardMethod(IntEnum):
 
     # Use Deepseek V3.2 sparse multi-latent attention for NPU
     DSA_NPU = auto()
+
+    # Use multi-head attention for ROCm
+    MHA_ROCM = auto()
+
+    # Use one-shot multi-head attention for ROCm
+    MHA_ONE_SHOT_ROCM = auto()
+
+    # Use absorbed multi-latent attention for ROCm
+    MLA_ROCM = auto()

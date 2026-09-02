@@ -13,6 +13,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.step3_vl import Step3VLConfig
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -316,7 +317,7 @@ class PerceptionEncoder(nn.Module):
             raise ValueError("use_rope2d must be True")
         self.image_size = config.image_size
 
-        self.conv1 = nn.Conv2d(
+        self.conv1 = Conv2dLayer(
             in_channels=3,
             out_channels=config.width,
             kernel_size=config.patch_size,
@@ -480,43 +481,93 @@ class StepVLForConditionalGeneration(nn.Module):
         return image_features
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        assert len(items) == 1  # We only have images.
+        # Phase 1: Collect thumbnails and patches separately (different resolutions).
+        all_thumbnails = []
+        all_patches = []
+        # Per-item metadata: (thumb_count, num_patches_list, patch_count)
+        item_metadata = []
 
-        item = items[0]
-        pixel_values = item.feature.type(self.vision_model.dtype).to(self.device)
-        num_patches = item.model_specific_data.get("num_patches")
-        patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
-        if patch_pixel_values is not None:
-            patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype).to(
-                self.device
-            )
-
-        image_features = self._get_vision_model_output(pixel_values)
-        patch_image_features = (
-            self._get_vision_model_output(patch_pixel_values)
-            if patch_pixel_values is not None
-            else None
-        )
-        image_features = self._process_image_features(image_features)
-        patch_image_features = (
-            self._process_image_features(patch_image_features)
-            if patch_image_features is not None
-            else None
-        )
-        merged_image_features = []
-        cur_patch_idx = 0
-        for i, num_patch in enumerate(num_patches):
-            cur_feature = []
-            if num_patch > 0:
-                patch_slice = patch_image_features[
-                    cur_patch_idx : cur_patch_idx + num_patch
+        for item in items:
+            pixel_values = item.feature.type(self.vision_model.dtype)
+            num_patches = item.model_specific_data.get("num_patches")
+            if num_patches is None:
+                raise ValueError("Step3-VL image item is missing num_patches.")
+            if isinstance(num_patches, torch.Tensor):
+                num_patches = [int(x) for x in num_patches.flatten().cpu().tolist()]
+            elif isinstance(num_patches, (list, tuple)):
+                num_patches = [
+                    int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+                    for x in num_patches
                 ]
-                cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
-            cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
-            cur_patch_idx += num_patch
-            merged_image_features.append(
-                torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
+            else:
+                num_patches = [int(num_patches)]
+
+            patch_pixel_values = item.model_specific_data.get(
+                "patch_pixel_values", None
             )
+            if patch_pixel_values is not None and patch_pixel_values.shape[0] == 0:
+                patch_pixel_values = None
+            if patch_pixel_values is not None:
+                patch_pixel_values = patch_pixel_values.type(
+                    self.vision_model.dtype
+                ).to(self.device)
+
+            all_thumbnails.append(pixel_values)
+            thumb_count = pixel_values.shape[0]
+            patch_count = 0
+            if patch_pixel_values is not None:
+                all_patches.append(patch_pixel_values)
+                patch_count = patch_pixel_values.shape[0]
+            item_metadata.append((thumb_count, num_patches, patch_count))
+
+        # Phase 2: Batched ViT + projector forward (one pass per resolution).
+        all_thumbnails = torch.cat(all_thumbnails, dim=0)
+        all_thumb_features = self._process_image_features(
+            self._get_vision_model_output(all_thumbnails)
+        )
+
+        all_patch_features = None
+        if all_patches:
+            all_patches = torch.cat(all_patches, dim=0)
+            all_patch_features = self._process_image_features(
+                self._get_vision_model_output(all_patches)
+            )
+
+        # Phase 3: Split results back and merge per-image features.
+        merged_image_features = []
+        thumb_offset = 0
+        patch_offset = 0
+        for thumb_count, num_patches_list, patch_count in item_metadata:
+            item_thumb_features = all_thumb_features[
+                thumb_offset : thumb_offset + thumb_count
+            ]
+            thumb_offset += thumb_count
+            item_patch_features = (
+                all_patch_features[patch_offset : patch_offset + patch_count]
+                if patch_count > 0
+                else None
+            )
+            patch_offset += patch_count
+
+            cur_patch_idx = 0
+            for i, num_patch in enumerate(num_patches_list):
+                cur_feature = []
+                if num_patch > 0:
+                    if item_patch_features is None:
+                        raise ValueError(
+                            "Step3-VL image item has num_patches > 0 but no patch_pixel_values."
+                        )
+                    patch_slice = item_patch_features[
+                        cur_patch_idx : cur_patch_idx + num_patch
+                    ]
+                    cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
+                cur_feature.append(
+                    item_thumb_features[i].view(-1, item_thumb_features.shape[-1])
+                )
+                cur_patch_idx += num_patch
+                merged_image_features.append(
+                    torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
+                )
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
