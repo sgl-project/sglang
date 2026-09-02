@@ -510,7 +510,9 @@ class TestComputePrefixHash(unittest.TestCase):
             with self.subTest(name=name):
                 key = RadixKey(tokens, extra_key=extra_key, cache_salt=cache_salt)
                 expected = get_hash_str(
-                    key, chain_prior_hash(key, None), page_size=manager.page_size
+                    key,
+                    chain_prior_hash(None, extra_key=extra_key, cache_salt=cache_salt),
+                    page_size=manager.page_size,
                 )
                 self.assertEqual(
                     manager._compute_prefix_hash(

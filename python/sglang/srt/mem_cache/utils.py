@@ -150,15 +150,12 @@ def namespace_seed(
     return digest.hexdigest()
 
 
-def key_namespace_seed(key: "RadixKey") -> Optional[str]:
-    """``namespace_seed`` for the namespace a RadixKey belongs to."""
-    return namespace_seed(key.extra_key, key.cache_salt)
-
-
-def chain_prior_hash(key: "RadixKey", prior_hash: Optional[str]) -> Optional[str]:
+def chain_prior_hash(
+    prior_hash: Optional[str], *, extra_key: Optional[str], cache_salt: Optional[str]
+) -> Optional[str]:
     """What this page-hash chain links back to: the prior page when the chain
     continues, else the seed that scopes a fresh chain to its namespace."""
-    return prior_hash if prior_hash else key_namespace_seed(key)
+    return prior_hash or namespace_seed(extra_key, cache_salt)
 
 
 def hash_str_to_int64(hash_str: str) -> int:
@@ -178,7 +175,9 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
             parent_hash = node.parent.hash_value[-1]
-    parent_hash = chain_prior_hash(node.key, parent_hash)
+    parent_hash = chain_prior_hash(
+        parent_hash, extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
+    )
 
     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)
@@ -217,7 +216,7 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     own: the storage chain is seeded with ``extra_key`` too, and only
     ``cache_salt`` reaches the consumer.
     """
-    if key_namespace_seed(node.key) is None:
+    if namespace_seed(node.key.extra_key, node.key.cache_salt) is None:
         return compute_node_hash_values(node, page_size)
 
     if node.event_hash_value is not None:

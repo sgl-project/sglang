@@ -1177,7 +1177,11 @@ class HiCacheController:
         hash_value = []
         page_hashes = self.get_hash_str(
             tokens_to_fetch,
-            self.chain_prior_hash(tokens_to_fetch, last_hash),
+            self.chain_prior_hash(
+                last_hash,
+                extra_key=tokens_to_fetch.extra_key,
+                cache_salt=tokens_to_fetch.cache_salt,
+            ),
             page_size=self.page_size,
         )
         operation.all_hash_values = page_hashes

@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.utils import namespace_seed
+from sglang.srt.mem_cache.utils import chain_prior_hash
 from sglang.srt.runtime_context import (
     get_memory,
     get_schedule,
@@ -302,7 +302,9 @@ class DecodeKVCacheOffloadManager:
         page_hashes = []
         # A fresh chain starts at the request's cache namespace, so these keys
         # match the ones the prefill side writes and looks up.
-        last_hash = prior_hash or namespace_seed(req.extra_key, req.cache_salt)
+        last_hash = chain_prior_hash(
+            prior_hash, extra_key=req.extra_key, cache_salt=req.cache_salt
+        )
         for offset in range(0, len(tokens), self.page_size):
             page_tokens = tokens[offset : offset + self.page_size]
             last_hash = self.cache_controller.get_hash_str(page_tokens, last_hash)

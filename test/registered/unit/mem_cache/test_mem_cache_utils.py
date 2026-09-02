@@ -505,7 +505,10 @@ class TestStorageWriteLookupParity(unittest.TestCase):
         return compute_node_hash_values(node, page_size=page_size)
 
     def _lookup_side(self, key, page_size, last_hash=None):
-        return get_hash_str(key, chain_prior_hash(key, last_hash), page_size=page_size)
+        prior_hash = chain_prior_hash(
+            last_hash, extra_key=key.extra_key, cache_salt=key.cache_salt
+        )
+        return get_hash_str(key, prior_hash, page_size=page_size)
 
     def test_fresh_chain_matches(self):
         tokens = array("q", range(1, 33))
