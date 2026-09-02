@@ -33,5 +33,5 @@ jobs:
   seed:
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
-      runs_on: 1-gpu-5090
+      runs_on: ubuntu-22.04
     secrets: inherit
