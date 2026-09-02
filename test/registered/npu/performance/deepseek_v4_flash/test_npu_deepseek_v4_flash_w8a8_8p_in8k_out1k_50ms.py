@@ -3,7 +3,7 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
-    DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -117,7 +117,7 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50ms(TestNpuPerformanceTestCaseBase):
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    model = DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH
+    model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_FLASH_W8A8_8P_ENVS
     dataset_name = "random"
