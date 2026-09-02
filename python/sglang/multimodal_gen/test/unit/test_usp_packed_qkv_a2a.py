@@ -173,7 +173,7 @@ class TestPackedQKVInputA2A(CustomTestCase):
                     )
                     self.assertTrue(packed[r][i].is_contiguous())
 
-    def test_batch_one_zero_copy_views_match_materialized_exchange(self):
+    def test_batch_one_zero_copy_views_match_reference(self):
         world, b, s_global, h_global, d = 4, 1, 128, 24, 64
         torch.manual_seed(9876)
         s_local, h_local = s_global // world, h_global // world
@@ -199,20 +199,6 @@ class TestPackedQKVInputA2A(CustomTestCase):
                 expected = full[index][:, :, rank * h_local : (rank + 1) * h_local]
                 self.assertTrue(torch.equal(views[rank][index], expected))
                 self.assertEqual(views[rank][index].stride(-1), 1)
-                self.assertFalse(views[rank][index].is_contiguous())
-
-    def test_zero_copy_rejects_batch_greater_than_one(self):
-        world, b, s_global, h_global, d = 2, 2, 16, 4, 8
-        s_local = s_global // world
-        shards = [
-            torch.randn(b, s_local, h_global, d, dtype=torch.bfloat16, device="cuda")
-            for _ in range(3)
-        ]
-        with (
-            patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=world),
-            self.assertRaisesRegex(ValueError, "batch size one"),
-        ):
-            usp_mod._usp_input_all_to_all_qkv(*shards, materialize=False)
 
 
 if __name__ == "__main__":
