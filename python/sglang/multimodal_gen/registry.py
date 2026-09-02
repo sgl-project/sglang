@@ -9,7 +9,6 @@ information based on model paths or other identifiers.
 
 import dataclasses
 import importlib
-import json
 import os
 import pkgutil
 from functools import lru_cache
@@ -203,6 +202,11 @@ from sglang.multimodal_gen.configs.sample.zimage import (
     ZImageSamplingParams,
     ZImageTurboSamplingParams,
 )
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    SENSENOVA_U1_MODEL_IDS,
+    is_sensenova_u1_adapter_only_model,
+    is_sensenova_u1_model,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -351,32 +355,6 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
 }
 
-SENSENOVA_U1_MODEL_IDS = {
-    "sensenova/sensenova-u1.5-8b-mot",
-}
-
-
-def _is_sensenova_u1_model(model_path: str) -> bool:
-    """Identify SenseNova U1 Hub IDs and local checkpoints."""
-    if os.path.isdir(model_path):
-        config_path = os.path.join(model_path, "config.json")
-        try:
-            with open(config_path) as config_file:
-                config = json.load(config_file)
-        except (OSError, json.JSONDecodeError):
-            return False
-
-        if not isinstance(config, dict):
-            return False
-        architectures = config.get("architectures", [])
-        return (
-            config.get("model_type") == "neo_chat"
-            and isinstance(architectures, list)
-            and "NEOChatModel" in architectures
-        )
-
-    return model_path.rstrip("/").lower() in SENSENOVA_U1_MODEL_IDS
-
 
 def register_configs(
     sampling_param_cls: Any,
@@ -486,7 +464,7 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
     _ensure_registry_initialized()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
-    if _is_sensenova_u1_model(model_path):
+    if is_sensenova_u1_model(model_path):
         return True
 
     if model_path in _MODEL_HF_PATH_TO_NAME:
@@ -539,7 +517,7 @@ def _get_config_info(
 
     # SenseNova Hub IDs require an exact match, while local checkpoints are
     # identified from their config metadata rather than their directory name.
-    if _is_sensenova_u1_model(model_path):
+    if is_sensenova_u1_model(model_path):
         for registered_hf_id in all_model_hf_paths:
             if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
                 return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
@@ -717,6 +695,15 @@ def get_model_info(
     # For AUTO or SGLANG backend, try native implementation first
     # 1. Discover all available pipeline classes and cache them
     _ensure_registry_initialized()
+
+    if is_sensenova_u1_adapter_only_model(model_path):
+        logger.error(
+            "SenseNova-U1 adapter-only checkpoint '%s' does not contain base "
+            "model weights or config. Use the base checkpoint "
+            "'sensenova/SenseNova-U1.5-8B-MoT' with the adapter instead.",
+            model_path,
+        )
+        return None
 
     # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
@@ -1426,7 +1413,7 @@ def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
-    if _is_sensenova_u1_model(model_path):
+    if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
