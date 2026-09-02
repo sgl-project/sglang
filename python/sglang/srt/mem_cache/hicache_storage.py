@@ -181,6 +181,15 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
+    def finalize_mem_pool_registration(self) -> None:
+        """Finish backend setup after every initial host pool is registered.
+
+        Backends that construct resources from the complete pool topology can
+        override this hook. It is intentionally optional so existing built-in
+        and dynamically loaded backends keep their current lifecycle.
+        """
+        pass
+
     def batch_exists_v2(
         self,
         keys: List[str],
