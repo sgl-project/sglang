@@ -1,14 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
 
 import logging
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +56,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-            # If no scales were loaded (both scales are invalid negative
+        elif layer.k_scale <= 0.0 and layer.v_scale <= 0.0:
+            # If no scales were loaded (both scales are invalid non-positive
             # values), use the default value of 1.0
             k_scale = 1.0
             v_scale = 1.0

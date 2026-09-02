@@ -9,32 +9,44 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
-    MODELOPT_WAN22_FP8_TRANSFORMER,
-    MODELOPT_WAN22_NVFP4_TRANSFORMER,
+    MODELOPT_WAN22_FP8_MODEL,
+    MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+    MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
+    COSMOS3_NANO_CI_sampling_params,
     DiffusionSamplingParams,
     DiffusionServerArgs,
     DiffusionTestCase,
-    HUNYUAN3D_SHAPE_sampling_params,
+    IDEOGRAM4_CI_sampling_params,
+    JOY_ECHO_T2V_CI_sampling_params,
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
+    LONGLIVE2_I2V_CI_sampling_params,
+    LONGLIVE2_T2V_CI_sampling_params,
+    MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
     MODELOPT_TI2I_CI_sampling_params,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
+    PI05_ACTION_CI_sampling_params,
+    REALTIME_MODEL_sampling_params,
+    SANA_VIDEO_T2V_CI_sampling_params,
+    SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
-    TI2I_sampling_params,
-    TI2V_sampling_params,
     _make_modelopt_ci_case,
     _with_default_num_gpus,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
@@ -42,6 +54,8 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
@@ -54,6 +68,7 @@ from sglang.multimodal_gen.test.test_utils import (
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -63,7 +78,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_cache_dit_enabled",
@@ -71,7 +85,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
             enable_cache_dit=True,
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu",
@@ -96,9 +109,18 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
+        "pi05_action_http",
+        DiffusionServerArgs(
+            model_path="lerobot/pi05_base",
+        ),
+        PI05_ACTION_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
-        T2I_sampling_params,
     ),
     # TODO: modeling of flux different from official flux, so weights can't be loaded
     # consider opting for a different quantized hf-repo
@@ -122,22 +144,18 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
-    # TODO: replace with a faster model to test the --dit-layerwise-offload
-    # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
-    # so we do one warmup and send one request instead
     DiffusionTestCase(
-        "layerwise_offload",
+        "flux_2_klein_base_image_t2i",
         DiffusionServerArgs(
-            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            dit_layerwise_offload=True,
-            dit_offload_prefetch_size=2,
+            model_path=DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
         ),
         T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i_fp8",
@@ -145,7 +163,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             extras=["--transformer-path MickJ/Z-Image-Turbo-fp8"],
         ),
-        T2I_sampling_params,
     ),
     # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
@@ -155,16 +172,25 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
             second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
         ),
-        T2I_sampling_params,
         run_lora_basic_api_check=True,
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,
+    ),
+    DiffusionTestCase(
+        "cosmos3_nano_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
+            modality="image",
+        ),
+        COSMOS3_NANO_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
         DiffusionServerArgs(model_path=DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
-        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_edit_2509_ti2i",
@@ -178,7 +204,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
         ),
-        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_layered_i2i",
@@ -190,7 +215,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "joyai_image_edit_ti2i",
         DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
-        TI2I_sampling_params,
         run_consistency_check=False,
         run_component_accuracy_check=False,
     ),
@@ -211,8 +235,54 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            modality="video",
         ),
-        T2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "sana_video_2b_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        SANA_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "cosmos3_nano_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
+            modality="video",
+            env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
+        ),
+        DiffusionSamplingParams(
+            prompt="A blue box slides across a clean warehouse floor.",
+            output_size="832x480",
+            seconds=1,
+            num_frames=9,
+            extras={
+                "num_inference_steps": 4,
+                "seed": 0,
+                "max_sequence_length": 128,
+                "flow_shift": 10.0,
+                "use_guardrails": False,
+                "use_duration_template": False,
+                "use_resolution_template": False,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "longlive2_t2v",
+        DiffusionServerArgs(
+            model_path="Rabinovich/LongLive-2.0-5B-Diffusers",
+            modality="video",
+        ),
+        LONGLIVE2_T2V_CI_sampling_params,
+        run_component_accuracy_check=False,
     ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
@@ -295,7 +365,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "flux_2_ti2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
-        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_t2i_customized_vae_path",
@@ -311,7 +380,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
         ),
-        T2V_sampling_params,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
@@ -319,14 +387,34 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
         ),
-        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
         ),
-        TI2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "sana_wm_ti2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+        ),
+        SANA_WM_TI2V_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "longlive2_i2v",
+        DiffusionServerArgs(
+            model_path="Rabinovich/LongLive-2.0-5B-Diffusers",
+            modality="video",
+        ),
+        LONGLIVE2_I2V_CI_sampling_params,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     # flaky
     # === Helios T2V ===
@@ -368,15 +456,47 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             extras=[
-                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode original"
             ],
             env_vars={
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
             },
         ),
-        T2I_sampling_params,
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_video_moe_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "lingbot_world_realtime_plastic_beach",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-world-fast-diffusers",
+            modality="video",
+            num_gpus=1,
+            extras=[
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
+            ],
+            text_encoder_cpu_offload=True,
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        REALTIME_MODEL_sampling_params,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
 ]
 
@@ -387,9 +507,7 @@ if not current_platform.is_hip():
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
-                enable_warmup=False,
             ),
-            HUNYUAN3D_SHAPE_sampling_params,
             run_consistency_check=False,
         ),
     )
@@ -402,34 +520,32 @@ if not current_platform.is_hip():
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
             ),
             T2V_sampling_params,
-        )
+        ),
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
-# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
+# Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
+# quantization coverage in the B200 suite.
 if current_platform.is_hip():
-    ONE_GPU_MODELOPT_CASES = []
+    ONE_GPU_MODELOPT_FP8_CASES = []
+    ONE_GPU_MODELOPT_NVFP4_CASES = []
 else:
-    ONE_GPU_MODELOPT_CASES = [
+    ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_fp8_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-        ),
-        _make_modelopt_ci_case(
-            "flux2_modelopt_fp8_t2i",
-            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_FP8_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+            extras=[],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "hunyuanvideo_modelopt_fp8_t2v",
@@ -457,6 +573,8 @@ else:
             sampling_params=MODELOPT_TI2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
+    ]
+    ONE_GPU_MODELOPT_NVFP4_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -464,6 +582,7 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -472,24 +591,263 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
+            "ideogram4_nvfp4_t2i",
+            model_path="Comfy-Org/Ideogram-4",
+            modality="image",
+            sampling_params=IDEOGRAM4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_2512_modelopt_nvfp4_t2i",
+            model_path=MODELOPT_QWEN_IMAGE_2512_NVFP4_MODEL,
+            modality="image",
+            sampling_params=MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
+            extras=[],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            extras=[],
+            env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
     ]
 
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
+
+MINIMAX_H3_FOUR_GPU_H100_CASES = [
+    DiffusionTestCase(
+        "minimax_h3_fl2va_first_frame_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            num_gpus=4,
+            tp_size=2,
+            ulysses_degree=2,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "speed",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp; preserve the album-cover "
+                "composition, brick storefronts, muted teal and amber colors, "
+                "subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "fl2va",
+                "conditions": [
+                    {
+                        "type": "image",
+                        "uri": (
+                            "https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/"
+                            "5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/"
+                            "825646124206.jpg/600x600bb.jpg"
+                        ),
+                        "role": "keyframe",
+                        "frame_index": 0,
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 2,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+]
+
 TWO_GPU_CASES = [
+    DiffusionTestCase(
+        "minimax_h3_t2va_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A static night view of a narrow London alley in soft rain, wet "
+                "pavement reflecting a yellow streetlamp, the blue K. West sign "
+                "glowing above a doorway, cardboard boxes near the wall, a pale "
+                "parked car in the distance, and a slender glam-rock figure "
+                "holding a guitar under the lamp, brick storefronts, muted teal "
+                "and amber colors, subtle rain shimmer only."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "minimax_h3_ref2va_video_audio_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "Follow the motion and appearance of <Video 1> while moving the "
+                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
+                "reference with coherent timing."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "ref2va",
+                "conditions": [
+                    {
+                        "type": "video_audio",
+                        "uri": (
+                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                            "ref2va.mp4"
+                        ),
+                        "role": "reference",
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "flux2_modelopt_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            tp_size=2,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        MODELOPT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "ideogram4_fp8_tp2_t2i",
+        DiffusionServerArgs(
+            model_path="ideogram-ai/ideogram-4-fp8",
+            tp_size=2,
+            extras=[
+                "--attention-backend",
+                "fa",
+            ],
+        ),
+        IDEOGRAM4_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_2_I2V_A14B_MODEL_NAME_FOR_TEST,
         ),
-        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
@@ -497,7 +855,6 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
             extras=["--ulysses-degree=2"],
         ),
-        T2V_sampling_params,
     ),
     # TeaCache bring-up test for Wan2.2 T2V A14B — verifies enable_teacache=True
     # doesn't crash. Perf check disabled because Wan2.2-specific TeaCache
@@ -523,6 +880,8 @@ TWO_GPU_CASES = [
             extras=[
                 "--lora-weight-name",
                 "985347-wan22_14B-low-Nfj1nx-e65.safetensors",
+                "--lora-merge-mode",
+                "dynamic",
             ],
         ),
         DiffusionSamplingParams(
@@ -541,12 +900,25 @@ TWO_GPU_CASES = [
         ),
     ),
     DiffusionTestCase(
+        "joy_echo_t2v_2gpu",
+        DiffusionServerArgs(
+            model_path="jdopensource/JoyAI-Echo",
+            extras=["--ulysses-degree=2"],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        JOY_ECHO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
         "wan2_1_t2v_1.3b_cfg_parallel",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             cfg_parallel=True,
         ),
-        T2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu",
@@ -574,7 +946,6 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             extras=["--use-fsdp-inference"],
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "mova_360p_tp2",
@@ -583,7 +954,6 @@ TWO_GPU_CASES = [
             tp_size=2,
             dit_layerwise_offload=True,
         ),
-        TI2V_sampling_params,
         run_perf_check=False,
     ),
     DiffusionTestCase(
@@ -594,7 +964,6 @@ TWO_GPU_CASES = [
             ulysses_degree=2,
             dit_layerwise_offload=True,
         ),
-        TI2V_sampling_params,
         run_perf_check=False,
     ),
     DiffusionTestCase(
@@ -615,7 +984,6 @@ TWO_GPU_CASES = [
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
             ],
         ),
-        TI2V_sampling_params,
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
@@ -624,7 +992,6 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
             extras=["--ulysses-degree=2"],
         ),
-        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "ltx_2.3_two_stage_t2v_2gpus",
@@ -633,7 +1000,6 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--component-attention-backends transformer=fa",
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
@@ -647,7 +1013,6 @@ TWO_GPU_CASES = [
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
             extras=["--ulysses-degree=2"],
         ),
-        TI2V_sampling_params,
         run_lora_basic_api_check=True,
     ),
     DiffusionTestCase(
@@ -656,7 +1021,6 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_WAN_2_1_I2V_14B_720P_MODEL_NAME_FOR_TEST,
             extras=["--ulysses-degree=2"],
         ),
-        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
@@ -666,21 +1030,17 @@ TWO_GPU_CASES = [
             ulysses_degree=1,
             ring_degree=2,
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2I_sampling_params.prompt,
@@ -693,7 +1053,6 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
         ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_image_t2i_2_gpus",
@@ -709,7 +1068,6 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
         ),
-        TI2V_sampling_params,
         run_component_accuracy_check=False,
     ),
 ]
@@ -727,5 +1085,358 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
+
+
+ONE_GPU_5090_PERF_CASE_IDS = frozenset(
+    {
+        "zimage_image_t2i",
+        "flux_2_klein_base_image_t2i",
+        "wan2_1_t2v_1.3b",
+    }
+)
+ONE_GPU_5090_SKIP_CONSISTENCY_CASE_IDS = frozenset(
+    {
+        "turbo_wan2_1_t2v_1.3b",
+    }
+)
+
+
+def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
+    cases_by_id = {case.id: case for case in ONE_GPU_CASES}
+    missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
+    if missing:
+        raise RuntimeError(f"Unknown 5090 diffusion canary case(s): {missing}")
+
+    return [
+        replace(
+            cases_by_id[case_id],
+            run_perf_check=case_id in ONE_GPU_5090_PERF_CASE_IDS,
+            run_consistency_check=(
+                cases_by_id[case_id].run_consistency_check
+                and case_id not in ONE_GPU_5090_SKIP_CONSISTENCY_CASE_IDS
+            ),
+        )
+        for case_id in case_ids
+    ]
+
+
+def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
+    base_case = next(case for case in ONE_GPU_CASES if case.id == "flux_image_t2i")
+
+    return replace(
+        base_case,
+        id="flux_image_t2i_layerwise_cpu_offload_5090",
+        server_args=replace(
+            base_case.server_args,
+            dit_layerwise_offload=True,
+            dit_offload_prefetch_size=5,
+            text_encoder_cpu_offload=True,
+            extras=[
+                *base_case.server_args.extras,
+                "--dit-cpu-offload",
+                "--pin-cpu-memory",
+            ],
+        ),
+        sampling_params=replace(
+            T2I_sampling_params,
+            output_size="512x512",
+            extras={"num_inference_steps": 4, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+
+
+def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
+    """MiniMax-H3 on a pretend 12 GiB card with a pretend 32 GiB host.
+
+    This is the cookbook's consumer recipe, and it guards the whole constrained
+    placement stack at once: the deployment-size gate that keeps the VAE on its
+    checkpoint mapping, per-layer pinning under a small budget, the courier
+    thread that ships still-mapped layers, and the decode-scoped VAE residency
+    that decodes inside the VRAM the denoise just vacated. The runner's real
+    card and host are never short, so the pretend sizes are what route the run
+    onto those paths: the allocator cap makes "fits 12 GiB" enforced rather
+    than inferred, and the runtime peak baseline is that budget.
+    """
+    return DiffusionTestCase(
+        "minimax_h3_t2va_consumer_budget_1gpu_5090",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            extras=[
+                "--model-variant",
+                "fl2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder,vae",
+                "--layerwise-resident-layers",
+                "video_vae=36",
+            ],
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "32",
+                "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": "12",
+                # the decode holds two thirds of the decoder against the 12 GiB
+                # cap; without expandable segments, fragmentation tips the
+                # last hundred MiB over
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            },
+        ),
+        DiffusionSamplingParams(
+            prompt=("A cat walking on a sunny beach, gentle waves, soft camera pan."),
+            output_size="672x384",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 384,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 8,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 1101,
+            },
+        ),
+        run_perf_check=True,
+        perf_repeat_requests=2,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    )
+
+
+ONE_GPU_5090_CANARY_CASE_IDS = (
+    "zimage_image_t2i",
+    "flux_2_klein_base_image_t2i",
+    "wan2_1_t2v_1.3b",
+)
+if not current_platform.is_hip():
+    ONE_GPU_5090_CANARY_CASE_IDS += ("turbo_wan2_1_t2v_1.3b",)
+
+ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
+ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
+ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
+
+
+# Intel Arc Pro B60 has 24 GiB of XPU memory, so only sub-~5B-parameter
+# checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.1-dev,
+# FLUX.2-dev, Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
+# 24 GiB, and the FP8/NVFP4 quant paths are CUDA-only.
+ONE_GPU_XPU_CASE_IDS = (
+    "zimage_image_t2i",
+    "flux_2_klein_image_t2i",
+    "flux_2_klein_base_image_t2i",
+    "wan2_1_t2v_1.3b",
+)
+
+
+def _select_xpu_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
+    cases_by_id = {case.id: case for case in ONE_GPU_CASES}
+    missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
+    if missing:
+        raise RuntimeError(f"Unknown XPU diffusion case(s): {missing}")
+    return [cases_by_id[case_id] for case_id in case_ids]
+
+
+# Consistency GT images are H100-generated; XPU output diverges at the
+# pixel level (different attention kernels + fp reductions on Xe2) so
+# SSIM/PSNR against the H100 golden always fails. test_server_1_gpu.py
+# parametrizes directly from ONE_GPU_CASES, so mutate those entries in
+# place -- overriding only via ONE_GPU_XPU_CASES would be ignored.
+if current_platform.is_xpu():
+    _xpu_ids = set(ONE_GPU_XPU_CASE_IDS)
+    for _i, _case in enumerate(ONE_GPU_CASES):
+        if _case.id in _xpu_ids and _case.run_consistency_check:
+            ONE_GPU_CASES[_i] = replace(_case, run_consistency_check=False)
+
+ONE_GPU_XPU_CASES = _select_xpu_cases(ONE_GPU_XPU_CASE_IDS)
+
+
+# Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
+# The CUDA lane runs the whole unit/ tree recursively; AMD enables nested
+# files incrementally as they are vetted, in follow-up PRs. Paths are
+# relative to the unit/ dir.
+_AMD_READY_NESTED_UNIT_TESTS = (
+    "realtime/test_causal_denoising.py",
+    "realtime/test_output_materialization.py",
+    "realtime/test_realtime_consistency_harness.py",
+    "realtime/test_realtime_control_signals.py",
+    "realtime/test_realtime_output_transport.py",
+    "realtime/test_realtime_vae.py",
+    "sana_wm/test_streaming_cached.py",
+    "sana_wm/test_streaming_stage.py",
+    "sana_wm/test_streaming_vae.py",
+    # Enabled with small test-harness stub fixes (see this PR's test edits).
+    "progressive_resolution/test_progressive.py",
+    "sana_wm/test_streaming_realtime_path.py",
+    # Stub gap already fixed upstream; only needs enabling here.
+    "realtime/test_lingbot_causal_denoising.py",
+)
+
+
+def _discover_unit_tests() -> list[str]:
+    unit_dir = Path(__file__).resolve().parent.parent / "unit"
+    if not unit_dir.is_dir():
+        return []
+    if not current_platform.is_hip():
+        # pytest recurses into the directory: every unit test runs, nested
+        # subdirs included, and new files need no registry edit.
+        return ["../unit"]
+    # AMD/ROCm keeps the vetted set: the flat files plus the nested tests
+    # verified to pass on ROCm.
+    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
+    nested = [
+        f"../unit/{rel}"
+        for rel in _AMD_READY_NESTED_UNIT_TESTS
+        if (unit_dir / rel).is_file()
+    ]
+    return sorted(flat + nested)
+
+
+FILE_SUITES = {
+    "unit": _discover_unit_tests(),
+    "component-accuracy": [
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
+    ],
+    "component-accuracy-1-gpu": [
+        "../single_test_file/component_accuracy/test_component_accuracy_1_gpu.py",
+    ],
+    "component-accuracy-2-gpu": [
+        "../single_test_file/component_accuracy/test_component_accuracy_2_gpu.py",
+    ],
+    "1-gpu-b200": [
+        "test_server_b200.py",
+    ],
+    "4-gpu-h100": [
+        "test_server_4_gpu_h100.py",
+    ],
+}
+
+PARAMETRIZED_CASE_GROUPS = {
+    "1-gpu": [
+        ("test_server_1_gpu.py", ONE_GPU_CASES),
+    ],
+    "1-gpu-5090": [
+        ("test_server_1_gpu_5090.py", ONE_GPU_5090_CASES),
+    ],
+    "1-gpu-xpu": [
+        ("test_server_1_gpu.py", ONE_GPU_XPU_CASES),
+    ],
+    "2-gpu": [
+        ("test_server_2_gpu.py", TWO_GPU_CASES),
+    ],
+    "bcg-diffusion": [],
+}
+
+STANDALONE_FILES = {
+    "bcg-diffusion": [
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
+    ],
+    "1-gpu": [
+        "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_update_weights_from_disk.py",
+    ],
+    "2-gpu": [
+        "../single_test_file/test_disagg_server.py",
+        "../single_test_file/test_ar_models.py",
+        "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py",
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
+        "../single_test_file/test_dp_serving_2_gpu.py",
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+    ],
+}
+
+# test_update_weights_from_disk fails deterministically on ROCm: the diffusion
+# weight-update-from-disk reload path does not reconcile the diffusers
+# checkpoint layout with the sglang transformer parameters (shape mismatch ->
+# HTTP 400). Tracked in #31924. NVIDIA does not run standalone files, so this
+# test is AMD-only; skip it on ROCm until the reload path is fixed. Remove
+# this block (keeping the STANDALONE_FILES / est-time entry above) to
+# re-enable once #31924 lands.
+if current_platform.is_hip():
+    STANDALONE_FILES["1-gpu"] = [
+        f
+        for f in STANDALONE_FILES["1-gpu"]
+        if f != "../single_test_file/test_update_weights_from_disk.py"
+    ]
+
+# New standalone files may omit an estimate once to learn the real CI runtime.
+# CI will use a fallback estimate for sharding, run the test, then print a
+# measured value that must be copied into STANDALONE_FILE_EST_TIMES.
+STANDALONE_FILE_EST_TIMES = {
+    "bcg-diffusion": {
+        "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
+    },
+    "1-gpu": {
+        "../single_test_file/test_update_weights_from_disk.py": 1200.0,
+    },
+    "2-gpu": {
+        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
+        # Raise if CI reports a higher measured time.
+        "../single_test_file/test_disagg_server.py": 600.0,
+        "../single_test_file/test_ar_models.py": 600.0,
+        # no model load; the cost is the one-time JIT build of the sync kernels
+        "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_encoder_fold_srt_linear_2_gpu.py": 120.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
+        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
+        # padded for cold-cache CI.
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
+        # zimage server startup dominates; six short requests after warmup
+        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        # one capture plus three replays on a 32K-element exchange
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        # two SDPA parity checks on 128+6 rows
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+    },
+}
+
+# Backward-compatible suite view for scripts that still operate on file lists.
+SUITES = {
+    **FILE_SUITES,
+    **{
+        suite: [filename for filename, _ in case_groups]
+        + STANDALONE_FILES.get(suite, [])
+        for suite, case_groups in PARAMETRIZED_CASE_GROUPS.items()
+    },
+}
+
+STRICT_SUITES = {"unit", "bcg-diffusion"}
+COMPONENT_ACCURACY_SUITES = {
+    "component-accuracy",
+    "component-accuracy-1-gpu",
+    "component-accuracy-2-gpu",
+}
+COMPONENT_ACCURACY_FILE_NUM_GPUS = {
+    "test_component_accuracy_1_gpu.py": 1,
+    "test_component_accuracy_2_gpu.py": 2,
+}
+
+DEFAULT_EST_TIME_SECONDS = 300.0
+STARTUP_OVERHEAD_SECONDS = 120.0
+DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
+
+_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = (
+    "../single_test_file/test_update_weights_from_disk.py"
+)
+_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
+_UPDATE_WEIGHTS_MODEL_PAIR_IDS = ("FLUX.2-klein-base-4B",)

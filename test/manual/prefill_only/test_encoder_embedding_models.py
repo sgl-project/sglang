@@ -6,7 +6,6 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
@@ -28,8 +27,6 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
 # python -m unittest test_encoder_embedding_models.TestEncoderEmbeddingModels.test_prefill_logits
 
-
-register_cuda_ci(est_time=444, suite="stage-b-test-1-gpu-small")
 
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 

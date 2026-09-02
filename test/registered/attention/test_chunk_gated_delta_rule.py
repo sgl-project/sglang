@@ -2,16 +2,26 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.fused_recurrent import (
+from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device, is_hip
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=11, stage="stage-b", runner_config="1-gpu-large-amd")
+register_xpu_ci(est_time=900, suite="stage-b-test-1-gpu-xpu")
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    "Test requires CUDA or XPU",
+)
 class TestChunkGatedDeltaRule(unittest.TestCase):
     """Test chunk_gated_delta_rule against token-by-token fused_recurrent reference."""
 
@@ -68,7 +78,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):
         """Run correctness check for one (B, T_per_seq, H, K, V, pool_size) config."""
-        device = "cuda"
+        device = get_device()
         dtype = torch.bfloat16
         T = B * T_per_seq
 
@@ -178,6 +188,11 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
     def test_dim_k_gt_v(self):
         self._check_shape(B=4, T_per_seq=128, H=16, K=128, V=64, pool_size=32)
 
+    @unittest.skipIf(
+        is_hip(),
+        "K=V=256 head dim exceeds the FLA chunk triton kernel's shared-memory "
+        "budget on ROCm (out-of-resource at launch); smaller head dims pass.",
+    )
     def test_dim_256x256(self):
         self._check_shape(B=4, T_per_seq=128, H=16, K=256, V=256, pool_size=32)
 
@@ -204,6 +219,16 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
 
     def test_large_pool(self):
         self._check_shape(B=4, T_per_seq=128, H=16, K=128, V=128, pool_size=512)
+
+    # ------------------------------------------------------------------
+    # Long prompts (many chunks; regression test for cross-chunk errors)
+    # ------------------------------------------------------------------
+    def test_long_prompt(self):
+        for B, T_per_seq in [(1, 1024), (1, 1536), (1, 2048), (2, 1024)]:
+            with self.subTest(T_per_seq=T_per_seq):
+                self._check_shape(
+                    B=B, T_per_seq=T_per_seq, H=16, K=128, V=128, pool_size=32
+                )
 
     # ------------------------------------------------------------------
     # Combined stress
@@ -268,6 +293,53 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
             pool_size=32,
             sequential_indices=True,
         )
+
+    # ------------------------------------------------------------------
+    # Padded rows (idle DP ranks under breakable CUDA graph prefill)
+    # ------------------------------------------------------------------
+
+    def test_padded_state_index_is_skipped(self):
+        """Rows carrying state index -1 must be skipped, not addressed.
+
+        Without the guard the sentinel reaches pointer arithmetic and
+        addresses before the state pool.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, T_per_seq, H, K, V, pool_size = 4, 64, 4, 128, 128, 8
+        T = B * T_per_seq
+        torch.manual_seed(0)
+
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cu_seqlens = torch.zeros(B + 1, dtype=torch.long, device=device)
+        cu_seqlens[1:] = (
+            torch.arange(1, B + 1, dtype=torch.long, device=device) * T_per_seq
+        )
+        q = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        k = torch.randn(1, T, H, K, dtype=dtype, device=device)
+        v = torch.randn(1, T, H, V, dtype=dtype, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=dtype, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=dtype, device=device))
+
+        # "all padded" is the idle-DP-rank case that faulted.
+        for label, indices in (("mixed", [0, -1, 2, -1]), ("all_padded", [-1] * B)):
+            with self.subTest(label):
+                cache_indices = torch.tensor(indices, dtype=torch.int32, device=device)
+                o, pool = self._run_chunk(
+                    pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+                )
+                # Forces a sync: an out-of-bounds access surfaces here.
+                self.assertTrue(torch.isfinite(o.float()).all())
+
+                untouched = [s for s in range(pool_size) if s not in indices]
+                self.assertTrue(
+                    torch.equal(pool[untouched], pool_init[untouched]),
+                    f"{label}: padded rows wrote into the state pool",
+                )
 
 
 if __name__ == "__main__":

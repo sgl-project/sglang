@@ -517,6 +517,17 @@ class _UvicornAccessLogFilter(logging.Filter):
         return True
 
 
+class _PytreeEnumRegistrationFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            "is an Enum subclass and is now natively supported by torch.compile"
+            in message
+            and "Calling register_constant() on Enum subclasses is deprecated"
+            in message
+        )
+
+
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
@@ -562,11 +573,20 @@ def globally_suppress_loggers():
         "urllib3",
         "httpx",
         "httpcore",
+        "diffusers.quantizers.torchao.torchao_quantizer",
+        "transformers.processing_utils",
         "flash_attn.cute.cache_utils",
     ]
 
     for name in target_names:
         logging.getLogger(name).setLevel(logging.ERROR)
+
+    pytree_logger = logging.getLogger("torch.utils._pytree")
+    if not any(
+        isinstance(filter_, _PytreeEnumRegistrationFilter)
+        for filter_ in pytree_logger.filters
+    ):
+        pytree_logger.addFilter(_PytreeEnumRegistrationFilter())
 
 
 # source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60

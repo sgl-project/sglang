@@ -9,14 +9,17 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    pred_noise_to_pred_video,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context as precision_autocast_context,
+)
 
 logger = init_logger(__name__)
 
@@ -65,10 +68,10 @@ class DmdDenoisingStage(DenoisingStage):
         """
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
 
-        target_dtype = prepared_vars["target_dtype"]
-        autocast_enabled = prepared_vars["autocast_enabled"]
-        num_warmup_steps = prepared_vars["num_warmup_steps"]
-        latents = prepared_vars["latents"]
+        target_dtype = prepared_vars.target_dtype
+        autocast_enabled = prepared_vars.autocast_enabled
+        num_warmup_steps = prepared_vars.num_warmup_steps
+        latents = prepared_vars.latents
         video_raw_latent_shape = latents.shape
         scheduler = self.scheduler
 
@@ -87,14 +90,13 @@ class DmdDenoisingStage(DenoisingStage):
             self.transformer.forward,
             {
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
+        pos_cond_kwargs = prepared_vars.pos_cond_kwargs
 
         denoising_loop_start_time = time.time()
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        with self.progress_bar(total=len(timesteps), batch=batch) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
@@ -109,15 +111,13 @@ class DmdDenoisingStage(DenoisingStage):
                 ):
                     t_int = int(t.item())
                     if self.transformer_2 is not None:
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=self._handle_boundary_ratio(
-                                    server_args, batch, scheduler
-                                ),
-                                server_args=server_args,
-                                batch=batch,
-                            )
+                        current_model, _ = self._select_and_manage_model(
+                            t_int=t_int,
+                            boundary_timestep=self._handle_boundary_ratio(
+                                server_args, batch, scheduler
+                            ),
+                            server_args=server_args,
+                            batch=batch,
                         )
                     else:
                         current_model = self.transformer
@@ -148,9 +148,9 @@ class DmdDenoisingStage(DenoisingStage):
                     )
 
                     # Predict noise residual
-                    with torch.autocast(
-                        device_type=current_platform.device_type,
-                        dtype=target_dtype,
+                    with precision_autocast_context(
+                        target_dtype,
+                        server_args.disable_autocast,
                         enabled=autocast_enabled,
                     ):
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
@@ -224,54 +224,3 @@ class DmdDenoisingStage(DenoisingStage):
         )
 
         return batch
-
-    def _select_and_manage_model(
-        self,
-        t_int: int,
-        boundary_timestep: float | None,
-        server_args: ServerArgs,
-        batch: Req,
-    ):
-        if boundary_timestep is None or t_int >= boundary_timestep:
-            # High-noise stage
-            current_model = self.transformer
-            current_guidance_scale = batch.guidance_scale
-            current_phase = "transformer"
-        else:
-            # Low-noise stage
-            current_model = self.transformer_2
-            current_guidance_scale = batch.guidance_scale_2
-            current_phase = "transformer_2"
-
-        self._manage_dit_use_site(current_model, current_phase, batch)
-
-        assert current_model is not None, "The model for the current step is not set."
-        return current_model, current_guidance_scale
-
-    def _handle_boundary_ratio(
-        self,
-        server_args,
-        batch,
-        scheduler,
-    ):
-        """
-        (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
-        """
-        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
-        if batch.boundary_ratio is not None:
-            logger.info(
-                "Overriding boundary ratio from %s to %s",
-                boundary_ratio,
-                batch.boundary_ratio,
-            )
-            boundary_ratio = batch.boundary_ratio
-
-        if boundary_ratio is not None:
-            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
-            if num_train_timesteps is None:
-                num_train_timesteps = scheduler.config.num_train_timesteps
-            boundary_timestep = boundary_ratio * num_train_timesteps
-        else:
-            boundary_timestep = None
-
-        return boundary_timestep

@@ -15,10 +15,6 @@ Example usage:
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from typing import List
 
@@ -32,7 +28,7 @@ register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-mi35x-kimi-k26", nightl
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -62,7 +58,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 KIMI_K26_MODEL_PATH = os.environ.get("KIMI_K26_MODEL_PATH", "moonshotai/Kimi-K2.6")
-PROFILE_DIR = "performance_profiles_kimi_k26_mi35x"
+RESULT_DIR = "performance_results_kimi_k26_mi35x"
 
 
 class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
@@ -105,8 +101,8 @@ class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_kimi_k26(self):
@@ -125,7 +121,6 @@ class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

@@ -1,6 +1,6 @@
 """Nightly performance benchmark for GLM-5 on MI30x.
 
-Tests GLM-5 with NSA attention backend using bench_one_batch on 8 GPUs.
+Tests GLM-5 with DSA attention backend using bench_one_batch on 8 GPUs.
 
 Model paths can be configured via environment variables:
 - GLM5_MODEL_PATH: Path to GLM-5 model (default: zai-org/GLM-5-FP8)
@@ -48,13 +48,13 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 GLM5_MODEL_PATH = os.environ.get("GLM5_MODEL_PATH", "zai-org/GLM-5-FP8")
-PROFILE_DIR = "performance_profiles_glm5"
+RESULT_DIR = "performance_results_glm5"
 
 
 class TestNightlyGLM5Performance(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.
 
-    Tests GLM-5 with NSA attention backend on TP=8.
+    Tests GLM-5 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -75,9 +75,9 @@ class TestNightlyGLM5Performance(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",
@@ -95,8 +95,8 @@ class TestNightlyGLM5Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_glm5(self):
@@ -115,7 +115,6 @@ class TestNightlyGLM5Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

@@ -11,6 +11,7 @@ The FrameInterpolator wrapper and integration code are original work.
 """
 
 import os
+import time
 from typing import Optional
 
 import numpy as np
@@ -28,6 +29,7 @@ _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
 
 # Module-level cache: model_path -> Model instance
 _MODEL_CACHE: dict[str, "Model"] = {}
+_MAX_RIFE_BATCH_PAIRS = 16
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +394,20 @@ class FrameInterpolator:
         arr = t.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0).cpu().numpy()
         return (arr * 255.0).astype(np.uint8)
 
+    @staticmethod
+    def _frames_to_tensor(
+        frames: list[np.ndarray], device: torch.device
+    ) -> torch.Tensor:
+        t = torch.from_numpy(np.stack(frames, axis=0))
+        t = t.permute(0, 3, 1, 2).contiguous().float() / 255.0
+        return t.to(device, non_blocking=True)
+
+    @staticmethod
+    def _tensor_to_frames(t: torch.Tensor) -> list[np.ndarray]:
+        arr = t.permute(0, 2, 3, 1).clamp(0.0, 1.0).cpu().numpy()
+        arr = (arr * 255.0).astype(np.uint8)
+        return [arr[i] for i in range(arr.shape[0])]
+
     def _make_inference(
         self, model: Model, I0: torch.Tensor, I1: torch.Tensor, n: int, scale: float
     ) -> list[torch.Tensor]:
@@ -408,6 +424,30 @@ class FrameInterpolator:
             + [mid]
             + self._make_inference(model, mid, I1, n // 2, scale)
         )
+
+    def _interpolate_2x_batched(
+        self, model: Model, frames: list[np.ndarray], scale: float
+    ) -> list[np.ndarray]:
+        device = model.device()
+        source = self._frames_to_tensor(frames, device)
+        intermediate_frames: list[np.ndarray] = []
+
+        with torch.inference_mode():
+            for start in range(0, len(frames) - 1, _MAX_RIFE_BATCH_PAIRS):
+                end = min(start + _MAX_RIFE_BATCH_PAIRS, len(frames) - 1)
+                mids = model.inference(
+                    source[start:end],
+                    source[start + 1 : end + 1],
+                    scale=scale,
+                )
+                intermediate_frames.extend(self._tensor_to_frames(mids))
+
+        result: list[np.ndarray] = []
+        for i, mid in enumerate(intermediate_frames):
+            result.append(frames[i])
+            result.append(mid)
+        result.append(frames[-1])
+        return result
 
     def interpolate(
         self,
@@ -436,6 +476,16 @@ class FrameInterpolator:
         device = model.device()
 
         n_intermediate = 2**exp // 2  # intermediates per adjacent pair
+        start_time = time.perf_counter()
+
+        if n_intermediate == 1:
+            result = self._interpolate_2x_batched(model, frames, scale)
+            logger.info(
+                "RIFE batched interpolation completed in %.3f seconds for %d frames",
+                time.perf_counter() - start_time,
+                len(frames),
+            )
+            return result, 2**exp
 
         result: list[np.ndarray] = []
         for i in range(len(frames) - 1):
@@ -452,6 +502,11 @@ class FrameInterpolator:
 
         result.append(frames[-1])
         multiplier = 2**exp
+        logger.info(
+            "RIFE interpolation completed in %.3f seconds for %d frames",
+            time.perf_counter() - start_time,
+            len(frames),
+        )
         return result, multiplier
 
 

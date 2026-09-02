@@ -1,7 +1,12 @@
 # vLLM Torch Compile Fusion Patterns
 
-Refresh: `2026-05-01`.
-Source tree: vLLM `origin/main` at `7075df79b`.
+Refresh: `2026-06-26`.
+Source tree: vLLM `origin/main` at
+`abc71548ef029132c3316b902207f254a246d593`; no new LLM compile-fusion pass was
+added after `2317682f9` in this refresh. The mainline `#40392` MLA RoPE +
+KV-cache cat fusion is already included below. Recent post-`#46735` vLLM
+changes include runtime / frontend work such as `#44800` and `#46799`, but they
+do not add a new LLM compile-fusion pass to this inventory.
 
 Use this file when the fuse-pattern table reports split kernels in a trace and
 you need to decide whether the shape is already covered by vLLM's
@@ -17,7 +22,7 @@ vLLM registers these passes from
 | --- | --- | --- |
 | `enable_sp` | `SequenceParallelismPass` | all-reduce around residual/norm blocks becomes reduce-scatter, local work, and all-gather |
 | `fuse_gemm_comms` | `AsyncTPPass` | GEMM plus reduce-scatter / all-gather overlap through symmetric-memory collectives |
-| `fuse_allreduce_rms` | `AllReduceFusionPass` | all-reduce followed by RMSNorm, optional residual add, optional FP8 / NVFP4 quant |
+| `fuse_allreduce_rms` | `AllReduceFusionPass` or ROCm AITER variant | all-reduce followed by RMSNorm, optional residual add, optional FP8 / NVFP4 quant; current pass ordering runs AITER add-RMSNorm-pad before this fusion when available |
 | `fuse_minimax_qk_norm` | `MiniMaxQKNormPass` | MiniMax Q/K all-reduce plus RMSNorm decode path |
 | `fuse_norm_quant` | `RMSNormQuantFusionPass` | RMSNorm or fused-add-RMSNorm followed by FP8 / FP4 quant |
 | `fuse_norm_quant` + AITER | `RocmAiterRMSNormQuantFusionPass` | ROCm AITER RMSNorm / fused-add-RMSNorm followed by AITER or vLLM quant |
@@ -26,6 +31,7 @@ vLLM registers these passes from
 | `fuse_act_padding` + AITER | `RocmAiterTritonAddRMSNormPadFusionPass` | AITER fused-add-RMSNorm followed by padding into the next layout |
 | `fuse_mla_dual_rms_norm` + AITER | `MLADualRMSNormFusionPass` | MLA paired Q and KV RMSNorms become `fused_mla_dual_rms_norm` |
 | `fuse_rope_kvcache` | `RopeKVCacheFusionPass` | RoPE plus paged KV-cache update, after split cleanup passes |
+| `fuse_rope_kvcache_cat_mla` | `MLARoPEKVCacheCatFusionPass` | MLA RoPE on `q_pe` / `k_pe` plus unified MLA KV-cache update through a fused concat/cache op |
 | `fuse_attn_quant` | `AttnQuantFusionPass` | attention output followed by FP8 / NVFP4 quant |
 | `fuse_attn_quant` | `MLAAttnQuantFusionPass` | MLA attention output followed by FP8 / NVFP4 / FP8 group quant |
 | `enable_qk_norm_rope_fusion` | `QKNormRoPEFusionPass` | Q/K RMSNorm plus RoPE on packed QKV tensors |
@@ -43,6 +49,7 @@ vLLM registers these passes from
 | `fusion/rocm_aiter_fusion.py` | `MLADualRMSNormPattern` | MLA Q branch and KV branch each run RMSNorm | `torch.ops.vllm.fused_mla_dual_rms_norm` backed by AITER fused QK RMSNorm |
 | `fusion/qk_norm_rope_fusion.py` | `QkNormRopePattern` | Q/K RMSNorm, split/getitem reshapes, then RoPE | `_C.fused_qk_norm_rope` |
 | `fusion/rope_kvcache_fusion.py` | `RopeReshapeKVCachePattern` | RoPE output followed by reshape/cache update | `vllm.fused_rope_and_unified_kv_cache_update` |
+| `fusion/mla_rope_kvcache_cat_fusion.py` | `MLARoPEKVCacheCatPattern` | MLA RoPE on `q_pe` and `k_pe` flows into `unified_mla_kv_cache_update` | `vllm.fused_rope_unified_mla_kv_cache_update`, backed by `concat_and_cache_mla_rope_fused` |
 | `fusion/attn_quant_fusion.py` | `AttnFp8StaticQuantPattern`, `AttnNvfp4QuantPattern` | attention output followed by FP8 static quant or NVFP4 quant | backend attention op with fused output quant when supported |
 | `fusion/mla_attn_quant_fusion.py` | `MLAAttnFp8StaticQuantPattern`, `MLAAttnNvfp4QuantPattern`, `MLAAttnFp8GroupQuantPattern` | MLA attention output followed by static FP8, NVFP4, or FP8 group quant | MLA attention op with fused output quant when supported |
 | `fusion/minimax_qk_norm_fusion.py` | `MiniMaxQKNormPattern` | MiniMax `forward_qk`: Q/K variance all-reduce divided by TP world size, then RMS apply | `vllm.minimax_qk_norm_fused` / Lamport fused kernel |
@@ -56,8 +63,9 @@ vLLM registers these passes from
 - If the trace shows attention output followed by quant kernels, compare against
   `AttnQuantFusionPass` or `MLAAttnQuantFusionPass`, not only handwritten
   attention kernels.
-- If the trace shows Q/K norm followed by RoPE or cache update, compare both
-  `QKNormRoPEFusionPass` and `RopeKVCacheFusionPass`; they are separate passes.
+- If the trace shows Q/K norm followed by RoPE or cache update, compare
+  `QKNormRoPEFusionPass`, `RopeKVCacheFusionPass`, and the MLA-specific
+  `MLARoPEKVCacheCatFusionPass`; they are separate passes.
 - If the trace is a TP decode trace with visible collectives, check whether
   `enable_sp` and `fuse_gemm_comms` would transform the same region into
   sequence-parallel or AsyncTP overlap.

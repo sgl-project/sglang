@@ -5,7 +5,7 @@ A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
 - /start_profile, /stop_profile (profiling control)
 
-The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
+The sidecar is started on --smg-http-sidecar-port (default: --port + 1)
 once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
@@ -17,6 +17,7 @@ import time
 
 from aiohttp import web
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -105,7 +106,7 @@ def _add_admin_routes(app, request_manager):
             record_shapes = (record_shapes is not False) and env_record_shapes
 
             req = ProfileReq(
-                type=ProfileReqType.START_PROFILE,
+                req_type=ProfileReqType.START_PROFILE,
                 output_dir=body.get("output_dir"),
                 start_step=body.get("start_step"),
                 num_steps=body.get("num_steps"),
@@ -134,7 +135,7 @@ def _add_admin_routes(app, request_manager):
 
     async def stop_profile_handler(request):
         try:
-            req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+            req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
@@ -165,18 +166,25 @@ async def serve_grpc(server_args, model_info=None):
             "version mismatch — see the chained exception above for details."
         ) from e
 
+    # The integrated servicer builds an `Engine`, which validates and publishes
+    # on its own. Validating here would run `check_server_args` twice, and the
+    # LoRA normalization is not idempotent -- the second pass sees the `LoRARef`
+    # objects the first one declared and rejects them. So this entry reads the
+    # declarations for what it needs before the engine exists.
+    cfg = resolving_view(server_args)
+
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.grpc_http_sidecar_port
-        if server_args.grpc_http_sidecar_port is not None
+        server_args.smg_http_sidecar_port
+        if server_args.smg_http_sidecar_port is not None
         else server_args.port + 1
     )
 
     # Metrics setup: must set PROMETHEUS_MULTIPROC_DIR before scheduler
     # processes import prometheus_client, since the env var is inherited
     # at fork time.
-    if server_args.enable_metrics:
+    if cfg.enable_metrics:
         try:
             from sglang.srt.observability.func_timer import enable_func_timer
             from sglang.srt.utils import set_prometheus_multiproc_dir
@@ -204,7 +212,7 @@ async def serve_grpc(server_args, model_info=None):
             )
         try:
             sidecar_runner = await _start_sidecar_server(
-                server_args.host, sidecar_port, sidecar_app
+                cfg.host, sidecar_port, sidecar_app
             )
         except OSError as e:
             logger.error(
@@ -232,7 +240,7 @@ async def serve_grpc(server_args, model_info=None):
     )
     if sidecar_supported:
         serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
-    elif server_args.enable_metrics:
+    elif cfg.enable_metrics:
         # User explicitly asked for metrics but the installed servicer can't
         # start the sidecar that serves them — fail loud rather than silently
         # produce a server with no /metrics endpoint.

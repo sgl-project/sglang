@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=167, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=167, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -29,7 +29,7 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(2):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

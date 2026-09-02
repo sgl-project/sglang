@@ -75,13 +75,16 @@ class RocmPlatform(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if device_id is None:
+            device_id = torch.cuda.current_device()
 
         free_gpu_memory, _ = torch.cuda.mem_get_info(device_id)
 
@@ -152,7 +155,9 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
-                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    _is_fa3_supported,
+                )
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
@@ -394,6 +399,6 @@ class RocmPlatform(Platform):
         return patched
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """ROCm performs better without DIT layerwise offload on Wan."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

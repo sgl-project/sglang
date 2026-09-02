@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=53, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=53, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=82, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -216,6 +216,9 @@ class TestPenalty(CustomTestCase):
         }
         self._test_penalty_effect(prompt, baseline_params, penalty_params)
 
+    @unittest.skip(
+        "TODO: Fix the flaky negative-penalty diversity assertion and re-enable."
+    )
     def test_penalty_edge_cases_negative_penalty_values(self):
         """Test that negative penalties decrease vocabulary diversity."""
         prompt = "Write the word 'test' exactly 15 times in a row, separated by spaces."

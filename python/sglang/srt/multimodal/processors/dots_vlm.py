@@ -33,8 +33,16 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         merge_size = vision_config.spatial_merge_size
 
         self.IMAGE_FACTOR = patch_size * merge_size
-        self.MIN_PIXELS = _processor.image_processor.min_pixels
-        self.MAX_PIXELS = _processor.image_processor.max_pixels
+        self.MIN_PIXELS = getattr(
+            _processor.image_processor,
+            "min_pixels",
+            getattr(_processor.image_processor, "size", {}).get("shortest_edge"),
+        )
+        self.MAX_PIXELS = getattr(
+            _processor.image_processor,
+            "max_pixels",
+            getattr(_processor.image_processor, "size", {}).get("longest_edge"),
+        )
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,
@@ -61,13 +69,13 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         ):
             image_data = sum(image_data, [])
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
         )
 
-        combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
+        combined_mm_item, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         if combined_mm_item is None:

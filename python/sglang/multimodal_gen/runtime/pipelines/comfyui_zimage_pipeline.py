@@ -38,7 +38,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, set_mixed_precision_policy
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.utils import set_mixed_precision_policy
 
 logger = init_logger(__name__)
 
@@ -267,7 +268,9 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         safetensors_list = [self.model_path]
         logger.info("Loading weights from: %s", safetensors_list)
 
-        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+        default_dtype = resolve_precision(
+            server_args, "dit", precision_attr="dit_precision"
+        )
         server_args.model_paths["transformer"] = os.path.dirname(self.model_path) or "."
         hf_config = {}
 
@@ -289,6 +292,8 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
             # Create model first (same as maybe_load_fsdp_model)
             from sglang.multimodal_gen.runtime.platforms import current_platform
 
+            # precision-constraint: FSDP mixed precision currently uses bf16
+            # parameters and fp32 reduction regardless of model load dtype.
             mp_policy = MixedPrecisionPolicy(
                 torch.bfloat16, torch.float32, None, cast_forward_inputs=False
             )
@@ -304,7 +309,10 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 model = model_cls(**{"config": dit_config, "hf_config": hf_config})
 
             # Check if we should use FSDP
-            use_fsdp = server_args.use_fsdp_inference
+            use_fsdp = server_args.should_use_fsdp_for_component("transformer")
+            component_starts_on_cpu = server_args.should_start_component_on_cpu(
+                "transformer"
+            )
             if current_platform.is_mps():
                 use_fsdp = False
                 logger.info("Disabling FSDP for MPS platform as it's not compatible")
@@ -320,7 +328,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 )
                 shard_model(
                     model,
-                    cpu_offload=server_args.dit_cpu_offload,
+                    cpu_offload=False,
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
@@ -350,7 +358,7 @@ class ComfyUIZImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 get_local_torch_device(),
                 default_dtype,
                 strict=True,
-                cpu_offload=server_args.dit_cpu_offload,
+                cpu_offload=component_starts_on_cpu and not use_fsdp,
                 param_names_mapping=param_names_mapping_fn,
             )
 

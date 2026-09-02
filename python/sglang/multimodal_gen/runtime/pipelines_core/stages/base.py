@@ -9,15 +9,22 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from enum import Enum, auto
 
 import torch
+from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    world_group_is_initialized,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -38,6 +45,8 @@ class StageParallelismType(Enum):
     MAIN_RANK_ONLY = auto()
     # this stage requires a cfg-parallel
     CFG_PARALLEL = auto()
+    # executed on main rank only and send result to other ranks
+    MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
 
 
 class StageVerificationError(Exception):
@@ -55,13 +64,23 @@ class PipelineStage(StageDedupMixin, ABC):
     for a specific part of the process, such as prompt encoding, latent preparation, etc.
     """
 
+    # Class-level default so subclasses that override __init__ without
+    # calling super().__init__() still see a consistent explicit-range gate.
+    _current_use_nvtx: bool = False
+    _current_batch_is_warmup: bool = False
+    _component_residency_manager = None
+    _registered_stage_name: str | None = None
+    _profile_stage_name: str | None = None
+
     def __init__(self):
         self.server_args = get_global_server_args()
         self._component_residency_manager = None
+        self._registered_stage_name: str | None = None
+        self._profile_stage_name: str | None = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
-        if self.server_args.comfyui_mode:
+        if self.server_args.comfyui_mode or self._current_batch_is_warmup:
             return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
@@ -76,6 +95,24 @@ class PipelineStage(StageDedupMixin, ABC):
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)
+
+    def progress_bar(
+        self,
+        iterable: Iterable | None = None,
+        total: int | None = None,
+        *,
+        disable: bool = False,
+        batch: Req | None = None,
+        **kwargs,
+    ) -> tqdm:
+        is_main_rank = not world_group_is_initialized() or get_world_rank() == 0
+        disable = disable or (batch is not None and batch.is_warmup)
+        return tqdm(
+            iterable=iterable,
+            total=total,
+            disable=disable or not is_main_rank,
+            **kwargs,
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
@@ -110,17 +147,38 @@ class PipelineStage(StageDedupMixin, ABC):
         """
         pass
 
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        """Expand one post-stage request into sequential downstream requests."""
+        del server_args
+        return iter((batch,))
+
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
+    def set_registered_stage_name(self, stage_name: str) -> None:
+        self._registered_stage_name = stage_name
+
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        self._profile_stage_name = stage_name
+
     def _component_stage_name(self, stage_name: str | None = None) -> str:
-        return stage_name or self.__class__.__name__
+        return stage_name or self._registered_stage_name or self.__class__.__name__
 
     def _active_component_stage_name(self) -> str:
+        """Stage name reported by the residency manager.
+
+        During execution this comes from the manager; otherwise the registered
+        stage name provides the static identity.
+        """
         manager = self._component_residency_manager
         if manager is not None and manager.state.stage_name is not None:
             return manager.state.stage_name
-        return self.__class__.__name__
+        return self._component_stage_name()
+
+    def _active_profile_stage_name(self) -> str:
+        return self._profile_stage_name or self.__class__.__name__
 
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
@@ -179,11 +237,49 @@ class PipelineStage(StageDedupMixin, ABC):
         with self._use_component(use, module) as component:
             yield component
 
+    def begin_declared_component_use(
+        self,
+        *,
+        component_name: str,
+        module=None,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> None:
+        """Keep a declared component active until the next use interval begins."""
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(
+            component_name=component_name,
+            phase=phase,
+            target_dtype=target_dtype,
+        )
+        self._component_residency_manager.begin_use(use, module=module)
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         """Declares component uses of current stage for unified residency scheduling."""
         return []
+
+    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
+        """Resolve the per-request NVTX gate for explicit stage ranges.
+
+        Layerwise module hooks are registered at component use-sites by
+        ``ComponentResidencyManager``. Stages use this value only for
+        explicit ``maybe_nvtx_range`` blocks.
+        """
+        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
+        self._current_use_nvtx = use_nvtx
+        return use_nvtx
+
+    @property
+    def current_use_nvtx(self) -> bool:
+        """Last resolved ``use_nvtx`` value from :meth:`_apply_nvtx_gate`.
+
+        ``forward`` implementations can read this to gate explicit
+        ``maybe_nvtx_range`` blocks without re-evaluating the flag.
+        """
+        return self._current_use_nvtx
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property
@@ -196,6 +292,12 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def cfg_parallel_local_batch_fields(
+        self, batch: Req, server_args: ServerArgs
+    ) -> tuple[str, ...]:
+        """the name of fields which already have a local version on each GPU in CFG-Parallel, no need to broadcast"""
+        return ()
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """
@@ -265,7 +367,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Returns:
             The updated batch information after this stage's processing.
         """
-        stage_name = self.__class__.__name__
+        stage_name = self._active_profile_stage_name()
         # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
@@ -276,16 +378,26 @@ class PipelineStage(StageDedupMixin, ABC):
             logger.error("Input verification failed for %s: %s", stage_name, str(e))
             raise
 
-        # Execute the actual stage logic with unified profiling
-        with StageProfiler(
-            stage_name,
-            logger=logger,
-            metrics=batch.metrics,
-            log_stage_start_end=not batch.is_warmup
-            and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-        ):
-            result = self.forward(batch, server_args)
+        # Resolve the NVTX gate once per call. Component-level hooks are
+        # attached by the residency manager at the actual component use-site.
+        self._apply_nvtx_gate(batch.is_warmup)
+
+        # Execute the actual stage logic with unified profiling.
+        previous_batch_is_warmup = self._current_batch_is_warmup
+        self._current_batch_is_warmup = batch.is_warmup
+        try:
+            with StageProfiler(
+                stage_name,
+                logger=logger,
+                metrics=batch.metrics,
+                log_stage_start_end=not batch.is_warmup
+                and not (self.server_args and self.server_args.comfyui_mode),
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                result = self.forward(batch, server_args)
+        finally:
+            self._current_batch_is_warmup = previous_batch_is_warmup
+            self._current_use_nvtx = False
 
         # Post-execution output verification
         try:

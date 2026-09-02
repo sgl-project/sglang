@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/kernels/mamba/test_causal_conv1d.py
@@ -13,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
     causal_conv1d_update,

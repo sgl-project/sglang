@@ -1,9 +1,7 @@
-# If the device is Battlemage, we need to set UBUNTU_VERSION to 24.10
-
-# Usage: docker build --build-arg UBUNTU_VERSION=24.04 --build-arg PYTHON_VERSION=3.10 -t sglang:xpu_kernel -f  xpu.Dockerfile --no-cache .
+# docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
 # Use Intel deep learning essentials base image with Ubuntu 24.04
-FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
+FROM intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
 
 # Avoid interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -17,63 +15,72 @@ ARG SG_LANG_BRANCH=main
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
 
-RUN useradd -m -d /home/sdp -s /bin/bash sdp && \
-    chown -R sdp:sdp /home/sdp
-
 USER root
 
-# Install the latest UMD driver for SYCL-TLA
-RUN apt-get update && apt-get install -y software-properties-common && \
+# Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
+# Keep in lockstep with the host xe KMD; override via --build-arg.
+ARG COMPUTE_RUNTIME_VERSION=26.18.38308.1
+ARG IGC_VERSION=2.34.4+21428
+ARG GMM_VERSION=22.10.0
+
+RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
     apt-get update && \
+    # Loader + media/metrics from the PPA; the GPU driver is pinned below.
     apt-get install -y \
-        libze-intel-gpu1 libze1 intel-metrics-discovery intel-opencl-icd clinfo intel-gsc \
+        libze1 intel-metrics-discovery clinfo intel-gsc \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
-        libze-dev intel-ocloc && \
+        libze-dev && \
+    cd /tmp && \
+    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
+    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
+    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
+    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    apt-get install -y --allow-downgrades \
+        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
+        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
+        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
+        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
+        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
+    rm -f /tmp/*.deb && \
+    # Hold so later apt upgrades can't pull the rolling PPA version back.
+    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
+        intel-igc-core-2 intel-igc-opencl-2 && \
     rm -rf /var/lib/apt/lists/*
 
-# Switch to non-root user 'sdp'
-USER sdp
 
-# Set HOME and WORKDIR to user's home directory
-ENV HOME=/home/sdp
-WORKDIR /home/sdp
+RUN apt-get update && apt-get install -y \
+    python3-dev \
+    build-essential \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/releases/download/25.1.1-0/Miniforge3-Linux-x86_64.sh && \
-    bash miniforge.sh -b -p ./miniforge3 && \
-    rm miniforge.sh && \
-    # Initialize conda environment and install pip
-    . ./miniforge3/bin/activate && \
-    conda create -y -n py${PYTHON_VERSION} python=${PYTHON_VERSION} && \
-    conda activate py${PYTHON_VERSION} && \
-    conda install pip && \
-    # Append environment activation to .bashrc for interactive shells
-    echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /home/sdp" >> /home/sdp/.bashrc
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:/root/.cargo/bin:$PATH"
+RUN curl --proto '=https' --retry 3 --retry-delay 2 --tlsv1.2 -sSf https://sh.rustup.rs \
+| sh -s -- -y --no-modify-path --profile minimal && rustc --version && cargo --version
+ENV VIRTUAL_ENV="/opt/venv"
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN uv venv --python ${PYTHON_VERSION} --seed ${VIRTUAL_ENV}
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN --mount=type=secret,id=github_token \
-    cd /home/sdp && \
-    . /home/sdp/miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+WORKDIR /sgl-workspace
 
-RUN --mount=type=secret,id=github_token \
-    cd /home/sdp && \
-    . /home/sdp/miniforge3/bin/activate && \
-    conda activate py${PYTHON_VERSION} && \
-    echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
+RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore
+
+RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
+    git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
-    pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install --no-deps xgrammar==0.1.33 && \
-    pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
-    conda install libsqlite=3.48.0 -y && \
-    # Add environment setup commands to .bashrc again (in case it was overwritten)
-    echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc
+    pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
+    pip install --no-cache-dir --no-deps xgrammar==0.1.33
 
-# Use bash as default shell with initialization from .bashrc
-SHELL ["bash", "-c"]
-
-# Start an interactive bash shell with all environment set up
-USER sdp
-CMD ["bash", "-c", "source /home/sdp/.bashrc && exec bash"]
+CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]

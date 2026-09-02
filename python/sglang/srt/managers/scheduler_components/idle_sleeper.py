@@ -1,0 +1,68 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import zmq
+
+from sglang.srt.environ import envs
+from sglang.srt.observability.req_time_stats import real_time
+from sglang.srt.platforms import current_platform
+
+if TYPE_CHECKING:
+    from sglang.srt.rust_server.server import RustServer
+
+
+class IdleSleeper:
+    """
+    In setups which have long inactivity periods it is desirable to reduce
+    system power consumption when sglang does nothing. This would lead not only
+    to power savings, but also to more CPU thermal headroom when a request
+    eventually comes. This is important in cases when multiple GPUs are connected
+    as each GPU would otherwise pin one thread at 100% CPU usage.
+
+    The simplest solution is to use zmq.Poller on all sockets that may receive
+    data that needs handling immediately.
+    """
+
+    def __init__(self, sockets):
+        self.poller = zmq.Poller()
+        self.last_empty_time = real_time()
+        for s in sockets:
+            self.poller.register(s, zmq.POLLIN)
+
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+
+    def maybe_sleep(self):
+        self.poller.poll(1000)
+        if (
+            self.empty_cache_interval > 0
+            and real_time() - self.last_empty_time > self.empty_cache_interval
+        ):
+            self.last_empty_time = real_time()
+            current_platform.empty_cache()
+
+
+class RustServerIdleSleeper:
+    """Idle sleeper for the embedded Rust server.
+
+    The Rust ingress is an in-process request ring, not a zmq socket.
+    Instead park directly on the ring: ``wait_request`` blocks until
+    a request is pushed — the request ring wakes the parked thread
+    the instant a producer pushes, so there's no added latency for real
+    requests — or the timeout elapses.
+    """
+
+    def __init__(self, rust_server: RustServer, timeout_ms: int = 1000):
+        self.rust_server = rust_server
+        self.timeout_ms = timeout_ms
+        self.last_empty_time = real_time()
+        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+
+    def maybe_sleep(self):
+        self.rust_server.wait_request(self.timeout_ms)
+        if (
+            self.empty_cache_interval > 0
+            and real_time() - self.last_empty_time > self.empty_cache_interval
+        ):
+            self.last_empty_time = real_time()
+            current_platform.empty_cache()

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,14 +39,23 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.nemotron_h import NemotronHForCausalLM
 from sglang.srt.models.parakeet import ProjectedParakeet
 from sglang.srt.models.radio import RadioModel
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.evs import EVS, EVSConfig
-from sglang.srt.multimodal.evs.evs_module import VideoEVSDataItem
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 
 class NemotronH_Nano_VL_V2(EVS):
+    # The loader reads `hf_to_sglang_mapper` off the outer model class when
+    # applying name rewrites to the quant config's `quantized_layers` keys;
+    # the inner NemotronHForCausalLM mapper is not consulted there.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.backbone.": "language_model.model.",
+        },
+    )
+
     @staticmethod
     def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
         return EVSConfig(video_pruning_rate=config.video_pruning_rate)
@@ -136,8 +147,11 @@ class NemotronH_Nano_VL_V2(EVS):
 
         if audio_items:
             for item in visual_items:
-                if isinstance(item, VideoEVSDataItem):
-                    item.pre_chunked_input_ids = input_ids
+                if (
+                    item.is_video()
+                    and "pre_chunked_input_ids" in item.model_specific_data
+                ):
+                    item.set("pre_chunked_input_ids", input_ids)
 
         return input_ids
 

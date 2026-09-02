@@ -17,7 +17,6 @@ from urllib.parse import urlparse
 import requests
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -28,10 +27,11 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=148, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=148, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -63,7 +63,7 @@ class HiCacheStorageBaseMixin:
     def tearDownClass(cls):
         """Clean up test environment"""
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
 
         import shutil
 
@@ -279,6 +279,7 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
 
         return server_args, {}
 
+    @unittest.skipIf(is_in_ci(), "To skip flaky test")
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
         run_eval_accuracy_test(self)

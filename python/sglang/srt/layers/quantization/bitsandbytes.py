@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/d4d2751732c3ccae162a5a0160c7d4fe05d2779a/vllm/model_executor/layers/quantization/bitsandbytes.py
 from __future__ import annotations
 
@@ -23,6 +24,21 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+
+
+def require_bitsandbytes() -> None:
+    try:
+        import bitsandbytes
+
+        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
+            raise ImportError(
+                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
+            )
+    except ImportError as err:
+        raise ImportError(
+            "Please install bitsandbytes>=0.46.1 via "
+            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
+        ) from err
 
 
 class BitsAndBytesConfig(QuantizationConfig):
@@ -89,7 +105,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "BitsAndBytesConfig":
+    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
         def get_safe_value(config, keys, default_value=None):
             try:
                 value = QuantizationConfig.get_from_keys(config, keys)
@@ -183,21 +199,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: BitsAndBytesConfig):
-        try:
-            import bitsandbytes
-
-            if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.46.1."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.46.1 via "
-                "`pip install bitsandbytes>=0.46.1` to use "
-                "bitsandbytes quantizer."
-            ) from err
-
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(

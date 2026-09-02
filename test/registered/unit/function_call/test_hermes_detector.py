@@ -7,7 +7,7 @@ from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "stage-a-test-cpu")
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestHermesDetector(CustomTestCase):

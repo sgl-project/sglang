@@ -22,19 +22,35 @@ python -m sglang.multimodal_gen.benchmarks.bench_offline_throughput \\
     --batch-size 1 \\
     --num-inference-steps 20 \\
     --output-file results.json
+
+## Reproducible JSONL request manifest with durable output evidence
+python -m sglang.multimodal_gen.benchmarks.bench_offline_throughput \\
+    --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \\
+    --request-manifest workload.jsonl \\
+    --save-output-dir artifacts \\
+    --output-file results.jsonl
 """
 
 import argparse
 import dataclasses
 import json
+import os
+import re
+import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from tqdm import tqdm
 
 from sglang.multimodal_gen.benchmarks.datasets import RandomDataset, VBenchDataset
+from sglang.multimodal_gen.benchmarks.request_manifest import (
+    LoadedRequestManifest,
+    file_sha256,
+    load_request_manifest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -57,6 +73,21 @@ class BatchOutput:
     peak_memory_mb: float = 0.0
     success: bool = False
     error: str = ""
+    requests: List["RequestOutput"] = dataclasses.field(default_factory=list)
+
+
+@dataclass
+class RequestOutput:
+    """Evidence recorded for one benchmark request."""
+
+    request_id: str
+    prompt: str
+    sampling_params: Dict[str, Any]
+    success: bool
+    latency_seconds: float
+    error: str = ""
+    output_file_paths: List[str] = dataclasses.field(default_factory=list)
+    output_sha256: List[str] = dataclasses.field(default_factory=list)
 
 
 @dataclass
@@ -80,14 +111,22 @@ class BenchArgs:
     dataset_path: str = ""
     task_name: str = "unknown"
     num_prompts: int = 10
+    num_outputs_per_prompt: int = 1
     batch_size: int = 1
     random_request_config: str = None
     random_request_seed: int = 42
+    request_manifest: str = ""
 
     # Benchmark Execution
     skip_warmup: bool = False
     output_file: str = ""
+    save_output_dir: str = ""
     disable_tqdm: bool = False
+
+    # Profiling
+    profile: bool = False
+    num_profiled_timesteps: int = 5
+    profile_all_stages: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -147,6 +186,12 @@ class BenchArgs:
             help="Total number of prompts to benchmark",
         )
         parser.add_argument(
+            "--num-outputs-per-prompt",
+            type=int,
+            default=1,
+            help="Number of generated outputs requested per prompt",
+        )
+        parser.add_argument(
             "--batch-size",
             type=int,
             default=1,
@@ -169,6 +214,15 @@ class BenchArgs:
             default=42,
             help="Random seed for sampling request profiles (default: 42).",
         )
+        parser.add_argument(
+            "--request-manifest",
+            type=str,
+            default="",
+            help=(
+                "JSONL request manifest. When set, every non-empty line is run once "
+                "and --dataset/--dataset-path/--num-prompts are ignored."
+            ),
+        )
 
         # Benchmark Execution
         parser.add_argument(
@@ -181,9 +235,40 @@ class BenchArgs:
             help="Output JSON file for results (append mode)",
         )
         parser.add_argument(
+            "--save-output-dir",
+            type=str,
+            default="",
+            help=(
+                "Persist generated media in this directory and record a SHA256 "
+                "digest for each output."
+            ),
+        )
+        parser.add_argument(
             "--disable-tqdm",
             action="store_true",
             help="Disable progress bar",
+        )
+        parser.add_argument(
+            "--profile",
+            action="store_true",
+            help=(
+                "Enable PyTorch profiler for diffusion generation. "
+                "Set SGLANG_DIFFUSION_TORCH_PROFILER_DIR to control trace output directory."
+            ),
+        )
+        parser.add_argument(
+            "--num-profiled-timesteps",
+            type=int,
+            default=5,
+            help=(
+                "Number of denoising timesteps to profile after warmup. "
+                "Use -1 to profile all denoising timesteps."
+            ),
+        )
+        parser.add_argument(
+            "--profile-all-stages",
+            action="store_true",
+            help="Profile all diffusion pipeline stages instead of only denoising steps.",
         )
 
     @classmethod
@@ -206,38 +291,84 @@ def generate_batch(
     bench_args: BenchArgs,
     prompts: List[str],
     user_sampling_params: List[Dict[str, Any]],
+    request_ids: Optional[List[str]] = None,
 ) -> BatchOutput:
     """Generate batch of images/videos synchronously."""
     assert len(user_sampling_params) == len(prompts), (
         f"user_sampling_params length ({len(user_sampling_params)}) must match "
         f"prompts length ({len(prompts)})"
     )
+    if request_ids is None:
+        request_ids = [f"request-{idx:05d}" for idx in range(len(prompts))]
+    assert len(request_ids) == len(prompts), (
+        f"request_ids length ({len(request_ids)}) must match "
+        f"prompts length ({len(prompts)})"
+    )
 
     output = BatchOutput()
     start_time = time.perf_counter()
 
-    torch.cuda.reset_peak_memory_stats()
+    torch.get_device_module().reset_peak_memory_stats()
 
-    for prompt, params in zip(prompts, user_sampling_params):
+    for prompt, params, request_id in zip(prompts, user_sampling_params, request_ids):
+        request_start_time = time.perf_counter()
         try:
             sampling_params_kwargs = dict(params)
             sampling_params_kwargs["prompt"] = prompt
+            sampling_params_kwargs["request_id"] = request_id
             result = engine.generate(sampling_params_kwargs=sampling_params_kwargs)
 
-            if result is not None:
-                if isinstance(result, list):
-                    output.total_frames += len(result)
-                else:
-                    output.total_frames += 1
+            results = result if isinstance(result, list) else [result]
+            results = [item for item in results if item is not None]
+            if not results:
+                raise RuntimeError("Engine returned no generation result")
+
+            output_paths = [
+                str(item.output_file_path)
+                for item in results
+                if item.output_file_path is not None
+            ]
+            output_hashes = []
+            for output_path in output_paths:
+                if not os.path.isfile(output_path):
+                    raise RuntimeError(
+                        f"Generated output does not exist: {output_path}"
+                    )
+                output_hashes.append(file_sha256(output_path))
+
+            output.total_frames += int(params.get("num_frames", 1)) * len(results)
             output.num_samples += 1
+            output.requests.append(
+                RequestOutput(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params=dict(params),
+                    success=True,
+                    latency_seconds=time.perf_counter() - request_start_time,
+                    output_file_paths=output_paths,
+                    output_sha256=output_hashes,
+                )
+            )
         except Exception as e:
             logger.error(f"Generation failed for prompt '{prompt[:50]}...': {e}")
             output.error = str(e)
+            output.requests.append(
+                RequestOutput(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params=dict(params),
+                    success=False,
+                    latency_seconds=time.perf_counter() - request_start_time,
+                    error=str(e),
+                )
+            )
 
     output.latency = time.perf_counter() - start_time
     output.latency_per_sample = output.latency / len(prompts) if prompts else 0.0
     output.success = output.num_samples > 0
-    output.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
+    output.peak_memory_mb = torch.get_device_module().max_memory_allocated() / (
+        1024 * 1024
+    )
 
     logger.debug(
         f"Batch generated: {output.num_samples}/{len(prompts)} samples in {output.latency:.2f}s"
@@ -254,18 +385,24 @@ def calculate_metrics(
     all_sampling_params: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Calculate generation-specific throughput metrics."""
-    successful = [o for o in outputs if o.success]
-    num_success = sum(o.num_samples for o in successful)
-    total_frames = sum(o.total_frames for o in successful)
+    num_success = sum(o.num_samples for o in outputs)
+    total_frames = sum(o.total_frames for o in outputs)
     peak_memory = max((o.peak_memory_mb for o in outputs), default=0)
+    request_outputs = [request for output in outputs for request in output.requests]
+    successful_request_outputs = [
+        request for request in request_outputs if request.success
+    ]
+    request_latencies = [
+        request.latency_seconds for request in successful_request_outputs
+    ]
 
     width, height, frames = resolution
     if all_sampling_params:
         total_pixels = sum(
-            p.get("width", width)
-            * p.get("height", height)
-            * p.get("num_frames", frames)
-            for p in all_sampling_params[:num_success]
+            request.sampling_params.get("width", width)
+            * request.sampling_params.get("height", height)
+            * request.sampling_params.get("num_frames", frames)
+            for request in successful_request_outputs
         )
     else:
         total_pixels = num_success * width * height * frames
@@ -288,6 +425,15 @@ def calculate_metrics(
         "latency_per_request_seconds": (
             total_duration / num_success if num_success > 0 else 0
         ),
+        "request_latency_mean_seconds": (
+            statistics.fmean(request_latencies) if request_latencies else 0
+        ),
+        "request_latency_median_seconds": (
+            statistics.median(request_latencies) if request_latencies else 0
+        ),
+        "request_latency_min_seconds": min(request_latencies, default=0),
+        "request_latency_max_seconds": max(request_latencies, default=0),
+        "request_results": [dataclasses.asdict(request) for request in request_outputs],
         "peak_memory_mb": peak_memory,
     }
 
@@ -303,18 +449,43 @@ def throughput_test(
     logger.info("Starting offline throughput benchmark...")
 
     engine = initialize_engine(server_args)
+    bench_args.task_name = str(engine.server_args.pipeline_config.task_type)
 
+    if bench_args.request_manifest and bench_args.random_request_config:
+        raise ValueError(
+            "--request-manifest and --random-request-config are mutually exclusive"
+        )
     if bench_args.random_request_config and bench_args.dataset != "random":
         raise ValueError(
             "--random-request-config can only be used with --dataset random"
         )
 
-    logger.info(f"Loading {bench_args.dataset} dataset...")
-    if bench_args.dataset == "vbench":
-        bench_args.task_name = engine.server_args.pipeline_config.task_type
+    if bench_args.num_outputs_per_prompt != 1:
+        raise ValueError(
+            "bench_offline_throughput currently supports only --num-outputs-per-prompt 1"
+        )
+
+    manifest: Optional[LoadedRequestManifest] = None
+    if bench_args.request_manifest:
+        logger.info(f"Loading request manifest {bench_args.request_manifest}...")
+        manifest = load_request_manifest(bench_args.request_manifest)
+        manifest_requests = manifest.requests
+        total_count = len(manifest_requests)
+        all_prompts = [request.prompt for request in manifest_requests]
+        all_request_ids = [request.request_id for request in manifest_requests]
+        all_sampling_params = [
+            dict(request.sampling_params) for request in manifest_requests
+        ]
+    elif bench_args.dataset == "vbench":
+        logger.info(f"Loading {bench_args.dataset} dataset...")
         dataset = VBenchDataset(bench_args)
+        total_count = min(bench_args.num_prompts, len(dataset))
+        dataset_requests = [dataset[i] for i in range(total_count)]
     elif bench_args.dataset == "random":
+        logger.info(f"Loading {bench_args.dataset} dataset...")
         dataset = RandomDataset(bench_args)
+        total_count = min(bench_args.num_prompts, len(dataset))
+        dataset_requests = [dataset[i] for i in range(total_count)]
     else:
         raise ValueError(f"Unknown dataset: {bench_args.dataset}")
 
@@ -324,31 +495,77 @@ def throughput_test(
         "height": bench_args.height,
         "width": bench_args.width,
         "num_frames": bench_args.num_frames,
+        "fps": bench_args.fps,
+        "num_outputs_per_prompt": bench_args.num_outputs_per_prompt,
         "seed": bench_args.seed,
+        "profile": bench_args.profile,
+        "num_profiled_timesteps": bench_args.num_profiled_timesteps,
+        "profile_all_stages": bench_args.profile_all_stages,
     }
     if bench_args.disable_safety_checker:
         _sampling_params["safety_checker"] = None
 
-    total_count = min(bench_args.num_prompts, len(dataset))
-    all_prompts = [dataset[i].prompt for i in range(total_count)]
-
-    if bench_args.random_request_config:
+    if manifest is None:
+        all_prompts = [request.prompt for request in dataset_requests]
+        all_request_ids = [request.request_id for request in dataset_requests]
         all_sampling_params = []
-        for i in range(total_count):
+        for i, request in enumerate(dataset_requests):
             params = dict(_sampling_params)
-            params.update(dataset.get_sampling_params(i))
+            if bench_args.random_request_config:
+                params.update(dataset.get_sampling_params(i))
+            if request.image_paths:
+                params["image_path"] = request.image_paths
             all_sampling_params.append(params)
     else:
-        all_sampling_params = [_sampling_params] * total_count
+        for params in all_sampling_params:
+            defaults = dict(_sampling_params)
+            defaults.update(params)
+            params.clear()
+            params.update(defaults)
+
+    if bench_args.save_output_dir:
+        output_dir = Path(bench_args.save_output_dir).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for index, (request_id, params) in enumerate(
+            zip(all_request_ids, all_sampling_params)
+        ):
+            safe_request_id = re.sub(r"[^A-Za-z0-9._-]+", "_", request_id).strip("._")
+            safe_request_id = safe_request_id or "request"
+            params.update(
+                {
+                    "output_path": str(output_dir),
+                    "output_file_name": f"{index:05d}-{safe_request_id}",
+                    "return_file_paths_only": True,
+                    "save_output": True,
+                }
+            )
 
     if not bench_args.skip_warmup:
         logger.info("Running warmup batch...")
         warmup_count = min(bench_args.batch_size, total_count)
         warmup_prompts = all_prompts[:warmup_count]
-        warmup_sampling_params = all_sampling_params[:warmup_count]
-        generate_batch(engine, bench_args, warmup_prompts, warmup_sampling_params)
+        warmup_sampling_params = [
+            {
+                **p,
+                "profile": False,
+                "save_output": False,
+                "return_file_paths_only": False,
+                "output_path": None,
+                "output_file_name": None,
+            }
+            for p in all_sampling_params[:warmup_count]
+        ]
+        generate_batch(
+            engine,
+            bench_args,
+            warmup_prompts,
+            warmup_sampling_params,
+            request_ids=[
+                f"warmup-{request_id}" for request_id in all_request_ids[:warmup_count]
+            ],
+        )
 
-    logger.info(f"Running benchmark with {bench_args.num_prompts} prompts...")
+    logger.info(f"Running benchmark with {total_count} prompts...")
     outputs: List[BatchOutput] = []
 
     start_time = time.perf_counter()
@@ -364,9 +581,14 @@ def throughput_test(
         batch_end = min(batch_start + bench_args.batch_size, total_count)
         batch_prompts = all_prompts[batch_start:batch_end]
         batch_sampling_params = all_sampling_params[batch_start:batch_end]
+        batch_request_ids = all_request_ids[batch_start:batch_end]
 
         batch_output = generate_batch(
-            engine, bench_args, batch_prompts, batch_sampling_params
+            engine,
+            bench_args,
+            batch_prompts,
+            batch_sampling_params,
+            request_ids=batch_request_ids,
         )
         outputs.append(batch_output)
 
@@ -391,7 +613,7 @@ def throughput_test(
     )
 
     if bench_args.output_file:
-        save_results(metrics, bench_args, server_args)
+        save_results(metrics, bench_args, server_args, manifest=manifest)
 
     return metrics
 
@@ -433,6 +655,12 @@ def display_results(
     print_value_formatted(
         "Latency Per Request (sec):", metrics["latency_per_request_seconds"]
     )
+    print_value_formatted(
+        "Request Latency Mean (sec):", metrics["request_latency_mean_seconds"]
+    )
+    print_value_formatted(
+        "Request Latency Median (sec):", metrics["request_latency_median_seconds"]
+    )
     print_value_formatted("Peak Memory (MB):", metrics["peak_memory_mb"])
     print_divider(110, "=")
 
@@ -441,6 +669,7 @@ def save_results(
     metrics: Dict[str, Any],
     bench_args: BenchArgs,
     server_args: ServerArgs,
+    manifest: Optional[LoadedRequestManifest] = None,
 ):
     """Save benchmark results to JSON file."""
     result = {
@@ -449,15 +678,22 @@ def save_results(
             "model_path": server_args.model_path,
             "task_type": bench_args.task_name,
             "backend": "engine",
+            "request_manifest": manifest.path if manifest else None,
+            "request_manifest_sha256": manifest.sha256 if manifest else None,
         },
         "configuration": {
             "num_inference_steps": bench_args.num_inference_steps,
             "guidance_scale": bench_args.guidance_scale,
             "seed": bench_args.seed,
             "batch_size": bench_args.batch_size,
-            "num_prompts": bench_args.num_prompts,
+            "num_prompts": metrics["num_requests"],
             "resolution": f"{bench_args.width}x{bench_args.height}x{bench_args.num_frames}",
-            "dataset": bench_args.dataset,
+            "dataset": "request_manifest" if manifest else bench_args.dataset,
+            "save_output_dir": (
+                str(Path(bench_args.save_output_dir).expanduser().resolve())
+                if bench_args.save_output_dir
+                else None
+            ),
         },
         "results": metrics,
     }

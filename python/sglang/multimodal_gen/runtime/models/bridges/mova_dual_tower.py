@@ -26,7 +26,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -220,7 +222,7 @@ class ConditionalCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
-            # is_cross_attention=True,
+            is_cross_attention=True,
         )
 
     def forward(
@@ -395,9 +397,13 @@ class ConditionalCrossAttentionBlock(nn.Module):
         return self.inner(x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs)
 
 
+def _is_conditioner_block(_name: str, module: nn.Module) -> bool:
+    return isinstance(module, ConditionalCrossAttentionBlock)
+
+
 class DualTowerConditionalBridge(
     CachableDiT,
-    OffloadableDiTMixin,
+    LayerwiseOffloadableModuleMixin,
 ):
     """Dual-tower conditional bridge module v2 (SGLang optimized version).
 
@@ -407,9 +413,10 @@ class DualTowerConditionalBridge(
     3. Cross-attention interaction between the hidden states of the two DiTs.
     """
 
-    _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVADualTowerConfig()._compile_conditions
-    _supported_attention_backends = MOVADualTowerConfig()._supported_attention_backends
+    layerwise_offload_dit_group_enabled = False
+
+    _fsdp_shard_conditions = [_is_conditioner_block]
+    _compile_conditions = [_is_conditioner_block]
     param_names_mapping = MOVADualTowerConfig().param_names_mapping
     reverse_param_names_mapping = MOVADualTowerConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVADualTowerConfig().lora_param_names_mapping
@@ -532,7 +539,6 @@ class DualTowerConditionalBridge(
             A tuple of ((cos_v, sin_v), (cos_a, sin_a)).
         """
         f_v, h, w = grid_size
-        L_v = f_v * h * w
         L_a = int(audio_steps)
 
         device = device or next(self.parameters()).device

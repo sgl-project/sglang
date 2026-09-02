@@ -7,6 +7,8 @@ from sglang.test.run_eval import run_eval
 
 class TestMMLU:
 
+    mmlu_num_examples = 128
+
     def test_mmlu(self):
         accuracy_mmlu_threshold = getattr(self, "accuracy_mmlu", 0.00)
 
@@ -23,12 +25,14 @@ class TestMMLU:
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="mmlu",
-                num_examples=128,
+                num_examples=self.mmlu_num_examples,
                 num_threads=32,
             )
             print("Starting mmlu test...")
             metrics = run_eval(args)
             model_metrics["accuracy"] = metrics["score"]
+            model_metrics["latency"] = metrics.get("latency", "-")
+            model_metrics["output_throughput"] = metrics.get("output_throughput", "-")
             self.assertGreater(metrics["score"], accuracy_mmlu_threshold)
         except Exception as e:
             model_metrics["error"] = e

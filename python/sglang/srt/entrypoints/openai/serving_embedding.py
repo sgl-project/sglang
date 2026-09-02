@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import struct
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import jinja2
@@ -21,8 +23,8 @@ from sglang.srt.parser.conversation import generate_embedding_convs
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
@@ -41,6 +43,12 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        if request.encoding_format not in ("float", "base64"):
+            return (
+                "encoding_format must be either 'float' or 'base64', "
+                f"got {request.encoding_format!r}"
+            )
+
         if not (input := request.input):
             return "Input cannot be empty"
 
@@ -254,10 +262,25 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_embedding_response(ret)
+        response = self._build_embedding_response(ret, request.encoding_format)
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
+    @staticmethod
+    def _serialize_embedding(
+        embedding: List[float], encoding_format: str
+    ) -> Union[List[float], str]:
+        if encoding_format == "float":
+            return embedding
+
+        # OpenAI-compatible base64 embeddings contain contiguous little-endian
+        # float32 values. Explicit packing prevents the wire format from
+        # depending on the host's native byte order or Python float width.
+        encoded = struct.pack(f"<{len(embedding)}f", *embedding)
+        return base64.b64encode(encoded).decode("ascii")
+
+    def _build_embedding_response(
+        self, ret: List[Dict[str, Any]], encoding_format: str = "float"
+    ) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0
@@ -265,7 +288,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         for idx, ret_item in enumerate(ret):
             embedding_objects.append(
                 EmbeddingObject(
-                    embedding=ret_item["embedding"],
+                    embedding=self._serialize_embedding(
+                        ret_item["embedding"], encoding_format
+                    ),
                     index=idx,
                 )
             )

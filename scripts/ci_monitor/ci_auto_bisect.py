@@ -576,7 +576,7 @@ def _infer_related_paths(test_file: str) -> List[str]:
         "specul": ["python/sglang/srt/speculative/"],
         "vision": ["python/sglang/srt/models/"],
         "embed": ["python/sglang/srt/layers/"],
-        "kernel": ["sgl-kernel/", "python/sglang/srt/layers/"],
+        "kernel": ["python/sglang/kernels/aot/", "python/sglang/srt/layers/"],
         "bench": ["benchmark/"],
         "constrained": ["python/sglang/srt/constrained/"],
     }
@@ -742,8 +742,8 @@ class SkillLoadError(Exception):
 
 
 # Required sections to extract from SKILL.md. If any are missing after a
-# rename or restructuring, the script raises SkillLoadError so the team
-# gets a Slack notification instead of silently falling back.
+# rename or restructuring, the script raises SkillLoadError instead of
+# silently falling back.
 _REQUIRED_SKILL_SECTIONS = {
     "Key Patterns to Recognize": r"## Key Patterns to Recognize\n(.*?)(?=\n## |\Z)",
     "Important Notes": r"## Important Notes\n(.*?)(?=\n## |\Z)",
@@ -1280,8 +1280,8 @@ def main():
 
         traceback.print_exc()
 
-        # Write an error result file so the Slack notification step can
-        # report the failure instead of silently skipping
+        # Write an error result file so downstream consumers can report
+        # the failure instead of silently skipping
         if args.output:
             error_output = {
                 "analysis_timestamp": datetime.now().isoformat(),

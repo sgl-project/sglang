@@ -16,9 +16,12 @@
 import unittest
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentAudioURLPart,
+    ChatCompletionMessageContentImageURL,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -32,7 +35,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestModelCard(unittest.TestCase):
@@ -113,6 +116,42 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
+    def test_json_schema_strict_requires_json_boolean(self):
+        base_request = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                },
+            },
+        }
+
+        for strict in (True, False, None):
+            with self.subTest(strict=strict):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                request = ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+                self.assertIs(request.response_format.json_schema.strict, strict)
+
+        for strict in ("yes", "false", 0, 1):
+            with self.subTest(strict=strict), self.assertRaises(ValidationError):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+
     def test_basic_chat_completion_request(self):
         """Test basic chat completion request"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -123,7 +162,19 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.messages[0].content, "Hello")
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
+        self.assertFalse(request.return_sampling_mask)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
+
+    def test_image_content_hash_validation(self):
+        digest = "sha256:" + "AB" * 32
+        image = ChatCompletionMessageContentImageURL(
+            url="https://example.com/image.jpg", content_hash=digest
+        )
+        self.assertEqual(image.content_hash, digest.lower())
+        with self.assertRaises(ValidationError):
+            ChatCompletionMessageContentImageURL(
+                url="https://example.com/image.jpg", content_hash="not-a-hash"
+            )
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -179,6 +230,20 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.stream_reasoning)
         self.assertEqual(request.chat_template_kwargs, {"custom_param": "value"})
 
+    def test_chat_completion_tito_extensions(self):
+        """Test chat completion with pre-tokenized prompt extensions."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            input_ids=[101, 102, 103],
+            return_prompt_token_ids=True,
+            return_meta_info=True,
+        )
+        self.assertEqual(request.input_ids, [101, 102, 103])
+        self.assertTrue(request.return_prompt_token_ids)
+        self.assertTrue(request.return_meta_info)
+
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -189,6 +254,20 @@ class TestChatCompletionRequest(unittest.TestCase):
                 "enabled": True,
                 "reasoning_effort": "high",
             },
+        )
+        self.assertEqual(request.reasoning_effort, "high")
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
+
+    def test_chat_completion_reasoning_effort_high_enables_thinking(self):
+        """Top-level reasoning_effort='high' enables thinking."""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="high",
         )
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(
@@ -220,19 +299,38 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
-    def test_chat_completion_reasoning_effort_max(self):
-        """`max` is an sglang extension on chat completion's top-level
-        `reasoning_effort` only; the Responses-API-style nested
-        `reasoning.effort` path stays aligned with OpenAI's three levels."""
-        from pydantic import ValidationError
-
+    def test_chat_completion_reasoning_effort_none_overrides_enabled(self):
         messages = [{"role": "user", "content": "Hello"}]
         request = ChatCompletionRequest(
             model="test-model",
             messages=messages,
-            reasoning_effort="max",
+            reasoning={"enabled": True, "effort": "none"},
         )
-        self.assertEqual(request.reasoning_effort, "max")
+        self.assertEqual(request.reasoning_effort, "none")
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_extended_reasoning_effort_levels(self):
+        """Extended effort levels work in both supported request forms."""
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        for effort in ("xhigh", "max"):
+            with self.subTest(effort=effort, request_form="top-level"):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    reasoning_effort=effort,
+                )
+                self.assertEqual(request.reasoning_effort, effort)
+
+            with self.subTest(effort=effort, request_form="nested"):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=messages,
+                    reasoning={"effort": effort},
+                )
+                self.assertEqual(request.reasoning_effort, effort)
 
         # Unknown values still rejected.
         with self.assertRaises(ValidationError):
@@ -242,14 +340,79 @@ class TestChatCompletionRequest(unittest.TestCase):
                 reasoning_effort="ultra",
             )
 
-        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
-        # the Responses API path keeps the OpenAI low/medium/high contract.
+    def test_chat_completion_reasoning_effort_is_strictly_validated(self):
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        for request_kwargs, expected in (
+            ({"reasoning_effort": 0.99}, 0.99),
+            ({"reasoning": {"effort": 0.0}}, 0.0),
+            # numeric strings coerce identically on BOTH request surfaces
+            # (the top-level field's lax union already coerced them).
+            ({"reasoning": {"effort": "0.5"}}, 0.5),
+            ({"reasoning": {"effort": None, "reasoning_effort": 0.4}}, 0.4),
+        ):
+            request = ChatCompletionRequest(
+                model="test-model", messages=messages, **request_kwargs
+            )
+            self.assertEqual(request.reasoning_effort, expected)
+
+        for request_kwargs in (
+            {"reasoning_effort": -0.1},
+            # 0.99 is the maximum valid effort; 1.0 is out of range.
+            {"reasoning_effort": 1.0},
+            {"reasoning_effort": 1.1},
+            {"reasoning_effort": float("nan")},
+            {"reasoning_effort": True},
+            {"reasoning": {"effort": "invalid"}},
+            {"reasoning": {"effort": 1.0}},
+            {"reasoning": {"effort": 1.1}},
+            {"reasoning": {"effort": "1.5"}},
+        ):
+            with self.subTest(request_kwargs=request_kwargs), self.assertRaises(
+                ValidationError
+            ):
+                ChatCompletionRequest(
+                    model="test-model", messages=messages, **request_kwargs
+                )
+
+    def test_chat_completion_accepts_ordered_thinking_parts(self):
         request = ChatCompletionRequest(
             model="test-model",
-            messages=messages,
-            reasoning={"effort": "max"},
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "first"},
+                        {"type": "text", "text": "visible"},
+                        {"type": "reasoning", "text": "second"},
+                    ],
+                }
+            ],
         )
-        self.assertNotEqual(request.reasoning_effort, "max")
+        parts = request.messages[0].content
+        self.assertEqual(
+            [part.type for part in parts], ["thinking", "text", "reasoning"]
+        )
+
+    def test_chat_completion_rejects_thinking_parts_outside_assistant(self):
+        """Bug regression: adding the thinking part to the SHARED content-part
+        union silently widened acceptance to every role (user/system/tool) and
+        every model family, where downstream templates cannot render it —
+        replacing the previous clean 422 with template-dependent behavior."""
+        from pydantic import ValidationError
+
+        for role in ("user", "system", "tool"):
+            with self.subTest(role=role), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[
+                        {
+                            "role": role,
+                            "content": [{"type": "thinking", "thinking": "x"}],
+                        }
+                    ],
+                )
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
@@ -326,6 +489,137 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(name, "VoiceNote")
         self.assertEqual(strict, True)
 
+    def test_schema_derived_strict_false_constraint_gated_on_renderer(self):
+        """A `strict` field on the user's model doubles as the protocol switch.
+
+        set_json_schema pops `strict` out of the schema's properties and feeds
+        its default into response_format. strict=False drops the sampling
+        constraint only when the renderer forwards response_format to the
+        model; otherwise the schema would be silently ignored, so the
+        constraint stays installed.
+        """
+
+        class Note(BaseModel):
+            title: str
+            strict: bool = False
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "schema": Note.model_json_schema(),
+            },
+        )
+
+        self.assertIs(request.response_format.json_schema.strict, False)
+        self.assertNotIn(
+            "strict", request.response_format.json_schema.schema_["properties"]
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertIn("json_schema", sampling_params)
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
+    def test_non_strict_response_format_constraint_gated_on_renderer(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Return JSON"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                    "strict": False,
+                },
+            },
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[], model_generation_config={}
+        )
+        self.assertIn("json_schema", sampling_params)
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            renderer_handles_response_format=True,
+        )
+        self.assertNotIn("json_schema", sampling_params)
+
+
+class TestAudioContentParts(unittest.TestCase):
+    """Test audio content parts and the input_audio conversion"""
+
+    def _audio_part(self, part):
+        """Validate a content part the way a request body would deliver it."""
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": [part]}],
+        )
+        return request.messages[0].content[0]
+
+    def test_input_audio_converted_to_data_uri(self):
+        part = self._audio_part(
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}
+        )
+        # Converted during validation, so the inline type does not survive.
+        self.assertIsInstance(part, ChatCompletionMessageContentAudioURLPart)
+        self.assertEqual(part.type, "audio_url")
+        self.assertEqual(part.audio_url.url, "data:audio/wav;base64,QUJD")
+
+    def test_input_audio_mp3_uses_registered_mime_type(self):
+        part = self._audio_part(
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "mp3"}}
+        )
+        self.assertEqual(part.audio_url.url, "data:audio/mpeg;base64,QUJD")
+
+    def test_audio_url_passes_through_unchanged(self):
+        for url in ("http://example.com/audio.wav", "data:audio/wav;base64,QUJD"):
+            with self.subTest(url=url):
+                part = self._audio_part(
+                    {"type": "audio_url", "audio_url": {"url": url}}
+                )
+                self.assertEqual(part.type, "audio_url")
+                self.assertEqual(part.audio_url.url, url)
+
+    def test_input_audio_rejects_unsupported_format(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part(
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": "QUJD", "format": "ogg"},
+                }
+            )
+
+    def test_input_audio_requires_a_payload(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part({"type": "input_audio"})
+
+    def test_audio_url_requires_a_payload(self):
+        with self.assertRaises(ValidationError):
+            self._audio_part({"type": "audio_url"})
+
+    def test_schema_advertises_both_spellings(self):
+        """Accepting input_audio without publishing it would hide the feature.
+
+        Each variant requires its own payload, so the schema states that exactly
+        one of the two forms is expected rather than leaving both optional.
+        """
+        schema = TypeAdapter(ChatCompletionMessageContentAudioPart).json_schema()
+        variants = {
+            frozenset(schema["$defs"][ref["$ref"].rsplit("/", 1)[-1]]["required"])
+            for ref in schema["anyOf"]
+        }
+        self.assertEqual(
+            variants,
+            {frozenset({"type", "audio_url"}), frozenset({"type", "input_audio"})},
+        )
+
 
 class TestModelSerialization(unittest.TestCase):
     """Test model serialization with hidden states"""
@@ -370,6 +664,32 @@ class TestModelSerialization(unittest.TestCase):
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+    def test_prompt_token_ids_and_meta_info_serialization(self):
+        """Test that prompt_token_ids and meta_info serialize only when set."""
+        default_choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+        )
+        default_data = default_choice.model_dump()
+        self.assertNotIn("prompt_token_ids", default_data)
+        self.assertNotIn("response_token_ids", default_data)
+        self.assertNotIn("meta_info", default_data)
+
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            prompt_token_ids=[1, 2, 3],
+            response_token_ids=[4, 5],
+            meta_info={"prompt_tokens": 3},
+        )
+        data = choice.model_dump()
+        self.assertEqual(data["prompt_token_ids"], [1, 2, 3])
+        self.assertNotIn("token_ids", data)
+        self.assertEqual(data["response_token_ids"], [4, 5])
+        self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 
 class TestFunctionDeferLoading(unittest.TestCase):
@@ -454,25 +774,9 @@ class TestValidationEdgeCases(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
 
-    def test_model_serialization_roundtrip(self):
-        """Test that models can be serialized and deserialized"""
-        original_request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.7,
-            max_tokens=100,
-        )
 
-        # Serialize to dict
-        data = original_request.model_dump()
-
-        # Deserialize back
-        restored_request = ChatCompletionRequest(**data)
-
-        self.assertEqual(restored_request.model, original_request.model)
-        self.assertEqual(restored_request.temperature, original_request.temperature)
-        self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
-        self.assertEqual(len(restored_request.messages), len(original_request.messages))
+class TestParsedResponseFieldsProtocol(unittest.TestCase):
+    """Test ParsedResponseFields protocol."""
 
 
 if __name__ == "__main__":

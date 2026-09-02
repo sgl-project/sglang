@@ -4,11 +4,18 @@
 from typing import List, Optional
 
 import torch
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_chunked_prefix_cache_kv_indices,
+    create_flashinfer_kv_indices_triton,
+)
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -23,6 +30,10 @@ class ForwardBatchDeepSeekMHAMixin:
     prefix_chunk_len: Optional[int] = None
     # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_starts: Optional[torch.Tensor] = None
+    # Start positions of prefix cache for each chunk, (num_prefix_chunks, batch_size), need prefix_chunk_starts_cpu for dcp all gather kv cache
+    prefix_chunk_starts_cpu: Optional[torch.Tensor] = None
+    # length of prefix cache for each chunk, (num_prefix_chunks, batch_size)
+    prefix_chunk_seq_lens_cpu: Optional[torch.Tensor] = None
     # Lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size)
     prefix_chunk_seq_lens: Optional[torch.Tensor] = None
     # Accumulated lengths of prefix cache for each chunk, (num_prefix_chunks, batch_size + 1)
@@ -55,6 +66,7 @@ class ForwardBatchDeepSeekMHAMixin:
 
     def prepare_chunked_kv_indices(self, device: torch.device):
         self.prefix_chunk_kv_indices = []
+        req_to_token = get_req_to_token_pool().req_to_token
         for idx in range(self.num_prefix_chunks):
             chunk_starts = self.prefix_chunk_starts[idx]
             chunk_seq_lens = self.prefix_chunk_seq_lens[idx]
@@ -66,14 +78,21 @@ class ForwardBatchDeepSeekMHAMixin:
             )
 
             create_chunked_prefix_cache_kv_indices[(self.batch_size,)](
-                self.req_to_token_pool.req_to_token,
+                req_to_token,
                 self.req_pool_indices,
                 chunk_starts,
                 chunk_seq_lens,
                 chunk_cu_seq_lens,
                 chunk_kv_indices,
-                self.req_to_token_pool.req_to_token.shape[1],
+                req_to_token.shape[1],
             )
+            chunk_kv_indices = filter_dcp_local_chunk_kv_indices(
+                chunk_kv_indices,
+                self.prefix_chunk_starts_cpu[idx],
+                self.prefix_chunk_seq_lens_cpu[idx],
+            )
+            translator = get_attn_backend().kv_index_translator
+            chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     # Here we suppose the length of each chunk is equal
@@ -108,10 +127,23 @@ class ForwardBatchDeepSeekMHAMixin:
     # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
     def prepare_chunked_prefix_cache_info(self, device: torch.device):
 
-        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-        assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
+        token_to_kv_pool = get_token_to_kv_pool()
+        assert (
+            isinstance(token_to_kv_pool, MLATokenToKVPool)
+            or (
+                isinstance(token_to_kv_pool, HybridLinearKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
+            or (
+                isinstance(token_to_kv_pool, SWAKVPool)
+                and isinstance(token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
+            )
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):
@@ -140,14 +172,19 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_len,
             )
         )
-        _, prefix_chunk_seq_lens_cpu = self.get_prefix_chunk_seq_lens(
-            torch.tensor(self.extend_prefix_lens_cpu),
-            self.num_prefix_chunks,
-            self.prefix_chunk_len,
+        prefix_chunk_starts_cpu, prefix_chunk_seq_lens_cpu = (
+            self.get_prefix_chunk_seq_lens(
+                torch.tensor(self.extend_prefix_lens_cpu),
+                self.num_prefix_chunks,
+                self.prefix_chunk_len,
+            )
         )
         self.prefix_chunk_starts = prefix_chunk_starts_cuda
         self.prefix_chunk_seq_lens = prefix_chunk_seq_lens_cuda
 
+        # set prefix_chunk_starts_cpu and prefix_chunk_seq_lens_cpu for dcp to gather chunk kv cache with arbitrary lens
+        self.prefix_chunk_starts_cpu = prefix_chunk_starts_cpu
+        self.prefix_chunk_seq_lens_cpu = prefix_chunk_seq_lens_cpu
         # Metadata for attention backend
         self.prefix_chunk_cu_seq_lens = torch.zeros(
             self.num_prefix_chunks,
@@ -191,51 +228,19 @@ class ForwardBatchDeepSeekMHAMixin:
             device=self.req_pool_indices.device,
         )
         kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        req_to_token = get_req_to_token_pool().req_to_token
         create_flashinfer_kv_indices_triton[(self.batch_size,)](
-            self.req_to_token_pool.req_to_token,
+            req_to_token,
             self.req_pool_indices,
             self.seq_lens,
             kv_indptr,
             None,
             kv_indices,
-            self.req_to_token_pool.req_to_token.shape[1],
+            req_to_token.shape[1],
         )
+        # None on a backend that never bound a translator.
+        src = get_attn_backend().kv_index_translator
+        if src is not None:
+            kv_indices = src.translate_full_attn_ids(kv_indices)
         self.mha_one_shot_kv_indices = kv_indices
         return kv_indices
-
-
-@triton.jit
-def create_chunked_prefix_cache_kv_indices(
-    req_to_token_ptr,  # (max_batch, max_context_len,)
-    req_pool_indices_ptr,  # (batch_size,)
-    chunk_start_idx_ptr,  # (batch_size,)
-    chunk_seq_lens_ptr,  # (batch_size,)
-    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
-    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
-    req_to_token_ptr_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-
-    # find the req pool idx, this is for batch to token
-    req_pool_index = tl.load(req_pool_indices_ptr + pid)
-    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
-
-    # get the token positions of current chunk
-    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
-    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < chunk_seq_len
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + chunk_start_pos
-            + offset,
-            mask=mask,
-        )
-        tl.store(
-            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
-        )
