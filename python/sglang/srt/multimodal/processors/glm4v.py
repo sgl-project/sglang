@@ -18,6 +18,8 @@ except ImportError:
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
+    smart_rgb_conversion = True
+    video_preprocessing_device = "cpu"
     models = [
         m
         for m in [
