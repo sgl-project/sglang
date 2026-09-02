@@ -253,6 +253,12 @@ class TestDefaultConfigurator(CustomTestCase):
             constrained = cfg.calculate_pool_sizes_from_max_tokens(1000, page_size=128)
         self.assertEqual(constrained.max_total_num_tokens, 896)  # 1000 // 128 * 128
 
+    def test_required_bytes_for_page_aligned_token_cap(self):
+        _, cfg, _ = self._run(10_000_000, page_size=16)
+        with mock_cpu_env():
+            required = cfg.required_memory_bytes_for_max_tokens(65_003, page_size=16)
+        self.assertEqual(required, 64_992 * cfg._cell_size)
+
     def test_no_swa_fields(self):
         _, _, config = self._run(10_000_000)
         self.assertIsNone(config.full_max_total_num_tokens)
@@ -425,6 +431,13 @@ class TestHybridSWAConfigurator(CustomTestCase):
         # constrained should use roughly half the memory
         original_used = _actual_memory_used(mr, original)
         self.assertAlmostEqual(used / original_used, 0.5, delta=0.01)
+
+    def test_required_bytes_matches_constrained_pool_layout(self):
+        mr, cfg, _ = self._run(10_000_000, ratio=0.5, page_size=16)
+        with mock_cpu_env():
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(100, page_size=16)
+            required = cfg.required_memory_bytes_for_max_tokens(100, page_size=16)
+        self.assertEqual(required, _actual_memory_used(mr, constrained))
 
     def test_different_layer_counts(self):
         """Asymmetric full/swa layer counts"""
@@ -685,6 +698,13 @@ class TestAllSWAConfigurator(CustomTestCase):
             config = cfg.calculate_pool_sizes_from_max_tokens(500, page_size=1)
         self.assertEqual(config.max_total_num_tokens, 500)
         self.assertEqual(config.swa_max_total_num_tokens, 500)
+
+    def test_required_bytes_matches_all_swa_layout(self):
+        mr, cfg, _ = self._run(10_000_000, page_size=16)
+        with mock_cpu_env():
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(100, page_size=16)
+            required = cfg.required_memory_bytes_for_max_tokens(100, page_size=16)
+        self.assertEqual(required, _actual_memory_used(mr, constrained))
 
 
 class TestEagleConfigurator(CustomTestCase):

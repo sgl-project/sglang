@@ -2340,6 +2340,19 @@ class KVCacheConfigurator:
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
 
+            target_cache_size = (
+                KVCacheConfigurator._target_mamba_cache_size_for_workload_caps(
+                    self,
+                    default_cache_size=int(
+                        (mamba_budget_bytes - (per_req + replayssm_ring_per_req))
+                        // (per_req + replayssm_ring_per_req)
+                    ),
+                    total_budget_bytes=int(total_rest_memory * (1 << 30)),
+                    state_bytes_per_slot=per_req + replayssm_ring_per_req,
+                    has_spec_dec=has_spec_dec,
+                )
+            )
+
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
@@ -2363,9 +2376,7 @@ class KVCacheConfigurator:
                 per_slot = per_req + replayssm_ring_per_req
                 get_context().override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_slot) // per_slot
-                    ),
+                    max_mamba_cache_size=target_cache_size,
                 )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
@@ -2393,6 +2404,87 @@ class KVCacheConfigurator:
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def _target_mamba_cache_size_for_workload_caps(
+        self,
+        *,
+        default_cache_size: int,
+        total_budget_bytes: int,
+        state_bytes_per_slot: int,
+        has_spec_dec: bool,
+    ) -> int:
+        """Grow a ratio-sized Mamba pool from explicit workload caps.
+
+        When both concurrency and token capacity are explicit, they describe a
+        feasible operating point more precisely than the generic Mamba/KV ratio.
+        Honor that point when its fixed-size state and KV pools fit together;
+        otherwise preserve ratio-based sizing. Unsupported execution modes also
+        retain the legacy split.
+        """
+        max_running_requests = get_schedule().max_running_requests
+        max_total_tokens = get_schedule().max_total_tokens
+        if (
+            max_running_requests is None
+            or max_total_tokens is None
+            or has_spec_dec
+            or self.ps.pp_size != 1
+        ):
+            return default_cache_size
+
+        # The unified allocator owns one combined Mamba/KV envelope. Applying
+        # this static split first would charge the Mamba state twice.
+        if get_memory().enable_unified_memory:
+            return default_cache_size
+
+        requested_per_worker = max_running_requests // self.ps.attn_dp_size
+        slots_per_request = self._calculate_mamba_ratio()
+        target_cache_size = requested_per_worker * slots_per_request
+        if target_cache_size <= default_cache_size:
+            return default_cache_size
+
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        pool_configurator = create_memory_pool_configurator(self)
+        required_kv_bytes = pool_configurator.required_memory_bytes_for_max_tokens(
+            max_total_tokens, get_schedule().page_size
+        )
+        if required_kv_bytes is None:
+            logger.info(
+                "Explicit hybrid-cache workload sizing is unavailable for %s; "
+                "retaining the ratio-sized state pool.",
+                type(pool_configurator).__name__,
+            )
+            return default_cache_size
+
+        required_state_bytes = (target_cache_size + 1) * state_bytes_per_slot
+        if required_state_bytes + required_kv_bytes > total_budget_bytes:
+            logger.info(
+                "Cannot jointly size the hybrid cache for max_running_requests=%d: "
+                "the target state pool and max_total_tokens=%d KV pool require "
+                "%.2f GiB, but only %.2f GiB is available. Retaining %d state "
+                "slots.",
+                max_running_requests,
+                max_total_tokens,
+                (required_state_bytes + required_kv_bytes) / (1 << 30),
+                total_budget_bytes / (1 << 30),
+                default_cache_size,
+            )
+            return default_cache_size
+
+        logger.info(
+            "Sized hybrid cache for max_running_requests=%d and "
+            "max_total_tokens=%d: Mamba state slots %d -> %d (%.2f GiB), "
+            "reserving %.2f GiB for KV cache.",
+            max_running_requests,
+            max_total_tokens,
+            default_cache_size,
+            target_cache_size,
+            required_state_bytes / (1 << 30),
+            required_kv_bytes / (1 << 30),
+        )
+        return target_cache_size
 
 
 def calculate_mla_kv_cache_dim(

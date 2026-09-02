@@ -14,6 +14,7 @@ Two entry points, same core computation:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -140,6 +141,18 @@ class MemoryPoolConfigurator:
     ) -> MemoryPoolConfig:
         """Constraint path: recalculate pool sizes from a constrained max_tokens."""
         raise NotImplementedError
+
+    def required_memory_bytes_for_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> Optional[int]:
+        """Return the bytes needed by a user-capped token pool, if known.
+
+        Hybrid Mamba models can donate the gap between the profiled KV budget
+        and an explicit ``--max-total-tokens`` cap to their state pool.  Pool
+        configurators with a closed-form memory model override this method;
+        specialized layouts may return ``None`` and retain ratio-based sizing.
+        """
+        return None
 
     def finalize_with_max_running_requests(
         self, config: MemoryPoolConfig
@@ -441,6 +454,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
+    def required_memory_bytes_for_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> Optional[int]:
+        config = self.calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        return math.ceil(config.max_total_num_tokens * self._cell_size)
+
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for MHA or MLA models with sliding-window layers.
@@ -637,6 +658,29 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
+
+    def required_memory_bytes_for_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> Optional[int]:
+        config = self.calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        full_tokens = config.full_max_total_num_tokens or 0
+        swa_tokens = config.swa_max_total_num_tokens or 0
+        if self._full_layers_num == 0:
+            return math.ceil(swa_tokens * self._cell_size)
+
+        full_bytes_per_token = (
+            self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+            + self._swa_per_token * self._draft_swa_full_layers_num
+            + self._draft_cell_size
+        )
+        swa_bytes_per_token = self._swa_per_token * (
+            self._swa_layers_num + self._draft_swa_layers_num
+        )
+        return math.ceil(
+            full_tokens * full_bytes_per_token + swa_tokens * swa_bytes_per_token
+        )
 
 
 class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
