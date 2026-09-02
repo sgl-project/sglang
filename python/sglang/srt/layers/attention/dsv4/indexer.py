@@ -19,12 +19,14 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
+    logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -822,25 +824,102 @@ class C4IndexerBackendMixin:
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
             )
+        # Resolved before the scores because the FP4 path consumes each row
+        # chunk's logits before the next chunk overwrites them. Returning here
+        # also skips scores that the external-indices debug mode would discard.
+        assert indexer_metadata.page_table is core_metadata.page_table
+        if self.debug_use_external_c4_sparse_indices:
+            return
+
+        indexer_capturer = get_global_indexer_capturer()
+        capture_enabled = indexer_capturer is not None
+
+        hisparse_coordinator = self.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        )
+
+        raw_indices = None
+        if capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
+        elif hisparse_decode:
+            raw_indices = hisparse_coordinator.raw_indices_buffer[
+                : c4_sparse_page_indices.size(0)
+            ]
+        elif core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+
         if use_aiter_fp4:
             q_fp4, q_scale = q
-            logits = aiter_fp4_paged_mqa_logits(
-                q_fp4=q_fp4,
-                q_scale=q_scale,
-                k_payload=token_to_kv_pool.get_index_k_fp4_payload_buffer(
-                    c4_indexer.layer_id
-                ),
-                k_scale=token_to_kv_pool.get_index_k_fp4_scale_buffer(
-                    c4_indexer.layer_id
-                ),
-                weights=weights,
-                page_table=page_table,
-                c4_seq_lens=c4_seq_lens,
-                weight_scale=c4_indexer.weight_scale,
-                is_decode=forward_batch.forward_mode.is_decode(),
-                decode_workspace=metadata.fp4_decode_workspace,
-                prefill_workspace=metadata.fp4_prefill_workspace,
+            is_decode = forward_batch.forward_mode.is_decode()
+            # The scores are the layer's largest transient and their width tracks
+            # context length, so prefill splits the rows into whatever fits the
+            # pooled logits block and reduces each chunk before the next one
+            # reuses it. Rows are scored and reduced independently, so this
+            # matches a single pass. Decode's rectangle is bounded by its capture
+            # shapes, so it always stays whole.
+            rows_per_chunk = (
+                query_rows if is_decode else logits_rows_per_chunk(page_table)
             )
+            # Hoisted: these await this layer's KV transfer, which every chunk
+            # would otherwise re-await.
+            k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
+                c4_indexer.layer_id
+            )
+            k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+            # HIP always uses the SGL top-k backend here; v2 takes its row plan
+            # in the argument slot used by v1 for the optional raw-index output.
+            use_topk_v2 = (
+                self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None
+            )
+            if use_topk_v2:
+                topk_transform = topk_transform_paged_v2
+            else:
+                topk_transform = topk_transform_paged
+            # Slicing seven tensors costs ~5us of Python, which at 61 layers is
+            # a third of a millisecond per forward, so one chunk passes through.
+            whole = rows_per_chunk >= query_rows
+            for start in range(0, query_rows, max(1, rows_per_chunk)):
+                if whole:
+                    q_rows, scale_rows, weight_rows = q_fp4, q_scale, weights
+                    lens_rows, table_rows = c4_seq_lens, page_table
+                    out_rows, raw_rows = c4_sparse_page_indices, raw_indices
+                else:
+                    rows = slice(start, min(start + rows_per_chunk, query_rows))
+                    q_rows, scale_rows = q_fp4[rows], q_scale[rows]
+                    weight_rows, lens_rows = weights[rows], c4_seq_lens[rows]
+                    table_rows = page_table[rows]
+                    out_rows = c4_sparse_page_indices[rows]
+                    raw_rows = None if raw_indices is None else raw_indices[rows]
+                logits = aiter_fp4_paged_mqa_logits(
+                    q_fp4=q_rows,
+                    q_scale=scale_rows,
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    weights=weight_rows,
+                    page_table=table_rows,
+                    c4_seq_lens=lens_rows,
+                    weight_scale=c4_indexer.weight_scale,
+                    is_decode=is_decode,
+                    decode_workspace=metadata.fp4_decode_workspace,
+                    prefill_workspace=metadata.fp4_prefill_workspace,
+                )
+                if not use_topk_v2:
+                    raw_or_plan = raw_rows
+                elif whole:
+                    raw_or_plan = indexer_metadata.topk_metadata
+                else:
+                    # The cached plan routes rows by their index in the full
+                    # range, so a chunk needs one built over its own rows.
+                    raw_or_plan = plan_topk_v2(lens_rows)
+                topk_transform(
+                    logits,
+                    lens_rows,
+                    table_rows,
+                    out_rows,
+                    indexer_metadata.c4_page_size,
+                    raw_or_plan,
+                )
         elif nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -870,64 +949,44 @@ class C4IndexerBackendMixin:
                 False,
             )
 
-        assert indexer_metadata.page_table is core_metadata.page_table
-        if self.debug_use_external_c4_sparse_indices:
-            return
-
-        indexer_capturer = get_global_indexer_capturer()
-        capture_enabled = indexer_capturer is not None
-
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
-
-        raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
-        elif hisparse_decode:
-            raw_indices = hisparse_coordinator.raw_indices_buffer[
-                : c4_sparse_page_indices.size(0)
-            ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
-
-        if self.dsa_topk_backend.is_torch():
-            topk_transform_pytorch_vectorized(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif self.dsa_topk_backend.is_flashinfer():
-            self.flashinfer_topk_transform(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
-        elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
-            topk_transform_paged_v2(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                indexer_metadata.topk_metadata,
-            )
-        else:
-            topk_transform_paged(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-            )
+        # The FP4 path reduced each chunk as it was scored.
+        if not use_aiter_fp4:
+            if self.dsa_topk_backend.is_torch():
+                topk_transform_pytorch_vectorized(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif self.dsa_topk_backend.is_flashinfer():
+                self.flashinfer_topk_transform(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
+            elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
+                topk_transform_paged_v2(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                )
+            else:
+                topk_transform_paged(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                )
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
