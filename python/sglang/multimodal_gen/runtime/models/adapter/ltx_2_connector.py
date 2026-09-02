@@ -1,6 +1,8 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +11,9 @@ from diffusers.models.attention import FeedForward
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 
 def apply_interleaved_rotary_emb(
@@ -19,8 +22,7 @@ def apply_interleaved_rotary_emb(
     cos, sin = freqs
     x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-    return out
+    return x * cos + x_rotated * sin
 
 
 def apply_split_rotary_emb(
@@ -47,7 +49,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -68,6 +70,19 @@ def apply_split_rotary_emb(
 
     out = out.to(dtype=x_dtype)
     return out
+
+
+@functools.lru_cache(maxsize=5)
+def _ltx2_connector_rope_freq_grid_np(
+    theta: float, num_pos_dims: int, dim: int
+) -> torch.Tensor:
+    # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
+    n_elem = 2 * num_pos_dims
+    pow_indices = np.power(
+        theta,
+        np.linspace(0.0, 1.0, dim // n_elem, dtype=np.float64),
+    )
+    return torch.tensor(pow_indices * math.pi / 2.0, dtype=torch.float32)
 
 
 class LTX2Attention(torch.nn.Module):
@@ -133,22 +148,6 @@ class LTX2Attention(torch.nn.Module):
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
-
-        # Scaled dot product attention
-        self.attn = USPAttention(
-            num_heads=heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },
-        )
 
     def forward(
         self,
@@ -261,18 +260,22 @@ class LTX2RotaryPosEmbed1d(nn.Module):
 
         # 2. Calculate 1D RoPE frequencies
         num_rope_elems = 2  # 1 (because 1D) * 2 (for cos, sin) = 2
-        freqs_dtype = torch.float64 if self.double_precision else torch.float32
-        pow_indices = torch.pow(
-            self.theta,
-            torch.linspace(
-                start=0.0,
-                end=1.0,
-                steps=self.dim // num_rope_elems,
-                dtype=freqs_dtype,
-                device=device,
-            ),
-        )
-        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+        if self.double_precision:
+            freqs = _ltx2_connector_rope_freq_grid_np(self.theta, 1, self.dim).to(
+                device=device
+            )
+        else:
+            pow_indices = torch.pow(
+                self.theta,
+                torch.linspace(
+                    start=0.0,
+                    end=1.0,
+                    steps=self.dim // num_rope_elems,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
 
         # 3. Matrix-vector outer product between pos ids of shape (batch_size, seq_len) and freqs vector of shape
         # (self.dim // 2,).
@@ -487,7 +490,12 @@ class LTX2ConnectorTransformer1d(nn.Module):
             attention_mask = torch.zeros_like(attention_mask)
 
         # 2. Calculate 1D RoPE positional embeddings
-        rotary_emb = self.rope(batch_size, seq_len, device=hidden_states.device)
+        rotary_emb = self.rope(
+            batch_size,
+            seq_len,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:
@@ -505,11 +513,17 @@ class LTX2ConnectorTransformer1d(nn.Module):
         return hidden_states, attention_mask
 
 
-class LTX2TextConnectors(nn.Module):
+class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
     streams.
     """
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "video_connector.transformer_blocks",
+        "audio_connector.transformer_blocks",
+    ]
 
     def __init__(
         self,
@@ -517,6 +531,7 @@ class LTX2TextConnectors(nn.Module):
     ):
         super().__init__()
         caption_channels = config.caption_channels
+        self.caption_channels = caption_channels
         text_proj_in_factor = config.text_proj_in_factor
         video_connector_num_attention_heads = config.video_connector_num_attention_heads
         video_connector_attention_head_dim = config.video_connector_attention_head_dim
@@ -641,7 +656,7 @@ class LTX2TextConnectors(nn.Module):
                 audio_hidden_states = audio_hidden_states.to(
                     self.audio_aggregate_embed.weight.dtype
                 )
-            source_dim = self.video_aggregate_embed.out_features
+            source_dim = self.caption_channels
             video_hidden_states = self._rescale_v2_features(
                 video_hidden_states,
                 self.video_aggregate_embed.out_features,

@@ -38,7 +38,7 @@ class EvalArgs:
     concurrency: int = 1
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
-    response_answer_regex: str = "(.*)"
+    response_answer_regex: str = "(?s)(.*)"
     lora_path: Optional[str] = None
     reasoning_effort: Optional[str] = None
 
@@ -273,11 +273,42 @@ def get_sampling_params(eval_args):
 
 
 # ----------- Process Multi-choice -------------
+# Patterns that explicitly commit to a single letter as the final answer.
+# Each captures the letter in group(1).  Matching uses ``re.IGNORECASE`` and
+# all matches are collected across patterns; the one with the latest offset
+# wins.
+_EXPLICIT_ANSWER_PATTERNS = (
+    # "answer: X" / "Final answer: X" (with optional bold/parens)
+    r"\banswer\s*:\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])",
+    # bare "X" / "(X)" on its own line at the end of the response
+    r"(?:^|\n)\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\.?\s*$",
+    # "\boxed{X}" (LaTeX boxed answer, common in math/CoT outputs)
+    r"\\boxed\{\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\}",
+    # "(the) answer is X" / "(the) correct answer is X"
+    r"\b(?:the\s+)?answer\s+is\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])",
+)
+
+
+def _parse_explicit_multi_choice_answer(response, all_choices):
+    choice_map = {choice.upper(): choice for choice in all_choices}
+    matches = []
+    for pattern in _EXPLICIT_ANSWER_PATTERNS:
+        for match in re.finditer(pattern, response, flags=re.IGNORECASE):
+            candidate = match.group(1).upper()
+            if candidate in choice_map:
+                matches.append((match.start(1), choice_map[candidate]))
+    return max(matches)[1] if matches else None
+
+
 def parse_multi_choice_response(response, all_choices, index2ans):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
     """
+    explicit_answer = _parse_explicit_multi_choice_answer(response, all_choices)
+    if explicit_answer is not None:
+        return explicit_answer
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "  # add space to avoid partial match

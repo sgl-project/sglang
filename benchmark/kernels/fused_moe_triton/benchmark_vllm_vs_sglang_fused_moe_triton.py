@@ -12,7 +12,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
 

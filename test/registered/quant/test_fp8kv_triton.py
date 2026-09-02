@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,7 +12,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=63, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=73, stage="extra-a", runner_config="1-gpu-large")
+register_amd_ci(est_time=94, suite="extra-a-test-1-gpu-large-amd")
 
 
 class TestFP8KVCacheTritonBackend(CustomTestCase):

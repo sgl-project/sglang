@@ -7,6 +7,7 @@ import torch
 from sglang.srt.debug_utils.comparator.dims_spec import (
     SEQ_DIM_NAME,
     TOKEN_DIM_NAME,
+    get_dim_names,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 
@@ -30,10 +31,9 @@ def execute_token_aligner_concat_steps(
 def _resolve_token_dim(tensor: torch.Tensor) -> int:
     """Find the token/seq dim index. Falls back to dim 0 for unnamed tensors or
     tensors without a recognised token/seq dim."""
-    if tensor.names[0] is None:
+    names: tuple[Optional[str], ...] = get_dim_names(tensor)
+    if names[0] is None:
         return _UNNAMED_TOKEN_DIM_FALLBACK
-
-    names: tuple[Optional[str], ...] = tensor.names
     for candidate in (TOKEN_DIM_NAME, SEQ_DIM_NAME):
         if candidate in names:
             return list(names).index(candidate)

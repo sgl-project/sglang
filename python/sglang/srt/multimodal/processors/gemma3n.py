@@ -52,14 +52,14 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         """Process multimodal data including images and audio."""
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

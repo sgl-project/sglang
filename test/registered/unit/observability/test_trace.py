@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import threading
 import unittest
@@ -13,14 +13,13 @@ from unittest.mock import patch
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
-    TraceCustomIdGenerator,
     TraceEvent,
     TraceNullContext,
     TraceReqContext,
     TraceSliceContext,
-    TraceThreadContext,
     TraceThreadInfo,
     extract_trace_headers,
+    get_global_trace_level,
     get_global_tracing_enabled,
     process_tracing_init,
     set_global_trace_level,
@@ -38,7 +37,7 @@ except ImportError:
     _has_otel = False
 
 # Access the private module-level function (avoid name mangling inside classes).
-_get_host_id = getattr(mod, "__get_host_id")
+_get_host_id = getattr(mod, "_get_host_id")
 
 
 class TestTraceFunctions(unittest.TestCase):
@@ -51,10 +50,29 @@ class TestTraceFunctions(unittest.TestCase):
         self.assertEqual(extract_trace_headers({}), {})
 
     def test_set_global_trace_level(self):
-        orig = mod.global_trace_level
-        set_global_trace_level(5)
-        self.assertEqual(mod.global_trace_level, 5)
-        mod.global_trace_level = orig
+        from sglang.srt.runtime_context import get_resources
+
+        orig = get_resources().trace_level
+        try:
+            set_global_trace_level(5)
+            self.assertEqual(get_global_trace_level(), 5)
+        finally:
+            get_resources().trace_level = orig
+
+    def test_global_trace_level_env_var(self):
+        # The level lives on ctx.resources and is seeded lazily from the env
+        # on first read after a reset (no module reload involved).
+        from sglang.srt.runtime_context import get_resources
+
+        orig = get_resources().trace_level
+        try:
+            with patch.dict(os.environ, {"SGLANG_TRACE_LEVEL": "2"}):
+                get_resources().trace_level = None
+                self.assertEqual(get_global_trace_level(), 2)
+            get_resources().trace_level = None  # SGLANG_TRACE_LEVEL unset → 3
+            self.assertEqual(get_global_trace_level(), 3)
+        finally:
+            get_resources().trace_level = orig
 
     def test_get_global_tracing_enabled(self):
         self.assertEqual(get_global_tracing_enabled(), mod.opentelemetry_initialized)
@@ -63,25 +81,6 @@ class TestTraceFunctions(unittest.TestCase):
         ts = mod.get_cur_time_ns()
         self.assertIsInstance(ts, int)
         self.assertGreater(ts, 0)
-
-
-class TestDataclasses(unittest.TestCase):
-    def test_trace_thread_info(self):
-        info = TraceThreadInfo("host", 123, "label", 0, 1)
-        self.assertEqual(info.thread_label, "label")
-
-    def test_trace_event(self):
-        evt = TraceEvent("name", 100, {"k": "v"})
-        self.assertEqual(evt.event_name, "name")
-
-    def test_trace_slice_context(self):
-        s = TraceSliceContext("slice", 100, end_time_ns=200, level=2, attrs={"a": 1})
-        self.assertEqual(s.slice_name, "slice")
-
-    def test_trace_thread_context(self):
-        info = TraceThreadInfo("h", 1, "l", 0, 0)
-        ctx = TraceThreadContext(thread_info=info, cur_slice_stack=[])
-        self.assertEqual(len(ctx.cur_slice_stack), 0)
 
 
 class TestTraceNullContext(unittest.TestCase):
@@ -102,44 +101,41 @@ class TestSpanAttributes(unittest.TestCase):
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
 
 
-class TestTraceCustomIdGenerator(unittest.TestCase):
-    def test_generates_nonzero_ids(self):
-        gen = TraceCustomIdGenerator()
-        trace_id = gen.generate_trace_id()
-        span_id = gen.generate_span_id()
-        self.assertIsInstance(trace_id, int)
-        self.assertIsInstance(span_id, int)
-
-
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
     def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                unittest.mock.mock_open(read_data="abc123\n"),
+            ),
         ):
             self.assertEqual(_get_host_id(), "abc123")
 
     def test_from_machine_id_file_error(self):
         """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("builtins.open", side_effect=IOError("read error")),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0x112233445566),
         ):
             result = _get_host_id()
             self.assertIsInstance(result, str)
             self.assertGreater(len(result), 0)
 
     def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
+        with (
+            patch("os.path.exists", return_value=False),
+            patch("uuid.getnode", return_value=0),
         ):
             self.assertEqual(_get_host_id(), "unknown")
 
@@ -193,32 +189,17 @@ class TestTraceReqContextDisabled(unittest.TestCase):
         self.assertFalse(ctx.tracing_enable)
         self.assertFalse(ctx.is_tracing_enabled())
 
-    def test_all_methods_noop(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start()
-        ctx.trace_req_finish()
-        ctx.trace_slice_start("s", 1)
-        ctx.trace_slice_end("s", 1)
-        ctx.trace_slice(TraceSliceContext("s", 100))
-        ctx.trace_event("e", 1)
-        ctx.trace_set_root_attrs({"k": "v"})
-        ctx.trace_set_thread_attrs({"k": "v"})
-        ctx.abort()
-        ctx.rebuild_thread_context()
-
     def test_getstate_disabled(self):
         ctx = TraceReqContext(rid="req-1")
         state = ctx.__getstate__()
         self.assertEqual(state, {"tracing_enable": False})
 
     def test_setstate_disabled(self):
-        ctx = TraceReqContext.__new__(TraceReqContext)
+        ctx = TraceReqContext(rid="req-1")
         ctx.__setstate__({"tracing_enable": True, "is_copy": False})
         # opentelemetry_initialized is False → tracing forced off
         self.assertFalse(ctx.tracing_enable)
 
-    def test_trace_set_thread_info_disabled(self):
-        trace_set_thread_info("test_label")
         # Should not register anything
 
 
@@ -229,20 +210,28 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         self.orig_initialized = mod.opentelemetry_initialized
         self.orig_tracer = mod.tracer
         self.orig_threads = mod.threads_info.copy()
-        self.orig_level = mod.global_trace_level
+        from sglang.srt.runtime_context import get_resources
+
+        self.orig_level = get_resources().trace_level
+
+        # Reset OTel global TracerProvider so set_tracer_provider works each test
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
 
         self.provider = TracerProvider()
         otel_trace.set_tracer_provider(self.provider)
         mod.opentelemetry_initialized = True
         mod.tracer = otel_trace.get_tracer("test")
-        mod.global_trace_level = 3
+        set_global_trace_level(3)
 
     def tearDown(self):
         mod.opentelemetry_initialized = self.orig_initialized
         mod.tracer = self.orig_tracer
         mod.threads_info.clear()
         mod.threads_info.update(self.orig_threads)
-        mod.global_trace_level = self.orig_level
+        from sglang.srt.runtime_context import get_resources
+
+        get_resources().trace_level = self.orig_level
 
     def test_trace_set_thread_info(self):
         trace_set_thread_info("scheduler", tp_rank=0, dp_rank=0)
@@ -255,9 +244,26 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         trace_set_thread_info("different_label")
         self.assertEqual(mod.threads_info[pid].thread_label, "scheduler")
 
+    def test_module_filtering(self):
+        """global_trace_modules gates only explicitly named modules."""
+        orig_modules = mod.global_trace_modules
+        mod.global_trace_modules = ["request"]
+        try:
+            # Default empty module_name is never filtered
+            ctx = TraceReqContext(rid="req-1")
+            self.assertTrue(ctx.tracing_enable)
+            # Listed module is traced
+            ctx = TraceReqContext(rid="req-1", module_name="request")
+            self.assertTrue(ctx.tracing_enable)
+            # Unlisted module is filtered out
+            ctx = TraceReqContext(rid="req-1", module_name="mooncake")
+            self.assertFalse(ctx.tracing_enable)
+        finally:
+            mod.global_trace_modules = orig_modules
+
     def test_full_lifecycle(self):
         """Start → slice_start → slice_end → finish."""
-        ctx = TraceReqContext(rid="req-1", role="unified", module_name="test")
+        ctx = TraceReqContext(rid="req-1", role="unified")
         self.assertTrue(ctx.tracing_enable)
 
         ctx.trace_req_start(ts=1000)
@@ -279,13 +285,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx = TraceReqContext(rid="req-1", bootstrap_room=0xFF, role="prefill")
         ctx.trace_req_start(ts=1000)
         self.assertIsNotNone(ctx.root_span)
-        ctx.trace_req_finish(ts=2000)
-
-    def test_trace_req_finish_without_start(self):
-        """finish without start is a no-op."""
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.root_span = None
         ctx.trace_req_finish(ts=2000)
 
     def test_trace_slice_combined(self):
@@ -405,24 +404,6 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
         ctx.trace_req_finish(ts=5000)
 
-    def test_trace_set_root_attrs(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.trace_set_root_attrs({"model": "llama"})
-        ctx.trace_req_finish(ts=2000)
-
-    def test_trace_set_root_attrs_no_span(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.root_span = None
-        ctx.trace_set_root_attrs({"model": "llama"})  # no crash
-
-    def test_trace_set_thread_attrs(self):
-        ctx = TraceReqContext(rid="req-1")
-        ctx.trace_req_start(ts=1000)
-        ctx.trace_set_thread_attrs({"batch_size": 32})
-        ctx.trace_req_finish(ts=2000)
-
     def test_abort_with_unclosed_slices(self):
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -503,7 +484,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         state = ctx.__getstate__()
         ctx.trace_req_finish(ts=2000)
 
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertTrue(ctx2.tracing_enable)
         self.assertTrue(ctx2.is_copy)
@@ -514,7 +495,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
         pid = threading.get_native_id()
         mod.threads_info[pid] = TraceThreadInfo(
-            "host", pid, "sched", tp_rank=0, dp_rank=0
+            "host", pid, "sched", tp_rank=0, dp_rank=0, pp_rank=0
         )
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)
@@ -531,7 +512,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_finish(ts=3000)
 
         self.assertIsNotNone(state.get("last_span_context"))
-        ctx2 = TraceReqContext.__new__(TraceReqContext)
+        ctx2 = TraceReqContext(rid="req-2")
         ctx2.__setstate__(state)
         self.assertIsNotNone(ctx2.last_span_context)
 

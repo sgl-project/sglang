@@ -274,7 +274,7 @@ class Lfm2VlForConditionalGeneration(nn.Module):
 
         return projected_packed
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

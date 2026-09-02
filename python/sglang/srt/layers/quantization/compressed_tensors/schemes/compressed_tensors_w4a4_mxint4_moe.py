@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 
-from sglang.srt.distributed import get_moe_expert_parallel_rank, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompressedTensorsMxInt4MoE"]
 
 if TYPE_CHECKING:
+    from compressed_tensors.quantization import QuantizationArgs
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -45,9 +48,13 @@ if is_flashinfer_available():
 
 
 class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
-    def __init__(self, quant_config: CompressedTensorsConfig):
+    def __init__(
+        self, quant_config: CompressedTensorsConfig, weight_quant: QuantizationArgs
+    ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # Per-layer scheme already resolved by get_moe_scheme(); reuse it directly
+        # (mixed-precision MoE has no "Linear" config group to fall back on).
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.strategy = config.strategy
@@ -65,7 +72,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         assert (
             not config.actorder
         ), "Actorder is not supported by flashinfer_trtllm backend"
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_rank = get_parallel().moe_ep_rank
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(

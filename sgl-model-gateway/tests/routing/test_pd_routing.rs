@@ -767,12 +767,12 @@ mod pd_routing_unit_tests {
             ("/health_generate", "GET", true), // Note: Python uses POST, we use GET
             ("/server_info", "GET", true),
             ("/v1/models", "GET", true),
-            ("/get_model_info", "GET", true),
+            ("/model_info", "GET", true),
             ("/generate", "POST", true),
             ("/v1/chat/completions", "POST", true),
             ("/v1/completions", "POST", true),
             ("/flush_cache", "POST", true),
-            ("/get_loads", "GET", true),
+            ("/v1/loads", "GET", true),
             ("/register", "POST", false), // NOT IMPLEMENTED - needs dynamic worker management
         ];
 
