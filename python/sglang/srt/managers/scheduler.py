@@ -3390,9 +3390,7 @@ class Scheduler(
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
             )
             prefill_delayer_single_pass = PrefillDelayerSinglePassExecutor(
-                self.prefill_delayer,
-                token_usage=max_pool_usage,
-                prefill_in_flight=self.chunked_req is not None,
+                self.prefill_delayer, token_usage=max_pool_usage
             )
 
         ret, running_batch = self._get_new_batch_prefill_raw(

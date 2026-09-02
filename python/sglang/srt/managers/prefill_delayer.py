@@ -70,6 +70,8 @@ class _NegotiateOutput(NamedTuple):
     # cannot convey it to the metrics observation.
     wait_forward_passes: int = 0
     wait_seconds: float = 0.0
+    # Whether any rank admitted an in-flight prefill chunk this pass.
+    any_prefill_in_flight: bool = False
 
 
 class PrefillDelayer:
@@ -140,7 +142,6 @@ class PrefillDelayer:
 
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
-        self._last_any_prefill_in_flight = False
 
         assert (
             not get_schedule().disable_overlap_schedule
@@ -197,14 +198,12 @@ class PrefillDelayer:
             waiting_queue_len=waiting_queue_len,
             prefill_in_flight=prefill_in_flight,
         )
-        self._last_any_prefill_in_flight = bool(
-            self._global_info_buffer[:, :, 5].max().item() > 0
-        )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
         global_running_batch = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
         global_waiting_queue_len = tp0_info[:, 4]
+        global_prefill_in_flight = tp0_info[:, 5]
 
         # Compute derived global states
         if global_prefillable.min().item() > 0:
@@ -220,6 +219,7 @@ class PrefillDelayer:
             input_estimation=prefillable_status,
             num_prefillable=global_prefillable.sum().item(),
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
+            any_prefill_in_flight=bool(global_prefill_in_flight.max().item() > 0),
         )
 
         # Wait accumulated so far, taken from prev_state. Release paths attach
@@ -390,15 +390,9 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
-    def __init__(
-        self,
-        prefill_delayer: PrefillDelayer,
-        token_usage: float,
-        prefill_in_flight: bool = False,
-    ):
+    def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
-        self._prefill_in_flight = prefill_in_flight
         self._result: Optional[_NegotiateOutput] = None
         self._attempted_prefill_bs = 0
 
@@ -408,11 +402,11 @@ class PrefillDelayerSinglePassExecutor:
 
     @property
     def is_phase_prefill(self) -> bool:
-        """Whether any rank runs prefill this pass: a new admission or an
-        in-flight prefill chunk."""
+        """Whether any rank runs prefill this pass: an admitted in-flight
+        chunk on any rank, or a new admission the delayer allowed."""
         if self._result is None:
             return False
-        if self._prefill_delayer._last_any_prefill_in_flight:
+        if self._result.any_prefill_in_flight:
             return True
         return self._result.output_allow and self._result.num_prefillable > 0
 
@@ -457,6 +451,7 @@ class PrefillDelayerSinglePassExecutor:
         max_prefill_bs: int = 0,
         max_running_requests: int = 0,
         waiting_queue_len: int = 0,
+        prefill_in_flight: bool = False,
     ) -> bool:
         if local_prefillable:
             self._attempted_prefill_bs = max(
@@ -471,7 +466,7 @@ class PrefillDelayerSinglePassExecutor:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
-                prefill_in_flight=self._prefill_in_flight,
+                prefill_in_flight=prefill_in_flight,
                 running_batch=running_batch,
                 max_prefill_bs=max_prefill_bs,
                 max_running_requests=max_running_requests,
