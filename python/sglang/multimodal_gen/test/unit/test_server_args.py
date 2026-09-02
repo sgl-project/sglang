@@ -188,7 +188,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             },
         )
 
-    def test_supplemental_weight_file_remains_a_component_path(self):
+    def test_any_explicit_component_weight_file_keeps_base_config(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
@@ -198,11 +198,11 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             }
         )
 
+        self.assertEqual(args.component_paths, {})
         self.assertEqual(
-            args.component_paths,
+            args.component_weights_paths,
             {"conditioning_projection": "owner/repo/projection.safetensors"},
         )
-        self.assertEqual(args.component_weights_paths, {})
 
     def test_component_attention_backends_are_normalized(self):
         args = self._from_dict_without_model_resolution(

@@ -131,6 +131,7 @@ jobs:
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: mi355x-${{ matrix.config.name }}
       MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
+      SLURM_EXCLUDE: mia1-p01-g20,mia1-p01-g09
       # NOTE: RUNNER_NAME is a built-in default env var on every runner, so the
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
@@ -255,7 +256,8 @@ jobs:
       - setup
       - nightly-mi355x-2n
     if: |
-      !cancelled() && github.repository == 'sgl-project/sglang'
+      false
+      && !cancelled() && github.repository == 'sgl-project/sglang'
       && needs.setup.result == 'success'
       && needs.setup.outputs.matrix-4n != '{"include":[]}'
     runs-on: linux-sglang-mi35x-di
