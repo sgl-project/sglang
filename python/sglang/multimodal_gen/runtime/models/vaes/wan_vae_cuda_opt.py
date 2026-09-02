@@ -3,10 +3,10 @@
 
 Fuses every decoder ``WanRMS_norm -> SiLU`` chain into one Triton kernel on
 the channels_last_3d layout. Wrappers are installed once at VAE load and
-dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality == "high"``
-runs the fused kernel (not bitwise-identical to aten, hence gated), the
-``"lossless"`` default runs the original module path bit-for-bit. Install is
-all-or-nothing and fail-closed.
+dispatch on a decode-scoped :class:`VaeFastPathGate`: ``quality="extra-high"``
+and ``quality="high"`` run the fused kernel (not bitwise-identical to aten,
+hence gated), while the ``"lossless"`` default runs the original module path
+bit-for-bit. Install is all-or-nothing and fail-closed.
 """
 
 import torch
@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 try:
-    from sglang.kernels.ops.diffusion.triton.wan_rmsnorm_silu import wan_rmsnorm_silu
+    from sglang.kernels.ops.diffusion import (
+        can_use_wan_rmsnorm_silu,
+        wan_rmsnorm_silu,
+    )
 
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
@@ -48,9 +51,8 @@ class FusedWanRMSNormSiLU(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._sgl_gate.enabled and not torch.compiler.is_compiling():
             bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-            y = wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
-            if y is not None:
-                return y
+            if can_use_wan_rmsnorm_silu(x, self.gamma, bias):
+                return wan_rmsnorm_silu(x, self.gamma, bias, rms_scale=self.scale)
         # WanRMS_norm.forward (channel-first) + SiLU, same ops in the same
         # order, so the off-path stays bit-identical.
         return F.silu(F.normalize(x, dim=1) * self.scale * self.gamma + self.bias)

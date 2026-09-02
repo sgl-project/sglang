@@ -40,7 +40,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_device,
     get_exec,
     get_parallel,
@@ -155,11 +154,14 @@ def _broadcast_indexer_topk_from_rank0_impl(topk_indices: torch.Tensor) -> None:
     if group.world_size == 1:
         return
 
-    if topk_indices.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
-        if group.pynccl_comm is None:
-            raise RuntimeError(
-                "SGLANG_DSA_TOPK_BROADCAST requires PyNCCL during CUDA graph capture."
-            )
+    # PyNCCL is the faster path under capture, but it is not a precondition:
+    # a split attn-TP group is built without one (parallel_state.py), and the
+    # process-group broadcast captures and replays correctly.
+    if (
+        topk_indices.device.type == "cuda"
+        and torch.cuda.is_current_stream_capturing()
+        and group.pynccl_comm is not None
+    ):
         with group.pynccl_comm.change_state(enable=True):
             group.pynccl_comm.broadcast(topk_indices, src=0)
     else:
@@ -201,6 +203,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
+    _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -249,7 +253,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
-            pp_size = configured_pp_size()
+            pp_size = get_parallel().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
         else:
             self.logits_with_pp_recv = False
@@ -389,12 +393,70 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return x if self.use_dsa_indexer_fusion else rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
-        if (
-            forward_batch.forward_mode.is_extend_without_speculative()
-            and forward_batch.seq_lens_cpu is not None
-        ):
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+        # When kv_len <= index_topk the top-k selects ALL valid positions, so the
+        # indexer's logits GEMM + paged_mqa_logits + top-k are wasted work: a plain
+        # topk_transform(dummy_logits) already yields the correct "select-all"
+        # (physical page-slot) indices. Skipping the logits path is safe here.
+        #
+        # Prefill/extend: original fast path, all platforms.
+        # Decode: new here, and ROCm-only for now (see the _is_hip gate below).
+        # Under a captured decode cuda graph the chosen branch is frozen at
+        # capture time and would replay incorrectly for kv_len > index_topk, so
+        # the decode skip is not decided per-step during capture; it is driven by
+        # which graph variant is being captured instead.
+        fb = forward_batch
+
+        # Prefill/extend: original per-step gate (host sync on seq_lens_cpu is fine).
+        if fb.forward_mode.is_extend_without_speculative():
+            if fb.seq_lens_cpu is None or fb.seq_lens_cpu.numel() == 0:
+                return False
+            return int(fb.seq_lens_cpu.max().item()) <= self.index_topk
+
+        # Decode/idle.
+        if fb.forward_mode.is_decode_or_idle():
+            # Decode k-only skip (both the captured dual-graph "dense" variant
+            # and the eager per-step skip below) is currently HIP-only. On CUDA
+            # this common code keeps the original behavior (decode never skips
+            # the indexer, i.e. always runs the full logits path) because the
+            # decode k-only path has not been validated on CUDA yet. Mirrors the
+            # is_hip() gate on dsa_dual_graph in decode_cuda_graph_runner, which
+            # already prevents the CUDA capture path from setting a "dense"
+            # variant.
+            if not _is_hip:
+                return False
+            if get_is_capture_mode():
+                # Under a captured decode cuda graph the taken branch is frozen at
+                # capture time, so we must NOT branch on a runtime seq_len (also a
+                # host sync would break capture). The chosen branch is instead
+                # driven by which graph variant is being captured.
+                #
+                # The decode runner captures a "dense" (k-only) and a "sparse"
+                # (full indexer) graph per bs bucket and dispatches on max_kv_len
+                # at replay. The capture-variant signal tells us which one to
+                # bake in.
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_dsa_variant,
+                )
+
+                variant = get_capture_dsa_variant()
+                if variant == "dense":
+                    return True
+                if variant == "sparse":
+                    return False
+
+                # No dual-variant capture signal: default to the correct-for-all
+                # full-indexer (sparse) path.
+                return False
+            # Eager decode: safe to check per-step (host sync OK); correct for both
+            # kv_len<=index_topk (k-only) and kv_len>index_topk (falls through).
+            if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
+                max_kv_len = int(fb.seq_lens_cpu.max().item())
+            elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
+                max_kv_len = int(fb.seq_lens.max().item())
+            else:
+                return False
             return max_kv_len <= self.index_topk
+
         return False
 
     def _get_q_k_bf16(
@@ -517,7 +579,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
 
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        # Rotary may update both inputs in place, so the K-only path must not
+        # alias its dummy query with the key.
+        if _is_cuda or _is_hip or _is_xpu:
+            dummy_q_rope = torch.empty_like(k_rope)
+        else:
+            dummy_q_rope = k_rope
+        _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
         self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
@@ -937,7 +1005,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self, num_q: int, num_k: int, device_index: int
     ) -> Tuple[bool, int]:
         """
-        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Detect whether we need to chunk the MQA logits computation to avoid OOM,
+        and on ROCm to stay under aiter's 2 GiB logits limit
         Return: (need_chunk, logits_budget_bytes)
         """
         # Quick static check for normal batches
@@ -946,6 +1015,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         logits_bytes = num_q * num_k * self._MQA_LOGITS_BYTES_PER_ELEM
         logits_budget_bytes = self._get_mqa_logits_budget_bytes(device_index)
+        if _is_hip:
+            logits_budget_bytes = min(
+                logits_budget_bytes, self._MQA_LOGITS_MAX_BYTES_ROCM
+            )
 
         need_chunk = logits_bytes > logits_budget_bytes
         return need_chunk, logits_budget_bytes
@@ -1175,7 +1248,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         #   - topk_result: pre-allocated padded buffer to fill in place (a downstream
         #     captured graph reads it at a fixed address). None => return a fresh,
         #     naturally-sized tensor.
-        assert forward_batch.forward_mode.is_extend_without_speculative()
+        assert (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            or forward_batch.forward_mode.is_decode_or_idle()
+        )
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops.

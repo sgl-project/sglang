@@ -31,7 +31,10 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
+    GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
+    graph_pool_capture_scope,
+    graph_pool_replay_scope,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -62,6 +65,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
+        self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -105,7 +109,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         for _ in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
-            forward_fn()
+            with self._precarve.measure():
+                forward_fn()
             if profiler is not None:
                 profiler.step()
             if post_warmup_hook is not None:
@@ -125,7 +130,11 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
-        with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
+        with (
+            graph_pool_capture_scope(),
+            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+        ):
+            self._precarve.mint()
             out = forward_fn()
 
         if profiler is not None:
@@ -147,7 +156,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        with graph_pool_replay_scope():
+            self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

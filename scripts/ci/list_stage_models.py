@@ -104,12 +104,6 @@ _FILE_EXTENSIONS = (
     ".onnx",
 )
 
-# Non-test helper files under test/registered/ (skipped by basename, matching
-# scripts/ci/check_registered_tests.py). run_suite.py skips `cpu/utils.py` by
-# path; excluding every `utils.py` by basename is a superset that drops no
-# CUDA-registered test (the other `utils.py` registers CPU only).
-_NON_TEST_BASENAMES = frozenset({"conftest.py", "__init__.py", "utils.py"})
-
 
 def looks_like_model_id(value: str, deny: Optional[Set[str]] = None) -> bool:
     """Heuristic: does ``value`` look like a HuggingFace repo id?
@@ -273,11 +267,13 @@ def collect_suite_files(
     ci_register = _load_ci_register(repo_root)
     backend = getattr(ci_register.HWBackend, backend_name.upper())
 
-    pattern = os.path.join(repo_root, "test", "registered", "**", "*.py")
+    # Same exclusion as run_suite.py: pytest+package structure files.
     files = sorted(
         f
-        for f in glob.glob(pattern, recursive=True)
-        if os.path.basename(f) not in _NON_TEST_BASENAMES
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"), recursive=True
+        )
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     )
 
     suite_files: Dict[str, List[str]] = {}

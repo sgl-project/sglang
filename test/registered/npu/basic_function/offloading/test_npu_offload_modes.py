@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=800, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=800, suite="full-2-npu-a3", nightly=True)
 
 TEST_MODEL_MATRIX = {
     DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH,
