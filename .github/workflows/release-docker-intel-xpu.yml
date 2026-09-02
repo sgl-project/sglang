@@ -44,6 +44,13 @@ jobs:
             exit 1
           fi
 
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if ! git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+              echo "::error::Version tag v${VERSION} does not exist"
+              exit 1
+            fi
+          fi
+
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Build and Push
@@ -56,4 +63,14 @@ jobs:
             --build-arg SG_LANG_BRANCH=v${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache --progress=plain
-          docker push lmsysorg/sglang:${tag}
+
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in $((i*15))s..."
+              sleep $((i*15))
+            done
+            return 1
+          }
+
+          push_with_retry lmsysorg/sglang:${tag}
