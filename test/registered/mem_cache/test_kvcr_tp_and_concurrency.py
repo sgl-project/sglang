@@ -399,7 +399,7 @@ class UnusableHostPoolTest(unittest.TestCase):
         self.assertIsNone(store._kvcr)
         build_kvcr.assert_not_called()
 
-    def test_finalize_reports_the_complete_unimplemented_pool_plan(self):
+    def test_finalize_passes_the_complete_physical_plan_to_the_builder(self):
         store = _store(0, 1)
         anchor = SimpleNamespace(kv_buffer=None)
         c4_buffer = torch.empty(4, dtype=torch.uint8)
@@ -415,24 +415,26 @@ class UnusableHostPoolTest(unittest.TestCase):
         store.register_mem_host_pool_v2(anchor, PoolName.KV)
         store.register_mem_host_pool_v2(c4_pool, PoolName.DEEPSEEK_V4_C4)
 
-        with self.assertRaises(RuntimeError) as raised:
+        with mock.patch.object(store, "_build_hybrid_kvcr") as build:
             store.finalize_mem_pool_registration()
 
-        self.assertIn(str(PoolName.KV), str(raised.exception))
-        self.assertIn(str(PoolName.DEEPSEEK_V4_C4), str(raised.exception))
-        self.assertIn("plural KVCR framework regions", str(raised.exception))
+        build.assert_called_once_with()
+        self.assertEqual(set(store._pool_contexts), {PoolName.DEEPSEEK_V4_C4})
         self.assertIsNone(store._kvcr)
 
     def test_single_pool_finalization_does_not_rebuild_an_eager_core(self):
         store = _store(0, 1)
         buffer = torch.empty(4, dtype=torch.uint8)
+        page_meta = mock.Mock(
+            side_effect=lambda indices: (
+                [buffer.data_ptr() + int(index) for index in indices],
+                [1] * len(indices),
+            )
+        )
         pool = SimpleNamespace(
             page_size=1,
             kv_buffer=buffer,
-            get_page_buffer_meta=lambda indices: (
-                [buffer.data_ptr() + int(index) for index in indices],
-                [1] * len(indices),
-            ),
+            get_page_buffer_meta=page_meta,
         )
 
         def build_once(mem_pool_host):
@@ -445,7 +447,23 @@ class UnusableHostPoolTest(unittest.TestCase):
             store.finalize_mem_pool_registration()
 
         build.assert_called_once_with(pool)
-        self.assertIs(store._pool_contexts[PoolName.KV].host_pool, pool)
+        page_meta.assert_not_called()
+        self.assertEqual(store._pool_contexts, {})
+
+    def test_late_anchor_replacement_cannot_change_the_started_topology(self):
+        store = _store(0, 1)
+        anchor = SimpleNamespace(kv_buffer=None)
+        store.register_mem_pool_host(anchor)
+        store._kvcr = object()
+
+        # Repeating the exact registration is harmless.
+        store.register_mem_pool_host(anchor)
+
+        replacement = SimpleNamespace(kv_buffer=None)
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            store.register_mem_pool_host(replacement)
+
+        self.assertIs(store.mem_pool_host, anchor)
 
     def test_a_per_layer_pool_refuses_to_start_the_backend(self):
         """A pool with no single kv_buffer tensor cannot be NIXL-registered.
@@ -638,15 +656,87 @@ class HybridPoolManifestTest(unittest.TestCase):
         )
         self.anchor.get_page_buffer_meta.assert_not_called()
 
-    def test_finalizer_retains_the_manifest_at_the_next_checkpoint_boundary(self):
-        with self.assertRaisesRegex(RuntimeError, "plural KVCR framework regions"):
-            self.store.finalize_mem_pool_registration()
+    def test_finalizer_builds_size_classed_arenas_from_the_complete_manifest(self):
+        store = _store(0, 1, local_dram_bytes=80)
+        store.register_mem_pool_host(self.anchor)
+        store.register_mem_host_pool_v2(self.anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(self.c4, PoolName.DEEPSEEK_V4_C4)
+        store.register_mem_host_pool_v2(self.c128, PoolName.DEEPSEEK_V4_C128)
 
+        with (
+            mock.patch.object(kvcr_store, "_require_kvcr_api"),
+            mock.patch.object(kvcr_store, "_ephemeral_port", return_value=26000),
+            mock.patch.object(kvcr_store, "ZmqPeerControlChannel"),
+            mock.patch.object(kvcr_store, "KVCR") as constructor,
+            mock.patch.object(store, "_start_source_pump") as start_pump,
+        ):
+            store.finalize_mem_pool_registration()
+            store.finalize_mem_pool_registration()
+
+        constructor.assert_called_once()
+        start_pump.assert_called_once()
+        backend = constructor.call_args.args[2]
+        self.assertIsNone(backend.framework_dram)
         self.assertEqual(
-            set(self.store._pool_contexts),
+            {
+                (region.address, region.length)
+                for region in backend.framework_dram_regions
+            },
+            {
+                (buffer.data_ptr(), buffer.numel() * buffer.element_size())
+                for buffer in (*self.c4.buffers, *self.c128.buffers)
+            },
+        )
+        self.assertIsNone(backend.local_dram)
+        arenas = {
+            arena.length // arena.slot_count: arena
+            for arena in backend.local_dram_arenas
+        }
+        self.assertEqual(
+            {size: (arena.slot_count, arena.length) for size, arena in arenas.items()},
+            {8: (4, 32), 24: (2, 48)},
+        )
+        self.assertEqual(
+            {size: arena.address for size, arena in arenas.items()},
+            {
+                size: buffer.data_ptr()
+                for size, buffer in store._local_dram_buffers.items()
+            },
+        )
+        self.assertEqual(
+            set(store._pool_contexts),
             {PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C128},
         )
-        self.assertIsNone(self.store._kvcr)
+        self.assertIs(store._kvcr, constructor.return_value)
+        self.assertEqual(self.c4.meta_calls, 1)
+        self.assertEqual(self.c128.meta_calls, 1)
+
+    def test_late_pool_registration_cannot_change_the_started_topology(self):
+        self.store._kvcr = object()
+
+        # An idempotent repeat from the controller is harmless.
+        self.store.register_mem_host_pool_v2(
+            self.c4,
+            PoolName.DEEPSEEK_V4_C4,
+        )
+
+        replacement = _ManifestPool(page_size=2, component_bytes=[8, 8])
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            self.store.register_mem_host_pool_v2(
+                replacement,
+                PoolName.DEEPSEEK_V4_C4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "after KVCR initialization"):
+            self.store.register_mem_host_pool_v2(
+                replacement,
+                PoolName.INDEXER,
+            )
+
+        self.assertIs(
+            self.store.registered_pools[PoolName.DEEPSEEK_V4_C4],
+            self.c4,
+        )
+        self.assertNotIn(PoolName.INDEXER, self.store.registered_pools)
 
     def test_a_bufferless_side_pool_is_not_silently_omitted(self):
         self.store.register_mem_host_pool_v2(

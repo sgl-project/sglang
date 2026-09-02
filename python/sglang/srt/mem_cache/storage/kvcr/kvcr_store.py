@@ -64,7 +64,7 @@ import socket
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -161,8 +161,8 @@ class _PoolContext:
     """Validated host-memory shape for one physical HiCache pool.
 
     ``component_sizes`` is the page-major order returned by that pool's own
-    ``get_page_buffer_meta`` for one logical page.  It deliberately does not
-    assign components to KVCR local arenas yet; that is the next checkpoint.
+    ``get_page_buffer_meta`` for one logical page. Equal-sized components share
+    one KVCR local arena while retaining their own pool-qualified keys.
     """
 
     name: PoolName
@@ -469,6 +469,7 @@ class KVCRStore(HiCacheStorage):
         self.registered_pools: Dict[PoolName, HostKVCache] = {}
         self._pool_contexts: Dict[PoolName, _PoolContext] = {}
         self._logical_anchor = False
+        self._local_dram_buffers: Dict[int, torch.Tensor] = {}
 
         # Single-pool layouts construct KVCR in register_mem_pool_host(). A
         # hybrid layout first presents a bufferless logical anchor, then its
@@ -544,9 +545,14 @@ class KVCRStore(HiCacheStorage):
     # ------------------------------------------------------------------
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
-        super().register_mem_pool_host(mem_pool_host)
         if self._kvcr is not None:
-            return
+            if mem_pool_host is self.mem_pool_host:
+                return
+            raise RuntimeError(
+                "KVCRStore cannot replace the host-pool anchor after KVCR "
+                "initialization."
+            )
+        super().register_mem_pool_host(mem_pool_host)
         if mem_pool_host.kv_buffer is None:
             self._logical_anchor = True
             return
@@ -554,27 +560,29 @@ class KVCRStore(HiCacheStorage):
         self._build_kvcr(mem_pool_host)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name) -> None:
-        """Record one physical pool without enabling its transfer path yet."""
+        """Record one physical pool before KVCR freezes its memory topology."""
+        if self._kvcr is not None:
+            existing = self.registered_pools.get(host_pool_name)
+            if existing is host_pool or (
+                host_pool_name == PoolName.KV and host_pool is self.mem_pool_host
+            ):
+                return
+            raise RuntimeError(
+                "KVCRStore cannot add or replace host pools after KVCR "
+                "initialization."
+            )
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
     def finalize_mem_pool_registration(self) -> None:
         """Construct KVCR only after the initial host-pool topology is known."""
-        self._pool_contexts = self._collect_pool_contexts()
         if self._kvcr is not None:
             return
+        self._pool_contexts = self._collect_pool_contexts()
         if self.mem_pool_host is None:
             raise RuntimeError("KVCRStore cannot finalize without a host-pool anchor.")
         if self._logical_anchor:
-            registered_names = ", ".join(
-                sorted(str(pool_name) for pool_name in self.registered_pools)
-            )
-            physical_names = ", ".join(map(str, self._pool_contexts))
-            raise RuntimeError(
-                "KVCRStore collected a logical host-pool anchor and registered "
-                f"pools [{registered_names}]. Validated physical contexts are "
-                f"[{physical_names}], but plural KVCR framework regions and "
-                "local arenas are not implemented yet."
-            )
+            self._build_hybrid_kvcr()
+            return
         self._build_kvcr(self.mem_pool_host)
 
     @staticmethod
@@ -746,7 +754,6 @@ class KVCRStore(HiCacheStorage):
         return configured + offset
 
     def _build_kvcr(self, mem_pool_host: HostKVCache) -> None:
-        _require_kvcr_api()
         framework_dram = self._framework_dram_region(mem_pool_host)
         local_dram = self._local_dram_region(mem_pool_host)
         if framework_dram is None:
@@ -775,6 +782,82 @@ class KVCRStore(HiCacheStorage):
                 "local DRAM tier cannot be sized. The backend has no storage "
                 "without it."
             )
+
+        self._start_kvcr(framework_dram=framework_dram, local_dram=local_dram)
+
+    def _build_hybrid_kvcr(self) -> None:
+        """Construct KVCR over the validated physical hybrid-pool manifest."""
+        if not self._pool_contexts:
+            raise RuntimeError(
+                "KVCRStore: hybrid host-pool manifest has no data pools."
+            )
+
+        framework_regions: List[FrameworkDramInput] = []
+        seen_regions: Set[Tuple[int, int]] = set()
+        for context in self._pool_contexts.values():
+            for region in context.regions:
+                identity = (region.address, region.length)
+                if identity not in seen_regions:
+                    seen_regions.add(identity)
+                    framework_regions.append(region)
+
+        component_counts = Counter(
+            size
+            for context in self._pool_contexts.values()
+            for size in context.component_sizes
+        )
+        component_count = sum(component_counts.values())
+        composite_page_bytes = sum(
+            size * count for size, count in component_counts.items()
+        )
+        if not framework_regions or not component_count or not composite_page_bytes:
+            raise RuntimeError("KVCRStore: hybrid host-pool manifest is empty.")
+
+        configured_slots = self._config.local_dram_slots
+        if configured_slots > 0:
+            page_capacity = configured_slots // component_count
+            budget_name = "local_dram_slots"
+            budget = configured_slots
+        else:
+            page_capacity = self._config.local_dram_bytes // composite_page_bytes
+            budget_name = "local_dram_bytes"
+            budget = self._config.local_dram_bytes
+        if page_capacity <= 0:
+            raise RuntimeError(
+                f"KVCRStore: {budget_name}={budget} cannot hold one complete "
+                f"hybrid page ({component_count} components, "
+                f"{composite_page_bytes} bytes)."
+            )
+
+        local_arenas: List[LocalDramInfo] = []
+        local_buffers: Dict[int, torch.Tensor] = {}
+        for size, occurrences in sorted(component_counts.items()):
+            slot_count = page_capacity * occurrences
+            length = slot_count * size
+            buffer = torch.empty(length, dtype=torch.uint8)
+            local_buffers[size] = buffer
+            local_arenas.append(
+                LocalDramInfo(
+                    address=buffer.data_ptr(),
+                    length=length,
+                    slot_count=slot_count,
+                )
+            )
+        self._local_dram_buffers = local_buffers
+        self._start_kvcr(
+            framework_dram_regions=tuple(framework_regions),
+            local_dram_arenas=tuple(local_arenas),
+        )
+
+    def _start_kvcr(
+        self,
+        *,
+        framework_dram: Optional[FrameworkDramInput] = None,
+        local_dram: Optional[LocalDramInfo] = None,
+        framework_dram_regions: Tuple[FrameworkDramInput, ...] = (),
+        local_dram_arenas: Tuple[LocalDramInfo, ...] = (),
+    ) -> None:
+        _require_kvcr_api()
 
         advertise = self._config.control_advertise_host or socket.gethostname()
         self._control = ZmqPeerControlChannel(
@@ -806,6 +889,8 @@ class KVCRStore(HiCacheStorage):
         backend_configs = KVCRBackendConfigs(
             framework_dram=framework_dram,
             local_dram=local_dram,
+            framework_dram_regions=framework_dram_regions,
+            local_dram_arenas=local_dram_arenas,
             remote_fw_dram=RemoteFWDramOptions(
                 eager_ctrl_connect=self._config.eager_ctrl_connect,
                 opportunistic_query=self._config.opportunistic_query,
@@ -815,10 +900,16 @@ class KVCRStore(HiCacheStorage):
         self._kvcr = KVCR(config, bindings, backend_configs)
         self._start_source_pump()
         logger.info(
-            "KVCRStore initialized (agent=%s, slot_size=%s, remote_hint=%s, "
+            "KVCRStore initialized (agent=%s, slot_sizes=%s, remote_hint=%s, "
             "policy=%s)",
             self._agent_name,
-            self._slot_size,
+            tuple(
+                sorted(
+                    arena.length // arena.slot_count for arena in local_dram_arenas
+                )
+            )
+            if local_dram_arenas
+            else self._slot_size,
             self._config.enable_remote_hint,
             self._config.policy,
         )
@@ -956,9 +1047,7 @@ class KVCRStore(HiCacheStorage):
         length = kv_buffer.numel() * kv_buffer.element_size()
         return FrameworkDramInput(address=address, length=length)
 
-    def _local_dram_region(
-        self, mem_pool_host: HostKVCache
-    ) -> Optional[LocalDramInfo]:
+    def _local_dram_region(self, mem_pool_host: HostKVCache) -> Optional[LocalDramInfo]:
         """Allocate KVCR's own local DRAM tier (the buffer-only L3 pool).
 
         One slot holds one page *segment* (a K or V run of a page), so slot_size
@@ -1017,7 +1106,7 @@ class KVCRStore(HiCacheStorage):
         segment_bytes = int(size_list[0])
         if segment_bytes <= 0 or any(int(s) != segment_bytes for s in size_list):
             logger.warning(
-                "KVCRStore: non-uniform host segment sizes %s; local tier " "disabled.",
+                "KVCRStore: non-uniform host segment sizes %s; local tier disabled.",
                 size_list,
             )
             return None
@@ -1231,9 +1320,9 @@ class KVCRStore(HiCacheStorage):
         ``{component_key: MemDescriptor}`` mapping KVCR takes. For today's KV
         path every component is exactly ``slot_size`` bytes. Hybrid contexts
         instead preserve the component sizes their own pool reported; those
-        descriptors remain gated from submission until checkpoint 3 supplies
-        matching local arenas. ``per_page_keys`` groups the same keys by page
-        so result folding cannot accidentally use a different key spelling.
+        descriptors remain gated from submission until hybrid hit folding is
+        implemented. ``per_page_keys`` groups the same keys by page so result
+        folding cannot accidentally use a different key spelling.
         """
         host_indices = transfer.host_indices
         keys = transfer.keys or []
