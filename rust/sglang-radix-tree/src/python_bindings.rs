@@ -1896,7 +1896,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
-    /// Build direct device-to-external-store transfers for an unstored node.
+    /// Build transfers for a node with no stored or pending external copy.
     fn build_external_linker_offload_transfers(
         &self,
         py: Python<'_>,
@@ -1929,14 +1929,14 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(tree_core_runtime_error)
     }
 
-    /// Publish an accepted external offload as pending and externally stored.
+    /// Publish an accepted external offload as pending.
     fn mark_external_linker_offload_pending(
         &self,
         py: Python<'_>,
         node_id: NodeId,
     ) -> PyResult<()> {
         py.allow_threads(|| self.core().mark_external_linker_offload_pending(node_id))
-            .map_err(tree_core_runtime_error)
+            .map_err(tree_core_assertion_error)
     }
 
     /// Finalize external-store state for an offload and its split fragments.
@@ -1951,7 +1951,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             self.core()
                 .finish_external_linker_offload(&node_ids, ack_id, success)
         })
-        .map_err(tree_core_runtime_error)
+        .map_err(tree_core_assertion_error)
     }
 
     /// Order-sensitive digest of reclaimed coexisting host values.
@@ -2047,6 +2047,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
     ) -> PyResult<Option<usize>> {
         py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+            .map_err(node_access_error)
+    }
+
+    fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+        py.allow_threads(|| self.core().inspect_is_external_cache_stored(node_id))
             .map_err(node_access_error)
     }
 
@@ -2985,7 +2990,7 @@ macro_rules! tree_core_binding {
                 self.inner.finish_load_back(py, anchor_node_id)
             }
 
-            /// Build direct device-to-external-store transfers for an unstored node.
+            /// Build transfers for a node with no stored or pending external copy.
             fn build_external_linker_offload_transfers(
                 &self,
                 py: Python<'_>,
@@ -3009,7 +3014,7 @@ macro_rules! tree_core_binding {
                 )
             }
 
-            /// Publish an accepted external offload as pending and externally stored.
+            /// Publish an accepted external offload as pending.
             fn mark_external_linker_offload_pending(
                 &self,
                 py: Python<'_>,
@@ -3140,6 +3145,15 @@ macro_rules! tree_core_binding {
             ) -> PyResult<Option<usize>> {
                 self.inner
                     .inspect_get_write_through_pending_id(py, node_id)
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_is_external_cache_stored(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<bool> {
+                self.inner.inspect_is_external_cache_stored(py, node_id)
             }
 
             #[cfg(feature = "inspection")]

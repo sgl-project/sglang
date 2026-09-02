@@ -2208,6 +2208,7 @@ def test_stale_inspection_handles_raise_key_error_or_report_absence():
         "get_write_through_pending_id": lambda: core.get_write_through_pending_id(
             stale_root
         ),
+        "is_external_cache_stored": lambda: core.is_external_cache_stored(stale_root),
         "is_node_in_device_lru": lambda: core.is_node_in_device_lru(
             stale_root, ComponentType.FULL
         ),
