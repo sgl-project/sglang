@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -114,14 +115,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     that field) and the validations.
     """
     cfg = resolving_view(server_args)
-    from sglang.srt.utils import is_hip
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
     # currently returns incorrect output for DeepSeek-V4-Flash on ROCm/HIP
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if is_hip():
+    if get_platform().is_hip:
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."

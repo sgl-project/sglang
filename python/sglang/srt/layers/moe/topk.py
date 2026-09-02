@@ -37,7 +37,12 @@ import triton.language as tl
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
-from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+    get_server_args,
+)
 
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
@@ -981,14 +986,9 @@ def fused_topk(
                 moe_fused_gate as _jit_moe_fused_gate,
             )
 
-            zero_bias = torch.zeros(
-                gating_output.shape[1],
-                dtype=torch.float32,
-                device=gating_output.device,
-            )
             topk_weights, topk_ids = _jit_moe_fused_gate(
                 gating_output,
-                zero_bias,
+                None,
                 topk,
                 scoring_func="softmax",
                 renormalize=renormalize,
@@ -1523,7 +1523,6 @@ def _eplb_remap_enabled() -> bool:
     # initial expert placement is non-trivial, or there are redundant physical
     # experts. Otherwise the map is identity and the remap must be skipped (it is
     # both unnecessary and not well-defined over the padded region of topk_ids).
-    from sglang.srt.runtime_context import get_server_args
 
     try:
         get_server_args()  # probes that a config is published

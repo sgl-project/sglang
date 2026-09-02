@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -72,6 +73,8 @@ def _align_pipeline_layers(layers: list, layer_model) -> list:
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
+    if len(layers) == len(layer_model.layers):
+        return layers
     assert (
         len(layers) <= end_layer - start_layer
     ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
@@ -322,14 +325,14 @@ def capture_prefill_graph(
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
     # NULL or LAST graph is dead; capturing it can perturb FP4/TRTLLM-MoE
-    # state and corrupt decode replay (see #28386 and #28870). BCG captures
-    # FULL for EAGLE target in PrefillCudaGraphRunner.__init__, so it does not
-    # need this skip.
+    # state and corrupt decode replay (see #28386 and #28870). BCG and FullCG
+    # capture FULL for EAGLE targets in PrefillCudaGraphRunner.__init__, so
+    # they do not need this skip.
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
         and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
-        and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
     ):
         logger.info(
             "Disable prefill CUDA graph for EAGLE target on tc_piecewise "
@@ -365,6 +368,17 @@ def capture_prefill_graph(
 
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
+    parallel = get_parallel()
+    if (
+        prefill_backend == Backend.BREAKABLE
+        and parallel.enable_prefill_cp
+        and parallel.pp_size > 1
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because pipeline parallelism combined "
+            "with prefill context parallelism is not validated."
+        )
+        return result(eager_runner)
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
         max_capture_requests = prefill_config.full_prefill_max_req
