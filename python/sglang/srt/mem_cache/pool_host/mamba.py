@@ -600,16 +600,23 @@ class MambaPoolHost(HostKVCache):
         if self.layout not in ["page_first", "page_first_direct"]:
             return False
         temporal_stride = (
-            self.num_mamba_layers
+            self.page_size
+            * self.num_mamba_layers
             * self.temporal_state_elem_size
             * self.temporal_dtype.itemsize
         )
-        if self.temporal_buffer.data_ptr() % page_size_bytes != 0:
-            return False
-        if temporal_stride % page_size_bytes != 0:
+        if self.temporal_state_elem_size > 0 and (
+            self.temporal_buffer.data_ptr() % page_size_bytes != 0
+            or temporal_stride % page_size_bytes != 0
+        ):
             return False
         for buf, elem_size in zip(self.conv_buffer, self.conv_state_elem_sizes):
-            conv_stride = self.num_mamba_layers * elem_size * self.conv_dtype.itemsize
+            conv_stride = (
+                self.page_size
+                * self.num_mamba_layers
+                * elem_size
+                * self.conv_dtype.itemsize
+            )
             if buf.data_ptr() % page_size_bytes != 0:
                 return False
             if conv_stride % page_size_bytes != 0:

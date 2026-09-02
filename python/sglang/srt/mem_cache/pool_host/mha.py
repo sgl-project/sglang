@@ -1017,6 +1017,21 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         element_size_list = [element_size] * len(ptr_list)
         return ptr_list, element_size_list
 
+    def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
+        if self.layout not in ("page_first", "page_first_direct"):
+            return False
+        page_stride_bytes = (
+            self.layer_num
+            * self.page_size
+            * self.head_num
+            * self.head_dim
+            * self.dtype.itemsize
+        )
+        return (
+            self.k_buffer.data_ptr() % page_size_bytes == 0
+            and page_stride_bytes % page_size_bytes == 0
+        )
+
 
 class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     """Host KV pool for MHA models whose K and V have different head dims
@@ -1138,6 +1153,9 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             registration_granularity_bytes=self.page_size * self._v_layout_dim(),
         )
         return (k_buffer, v_buffer)
+
+    def get_hybrid_pool_buffer(self):
+        return [self.k_buffer, self.v_buffer]
 
     def _k_token_stride_size(self) -> int:
         return self.head_num * self.head_dim * self.dtype.itemsize
