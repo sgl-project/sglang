@@ -82,13 +82,14 @@ if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
 
 fp8_macro = (
     "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+)  # gfx950 and gfx1250 use E4M3
 
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350) and gfx1250: LDS is larger -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
+#   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
+topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
 
 hipcc_flags = [
     "-DNDEBUG",
