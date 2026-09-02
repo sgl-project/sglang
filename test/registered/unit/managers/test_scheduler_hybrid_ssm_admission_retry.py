@@ -1,5 +1,7 @@
-"""A waiting request refused with NO_TOKEN is retried on the next round on a
-hybrid SSM radix cache, and stays latched out on a plain cache."""
+"""With a PrefillAdder stand-in that refuses every request with NO_TOKEN, a
+hybrid SSM model with a mamba-aware cache re-offers the waiting request each
+round; a model that is neither hybrid SSM nor hybrid SWA offers it once and
+keeps batch_is_full set."""
 
 import unittest
 from types import SimpleNamespace
@@ -116,7 +118,7 @@ class TestHybridSsmAdmissionRetry(CustomTestCase):
         calls, _ = self._rounds(_scheduler(is_hybrid_ssm=True), 3)
         self.assertEqual(calls, 3)
 
-    def test_plain_cache_latches_after_one_refusal(self):
+    def test_non_hybrid_model_latches_after_one_refusal(self):
         calls, latched = self._rounds(_scheduler(is_hybrid_ssm=False), 3)
         self.assertEqual(calls, 1)
         self.assertTrue(latched)

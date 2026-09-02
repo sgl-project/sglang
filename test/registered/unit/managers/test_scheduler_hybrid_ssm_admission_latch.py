@@ -1,6 +1,7 @@
 """Gating of the per-round batch_is_full reset in _get_new_batch_prefill_raw:
-cleared for hybrid SWA and for hybrid SSM with a mamba-aware radix cache,
-kept for hybrid SSM without mamba cache support and for a plain cache."""
+cleared for hybrid SWA and for a hybrid SSM model with a mamba-aware cache,
+kept for a hybrid SSM model whose cache lacks mamba support and for a model
+that is neither hybrid SSM nor hybrid SWA (no preemption in any case)."""
 
 import unittest
 from types import SimpleNamespace
@@ -61,7 +62,7 @@ class TestHybridSsmAdmissionLatch(CustomTestCase):
             self._latch_after_round(_scheduler(is_hybrid_ssm=False, is_hybrid_swa=True))
         )
 
-    def test_plain_cache_keeps_latch(self):
+    def test_non_hybrid_model_keeps_latch(self):
         self.assertTrue(self._latch_after_round(_scheduler(is_hybrid_ssm=False)))
 
 
