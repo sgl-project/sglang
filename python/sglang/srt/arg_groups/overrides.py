@@ -41,7 +41,12 @@ import math
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups import model_override_base
-from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
+from sglang.srt.arg_groups.arg_utils import (
+    REDACTED,
+    field_names,
+    resolvable_fields,
+    secret_fields,
+)
 
 # Re-exported for the callers that already import these names from here; the
 # declarations under ``model_overrides/`` import them from the base directly.
@@ -288,7 +293,8 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
 
 
 def resolution_projection(server_args: Any) -> Dict[str, Any]:
-    """Every field's resolved value, nested dataclasses expanded.
+    """Every field's resolved value, nested dataclasses expanded, credentials
+    replaced by ``REDACTED``.
 
     The whole-object shape of ``resolution_result``, for the exits that hand out
     the entire configuration (``/server_info``, the gRPC and engine readbacks).
@@ -296,11 +302,21 @@ def resolution_projection(server_args: Any) -> Dict[str, Any]:
     input, not what resolution decided. Field values only: the private resolution
     bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
     the readback are not configuration.
+
+    A field marked ``Arg(secret=True)`` projects as ``REDACTED``: these exits
+    are quotable, and ``/server_info`` answers a caller holding only
+    ``api_key``, which is how a published ``admin_api_key`` escalates. An unset
+    credential still projects as ``None`` -- whether a key is configured is
+    already visible from outside.
     """
-    return {
-        field.name: _plain(resolution_result(server_args, field.name))
-        for field in dataclasses.fields(server_args)
-    }
+    secrets = secret_fields(type(server_args))
+    projection: Dict[str, Any] = {}
+    for field in dataclasses.fields(server_args):
+        value = resolution_result(server_args, field.name)
+        projection[field.name] = (
+            REDACTED if field.name in secrets and value is not None else _plain(value)
+        )
+    return projection
 
 
 def _plain(value: Any) -> Any:

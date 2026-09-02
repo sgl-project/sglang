@@ -1117,9 +1117,16 @@ class RuntimeContext:
         The top-level ``/server_info`` fields are the startup record, not this
         dump.
         """
+        from sglang.srt.arg_groups.arg_utils import REDACTED, secret_fields
+
         d = self.server_args.resolved_dict() if base is None else dict(base)
         for _source, fields in self._overrides_log:
             d.update(fields)
+        # The overlay carries raw values, so a credential written through
+        # `override` would land in the readback the base just redacted.
+        for name in secret_fields(type(self.server_args)):
+            if d.get(name) is not None:
+                d[name] = REDACTED
         return d
 
     def override_server_args(self, **fields) -> _ServerArgsOverride:

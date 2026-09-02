@@ -57,6 +57,10 @@ from typing import (
 
 A = Annotated
 
+# What the diagnostic projection publishes in a credential's place. Stable and
+# deterministic: a reader diffing two dumps must not see it as a change.
+REDACTED = "<redacted>"
+
 
 @dataclasses.dataclass(frozen=True)
 class Arg:
@@ -80,6 +84,11 @@ class Arg:
     # `resolution_result` and the config bags answer with the decision. The
     # field keeps what the operator passed.
     resolvable: bool = False
+    # When True, this field holds a credential: the diagnostic projection
+    # (`/server_info`, the `server_args=` startup log line) reports a redacted
+    # marker in its place. The record keeps the real value, so the operational
+    # reads are unaffected.
+    secret: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,6 +150,25 @@ def resolvable_fields(cls) -> frozenset:
     for field in dataclasses.fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.resolvable:
+            names.add(field.name)
+    return frozenset(names)
+
+
+@functools.lru_cache(maxsize=None)
+def secret_fields(cls) -> frozenset:
+    """Names of ``cls`` dataclass fields whose ``Arg`` metadata declares
+    ``secret=True`` -- the credentials ``resolution_projection`` redacts.
+
+    Non-dataclass types (e.g. mock config objects in tests) have no Arg
+    metadata and yield an empty set; only a real ``ServerArgs`` carries
+    credentials, and only it reaches the projection."""
+    if not dataclasses.is_dataclass(cls):
+        return frozenset()
+    hints = get_type_hints(cls, include_extras=True)
+    names = set()
+    for field in dataclasses.fields(cls):
+        _, arg = _unwrap_annotated(hints.get(field.name, field.type))
+        if arg is not None and arg.secret:
             names.add(field.name)
     return frozenset(names)
 

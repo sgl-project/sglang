@@ -18,6 +18,11 @@ Current coverage:
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
   pre-existing flat `kv_events_config` string all remain visible.
+
+* `TestServerInfoRedactsCredentials` — the endpoint half of
+  `server_args/test_credential_redaction.py`: the response carries the
+  redaction marker, not the keys. `/server_info` is `AuthLevel.NORMAL`,
+  so a caller holding only `api_key` reads whatever it publishes.
 """
 
 import asyncio
@@ -26,6 +31,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.arg_groups.arg_utils import REDACTED
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
@@ -583,6 +589,31 @@ class TestLoadPublishEndpointValidation(CustomTestCase):
                     load_publish_endpoint=endpoint,
                 )
                 check_load_publish_args(args)  # must not raise
+
+
+class TestServerInfoRedactsCredentials(CustomTestCase):
+    """The endpoint publishes the redaction marker, not the credentials."""
+
+    def test_no_credential_reaches_the_response_body(self):
+        api_key = "sentinel-api-key-2b7f"
+        admin_api_key = "sentinel-admin-api-key-9c31"
+        ssl_keyfile_password = "sentinel-ssl-keyfile-password-4e08"
+        args = ServerArgs(
+            model_path="dummy",
+            api_key=api_key,
+            admin_api_key=admin_api_key,
+            ssl_keyfile_password=ssl_keyfile_password,
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(info["api_key"], REDACTED)
+        self.assertEqual(info["admin_api_key"], REDACTED)
+        self.assertEqual(info["ssl_keyfile_password"], REDACTED)
+        body = json.dumps(info, default=str)
+        for sentinel in (api_key, admin_api_key, ssl_keyfile_password):
+            with self.subTest(sentinel=sentinel):
+                self.assertNotIn(sentinel, body)
 
 
 if __name__ == "__main__":
