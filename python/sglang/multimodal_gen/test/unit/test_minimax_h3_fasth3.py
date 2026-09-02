@@ -55,6 +55,7 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     params = FastH3SamplingParams(prompt="p")
     assert params.num_inference_steps == 5
     assert params.guidance_scale == 1.0
+    assert params.quality == "extra-high"
 
     with pytest.raises(ValueError, match="exactly five sigma grid points"):
         FastH3SamplingParams(prompt="p", num_inference_steps=50)
