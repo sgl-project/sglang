@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    claim_deferred_component_attn_backend,
     get_attn_backend,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
@@ -71,6 +72,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -282,6 +284,30 @@ def _install_qkv_row_reorder(
     else:
         param.weight_loader = _weight_loader
     param.rank_local_weight_transform = _maybe_reorder
+
+
+def _qkv_scale_block_rows(qkv_proj: nn.Module, head_dim: int) -> int:
+    """Weight rows covered by one row of the qkv projection's scale.
+
+    Per-channel and NVFP4 scales hold one row per weight row and report 1. A
+    block-FP8 scale holds one row per weight_block_size[0] weight rows, so the
+    qkv row permutation has to count its rows in blocks instead. Only whole
+    scale rows can move, so a block spanning two heads' q/k/v rows cannot be
+    repaired by a permutation and is rejected rather than silently mis-scaled.
+    """
+    quant_config = getattr(
+        getattr(qkv_proj, "quant_method", None), "quant_config", None
+    )
+    block_size = getattr(quant_config, "weight_block_size", None)
+    if not block_size:
+        return 1
+    block_rows = block_size[0]
+    if head_dim % block_rows:
+        raise ValueError(
+            "block-quantized qkv needs a block size that divides the head dim: "
+            f"head_dim={head_dim}, weight_block_size={block_size}."
+        )
+    return block_rows
 
 
 def _copy_grouped_qkv_tp_shard(
@@ -614,17 +640,15 @@ def _minimax_h3_attention_core_impl(
             )[0]
 
     if attention._attention_impl is None:
-        # Token refiner is not packed DiT layout; keep FA.
-        selected = (
-            AttentionBackendEnum.FA
-            if attention.prefix.startswith("token_refiner")
-            else None
-        )
+        # Token-refiner FA routing lives in `_set_attention_backend`
+        # (cube) and `_resolve_attention_backend_once` (VSA-H3). Keep
+        # the transformer-scoped selection so a component override is
+        # not dropped on this lazy path.
         attention._set_attention_backend(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
-                selected_attention_backend=selected,
+                selected_attention_backend=attention._selected_attention_backend,
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
@@ -717,6 +741,7 @@ class MiniMaxH3Attention(nn.Module):
         *,
         prefix: str,
         bcg_breakpoint: bool = True,
+        cube_sparse_capable: bool = True,
     ) -> None:
         super().__init__()
         self.bcg_breakpoint = bcg_breakpoint
@@ -735,6 +760,13 @@ class MiniMaxH3Attention(nn.Module):
         self.prefix = prefix
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
+        # attention initializes on the first real QKV tensors, after the
+        # component-loading context has ended; retain the transformer-scoped
+        # selection so a component override is not silently lost at runtime
+        self._selected_attention_backend = get_component_forced_attn_backend()
+        # Cube metadata describes only the packed multimodal sequence. The
+        # text-only token refiner must preserve the exact dense FA baseline.
+        self._cube_sparse_capable = cube_sparse_capable
         # The checkpoint stores one fused qkv tensor. Each logical Q/K/V
         # matrix must be sharded independently; a plain ColumnParallelLinear
         # would instead slice across the concatenated tensor and is incorrect
@@ -799,6 +831,18 @@ class MiniMaxH3Attention(nn.Module):
             self.to_gate_compress.weight.missing_param_init = "zeros"
 
     def _set_attention_backend(self, backend) -> None:
+        if (
+            backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
+            and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.prefix.startswith("token_refiner")
+        ):
+            backend = get_attn_backend(
+                self.head_dim,
+                _BF16_DTYPE,
+                selected_attention_backend=AttentionBackendEnum.FA,
+            )
         impl_cls = backend.get_impl_cls()
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
@@ -828,13 +872,20 @@ class MiniMaxH3Attention(nn.Module):
         weight.checkpoint_mapping_unsafe = True
         base_loader = weight.weight_loader
 
-        def _reorder_checkpoint_weight(loaded_weight: torch.Tensor) -> torch.Tensor:
-            return _reorder_grouped_qkv_to_qkv(
-                loaded_weight,
-                num_query_groups=arch.num_attention_heads,
-                heads_per_group=1,
-                head_dim=arch.attention_head_dim,
-            )
+        def _make_row_reorder(
+            head_dim: int,
+        ) -> Callable[[torch.Tensor], torch.Tensor]:
+            def _reorder(loaded_weight: torch.Tensor) -> torch.Tensor:
+                return _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=head_dim,
+                )
+
+            return _reorder
+
+        _reorder_checkpoint_weight = _make_row_reorder(arch.attention_head_dim)
 
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # The grouped checkpoint layout is
@@ -864,11 +915,22 @@ class MiniMaxH3Attention(nn.Module):
         # are permuted above, so the per-row metadata has to be permuted the same
         # way. Row count is the gate: a swizzled scale layout is not row-indexed,
         # and per-tensor scales are scalars, so both are passed through untouched.
+        # A block-FP8 scale is row-indexed too, but in blocks rather than rows:
+        # it carries one row per block of weight rows, so both its permutation
+        # and the row count gating it are scaled down by the block height.
         qkv_rows = 3 * arch.num_attention_heads * arch.attention_head_dim
+        block_rows = _qkv_scale_block_rows(self.qkv_proj, arch.attention_head_dim)
         for name, param in self.qkv_proj.named_parameters(recurse=False):
             if name == "weight":
                 continue
-            _install_qkv_row_reorder(param, _reorder_checkpoint_weight, qkv_rows)
+            rows_per_scale_row = (
+                block_rows if isinstance(param, BlockQuantScaleParameter) else 1
+            )
+            _install_qkv_row_reorder(
+                param,
+                _make_row_reorder(arch.attention_head_dim // rows_per_scale_row),
+                qkv_rows // rows_per_scale_row,
+            )
 
     def _forward_mps_streamed_attention(
         self,
@@ -1502,6 +1564,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             quant_config,
             prefix=f"{prefix}.attn",
             bcg_breakpoint=False,
+            cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
 
@@ -2089,7 +2152,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         # Component overrides disappear when the loader context exits. Preserve
         # only that selection; process-wide overrides are resolved at first use.
-        self._component_attention_backend_override = get_component_forced_attn_backend()
+        self._component_attention_backend_override = (
+            claim_deferred_component_attn_backend()
+        )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
 
@@ -2749,5 +2814,6 @@ __all__ = [
     "MINIMAX_H3_FP32_BUFFER_NAMES",
     "MINIMAX_H3_FP32_PARAM_NAMES",
     "MiniMaxH3DiTModel",
+    "_qkv_scale_block_rows",
     "_reorder_grouped_qkv_to_qkv",
 ]

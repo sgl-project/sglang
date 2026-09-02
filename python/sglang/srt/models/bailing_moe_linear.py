@@ -58,7 +58,13 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP, _is_hip
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_device, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_device,
+    get_forward,
+    get_parallel,
+    get_platform,
+    get_stream,
+)
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -72,7 +78,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_sm100_supported,
     make_layers,
 )
 from sglang.srt.utils.common import rank0_log
@@ -107,7 +112,7 @@ if _is_hip:
     pass
 
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):

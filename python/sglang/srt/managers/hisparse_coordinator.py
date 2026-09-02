@@ -349,7 +349,7 @@ class HiSparseCoordinator:
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.extend_range.end
+            req.kv.req_pool_idx, : req.extend_range.end
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -361,7 +361,7 @@ class HiSparseCoordinator:
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             prefill_len,
         )
@@ -411,11 +411,11 @@ class HiSparseCoordinator:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
             # sees all slots as empty -> every top-k lookup is a miss -> host load.
             self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
+                :, req.kv.req_pool_idx, : self.device_buffer_size
             ] = -1
 
         req.hisparse_staging = False
-        self._skip_first_backup[req.req_pool_idx] = True
+        self._skip_first_backup[req.kv.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def host_token_len(self, kv_allocated_len: int) -> int:
@@ -426,8 +426,8 @@ class HiSparseCoordinator:
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
         n = self.host_token_len(req.kv.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        host_indices = self.req_to_host_pool[req.kv.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.kv.req_pool_idx, :n]
 
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
@@ -456,7 +456,7 @@ class HiSparseCoordinator:
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
+                self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :allocated_len]
             )
         )
         compressed_len = len(compressed_logical_indices)
@@ -475,13 +475,13 @@ class HiSparseCoordinator:
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
 
         buffer_indices = buffer_indices.to(torch.int32)
-        self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
-        self.req_device_buffer_size[req.req_pool_idx] = alloc_size
+        self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
+        self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
         self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
+            :, req.kv.req_pool_idx, : self.device_buffer_size
         ] = self._device_buffer_arange_i32
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
+        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
 
@@ -584,7 +584,7 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
-            self._skip_first_backup[req.req_pool_idx] = True
+            self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
             ready_reqs.append(req)
@@ -863,21 +863,21 @@ class HiSparseCoordinator:
 
         prefill_len = req.extend_range.end
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.kv.req_pool_idx, :prefill_len
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self._skip_first_backup[req.req_pool_idx] = False
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        self._skip_first_backup[req.kv.req_pool_idx] = False
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -901,15 +901,15 @@ class HiSparseCoordinator:
         allocated_len = req.kv.kv_allocated_len
 
         # release memory -- only free actually-allocated buffer indices
-        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
         if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+            side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
+            req.kv.req_pool_idx, :allocated_len
         ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
@@ -918,21 +918,21 @@ class HiSparseCoordinator:
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
-        self._skip_first_backup[req.req_pool_idx] = False
+        self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :] = -1
+        self.req_to_device_buffer[req.kv.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.kv.req_pool_idx] = 0
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req.kv.req_pool_idx] = False
 
     def _run_swap_in_kernel(
         self,

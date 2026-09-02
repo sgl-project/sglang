@@ -200,6 +200,40 @@ class _SageAttention3BackendResolver(_CudaAttentionBackendResolver):
             return AttentionBackendEnum.TORCH_SDPA
 
 
+class _SpargeAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.SPARGE_ATTN
+    supported_capabilities = {(8, 0), (8, 6), (8, 7), (8, 9), (9, 0)}
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
+            found = capability.as_version_str() if capability else "unknown"
+            raise ValueError(
+                "SpargeAttention supports CUDA compute capabilities "
+                f"8.0, 8.6, 8.7, 8.9, and 9.0; found {found}."
+            )
+        try:
+            from spas_sage_attn import (  # noqa: F401
+                spas_sage2_attn_meansim_topk_cuda,
+            )
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn import (  # noqa: F401
+                SpargeAttentionBackend,
+            )
+
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn.SpargeAttentionBackend"
+        except ImportError as e:
+            raise ImportError(
+                "SpargeAttention is not installed. Install it with "
+                "`pip install git+https://github.com/thu-ml/SpargeAttn.git "
+                "--no-build-isolation`."
+            ) from e
+
+
 class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN
 
@@ -243,6 +277,22 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
                 "Install fastvideo-kernel (Triton 64-token path; sm100a is "
                 "not used on H200)."
             ) from e
+
+
+class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        # MiniMax H3's text-only token refiner deliberately stays on the exact
+        # FA baseline when the packed multimodal blocks use cube attention.
+        # Initialize the Blackwell FA generation on the cube selection path as
+        # well, otherwise the refiner can fall into an unavailable FA2 package.
+        if not platform._prepare_flash_attention_for_blackwell():
+            raise RuntimeError(
+                "cube sparse attention requires FlashAttention for H3's dense paths"
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn.CubeSparseAttentionBackend"
 
 
 class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -410,8 +460,10 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SlidingTileAttentionBackendResolver,
         _SageAttentionBackendResolver,
         _SageAttention3BackendResolver,
+        _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
         _VideoSparseAttentionH3BackendResolver,
+        _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
@@ -471,7 +523,10 @@ class CudaPlatformBase(Platform):
     @lru_cache(maxsize=1)
     def get_modelopt_flashinfer_fp4_backend(cls) -> str:
         backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
-        default_backend = "trtllm"
+        # flashinfer.mm_fp4 rejects backend="trtllm" on sm_120 ("does not support
+        # backend 'trtllm' with capability 120"); "auto" resolves to its sm_12x
+        # NVFP4 kernel there.
+        default_backend = "auto" if cls.is_sm120() else "trtllm"
         if backend is None:
             return default_backend
 
@@ -675,8 +730,8 @@ class CudaPlatformBase(Platform):
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
         fast paths.
 
-        Requests with quality == "high" run the fast paths; the "lossless"
-        default runs the original module path bit-for-bit. See
+        Requests with quality="extra-high" or "high" run the fast paths; the
+        "lossless" default runs the original module path bit-for-bit. See
         flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:
