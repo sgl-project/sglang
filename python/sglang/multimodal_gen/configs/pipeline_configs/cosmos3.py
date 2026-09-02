@@ -24,6 +24,20 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
+COSMOS3_NANO_ARCH_SIGNATURE = (4096, 36, 32)
+COSMOS3_NANO_KEEP_RESIDENT_MIN_AVAILABLE_GB = 90
+COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120
+
+
+@functools.lru_cache(maxsize=None)
+def _transformer_config(model_path: str) -> dict:
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        get_diffusers_component_config,
+    )
+
+    return get_diffusers_component_config(
+        component_path=os.path.join(model_path, "transformer")
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -34,17 +48,23 @@ def is_edge_checkpoint(model_path: str) -> bool:
     is available before the weights are on device (e.g. when resolving sampling
     defaults in the client process).
     """
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        get_diffusers_component_config,
-    )
-
-    config = get_diffusers_component_config(
-        component_path=os.path.join(model_path, "transformer")
-    )
+    config = _transformer_config(model_path)
     return (
         config.get("backbone_type") == COSMOS3_EDGE_BACKBONE_TYPE
         or config.get("hidden_act") == "relu2"
     )
+
+
+@functools.lru_cache(maxsize=None)
+def is_nano_checkpoint(model_path: str) -> bool:
+    """Whether the checkpoint uses the Nano transformer architecture."""
+    config = _transformer_config(model_path)
+    signature = (
+        config.get("hidden_size"),
+        config.get("num_hidden_layers"),
+        config.get("num_attention_heads"),
+    )
+    return signature == COSMOS3_NANO_ARCH_SIGNATURE
 
 
 @functools.lru_cache(maxsize=None)
@@ -125,6 +145,7 @@ class Cosmos3Config(PipelineConfig):
     # Pre-computed once in update_config_from_dict from the resolved model_path.
     # None until that point (e.g. in unit-test mocks that never call update_config_from_dict).
     is_edge: bool | None = None
+    is_nano: bool | None = None
     distilled_sigmas: list[float] | None = None
 
     def __post_init__(self):
@@ -145,6 +166,7 @@ class Cosmos3Config(PipelineConfig):
         if self.model_path:
             self.distilled_sigmas = get_distilled_sigmas(self.model_path)
             self.is_edge = is_edge_checkpoint(self.model_path)
+            self.is_nano = is_nano_checkpoint(self.model_path)
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 
@@ -171,7 +193,17 @@ class Cosmos3Config(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         # Keep the DiT and VAE resident when the GPUs have the headroom.
+        is_nano = self.is_nano
+        if is_nano is None:
+            # Directly constructed configs in callers/tests have not resolved
+            # checkpoint metadata yet; registered model IDs remain unambiguous.
+            is_nano = "cosmos3-nano" in (self.model_path or "").lower()
+        threshold_gb = (
+            COSMOS3_NANO_KEEP_RESIDENT_MIN_AVAILABLE_GB
+            if is_nano
+            else COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
+        )
         return ModelDeploymentConfig(
-            keep_resident_min_available_gb=120,
+            keep_resident_min_available_gb=threshold_gb,
             keep_resident_components=("dit", "vae"),
         )

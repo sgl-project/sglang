@@ -38,7 +38,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.rust_server import RustServer
+    from sglang.srt.rust_server.server import RustServer
 
 
 logger = logging.getLogger(__name__)

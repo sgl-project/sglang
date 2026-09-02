@@ -134,7 +134,7 @@ def _allocate_decode_buffers(
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None
-                    else (max_bs, hidden_size)
+                    else (max_num_token, hidden_size)
                 )
                 pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
             if pp_proxy_topk_size is not None:
@@ -243,6 +243,14 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+
+        # Model-owned communication resources may depend on the resolved
+        # request pool and must be compiled/allocated before graph capture.
+        prepare_model_resources = getattr(
+            mr.model, "prepare_before_cuda_graph_capture", None
+        )
+        if prepare_model_resources is not None:
+            prepare_model_resources(mr)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()

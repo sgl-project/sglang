@@ -346,9 +346,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:
             return
-        # index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0 copies a
-        # host-resident scalar and blocks until the stream drains.
-        self.full_to_swa_index_mapping.index_fill_(0, full_indices.to(torch.int64), 0)
+        full_indices = full_indices.to(torch.int64)
+        if _is_npu:
+            # NPU: aclnnIndexFill is unoptimized; direct assignment avoids the overhead.
+            self.full_to_swa_index_mapping[full_indices] = 0
+        else:
+            # CUDA: index_fill_ passes the 0 as a kernel argument; mapping[idx] = 0
+            # copies a host-resident scalar and blocks until the stream drains.
+            self.full_to_swa_index_mapping.index_fill_(0, full_indices, 0)
 
     def free_swa(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -402,11 +407,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_full(torch.cat(full_free_group))
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
-        pages = torch.unique(indices // self.page_size)
+        # Duplicates are kept: deduplicating would be a torch.unique whose
+        # data-dependent output shape synchronizes the scheduler stream, and
+        # every consumer ends in the paged free's own page dedup anyway.
+        base = (indices // self.page_size) * self.page_size
         page_offsets = torch.arange(
             self.page_size, dtype=indices.dtype, device=indices.device
         )
-        return (pages[:, None] * self.page_size + page_offsets[None, :]).reshape(-1)
+        expanded = (base[:, None] + page_offsets[None, :]).reshape(-1)
+        if self.swa_attn_allocator.debug_mode:
+            # Reference unique on CPU: the expansion must cover exactly the
+            # touched pages, on every caller's real input.
+            got = torch.unique(expanded.cpu() // self.page_size)
+            ref = torch.unique(indices.cpu() // self.page_size)
+            assert torch.equal(got, ref), "expansion page set mismatch"
+        return expanded
 
     def resize(self, config) -> None:
         size_full = int(config.full_max_total_num_tokens)
