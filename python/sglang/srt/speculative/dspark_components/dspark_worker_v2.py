@@ -62,6 +62,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
+    ragged_capture_num_tokens,
 )
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
@@ -271,7 +272,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and is_cuda()
+            and (is_cuda() or _is_npu)
         ):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -553,7 +554,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        # An idle rank only needs fabricated compact rows to replay the same
+        # token-keyed graph as busy ranks.  In eager mode it must keep zero
+        # local tokens and merely participate in the DP/EP collectives.  If we
+        # build a uniform layout without a ragged graph runner, the verify path
+        # creates ``verify_num_draft_tokens`` dummy inputs while DP padding
+        # still assigns this rank zero tokens, which results in negative
+        # padding (for example, ``0 - 6``).
+        if (
+            batch.global_num_tokens is None
+            or not self._verify_planner.is_compact_mode
+            or ragged_capture_num_tokens(model_runner=self.model_runner) is None
+        ):
             return None
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:

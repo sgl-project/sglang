@@ -223,7 +223,18 @@ def maybe_build_dsv4_verify_bundle(
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
-    verify_lens = [int(draft_token_num)] * len(req_indices)
+    ragged_layout = getattr(
+        getattr(batch, "spec_info", None), "ragged_verify_layout", None
+    )
+    if ragged_layout is None:
+        verify_lens = [int(draft_token_num)] * len(req_indices)
+    elif ragged_layout.verify_lens_cpu is not None:
+        verify_lens = [int(v) for v in ragged_layout.verify_lens_cpu]
+    else:
+        # This helper only runs while preparing eager NPU verify metadata. A
+        # device layout is allowed here; compact graph replay has its own
+        # static metadata buffers and must not take this host path.
+        verify_lens = [int(v) for v in ragged_layout.verify_lens.cpu().tolist()]
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         page_size = pool.c128_page_size
