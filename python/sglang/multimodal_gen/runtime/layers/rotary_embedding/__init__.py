@@ -37,6 +37,7 @@ from .utils import (
     _apply_rotary_emb,
     _apply_rotary_emb_complex,
     apply_flashinfer_rope_qk_inplace,
+    apply_sglang_jit_rope_qk_inplace,
 )
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "_apply_rotary_emb",
     "_apply_rotary_emb_complex",
     "apply_flashinfer_rope_qk_inplace",
+    "apply_sglang_jit_rope_qk_inplace",
     # _base
     "RotaryEmbedding",
     # _mrope

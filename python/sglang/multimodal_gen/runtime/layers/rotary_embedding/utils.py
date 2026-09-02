@@ -212,6 +212,105 @@ def apply_flashinfer_rope_qk_inplace(
     return q_flat.view(bsz, seqlen, q_heads, d), k_flat.view(bsz, seqlen, k_heads, d)
 
 
+def _split_cos_sin_from_cache(
+    cache: torch.Tensor, *, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert a 2D RoPE cache into (cos, sin) tensors."""
+    if cache.is_complex():
+        cos = cache.real
+        sin = cache.imag
+        if cos.dtype != dtype:
+            cos = cos.to(dtype)
+        if sin.dtype != dtype:
+            sin = sin.to(dtype)
+        return cos, sin
+    if cache.shape[1] % 2 != 0:
+        raise ValueError(
+            "Expected complex freqs_cis or cat([cos,sin]) cache; "
+            f"got real cache with odd last dim={cache.shape[1]}"
+        )
+    half = cache.shape[1] // 2
+    cos = cache[:, :half]
+    sin = cache[:, half:]
+    if cos.dtype != dtype:
+        cos = cos.to(dtype)
+    if sin.dtype != dtype:
+        sin = sin.to(dtype)
+    return cos, sin
+
+
+def apply_sglang_jit_rope_qk_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    head_size: Optional[int] = None,
+    is_neox: bool = False,
+    positions: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply SGLang JIT RoPE on GPU using the fused cos/sin kernel."""
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError(
+            f"Expected q/k to be 4D [bsz, seqlen, nheads, head_size], "
+            f"got q:{tuple(q.shape)} k:{tuple(k.shape)}"
+        )
+    if q.shape != k.shape:
+        raise ValueError(
+            f"q and k must have the same shape, got {q.shape} vs {k.shape}"
+        )
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+
+    bsz, seqlen, nheads, d = q.shape
+    if head_size is None:
+        head_size = d
+    if head_size != d:
+        raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
+
+    from sglang.kernels.jit.rotary_embedding import (
+        rotary_embedding_cos_sin as sglang_jit_rotary_embedding_cos_sin,
+    )
+
+    num_tokens = bsz * seqlen
+    if positions is None:
+        if bsz > 1:
+            pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
+            positions = pos_1d.repeat(bsz)
+    else:
+        if not (
+            isinstance(positions, torch.Tensor)
+            and positions.dtype == torch.long
+            and positions.dim() == 1
+        ):
+            raise ValueError("positions must be a 1D torch.long Tensor")
+        if positions.numel() != num_tokens:
+            raise ValueError(
+                f"positions length must be bsz*seqlen={num_tokens}, "
+                f"got {positions.numel()}"
+            )
+        positions = positions.to(q.device, non_blocking=True)
+
+    q3 = q.view(num_tokens, nheads, d)
+    k3 = k.view(num_tokens, nheads, d)
+    interleaved = not is_neox
+    cos_full, sin_full = _split_cos_sin_from_cache(cos_sin_cache, dtype=q.dtype)
+
+    if interleaved:
+        cos = cos_full.contiguous()
+        sin = sin_full.contiguous()
+    elif cos_full.shape[1] * 2 == head_size:
+        cos = torch.cat([cos_full, cos_full], dim=-1).contiguous()
+        sin = torch.cat([sin_full, sin_full], dim=-1).contiguous()
+    else:
+        cos = cos_full.contiguous()
+        sin = sin_full.contiguous()
+
+    sglang_jit_rotary_embedding_cos_sin(
+        cos, sin, q3, k3, head_size, interleaved, positions=positions
+    )
+    return q3.view(bsz, seqlen, nheads, d), k3.view(bsz, seqlen, nheads, d)
+
+
 @torch.compiler.assume_constant_result
 def _warn_about_missing_flashinfer():
     """
