@@ -228,6 +228,7 @@ class Learnable2DInterpPosEmbDividedFixed(nn.Module):
             .unsqueeze(1),
             persistent=False,
         )
+        self.time_weight._skip_weight_check = True
 
     def position_embeddings(
         self,
