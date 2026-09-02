@@ -24,6 +24,22 @@ from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
+_DFLASH_UNBOUNDED_ATTENTION_FIELDS = (
+    "attention_sink_size",
+    "attention_sinks",
+    "dilated_attention",
+    "dilated_window",
+    "dilation",
+    "global_attention",
+    "global_attention_every_n_layers",
+    "global_attn_every_n_layers",
+    "global_block_size",
+    "global_tokens",
+    "num_global_tokens",
+    "num_sink_tokens",
+    "sink_size",
+)
+
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
@@ -424,6 +440,155 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 
     # HF sliding windows include the current token; SGLang stores window_left.
     return int(sliding_window) - 1
+
+
+@dataclass(frozen=True)
+class DFlashCompactCapability:
+    """Checkpoint-derived bounded-request KV capability for DFLASH."""
+
+    eligible: bool
+    architecture: str
+    num_layers: int
+    layer_types: tuple[str, ...]
+    checkpoint_window_tokens: Optional[int]
+    attention_window_left: Optional[int]
+    block_size: int
+    rejection_reasons: tuple[str, ...]
+
+    def identity(self) -> tuple[Any, ...]:
+        return (
+            self.architecture,
+            self.num_layers,
+            self.layer_types,
+            self.checkpoint_window_tokens,
+            self.attention_window_left,
+            self.block_size,
+        )
+
+
+def _compact_capability_architecture(config: Any) -> str:
+    architectures = _cfg_get(config, "architectures", None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if not isinstance(architectures, Sequence):
+        return "<invalid>"
+    names = [str(value) for value in architectures]
+    return names[0] if len(names) == 1 else ",".join(names) or "<missing>"
+
+
+def _positive_config_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+def resolve_uniform_swa_dflash_compact_capability(
+    draft_hf_config: Any,
+    runtime_window_tokens: Any,
+    resolved_block_size: Any,
+) -> DFlashCompactCapability:
+    """Resolve compact eligibility only from explicit checkpoint semantics.
+
+    Public capacity units include the current token (``W``); attention metadata
+    uses ``window_left=W-1``.  The architecture tag is diagnostic and is never
+    an allowlist condition.
+    """
+
+    architecture = _compact_capability_architecture(draft_hf_config)
+    text_config = _get_text_config(draft_hf_config)
+    reasons: list[str] = []
+
+    raw_num_layers = _cfg_get(text_config, "num_hidden_layers", None)
+    num_layers = _positive_config_int(raw_num_layers)
+    if num_layers is None:
+        reasons.append(
+            "num_hidden_layers must be an explicit positive integer "
+            f"(got {raw_num_layers!r})"
+        )
+
+    try:
+        raw_layer_types = get_dflash_layer_types(draft_hf_config)
+    except ValueError as exc:
+        raw_layer_types = None
+        reasons.append(str(exc))
+    layer_types = tuple(raw_layer_types or ())
+    if raw_layer_types is None:
+        reasons.append("layer_types must be explicitly present")
+    elif num_layers is not None and len(layer_types) != num_layers:
+        reasons.append(
+            "layer_types length must match num_hidden_layers "
+            f"(layers={num_layers}, entries={len(layer_types)})"
+        )
+    for index, layer_type in enumerate(layer_types):
+        if layer_type != "sliding_attention":
+            reasons.append(
+                "all KV-bearing draft layers must be sliding_attention "
+                f"(layer_types[{index}]={layer_type!r})"
+            )
+
+    raw_checkpoint_window = _cfg_get(
+        text_config,
+        "sliding_window",
+        _cfg_get(draft_hf_config, "sliding_window", None),
+    )
+    if raw_checkpoint_window is None and is_nemotron_35_draft_config(draft_hf_config):
+        raw_checkpoint_window = _get_dflash_config(draft_hf_config).get(
+            "swa_window_size"
+        )
+    checkpoint_window = _positive_config_int(raw_checkpoint_window)
+    if checkpoint_window is None:
+        reasons.append(
+            "sliding_window must be an explicit positive integer "
+            f"(got {raw_checkpoint_window!r})"
+        )
+
+    runtime_window = _positive_config_int(runtime_window_tokens)
+    if runtime_window is None:
+        reasons.append(
+            "runtime draft window must be an explicit positive integer "
+            f"(checkpoint={checkpoint_window!r}, runtime={runtime_window_tokens!r})"
+        )
+    elif checkpoint_window is not None and runtime_window != checkpoint_window:
+        reasons.append(
+            "runtime draft window must equal checkpoint sliding_window "
+            f"(checkpoint={checkpoint_window}, runtime={runtime_window})"
+        )
+
+    block_size = _positive_config_int(resolved_block_size)
+    if block_size is None:
+        reasons.append(
+            "resolved DFLASH block size must be a positive integer "
+            f"(got {resolved_block_size!r})"
+        )
+        block_size = 0
+    elif checkpoint_window is not None and block_size > checkpoint_window:
+        reasons.append(
+            "resolved DFLASH block size exceeds checkpoint window "
+            f"(block={block_size}, checkpoint={checkpoint_window})"
+        )
+
+    for field in _DFLASH_UNBOUNDED_ATTENTION_FIELDS:
+        value = _cfg_get(text_config, field, _cfg_get(draft_hf_config, field, None))
+        if value not in (None, False, 0, "", (), [], {}):
+            reasons.append(
+                "unsupported non-trailing-window attention dependency "
+                f"({field}={value!r})"
+            )
+
+    attention_window_left = (
+        checkpoint_window - 1 if checkpoint_window is not None else None
+    )
+    return DFlashCompactCapability(
+        eligible=not reasons,
+        architecture=architecture,
+        num_layers=num_layers or 0,
+        layer_types=layer_types,
+        checkpoint_window_tokens=checkpoint_window,
+        attention_window_left=attention_window_left,
+        block_size=block_size,
+        rejection_reasons=tuple(reasons),
+    )
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:

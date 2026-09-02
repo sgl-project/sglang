@@ -172,6 +172,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_fixed_bytes=0,
     )
 
     return mr
@@ -976,6 +977,43 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     target_kv_per_token + draft_kv_per_token * dcp_size,
                 )
 
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = 0
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            compact_cfg = create_memory_pool_configurator(mr)
+        self.assertEqual(compact_cfg._cell_size, target_kv_per_token)
+
+    def test_compact_fixed_pool_is_subtracted_before_target_solver(self):
+        fixed_draft_bytes = 42_608_640
+        target_tokens = 10_000
+        mr = _make_model_runner(self)
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+            dflash_draft_cell_size_per_token=0,
+            dflash_draft_fixed_bytes=fixed_draft_bytes,
+        )
+        target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
+        available = fixed_draft_bytes + target_tokens * target_kv_per_token
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        self.assertEqual(cfg._cell_size, target_kv_per_token)
+        self.assertEqual(cfg._fixed_bytes, fixed_draft_bytes)
+        self.assertEqual(config.max_total_num_tokens, target_tokens)
+        with self.assertRaisesRegex(RuntimeError, "leaves no memory"):
+            cfg.calculate_pool_sizes(fixed_draft_bytes, page_size=1)
+
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """HybridSWA carried no draft term, so the draft pool fell outside the budget."""
         available = 10_000_000
@@ -1004,6 +1042,64 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+    def test_swa_chunk_cap_budget_shrinks_by_dflash_draft_pool(self):
+        """A capped target SWA pool must still price full-capacity DFlash KV."""
+        available = 1_000_000_000
+
+        def _solve(draft_kv_per_token):
+            mr = _make_model_runner(
+                self,
+                num_layers=52,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(13)),
+                swa_attention_layer_ids=list(range(13, 52)),
+                swa_num_kv_heads=2,
+                disable_radix_cache=True,
+                chunked_prefill_size=8192,
+                sliding_window_size=2048,
+                max_running_requests=2,
+                speculative_num_draft_tokens=16,
+                disable_overlap_schedule=True,
+            )
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                dflash_draft_cell_size_per_token=draft_kv_per_token,
+                dflash_draft_fixed_bytes=0,
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    SWAChunkCapPoolConfigurator,
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+                config = cfg.calculate_pool_sizes(available, page_size=1)
+            return cfg, config
+
+        legacy_cfg, legacy = _solve(20_480)
+        compact_cfg, compact = _solve(0)
+        self.assertLess(
+            legacy.full_max_total_num_tokens, compact.full_max_total_num_tokens
+        )
+        fixed_swa_bytes = (
+            legacy.swa_max_total_num_tokens
+            * legacy_cfg._swa_per_token
+            * legacy_cfg._swa_layers_num
+        )
+        legacy_used = fixed_swa_bytes + legacy.full_max_total_num_tokens * (
+            legacy_cfg._full_per_token * legacy_cfg._full_layers_num
+            + legacy_cfg._draft_cell_size
+        )
+        self.assertLessEqual(legacy_used, available)
+        self.assertLess(
+            available - legacy_used,
+            legacy_cfg._full_per_token * legacy_cfg._full_layers_num
+            + legacy_cfg._draft_cell_size,
+        )
 
 
 if __name__ == "__main__":

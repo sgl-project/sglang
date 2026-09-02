@@ -148,6 +148,38 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 cfg.speculative_algorithm,
             )
 
+    if getattr(cfg, "speculative_dflash_compact_cache", False):
+        if cfg.speculative_algorithm != "DFLASH":
+            raise ValueError(
+                "--speculative-dflash-compact-cache requires "
+                "--speculative-algorithm DFLASH"
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-dflash-compact-cache requires "
+                "--speculative-draft-window-size"
+            )
+        if not cfg.disable_radix_cache:
+            raise ValueError(
+                "--speculative-dflash-compact-cache requires --disable-radix-cache"
+            )
+        if cfg.enable_hierarchical_cache or cfg.hicache_storage_backend is not None:
+            raise ValueError(
+                "--speculative-dflash-compact-cache does not support HiCache"
+            )
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--speculative-dflash-compact-cache does not support unified memory"
+            )
+        if cfg.disaggregation_decode_enable_radix_cache:
+            raise ValueError(
+                "--speculative-dflash-compact-cache does not support Decode radix"
+            )
+        if cfg.page_size is not None and int(cfg.page_size) != 1:
+            raise ValueError(
+                "--speculative-dflash-compact-cache requires --page-size 1"
+            )
+
     algo = None
     if cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

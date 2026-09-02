@@ -9,6 +9,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NamedTuple,
     Optional,
     Tuple,
     Type,
@@ -24,6 +25,9 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
 )
 from sglang.srt.utils import is_hip, is_npu
 
@@ -581,6 +585,162 @@ class TransferBackend(Enum):
     FAKE = "fake"
 
 
+class DraftKVTransferSpec(NamedTuple):
+    window_size: int
+    layer_ids: Tuple[int, ...]
+    suffix_enabled: bool
+    compact_physical: bool = True
+
+
+def draft_swa_suffix_start(seq_len: int, window_size: int, page_size: int) -> int:
+    """First page-aligned absolute position in the visible draft suffix."""
+    if seq_len < 0 or window_size <= 0 or page_size <= 0:
+        raise ValueError(
+            f"Invalid draft SWA geometry: seq_len={seq_len}, "
+            f"window_size={window_size}, page_size={page_size}"
+        )
+    visible = min(seq_len, window_size)
+    return ((seq_len - visible) // page_size) * page_size
+
+
+def get_dflash_draft_kv_transfer_locs(
+    draft_worker,
+    req_pool_idx: int,
+    seq_len: int,
+    transfer_spec: DraftKVTransferSpec,
+    page_size: int,
+):
+    """Resolve the exact visible suffix in this role's draft physical pool."""
+    window_start = draft_swa_suffix_start(seq_len, transfer_spec.window_size, page_size)
+    if transfer_spec.compact_physical:
+        return draft_worker.compact_physical_transfer_locs(
+            int(req_pool_idx), window_start, seq_len
+        )
+    return draft_worker.legacy_physical_transfer_locs(
+        int(req_pool_idx), window_start, seq_len
+    )
+
+
+def get_legacy_draft_kv_buf_infos(
+    draft_token_to_kv_pool,
+    draft_kv_transfer_spec: Optional[DraftKVTransferSpec],
+):
+    """Return full-draft buffers only for the legacy shared-index route."""
+    if draft_token_to_kv_pool is None or draft_kv_transfer_spec is not None:
+        return None
+    return draft_token_to_kv_pool.get_contiguous_buf_infos()
+
+
+def get_dflash_draft_kv_transfer_spec(
+    scheduler, draft_token_to_kv_pool, transfer_backend
+) -> Optional[DraftKVTransferSpec]:
+    """Resolve the fail-closed DFlash PD suffix capability.
+
+    Compact mode maps absolute positions into owner-local rings.  The legacy
+    physical pool uses the role-local target ``req_to_token`` row as its draft
+    index space.  Both modes register draft K/V as an independent DRAFT_SWA
+    state component so target KV pointers never share draft index semantics.
+    """
+    draft_worker = getattr(scheduler, "draft_worker", None)
+    compact_requested = bool(
+        draft_worker is not None
+        and getattr(draft_worker, "use_compact_draft_cache", False)
+    )
+    suffix_requested = bool(
+        scheduler.spec_algorithm.is_dflash()
+        and envs.SGLANG_DFLASH_PD_DRAFT_SWA_SUFFIX.get()
+    )
+    if not compact_requested and not suffix_requested:
+        return None
+
+    def reject(reason: str):
+        physical_mode = "compact" if compact_requested else "legacy-physical"
+        raise RuntimeError(
+            f"{physical_mode} DFlash PD cannot use the legacy full-pool route: "
+            + reason
+        )
+
+    if not envs.SGLANG_DFLASH_PD_DRAFT_SWA_SUFFIX.get():
+        return reject("draft suffix protocol is disabled")
+    if not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get():
+        return reject("deferred decode KV release must be enabled")
+    if transfer_backend != TransferBackend.MOONCAKE:
+        return reject("transfer backend is not Mooncake")
+    if not scheduler.spec_algorithm.is_dflash():
+        return reject("speculative algorithm is not DFlash")
+    if draft_token_to_kv_pool is None or draft_worker is None:
+        return reject("draft pool or worker is missing")
+
+    parallel = get_parallel()
+    memory = get_memory()
+    disagg = get_disagg()
+    if parallel.pp_size != 1:
+        return reject("pipeline parallelism must be 1")
+    if parallel.dp_size != 1:
+        return reject("data parallelism must be 1")
+    if parallel.attn_dcp_size != 1:
+        return reject("DCP must be 1")
+    if parallel.attn_cp_size != 1:
+        return reject("context parallelism must be 1")
+    if int(disagg.disaggregation_decode_extra_slots or 0) != 0:
+        return reject("decode extra slots must be 0")
+    if not memory.disable_radix_cache:
+        return reject("radix cache must be disabled")
+    if disagg.disaggregation_decode_enable_radix_cache:
+        return reject("decode radix cache must be disabled")
+    if memory.enable_hierarchical_cache or memory.hicache_storage_backend is not None:
+        return reject("HiCache must be disabled")
+    if memory.enable_unified_memory:
+        return reject("unified memory is unsupported")
+
+    layers = getattr(getattr(draft_worker, "draft_model", None), "layers", ())
+    if not layers:
+        return reject("draft layers are missing")
+    window_size = getattr(draft_worker, "draft_window_size", None)
+    if compact_requested:
+        capability = getattr(draft_worker, "compact_capability", None)
+        if capability is None or not capability.eligible:
+            return reject("checkpoint-derived compact capability is unavailable")
+        checkpoint_window = int(capability.checkpoint_window_tokens)
+        if len(layers) != int(capability.num_layers):
+            return reject("loaded draft layer count differs from frozen capability")
+        layer_windows = tuple(
+            int(getattr(layer.self_attn, "sliding_window_size", -1)) for layer in layers
+        )
+        if layer_windows != (int(capability.attention_window_left),) * len(layers):
+            return reject("loaded draft attention windows differ from capability")
+    else:
+        layer_windows = tuple(
+            int(getattr(layer.self_attn, "sliding_window_size", -1)) + 1
+            for layer in layers
+        )
+        if any(window <= 0 for window in layer_windows) or len(set(layer_windows)) != 1:
+            return reject("draft layer windows are invalid or heterogeneous")
+        checkpoint_window = layer_windows[0]
+    if window_size is None or int(window_size) != checkpoint_window:
+        return reject("runtime and checkpoint draft windows differ")
+    if int(getattr(draft_token_to_kv_pool, "layer_num", -1)) != len(layers):
+        return reject("draft pool layer count mismatch")
+    if getattr(draft_token_to_kv_pool, "use_hnd", False):
+        return reject("HND draft pool layout is unsupported")
+
+    target_page_size = int(get_schedule().page_size)
+    draft_page_size = int(getattr(draft_token_to_kv_pool, "page_size", -1))
+    if target_page_size != 1 or draft_page_size != 1:
+        return reject("target and draft page_size must both be 1")
+
+    layer_ids = tuple(
+        int(getattr(layer.self_attn.attn, "layer_id", i))
+        for i, layer in enumerate(layers)
+    )
+    return DraftKVTransferSpec(
+        checkpoint_window,
+        layer_ids + layer_ids,
+        True,
+        compact_requested,
+    )
+
+
 class KVClassType(Enum):
     KVARGS = "kvargs"
     MANAGER = "manager"
@@ -1073,6 +1233,8 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    *,
+    draft_kv_transfer_spec: Optional[DraftKVTransferSpec] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -1237,6 +1399,25 @@ def setup_state_kv_args(
                 c128_lens,
                 c128_item_lens,
             )
+
+    if draft_kv_transfer_spec is not None:
+        draft_ptrs, draft_lens, draft_item_lens = (
+            draft_token_to_kv_pool.get_contiguous_buf_infos()
+        )
+        if len(draft_ptrs) != len(draft_kv_transfer_spec.layer_ids):
+            raise RuntimeError(
+                "DFlash draft state layer metadata mismatch: "
+                f"entries={len(draft_ptrs)}, "
+                f"layer_ids={len(draft_kv_transfer_spec.layer_ids)}"
+            )
+        append_state_component(
+            kv_args,
+            StateType.DRAFT_SWA,
+            draft_ptrs,
+            draft_lens,
+            draft_item_lens,
+            layer_ids=list(draft_kv_transfer_spec.layer_ids),
+        )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

@@ -574,6 +574,7 @@ class ModelRunner:
                 model_config=self.model_config,
                 spec_algorithm=self.spec_algorithm,
                 is_draft_worker=self.is_draft_worker,
+                attn_dp_size=self.ps.attn_dp_size,
             )
         )
 

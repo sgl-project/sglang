@@ -85,6 +85,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
             req_pool_indices, dtype=torch.int64, device=self.device
         )
         self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        # PREBUILT performs no model forward. Keep first-bind authority for the
+        # first real decode forward after the transferred state is admitted.
+        uses_owner_metadata = getattr(self, "uses_dflash_owner_metadata", None)
+        if uses_owner_metadata is not None and uses_owner_metadata():
+            self.set_req_pool_owner_metadata([True] * len(reqs))
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(

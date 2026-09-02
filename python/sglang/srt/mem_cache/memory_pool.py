@@ -338,7 +338,9 @@ class ReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
-        self.req_generation.zero_()
+        # Keep generations monotonic across a global clear. Resetting permits
+        # an ABA collision (old generation 1 -> clear -> new generation 1), so
+        # request-owned side pools could accept stale state after slot reuse.
         if self._aux_cache is not None:
             self._aux_cache.clear()
 
