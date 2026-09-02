@@ -429,6 +429,7 @@ class RuntimeHandle:
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
         )
+        result["request_lifecycle"] = {"prefill_completed": True}
         return json.dumps(msgspec_to_builtins(result), default=str)
 
     def health_check(self) -> bool:
