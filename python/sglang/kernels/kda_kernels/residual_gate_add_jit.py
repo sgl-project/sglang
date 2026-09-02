@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.kda_kernels import _cuda_source
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -29,7 +30,7 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
     return load_jit(
         "diffusion_residual_gate_add",
         *args,
-        cuda_files=["diffusion/residual_gate_add.cuh"],
+        cuda_files=[_cuda_source("diffusion/residual_gate_add.cuh")],
         cuda_wrappers=[
             (
                 "residual_gate_add",

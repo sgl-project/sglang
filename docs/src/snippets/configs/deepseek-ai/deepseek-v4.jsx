@@ -9,6 +9,10 @@ export const config = {
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "rtx6000", "rtx5090",
+    // NVIDIA DGX Spark (GB10, SM121) — Flash Official FP4 only, as a 2-node
+    // TP=2 pair over ConnectX-7 RoCE; the shared HARDWARE_CATALOG carries the
+    // entry and its multi-node Docker flags.
+    "dgx-spark",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
   ],
@@ -192,6 +196,12 @@ sgl-eval run mmmu_pro \\
     // (sgl-project/sglang#37253) — until it does, the variant needs this
     // preview build on every hardware.
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
+    // DGX Spark ONLY. A dedicated preview build for the 2x GB10 pair: it bakes
+    // in the SM12x b12x MoE/attention kernels (sgl-project/sglang#34878,
+    // #35899, #34018) and CuTeDSL/NCCL pins the GB10 recipe needs, none of
+    // which are in `latest`. It is not built for, and must not be used on, any
+    // other hardware — every other row keeps its own image.
+    "dgx-spark|flash-official|fp4": "lmsysorg/sglang:dev-v4f-2dgx",
     // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
     // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
     // every NVFP4 cell to the nightly until a release contains that fix.
@@ -3020,6 +3030,50 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
+    // DGX Spark (GB10 / SM121) — Flash Official FP4, 2-node TP=2, Balanced
+    // ====================================================================
+    // One cell only: the verified GB10 recipe. It runs the SM12x b12x MoE
+    // (W4A8) + b12x compressed-MLA attention with DSpark, split TP=2 across two
+    // DGX Sparks over ConnectX-7 RoCE. Verified end to end on 2x DGX Spark with
+    // the `lmsysorg/sglang:dev-v4f-2dgx` image (GSM8K 96%, AgentX c1/c2 clean).
+    // Every other DGX Spark combination (other variants / quants / strategies /
+    // single node) is intentionally absent and greys out: a single 128GB GB10
+    // cannot hold the checkpoint, and the b12x kernels are text-only today
+    // (image prefill for Flash Vision is unsupported on SM12x).
+    // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
+    // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
+    // expandable_segments avoids unified-memory fragmentation OOMs.
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // B200 + FP4 — Flash Vision (Exp)
     //
     // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
@@ -3029,7 +3083,8 @@ sgl-eval run mmmu_pro \\
     // verified on B200 via the MMMU-Pro round (4×B200, image batches).
     // Balanced / high-throughput stay target-only: those recipes run DP
     // attention, which DSpark is incompatible with on the current release.
-    // Non-B200 hardware — final verification in progress.
+    // GB300 verified via the same MMMU-Pro round (4×GB300); B300 /
+    // GB200 / H200 / H100 — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -3190,8 +3245,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
       flags: [
@@ -3205,8 +3259,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -3223,8 +3276,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
