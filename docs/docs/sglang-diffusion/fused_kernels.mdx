@@ -89,6 +89,7 @@ These fusion families mount under both `quality="extra-high"` and
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
+| MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention |
 
 ## Kernel inventory
 
