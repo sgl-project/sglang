@@ -1973,11 +1973,13 @@ class KVCacheConfigurator:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                swa_allocator = getattr(
+                if isinstance(
                     token_to_kv_pool_allocator,
-                    "logical_attn_allocator",
-                    token_to_kv_pool_allocator,
-                )
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+                ):
+                    swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
+                else:
+                    swa_allocator = token_to_kv_pool_allocator
                 uses_unified_virtual_ids = isinstance(
                     swa_allocator, UnifiedSWATokenToKVPoolAllocator
                 )
