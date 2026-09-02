@@ -18,16 +18,11 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
-    get_device_sm,
-    is_cuda,
-    is_hip,
     is_mnnvl_fabric_device,
-    is_sm90_supported,
-    is_sm100_supported,
-    is_sm120_supported,
 )
 from sglang.utils import is_in_ci
 
@@ -409,7 +404,7 @@ def handle_environment_variables(server_args: Any):
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
     if cfg.debug_cuda_graph:
-        if not (is_cuda() or is_hip()):
+        if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(
                 "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                 "Disabling breakable CUDA graph."
@@ -424,7 +419,7 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        is_sm100_supported() or is_sm120_supported()
+        get_platform().is_sm100 or get_platform().is_sm120
     ):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
@@ -434,13 +429,15 @@ def handle_environment_variables(server_args: Any):
     # it, mirroring the forward scale split: the ue8m0 path
     # (DEEPGEMM_SCALE_UE8M0, true sm100, default on) or an sm90 opt-in
     # fp32-scale path (use FP4 expert ckpt). Disable in every other case.
-    if is_cuda() and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+    if get_platform().is_cuda and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
         from sglang.srt.layers import deep_gemm_wrapper
 
-        sm = get_device_sm()
+        sm = get_platform().device_sm
         explicit = envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set()
         supported = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 or (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_sm90_supported() and explicit
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and get_platform().is_sm90
+            and explicit
         )
         if not supported and explicit:
             logger.warning(
@@ -788,7 +785,7 @@ def handle_multimodal_feature_transport(server_args: Any):
             )
         elif (
             model_config_of(server_args).is_multimodal
-            and is_cuda()
+            and get_platform().is_cuda
             and cfg.disaggregation_mode == "null"
         ):
             # A full GPU pool always degrades to CPU transport per tensor.
@@ -849,7 +846,7 @@ def handle_multimodal_feature_transport(server_args: Any):
         requested_transport = "cpu"
 
     if requested_transport == "cuda_vmm":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_vmm requires NVIDIA CUDA.")
         if cfg.pp_size != 1:
             raise ValueError(
@@ -875,7 +872,7 @@ def handle_multimodal_feature_transport(server_args: Any):
         )
 
     if requested_transport == "cuda_ipc":
-        if not is_cuda():
+        if not get_platform().is_cuda:
             raise ValueError("--mm-feature-transport=cuda_ipc requires NVIDIA CUDA.")
         if cfg.nnodes != 1:
             raise ValueError(
@@ -913,3 +910,32 @@ def handle_multimodal_feature_transport(server_args: Any):
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"
     )
+
+
+_ssl_verify_warned = False
+
+
+def ssl_verify_of(cfg: Any):
+    """What to pass as the requests library's ``verify=``.
+
+    A CA file means validate against it. SSL configured without one means
+    verification off -- self-signed certificates in development -- and that is
+    worth saying out loud, once. No SSL means the system CA bundle.
+
+    The warning is once per process: the message is about how this process was
+    configured, and a second engine repeating it says nothing new.
+    """
+    global _ssl_verify_warned
+    if cfg.ssl_ca_certs:
+        return cfg.ssl_ca_certs
+    if cfg.ssl_certfile:
+        if not _ssl_verify_warned:
+            logger.warning(
+                "SSL is enabled but --ssl-ca-certs was not provided. Certificate "
+                "verification is DISABLED for internal health checks. For "
+                "production deployments, provide --ssl-ca-certs or use CA-signed "
+                "certificates."
+            )
+            _ssl_verify_warned = True
+        return False
+    return True

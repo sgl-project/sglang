@@ -174,11 +174,7 @@ def update_kv_lens_and_indices(
     local_kv_indices_offsets = local_kv_indices_start + offsets
 
     kv_values = tl.load(kv_indices + kv_indice_offsets, mask=mask)
-    tl.store(
-        local_kv_indices + local_kv_indices_offsets,
-        kv_values // dcp_world_size,
-        mask=mask,
-    )
+    tl.store(local_kv_indices + local_kv_indices_offsets, kv_values, mask=mask)
 
 
 # ---------------------------------------------------------------------------

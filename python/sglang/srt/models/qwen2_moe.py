@@ -98,7 +98,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_stream,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -118,7 +123,6 @@ if is_npu():
     )
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()

@@ -54,11 +54,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
         for field in dataclasses.fields(server_args)
     }
 
-    # Declaration stash for the override/post-process passes. Set before any
-    # short-circuit (none/dummy model paths) so run_post_process_pass and
-    # direct handler invocations can rely on it even when
-    # _handle_model_specific_adjustments never runs.
-    server_args._resolved_overrides = []
+    # Preserve launcher-stage declarations made before Engine starts. They are
+    # part of the same resolution result as the declarations accumulated below.
+    server_args._resolved_overrides = list(
+        getattr(server_args, "_resolved_overrides", ())
+    )
 
     cfg = resolving_view(server_args)
 
@@ -199,6 +199,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_mps_backends,
         handle_nccl_pre_warm,
         handle_npu_backends,
+        handle_symm_mem_device_support,
         handle_xpu_backends,
     )
 
@@ -207,6 +208,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_npu_backends(server_args)
     handle_mps_backends(server_args)
     handle_xpu_backends(server_args)
+    # Must precede handle_gpu_memory_settings: its symm-mem prealloc default
+    # keys off enable_symm_mem.
+    handle_symm_mem_device_support(server_args)
 
     # OOT platform plugins set fields directly (an interface this tree
     # does not own); the diff records what they applied.
@@ -313,6 +317,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     handle_speculative_decoding(server_args)
+
+    # After the speculative hook so speculative_algorithm is final.
+    from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
+
+    handle_layernorm_sp(server_args)
 
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     validate_cutedsl_a2a_token_budget(server_args)
