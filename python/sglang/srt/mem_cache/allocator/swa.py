@@ -21,8 +21,7 @@ if _is_npu:
 # free_swa releases whatever the mapping points at, so an entry that reads as the
 # padding slot would push slot 0 into the SWA free list and hand it out twice.
 _SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
-# free_full leaves the mapping alone, so a live entry would strand its SWA peer:
-# the full slot goes back to the pool and the peer is never released.
+# free_full leaves the mapping alone, so a live entry would strand its SWA peer.
 _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 
 
