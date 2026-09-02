@@ -269,23 +269,17 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
         ]
         self.assertEqual(len(shared_targets), 42 * 3)
         for name in shared_targets:
-            self.assertEqual(
-                self.quantized_headers[f"{name}_scale"]["dtype"], "U8"
-            )
+            self.assertEqual(self.quantized_headers[f"{name}_scale"]["dtype"], "U8")
 
         preserved_mtp = [
             name
             for name, metadata in self.quantized_headers.items()
             if ".layers.45.mlp." in name
-            and (
-                ".experts." in name or ".shared_experts." in name
-            )
+            and (".experts." in name or ".shared_experts." in name)
             and name.endswith(".weight")
             and metadata["dtype"] == "F8_E4M3"
         ]
-        self.assertEqual(
-            len(preserved_mtp), (self.num_experts + 1) * 3
-        )
+        self.assertEqual(len(preserved_mtp), (self.num_experts + 1) * 3)
 
     @unittest.skipUnless(
         torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
@@ -340,9 +334,7 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
         up = F.linear(hidden.float(), shared["up_proj"].float()).clamp(
             -cls.swiglu_limit, cls.swiglu_limit
         )
-        return F.linear(
-            F.silu(gate) * up, shared["down_proj"].float()
-        ).bfloat16()
+        return F.linear(F.silu(gate) * up, shared["down_proj"].float()).bfloat16()
 
     @classmethod
     def _load_ffn_mhc(cls, layer):
@@ -447,9 +439,7 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
                     moe_input = (
                         moe_input.float()
                         * torch.rsqrt(
-                            moe_input.float().square().mean(
-                                dim=-1, keepdim=True
-                            )
+                            moe_input.float().square().mean(dim=-1, keepdim=True)
                             + self.rms_eps
                         )
                         * norm.float()
