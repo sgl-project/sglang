@@ -252,6 +252,22 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        # MiniMax H3's text-only token refiner deliberately stays on the exact
+        # FA baseline when the packed multimodal blocks use cube attention.
+        # Initialize the Blackwell FA generation on the cube selection path as
+        # well, otherwise the refiner can fall into an unavailable FA2 package.
+        if not platform._prepare_flash_attention_for_blackwell():
+            raise RuntimeError(
+                "cube sparse attention requires FlashAttention for H3's dense paths"
+            )
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn.CubeSparseAttentionBackend"
+
+
 class _SparseVideoGen2AttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN
 
@@ -419,6 +435,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
+        _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,
         _VMOBAAttentionBackendResolver,
@@ -685,8 +702,8 @@ class CudaPlatformBase(Platform):
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan VAE decoder
         fast paths.
 
-        Requests with quality == "high" run the fast paths; the "lossless"
-        default runs the original module path bit-for-bit. See
+        Requests with quality="extra-high" or "high" run the fast paths; the
+        "lossless" default runs the original module path bit-for-bit. See
         flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
         """
         try:
