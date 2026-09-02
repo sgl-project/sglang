@@ -56,11 +56,33 @@ sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculat
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+    C4IndexerAscendBackendMixin,
+    CompressorAscendBackendMixin,
+    DeepseekV4AscendAttnBackend,
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
+    _build_cycle_state_block_table,
     _get_kv_indices,
+    _sparse_attn_kv_quant_kwargs,
+    _sparse_attn_ops,
     _walsh_hadamard_matrix,
 )
+
+
+class TestC4IndexerInitialization(unittest.TestCase):
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_indexer_uses_float8_kv(self, _):
+        indexer = torch.nn.Module()
+        indexer.head_dim = 8
+        indexer.compressor = SimpleNamespace()
+        backend = C4IndexerAscendBackendMixin.__new__(C4IndexerAscendBackendMixin)
+
+        backend._ensure_npu_c4_indexer(indexer, torch.device("cpu"))
+
+        self.assertEqual(indexer.compressor.li_kv_dtype, "float8")
 
 
 class TestWalshHadamardMatrix(unittest.TestCase):
@@ -179,6 +201,270 @@ class TestApplyHadamard(unittest.TestCase):
         expected = inp.matmul(H).to(torch.bfloat16)
         out = _apply_hadamard(inp, H)
         self.assertTrue(torch.equal(out, expected))
+
+
+class TestCompressorStateTableABI(unittest.TestCase):
+    def test_arch35_cycle_table_is_one_bank_per_request(self):
+        req_pool_indices = torch.tensor([7, 3], dtype=torch.int64)
+        table = _build_cycle_state_block_table(req_pool_indices)
+        self.assertEqual(tuple(table.shape), (2,))
+        self.assertEqual(table.dtype, torch.int32)
+        self.assertEqual(table.tolist(), [7, 3])
+
+    def test_arch35_cycle_table_rejects_explicit_shape(self):
+        with self.assertRaises(ValueError):
+            _build_cycle_state_block_table(torch.zeros((2, 8), dtype=torch.int32))
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_eager_metadata_builds_cycle_table(self, _):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.forward_metadata = SimpleNamespace()
+        backend.token_to_kv_pool = MagicMock()
+        backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)
+        backend.req_to_token_pool = MagicMock()
+        backend._dsv4_compress_ratios = ()
+        backend._compute_compress_locs = MagicMock(return_value={})
+
+        forward_mode = MagicMock()
+        forward_mode.is_decode.return_value = True
+        forward_mode.is_target_verify.return_value = False
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            req_pool_indices=torch.tensor([7, 3], dtype=torch.int64),
+            seq_lens=torch.tensor([5, 9], dtype=torch.int32),
+            out_cache_loc=torch.empty(0, dtype=torch.int64),
+            out_cache_loc_dsv4=None,
+            batch_size=2,
+        )
+
+        backend._build_npu_compress_metadata(forward_batch)
+
+        table = getattr(backend.forward_metadata, "dsv4_cycle_state_block_table", None)
+        self.assertIsNotNone(table)
+        self.assertEqual(table.tolist(), [7, 3])
+        self.assertEqual(table.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_graph_replay_slices_static_req_pool_buffer_to_graph_bs(self, _):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        table = torch.zeros(1, dtype=torch.int32)
+        graph_mode = MagicMock()
+        graph_mode.is_decode.return_value = False
+        graph_mode.is_target_verify.return_value = False
+        ctx = SimpleNamespace(
+            fm=SimpleNamespace(dsv4_cycle_state_block_table=table),
+            forward_batch=SimpleNamespace(
+                req_pool_indices=torch.arange(7, 19, dtype=torch.int64)
+            ),
+            graph_mode=graph_mode,
+            bs=1,
+        )
+        backend._build_dsv4_graph_replay_ctx = MagicMock(return_value=ctx)
+        for name in (
+            "_refresh_graph_seq_metadata",
+            "_refresh_graph_compress_page_tables_direct",
+            "_refresh_graph_explicit_state_block_tables",
+            "_refresh_graph_swa_metadata_direct",
+            "_refresh_graph_dspark_sparse_metadata",
+            "_refresh_graph_kernel_metadata",
+        ):
+            setattr(backend, name, MagicMock())
+
+        backend._apply_dsv4_graph_metadata(SimpleNamespace())
+
+        self.assertIs(ctx.fm.dsv4_cycle_state_block_table, table)
+        self.assertEqual(table.tolist(), [7])
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_graph_capture_allocates_cycle_table_buffer(self, _):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        metadata = SimpleNamespace()
+        backend.device = "cpu"
+        backend.graph_metadata = {
+            2: metadata,
+            "swa_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "c4_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "c128_page_table": torch.full((2, 4), -1, dtype=torch.int32),
+            "kernel_metadata_c1a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c4a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_c128a": torch.zeros(1024, dtype=torch.int32),
+            "kernel_metadata_li_quant": torch.zeros(1024, dtype=torch.int32),
+            "c4_topk_indices": torch.full((2, 1), -1, dtype=torch.int32),
+        }
+        backend._dsv4_graph_tokens_per_req = 1
+        backend._dsv4_index_topk = 1
+        backend._dsv4_state_pools_by_ratio = {}
+        backend._dsv4_sliding_window_size = 128
+        backend._is_dspark_draft_worker = False
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+
+        backend._init_dsv4_graph_metadata(2, forward_mode)
+
+        table = getattr(metadata, "dsv4_cycle_state_block_table", None)
+        self.assertIsNotNone(table)
+        self.assertEqual(tuple(table.shape), (2,))
+        self.assertEqual(table.dtype, torch.int32)
+
+    @patch(
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35",
+        return_value=True,
+    )
+    def test_arch35_forward_reuses_batch_cycle_table(self, _):
+        table = torch.tensor([7, 3], dtype=torch.int32)
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.graph_mode = False
+        backend.forward_metadata = SimpleNamespace(
+            dsv4_cycle_state_block_table=table,
+            positions_cmp_padding_c128=torch.empty(0, dtype=torch.int64),
+            actual_seq_lengths_q_pa=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seqused=torch.ones(2, dtype=torch.int32),
+            start_pos=torch.zeros(2, dtype=torch.int32),
+            c128_loc=None,
+        )
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool._get_state_pool.return_value = SimpleNamespace(
+            state_cache_3d=torch.empty(0)
+        )
+        backend._ensure_compressor_hadamard = MagicMock()
+        backend._ensure_fused_caches = MagicMock()
+        backend._compressor_epilog_npu = MagicMock()
+
+        compressor = SimpleNamespace(
+            ratio=128,
+            overlap=False,
+            layer_id=0,
+            is_in_indexer=False,
+            freqs_cis=None,
+            rotary_emb=None,
+            _fused_wkv_w=torch.empty(0),
+            _fused_wgate_w=torch.empty(0),
+            ape=torch.empty(0),
+            _fused_norm_weight_fp32=torch.empty(0),
+            rope_head_dim=64,
+            norm=SimpleNamespace(variance_epsilon=1e-6),
+            rotate=False,
+        )
+        forward_mode = MagicMock()
+        forward_mode.is_prefill.return_value = False
+        forward_mode.is_target_verify.return_value = False
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([7, 3], dtype=torch.int64),
+            forward_mode=forward_mode,
+        )
+        rope = MagicMock()
+        rope.get_cos_sin.return_value = (torch.empty(0), torch.empty(0))
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend."
+                "Dsv4NpuRoPE.for_freqs",
+                return_value=rope,
+            ),
+            patch.object(torch.ops, "custom", MagicMock(), create=True) as custom_ops,
+            patch.object(torch.ops, "npu", MagicMock(), create=True) as npu_ops,
+        ):
+            custom_ops.compressor.return_value = torch.empty((0, 1))
+            backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
+            backend.forward_compress(compressor, torch.empty((2, 1)), forward_batch)
+
+        self.assertEqual(npu_ops.compressor.call_count, 0)
+        self.assertIs(
+            custom_ops.compressor.call_args_list[0].kwargs["state_block_table"], table
+        )
+        self.assertIs(
+            custom_ops.compressor.call_args_list[1].kwargs["state_block_table"], table
+        )
+
+
+class TestArch35SparseAttentionDispatch(unittest.TestCase):
+    _ARCH35_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
+    )
+
+    @patch(_ARCH35_PATCH_TARGET, return_value=True)
+    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _):
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            metadata_op, attention_op = _sparse_attn_ops()
+            kwargs = _sparse_attn_kv_quant_kwargs()
+
+        self.assertIs(
+            metadata_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv_metadata
+        )
+        self.assertIs(attention_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv)
+        self.assertEqual(
+            kwargs,
+            {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+        )
+
+    @patch(_ARCH35_PATCH_TARGET, return_value=False)
+    def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            metadata_op, attention_op = _sparse_attn_ops()
+            kwargs = _sparse_attn_kv_quant_kwargs()
+
+        self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
+        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
+        self.assertEqual(kwargs, {})
+
+
+class TestSparseAttentionMetadata(unittest.TestCase):
+    _ARCH35_PATCH_TARGET = (
+        "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._is_npu_arch35"
+    )
+
+    def test_device_metadata_receives_sequence_lengths(self):
+        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
+        seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
+
+        for is_arch35, metadata_op_name in (
+            (False, "npu_sparse_attn_sharedkv_metadata"),
+            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
+        ):
+            with (
+                self.subTest(is_arch35=is_arch35),
+                patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
+                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
+            ):
+                backend = DeepseekV4AscendAttnBackend.__new__(
+                    DeepseekV4AscendAttnBackend
+                )
+                backend.forward_metadata = SimpleNamespace()
+                backend._is_dspark_draft_worker = False
+                backend._dsv4_sliding_window_size = 128
+                backend._dsv4_q_head_num = 64
+                backend._dsv4_kv_head_num = 1
+                backend._dsv4_head_dim = 512
+                backend._dsv4_has_c4 = True
+                backend._dsv4_has_c128 = True
+                backend._dsv4_index_topk = 512
+                backend._dsv4_index_n_heads = 16
+                backend._dsv4_index_head_dim = 128
+
+                backend._kernel_metadata_from_parts(
+                    bs=2,
+                    actual_seq_lengths_q_pa=cu_seqlens_q,
+                    actual_seq_lengths_kv=seqused_kv,
+                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
+                    max_seqlen_q=2,
+                    is_nextn=False,
+                )
+
+                metadata_op = getattr(custom_ops, metadata_op_name)
+                self.assertEqual(metadata_op.call_count, 3)
+                for call in metadata_op.call_args_list:
+                    self.assertIs(call.kwargs["cu_seqlens_q"], cu_seqlens_q)
+                    self.assertIs(call.kwargs["seqused_kv"], seqused_kv)
 
 
 class TestGetKvIndices(unittest.TestCase):
@@ -381,6 +667,70 @@ class TestCommonTemplate(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             backend.common_template(forward_batch, call_fn)
         self.assertEqual(call_fn.call_count, 1)
+
+
+class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    @staticmethod
+    def _backend(*, loc, graph_mode=False):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.graph_mode = graph_mode
+        backend.token_to_kv_pool = MagicMock()
+        backend.forward_metadata = SimpleNamespace(c4_loc=loc, c128_loc=loc)
+        return backend
+
+    @staticmethod
+    def _compressor(*, li_kv_dtype="bf16", is_in_indexer=False):
+        return SimpleNamespace(
+            ratio=128,
+            layer_id=0,
+            is_in_indexer=is_in_indexer,
+            li_kv_dtype=li_kv_dtype,
+        )
+
+    @staticmethod
+    def _verify_batch():
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = True
+        return SimpleNamespace(forward_mode=forward_mode)
+
+    def test_all_slots_masked_skips_compress_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.zeros(3, 512), self._verify_batch()
+        )
+        backend.token_to_kv_pool.set_compress_buffer.assert_not_called()
+
+    def test_partially_masked_slots_writes_surviving_rows(self):
+        backend = self._backend(loc=torch.tensor([0, 7, 0], dtype=torch.int32))
+        kv = torch.arange(12, dtype=torch.float32).view(3, 4)
+        backend._compressor_epilog_npu(self._compressor(), kv, self._verify_batch())
+
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        _, written_loc, written_kv, _, _ = (
+            backend.token_to_kv_pool.set_compress_buffer.call_args.args
+        )
+        self.assertEqual(written_loc.tolist(), [7])
+        self.assertEqual(written_kv.tolist(), [kv[1].tolist()])
+
+    def test_graph_mode_keeps_static_shape_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32), graph_mode=True)
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.ones(3, 4), self._verify_batch()
+        )
+
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        written_kv = backend.token_to_kv_pool.set_compress_buffer.call_args.args[2]
+        self.assertEqual(written_kv.shape[0], 3)
+        self.assertEqual(written_kv.abs().sum().item(), 0.0)
+
+    def test_all_slots_masked_skips_fused_indexer_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            backend._compressor_epilog_npu(
+                compressor, torch.zeros(3, 512), self._verify_batch()
+            )
+        custom_ops.indexer_compress_epilog.assert_not_called()
 
 
 if __name__ == "__main__":

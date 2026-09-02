@@ -201,6 +201,19 @@ class NPUSwigluStepAndMul(BaseActivation):
         return gate * up
 
 
+class NPUSwigluLimit(BaseActivation):
+    """DeepSeek-V4 SwiGLU with pre-activation gate/up clipping."""
+
+    def __init__(self, limit: float):
+        self._limit = float(limit)
+
+    def _apply_activation(self, hidden_states: torch.Tensor):
+        gate, up = hidden_states.chunk(2, dim=-1)
+        gate.clamp_(max=self._limit)
+        up.clamp_(min=-self._limit, max=self._limit)
+        return torch.ops.npu.npu_swiglu(hidden_states), None
+
+
 # =============================================================================
 # Generic TP all‑gather wrapper – used by the runner when needed
 # =============================================================================

@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
@@ -60,6 +60,36 @@ class _NPULinearMethodBase(LinearMethodBase):
         quant_config: Optional["QuantizationConfig"] = None,
     ):
         self.quant_config = quant_config
+
+
+def _npu_mxfp8_linear_2d(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Shared dynamic-MXFP8 quantization and A5 matrix multiplication."""
+    quantized_input, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        input_2d, dst_type=torch.float8_e4m3fn
+    )
+    quant_bias = (
+        bias.to(torch.float32)
+        if bias is not None and bias.dtype != torch.float32
+        else bias
+    )
+    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    return torch.ops.npu.npu_quant_matmul(
+        quantized_input,
+        weight,
+        scale=weight_scale,
+        scale_dtype=e8m0_dtype,
+        pertoken_scale=input_scale,
+        pertoken_scale_dtype=e8m0_dtype,
+        bias=quant_bias,
+        output_dtype=output_dtype,
+        group_sizes=(1, 1, MXFP8_BLOCK_SIZE),
+    )
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
@@ -271,11 +301,6 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation
-        qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
-
         # MXFP8 matmul (weight & scale already transposed at load time)
         # Use the cached FP32 bias from process_weights_after_loading; fall back
         # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
@@ -289,22 +314,162 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         else:
             quant_bias = bias.to(torch.float32)
 
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        output = torch.ops.npu.npu_quant_matmul(
-            qx,
+        output = _npu_mxfp8_linear_2d(
+            x_2d,
             layer.weight,
             layer.weight_scale_inv,
-            scale_dtype=e8m0_dtype,
-            pertoken_scale=input_scale,
-            pertoken_scale_dtype=e8m0_dtype,
-            bias=quant_bias,
-            output_dtype=original_dtype,
-            group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+            quant_bias,
+            original_dtype,
         )
 
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+
+def npu_w8a8_mxfp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
+    backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
+
+    The loading path requantizes block-FP8 weights into the A5 MXFP8 layout;
+    activations are quantized per call. ``block_size`` is retained for the shared
+    block-FP8 backend interface and ``input_scale`` is unused because activation
+    scales are always dynamic here.
+    """
+    if weight.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, "
+            f"got {weight.dtype}"
+        )
+
+    original_dtype = input.dtype
+    if original_dtype not in (torch.float16, torch.bfloat16):
+        input = input.to(torch.bfloat16)
+        original_dtype = torch.bfloat16
+
+    orig_shape = input.shape
+    input_2d = input.view(-1, orig_shape[-1]).contiguous()
+
+    output_2d = _npu_mxfp8_linear_2d(
+        input_2d,
+        weight,
+        weight_scale,
+        bias,
+        original_dtype,
+    )
+
+    return output_2d.reshape(*orig_shape[:-1], output_2d.shape[-1])
+
+
+def process_npu_arch35_mxfp8_linear_weights(
+    layer: torch.nn.Module, weight_block_size: List[int], scale_fmt: str
+) -> None:
+    """Convert UE8M0 block-FP8 weights to the NPU arch35 MXFP8 layout."""
+    if scale_fmt != "ue8m0":
+        raise ValueError(
+            "NPU arch35 MXFP8 weight loading requires scale_fmt='ue8m0', "
+            f"got {scale_fmt!r}."
+        )
+    _layout_npu_arch35_ue8m0_weights(layer, weight_block_size)
+
+
+def _layout_npu_arch35_ue8m0_weights(
+    layer: torch.nn.Module, weight_block_size: List[int]
+) -> None:
+    """Reinterpret UE8M0 block scales and transpose weights without requantizing."""
+    block_n, block_k = weight_block_size
+    group_size = MXFP8_BLOCK_SIZE
+    n_dim, k_dim = layer.weight.shape
+    if block_k % group_size != 0:
+        raise ValueError(
+            f"UE8M0 block K size must be divisible by {group_size}, got {block_k}."
+        )
+    if k_dim % (2 * group_size) != 0:
+        raise ValueError(
+            "NPU arch35 MXFP8 linear requires K to be divisible by "
+            f"{2 * group_size}, got {k_dim}."
+        )
+
+    expected_scale_shape = (
+        (n_dim + block_n - 1) // block_n,
+        (k_dim + block_k - 1) // block_k,
+    )
+    checkpoint_scale = layer.weight_scale_inv.data
+    if tuple(checkpoint_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Unexpected UE8M0 scale shape: "
+            f"got {tuple(checkpoint_scale.shape)}, expected {expected_scale_shape}."
+        )
+
+    if checkpoint_scale.dtype == torch.float8_e8m0fnu:
+        scale_u8 = checkpoint_scale.view(torch.uint8)
+    elif checkpoint_scale.dtype == torch.uint8:
+        scale_u8 = checkpoint_scale
+    elif checkpoint_scale.dtype == torch.float32:
+        scale_u8 = ((checkpoint_scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+    else:
+        raise TypeError(
+            "UE8M0 checkpoint scales must be float8_e8m0fnu, uint8, or float32, "
+            f"got {checkpoint_scale.dtype}."
+        )
+
+    scale_u8 = scale_u8.repeat_interleave(block_n, dim=0)[:n_dim]
+    scale_u8 = scale_u8.repeat_interleave(block_k // group_size, dim=1)
+    scale_u8 = scale_u8[:, : k_dim // group_size]
+
+    layer.weight.data = layer.weight.data.transpose(0, 1)
+    layer.weight_scale_inv.data = scale_u8.reshape(
+        n_dim, k_dim // (2 * group_size), 2
+    ).transpose(0, 1)
+    layer.weight_scale_inv.format_ue8m0 = True
+
+    if getattr(layer, "_dsv4_npu_arch35_mxfp8_wo_a", False):
+        _batch_npu_arch35_wo_a_weights(layer)
+
+
+def _batch_npu_arch35_wo_a_weights(layer: torch.nn.Module) -> None:
+    """Reshape DSV4 ``wo_a`` weights for arch35 batched MXFP8 matmul."""
+    num_groups = layer._dsv4_num_groups
+    rank = layer._dsv4_o_lora_rank
+    hidden_dim = layer.weight.shape[0]
+    scale_k64 = layer.weight_scale_inv.shape[0]
+    output_dim = num_groups * rank
+
+    if layer.weight.shape != (hidden_dim, output_dim):
+        raise ValueError(
+            "Unexpected NPU arch35 wo_a weight layout after FP8 post-processing: "
+            f"got {tuple(layer.weight.shape)}, expected ({hidden_dim}, {output_dim})."
+        )
+    if layer.weight_scale_inv.shape != (scale_k64, output_dim, 2):
+        raise ValueError(
+            "Unexpected NPU arch35 wo_a scale layout after FP8 post-processing: "
+            f"got {tuple(layer.weight_scale_inv.shape)}, expected "
+            f"({scale_k64}, {output_dim}, 2)."
+        )
+    if scale_k64 * 64 != hidden_dim:
+        raise ValueError(
+            "Unexpected NPU arch35 wo_a scale K dimension: "
+            f"{scale_k64} packed pairs for hidden dim {hidden_dim}."
+        )
+
+    layer.weight.data = (
+        layer.weight.data.T.reshape(num_groups, rank, hidden_dim)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    layer.weight_scale_inv.data = (
+        layer.weight_scale_inv.data.transpose(0, 1)
+        .reshape(num_groups, rank, scale_k64, 2)
+        .transpose(1, 2)
+        .contiguous()
+    )
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
