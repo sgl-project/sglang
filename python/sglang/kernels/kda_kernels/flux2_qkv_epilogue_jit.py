@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.kda_kernels import _cuda_source
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -18,7 +19,7 @@ _ALIGN = 32
 def flux2_qkv_epilogue_module() -> Module:
     return load_jit(
         "flux2_qkv_epilogue_bf16",
-        cuda_files=["diffusion/flux2_qkv_epilogue.cuh"],
+        cuda_files=[_cuda_source("diffusion/flux2_qkv_epilogue.cuh")],
         cuda_wrappers=[
             (
                 "flux2_qkv_epilogue",

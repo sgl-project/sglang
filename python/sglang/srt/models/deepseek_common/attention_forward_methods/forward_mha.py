@@ -499,6 +499,10 @@ class DeepseekMHAForwardMixin:
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            # Read door: the pool never translates, so the production site does.
+            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
+                kv_indices
+            )
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, torch.bfloat16
             )
