@@ -176,20 +176,19 @@ def handle_attention_backend_compatibility(server_args: Any):
     # AMD platforms backends
     if resolved_view(server_args).attention_backend == "aiter":
         if model_config.context_len > 8192:
-            # The 0.85 covers the extra non-static workspace aiter reserves for
-            # long contexts, but it is a heuristic for the auto-derived default
-            # only. Shrinking a value the user picked can push the static budget
-            # below the model-weight footprint on a nearly full GPU and break
-            # KV-cache allocation outright, so an explicit value is honored.
-            if (getattr(server_args, "_raw_input", None) or {}).get(
-                "mem_fraction_static"
-            ) is not None:
+            explicit_mem_fraction = (
+                getattr(server_args, "_raw_input", None) or {}
+            ).get("mem_fraction_static") is not None
+            if (
+                explicit_mem_fraction
+                and envs.SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION.get()
+            ):
                 logger.warning(
-                    "attention_backend=aiter with context_len=%d (>8192) "
-                    "normally scales mem_fraction_static by 0.85, but "
-                    "mem_fraction_static=%.3f was set explicitly and will be "
-                    "used as-is. Ensure enough non-static memory is left for "
-                    "attention workspace and CUDA graphs.",
+                    "attention_backend=aiter with context_len=%d (>8192) normally "
+                    "scales mem_fraction_static by 0.85 to reserve non-static "
+                    "workspace, but SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION is set, "
+                    "so mem_fraction_static=%.3f is used as-is. Ensure enough memory "
+                    "is left for attention workspace and CUDA graphs.",
                     model_config.context_len,
                     cfg.mem_fraction_static,
                 )
