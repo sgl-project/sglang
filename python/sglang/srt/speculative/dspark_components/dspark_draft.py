@@ -277,7 +277,7 @@ class DraftBlockProposer:
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
             and draft_sampler is not None
             and fwd.can_run_graph
-            and (all_greedy or draft_sampler.folded_sampling)
+            and (all_greedy or draft_sampler.samples_any_temperature)
         ):
             folded = True
             if draft_sampler.folded_sampling:

@@ -437,7 +437,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
 
-    def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+    def _maybe_build_draft_sampler(self, *, available_memory_gb: float, **overrides):
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -457,6 +457,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            **overrides,
         )
 
     def clear_cache_pool(self):

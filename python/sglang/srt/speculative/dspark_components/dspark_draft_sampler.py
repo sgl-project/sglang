@@ -44,20 +44,22 @@ class DsparkDraftSampler:
         *,
         model,
         gamma,
-        num_drafts,
+        num_drafts: Optional[int] = None,
         max_bs,
         device,
         tp_sync: SpecTpSync,
         confidence_fn=None,
         out=None,
         folded_sampling: bool = True,
+        samples_any_temperature: Optional[bool] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
         self.sample_from_anchor = bool(model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
-        self.num_drafts = int(num_drafts)
+        # Drafts per block; the autoregressive convention (one per row) when unset.
+        self.num_drafts = int(gamma if num_drafts is None else num_drafts)
         max_bs = int(max_bs)
         # Resolved once: this sampler runs inside cuda-graph capture, so the
         # branch below is baked into the captured graph anyway.
@@ -76,6 +78,10 @@ class DsparkDraftSampler:
             else None
         )
         self.folded_sampling = folded_sampling
+        # Whether the captured draft graph samples correctly at any temperature.
+        self.samples_any_temperature = (
+            folded_sampling if samples_any_temperature is None else samples_any_temperature
+        )
         self._tp_sync = tp_sync
         self.temperatures = None
         self.greedy_mask = None
@@ -234,9 +240,11 @@ def maybe_build_draft_sampler(
     available_memory_gb: float,
     confidence_fn=None,
     out=None,
+    folded_sampling: Optional[bool] = None,
+    samples_any_temperature: Optional[bool] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
-    proposal must stay eager."""
+    proposal must stay eager. folded_sampling defaults to the AUTO resolution."""
 
     def _eager(reason):
         if tp_rank == 0:
@@ -249,14 +257,15 @@ def maybe_build_draft_sampler(
         return _eager("no compute_base_logits")
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
-    folded_sampling = _resolve_folded_sampling(
-        model=draft_model,
-        num_drafts=num_drafts,
-        max_bs=max_bs,
-        device=device,
-        tp_rank=tp_rank,
-        available_memory_gb=available_memory_gb,
-    )
+    if folded_sampling is None:
+        folded_sampling = _resolve_folded_sampling(
+            model=draft_model,
+            num_drafts=num_drafts,
+            max_bs=max_bs,
+            device=device,
+            tp_rank=tp_rank,
+            available_memory_gb=available_memory_gb,
+        )
     if tp_rank == 0:
         logger.info(
             "DSpark draft proposal (%s) folded into the draft cuda graph.",
@@ -272,4 +281,5 @@ def maybe_build_draft_sampler(
         confidence_fn=confidence_fn,
         out=out,
         folded_sampling=folded_sampling,
+        samples_any_temperature=samples_any_temperature,
     )
