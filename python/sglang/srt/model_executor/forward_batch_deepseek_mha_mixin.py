@@ -91,10 +91,8 @@ class ForwardBatchDeepSeekMHAMixin:
                 self.prefix_chunk_starts_cpu[idx],
                 self.prefix_chunk_seq_lens_cpu[idx],
             )
-            # None on a backend that never bound a translator.
-            src = get_attn_backend().kv_index_translator
-            if src is not None:
-                chunk_kv_indices = src.translate_full_attn_ids(chunk_kv_indices)
+            translator = get_attn_backend().kv_index_translator
+            chunk_kv_indices = translator.translate_dcp_read_ids(chunk_kv_indices)
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     # Here we suppose the length of each chunk is equal

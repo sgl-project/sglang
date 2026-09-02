@@ -60,6 +60,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -1101,7 +1102,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if get_spec().speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
-                config_path=get_spec().speculative_adaptive_config,
+                AdaptiveSpeculativeParams(
+                    initial_steps=self.speculative_num_steps,
+                    cfg_path=get_spec().speculative_adaptive_config,
+                ),
             )
 
         # Some dummy tensors
