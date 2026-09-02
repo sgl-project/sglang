@@ -161,11 +161,19 @@ class TestDeepseekV2Gate(_FusionGateCase):
 
     def test_hopper_modelopt_fp4_marlin_disables_fusion_by_default(self):
         import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
-        self._seed(moe_runner_backend="marlin")
-        with unittest.mock.patch.object(
-            deepseek_v2, "is_sm90_supported", return_value=True
+        self._seed()
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
         ):
             self.assertIn(
                 "fusion off by default",
@@ -178,14 +186,19 @@ class TestDeepseekV2Gate(_FusionGateCase):
 
     def test_hopper_modelopt_fp4_marlin_can_still_be_forced(self):
         import sglang.srt.models.deepseek_v2 as deepseek_v2
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
-        self._seed(
-            moe_runner_backend="marlin",
-            enforce_shared_experts_fusion=True,
-        )
-        with unittest.mock.patch.object(
-            deepseek_v2, "is_sm90_supported", return_value=True
+        self._seed(enforce_shared_experts_fusion=True)
+        with (
+            unittest.mock.patch.object(
+                deepseek_v2, "is_sm90_supported", return_value=True
+            ),
+            unittest.mock.patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
         ):
             self.assertIsNone(
                 self._reason(
