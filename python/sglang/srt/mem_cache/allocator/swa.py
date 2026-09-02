@@ -21,6 +21,9 @@ if _is_npu:
 # free_swa releases whatever the mapping points at, so an entry that reads as the
 # padding slot would push slot 0 into the SWA free list and hand it out twice.
 _SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
+# free_full leaves the mapping alone, so a live entry would strand its SWA peer:
+# the full slot goes back to the pool and the peer is never released.
+_SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -393,12 +396,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Checked at enqueue: a cache action later in this group may pair the
+        # slot again, and that new peer is not this call's to judge.
+        expect(
+            _SWA_PEER_RELEASED,
+            self.full_to_swa_index_mapping[free_index] == 0,
+            msg="caller wants free",
+        )
         if self.free_group is None:
-            # Full side only: a tombstoned range's mapping entries read as the
-            # padding slot, so `free` would push slot 0 into the SWA free list.
-            self.full_attn_allocator.free(free_index)
+            self._release_full(free_index)
         else:
             self.full_free_group.append(self._copy_for_free_group(free_index))
+
+    def _release_full(self, free_index: torch.Tensor):
+        self.full_attn_allocator.free(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
@@ -417,7 +428,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.full_free_group:
             full_free_group = self.full_free_group
             self.full_free_group = []
-            self.free_full(torch.cat(full_free_group))
+            self._release_full(torch.cat(full_free_group))
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
