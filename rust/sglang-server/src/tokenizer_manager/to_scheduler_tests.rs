@@ -636,6 +636,27 @@ fn negative_and_logprob_token_ids_rejected() {
     }
 }
 
+#[test]
+fn multimodal_sentinel_is_validated_after_expansion() {
+    let mut req = generate_req(24, SamplingParams::default());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    g.input_ids = Some(vec![1, -103, 2]);
+    g.mm = Some(Box::new(crate::message::request::MmData {
+        audio_data: Some(rmpv::Value::from("data:audio/wav;base64,xxxx")),
+        ..Default::default()
+    }));
+
+    assert!(validate(&mut req, &test_limits()).is_ok());
+    let RequestKind::Generate(g) = &mut req.kind else {
+        unreachable!()
+    };
+    assert!(validate_input_ids(g, test_limits().vocab_size).is_err());
+    g.input_ids = Some(vec![1, 103, 2]);
+    assert!(validate_input_ids(g, test_limits().vocab_size).is_ok());
+}
+
 /// A valid request is registered and handed onward — never deregistered.
 #[test]
 fn admitted_request_keeps_registration() {
