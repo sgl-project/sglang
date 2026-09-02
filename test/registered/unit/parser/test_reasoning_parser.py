@@ -530,6 +530,270 @@ class TestLing3Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "")
 
 
+class TestSkippedThinkAsContent(CustomTestCase):
+    """Template-opened reasoning (GLM-4.5 family) that ends with a natural stop
+    before any </think> is the model's answer, not truncated reasoning: the
+    template already emitted <think>, so the model skipped thinking and wrote
+    the answer straight away. finish_reason is the only signal that separates
+    this from a max_tokens cut."""
+
+    ANSWER = '```json\n{"kind": "tool", "operation": "alerts"}\n```'
+
+    def _detector(self, **kwargs):
+        return Glm45Detector(force_reasoning=True, **kwargs)
+
+    def test_stop_without_think_end_is_content(self):
+        detector = self._detector()
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.normal_text, self.ANSWER)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_length_without_think_end_stays_reasoning(self):
+        detector = self._detector()
+        detector.set_finish_reason("length")
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.reasoning_text, self.ANSWER)
+        self.assertEqual(result.normal_text, "")
+
+    def test_unknown_finish_reason_stays_reasoning(self):
+        """Callers that do not know how generation ended (/separate_reasoning)
+        keep today's behaviour."""
+        detector = self._detector()
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.reasoning_text, self.ANSWER)
+        self.assertEqual(result.normal_text, "")
+
+    def test_abort_without_think_end_stays_reasoning(self):
+        detector = self._detector()
+        detector.set_finish_reason("abort")
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.reasoning_text, self.ANSWER)
+        self.assertEqual(result.normal_text, "")
+
+    def test_engine_finish_reason_dict_with_eos_token_is_content(self):
+        detector = self._detector()
+        detector.set_finish_reason({"type": "stop", "matched": 154827})
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.normal_text, self.ANSWER)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_user_stop_string_inside_reasoning_stays_reasoning(self):
+        """A user stop sequence also reports finish_reason "stop", but it cut
+        the model off; only the model's own EOS says it chose to answer."""
+        detector = self._detector()
+        detector.set_finish_reason({"type": "stop", "matched": "\n\n"})
+        result = detector.detect_and_parse("half a thought")
+        self.assertEqual(result.reasoning_text, "half a thought")
+        self.assertEqual(result.normal_text, "")
+
+    def test_client_opened_think_in_continue_final_message_stays_reasoning(self):
+        """With continue_final_message the block was opened by the client's
+        assistant prefix, not by the template, so the premise does not hold."""
+        detector = Glm45Detector(
+            continue_final_message=True, previous_content="<think>half a"
+        )
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse(" thought")
+        self.assertEqual(result.reasoning_text, " thought")
+        self.assertEqual(result.normal_text, "")
+
+    def test_stop_with_tool_call_keeps_tool_split(self):
+        detector = self._detector()
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse("need a tool<tool_call>get_weather")
+        self.assertEqual(result.reasoning_text, "need a tool")
+        self.assertEqual(result.normal_text, "<tool_call>get_weather")
+
+    def test_stop_with_closed_reasoning_unchanged(self):
+        detector = self._detector()
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse("thinking</think>The answer is 42.")
+        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_stop_strips_echoed_think_start(self):
+        detector = self._detector()
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse("<think>" + self.ANSWER)
+        self.assertEqual(result.normal_text, self.ANSWER)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_flag_off_keeps_reasoning_on_stop(self):
+        detector = self._detector(skipped_think_as_content=False)
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.reasoning_text, self.ANSWER)
+        self.assertEqual(result.normal_text, "")
+
+    def test_default_off_for_other_detectors(self):
+        """Qwen3 writes its own <think></think> pair when it skips thinking, so
+        an unclosed block there is a real truncation; the rule stays opt-in."""
+        detector = Qwen3Detector(force_reasoning=True)
+        detector.set_finish_reason("stop")
+        result = detector.detect_and_parse(self.ANSWER)
+        self.assertEqual(result.reasoning_text, self.ANSWER)
+        self.assertEqual(result.normal_text, "")
+
+    def test_ling3_inherits_glm45_default(self):
+        self.assertTrue(Ling3Detector().skipped_think_as_content)
+
+    # --- streaming: reasoning streams live, finish() re-emits it as content ---
+
+    def _stream(self, detector, text, size):
+        reasoning, normal = "", ""
+        for i in range(0, len(text), size):
+            ret = detector.parse_streaming_increment(text[i : i + size])
+            reasoning += ret.reasoning_text
+            normal += ret.normal_text
+        return reasoning, normal
+
+    def test_streaming_stop_reemits_reasoning_as_content(self):
+        for size in (1, 5, 13):
+            with self.subTest(chunk=size):
+                detector = self._detector()
+                reasoning, normal = self._stream(detector, self.ANSWER, size)
+                self.assertEqual(reasoning, self.ANSWER)
+                self.assertEqual(normal, "")
+                detector.set_finish_reason("stop")
+                end = detector.finish()
+                self.assertEqual(end.normal_text, self.ANSWER)
+                self.assertEqual(end.reasoning_text, "")
+
+    def test_streaming_stop_flushes_held_back_tail_to_both_fields(self):
+        """A trailing slice that could start </think> is held back while
+        streaming; on stop it completes the reasoning stream and the re-emitted
+        content alike."""
+        detector = self._detector()
+        reasoning, _ = self._stream(detector, "answer <", 100)
+        self.assertEqual(reasoning, "answer ")
+        detector.set_finish_reason("stop")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "answer <")
+        self.assertEqual(end.reasoning_text, "<")
+
+    def test_streaming_length_flushes_reasoning_only(self):
+        detector = self._detector()
+        self._stream(detector, "answer <", 100)
+        detector.set_finish_reason("length")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.reasoning_text, "<")
+
+    def test_streaming_stop_no_stream_reasoning_emits_content_once(self):
+        detector = self._detector(stream_reasoning=False)
+        reasoning, normal = self._stream(detector, self.ANSWER, 5)
+        self.assertEqual((reasoning, normal), ("", ""))
+        detector.set_finish_reason("stop")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, self.ANSWER)
+        self.assertEqual(end.reasoning_text, "")
+
+    def test_streaming_tool_call_then_stop_does_not_reemit(self):
+        detector = self._detector()
+        reasoning, normal = self._stream(detector, "need a tool<tool_call>x", 7)
+        self.assertEqual(reasoning, "need a tool")
+        self.assertEqual(normal, "<tool_call>x")
+        detector.set_finish_reason("stop")
+        end = detector.finish()
+        self.assertEqual((end.normal_text, end.reasoning_text), ("", ""))
+
+    def test_streaming_closed_think_then_stop_does_not_reemit(self):
+        detector = self._detector()
+        reasoning, normal = self._stream(detector, "thinking</think>answer", 4)
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "answer")
+        detector.set_finish_reason("stop")
+        end = detector.finish()
+        self.assertEqual((end.normal_text, end.reasoning_text), ("", ""))
+
+    def test_streaming_user_stop_string_flushes_reasoning_only(self):
+        detector = self._detector()
+        self._stream(detector, "half a thought <", 100)
+        detector.set_finish_reason({"type": "stop", "matched": "\n\n"})
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.reasoning_text, "<")
+
+    def test_streaming_flag_off_stop_flushes_reasoning(self):
+        detector = self._detector(skipped_think_as_content=False)
+        self._stream(detector, "answer <", 100)
+        detector.set_finish_reason("stop")
+        end = detector.finish()
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.reasoning_text, "<")
+
+    # --- ReasoningParser: finish_reason plumbing and chat_template_kwargs ---
+
+    def _request(self, **chat_template_kwargs):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageUserParam,
+            ChatCompletionRequest,
+        )
+
+        return ChatCompletionRequest(
+            model="test",
+            messages=[ChatCompletionMessageUserParam(role="user", content="Hi")],
+            chat_template_kwargs=chat_template_kwargs or None,
+        )
+
+    def test_parse_non_stream_takes_finish_reason(self):
+        parser = ReasoningParser("glm45", force_reasoning=True)
+        self.assertEqual(
+            parser.parse_non_stream(self.ANSWER, finish_reason="stop"),
+            ("", self.ANSWER),
+        )
+        self.assertEqual(
+            parser.parse_non_stream(self.ANSWER, finish_reason="length"),
+            (self.ANSWER, ""),
+        )
+        self.assertEqual(parser.parse_non_stream(self.ANSWER), (self.ANSWER, ""))
+
+    def test_parse_stream_end_takes_finish_reason(self):
+        parser = ReasoningParser("glm45", force_reasoning=True)
+        self.assertEqual(parser.parse_stream_chunk(self.ANSWER), (self.ANSWER, ""))
+        self.assertEqual(
+            parser.parse_stream_end(finish_reason="stop"), ("", self.ANSWER)
+        )
+
+    def test_parser_takes_engine_finish_reason_dict(self):
+        parser = ReasoningParser("glm45", force_reasoning=True)
+        self.assertEqual(
+            parser.parse_non_stream(
+                self.ANSWER, finish_reason={"type": "stop", "matched": [154827]}
+            ),
+            ("", self.ANSWER),
+        )
+        self.assertEqual(
+            parser.parse_non_stream(
+                "half a thought", finish_reason={"type": "stop", "matched": "\n\n"}
+            ),
+            ("half a thought", ""),
+        )
+
+    def test_chat_template_kwargs_opt_out(self):
+        parser = ReasoningParser(
+            "glm45",
+            force_reasoning=True,
+            request=self._request(skipped_think_as_content=False),
+        )
+        self.assertEqual(
+            parser.parse_non_stream(self.ANSWER, finish_reason="stop"),
+            (self.ANSWER, ""),
+        )
+
+    def test_chat_template_kwargs_opt_in_for_other_detectors(self):
+        parser = ReasoningParser(
+            "qwen3",
+            force_reasoning=True,
+            request=self._request(skipped_think_as_content=True),
+        )
+        self.assertEqual(
+            parser.parse_non_stream(self.ANSWER, finish_reason="stop"),
+            ("", self.ANSWER),
+        )
+
+
 class TestHunyuanDetector(CustomTestCase):
     """Test cases for Hunyuan detector with tool interruption support."""
 
