@@ -83,9 +83,13 @@ void murmur_hash32_kernel_impl(
 }  // namespace
 
 at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices) {
-  TORCH_CHECK(seed.dim() == 1, "seed must be 1D");
-  TORCH_CHECK(positions.dim() == 1, "positions must be 1D");
-  TORCH_CHECK(col_indices.dim() == 1, "col_indices must be 1D");
+  CHECK_INPUT(seed);
+  CHECK_INPUT(positions);
+  CHECK_INPUT(col_indices);
+
+  CHECK_DIM(1, seed);
+  CHECK_DIM(1, positions);
+  CHECK_DIM(1, col_indices);
   TORCH_CHECK(seed.size(0) == positions.size(0), "seed and positions must have the same length");
 
   TORCH_CHECK(seed.scalar_type() == at::kUInt64, "seed must have dtype torch.uint64");
