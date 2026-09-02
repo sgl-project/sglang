@@ -11,7 +11,7 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 SGLang Diffusion has the following features:
   - Broad model support: Wan, FastWan, FLUX, Qwen-Image, LongCat-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, FastH3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
   - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
-  - Ease of use: OpenAI-compatible api, CLI, and python sdk support
+  - Ease of use: OpenAI-compatible api, CLI, python sdk, and a [ComfyUI plugin](apps/ComfyUI_SGLDiffusion/README.md)
   - Multi-platform support:
     - NVIDIA GPUs (H100, H200, A100, B200, 4090, 5090)
     - AMD GPUs (MI300X, MI325X, MI355X)

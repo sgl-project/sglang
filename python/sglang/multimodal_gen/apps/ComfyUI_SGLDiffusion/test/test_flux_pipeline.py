@@ -1,4 +1,4 @@
-"""Test for ComfyUIFluxPipeline with pass-through scheduler."""
+"""Test for FluxPipeline with pass-through scheduler."""
 
 import os
 import sys
@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
 
 def test_comfyui_flux_pipeline_direct() -> None:
-    """Test ComfyUIFluxPipeline with custom inputs."""
+    """Test FluxPipeline with custom inputs."""
     model_path = os.environ.get(
         "SGLANG_TEST_FLUX_MODEL_PATH",
         "black-forest-labs/FLUX.1-dev",  # Supports both safetensors file and diffusers format
@@ -20,7 +20,8 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     generator = DiffGenerator.from_pretrained(
         model_path=model_path,
-        pipeline_class_name="ComfyUIFluxPipeline",
+        model_id="FLUX.1-dev",
+        pipeline_class_name="FluxPipeline",
         num_gpus=2,
         comfyui_mode=True,
     )
@@ -68,6 +69,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
         width=width,
         num_frames=1,
         num_inference_steps=1,
+        guidance_scale=1.0,
         save_output=True,
         return_trajectory_latents=True,
     )
@@ -83,6 +85,10 @@ def test_comfyui_flux_pipeline_direct() -> None:
 
     clip_dim = 768
     req.prompt_embeds = [pooled_projections, encoder_hidden_states]
+    req.prompt_seq_lens = [
+        [int(pooled_projections.shape[0])],
+        [encoder_seq_len],
+    ]
 
     if req.guidance_scale > 1.0:
         dummy_neg_clip_embedding = torch.zeros(
@@ -103,11 +109,15 @@ def test_comfyui_flux_pipeline_direct() -> None:
             dummy_neg_clip_embedding,
             negative_encoder_hidden_states,
         ]
+        req.negative_prompt_seq_lens = [
+            [int(dummy_neg_clip_embedding.shape[0])],
+            [encoder_seq_len],
+        ]
     else:
         req.negative_prompt_embeds = None
 
     req.pooled_embeds = [pooled_projections]
-    req.neg_pooled_embeds = []
+    req.neg_pooled_embeds = [torch.zeros_like(pooled_projections)]
 
     if (
         req.guidance_scale > 1.0

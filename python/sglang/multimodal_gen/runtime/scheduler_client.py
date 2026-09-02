@@ -7,6 +7,11 @@ from typing import Any, Optional
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
+    materialize_cuda_refs,
+    release_retained_producer_tensors,
+    spill_cuda_tensors,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -22,7 +27,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
-from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
+from sglang.multimodal_gen.runtime.ipc_array import (
+    is_local_endpoint,
+    materialize_file_refs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
@@ -174,9 +182,10 @@ class SchedulerClient:
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
-            socket.send_pyobj(batch)
+            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
             output_batch = socket.recv_pyobj()
             _materialize_output_batch_file_refs(output_batch)
+            _materialize_local_cuda_refs(endpoint, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
@@ -286,10 +295,11 @@ class AsyncSchedulerClient:
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
             socket.connect(endpoint)
-            await socket.send(pickle.dumps(batch))
+            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
             payload = await socket.recv()
             output_batch = pickle.loads(payload)
             _materialize_output_batch_file_refs(output_batch)
+            _materialize_local_cuda_refs(endpoint, output_batch)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
@@ -329,6 +339,19 @@ class AsyncSchedulerClient:
 # Singleton instances for easy access
 async_scheduler_client = AsyncSchedulerClient()
 sync_scheduler_client = SchedulerClient()
+
+
+def _prepare_local_payload(endpoint: str, batch: Any) -> Any:
+    if is_local_endpoint(endpoint):
+        return spill_cuda_tensors(batch)
+    return batch
+
+
+def _materialize_local_cuda_refs(endpoint: str, output_batch: Any) -> None:
+    if is_local_endpoint(endpoint):
+        materialize_cuda_refs(output_batch)
+        # Request-side IPC retains are no longer needed after the round-trip.
+        release_retained_producer_tensors()
 
 
 def _materialize_output_batch_file_refs(output_batch: Any) -> None:
