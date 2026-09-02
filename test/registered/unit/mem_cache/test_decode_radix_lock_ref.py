@@ -87,6 +87,7 @@ class MockReq:
             cache_protected_len=cache_protected_len,
             swa_evicted_seqlen=0,
         )
+        self.kv_rotation_base = None
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]
