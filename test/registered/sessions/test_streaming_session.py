@@ -10,6 +10,7 @@ import unittest
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.streaming_session_kit import (
     AbortLeakReproKitMixin,
+    ClientDisconnectKitMixin,
     StreamingSessionKitMixin,
 )
 from sglang.test.server_fixtures.streaming_session_fixture import (
@@ -60,6 +61,12 @@ class TestStreamingSessionEagleV2RetractLargePage(TestStreamingSession):
         ("SGLANG_TEST_RETRACT", True),
         ("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", True),
     ]
+
+
+class TestStreamingSessionClientDisconnect(
+    StreamingSessionServerBase, ClientDisconnectKitMixin
+):
+    """Client disconnects mid-turn; the next turn must roll back cleanly."""
 
 
 class TestStreamingSessionAbortLeakRepro(

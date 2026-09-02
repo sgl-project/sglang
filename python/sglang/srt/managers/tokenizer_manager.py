@@ -230,6 +230,10 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+
+    # HTTP request handle, for client-disconnect probing of streaming
+    # sessions (see _await_session_ready_for_new_turn).
+    request: Optional[fastapi.Request] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -585,6 +589,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Streaming-session bookkeeping for client-disconnect aborts dispatched
+        # from _discard_pending_req_states. Maps the aborted rid to its session
+        # id and the session id to the settle event a follow-up request on the
+        # same session waits on (see _await_session_disconnect_settled).
+        self.disconnect_aborted_rid_to_session: Dict[str, str] = {}
+        self.session_settle_events: Dict[str, asyncio.Event] = {}
+        # session_id -> rid of the most recently dispatched request on that
+        # streaming session (validated against rid_to_state on use).
+        self.session_inflight_rids: Dict[str, str] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
 
@@ -818,6 +831,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    if obj.is_single:
+                        session_id = self._get_session_params_id(obj.session_params)
+                        if session_id:
+                            await self._await_session_ready_for_new_turn(session_id)
+                            self.session_inflight_rids[session_id] = obj.rid
                     self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
@@ -2205,6 +2223,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
+                if recv_obj.finished_reasons[i]:
+                    self._mark_session_settled_for_rid(rid)
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
@@ -2468,6 +2488,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                self._mark_session_settled_for_rid(rid)
 
                 # Mark ongoing LoRA request as finished.
                 if self.enable_lora and state.obj.lora_path:
@@ -3201,6 +3222,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # disconnects, amplified by prefix / abort_all fan-out.
         state = self.rid_to_state.get(recv_obj.rid)
         if state is None:
+            self._mark_session_settled_for_rid(recv_obj.rid)
             logger.info(
                 "Abort request for rid=%s not found in rid_to_state; "
                 "likely already finished/removed.",
@@ -3445,6 +3467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            state.request = request
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
@@ -3462,7 +3485,107 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            if (
+                state is not None
+                and not state.finished
+                and not getattr(obj, "background", False)
+            ):
+                # Torn down before completion: almost always a client
+                # disconnect. The request can still be live on the scheduler,
+                # and once its state is gone here the delayed background abort
+                # from create_abort_task is a no-op (abort_request
+                # early-returns for unknown rids). Abort it now so its KV is
+                # released promptly and streaming sessions roll back to the
+                # last committed turn, instead of decoding to max_new_tokens
+                # as a zombie whose output is later committed into the
+                # session (or racing the next turn's pre-abort and leaking
+                # pool memory, cf. #36475).
+                self._dispatch_to_scheduler(
+                    AbortReq(rid=rid, abort_message="Client disconnected")
+                )
+                session_id = self._get_session_params_id(
+                    getattr(state.obj, "session_params", None)
+                )
+                if session_id:
+                    self._register_session_settle_event(session_id, rid)
+
+    @staticmethod
+    def _get_session_params_id(session_params):
+        """session_params is a dict on GenerateReqInput and a SessionReqParam
+        object once tokenized; accept both."""
+        if session_params is None:
+            return None
+        if isinstance(session_params, dict):
+            return session_params.get("id")
+        return getattr(session_params, "id", None)
+
+    def _register_session_settle_event(self, session_id: str, rid: str):
+        """Track rid -> session and arm a fresh settle event for the session."""
+        self.disconnect_aborted_rid_to_session[rid] = session_id
+        event = self.session_settle_events.get(session_id)
+        if event is None or event.is_set():
+            self.session_settle_events[session_id] = asyncio.Event()
+
+    async def _await_session_ready_for_new_turn(self, session_id):
+        """Make sure the previous turn on a streaming session is retired
+        before dispatching a new one.
+
+        If the previous turn's client disconnected mid-stream, abort that
+        request and wait until the scheduler retires it, so the new request is
+        admitted against the rolled-back session state (mirroring the
+        explicit /abort_request behavior) instead of being pre-aborted by
+        SessionController.create_req while the old request is still in flight.
+        """
+        if not session_id:
+            return
+        inflight_rid = self.session_inflight_rids.get(session_id)
+        if inflight_rid is not None:
+            state = self.rid_to_state.get(inflight_rid)
+            if (
+                state is not None
+                and state.request is not None
+                and not getattr(state.obj, "background", False)
+                and await state.request.is_disconnected()
+            ):
+                self._register_session_settle_event(session_id, inflight_rid)
+                self.abort_request(inflight_rid)
+            # If the state is already gone, the disconnect teardown path has
+            # dispatched the abort and armed the event itself.
+        await self._await_session_disconnect_settled(session_id)
+
+    def _mark_session_settled_for_rid(self, rid: str):
+        """Signal that a client-disconnect-aborted request has settled."""
+        session_id = self.disconnect_aborted_rid_to_session.pop(rid, None)
+        if session_id is None:
+            return
+        event = self.session_settle_events.get(session_id)
+        if event is not None:
+            event.set()
+
+    async def _await_session_disconnect_settled(self, session_id):
+        """Wait until a just-disconnected streaming session settles.
+
+        A client disconnect aborts the in-flight request, but the scheduler
+        retires it only after its current forward pass completes. A follow-up
+        request racing into that window is pre-aborted by
+        SessionController.create_req ("Streaming session already has an
+        active request"). Waiting for the aborted request's final output lets
+        the new request run against the rolled-back session state, matching
+        the explicit /abort_request behavior.
+        """
+        if not session_id:
+            return
+        event = self.session_settle_events.get(session_id)
+        if event is None or event.is_set():
+            return
+        try:
+            await asyncio.wait_for(event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting for disconnected session %s to settle",
+                session_id,
+            )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
