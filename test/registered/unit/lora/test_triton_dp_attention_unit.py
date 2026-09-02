@@ -84,7 +84,7 @@ def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(
         "sglang.srt.lora.backend.triton_backend.dp_gather_replicate", gather
     )
     _, global_batch_info, lm_head_batch_infos = gather_dp_attention_lora_batch_info(
-        SimpleNamespace(global_num_tokens_cpu=[2, 2]),
+        SimpleNamespace(global_num_tokens_cpu=[2, 2], is_extend_in_batch=False),
         local_batch_info,
         graph_batch_info,
         True,
