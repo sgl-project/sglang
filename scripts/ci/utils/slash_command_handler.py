@@ -30,6 +30,7 @@ PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
+CHANGED_TESTS_FLAG = "--changed"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -628,19 +629,11 @@ def expand_glob_spec(file_part):
             expanded.add(p)
     matches = expanded
 
-    def _under_test_root(path):
-        return path.startswith("test/registered/") or path.startswith(
-            MULTIMODAL_TEST_DIR + "/"
-        )
-
     files = sorted(
         {
             os.path.normpath(p)
             for p in matches
-            if os.path.isfile(p)
-            and os.path.basename(p).startswith("test_")
-            and p.endswith(".py")
-            and _under_test_root(os.path.normpath(p))
+            if os.path.isfile(p) and _is_rerunnable_test_path(os.path.normpath(p))
         }
     )
     if not files:
@@ -650,6 +643,27 @@ def expand_glob_spec(file_part):
             f"(patterns only match files named `test_*.py`)."
         )
     return files, None
+
+
+def _is_rerunnable_test_path(path):
+    """A repo-relative `test_*.py` under one of the roots resolve_test_file() searches."""
+    under_test_root = path.startswith("test/registered/") or path.startswith(
+        MULTIMODAL_TEST_DIR + "/"
+    )
+    return (
+        under_test_root
+        and os.path.basename(path).startswith("test_")
+        and path.endswith(".py")
+    )
+
+
+def changed_test_files(pr):
+    """Rerunnable test files in the PR diff, as repo-relative paths (deleted files skipped)."""
+    return sorted(
+        f.filename
+        for f in pr.get_files()
+        if f.status != "removed" and _is_rerunnable_test_path(f.filename)
+    )
 
 
 def resolve_test_file(file_part):
@@ -1196,6 +1210,7 @@ def handle_rerun_test(
     skip_permission_check=False,
     command_label=None,
     refresh_precision_baseline=False,
+    include_changed_tests=False,
 ):
     """
     Handles the /rerun-test command. Resolves all test specs, groups them by
@@ -1213,7 +1228,7 @@ def handle_rerun_test(
     ):
         return False
 
-    if not test_specs:
+    if not test_specs and not include_changed_tests:
         comment.create_reaction("confused")
         pr.create_issue_comment(
             "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
@@ -1223,7 +1238,8 @@ def handle_rerun_test(
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
-            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)"
+            "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
+            f"- `/rerun-test {CHANGED_TESTS_FLAG}` (every test file this PR adds or modifies)"
         )
         return False
 
@@ -1232,6 +1248,17 @@ def handle_rerun_test(
         comment.create_reaction("confused")
         pr.create_issue_comment(gate_msg)
         return False
+
+    if include_changed_tests:
+        changed = changed_test_files(pr)
+        if not changed:
+            comment.create_reaction("confused")
+            pr.create_issue_comment(
+                f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no test files "
+                f"under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`."
+            )
+            return False
+        test_specs = list(test_specs or []) + changed
 
     # Phase 0: Expand wildcard specs into concrete test files. A spec whose
     # file part contains a glob metacharacter (* ? [) expands to every
@@ -1543,9 +1570,9 @@ def main():
     elif first_line.startswith("/rerun-test"):
         rerun_args = first_line.split()[1:]
         refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
-        test_specs = [
-            arg for arg in rerun_args if arg != PRECISION_BASELINE_REFRESH_FLAG
-        ]
+        include_changed_tests = CHANGED_TESTS_FLAG in rerun_args
+        flags = {PRECISION_BASELINE_REFRESH_FLAG, CHANGED_TESTS_FLAG}
+        test_specs = [arg for arg in rerun_args if arg not in flags]
         handle_rerun_test(
             repo,
             pr,
@@ -1555,6 +1582,7 @@ def main():
             token,
             command_label=first_line,
             refresh_precision_baseline=refresh_precision_baseline,
+            include_changed_tests=include_changed_tests,
         )
 
     else:

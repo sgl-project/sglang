@@ -1,4 +1,4 @@
-"""Tests for declarative slash-command test groups."""
+"""Tests for slash-command test selection: declarative groups and `--changed`."""
 
 import importlib.util
 import json
@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,6 +93,48 @@ class TestConfiguredTestGroups(CustomTestCase):
             )
         finally:
             os.chdir(previous_cwd)
+
+
+class TestChangedTestFiles(CustomTestCase):
+    def test_only_live_test_files_under_test_roots_are_selected(self):
+        """`--changed` must skip deleted tests, helpers, and non-test source; a
+        predicate that degrades to always-true would dispatch undispatchable files."""
+        handler = _load_handler()
+        pr = SimpleNamespace(
+            get_files=lambda: [
+                SimpleNamespace(
+                    filename="test/registered/unit/mem_cache/test_radix_cache_unit.py",
+                    status="modified",
+                ),
+                SimpleNamespace(
+                    filename="python/sglang/multimodal_gen/test/server/test_server_a.py",
+                    status="added",
+                ),
+                SimpleNamespace(
+                    filename="test/registered/core/test_srt_endpoint.py",
+                    status="removed",
+                ),
+                SimpleNamespace(
+                    filename="test/registered/unit/mem_cache/helpers.py",
+                    status="modified",
+                ),
+                SimpleNamespace(
+                    filename="python/sglang/srt/mem_cache/radix_cache.py",
+                    status="modified",
+                ),
+                SimpleNamespace(
+                    filename="test/manual/test_not_registered.py",
+                    status="added",
+                ),
+            ]
+        )
+        self.assertEqual(
+            handler.changed_test_files(pr),
+            [
+                "python/sglang/multimodal_gen/test/server/test_server_a.py",
+                "test/registered/unit/mem_cache/test_radix_cache_unit.py",
+            ],
+        )
 
 
 if __name__ == "__main__":
