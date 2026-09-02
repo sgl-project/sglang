@@ -29,6 +29,20 @@ def check_pipeline_parallelism(server_args: Any) -> None:
     if cfg.pp_size <= 1:
         return
 
+    # A PD prefill server never schedules decode. EAGLEWorkerV2 also returns
+    # after the target forward on non-last PP ranks, so only its last rank needs
+    # the draft worker. Other roles and worker families still enter a draft
+    # path on every rank and cannot safely use PP.
+    pp_prefill_eagle = (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        and not cfg.enable_multi_layer_eagle
+    )
+    assert cfg.speculative_algorithm is None or pp_prefill_eagle, (
+        "Pipeline parallelism with speculative decoding is only supported "
+        "for disaggregation prefill with EAGLE/EAGLE3; speculative decode "
+        "requires a draft worker on ranks where PP does not create one"
+    )
     assert (
         cfg.disable_overlap_schedule
     ), "Pipeline parallelism is not compatible with overlap schedule"

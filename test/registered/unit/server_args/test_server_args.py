@@ -105,16 +105,41 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
-    def test_pipeline_parallel_speculative_allows_synchronous_schedule(self):
-        args = ServerArgs(
-            model_path="dummy",
-            served_model_name="dummy",
-            pp_size=2,
-            disable_overlap_schedule=True,
-            speculative_algorithm="EAGLE",
-        )
+    def test_pipeline_parallel_speculative_allows_synchronous_pd_prefill(self):
+        for speculative_algorithm in ("EAGLE", "EAGLE3"):
+            with self.subTest(speculative_algorithm=speculative_algorithm):
+                args = ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    pp_size=2,
+                    disable_overlap_schedule=True,
+                    speculative_algorithm=speculative_algorithm,
+                    disaggregation_mode="prefill",
+                )
 
-        check_pipeline_parallelism(args)
+                check_pipeline_parallelism(args)
+
+    def test_pipeline_parallel_speculative_rejects_unsafe_worker_path(self):
+        cases = [
+            ("monolithic_eagle", "null", "EAGLE", False),
+            ("decode_eagle", "decode", "EAGLE", False),
+            ("prefill_multi_layer_eagle", "prefill", "EAGLE", True),
+            ("prefill_dflash", "prefill", "DFLASH", False),
+        ]
+        for name, disaggregation_mode, speculative_algorithm, multi_layer in cases:
+            with self.subTest(name=name):
+                args = ServerArgs(
+                    model_path="dummy",
+                    served_model_name="dummy",
+                    pp_size=2,
+                    disable_overlap_schedule=True,
+                    speculative_algorithm=speculative_algorithm,
+                    enable_multi_layer_eagle=multi_layer,
+                    disaggregation_mode=disaggregation_mode,
+                )
+
+                with self.assertRaisesRegex(AssertionError, "only supported"):
+                    check_pipeline_parallelism(args)
 
     def test_pipeline_parallel_speculative_rejects_overlap_schedule(self):
         args = ServerArgs(
@@ -123,6 +148,7 @@ class TestPrepareServerArgs(CustomTestCase):
             pp_size=2,
             disable_overlap_schedule=False,
             speculative_algorithm="EAGLE",
+            disaggregation_mode="prefill",
         )
 
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
