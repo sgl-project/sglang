@@ -17,6 +17,11 @@ from typing import Iterable, List, Optional, Set, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.mamba.lfm_short_conv import (
+    can_dispatch_fused_lfm_short_conv,
+    fused_lfm_short_conv_decode,
+    fused_lfm_short_conv_prefill,
+)
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
@@ -342,9 +347,26 @@ class Lfm2MoeShortConv(nn.Module):
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
-        Bx = B_gate * x
+        use_fused = can_dispatch_fused_lfm_short_conv(
+            B_gate,
+            C_gate,
+            x,
+            self.conv_weight,
+            self.conv_bias,
+            conv_state,
+        )
 
-        if forward_batch.forward_mode.is_decode():
+        if forward_batch.forward_mode.is_decode() and use_fused:
+            gated_conv_out = fused_lfm_short_conv_decode(
+                B_gate,
+                C_gate,
+                x,
+                self.conv_weight,
+                conv_state,
+                meta.cache_indices,
+            )
+        elif forward_batch.forward_mode.is_decode():
+            Bx = B_gate * x
             conv_out = causal_conv1d_update(
                 Bx,
                 conv_state,
@@ -353,11 +375,32 @@ class Lfm2MoeShortConv(nn.Module):
                 activation=None,
                 conv_state_indices=meta.cache_indices,
             )
+            gated_conv_out = C_gate * conv_out
         elif forward_batch.forward_mode.is_target_verify():
+            Bx = B_gate * x
             conv_out = shortconv_target_verify(
                 self, Bx, meta, forward_batch.spec_info.draft_token_num, "LFM2-MoE"
             )
+            gated_conv_out = C_gate * conv_out
+        elif (
+            use_fused
+            and meta.query_start_loc is not None
+            and meta.has_initial_state is not None
+            and forward_batch.extend_seq_lens_cpu
+        ):
+            gated_conv_out = fused_lfm_short_conv_prefill(
+                B_gate,
+                C_gate,
+                x,
+                self.conv_weight,
+                conv_state,
+                meta.query_start_loc,
+                meta.cache_indices,
+                meta.has_initial_state,
+                max(forward_batch.extend_seq_lens_cpu),
+            )
         else:
+            Bx = B_gate * x
             Bx_t = Bx.transpose(0, 1).contiguous()
             conv_out = causal_conv1d_fn(
                 Bx_t,
@@ -369,8 +412,9 @@ class Lfm2MoeShortConv(nn.Module):
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
+            gated_conv_out = C_gate * conv_out
 
-        output, _ = self.out_proj(C_gate * conv_out)
+        output, _ = self.out_proj(gated_conv_out)
         return output
 
 
