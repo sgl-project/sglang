@@ -95,6 +95,10 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        # Envelope-strided pools have a per-slot pitch != HV*K*V.
+        stride_h0_source=(
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,

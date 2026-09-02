@@ -815,11 +815,11 @@ class TextEncodingStage(ConditionEncodingStage):
                             embeds_mask
                         )
                     )
-                elif prompt_embeds.ndim == 2:
-                    seq_lens_list.append([int(prompt_embeds.shape[0])])
                 else:
                     seq_lens_list.append(
-                        [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+                        server_args.pipeline_config.seq_lens_from_prompt_embeds(
+                            prompt_embeds
+                        )
                     )
 
         # Shape results according to return_type
