@@ -753,6 +753,7 @@ class SchedulerPPMixin:
                     self.attn_cp_cpu_group,
                     src=self.attn_cp_group.ranks[0],
                 )
+                seq_lens, latencies = data_to_sync_tp
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
