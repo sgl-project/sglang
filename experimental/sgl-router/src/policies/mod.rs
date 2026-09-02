@@ -484,3 +484,314 @@ impl PolicyRegistry {
         }
     }
 }
+    #[test]
+    fn default_proposal_preserves_legacy_single_worker_selection() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let only = worker("only");
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&[Arc::clone(&only)], &ctx)
+            .expect("one candidate must produce a proposal");
+        assert_eq!(proposal.primary.id, only.id);
+        assert!(proposal.backup.is_none());
+    }
+
+    #[test]
+    fn only_step_one_policies_opt_into_shared_prefill_admission() {
+        assert!(PowerOfTwoChoicesPolicy::new().uses_shared_prefill_admission());
+        assert!(SessionAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
+        assert!(CacheAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
+        assert!(!RoundRobinPolicy::new().uses_shared_prefill_admission());
+    }
+
+    #[test]
+    fn power_of_two_proposal_keeps_the_other_sample_as_backup() {
+        let model = ModelId("model".into());
+        let ctx = SelectionContext::new(&model, None);
+        let workers = vec![worker("first"), worker("second")];
+        let policy = PowerOfTwoChoicesPolicy::new();
+
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+        let backup = proposal.backup.expect("P2 must retain its second sample");
+
+        assert_ne!(proposal.primary.id, backup.id);
+        assert_eq!(proposal.kind, ProposalKind::PowerOfTwo);
+    }
+
+    #[test]
+    fn prefill_proposal_adapter_keeps_existing_pair_semantics() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = PowerOfTwoChoicesPolicy::new();
+        let ctx = SelectionContext::new(&model, None);
+
+        let proposal = policy
+            .propose_prefill(&workers, &ctx)
+            .expect("P2 must produce a prefill proposal");
+
+        let PrefillProposal::Pair(pair) = proposal else {
+            panic!("existing policies must use the pair adapter");
+        };
+        assert_eq!(pair.kind, ProposalKind::PowerOfTwo);
+        assert!(pair.backup.is_some());
+    }
+
+    #[test]
+    fn cache_candidate_proposal_carries_target_specific_work() {
+        let hot = worker("hot");
+        let proposal = CacheCandidateProposal {
+            candidates: vec![CacheCandidate {
+                worker: Arc::clone(&hot),
+                matched_prefix_tokens: 75,
+                uncached_tokens: 25,
+                candidate_range_id: "global".into(),
+                max_pending_prefill_tokens: None,
+            }],
+            cache_switch_margin_tokens: 8,
+        };
+
+        assert_eq!(proposal.candidates[0].worker.id, hot.id);
+        assert_eq!(proposal.candidates[0].matched_prefix_tokens, 75);
+        assert_eq!(proposal.candidates[0].uncached_tokens, 25);
+    }
+
+    #[test]
+    fn power_of_two_orders_its_sample_with_fresh_engine_load_snapshot() {
+        let model = ModelId("model".into());
+        let busy = worker("busy");
+        let idle = worker("idle");
+        let workers = vec![Arc::clone(&busy), Arc::clone(&idle)];
+        let load_snapshot = snapshot(&[
+            (
+                &busy,
+                TestEngineLoad {
+                    num_waiting_reqs: 512,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+            (
+                &idle,
+                TestEngineLoad {
+                    num_waiting_reqs: 16,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let ctx = SelectionContext::new(&model, None).with_load_snapshot(&load_snapshot);
+
+        let proposal = PowerOfTwoChoicesPolicy::new()
+            .propose(&workers, &ctx)
+            .expect("two candidates must produce a proposal");
+
+        assert_eq!(proposal.primary.id, idle.id);
+        assert_eq!(
+            proposal.backup.expect("P2 keeps its other sample").id,
+            busy.id
+        );
+    }
+
+    #[test]
+    fn session_affinity_reuses_primary_and_stable_backup_without_remapping() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second"), worker("third")];
+        let policy = SessionAwarePolicy::new(AffinityConfig {
+            stable_pair: true,
+            ..Default::default()
+        });
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+
+        let first = policy
+            .propose(&workers, &ctx)
+            .expect("a new session must get an initial P2 proposal");
+        policy.commit_prefill_selection(&ctx, first.kind, &first.primary);
+        let second = policy
+            .propose(&workers, &ctx)
+            .expect("a mapped session must produce an affinity proposal");
+        let third = policy
+            .propose(&workers, &ctx)
+            .expect("the session assignment must remain stable");
+
+        assert_eq!(second.kind, ProposalKind::SessionAffinity);
+        assert_eq!(second.primary.id, first.primary.id);
+        assert_eq!(third.primary.id, second.primary.id);
+        assert_eq!(
+            third.backup.expect("stable pair has backup").id,
+            second.backup.expect("stable pair has backup").id,
+        );
+    }
+
+    #[test]
+    fn new_session_commits_the_final_capacity_admitted_worker() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = SessionAwarePolicy::new(AffinityConfig::default());
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let proposal = policy
+            .propose(&workers, &ctx)
+            .expect("a new session produces a P2 proposal");
+        let backup = proposal
+            .backup
+            .clone()
+            .expect("two workers retain a backup");
+        let loads = snapshot(&[
+            (
+                &proposal.primary,
+                TestEngineLoad {
+                    num_running_reqs: 1,
+                    num_tokens: 4_090,
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+            (
+                &backup,
+                TestEngineLoad {
+                    max_total_num_tokens: 4_096,
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &loads)
+            .expect("the admitted backup must become Final P");
+        assert_eq!(decision.selected.id, backup.id);
+        policy.commit_prefill_selection(&ctx, proposal.kind, &decision.selected);
+
+        let mapped = policy
+            .propose(&workers, &ctx)
+            .expect("the next turn must reuse the actual first-turn worker");
+        assert_eq!(mapped.kind, ProposalKind::SessionAffinity);
+        assert_eq!(mapped.primary.id, backup.id);
+    }
+
+    #[test]
+    fn read_only_affinity_probe_does_not_create_a_session_assignment() {
+        let model = ModelId("model".into());
+        let workers = vec![worker("first"), worker("second")];
+        let policy = SessionAwarePolicy::new(AffinityConfig::default());
+        let probe = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .without_affinity_assignment();
+
+        let first = policy
+            .propose(&workers, &probe)
+            .expect("read-only probe still gets a P2 candidate");
+        assert_eq!(first.kind, ProposalKind::PowerOfTwo);
+
+        let normal = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let second = policy
+            .propose(&workers, &normal)
+            .expect("first admitted route creates the session assignment");
+        assert_eq!(second.kind, ProposalKind::PowerOfTwo);
+        policy.commit_prefill_selection(&normal, second.kind, &second.primary);
+
+        let mapped = policy
+            .propose(&workers, &normal)
+            .expect("subsequent route resolves the admitted assignment");
+        assert_eq!(mapped.kind, ProposalKind::SessionAffinity);
+    }
+
+    #[test]
+    fn bucket_scoped_session_affinity_remembers_each_bucket_independently() {
+        let model = ModelId("model".into());
+        let short = worker("short");
+        let long = worker("long");
+        let policy = SessionAwarePolicy::new(AffinityConfig {
+            session_affinity_mode: SessionAffinityMode::Bucket,
+            ..Default::default()
+        });
+        let short_ctx = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .with_candidate_range_id("p-short");
+        let long_ctx = SelectionContext::new(&model, None)
+            .with_session_id(Some("session-a"))
+            .with_candidate_range_id("p-long");
+
+        let short_proposal = policy
+            .propose(&[Arc::clone(&short)], &short_ctx)
+            .expect("short bucket creates its assignment");
+        policy.commit_prefill_selection(&short_ctx, short_proposal.kind, &short_proposal.primary);
+        let long_proposal = policy
+            .propose(&[Arc::clone(&long)], &long_ctx)
+            .expect("long bucket creates an independent assignment");
+        policy.commit_prefill_selection(&long_ctx, long_proposal.kind, &long_proposal.primary);
+        let returned = policy
+            .propose(&[short], &short_ctx)
+            .expect("returning to short bucket reuses its assignment");
+
+        assert_eq!(returned.kind, ProposalKind::SessionAffinity);
+    }
+
+    #[test]
+    fn decode_pressure_tie_is_not_broken_by_worker_id() {
+        let a = worker("a");
+        let z = worker("z");
+        assert_eq!(
+            admission::compare_decode_pressure(&a, &z, None),
+            std::cmp::Ordering::Equal,
+            "P2 must preserve random sampling when observable pressure is equal"
+        );
+    }
+
+    #[test]
+    fn cache_affinity_uses_longest_routable_prefix_holder() {
+        let model = ModelId("model".into());
+        let hot = worker("hot");
+        let other = worker("other");
+        let workers = vec![Arc::clone(&hot), Arc::clone(&other)];
+        let signal = ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Matched {
+                matches: vec![
+                    sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: 8,
+                        worker_id: "gone".into(),
+                        address: "http://gone:30000".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: 6,
+                        worker_id: "hot".into(),
+                        address: "http://hot:30000".into(),
+                    },
+                    sgl_kv_indexer::PrefixMatch {
+                        matched_prefix_blocks: 4,
+                        worker_id: "other".into(),
+                        address: "http://other:30000".into(),
+                    },
+                ],
+                best_prefix_blocks: 8,
+            },
+            ),
+            (
+                &aggregate_busy,
+                TestEngineLoad {
+                    num_waiting_reqs: 1_000,
+                    ..TestEngineLoad::default()
+                },
+            ),
+        ]);
+
+        let lookup =
+            FreshLoadLookup::new(Some(&snapshot), [&aggregate_idle, &aggregate_busy, &stale]);
+        assert!(lookup.get(&aggregate_idle.id).is_some());
+        assert!(lookup.get(&stale.id).is_none());
+        assert_eq!(
+            lookup.compare_prefill_pressure(&aggregate_idle, &aggregate_busy),
+            std::cmp::Ordering::Greater,
+            "one stale member makes the complete candidate set compare by the captured local level"
+        );
+    }
+
+    fn cache_candidate(
+        worker: &Arc<Worker>,
+        matched_prefix_tokens: u64,
+        uncached_tokens: u64,
+        max_pending_prefill_tokens: Option<u64>,
+    ) -> CacheCandidate {
+        CacheCandidate {
+            worker: Arc::clone(worker),
+}
