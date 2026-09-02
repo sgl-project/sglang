@@ -166,6 +166,28 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+def count_expected_pool_hits(
+    results: dict[str, List[bool]], transfers: List[PoolTransfer]
+) -> dict[str, int]:
+    """Count leading hits, failing closed for missing or malformed pool results."""
+    hits: dict[str, int] = {}
+    for transfer in transfers:
+        name = str(transfer.name)
+        result = results.get(transfer.name)
+        if result is None:
+            result = results.get(name)
+        expected = len(transfer.keys or [])
+        if (
+            not isinstance(result, (list, tuple))
+            or len(result) != expected
+            or any(type(value) is not bool for value in result)
+        ):
+            hits[name] = 0
+            continue
+        hits[name] = result.index(False) if False in result else len(result)
+    return hits
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
