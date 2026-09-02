@@ -83,6 +83,7 @@ from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
+    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -91,7 +92,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     is_cuda,
     is_flashinfer_available,
-    is_sm100_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -111,7 +111,7 @@ elif not (_is_cpu and _is_cpu_amx_available):
     from vllm._custom_ops import awq_dequantize
 
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):

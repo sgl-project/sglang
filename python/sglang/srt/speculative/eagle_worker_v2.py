@@ -60,6 +60,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -977,7 +978,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, select_index
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -1007,15 +1008,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+        if not can_run_decode_cuda_graph:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
+        # Selected-row top-k remains worker-owned for both graph and eager
+        # paths; the graph runner only moves the row selection before lm_head.
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
@@ -1101,7 +1103,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if get_spec().speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
-                config_path=get_spec().speculative_adaptive_config,
+                AdaptiveSpeculativeParams(
+                    initial_steps=self.speculative_num_steps,
+                    cfg_path=get_spec().speculative_adaptive_config,
+                ),
             )
 
         # Some dummy tensors
