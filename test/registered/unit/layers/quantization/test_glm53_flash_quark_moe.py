@@ -16,6 +16,8 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterRunnerCore,
     AiterRunnerInput,
 )
+from sglang.srt.layers.quantization import fp8 as fp8_module
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     quark_w4a4_mxfp4_moe as quark_moe,
 )
@@ -38,6 +40,42 @@ class _CapturingRunner:
 
 
 class TestGLM53FlashQuarkMoE(CustomTestCase):
+    def test_block_fp8_forwards_separated_layout_and_clamp(self):
+        method = object.__new__(Fp8MoEMethod)
+        method.block_quant = True
+        method.is_fp4_expert = False
+        method.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((1, 4, 4), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.zeros((1, 4, 2), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            w2_weight_scale_inv=torch.ones((1, 4, 1), dtype=torch.float32),
+            hidden_pad=0,
+            intermediate_pad=0,
+            _aiter_gate_up_interleaved=False,
+            dispatcher=SimpleNamespace(expert_mask_gpu=torch.tensor([True, False])),
+        )
+        gate_mode = SimpleNamespace(
+            SEPARATED=SimpleNamespace(value="separated"),
+            INTERLEAVE=SimpleNamespace(value="interleave"),
+        )
+        fake_moe_common = types.ModuleType("aiter.ops.flydsl.moe_common")
+        fake_moe_common.GateMode = gate_mode
+        with (
+            patch.dict(
+                sys.modules,
+                {"aiter.ops.flydsl.moe_common": fake_moe_common},
+            ),
+            patch.object(fp8_module, "_use_aiter", True),
+        ):
+            quant_info = method.maybe_get_hip_aiter_quant_info(layer)
+
+        self.assertIsNotNone(quant_info)
+        self.assertEqual(quant_info.quant_type, AiterQuantType.PER_128X128)
+        self.assertEqual(quant_info.swiglu_limit, 10.0)
+        self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
+        self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+
     def test_apply_forwards_clamp_separated_layout_and_padding(self):
         scheme = object.__new__(QuarkW4A4MXFp4MoE)
         scheme.moe_runner_config = SimpleNamespace(swiglu_limit=10.0)

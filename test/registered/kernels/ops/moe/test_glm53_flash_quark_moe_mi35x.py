@@ -120,6 +120,33 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
             "s2": e8m0_shuffle(s2.view(-1, s2.shape[-1])).view_as(s2),
         }
 
+    @staticmethod
+    def _quantize_fp8_weight(weight):
+        rows, width = weight.shape
+        blocks = (
+            weight.float().view(rows // 128, 128, width // 128, 128).permute(0, 2, 1, 3)
+        )
+        scale = blocks.abs().amax(dim=(2, 3)).clamp(min=1e-12) / 448.0
+        quantized = (blocks / scale[:, :, None, None]).to(torch.float8_e4m3fn)
+        return (
+            quantized.permute(0, 2, 1, 3).reshape(rows, width),
+            scale,
+        )
+
+    @staticmethod
+    def _dequantize_fp8_weight(weight, scale):
+        return weight.float() * scale.repeat_interleave(128, dim=0).repeat_interleave(
+            128, dim=1
+        )
+
+    @staticmethod
+    def _quant_dequant_fp8_activation(activation):
+        tokens, width = activation.shape
+        groups = activation.float().view(tokens, width // 128, 128)
+        scale = groups.abs().amax(dim=-1).clamp(min=1e-12) / 448.0
+        quantized = (groups / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        return (quantized.float() * scale.unsqueeze(-1)).reshape(tokens, width)
+
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "weights"):
@@ -276,6 +303,94 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
         expected = self._torch_oracle(hidden, ids, weights)
         actual = self._aiter(hidden, ids, weights)
         self._assert_numerics(actual, expected)
+
+    def test_plain_block_fp8_matches_separated_oracle(self):
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(1234)
+        gate = (
+            torch.randn(
+                self.intermediate_size,
+                self.hidden_size,
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 0.05
+        )
+        up = (
+            torch.randn(
+                self.intermediate_size,
+                self.hidden_size,
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 0.05
+        )
+        down = (
+            torch.randn(
+                self.hidden_size,
+                self.intermediate_size,
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 0.01
+        )
+        gate_q, gate_s = self._quantize_fp8_weight(gate)
+        up_q, up_s = self._quantize_fp8_weight(up)
+        down_q, down_s = self._quantize_fp8_weight(down)
+        w13_raw = torch.cat([gate_q, up_q], dim=0).unsqueeze(0)
+        w13_scale = torch.cat([gate_s, up_s], dim=0).unsqueeze(0)
+        w2_raw = down_q.unsqueeze(0)
+        w2_scale = down_s.unsqueeze(0)
+        w13 = shuffle_weight(w13_raw.contiguous(), (16, 16))
+        w2 = shuffle_weight(w2_raw.contiguous(), (16, 16))
+        quant_info = AiterMoeQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            quant_type=AiterQuantType.PER_128X128,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            swiglu_limit=self.swiglu_limit,
+            fused_moe_kwargs={"gate_mode": GateMode.SEPARATED.value},
+        )
+
+        gate_deq = self._dequantize_fp8_weight(gate_q, gate_s)
+        up_deq = self._dequantize_fp8_weight(up_q, up_s)
+        down_deq = self._dequantize_fp8_weight(down_q, down_s)
+        for tokens in (1, 8, 32):
+            with self.subTest(tokens=tokens):
+                hidden = (
+                    torch.randn(
+                        tokens,
+                        self.hidden_size,
+                        generator=generator,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    * 0.5
+                )
+                hidden_qdq = self._quant_dequant_fp8_activation(hidden)
+                gate_out = F.linear(hidden_qdq, gate_deq).clamp(max=self.swiglu_limit)
+                up_out = F.linear(hidden_qdq, up_deq).clamp(
+                    -self.swiglu_limit, self.swiglu_limit
+                )
+                activated = self._quant_dequant_fp8_activation(
+                    (F.silu(gate_out) * up_out).bfloat16()
+                )
+                expected = F.linear(activated, down_deq).bfloat16()
+
+                runner_input = AiterRunnerInput(
+                    hidden_states=hidden,
+                    topk_ids=torch.zeros((tokens, 1), device="cuda", dtype=torch.int32),
+                    topk_weights=torch.ones(
+                        (tokens, 1), device="cuda", dtype=torch.float32
+                    ),
+                    quant_type=AiterQuantType.PER_128X128,
+                )
+                actual = self.runner.run(runner_input, quant_info, {}).hidden_states
+                self._assert_numerics(actual, expected, max_abs=0.75)
 
 
 if __name__ == "__main__":

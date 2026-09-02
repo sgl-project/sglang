@@ -151,6 +151,59 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
         }
 
     @classmethod
+    def _load_fp8_expert_bank(cls, layer, expert, shared=False):
+        if shared:
+            base = f"model.language_model.layers.{layer}.mlp.shared_experts"
+        else:
+            base = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
+        tensors = {}
+        scales = {}
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            tensors[projection] = cls._load(
+                cls.source,
+                cls.source_map,
+                f"{base}.{projection}.weight",
+            )
+            scales[projection] = cls._load(
+                cls.source,
+                cls.source_map,
+                f"{base}.{projection}.weight_scale_inv",
+            )
+        w13 = torch.cat([tensors["gate_proj"], tensors["up_proj"]], dim=0).unsqueeze(0)
+        s13 = torch.cat([scales["gate_proj"], scales["up_proj"]], dim=0).unsqueeze(0)
+        return {
+            "w13": shuffle_weight(w13.contiguous(), (16, 16)),
+            "w2": shuffle_weight(
+                tensors["down_proj"].unsqueeze(0).contiguous(), (16, 16)
+            ),
+            "s13": s13,
+            "s2": scales["down_proj"].unsqueeze(0),
+            "gate": tensors["gate_proj"].float()
+            * scales["gate_proj"]
+            .repeat_interleave(128, dim=0)
+            .repeat_interleave(128, dim=1)
+            .float(),
+            "up": tensors["up_proj"].float()
+            * scales["up_proj"]
+            .repeat_interleave(128, dim=0)
+            .repeat_interleave(128, dim=1)
+            .float(),
+            "down": tensors["down_proj"].float()
+            * scales["down_proj"]
+            .repeat_interleave(128, dim=0)
+            .repeat_interleave(128, dim=1)
+            .float(),
+        }
+
+    @staticmethod
+    def _quant_dequant_fp8_activation(activation):
+        tokens, width = activation.shape
+        groups = activation.float().view(tokens, width // 128, 128)
+        scale = groups.abs().amax(dim=-1).clamp(min=1e-12) / 448.0
+        quantized = (groups / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+        return (quantized.float() * scale.unsqueeze(-1)).reshape(tokens, width)
+
+    @classmethod
     def _dequant(cls, weight, scale):
         experts, rows, packed = weight.shape
         blocks = packed // 16
@@ -280,6 +333,61 @@ class TestGLM53FlashMoECheckpoint(CustomTestCase):
             and metadata["dtype"] == "F8_E4M3"
         ]
         self.assertEqual(len(preserved_mtp), (self.num_experts + 1) * 3)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+        "requires one gfx950 GPU",
+    )
+    def test_source_block_fp8_routed_shared_and_mtp_experts(self):
+        cases = (
+            (3, 0, False),
+            (43, 287, False),
+            (3, 0, True),
+            (45, 0, False),
+            (45, 0, True),
+        )
+        for layer, expert, shared in cases:
+            with self.subTest(layer=layer, expert=expert, shared=shared):
+                bank = self._load_fp8_expert_bank(layer, expert, shared=shared)
+                generator = torch.Generator(device="cuda")
+                generator.manual_seed(layer * 1000 + expert + int(shared))
+                hidden = (
+                    torch.randn(
+                        2,
+                        self.hidden_size,
+                        generator=generator,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    * 0.5
+                )
+                hidden_qdq = self._quant_dequant_fp8_activation(hidden)
+                gate = F.linear(hidden_qdq, bank["gate"]).clamp(max=self.swiglu_limit)
+                up = F.linear(hidden_qdq, bank["up"]).clamp(
+                    -self.swiglu_limit, self.swiglu_limit
+                )
+                activated = self._quant_dequant_fp8_activation(
+                    (F.silu(gate) * up).bfloat16()
+                )
+                expected = F.linear(activated, bank["down"]).bfloat16()
+
+                quant_info = AiterMoeQuantInfo(
+                    w13_weight=bank["w13"],
+                    w2_weight=bank["w2"],
+                    quant_type=AiterQuantType.PER_128X128,
+                    w13_scale=bank["s13"],
+                    w2_scale=bank["s2"],
+                    swiglu_limit=self.swiglu_limit,
+                    fused_moe_kwargs={"gate_mode": GateMode.SEPARATED.value},
+                )
+                runner_input = AiterRunnerInput(
+                    hidden_states=hidden,
+                    topk_ids=torch.zeros((2, 1), device="cuda", dtype=torch.int32),
+                    topk_weights=torch.ones((2, 1), device="cuda", dtype=torch.float32),
+                    quant_type=AiterQuantType.PER_128X128,
+                )
+                actual = self.runner.run(runner_input, quant_info, {}).hidden_states
+                self._assert_numerics(actual, expected)
 
     @unittest.skipUnless(
         torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
