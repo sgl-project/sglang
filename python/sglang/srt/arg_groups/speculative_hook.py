@@ -40,8 +40,11 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
 
 
 def _reject_mamba_radix_cache_for_cpu_spec(server_args: ServerArgs) -> None:
-    """CPU resolves the strategy to no_buffer, which has no spec-aware state
-    tracking, and has no extra_buffer FLA kernels to fall back on."""
+    """Neither mamba radix cache strategy serves speculative decoding on CPU:
+    extra_buffer needs FLA kernels CPU does not have, and no_buffer has no
+    spec-aware state tracking. The extra_buffer arm is already refused during
+    the model-hook resolution that runs before this one, so this guard covers
+    the no_buffer arm and names the flag that resolves either."""
     cfg = resolving_view(server_args)
     if cfg.device != "cpu" or cfg.disable_radix_cache:
         return

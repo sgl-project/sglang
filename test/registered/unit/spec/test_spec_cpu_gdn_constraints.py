@@ -11,11 +11,13 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 QWEN3_NEXT_ARCH = "Qwen3NextForCausalLM"
 
 
-def _make_spec_args(device: str, arch: str, topk: int) -> ServerArgs:
+def _make_spec_args(
+    device: str, arch: str, topk: int, algorithm: str = "EAGLE"
+) -> ServerArgs:
     # model_path="dummy" short-circuits ServerArgs.__post_init__; invoke the
     # speculative hook directly (same pattern as the unit/server_args tests).
     args = ServerArgs(model_path="dummy")
-    args.speculative_algorithm = "EAGLE"
+    args.speculative_algorithm = algorithm
     args.device = device
     # Resolved during __post_init__ on real args; the topk > 1 paths compare it.
     args.page_size = 1
@@ -42,6 +44,15 @@ class TestSpecMambaRadixCacheGuardOnCPU(CustomTestCase):
         state tracking, so the combination must be rejected rather than
         resolved into a spec-incompatible setup."""
         args = _make_spec_args(device="cpu", arch=QWEN3_NEXT_ARCH, topk=1)
+        args.disable_radix_cache = False
+        with self.assertRaisesRegex(ValueError, "radix cache"):
+            handle_speculative_decoding(args)
+
+    def test_ngram_rejects_radix_cache_on_cpu(self):
+        # the guard sits in the NGRAM handler as well as the EAGLE family one
+        args = _make_spec_args(
+            device="cpu", arch=QWEN3_NEXT_ARCH, topk=1, algorithm="NGRAM"
+        )
         args.disable_radix_cache = False
         with self.assertRaisesRegex(ValueError, "radix cache"):
             handle_speculative_decoding(args)
