@@ -117,6 +117,42 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
+
+# Whether the installed sgl-kernel-xpu build's fused_experts() supports FP8
+# MoE (use_fp8_w8a8=True). Older builds hard-assert against it; probe the
+# source once (cheap, no device work) and cache the result so we don't
+# reinspect on every forward call. Once sgl-kernel-xpu adds real FP8 MoE
+# support (tracked: https://github.com/sgl-project/sgl-kernel-xpu/pull/341),
+# this will automatically detect it and stop falling back.
+_xpu_fp8_moe_kernel_supported: Optional[bool] = None
+
+
+def _xpu_moe_kernel_supports_fp8() -> bool:
+    global _xpu_fp8_moe_kernel_supported
+    if _xpu_fp8_moe_kernel_supported is None:
+        try:
+            import inspect
+
+            from sgl_kernel import fused_experts
+
+            src = inspect.getsource(fused_experts)
+            _xpu_fp8_moe_kernel_supported = "assert use_fp8_w8a8 is False" not in src
+        except Exception:
+            # Conservatively assume unsupported if we can't introspect.
+            _xpu_fp8_moe_kernel_supported = False
+        if not _xpu_fp8_moe_kernel_supported:
+            logger.warning(
+                "sgl-kernel-xpu's fused_experts() does not support FP8 MoE in "
+                "this build (see https://github.com/sgl-project/sgl-kernel-xpu/"
+                "pull/341, not yet merged/installed). Falling back to the "
+                "generic Triton MoE runner for FP8 layers; BF16/unquantized "
+                "MoE is unaffected and still uses the dedicated XPU kernel. "
+                "This fallback is slower than a dedicated kernel and is a "
+                "functional stopgap, not the final XPU FP8 MoE path."
+            )
+    return _xpu_fp8_moe_kernel_supported
+
+
 # gfx942 (MI300) has no MX matmul HW; MXFP8 checkpoints are converted to
 # block-fp8 [128,128] at load and run through the native block-fp8 kernels.
 # SGLANG_FORCE_MXFP8_BLOCK_CONVERT=1 opts into that same block-fp8 path on
@@ -2423,41 +2459,48 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_xpu_backend():
-            # sgl-kernel-xpu path
-            from sgl_kernel import fused_experts
-
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
-            output = fused_experts(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                b1=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-                use_mxfp4_w4a16=use_mxfp4_w4a16,
-                use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                activation=moe_runner_config.activation,
-                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
-                gemm1_alpha=moe_runner_config.gemm1_alpha,
-                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
-                swiglu_limit=moe_runner_config.swiglu_limit,
-            )
-            return StandardCombineInput(hidden_states=output)
+
+            # sgl-kernel-xpu path - only take it if the installed build
+            # actually supports the requested quant mode. Older builds
+            # hard-assert against FP8 MoE (tracked:
+            # https://github.com/sgl-project/sgl-kernel-xpu/pull/341); fall
+            # through to the generic Triton MoE runner below in that case,
+            # which already supports FP8 + block-wise scales.
+            if not use_fp8_w8a8 or _xpu_moe_kernel_supports_fp8():
+                from sgl_kernel import fused_experts
+
+                output = fused_experts(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    b1=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                    use_mxfp4_w4a16=use_mxfp4_w4a16,
+                    use_fp8_w8a8=use_fp8_w8a8,
+                    w1_scale=(
+                        layer.w13_weight_scale_inv
+                        if self.block_quant
+                        else layer.w13_weight_scale
+                    ),
+                    w2_scale=(
+                        layer.w2_weight_scale_inv
+                        if self.block_quant
+                        else layer.w2_weight_scale
+                    ),
+                    activation=moe_runner_config.activation,
+                    routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                    gemm1_alpha=moe_runner_config.gemm1_alpha,
+                    gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
+                )
+                return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
