@@ -904,8 +904,39 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    # Stage draft_extend's shared-buffer reads (the metadata init's
+    # req_to_token gathers) before verify; False keeps post-verify sequencing.
+    def _draft_extend_plan_for_decode(self, batch: ScheduleBatch) -> bool:
+        runner = self.cuda_graph_runner_for_draft_extend
+        if runner is None or batch.forward_mode.is_idle():
+            return False
+        # SWA metadata derives its prefix from num_accept_tokens (flashinfer
+        # update_sliding_window), a verify product that does not exist yet.
+        if self.draft_runner.sliding_window_size is not None:
+            return False
+        # The DP-padded width would duplicate init_new's token-unit transform;
+        # oversized batches would overflow the bucket pad.
+        if runner.require_mlp_tp_gather or len(batch.seq_lens) > runner.max_bs:
+            return False
+        num_draft_tokens = self.speculative_num_draft_tokens
+        runner.stage_shared_reads(
+            # Forward sees post-write length, matching prepare_for_draft_extend.
+            seq_lens=batch.seq_lens + num_draft_tokens,
+            seq_lens_cpu=(
+                batch.seq_lens_cpu + num_draft_tokens
+                if batch.seq_lens_cpu is not None
+                else None
+            ),
+            req_pool_indices=batch.req_pool_indices,
+            out_cache_loc_dsv4=getattr(batch, "out_cache_loc_dsv4", None),
+        )
+        return True
+
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        staged: bool = False,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -977,7 +1008,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, staged=staged
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -1246,6 +1277,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            # Stage draft_extend's shared-buffer reads before the verify launch.
+            staged_draft_extend = self.draft_worker._draft_extend_plan_for_decode(batch)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1264,7 +1297,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._draft_extend_for_decode(
+                        batch, batch_output, staged=staged_draft_extend
+                    )
 
             return batch_output
 

@@ -469,7 +469,98 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def execute(self, forward_batch: ForwardBatch):
+    # Out-graph metadata init over the padded static buffers.
+    def _init_out_graph_metadata(
+        self,
+        *,
+        bs: int,
+        raw_bs: int,
+        num_tokens: int,
+        input_ids: Optional[torch.Tensor],
+        seq_lens_sum: Optional[int],
+        has_seq_lens_cpu: bool,
+        spec_info,
+        out_cache_loc_dsv4,
+    ):
+        buffers = self.buffers
+        from types import SimpleNamespace
+
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        fb_view = SimpleNamespace(
+            batch_size=bs,
+            forward_mode=self.forward_mode,
+            input_ids=input_ids,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(buffers.seq_lens_cpu if has_seq_lens_cpu else None),
+            encoder_lens=None,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+            spec_info=spec_info,
+        )
+        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
+    # Pre-verify run of the out-graph metadata init (its pool gathers read
+    # req_to_token); execute(staged=True) then skips the init.
+    def stage_shared_reads(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        req_pool_indices: torch.Tensor,
+        out_cache_loc_dsv4=None,
+    ):
+        buffers = self.buffers
+        raw_bs = req_pool_indices.shape[0]
+        num_tokens = raw_bs * self.captured_req_width
+        bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+
+        if bs != raw_bs:
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+            # Pair with seq_lens fill: padded rows must point at reserved
+            # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
+            buffers.req_pool_indices.zero_()
+        _grouped_foreach_copy_(
+            [buffers.seq_lens[:raw_bs], buffers.req_pool_indices[:raw_bs]],
+            [seq_lens, req_pool_indices],
+        )
+        seq_lens_sum = None
+        if seq_lens_cpu is not None:
+            if bs != raw_bs:
+                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu)
+            seq_lens_sum = int(seq_lens_cpu.sum())
+
+        self._init_out_graph_metadata(
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=num_tokens,
+            input_ids=buffers.input_ids[:num_tokens],
+            seq_lens_sum=seq_lens_sum,
+            has_seq_lens_cpu=seq_lens_cpu is not None,
+            spec_info=self._make_spec_view(bs),
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+        )
+
+    # Shape-only stand-in for the not-yet-built spec_info: the init reads
+    # verify products only by shape, so stale buffer values are fine.
+    def _make_spec_view(self, bs: int) -> EagleDraftExtendInput:
+        buffers = self.buffers
+        spec_view = EagleDraftExtendInput(
+            hidden_states=None,
+            num_correct_drafts=buffers.num_correct_drafts[:bs],
+            num_accept_tokens=buffers.num_accept_tokens[:bs],
+            num_tokens_per_req=self.captured_req_width,
+            num_tokens_for_logprob_per_req=self.captured_req_width,
+        )
+        spec_view.extend_seq_lens_cpu = [self.captured_req_width] * bs
+        spec_view.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
+        return spec_view
+
+    def execute(self, forward_batch: ForwardBatch, staged: bool = False):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         buffers = self.buffers
@@ -570,28 +661,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        from types import SimpleNamespace
-
-        seq_lens_sum = forward_batch.seq_lens_sum
-        if seq_lens_sum is not None:
-            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        fb_view = SimpleNamespace(
-            batch_size=bs,
-            forward_mode=self.forward_mode,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-            ),
-            encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-            spec_info=forward_batch.spec_info,
-        )
-        self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+        if not staged:
+            # A staged replay ran this init at plan time (stage_shared_reads).
+            self._init_out_graph_metadata(
+                bs=bs,
+                raw_bs=raw_bs,
+                num_tokens=num_tokens,
+                input_ids=getattr(forward_batch, "input_ids", None),
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                has_seq_lens_cpu=forward_batch.seq_lens_cpu is not None,
+                spec_info=forward_batch.spec_info,
+                out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            )
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
