@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -74,7 +75,9 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
         last_node=None,
-        kv=SimpleNamespace(
+        # The real record, so the scheduler reads the same fields and defaults
+        # it does in production.
+        kv=ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
             kv_allocated_len=(

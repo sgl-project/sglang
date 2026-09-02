@@ -150,7 +150,6 @@ logger = logging.getLogger(__name__)
 # lists can otherwise turn the lower launch overhead into substantially more
 # model work than an exact-shape eager forward.
 _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
-_is_hip = is_hip()
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)

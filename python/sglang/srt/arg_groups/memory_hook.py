@@ -24,10 +24,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
-def generate_dllm_prefill_cuda_graph_batch_sizes(
-    server_args: Any, max_bs: int
-) -> Optional[list[int]]:
-    """Generate exact aggregate-token buckets for multi-block dLLM prefill."""
+def dllm_prefill_graph_alignment(server_args: Any) -> Optional[int]:
+    """Token granularity every pure dLLM prefill batch is a multiple of.
+
+    ``PrefillAdder._get_dllm_extend_len`` rounds each pure-prefill extend down
+    to ``lcm(page_size, block_size)``, so an aggregate batch total is always a
+    multiple of it. Returns ``None`` when the run has no dLLM prefill graph.
+
+    The page size is resolved rather than read: this runs at memory sizing,
+    before ``_page_size_default`` and the backend page constraints declare it.
+    """
     cfg = resolving_view(server_args)
     if cfg.dllm_algorithm is None:
         return None
@@ -41,15 +47,36 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     from sglang.srt.dllm.config import DllmConfig
 
     dllm_config = DllmConfig.from_server_args(server_args)
-    if dllm_config.prefill_block_size <= dllm_config.block_size:
-        return None
-
     page_size = resolve_dllm_page_size(
         page_size=resolve_default_page_size(cfg),
         block_size=dllm_config.block_size,
         disable_radix_cache=cfg.disable_radix_cache,
     )
-    alignment = math.lcm(page_size, dllm_config.block_size)
+    return math.lcm(page_size, dllm_config.block_size)
+
+
+def generate_dllm_prefill_cuda_graph_batch_sizes(
+    server_args: Any, max_bs: int
+) -> Optional[list[int]]:
+    """Generate exact aggregate-token buckets for pure dLLM prefill.
+
+    Pure dLLM prefill runs bidirectional block attention and cannot be padded
+    up to a captured bucket, so ``can_replay_locally`` requires an exact match
+    (see ``PrefillCudaGraphRunner``). The generic geometric schedule would miss
+    most legal totals; capture every reachable aligned total instead.
+
+    This is not multi-block-specific: the scheduler emits aligned totals for
+    single-block runs too, and the runner's exact-bucket gate applies to every
+    pure dLLM prefill.
+    """
+    alignment = dllm_prefill_graph_alignment(server_args)
+    if alignment is None:
+        return None
+
+    from sglang.srt.dllm.config import DllmConfig
+
+    cfg = resolving_view(server_args)
+    dllm_config = DllmConfig.from_server_args(server_args)
     max_tokens = dllm_config.prefill_block_size * dllm_config.max_running_requests
     if cfg.max_prefill_tokens is not None:
         max_tokens = min(max_tokens, cfg.max_prefill_tokens)
@@ -58,13 +85,22 @@ def generate_dllm_prefill_cuda_graph_batch_sizes(
     capture_bs = (
         list(range(alignment, max_tokens + 1, alignment)) if max_tokens > 0 else []
     )
-    logger.info(
-        "Configured %d exact multi-block dLLM prefill CUDA graph buckets: "
-        "alignment=%d, max_tokens=%d",
-        len(capture_bs),
-        alignment,
-        max_tokens,
-    )
+    if capture_bs:
+        logger.info(
+            "Configured %d exact dLLM prefill CUDA graph buckets: "
+            "alignment=%d, max_tokens=%d",
+            len(capture_bs),
+            alignment,
+            max_tokens,
+        )
+    else:
+        # An empty list leaves the breakable prefill graph with nothing to
+        # capture, so every pure dLLM prefill stays eager.
+        logger.warning(
+            "No dLLM prefill CUDA graph bucket fits alignment=%d within the "
+            "prefill budget; pure dLLM prefill will run eager.",
+            alignment,
+        )
     return capture_bs
 
 

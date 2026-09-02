@@ -493,32 +493,19 @@ class SchedulerDllmMixin:
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
 
-        kv = getattr(req, "kv", None)
-        req_pool_idx = getattr(kv, "req_pool_idx", None)
-        mamba_pool_idx = getattr(kv, "mamba_pool_idx", None)
-        if req_pool_idx is not None or mamba_pool_idx is not None:
+        # `Req.kv` is always a ReqKvInfo, so every field below is present.
+        kv = req.kv
+        if kv.req_pool_idx is not None or kv.mamba_pool_idx is not None:
             release_kv_cache(req, self.tree_cache, is_insert=False)
             return
-        if kv is None:
-            return
 
-        cache_protected_len = getattr(
-            kv, "cache_protected_len", getattr(req, "cache_protected_len", 0)
-        )
-        uncached = req.prefix_indices[cache_protected_len:]
+        uncached = req.prefix_indices[kv.cache_protected_len :]
         if len(uncached):
             self.token_to_kv_pool_allocator.free(uncached)
         if req.last_node is not None:
             self.tree_cache.dec_lock_ref(req.last_node)
             req.last_node = None
-        mark_released = getattr(kv, "mark_kv_released", None)
-        if callable(mark_released):
-            mark_released()
-        else:
-            if hasattr(kv, "kv_allocated_len"):
-                kv.kv_allocated_len = 0
-            if hasattr(kv, "swa_evicted_seqlen"):
-                kv.swa_evicted_seqlen = 0
+        kv.mark_kv_released()
 
     def _abort_dllm_req_exact(self: Scheduler, req: Req) -> None:
         self._cleanup_dllm_req(req)

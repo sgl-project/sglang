@@ -310,7 +310,12 @@ class TestPrepareServerArgs(CustomTestCase):
 
         self.assertEqual(capture_bs, list(range(32, 513, 32)))
 
-    def test_dllm_prefill_graph_buckets_only_for_multi_block(self):
+    def test_dllm_prefill_graph_buckets_cover_single_block_runs(self):
+        # can_replay_locally requires an exact bucket for *every* pure dLLM
+        # prefill, not only multi-block, and the scheduler emits aligned totals
+        # in both cases. Restricting the exact schedule to multi-block would
+        # leave single-block prefill on the generic geometric buckets, which it
+        # can essentially never hit.
         config = CudaGraphConfig(
             prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512)
         )
@@ -333,7 +338,22 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             capture_bs = generate_dllm_prefill_cuda_graph_batch_sizes(args, 512)
 
-        self.assertIsNone(capture_bs)
+        # block_size * max_running_requests = 256 caps below max_bs.
+        self.assertEqual(capture_bs, list(range(32, 257, 32)))
+
+    def test_dllm_prefill_graph_buckets_skipped_without_breakable_graph(self):
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=512)
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=32,
+            disable_radix_cache=False,
+            _resolved_overrides=[],
+            max_prefill_tokens=768,
+        )
+        self.assertIsNone(generate_dllm_prefill_cuda_graph_batch_sizes(args, 512))
 
     def test_dllm_prefill_graph_buckets_preserve_explicit_config(self):
         config = CudaGraphConfig(
@@ -395,6 +415,142 @@ class TestPrepareServerArgs(CustomTestCase):
         resolved_cfg = resolving_view(args).cuda_graph_config
         self.assertEqual(resolved_cfg.decode.backend, Backend.DISABLED)
         self.assertEqual(resolved_cfg.prefill.backend, Backend.DISABLED)
+
+    def _deepep_dllm_args(self, block_size):
+        config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512),
+        )
+        return SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=1,
+            disable_radix_cache=False,
+            moe_a2a_backend="deepep",
+            max_prefill_tokens=512,
+            _resolved_overrides=[],
+        ), SimpleNamespace(
+            block_size=block_size,
+            prefill_block_size=block_size * 4,
+            max_running_requests=8,
+        )
+
+    def test_dllm_deepep_disables_prefill_graph_when_alignment_is_not_8x(self):
+        # SDAR-style block_size=4: exact dLLM buckets step by 4, which DeepEP
+        # a2a capture cannot take. No bucket satisfies both, so stay eager.
+        args, dllm_config = self._deepep_dllm_args(block_size=4)
+        with (
+            patch(
+                "sglang.srt.dllm.config.DllmConfig.from_server_args",
+                return_value=dllm_config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.dllm_hook.get_platform",
+                return_value=SimpleNamespace(is_hip=False),
+            ),
+        ):
+            handle_dllm_cuda_graph_compatibility(args)
+
+        resolved_cfg = resolving_view(args).cuda_graph_config
+        self.assertEqual(resolved_cfg.prefill.backend, Backend.DISABLED)
+        # Decode is untouched: the 8-alignment constraint is prefill-only.
+        self.assertEqual(resolved_cfg.decode.backend, Backend.FULL)
+
+    def test_dllm_deepep_keeps_prefill_graph_when_alignment_is_8x(self):
+        args, dllm_config = self._deepep_dllm_args(block_size=32)
+        with (
+            patch(
+                "sglang.srt.dllm.config.DllmConfig.from_server_args",
+                return_value=dllm_config,
+            ),
+            patch(
+                "sglang.srt.arg_groups.dllm_hook.get_platform",
+                return_value=SimpleNamespace(is_hip=False),
+            ),
+        ):
+            handle_dllm_cuda_graph_compatibility(args)
+
+        self.assertEqual(
+            resolving_view(args).cuda_graph_config.prefill.backend, Backend.BREAKABLE
+        )
+
+    def test_deepep_leaves_unset_dllm_prefill_buckets_for_memory_sizing(self):
+        # Fabricating generic buckets here would make memory_hook's `bs is None`
+        # guard false, so the exact dLLM schedule would never be installed.
+        from sglang.srt.arg_groups.cuda_graph_hook import apply_deepep_adjustments
+
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512)
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            moe_a2a_backend="deepep",
+            _resolved_overrides=[],
+        )
+
+        apply_deepep_adjustments(args)
+
+        self.assertIsNone(resolving_view(args).cuda_graph_config.prefill.bs)
+
+    def test_dllm_prefill_buckets_are_rebuilt_when_page_size_moves(self):
+        # Memory sizing predicted alignment 32; the resolution settled on a
+        # page size that makes it 96, so the captured list is unreachable.
+        from sglang.srt.arg_groups.dllm_hook import (
+            _reconcile_dllm_prefill_graph_buckets,
+        )
+
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(
+                backend=Backend.BREAKABLE, max_bs=512, bs=list(range(32, 513, 32))
+            )
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=12,
+            disable_radix_cache=True,
+            max_prefill_tokens=512,
+            _cuda_graph_config_locked=set(),
+            _resolved_overrides=[],
+        )
+        dllm_config = SimpleNamespace(
+            block_size=32, prefill_block_size=128, max_running_requests=8
+        )
+        with patch(
+            "sglang.srt.dllm.config.DllmConfig.from_server_args",
+            return_value=dllm_config,
+        ):
+            _reconcile_dllm_prefill_graph_buckets(args)
+
+        # lcm(12, 32) = 96
+        self.assertEqual(
+            resolving_view(args).cuda_graph_config.prefill.bs,
+            list(range(96, 481, 96)),
+        )
+
+    def test_dllm_prefill_buckets_reconcile_respects_user_lock(self):
+        from sglang.srt.arg_groups.dllm_hook import (
+            _reconcile_dllm_prefill_graph_buckets,
+        )
+
+        config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=512, bs=[128, 256])
+        )
+        args = SimpleNamespace(
+            dllm_algorithm="LowConfidence",
+            cuda_graph_config=config,
+            page_size=12,
+            disable_radix_cache=True,
+            max_prefill_tokens=512,
+            _cuda_graph_config_locked={(Phase.PREFILL, "bs")},
+            _resolved_overrides=[],
+        )
+
+        _reconcile_dllm_prefill_graph_buckets(args)
+
+        self.assertEqual(config.prefill.bs, [128, 256])
+        self.assertEqual(resolving_view(args)._resolved_overrides, [])
 
     @patch(
         "sglang.srt.dllm.config.DllmConfig.from_server_args",
