@@ -11,7 +11,7 @@ from sglang.kernels.ops.qwen4_ple import (
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-b200")
+register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 _EOS = 248044
