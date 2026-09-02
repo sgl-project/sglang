@@ -26,7 +26,7 @@ from mori.io import (
     StatusCode,
 )
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -42,7 +42,11 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_dsa_tail_transfer_blocks,
+    slice_dsa_tail_dst_ptrs_for_pp,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -1288,9 +1292,13 @@ class MoriKVManager(CommonKVManager):
         for i, st in enumerate(state_types):
             src_indices = src_state_indices[i] if i < len(src_state_indices) else None
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else None
-            if src_indices is None or src_indices.size == 0:
+            if src_indices is None:
                 continue
-            if dst_indices is None or dst_indices.size == 0:
+            if st != StateType.DSA_TAIL and src_indices.size == 0:
+                continue
+            if dst_indices is None:
+                dst_indices = np.array([], dtype=np.int32)
+            if st != StateType.DSA_TAIL and dst_indices.size == 0:
                 continue
 
             src_descs = self.state_mem_descs[i]
@@ -1310,7 +1318,7 @@ class MoriKVManager(CommonKVManager):
                 else []
             )
 
-            if st == "mamba":
+            if st == StateType.MAMBA:
                 statuses.extend(
                     self._send_mamba_state(
                         peer_info,
@@ -1324,7 +1332,24 @@ class MoriKVManager(CommonKVManager):
                         dst_dims,
                     )
                 )
-            elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
+            elif st == StateType.DSA_TAIL:
+                statuses.extend(
+                    self._send_dsa_tail_state(
+                        src_indices,
+                        dst_indices,
+                        src_descs,
+                        dst_descs,
+                        src_lens,
+                        dst_lens,
+                    )
+                )
+            elif st in (
+                StateType.SWA,
+                StateType.DSA,
+                StateType.SWA_RING,
+                StateType.C128_STATE,
+                StateType.MINIMAX_INDEX_K,
+            ):
                 statuses.extend(
                     self._send_swa_dsa_state(
                         peer_info,
@@ -1339,6 +1364,89 @@ class MoriKVManager(CommonKVManager):
             else:
                 raise RuntimeError(f"PD state transfer failed: unknown state_type={st}")
 
+        return statuses
+
+    def _send_dsa_tail_state(
+        self,
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+        src_state_mem_descs: List[MemoryDesc],
+        dst_state_mem_descs: List[MemoryDesc],
+        src_state_item_lens: List[int],
+        dst_state_item_lens: List[int],
+    ) -> List[TransferStatus]:
+        # The DSA tail payload describes live segments inside a per-request
+        # ring, not flat state rows. Keep the shared address remapping used by
+        # NIXL and Mooncake, then translate its absolute addresses into the
+        # descriptor-relative offsets expected by Mori.
+        dst_state_mem_descs = slice_dsa_tail_dst_ptrs_for_pp(
+            src_state_mem_descs,
+            dst_state_mem_descs,
+            self.kv_args.prefill_start_layer,
+            getattr(self.kv_args, "prefill_end_layer", None),
+        )
+        dst_state_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+            src_state_mem_descs,
+            dst_state_item_lens,
+            self.kv_args.prefill_start_layer,
+            getattr(self.kv_args, "prefill_end_layer", None),
+        )
+
+        if not (
+            len(src_state_mem_descs)
+            == len(dst_state_mem_descs)
+            == len(src_state_item_lens)
+            == len(dst_state_item_lens)
+        ):
+            raise ValueError(
+                "DSA tail descriptor metadata mismatch: "
+                f"src_descs={len(src_state_mem_descs)}, "
+                f"dst_descs={len(dst_state_mem_descs)}, "
+                f"src_item_lens={len(src_state_item_lens)}, "
+                f"dst_item_lens={len(dst_state_item_lens)}"
+            )
+
+        plans: List[Tuple[MemoryDesc, MemoryDesc, BatchTransferPlan]] = []
+        for src_desc, dst_desc, src_item_len, dst_item_len in zip(
+            src_state_mem_descs,
+            dst_state_mem_descs,
+            src_state_item_lens,
+            dst_state_item_lens,
+        ):
+            src_base = int(src_desc.data)
+            dst_base = int(dst_desc.data)
+            blocks = build_dsa_tail_transfer_blocks(
+                [src_base],
+                [src_item_len],
+                [dst_base],
+                src_state_indices.tolist(),
+                dst_state_indices.tolist(),
+                [dst_item_len],
+            )
+            plan = BatchTransferPlan(
+                local_offsets=[src_addr - src_base for src_addr, _, _ in blocks],
+                remote_offsets=[dst_addr - dst_base for _, dst_addr, _ in blocks],
+                sizes=[size for _, _, size in blocks],
+            )
+            for local_offset, remote_offset, size in zip(
+                plan.local_offsets, plan.remote_offsets, plan.sizes
+            ):
+                if (
+                    local_offset < 0
+                    or remote_offset < 0
+                    or local_offset + size > int(src_desc.size)
+                    or remote_offset + size > int(dst_desc.size)
+                ):
+                    raise ValueError(
+                        "DSA tail transfer block exceeds registered memory: "
+                        f"local=({local_offset}, {size}, {src_desc.size}), "
+                        f"remote=({remote_offset}, {size}, {dst_desc.size})"
+                    )
+            plans.append((src_desc, dst_desc, plan))
+
+        statuses: List[TransferStatus] = []
+        for src_desc, dst_desc, plan in plans:
+            statuses.extend(self._submit_batch_transfer_plan(src_desc, dst_desc, plan))
         return statuses
 
     def _send_mamba_state(
