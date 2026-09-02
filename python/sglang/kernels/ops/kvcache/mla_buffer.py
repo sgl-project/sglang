@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -81,29 +83,62 @@ def set_mla_kv_buffer_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def set_mla_kv_buffer_triton(
+@triton.jit
+def set_mla_kv_buffer_kernel_norope(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    mask = offs < nope_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+
+    src = tl.load(
+        cache_k_nope_ptr + pid_loc * nope_stride + offs,
+        mask=mask,
+    )
+    tl.store(dst_ptr, src, mask=mask)
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def _set_mla_kv_buffer_impl(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor] = None,
     *,
-    reserved_skip_index: int = 0,
+    reserved_skip_index: int,
+    dcp_world_size: int,
+    dcp_rank: int,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
-    Two paths, chosen on ``n_loc``:
+    Two paths:
 
-    - ``n_loc >= 768`` (and SM90+ with TMA-compatible row widths): JIT CUDA
-      kernel where each warp loads one (nope, rope) row into shared memory and
-      issues a single ``cp.async.bulk.global.shared::cta`` store to scatter the
-      row at ``kv_buffer[loc[item]]``. Wins at large bs because it packs 4-8
-      items per CTA, drastically reducing the CTA count vs single-CTA-per-loc.
+    - SM90+ with TMA-compatible row widths: JIT CUDA kernel where each warp
+      loads one (nope, rope) row into shared memory and issues a single
+      ``cp.async.bulk.global.shared::cta`` store to scatter the row at
+      ``kv_buffer[loc[item]]``. It packs 4-8 items per CTA, so the CTA count
+      falls well below single-CTA-per-loc.
     - Otherwise: Triton kernel with ``BLOCK = next_pow2(nope_dim + rope_dim)``,
-      i.e. one CTA per loc covering the entire row in one tile. Wins at small
-      bs because there's no per-loc CTA fan-out (5x fewer CTAs than the old
-      BLOCK=128 dispatch) and the row-spanning block makes the boundary branch
-      a one-shot per CTA. This is also the path for SM<90 and for shapes that
-      violate the TMA 16-byte alignment.
+      i.e. one CTA per loc covering the entire row in one tile. This is the
+      path for SM<90 and for shapes that violate the TMA 16-byte alignment.
 
     Speedup vs the legacy BLOCK=128 Triton kernel on GB300 (BF16, nope=512,
     rope=64): ~1.05x at bs=8, ~1.5x at bs=128, 3.5x at bs=512, **11.7x at
@@ -114,7 +149,32 @@ def set_mla_kv_buffer_triton(
 
     Writes targeting ``reserved_skip_index`` are skipped. Slot 0 is reserved
     for CUDA-graph padding by default; pass -1 to disable skipping.
+
+    Shared body of the two entry points below; the owner rule reaches it as
+    ``1, 0`` (nothing to select) or as the live topology.
     """
+    has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
+    n_loc = loc.numel()
+    nope_dim = cache_k_nope.shape[-1]
+
+    if not has_rope:
+        BLOCK = triton.next_power_of_2(nope_dim)
+        grid = (n_loc, 1)
+        pdl_kwargs = (
+            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+        )
+        set_mla_kv_buffer_kernel_norope[grid](
+            kv_buffer,
+            cache_k_nope,
+            loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            nope_dim,
+            BLOCK=BLOCK,
+            **pdl_kwargs,
+        )
+        return
+
     from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
         can_use_set_mla_kv_buffer,
     )
@@ -122,13 +182,12 @@ def set_mla_kv_buffer_triton(
         set_mla_kv_buffer as jit_set_mla_kv_buffer,
     )
 
-    n_loc = loc.numel()
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
     if (
         is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and dcp_world_size == 1
     ):
         jit_set_mla_kv_buffer(
             kv_buffer,
@@ -144,7 +203,6 @@ def set_mla_kv_buffer_triton(
     # ``set_mla_kv_buffer_kernel`` handles the over-allocation past total_dim
     # via the offs<total_dim mask). Beats BLOCK=128 by 60-2700 ns across the
     # 2 <= bs <= 512 range on GB300.
-    nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
     total_dim = nope_dim + rope_dim
     BLOCK = triton.next_power_of_2(total_dim)
@@ -162,9 +220,51 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
+    )
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at locs already addressing this rank's rows (widened ->
+    `set_mla_kv_buffer_dcp_sharded_triton`)."""
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=1,
+        dcp_rank=0,
+    )
+
+
+def set_mla_kv_buffer_dcp_sharded_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Scatter at DCP-WIDENED locs: select this rank's ids and collapse them."""
+    parallel = get_parallel()
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
     )
 
 
@@ -382,18 +482,51 @@ def get_mla_kv_buffer_kernel(
     )
 
 
+@triton.jit
+def get_mla_kv_buffer_kernel_norope(
+    kv_buffer_ptr,
+    cache_k_nope_ptr,
+    loc_ptr,
+    buffer_stride: tl.constexpr,
+    nope_stride: tl.constexpr,
+    nope_dim: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
+
+    nope_offs = tl.arange(0, nope_dim)
+    nope_src = tl.load(loc_src_ptr + nope_offs)
+    tl.store(
+        cache_k_nope_ptr + pid_loc * nope_stride + nope_offs,
+        nope_src,
+    )
+
+
 def get_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor] = None,
 ):
     # The source data type will be implicitly converted to the target data type.
     nope_dim = cache_k_nope.shape[-1]  # 512
-    rope_dim = cache_k_rope.shape[-1]  # 64
     n_loc = loc.numel()
     grid = (n_loc,)
 
+    has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
+    if not has_rope:
+        get_mla_kv_buffer_kernel_norope[grid](
+            kv_buffer,
+            cache_k_nope,
+            loc,
+            kv_buffer.stride(0),
+            cache_k_nope.stride(0),
+            nope_dim,
+        )
+        return
+
+    rope_dim = cache_k_rope.shape[-1]  # 64
     get_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
