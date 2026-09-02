@@ -40,13 +40,15 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.model_loader.runai_utils import (
+    _clone_if_runai_streamed_tensor,
+)
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
     should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import (
-    RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -70,12 +72,6 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
-
-
-def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
-    return tensor
 
 
 def _get_indexer_weight_block_size(

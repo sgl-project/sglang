@@ -70,6 +70,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.model_loader.runai_utils import _clone_if_runai_streamed_tensor
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
@@ -896,13 +897,17 @@ class FusedMoE(torch.nn.Module):
             fp8_weight = loaded_weight
             fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
             if fp8_scale is None:
-                self._pending_fp8_shared_weights[key] = loaded_weight
+                self._pending_fp8_shared_weights[key] = _clone_if_runai_streamed_tensor(
+                    loaded_weight
+                )
                 return True
         else:
             fp8_weight = self._pending_fp8_shared_weights.pop(key, None)
             fp8_scale = loaded_weight
             if fp8_weight is None:
-                self._pending_fp8_shared_scales[key] = loaded_weight
+                self._pending_fp8_shared_scales[key] = _clone_if_runai_streamed_tensor(
+                    loaded_weight
+                )
                 return True
 
         logging.getLogger(__name__).warning_once(

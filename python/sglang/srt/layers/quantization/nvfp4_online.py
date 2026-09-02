@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     per_tensor_dequantize,
 )
+from sglang.srt.model_loader.runai_utils import _clone_if_runai_streamed_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +493,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             pending_key = expert_id
             current = (
                 param,
-                loaded_weight,
+                _clone_if_runai_streamed_tensor(loaded_weight),
                 weight_name,
                 shard_id,
                 expert_id,
@@ -574,7 +575,7 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 if weight_scale is None:
                     pending_fp8_weights[key] = (
                         param,
-                        loaded_weight,
+                        _clone_if_runai_streamed_tensor(loaded_weight),
                         weight_name,
                         shard_id,
                         expert_id,
@@ -596,7 +597,9 @@ class ModelOptNvFp4OnlineFusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             with pending_fp8_lock:
                 pending = pending_fp8_weights.pop(key, None)
                 if pending is None:
-                    pending_fp8_weight_scales[key] = loaded_weight
+                    pending_fp8_weight_scales[key] = _clone_if_runai_streamed_tensor(
+                        loaded_weight
+                    )
                     return
 
             log_quantization_start()
