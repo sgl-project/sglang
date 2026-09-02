@@ -1580,8 +1580,16 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        use_unified_kv = is_unified_kv_triton()
+        use_unpadded_prefill_q = (
+            use_unified_kv and forward_batch.forward_mode.is_extend()
+        )
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
+        if self.attn_tp_size > 1 and not use_unpadded_prefill_q:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
@@ -1648,11 +1656,7 @@ class MQALayer(MqaAttentionBase):
         # _forward_prepare* deliberately left the store off and the backend does
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_triton,
-        )
-
-        if is_unified_kv_triton():
+        if use_unified_kv:
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
