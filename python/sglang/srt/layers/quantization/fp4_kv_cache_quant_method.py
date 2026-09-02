@@ -42,7 +42,7 @@ import torch
 from torch import Tensor
 
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_MAX
-from sglang.srt.utils.common import is_sm100_supported
+from sglang.srt.runtime_context import get_platform
 
 
 class KVCacheAttentionPhase(str, Enum):
@@ -382,6 +382,58 @@ class UnquantizedKVCacheMethod(KVCacheQuantMethodBase):
         )
 
 
+class CPUFP8KVCacheMethod(KVCacheQuantMethodBase):
+    name = "cpu_fp8_e4m3"
+    SCALE_BLOCK_SIZE = 1
+
+    def create_buffers(self, size, head_num, head_dim, layer_num, device) -> dict:
+        buffer_shape = (size, head_num, head_dim)
+        return {
+            "k_buffer": [
+                torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
+                for _ in range(layer_num)
+            ],
+            "v_buffer": [
+                torch.zeros(buffer_shape, dtype=torch.float8_e4m3fn, device=device)
+                for _ in range(layer_num)
+            ],
+            "k_scale_buffer": None,
+            "v_scale_buffer": None,
+            "dq_k_buffer": None,
+            "dq_v_buffer": None,
+            "store_dtype": torch.float8_e4m3fn,
+        }
+
+    def quantize_and_store(
+        self,
+        k_buffer,
+        v_buffer,
+        k_scale_buffer,
+        v_scale_buffer,
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+    ) -> None:
+        k_scale = 1.0 if k_scale is None else k_scale
+        v_scale = 1.0 if v_scale is None else v_scale
+        k_buffer[loc] = (cache_k / k_scale).to(torch.float8_e4m3fn)
+        v_buffer[loc] = (cache_v / v_scale).to(torch.float8_e4m3fn)
+
+    def dequantize_prev_kv(
+        self, k_fp8, k_scales, v_fp8, v_scales, layer_id
+    ) -> tuple[Tensor, Tensor]:
+        raise NotImplementedError(
+            "CPU FP8 KV cache is consumed directly by the CPU attention kernels."
+        )
+
+    def compute_cell_size(
+        self, head_num: int, head_dim: int, num_layers: int, kv_size: int
+    ) -> int:
+        return head_num * head_dim * num_layers * kv_size * 2
+
+
 class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
     """NVFP4 two-level scaling: global FP32 + per-block FP8 E4M3.
 
@@ -402,7 +454,9 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         self.device = device
         self.page_size = page_size
         self.use_trtllm_gen_native_scale_layout = (
-            is_sm100_supported() if native_scale_layout is None else native_scale_layout
+            get_platform().is_sm100
+            if native_scale_layout is None
+            else native_scale_layout
         )
         # Per-layer global FP32 scales; filled by load_scales_from_model()
         self.k_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
@@ -497,9 +551,9 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             # it into 6.0 needlessly pushes the online block scales toward the
             # low-precision end of E4M3. Real calibrated scales are tiny
             # positive values and need the E2M1_MAX conversion below.
-            if is_sm100_supported() and k_scale != 1.0:
+            if get_platform().is_sm100 and k_scale != 1.0:
                 k_scale *= E2M1_MAX
-            if is_sm100_supported() and v_scale != 1.0:
+            if get_platform().is_sm100 and v_scale != 1.0:
                 v_scale *= E2M1_MAX
             k_scales_cpu[layer_id] = k_scale
             v_scales_cpu[layer_id] = v_scale
@@ -876,6 +930,7 @@ _FP4_MX_MHA_BACKENDS = frozenset(
     {"triton", "torch_native", "flex_attention", "trtllm_mha"}
 )
 _FP4_MX_PREFILL_BACKENDS = _FP4_MX_MHA_BACKENDS | frozenset({"fa4"})
+_CPU_FP8_BACKENDS = frozenset({"intel_amx"})
 
 
 def _backend_matcher(backends) -> KVCacheBackendMatcher:
@@ -938,6 +993,10 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
         _plain(_PREFILL, _ANY_BACKEND),
         _plain(_DECODE, _ANY_BACKEND),
     ),
+    CPUFP8KVCacheMethod.name: (
+        _plain(_PREFILL, _CPU_FP8_BACKENDS),
+        _plain(_DECODE, _CPU_FP8_BACKENDS),
+    ),
     NVFP4KVCacheMethod.name: (
         _dq_workspace(_PREFILL, _NVFP4_DQ_PREFILL_BACKENDS, _NVFP4_SCALE, _FP8_E4M3),
         _native_fp4(_PREFILL, _NVFP4_NATIVE_BACKENDS, _NVFP4_SCALE, _TORCH_FP4),
@@ -952,6 +1011,7 @@ KV_CACHE_ATTENTION_ACCESS_REGISTRY: dict[str, tuple[KVCacheAttentionAccess, ...]
 
 # Registry: explicit --kv-cache-dtype value -> method class.
 KV_CACHE_QUANT_REGISTRY: dict[str, type[KVCacheQuantMethodBase]] = {
+    "cpu_fp8_e4m3": CPUFP8KVCacheMethod,
     "nvfp4": NVFP4KVCacheMethod,
     "fp4_mx_block16": FP4MXBlock16KVCacheMethod,
 }

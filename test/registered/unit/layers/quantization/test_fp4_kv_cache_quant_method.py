@@ -1,4 +1,4 @@
-"""Unit tests for FP4 KV cache quantization strategy pattern - no server, no model loading."""
+"""Unit tests for KV cache quantization strategies - no server, no model loading."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -6,10 +6,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
+from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -32,6 +32,7 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         self.assertIn("nvfp4", KV_CACHE_QUANT_REGISTRY)
         self.assertIn("fp4_mx_block16", KV_CACHE_QUANT_REGISTRY)
+        self.assertIn("cpu_fp8_e4m3", KV_CACHE_QUANT_REGISTRY)
 
     def test_factory_nvfp4(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -100,6 +101,65 @@ class TestKVCacheQuantRegistry(CustomTestCase):
 
         with self.assertRaises(ValueError):
             get_kv_cache_quant_method("unknown_method")
+
+
+class TestCPUFP8KVCacheMethod(CustomTestCase):
+    def test_static_scale_quantize_and_store(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            CPUFP8KVCacheMethod,
+        )
+
+        method = CPUFP8KVCacheMethod()
+        buffers = method.create_buffers(4, 2, 8, 1, "cpu")
+        loc = torch.tensor([1, 3])
+        cache_k = torch.randn(2, 2, 8, dtype=torch.bfloat16)
+        cache_v = torch.randn(2, 2, 8, dtype=torch.bfloat16)
+
+        method.quantize_and_store(
+            buffers["k_buffer"][0],
+            buffers["v_buffer"][0],
+            buffers["k_scale_buffer"],
+            buffers["v_scale_buffer"],
+            loc,
+            cache_k,
+            cache_v,
+            k_scale=0.5,
+            v_scale=0.25,
+        )
+
+        torch.testing.assert_close(
+            buffers["k_buffer"][0][loc].float(),
+            (cache_k / 0.5).to(torch.float8_e4m3fn).float(),
+        )
+        torch.testing.assert_close(
+            buffers["v_buffer"][0][loc].float(),
+            (cache_v / 0.25).to(torch.float8_e4m3fn).float(),
+        )
+        self.assertIsNone(buffers["k_scale_buffer"])
+        self.assertIsNone(buffers["v_scale_buffer"])
+        self.assertEqual(method.compute_cell_size(2, 8, 1, 4), 128)
+
+    def test_defaults_to_unit_scales(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            CPUFP8KVCacheMethod,
+        )
+
+        method = CPUFP8KVCacheMethod()
+        buffers = method.create_buffers(1, 1, 8, 1, "cpu")
+        cache = torch.ones(1, 1, 8, dtype=torch.bfloat16)
+        method.quantize_and_store(
+            buffers["k_buffer"][0],
+            buffers["v_buffer"][0],
+            buffers["k_scale_buffer"],
+            buffers["v_scale_buffer"],
+            torch.tensor([0]),
+            cache,
+            cache,
+        )
+
+        expected = cache.to(torch.float8_e4m3fn)
+        torch.testing.assert_close(buffers["k_buffer"][0][0], expected[0])
+        torch.testing.assert_close(buffers["v_buffer"][0][0], expected[0])
 
 
 class TestNVFP4KVCacheMethod(CustomTestCase):
@@ -319,10 +379,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         )
         method = NVFP4KVCacheMethod(num_layers=1, device="cpu")
 
-        with patch(
-            "sglang.srt.layers.quantization.fp4_kv_cache_quant_method.is_sm100_supported",
-            return_value=True,
-        ):
+        with override_platform(is_sm100=True):
             method.load_scales_from_model(model)
 
         self.assertEqual(method.get_bmm_scales(0), (1.0, 1.0))
@@ -342,10 +399,7 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         )
         method = NVFP4KVCacheMethod(num_layers=1, device="cpu")
 
-        with patch(
-            "sglang.srt.layers.quantization.fp4_kv_cache_quant_method.is_sm100_supported",
-            return_value=True,
-        ):
+        with override_platform(is_sm100=True):
             method.load_scales_from_model(model)
 
         k_scale, v_scale = method.get_bmm_scales(0)

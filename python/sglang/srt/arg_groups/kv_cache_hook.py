@@ -7,19 +7,16 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.utils.common import (
-    is_blackwell_supported,
-    is_cuda,
-    is_sm100_supported,
-    is_sm120_supported,
-)
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +26,7 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not is_blackwell_supported():
+    if not get_platform().is_blackwell:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
@@ -38,7 +35,6 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
 
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -49,13 +45,19 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
     attention_backend = resolved_view(server_args).attention_backend
 
-    if is_cuda():
+    if get_platform().is_cuda:
         if cfg.kv_cache_dtype == "nvfp4" and not (
-            is_sm100_supported() or is_sm120_supported()
+            get_platform().is_sm100 or get_platform().is_sm120
         ):
             raise RuntimeError(
                 "--kv-cache-dtype=nvfp4 requires Blackwell SM100 or SM120. "
                 "Use --kv-cache-dtype=fp4_mx_block16 for the block-size-16 FP4 recipe."
+            )
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "FP4 KV cache does not yet support --enable-unified-memory: "
+                "the unified MHA pool does not allocate FP4 block scales or "
+                "the prefill dequant workspace."
             )
 
         # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
@@ -64,7 +66,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         # reuse the same monolithic cache and GenMHA kernels.
         uses_sm100_native_nvfp4 = (
             cfg.kv_cache_dtype == "nvfp4"
-            and is_sm100_supported()
+            and get_platform().is_sm100
             and "trtllm_mha" in (prefill_backend, decode_backend)
         )
         uses_sm100_mixed_nvfp4 = (
@@ -250,7 +252,6 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     still None, backends haven't settled yet and the resolved (prefill,
     decode) pair would be a stale (None, None).
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
 
@@ -326,7 +327,6 @@ def handle_cache_compatibility(server_args: Any) -> None:
 
 
 def handle_unified_memory_pool(server_args: Any) -> None:
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
@@ -357,7 +357,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     assert cfg.speculative_algorithm in (None, "DSPARK"), (
         "--enable-unified-memory only supports --speculative-algorithm "
         "DSPARK (chain draft); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/dense loc translation. Got "
+        "audited for the unified pool's virtual/kernel-facing loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     if cfg.speculative_algorithm == "DSPARK":
@@ -377,7 +377,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"attention backends {sorted(spec_allowed)} for both prefill "
             f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
             "not translate speculative verify indices to the unified "
-            "pool's dense space yet."
+            "pool's kernel-facing space yet."
         )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
@@ -386,28 +386,80 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "full-attention slots are VIRTUAL — the host-offload path does not "
         "translate them to physical."
     )
-    assert cfg.dcp_size == 1, (
-        "--enable-unified-memory is not yet compatible with decode context "
-        "parallelism (--dcp-size > 1): the pool has no DCP-aware masked write "
-        "path (UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None), "
-        "so a DCP run would boot and then fail on the first KV write."
-    )
+    if cfg.dcp_size > 1:
+        _validate_unified_memory_dcp(server_args)
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill
     # capture is not. Guard when the user opts into it.
     _cg_cfg = cfg.cuda_graph_config
-    if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
-        raise ValueError(
-            "--enable-unified-memory supports monolithic (decode) "
-            "cuda-graph capture only; disable piecewise prefill capture "
-            "(e.g. --cuda-graph-backend-prefill=disabled)."
+    if _cg_cfg is not None and _cg_cfg.prefill.backend != Backend.DISABLED:
+        if cfg.cuda_graph_backend_prefill is not None:
+            raise ValueError(
+                "--enable-unified-memory supports decode cuda-graph "
+                "capture only; prefill capture is not wired (the prefill "
+                "graph runner bypasses the unified virtual->physical loc "
+                "rebind). Got --cuda-graph-backend-prefill="
+                f"{cfg.cuda_graph_backend_prefill!r}; pass "
+                "--cuda-graph-backend-prefill=disabled."
+            )
+        _cg_cfg.prefill.backend = Backend.DISABLED
+        logger.warning(
+            "--enable-unified-memory: disabling prefill cuda-graph "
+            "capture (not wired for the unified pool's loc rebind); "
+            "decode capture is unaffected."
         )
+
+
+def _validate_unified_memory_dcp(server_args: Any) -> None:
+    """Gate --enable-unified-memory + --dcp-size > 1 to the audited path.
+
+    Under DCP the unified allocator hands out a WIDENED virtual id space
+    (dcp_size logical ids per stored row) and every read index reaches
+    `translate_kv_loc*` already collapsed by a DCP index kernel. Only the
+    pieces below have been converted to that two-stage contract.
+    """
+    assert use_mla_backend(server_args), (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
+        "MHA unified pool has no DCP-aware masked write path "
+        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+    )
+    assert not model_config_of(server_args).is_hybrid_swa, (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support hybrid sliding-window models: "
+        "UnifiedSWATokenToKVPoolAllocator does not widen its virtual id "
+        "space, and the full->swa mapping is not DCP-sharded."
+    )
+    cfg = resolving_view(server_args)
+    assert cfg.disaggregation_mode == "null", (
+        "--enable-unified-memory with decode context parallelism "
+        "(--dcp-size > 1) does not support PD disaggregation: the transfer "
+        "ships whole page envelopes, which under DCP hold only this rank's "
+        "shard of each widened page. Rejected here rather than at the first KV "
+        "transfer, where translate_kv_indices_for_transfer would abort a "
+        "server that had already booted."
+    )
+    # trtllm_mla (and its cutedsl_mla / tokenspeed_mla subclasses) build the
+    # MLA block table straight from req_to_token with
+    # create_flashmla_kv_indices_triton, whose v2p gather assumes UNWIDENED
+    # page ids; the DCP variant (create_mla_kv_page_table_for_dcp) has no v2p
+    # gather at all. Wire one of them through the other to add those here.
+    dcp_allowed = {"flashinfer"}
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= dcp_allowed, (
+        "--enable-unified-memory with decode context parallelism "
+        f"(--dcp-size > 1) requires {sorted(dcp_allowed)} for the "
+        f"full-attention layers; got {sorted(backends)}. The other paged MLA "
+        "backends build their block table from raw (widened) req_to_token "
+        "page ids and do not translate them through the unified pool's "
+        "virtual->physical page table."
+    )
 
 
 def handle_page_major_kv_layout(server_args: Any):
     # The unified pool stores state in the page-major envelope-strided layout, so
     # enabling it implies --enable-page-major-kv-layout — routing it through the
     # single page-major path + stride-aware Triton asserts (set before the guard).
-    from sglang.srt.arg_groups.overrides import attention_backends_of
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
@@ -418,18 +470,38 @@ def handle_page_major_kv_layout(server_args: Any):
         )
     if not cfg.enable_page_major_kv_layout:
         return
-    # Only the Triton attention kernels read the strided 4-D envelope K/V
-    # views; FA3 / FlashInfer do not. EXCEPTION: the unified-memory MLA pool
-    # exposes each layer as a DENSE contiguous per-layer view
-    # (build_dense_mla_views), which the paged MLA kernels consume directly,
-    # with their kv_indices / block tables remapped to dense ids. Names below
-    # are the RESOLVED ids from attention_backends_of: "flashinfer" is
-    # FlashInferMLAAttnBackend for an MLA model, "trtllm_mla" the trtllm
-    # decode kernel; "cutedsl_mla" and "tokenspeed_mla" subclass
-    # TRTLLMMLABackend and inherit its dense read/write path; "fa3" remaps its
-    # page_table (in-kernel for captured decode, one funnel for eager).
-    # flashmla / cutlass_mla share the create_flashmla block-table path and
-    # can be added the same way once exercised.
+    assert cfg.enable_unified_memory, (
+        "--enable-page-major-kv-layout without --enable-unified-memory is "
+        "temporarily unsupported: the strided MHA K/V views were removed "
+        "and the static-pool page-major layout awaits its per-layer-view "
+        "reimplementation. Run with --enable-unified-memory, or drop "
+        "--enable-page-major-kv-layout."
+    )
+    from sglang.srt.mem_cache.unified_memory_pool import (
+        unified_memory_supported_for_model,
+    )
+
+    model_config = model_config_of(server_args)
+    assert unified_memory_supported_for_model(
+        model_config, use_mla_backend=use_mla_backend(server_args)
+    ), (
+        "--enable-unified-memory requires uniform K/V rows "
+        "(head_dim == v_head_dim); this model has "
+        f"head_dim={model_config.head_dim}, "
+        f"v_head_dim={model_config.v_head_dim}, "
+        f"swa_head_dim={model_config.swa_head_dim}, "
+        f"swa_v_head_dim={model_config.swa_v_head_dim}. The unified "
+        "pool's per-layer views require a uniform row width; run "
+        "this model without --enable-unified-memory."
+    )
+    # Allow-list. Every backend below reads through the translator, so what
+    # gates one is only whether its kernels can address the per-layer views:
+    #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
+    #     snap). cutlass_mla stays rejected (never exercised).
+    #   * MHA/SWA models: fa3 / fa4 / flashinfer / trtllm_mha alongside
+    #     Triton. fa4 is the fa3 class.
+    #   * Without the unified pool, plain page-major stays Triton-only.
+    # Names are the RESOLVED ids from attention_backends_of.
     if cfg.enable_unified_memory and use_mla_backend(server_args):
         allowed_full = {
             "triton",
@@ -438,16 +510,27 @@ def handle_page_major_kv_layout(server_args: Any):
             "flashinfer",
             "cutedsl_mla",
             "tokenspeed_mla",
+            "flashmla",
+        }
+    elif cfg.enable_unified_memory:
+        allowed_full = {
+            "triton",
+            "fa3",
+            "fa4",
+            "flashinfer",
+            "trtllm_mha",
         }
     else:
         allowed_full = {"triton"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed_full, (
-        "--enable-page-major-kv-layout requires the Triton attention backend "
-        "for the full-attention layers (unified-memory MLA also allows the "
-        f"paged MLA backends); got {sorted(backends)}, allowed "
-        f"{sorted(allowed_full)}. Pass a compatible --attention-backend."
+        "--enable-page-major-kv-layout: the resolved attention backends "
+        f"{sorted(backends)} are not in the allowed set "
+        f"{sorted(allowed_full)} for this configuration (unified memory "
+        "allows the per-layer-view families; plain page-major keeps the "
+        "envelope-strided views only Triton reads). Pass a compatible "
+        "--attention-backend."
     )
     # The Mamba/KDA state is stored in envelope-strided views; only
     # stride-audited kernels may read it (Stage 4 audit, per slot):

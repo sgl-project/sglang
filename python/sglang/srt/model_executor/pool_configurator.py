@@ -71,6 +71,13 @@ class MemoryPoolConfig:
 
     mem_fraction_static: Optional[float] = None
 
+    # Unified pool only: the PROFILED byte budget for the token-granular
+    # sub-pools. Set, the factories size the buffer from it directly instead of
+    # re-summing ratio-derived token counts, which keeps the re-sum's floor
+    # losses out of the buffer; the token counts stay boot labels / conserve
+    # caps. None on the token-capped path -- a user token cap IS the budget.
+    unified_total_bytes: Optional[int] = None
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."
@@ -390,7 +397,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if memory_config.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+            indexer_ratio = parse_hisparse_config().host_to_device_ratio
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -811,9 +818,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if get_memory().enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
