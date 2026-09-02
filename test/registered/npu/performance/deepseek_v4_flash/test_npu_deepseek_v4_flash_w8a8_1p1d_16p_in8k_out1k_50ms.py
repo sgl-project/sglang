@@ -3,7 +3,7 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
-    DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -195,7 +195,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep deployment.
 DEEPSEEK_V4_FLASH_W8A8_1P1D_MODEL_CONFIG = {
-    "model_path": DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH,
+    "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     "prefill_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ARGS,
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS,
