@@ -1,0 +1,80 @@
+---
+title: "TextSeal Watermarking"
+metatags:
+    description: "Configure request-controlled TextSeal generation-time watermarking in SGLang."
+---
+
+SGLang supports server-configured, request-controlled TextSeal generation-time watermarking. Secret keys are loaded from a local JSON file at startup and are never accepted in request bodies, headers, or command-line values.
+
+## Configuration
+
+Create a file readable only by the server account:
+
+```json
+{
+  "providers": {
+    "textseal": {
+      "enabled": true,
+      "key_a": "REPLACE_WITH_DECIMAL_KEY_A",
+      "key_b": "REPLACE_WITH_DECIMAL_KEY_B",
+      "ngram": 2,
+      "mixing_probability": 0.5
+    }
+  }
+}
+```
+
+Replace both placeholders with distinct decimal integer strings. Restrict permissions to the server account and rotate keys by replacing the file and restarting the server. SGLang validates the file during startup and redacts key values from configuration representations and errors.
+
+Launch a supported server:
+
+```bash
+sglang serve --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --watermark-config /run/secrets/sglang-watermark.json \
+  --disable-cuda-graph \
+  --sampling-backend pytorch
+```
+
+## Requests
+
+Enable TextSeal with a header:
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'X-SGLang-Watermark: textseal' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"Explain photosynthesis."}],"temperature":0.8}'
+```
+
+Disable watermarking with `X-SGLang-Watermark: off`. HTTP request bodies cannot select watermark providers or configuration.
+
+## Supported Modes
+
+The initial implementation supports text generation through native `/generate`, `/v1/chat/completions`, and `/v1/completions`, including streaming, with TP size 1 and the PyTorch or FlashInfer sampler. Temperature must be nonzero and effective sampling support should contain multiple tokens.
+
+Beam search, speculative decoding, multimodal requests, disaggregated serving, TP greater than 1, other sampling backends, and CUDA graphs are rejected with `watermark_unsupported_mode`. Dynamically collapsed top-p or min-p support emits its sole admissible token for that step.
+
+## Errors
+
+Watermark request failures use HTTP 400 and one of these stable codes: `watermark_invalid_request`, `watermark_provider_unknown`, `watermark_disabled`, or `watermark_unsupported_mode`.
+
+## Provenance And Detection
+
+The generation core is adapted from Meta TextSeal v0.2.0 at commit `c60d0d1da2e59f09a698438e218a07ee779b4616`, licensed under Apache-2.0. Detection remains an offline operation using the official TextSeal detector and its heavier scientific dependencies.
+
+Generate matched samples and run detection from an environment containing that exact upstream checkout:
+
+```bash
+python benchmark/textseal/generate_samples.py --output artifacts/textseal/samples.jsonl
+PYTHONPATH=/path/to/textseal python benchmark/textseal/validate_detection.py \
+  --samples artifacts/textseal/samples.jsonl \
+  --watermark-config /run/secrets/sglang-watermark.json \
+  --textseal-checkout /path/to/textseal \
+  --output artifacts/textseal/detection.json
+```
+
+Run five interleaved latency pairs against the same capable server:
+
+```bash
+python benchmark/textseal/run_latency.py --output-dir artifacts/textseal/latency
+```

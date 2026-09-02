@@ -110,7 +110,10 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    apply_watermark_request,
+)
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -907,6 +910,7 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    apply_watermark_request(obj, request.headers)
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:

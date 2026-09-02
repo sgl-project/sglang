@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.request_headers import apply_watermark_request
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -94,6 +95,9 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
 
+            if isinstance(adapted_request, GenerateReqInput):
+                apply_watermark_request(adapted_request, raw_request.headers)
+
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
@@ -108,6 +112,19 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
         except HTTPException as e:
+            if (
+                isinstance(e.detail, dict)
+                and {
+                    "code",
+                    "message",
+                }
+                <= e.detail.keys()
+            ):
+                return self.create_error_response(
+                    message=e.detail["message"],
+                    err_type=e.detail["code"],
+                    status_code=e.status_code,
+                )
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )

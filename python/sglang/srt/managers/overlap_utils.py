@@ -102,6 +102,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                     future_map.output_tokens_buf,
                     batch.mix_running_indices,
                 )
+            if batch.sampling_info.watermark is not None:
+                batch.sampling_info.watermark = (
+                    batch.sampling_info.watermark.advance_contexts(
+                        decode_gpu, row_start=len(batch.reqs) - decode_gpu.shape[0]
+                    )
+                )
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
         else:
             batch.input_ids = prefill_gpu
@@ -112,6 +118,10 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+            )
+        if batch.sampling_info.watermark is not None:
+            batch.sampling_info.watermark = (
+                batch.sampling_info.watermark.advance_contexts(batch.input_ids)
             )
 
     # Only the overlap path relays spec extras through the future_map; the

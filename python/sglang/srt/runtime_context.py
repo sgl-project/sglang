@@ -579,6 +579,8 @@ class Resources(_FlagGroupBase):
     tcp_store: Any = None
     # Trace verbosity; the accessor seeds it lazily from SGLANG_TRACE_LEVEL.
     trace_level: Any = None
+    # Secret-owning watermark provider registry, initialized once per process.
+    watermark_registry: Any = None
 
 
 class ForwardFlags:

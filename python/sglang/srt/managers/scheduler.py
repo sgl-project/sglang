@@ -39,11 +39,13 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_resources,
     get_schedule,
     get_serving,
     get_spec,
     publish,
 )
+from sglang.srt.sampling.watermark import load_watermark_config
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -446,6 +448,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.init_watermark_registry()
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = get_schedule().schedule_policy
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
@@ -701,6 +704,11 @@ class Scheduler(
 
         self.is_initializing = False
         self.init_startup_timing_summary()
+
+    def init_watermark_registry(self) -> None:
+        get_resources().watermark_registry = load_watermark_config(
+            get_serving().watermark_config
+        )
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
@@ -2625,6 +2633,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
+                watermark=recv_req.watermark,
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
