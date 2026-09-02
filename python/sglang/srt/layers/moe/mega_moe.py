@@ -194,10 +194,18 @@ def _run_mega_routed(
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
+        # _forward_topk passes input_ids to HashTopK for hash layers and
+        # handles the DeepSeek-V4-Vision per-token bias_vl fallback.
+        topk_output = moe._forward_topk(
             hidden_states,
             router_logits,
+            input_ids=input_ids_global,
+            image_mask=(
+                getattr(forward_batch, "dsv4_image_mask", None)
+                if forward_batch is not None
+                else None
+            ),
+            forward_batch=forward_batch,
             num_token_non_padded=(
                 forward_batch.num_token_non_padded
                 if forward_batch is not None
@@ -206,7 +214,6 @@ def _run_mega_routed(
             expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                 layer_id=moe.layer_id,
             ),
-            **topk_kwargs,
         )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights

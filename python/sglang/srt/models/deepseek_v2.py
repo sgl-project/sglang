@@ -110,7 +110,12 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    per_token_biased_topk,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -251,6 +256,8 @@ logger = logging.getLogger(__name__)
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
+
+_bias_vl_route_logged = [False]
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -499,6 +506,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter(correction_bias)
         else:
             self.e_score_correction_bias = None
+        # DeepSeek-V4-Vision: image tokens are selected with bias_vl instead
+        # of the (text) correction bias. The checkpoint carries it on every
+        # MoE layer (hash and non-hash). Text-only configs never set
+        # vision_n_layers, so nothing changes for them.
+        self.bias_vl = (
+            nn.Parameter(torch.empty(config.n_routed_experts, dtype=torch.float32))
+            if getattr(config, "vision_n_layers", 0) > 0
+            else None
+        )
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.use_dsa = is_deepseek_dsa(config)
@@ -680,6 +696,7 @@ class DeepseekV2MoE(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
+                bias_vl=self.gate.bias_vl,
             )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
@@ -936,6 +953,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
             else:
                 return self.forward_normal(
@@ -944,6 +962,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -956,6 +975,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -989,16 +1009,17 @@ class DeepseekV2MoE(nn.Module):
                 topk_config=self.topk.topk_config,
             )
         else:
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
+                image_mask=(
+                    getattr(forward_batch, "dsv4_image_mask", None)
+                    if forward_batch is not None
+                    else None
+                ),
+                forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
             )
         deferred_finalize = (
             has_shared_output
@@ -1063,6 +1084,84 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _forward_topk(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        image_mask: Optional[torch.Tensor] = None,
+        forward_batch=None,
+        **kwargs,
+    ):
+        """self.topk(...) plus the DeepSeek-V4-Vision bias_vl fallback.
+
+        Hash layers route via HashTopK (image-aware when built with bias_vl).
+        Non-hash layers: image tokens must be selected with gate.bias_vl
+        instead of the 1D correction bias the fused kernels take, so a batch
+        containing image tokens falls back to an eager per-token-bias top-k.
+        Text-only batches and non-vision models keep the fused path
+        bit-identical.
+
+        The image check uses the host-side batch flag
+        (forward_batch.dsv4_has_image_tokens) when available, so text-only
+        batches pay no GPU->CPU sync per layer.
+        """
+        skip_image_check = forward_batch is not None and not getattr(
+            forward_batch, "dsv4_has_image_tokens", False
+        )
+        if getattr(self, "is_hash", False):
+            return self.topk(
+                hidden_states,
+                router_logits,
+                input_ids=input_ids,
+                image_mask=image_mask,
+                skip_image_check=skip_image_check,
+                **kwargs,
+            )
+        bias_vl = self.gate.bias_vl
+        if (
+            bias_vl is not None
+            and input_ids is not None
+            and not skip_image_check
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # The .any() below syncs, which is illegal under CUDA graph
+            # capture. Capture only sees dummy (pad-free) input_ids, and image
+            # batches never replay graphs (prefill-with-image runs eager;
+            # decode input_ids never contain pad sentinels), so skipping the
+            # check during capture is exact.
+            if image_mask is None:
+                from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+                image_mask = input_ids >= MM_PAD_SHIFT_VALUE
+                if not image_mask.any():
+                    image_mask = None
+            if image_mask is not None:
+                if not _bias_vl_route_logged[0]:
+                    _bias_vl_route_logged[0] = True
+                    logger.info(
+                        "DSV4-Vision: routing image tokens with gate bias_vl (MoE gate)."
+                    )
+                correction_bias = self.gate.e_score_correction_bias
+                text_bias = (
+                    torch.zeros_like(bias_vl)
+                    if correction_bias is None
+                    else correction_bias.to(torch.float32)
+                )
+                per_token_bias = torch.where(
+                    image_mask.unsqueeze(1), bias_vl, text_bias
+                )
+                topk_output = per_token_biased_topk(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    per_token_correction_bias=per_token_bias,
+                    topk_config=self.topk.topk_config,
+                    layer_id=self.layer_id,
+                    **kwargs,
+                )
+                return self.topk._apply_waterfill(topk_output, hidden_states.shape[0])
+        return self.topk(hidden_states, router_logits, **kwargs)
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1070,6 +1169,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1105,16 +1205,17 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
+                image_mask=(
+                    getattr(forward_batch, "dsv4_image_mask", None)
+                    if forward_batch is not None
+                    else None
+                ),
+                forward_batch=forward_batch,
                 expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
             )
         else:
             pre_quant_input = None
@@ -1294,14 +1395,12 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
+            topk_output = self._forward_topk(
                 hidden_states,
                 router_logits,
+                input_ids=input_ids_global,
+                image_mask=getattr(forward_batch, "dsv4_image_mask", None),
+                forward_batch=forward_batch,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
@@ -1310,7 +1409,6 @@ class DeepseekV2MoE(nn.Module):
                     if not self.is_nextn
                     else None
                 ),
-                **topk_kwargs,
             )
         else:
             topk_output = self.topk.empty_topk_output(
@@ -1642,21 +1740,41 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
 
-        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; forward_deepep
-        # passes them as a topk kwarg. The per-ubatch forward_batch.input_ids is
-        # already sliced+padded to match hidden_states rows (and equals the
-        # global ids under EP dp-attention). No-op for non-hash models.
-        topk_kwargs = {}
-        if getattr(self, "is_hash", False):
-            topk_kwargs["input_ids"] = state.forward_batch.input_ids
-
+        # Hash MoE layers (e.g. DeepSeek-V4) route on input_ids; _forward_topk
+        # passes them as a topk kwarg (and uses them for the bias_vl fallback
+        # on vision models). The per-ubatch forward_batch.input_ids is already
+        # sliced+padded to match hidden_states rows (and equals the global ids
+        # under EP dp-attention). No-op for non-hash models.
+        # Prefer the pre-clamp snapshot: embed_mm_inputs clamps
+        # forward_batch.input_ids in place, which would erase the mm pad
+        # sentinels the bias_vl routing keys on (EP+TBO+image path).
+        routing_ids = getattr(state.forward_batch, "dsv4_routing_input_ids", None)
+        if routing_ids is not None:
+            if routing_ids.shape[0] < hidden_states.shape[0]:
+                # The child batch may pad input_ids after the slice; pad with
+                # a plain token id so the image mask stays empty there.
+                routing_ids = torch.nn.functional.pad(
+                    routing_ids,
+                    (0, hidden_states.shape[0] - routing_ids.shape[0]),
+                )
+            elif routing_ids.shape[0] > hidden_states.shape[0]:
+                # Symmetric with the pad above; never fall back to the
+                # (possibly clamped) batch ids.
+                routing_ids = routing_ids[: hidden_states.shape[0]]
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
-                state.topk_output = self.topk(
+                state.topk_output = self._forward_topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
+                    input_ids=(
+                        routing_ids
+                        if routing_ids is not None
+                        else state.forward_batch.input_ids
+                    ),
+                    image_mask=getattr(state.forward_batch, "dsv4_image_mask", None),
+                    forward_batch=state.forward_batch,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
@@ -1665,7 +1783,6 @@ class DeepseekV2MoE(nn.Module):
                         if not self.is_nextn
                         else None
                     ),
-                    **topk_kwargs,
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(

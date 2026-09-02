@@ -5183,6 +5183,24 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if req.multimodal_inputs is not None:
+                    # The rebootstrap payload only carries token ids (see
+                    # Req.build_rebootstrap_payload), so the prefill recompute
+                    # would silently rebuild the prefix KV without the image.
+                    # Abort with a client-visible error instead of serving
+                    # silently-wrong output.
+                    req.set_finish_with_abort(
+                        "Multimodal requests are not supported by PD "
+                        "rebootstrap (retraction + weight update)."
+                    )
+                    # retract_all already released this request's KV; emit
+                    # the abort to the client directly (no re-run), with the
+                    # finish reason attached so the client gets a structured
+                    # 400 (BadRequestError) instead of a bare abort.
+                    self.ipc_channels.send_to_tokenizer.send_output(
+                        _make_abort_req(req, req.to_finish.to_json()), req
+                    )
+                    continue
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True

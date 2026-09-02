@@ -40,6 +40,9 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
+from sglang.srt.layers.attention.dsv4.visible_window import (
+    image_span_aligned_extend_end,
+)
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
     Req,
@@ -1002,8 +1005,13 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        # Never cut an image span: DeepSeek-V4-Vision needs each span in one
+        # extend (may overshoot the chunk budget by up to one span).
+        new_len = image_span_aligned_extend_end(
+            req.multimodal_inputs, len(req.prefix_indices) + new_len
+        ) - len(req.prefix_indices)
+        truncated = cand_extend_input_len > new_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -1154,6 +1162,9 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
+            # Never cut an image span: DeepSeek-V4-Vision needs each span in
+            # one extend (may overshoot the chunk budget by up to one span).
+            trunc_len = image_span_aligned_extend_end(req.multimodal_inputs, trunc_len)
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1373,6 +1384,14 @@ class PrefillAdder:
                 now_input_len = trunc_len + len(req.prefix_indices)
                 now_input_len = now_input_len // self.page_size * self.page_size
                 trunc_len = now_input_len - len(req.prefix_indices)
+
+                # Never cut an image span: DeepSeek-V4-Vision needs each span
+                # in one extend. This may intentionally break the page
+                # alignment above when it would land inside a span (overshoots
+                # the chunk budget by up to one span).
+                trunc_len = image_span_aligned_extend_end(
+                    req.multimodal_inputs, len(req.prefix_indices) + trunc_len
+                ) - len(req.prefix_indices)
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

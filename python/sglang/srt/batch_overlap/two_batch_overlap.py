@@ -847,7 +847,23 @@ class TboForwardBatchPreparer:
         if len(errors) > 0:
             raise Exception(f"{len(errors)} errors happen:\n" + "\n\n".join(errors))
 
-        return ForwardBatch(**output_dict)
+        child = ForwardBatch(**output_dict)
+        # DeepSeek-V4-Vision: carry the pre-clamp routing ids to the child so
+        # the MoE gate can still see the mm pad sentinels after the parent's
+        # input_ids got clamped by embed_mm_inputs.
+        routing_ids = getattr(batch, "dsv4_routing_input_ids", None)
+        if routing_ids is not None:
+            child.dsv4_routing_input_ids = routing_ids[
+                start_token_index:end_token_index
+            ]
+        # Also carry the hoisted image-token mask and its host-side flag (the
+        # child's mask may have no sentinel left; inheriting the parent's flag
+        # is a conservative superset and only costs the eager fallback).
+        image_mask = getattr(batch, "dsv4_image_mask", None)
+        if image_mask is not None:
+            child.dsv4_image_mask = image_mask[start_token_index:end_token_index]
+            child.dsv4_has_image_tokens = getattr(batch, "dsv4_has_image_tokens", False)
+        return child
 
     @classmethod
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):

@@ -1,9 +1,11 @@
-# Adapted from the DeepSeek-V4 release reference implementation.
+# Adapted from the DeepSeek-V4-Flash-Vision-Exp release reference implementation
+# (encoding/encoding_dsv4.py), with sglang-specific compatibility shims at the
+# bottom of the "Reasoning Effort" section and in "Task Support".
 """
-DeepSeek-V4 Encoding
+DeepSeek-V4 Text and Vision Encoding
 
 A self-contained implementation for encoding/decoding DeepSeek-V4 chat messages
-with tool calling, thinking mode, and quick instruction task support.
+with tool calling, thinking mode, quick instruction tasks, and image content blocks.
 """
 
 import copy
@@ -24,6 +26,8 @@ dsml_token: str = "｜DSML｜"
 USER_SP_TOKEN = "<｜User｜>"
 ASSISTANT_SP_TOKEN = "<｜Assistant｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
+IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+IMAGE_TAG_PATTERN = re.compile(r"<image>(.*?)</image>", re.DOTALL)
 
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
@@ -60,29 +64,48 @@ tool_calls_block_name: str = "tool_calls"
 
 tool_output_template: str = "<tool_result>{content}</tool_result>"
 
-REASONING_EFFORT_PREVIEW_MAX = (
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-)
-
-REASONING_EFFORT_OFFICIAL_MAX = (
-    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
-)
-
-REASONING_EFFORT_PROFILES = {
-    "preview": {
-        "high": "",
-        "max": REASONING_EFFORT_PREVIEW_MAX,
-    },
-    "official": {
-        "low": "",
-        "high": REASONING_EFFORT_PREVIEW_MAX,
-        "max": REASONING_EFFORT_OFFICIAL_MAX,
-    },
+# Reasoning effort levels. In thinking mode, the prompt for the selected level is
+# prepended at the very beginning of the conversation. `low` is the default and
+# adds nothing.
+REASONING_EFFORT_PROMPTS: Dict[str, str] = {
+    "low": "",
+    "high": (
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+    ),
+    "max": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+    ),
 }
+DEFAULT_REASONING_EFFORT = "low"
+
+# --- sglang compatibility shim -------------------------------------------
+# Previous sglang adapter exposed two reasoning-effort "profiles" keyed off
+# the checkpoint's bundled encoder: "preview" (original V4 text release) and
+# "official" (current upstream). The prompt texts are unchanged upstream, so
+# the profiles map onto the flat levels: preview/high == "", preview/max ==
+# upstream "high", official/* == upstream level of the same name.
+REASONING_EFFORT_PROFILES: Dict[str, Dict[str, str]] = {
+    "preview": {"high": "", "max": REASONING_EFFORT_PROMPTS["high"]},
+    "official": REASONING_EFFORT_PROMPTS,
+}
+
+
+def resolve_profile_reasoning_effort(
+    profile: str, reasoning_effort: Optional[str]
+) -> Optional[str]:
+    """Translate a legacy (profile, effort) pair to a flat upstream effort."""
+    if reasoning_effort is None:
+        return None
+    if profile == "preview":
+        return {"high": "low", "max": "high"}.get(reasoning_effort, reasoning_effort)
+    return reasoning_effort
+
+
+# --- end sglang compatibility shim ---------------------------------------
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -159,7 +182,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" keys.
+        tool_call: Dict with "name" and "arguments" (JSON string) keys.
 
     Returns:
         DSML-formatted parameter string.
@@ -167,14 +190,10 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    raw_arguments = tool_call["arguments"]
-    arguments = (
-        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-    )
-    if not isinstance(arguments, dict):
-        raise ValueError(
-            "Assistant tool call function.arguments must be a JSON object."
-        )
+    try:
+        arguments = json.loads(tool_call["arguments"])
+    except Exception as err:
+        arguments = {"arguments": tool_call["arguments"]}
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -248,7 +267,10 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
 
 def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
-    """Set `task` on the most recent user/developer message; raise if none exists."""
+    """Set `task` on the most recent user/developer message; raise if none exists.
+
+    sglang addition (used by serving_chat for the OpenAI `task` request field).
+    """
     idx = find_last_user_index(messages)
     if idx == -1:
         raise ValueError(
@@ -268,7 +290,6 @@ def render_message(
     thinking_mode: str,
     drop_thinking: bool = True,
     reasoning_effort: Optional[str] = None,
-    reasoning_effort_profile: str = "preview",
 ) -> str:
     """
     Render a single message at the given index into its encoded string form.
@@ -281,9 +302,8 @@ def render_message(
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level. The preview profile accepts
-            "high" and "max"; the official profile accepts "low", "high", and "max".
-        reasoning_effort_profile: DeepSeek-V4 effort mapping ("preview" or "official").
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            None is treated as "low".
 
     Returns:
         Encoded string for this message.
@@ -311,21 +331,13 @@ def render_message(
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    if reasoning_effort_profile not in REASONING_EFFORT_PROFILES:
-        raise ValueError(
-            f"Invalid reasoning effort profile: {reasoning_effort_profile!r}; "
-            f"expected one of {list(REASONING_EFFORT_PROFILES)}"
-        )
-    effort_prompts = REASONING_EFFORT_PROFILES[reasoning_effort_profile]
-    if reasoning_effort is None:
-        reasoning_effort = "low" if reasoning_effort_profile == "official" else "high"
-    if reasoning_effort not in effort_prompts:
-        raise ValueError(
-            f"Invalid reasoning effort {reasoning_effort!r} for profile "
-            f"{reasoning_effort_profile!r}; expected one of {list(effort_prompts)}"
-        )
+    # Reasoning effort prefix (only at index 0 in thinking mode; "low" adds nothing)
+    reasoning_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
+    assert (
+        reasoning_effort in REASONING_EFFORT_PROMPTS
+    ), f"Invalid reasoning effort: {reasoning_effort}, expected one of {list(REASONING_EFFORT_PROMPTS)}"
     if index == 0 and thinking_mode == "thinking":
-        prompt += effort_prompts[reasoning_effort]
+        prompt += REASONING_EFFORT_PROMPTS[reasoning_effort]
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
@@ -528,24 +540,20 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     }
                 )
         elif role == "user":
-            text_block = {"type": "text", "text": msg.get("content", "")}
+            content_blocks = msg.get("content_blocks")
+            if content_blocks is None:
+                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
             if (
                 merged
                 and merged[-1].get("role") == "user"
                 and "content_blocks" in merged[-1]
                 and merged[-1].get("task") is None
             ):
-                merged[-1]["content_blocks"].append(text_block)
+                merged[-1]["content_blocks"].extend(content_blocks)
             else:
-                new_msg = {
-                    "role": "user",
-                    "content": msg.get("content", ""),
-                    "content_blocks": [text_block],
-                }
-                # Preserve extra fields (task, wo_eos, mask, etc.)
-                for key in ("task", "wo_eos", "mask"):
-                    if key in msg:
-                        new_msg[key] = msg[key]
+                # Preserve structured content and all message-level metadata.
+                new_msg = msg
+                new_msg["content_blocks"] = content_blocks
                 merged.append(new_msg)
         else:
             merged.append(msg)
@@ -604,14 +612,13 @@ def sort_tool_results_by_call_order(
 # ============================================================
 
 
-def encode_messages(
+def _encode_messages_text(
     messages: List[Dict[str, Any]],
     thinking_mode: str,
     context: Optional[List[Dict[str, Any]]] = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Optional[str] = None,
-    reasoning_effort_profile: str = "preview",
 ) -> str:
     """
     Encode a list of messages into the DeepSeek-V4 prompt format.
@@ -629,9 +636,8 @@ def encode_messages(
         drop_thinking: If True, drop reasoning_content from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level. The preview profile accepts
-            "high" and "max"; the official profile accepts "low", "high", and "max".
-        reasoning_effort_profile: DeepSeek-V4 effort mapping ("preview" or "official").
+        reasoning_effort: Reasoning effort level, one of "low", "high", "max".
+            Only takes effect in thinking mode. None is treated as "low".
 
     Returns:
         The encoded prompt string.
@@ -671,7 +677,6 @@ def encode_messages(
             thinking_mode=thinking_mode,
             drop_thinking=effective_drop_thinking,
             reasoning_effort=reasoning_effort,
-            reasoning_effort_profile=reasoning_effort_profile,
         )
 
     return prompt
@@ -702,6 +707,214 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
         # developer and other roles before last_user_idx are dropped
 
     return result
+
+
+# ============================================================
+# Vision Message Preprocessing
+# ============================================================
+
+
+def parse_tagged_text(text: str) -> Union[str, List[Dict[str, Any]]]:
+    """Convert ``<image>path</image>`` text into standard content blocks."""
+    matches = list(IMAGE_TAG_PATTERN.finditer(text))
+    remaining = IMAGE_TAG_PATTERN.sub("", text)
+    if "<image>" in remaining or "</image>" in remaining:
+        raise ValueError("Malformed <image>path</image> tag")
+    if not matches:
+        return text
+
+    blocks: List[Dict[str, Any]] = []
+    cursor = 0
+    for match in matches:
+        if match.start() > cursor:
+            blocks.append({"type": "text", "text": text[cursor : match.start()]})
+        path = match.group(1)
+        if not path:
+            raise ValueError("Image path must not be empty")
+        blocks.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": path},
+            }
+        )
+        cursor = match.end()
+    if cursor < len(text):
+        blocks.append({"type": "text", "text": text[cursor:]})
+    return blocks
+
+
+def _is_image_block(block: Dict[str, Any]) -> bool:
+    """Return whether a content block is an OpenAI/Anthropic/internal image."""
+    return isinstance(block, dict) and block.get("type") in ("image", "image_url")
+
+
+def _extract_image(block: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a supported image block into an internal image record."""
+    record: Dict[str, Any] = {"type": "image"}
+    if block.get("type") == "image_url":
+        image_url = block.get("image_url")
+        if isinstance(image_url, str):
+            record["url"] = image_url
+        else:
+            record["url"] = (image_url or {}).get("url", "")
+    else:
+        for key in ("source", "url", "data"):
+            if key in block:
+                record[key] = block[key]
+    if not any(record.get(key) for key in ("source", "url", "data")):
+        raise ValueError("Image block does not contain a valid source")
+    return record
+
+
+def _process_image_blocks(
+    blocks: List[Any], image_placeholder: str = IMAGE_PLACEHOLDER
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    """Replace image blocks and collect their records in one ordered traversal."""
+    new_blocks: List[Any] = []
+    images: List[Dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+        if _is_image_block(block):
+            new_blocks.append({"type": "text", "text": image_placeholder})
+            images.append(_extract_image(block))
+        elif block.get("type") == "tool_result" and isinstance(
+            block.get("content"), list
+        ):
+            block = copy.copy(block)
+            block["content"], nested_images = _process_image_blocks(
+                block["content"], image_placeholder
+            )
+            new_blocks.append(block)
+            images.extend(nested_images)
+        elif block.get("type") == "text":
+            text = block.get("text") or ""
+            if IMAGE_PLACEHOLDER in text:
+                raise ValueError(
+                    f"Text block contains image placeholder '{IMAGE_PLACEHOLDER}': "
+                    f"'{text[:100]}'. Images should be separate content blocks."
+                )
+            new_blocks.append(block)
+        else:
+            new_blocks.append(block)
+    return new_blocks, images
+
+
+def _validate_no_image_sp_tokens(msg: Dict[str, Any]) -> None:
+    """Reject user-supplied image placeholder tokens in textual fields."""
+    content = msg.get("content")
+    if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
+        raise ValueError(
+            f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
+            "Images should be provided as image content blocks."
+        )
+    reasoning_content = msg.get("reasoning_content")
+    if isinstance(reasoning_content, str) and IMAGE_PLACEHOLDER in reasoning_content:
+        raise ValueError(
+            f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
+        )
+
+
+def process_image_messages(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Normalize image blocks and return their records in prompt order."""
+    processed: List[Dict[str, Any]] = []
+    images: List[Dict[str, Any]] = []
+    for msg in messages:
+        msg = copy.deepcopy(msg)
+        _validate_no_image_sp_tokens(msg)
+
+        if isinstance(msg.get("content"), list) and "content_blocks" not in msg:
+            msg["content_blocks"] = msg.pop("content")
+
+        if msg.get("content_blocks"):
+            msg["content_blocks"], message_images = _process_image_blocks(
+                msg["content_blocks"]
+            )
+            images.extend(message_images)
+            if not isinstance(msg.get("content"), str):
+                texts = [
+                    block.get("text", "")
+                    for block in msg["content_blocks"]
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                msg["content"] = "\n\n".join(texts)
+
+        processed.append(msg)
+    return processed, images
+
+
+def encode_messages(
+    messages: List[Dict[str, Any]],
+    thinking_mode: str,
+    context: Optional[List[Dict[str, Any]]] = None,
+    drop_thinking: bool = True,
+    add_default_bos_token: bool = True,
+    reasoning_effort: Optional[str] = None,
+    return_multi_modal_data: bool = False,
+) -> Any:
+    """Encode text or multimodal messages through one canonical public entrypoint.
+
+    Text-only calls preserve the original string-returning API. When
+    return_multi_modal_data is true, the result is ``(prompt, media_data)``.
+    """
+    context = context or []
+    processed_context, _ = process_image_messages(context) if context else ([], [])
+    processed_messages, images = process_image_messages(messages)
+    prompt = _encode_messages_text(
+        processed_messages,
+        thinking_mode=thinking_mode,
+        context=processed_context if processed_context else None,
+        drop_thinking=drop_thinking,
+        add_default_bos_token=add_default_bos_token,
+        reasoning_effort=reasoning_effort,
+    )
+    if return_multi_modal_data:
+        return prompt, {"images": images}
+    return prompt
+
+
+def load_cases(input_file: str) -> List[Dict[str, Any]]:
+    """Load one or more OpenAI-format conversation cases from JSON."""
+    with open(input_file) as file:
+        data = json.load(file)
+    if isinstance(data, dict):
+        data = [data]
+    elif data and isinstance(data[0], dict) and "role" in data[0]:
+        data = [{"messages": data}]
+
+    cases = []
+    for case in data:
+        messages = copy.deepcopy(case["messages"])
+        if "tools" in case:
+            if not messages:
+                raise ValueError("A case with tools must contain at least one message")
+            messages[0]["tools"] = case["tools"]
+        cases.append(
+            {
+                "messages": messages,
+                "context": case.get("context"),
+                "thinking_mode": case.get("thinking_mode"),
+                "reasoning_effort": case.get("reasoning_effort"),
+            }
+        )
+    return cases
+
+
+def encode_case(
+    case: Dict[str, Any], thinking_mode: str
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Encode one JSON case and return its current-turn image records."""
+    prompt, media_data = encode_messages(
+        case["messages"],
+        thinking_mode=case.get("thinking_mode") or thinking_mode,
+        context=case.get("context"),
+        reasoning_effort=case.get("reasoning_effort"),
+        return_multi_modal_data=True,
+    )
+    return prompt, media_data["images"]
 
 
 # ============================================================

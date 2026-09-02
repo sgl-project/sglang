@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.dsv4.visible_window import image_span_cut_point
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1462,6 +1463,37 @@ class Req(ReqDllmMixin):
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(
                     tree_cache, match_result, extra_key=self.extra_key
+                )
+            # DeepSeek-V4-Vision: a prefix match ending inside an image span
+            # would cut the span's atomic visible-window prefill — the span's
+            # early raw KV is not retained beyond the sliding window, so the
+            # re-prefilled tail could not read it. Re-match capped to the span
+            # start, which fully re-prefills the span in one extend.
+            # HiCache: the effective match after load-back is deeper than the
+            # device-resident anchor, so include the host-hit length —
+            # otherwise a deep host hit into a span would bypass the cut and
+            # silently degrade the span to a causal window.
+            cut_point = image_span_cut_point(
+                self.multimodal_inputs,
+                len(match_result.device_indices) + match_result.host_hit_length,
+                getattr(tree_cache, "sliding_window_size", None) or 128,
+            )
+            if cut_point is not None:
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids=token_ids_to_match,
+                            extra_key=self.extra_key,
+                            limit=(
+                                cut_point
+                                if key_limit is None
+                                else min(key_limit, cut_point)
+                            ),
+                            cache_salt=self.cache_salt,
+                        ),
+                        req=self,
+                        cow_mamba=cow_mamba,
+                    )
                 )
             (
                 self.prefix_indices,

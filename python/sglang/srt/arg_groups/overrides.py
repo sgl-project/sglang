@@ -1542,6 +1542,18 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
             "FlashInfer TRTLLM routed MoE is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
+    if runner == "flashinfer_mxfp4":
+        # DeepSeek-V4 hash-routing layers (HashTopK) reject
+        # apply_routed_scaling_factor_on_output together with fused shared
+        # experts; the mxfp4 runner's quant method fuses the scaling factor
+        # into top-k, so the combination fails at model build time.
+        hf_config = model_config_of(view).hf_config
+        if getattr(hf_config, "architectures", [None])[0] == "DeepseekV4ForCausalLM":
+            logger.warning(
+                "DeepSeek-V4 with the FlashInfer MXFP4 MoE runner requires "
+                "--disable-shared-experts-fusion; setting it automatically."
+            )
+            return {"disable_shared_experts_fusion": True}
     return {}
 
 

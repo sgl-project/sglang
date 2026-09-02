@@ -2873,6 +2873,10 @@ class DeepseekV4Model(nn.Module):
             # MTP target-verify also reports is_extend(); only real prefill
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
+            # TBO child batches drop mm metadata (the split sets mm_inputs=None),
+            # which would silently degrade image-span visible-window attention
+            # to causal. Fall back to the normal path for mm batches.
+            and not forward_batch.contains_mm_inputs()
             and path_ok
             and self.pp_group.world_size == 1
         )
@@ -3072,6 +3076,20 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Multimodal prefill embeds tokens outside and calls this with
+        # input_ids=None; the hash-MoE routing and the dp gather below still
+        # need the real (padded) ids. Read the pre-embedding snapshot when
+        # present: embed_mm_inputs clamps forward_batch.input_ids in place
+        # (max=vocab_size-1), which would erase the mm pad sentinels the
+        # bias_vl routing keys on.
+        if input_ids is None:
+            input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+            if input_ids is None:
+                input_ids = forward_batch.input_ids
+        # Note: the image-token mask + host flag for the bias_vl routing are
+        # hoisted by the VL wrapper (deepseek_v4_vl.py) before the mm embed
+        # routine — by the time this forward runs, forward_batch.mm_inputs
+        # has been nulled by embed_mm_inputs.
         cp_v2_active = is_cp_v2_active(forward_batch)
         use_prefill_cp = dsa_use_prefill_cp(forward_batch)
         if self.pp_group.is_first_rank:
@@ -3104,6 +3122,26 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids_global.squeeze(-1)
         else:
             input_ids_global = input_ids
+
+        # Hoist the image-token mask + host flag for the bias_vl routing,
+        # computed from input_ids_global — the exact ids the MoE gate sees.
+        # (Computing from the local batch ids breaks under dp-attention: an
+        # idle/text-only rank would skip the check while the gathered global
+        # ids still contain a peer's mm pad sentinels, sending them into the
+        # fused hash_topk kernel for an illegal access.)
+        from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+
+        if not torch.cuda.is_current_stream_capturing():
+            image_mask = input_ids_global >= MM_PAD_SHIFT_VALUE
+            if image_mask.any():
+                forward_batch.dsv4_image_mask = image_mask
+                forward_batch.dsv4_has_image_tokens = True
+            else:
+                forward_batch.dsv4_image_mask = None
+                forward_batch.dsv4_has_image_tokens = False
+        else:
+            forward_batch.dsv4_image_mask = None
+            forward_batch.dsv4_has_image_tokens = False
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []
@@ -3338,10 +3376,19 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # input_ids is None for multimodal prefill (tokens are embedded by
+        # the VL wrapper); CP metadata prep only needs the length, so resolve
+        # the ids the same way DeepseekV4Model.forward does — the pre-clamp
+        # snapshot first, then the (possibly clamped) batch ids.
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            cp_input_ids = input_ids
+            if cp_input_ids is None:
+                cp_input_ids = getattr(forward_batch, "dsv4_routing_input_ids", None)
+            if cp_input_ids is None:
+                cp_input_ids = forward_batch.input_ids
+            if can_dsa_cp_split(len(cp_input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
+                    len(cp_input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
@@ -3490,7 +3537,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.removesuffix(".scale") + ".weight_scale_inv"
 
         name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        # Suffix-exact match: a substring replace would also rewrite the
+        # vision model's ".gate.bias_vl" into ".gate.e_score_correction_bias_vl".
+        if name.endswith(".gate.bias"):
+            name = name.removesuffix(".gate.bias") + ".gate.e_score_correction_bias"
         name = name.replace(".w1.", ".gate_proj.")
         name = name.replace(".w2.", ".down_proj.")
         name = name.replace(".w3.", ".up_proj.")
@@ -3940,7 +3990,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
 
-EntryClass = [DeepseekV4ForCausalLM]
+# NOTE: EntryClass registration moved to deepseek_v4_vl.py, whose vision-capable
+# wrapper is also named DeepseekV4ForCausalLM (the HF arch string is identical
+# for text-only and vision checkpoints). Text-only checkpoints delegate to this
+# class unchanged. Do not re-add an EntryClass here — the model registry rejects
+# duplicate class names.
+# EntryClass = [DeepseekV4ForCausalLM]  # see deepseek_v4_vl.py
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

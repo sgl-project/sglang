@@ -254,6 +254,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        swa_topk_lengths_override: Optional[torch.Tensor] = None,
     ) -> PageTablePositionsResult:
         return build_page_table_positions(
             req_to_token=req_to_token,
@@ -262,6 +263,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            swa_topk_lengths_override=swa_topk_lengths_override,
         )
 
     @classmethod
@@ -274,6 +276,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        swa_topk_lengths_override: Optional[torch.Tensor] = None,
     ) -> PageTablePositionsResult:
         return build_page_table_positions_triton(
             req_to_token=req_to_token,
@@ -282,6 +285,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            swa_topk_lengths_override=swa_topk_lengths_override,
         )
 
 
@@ -293,6 +297,7 @@ def build_page_table_positions(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    swa_topk_lengths_override: Optional[torch.Tensor] = None,
 ) -> PageTablePositionsResult:
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     positions_casual = seq_lens_casual - 1
@@ -300,7 +305,11 @@ def build_page_table_positions(
         req_pool_indices_repeated.to(torch.int64), :max_seq_len:page_size
     ]
     page_table = (page_table // page_size).to(torch.int32)
-    swa_topk_lengths = torch.clamp(seq_lens_casual, max=swa_window)
+    if swa_topk_lengths_override is not None:
+        # Per-token visible-window lengths (image spans); otherwise causal.
+        swa_topk_lengths = swa_topk_lengths_override
+    else:
+        swa_topk_lengths = torch.clamp(seq_lens_casual, max=swa_window)
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_casual,
         positions_casual=positions_casual,
@@ -318,17 +327,22 @@ def _page_table_positions_kernel(
     positions_out_ptr,
     page_table_ptr,
     topk_out_ptr,
+    topk_override_ptr,
     rt_stride,
     num_pages,
     page_size,
     swa_window,
     BLOCK_P: tl.constexpr,
+    HAS_TOPK_OVERRIDE: tl.constexpr,
 ):
     row = tl.program_id(0)
     seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
     tl.store(seq_lens_out_ptr + row, seq_len)
     tl.store(positions_out_ptr + row, seq_len - 1)
-    tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
+    if HAS_TOPK_OVERRIDE:
+        tl.store(topk_out_ptr + row, tl.load(topk_override_ptr + row))
+    else:
+        tl.store(topk_out_ptr + row, tl.minimum(seq_len, swa_window))
 
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
@@ -350,6 +364,7 @@ def build_page_table_positions_triton(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    swa_topk_lengths_override: Optional[torch.Tensor] = None,
 ) -> PageTablePositionsResult:
     num_q = seq_lens_casual.shape[0]
     num_pages = (max_seq_len + page_size - 1) // page_size
@@ -368,11 +383,17 @@ def build_page_table_positions_triton(
         positions_out,
         page_table,
         topk_out,
+        (
+            swa_topk_lengths_override
+            if swa_topk_lengths_override is not None
+            else seq_lens_casual
+        ),
         req_to_token.stride(0),
         num_pages,
         page_size,
         swa_window,
         BLOCK_P=BLOCK_P,
+        HAS_TOPK_OVERRIDE=swa_topk_lengths_override is not None,
     )
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_out,
@@ -399,6 +420,8 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
+        win_starts: Optional[torch.Tensor] = None,
+        win_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_causal_swa_page_indices(
             req_to_token=req_to_token,
@@ -407,6 +430,8 @@ class BuildCausalSwaPageIndices:
             seq_lens_casual=seq_lens_casual,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            win_starts=win_starts,
+            win_lens=win_lens,
         )
 
     @classmethod
@@ -419,6 +444,8 @@ class BuildCausalSwaPageIndices:
         seq_lens_casual: torch.Tensor,
         swa_window: int,
         page_index_aligned_size: int,
+        win_starts: Optional[torch.Tensor] = None,
+        win_lens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_causal_swa_page_indices_triton(
             req_to_token=req_to_token,
@@ -427,6 +454,8 @@ class BuildCausalSwaPageIndices:
             seq_lens_casual=seq_lens_casual,
             swa_window=swa_window,
             page_index_aligned_size=page_index_aligned_size,
+            win_starts=win_starts,
+            win_lens=win_lens,
         )
 
 
@@ -438,10 +467,30 @@ def build_causal_swa_page_indices(
     seq_lens_casual: torch.Tensor,
     swa_window: int,
     page_index_aligned_size: int,
+    win_starts: Optional[torch.Tensor] = None,
+    win_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = seq_lens_casual.device
-    pos_causal = seq_lens_casual - 1
     num_qo_tokens = seq_lens_casual.size(0)
+    if win_starts is not None:
+        # Per-token visible windows (image spans): row i covers
+        # [win_starts[i], win_starts[i] + win_lens[i]); width covers the max.
+        assert win_lens is not None
+        window_width = int(win_lens.max().item())
+        padded_width = (
+            (window_width + page_index_aligned_size - 1) // page_index_aligned_size
+        ) * page_index_aligned_size
+        offsets = win_starts.unsqueeze(1) + torch.arange(
+            padded_width, dtype=torch.int32, device=device
+        ).unsqueeze(0)
+        invalid_offset_mask = offsets >= (win_starts + win_lens).unsqueeze(1)
+        offsets.masked_fill_(invalid_offset_mask, 0)
+        raw_indices = req_to_token[req_pool_indices_repeated[:, None], offsets]
+        assert raw_indices.shape == (num_qo_tokens, padded_width)
+        raw_indices.masked_fill_(invalid_offset_mask, -1)
+        return full_to_swa_mapping[raw_indices].to(torch.int32)
+
+    pos_causal = seq_lens_casual - 1
     offsets = pos_causal.unsqueeze(1) - torch.arange(
         swa_window, dtype=torch.int32, device=device
     ).unsqueeze(0)
@@ -469,23 +518,33 @@ def _causal_swa_page_indices_kernel(
     full_to_swa_ptr,
     req_pool_ptr,
     seq_lens_ptr,
+    win_starts_ptr,
+    win_lens_ptr,
     out_ptr,
     rt_stride,
     swa_window,
     padded_width,
     BLOCK_K: tl.constexpr,
+    HAS_WIN: tl.constexpr,
 ):
     row = tl.program_id(0)
     pos = tl.load(seq_lens_ptr + row).to(tl.int64) - 1
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
     out_base = out_ptr + row.to(tl.int64) * padded_width
+    if HAS_WIN:
+        win_start = tl.load(win_starts_ptr + row).to(tl.int64)
+        win_len = tl.load(win_lens_ptr + row).to(tl.int64)
 
     for k0 in range(0, padded_width, BLOCK_K):
         k = k0 + tl.arange(0, BLOCK_K)
         kmask = k < padded_width
-        off = pos - k.to(tl.int64)
-        valid = (k < swa_window) & (off >= 0) & kmask
+        if HAS_WIN:
+            off = win_start + k.to(tl.int64)
+            valid = (k < win_len) & kmask
+        else:
+            off = pos - k.to(tl.int64)
+            valid = (k < swa_window) & (off >= 0) & kmask
         full_loc = tl.load(base + tl.where(valid, off, 0), mask=valid, other=-1).to(
             tl.int64
         )
@@ -501,10 +560,17 @@ def build_causal_swa_page_indices_triton(
     seq_lens_casual: torch.Tensor,
     swa_window: int,
     page_index_aligned_size: int,
+    win_starts: Optional[torch.Tensor] = None,
+    win_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_qo_tokens = seq_lens_casual.size(0)
+    if win_lens is not None:
+        # Per-token visible windows (image spans); width covers the max len.
+        window_width = int(win_lens.max().item())
+    else:
+        window_width = swa_window
     padded_width = (
-        (swa_window + page_index_aligned_size - 1) // page_index_aligned_size
+        (window_width + page_index_aligned_size - 1) // page_index_aligned_size
     ) * page_index_aligned_size
     out = torch.empty(
         (num_qo_tokens, padded_width),
@@ -517,10 +583,13 @@ def build_causal_swa_page_indices_triton(
         full_to_swa_mapping,
         req_pool_indices_repeated,
         seq_lens_casual,
+        win_starts if win_starts is not None else seq_lens_casual,
+        win_lens if win_lens is not None else seq_lens_casual,
         out,
         req_to_token.stride(0),
         swa_window,
         padded_width,
         BLOCK_K=BLOCK_K,
+        HAS_WIN=win_starts is not None,
     )
     return out

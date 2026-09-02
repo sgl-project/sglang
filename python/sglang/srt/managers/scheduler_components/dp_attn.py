@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -272,6 +272,23 @@ def _local_decode_cuda_graph_vote(
     )
 
 
+def _dsv4_batch_needs_visible_window(local_batch: ScheduleBatch, model_config) -> bool:
+    """True iff a DSV4 batch's extend chunk contains an image span that needs
+    per-token visible-window overrides (eager-only)."""
+    if not is_deepseek_v4(model_config.hf_config):
+        return False
+    from sglang.srt.layers.attention.dsv4.visible_window import (
+        has_visible_window_span,
+    )
+
+    return has_visible_window_span(
+        local_batch.multimodal_inputs,
+        local_batch.prefix_lens,
+        local_batch.extend_lens,
+        getattr(model_config, "sliding_window_size", None) or 128,
+    )
+
+
 def _local_prefill_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
@@ -297,6 +314,11 @@ def _local_prefill_cuda_graph_vote(
         replace_embeds = local_batch.replace_embeds
         prefix_lens = local_batch.prefix_lens
         return_logprob = local_batch.return_logprob
+        if _dsv4_batch_needs_visible_window(local_batch, model_config):
+            # DSV4 image spans widen the SWA window per token, making the
+            # index shapes batch-dependent; prefill graphs capture fixed
+            # shapes, so such batches must run eagerly.
+            return False
     elif (
         mode.is_decode()
         # Conversion replays the breakable graphs only; full's fixed
