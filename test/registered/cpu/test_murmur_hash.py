@@ -1,6 +1,7 @@
 import sys
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
@@ -9,10 +10,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 
 
-def test_murmur_hash32_cpu_known_values():
+@pytest.mark.parametrize("positions_dtype", [torch.int64, torch.uint64])
+def test_murmur_hash32_cpu_known_values(positions_dtype):
     seed = torch.tensor([0, 1, 42, 0x123456789ABCDEF0], dtype=torch.uint64)
 
-    positions = torch.tensor([0, 7, 123, 456], dtype=torch.int64)
+    positions = torch.tensor([0, 7, 123, 456], dtype=positions_dtype)
 
     col_indices = torch.tensor([0, 1, 2, 17], dtype=torch.int64)
 
@@ -31,9 +33,12 @@ def test_murmur_hash32_cpu_known_values():
     torch.testing.assert_close(actual, expected)
 
 
-def test_murmur_hash32_cpu_shape_and_dtype():
+@pytest.mark.parametrize("positions_dtype", [torch.int64, torch.uint64])
+def test_murmur_hash32_cpu_shape_and_dtype(positions_dtype):
     seed = torch.tensor([1, 2, 3], dtype=torch.uint64)
-    positions = torch.tensor([10, 20, 30], dtype=torch.int64)
+
+    positions = torch.tensor([10, 20, 30], dtype=positions_dtype)
+
     col_indices = torch.arange(128, dtype=torch.int64)
 
     actual = murmur_hash32(
