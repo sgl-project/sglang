@@ -128,6 +128,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -236,6 +238,8 @@ jobs:
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test

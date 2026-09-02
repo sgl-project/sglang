@@ -203,6 +203,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -400,6 +402,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -475,6 +479,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
@@ -552,6 +558,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
