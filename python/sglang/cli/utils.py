@@ -96,8 +96,9 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return False
 
 
-def get_model_path(extra_argv):
-    # Find the model_path argument
+def try_get_model_path(extra_argv) -> str | None:
+    """Return a model path from command-line arguments when one is present."""
+
     model_path = None
     for i, arg in enumerate(extra_argv):
         if arg in ("--model-path", "--model"):
@@ -107,6 +108,13 @@ def get_model_path(extra_argv):
         elif arg.startswith("--model-path=") or arg.startswith("--model="):
             model_path = arg.split("=", 1)[1]
             break
+
+    return model_path
+
+
+def get_model_path(extra_argv):
+    # Find the model_path argument
+    model_path = try_get_model_path(extra_argv)
 
     if model_path is None:
         # Fallback for --help or other cases where model-path is not provided

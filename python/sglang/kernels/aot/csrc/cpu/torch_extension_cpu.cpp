@@ -28,7 +28,7 @@ at::Tensor gelu_tanh_and_mul_cpu(const at::Tensor& input);
 at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // fused_sigmoid_mul
-at::Tensor fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate, bool inplace);
+void fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
@@ -56,6 +56,19 @@ at::Tensor fused_add_layernorm_cpu(
     at::Tensor& residual,
     const at::Tensor& weight,
     const std::optional<at::Tensor>& bias,
+    double eps);
+
+// fused_qk_rmsnorm
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
+at::Tensor fused_qk_rmsnorm_sumsq_cpu(const at::Tensor& q, const at::Tensor& k);
+std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_apply_from_stats_cpu(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& sum_sq,
+    int64_t tp_world_size,
     double eps);
 
 // fused_qk_gemma_rmsnorm
@@ -157,10 +170,18 @@ void rotate_input_ids_cpu(
     const std::optional<at::Tensor>& select_index_opt);
 
 // topk
-std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
-std::tuple<at::Tensor, at::Tensor>
-topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
+std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    int64_t topk,
+    bool renormalize,
+    const std::optional<at::Tensor>& correction_bias);
 
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -224,7 +245,8 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask);
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true);
 
 // flash attention
 at::Tensor flash_attn_varlen_func(
@@ -340,7 +362,8 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_bias,
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
-    bool is_vnni);
+    bool is_vnni,
+    const std::optional<std::string>& activation);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -457,8 +480,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
+// multidimensional rope
+void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+
 // mrope
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -554,7 +580,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_tanh_and_mul_cpu", torch::kCPU, &gelu_tanh_and_mul_cpu);
   m.def("gelu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("gelu_and_mul_cpu", torch::kCPU, &gelu_and_mul_cpu);
-  m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate, bool inplace) -> Tensor(a!)");
+  m.def("fused_sigmoid_mul_cpu(Tensor(a!) input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul_cpu", torch::kCPU, &fused_sigmoid_mul_cpu);
 
   // norm
@@ -580,6 +606,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def(
+      "fused_qk_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps) -> "
+      "(Tensor, Tensor)");
+  m.impl("fused_qk_rmsnorm_cpu", torch::kCPU, &fused_qk_rmsnorm_cpu);
+  m.def("fused_qk_rmsnorm_sumsq_cpu(Tensor q, Tensor k) -> Tensor");
+  m.impl("fused_qk_rmsnorm_sumsq_cpu", torch::kCPU, &fused_qk_rmsnorm_sumsq_cpu);
+  m.def(
+      "fused_qk_rmsnorm_apply_from_stats_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, Tensor sum_sq, int "
+      "tp_world_size, float eps) -> (Tensor, Tensor)");
+  m.impl("fused_qk_rmsnorm_apply_from_stats_cpu", torch::kCPU, &fused_qk_rmsnorm_apply_from_stats_cpu);
   m.def(
       "fused_qk_gemma_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps, int head_dim) -> "
       "(Tensor, Tensor)");
@@ -649,9 +685,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("reconstruct_indices_from_tree_mask_cpu", torch::kCPU, &reconstruct_indices_from_tree_mask_cpu);
 
   // topk
-  m.def("topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
+  m.def(
+      "topk_sigmoid_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_sigmoid_cpu", torch::kCPU, &topk_sigmoid_cpu);
-  m.def("topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize) -> (Tensor, Tensor)");
+  m.def(
+      "topk_softmax_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, "
+      "Tensor? correction_bias=None) -> (Tensor, Tensor)");
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
@@ -680,7 +720,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, int "
       "sliding_window_size, Tensor? "
-      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None) -> ()");
+      "encoder_lens, Tensor? sinks, Tensor? tree_mask=None, bool is_causal=True) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // flash attn
@@ -760,7 +800,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
-      "limit, bool is_vnni) -> Tensor");
+      "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
@@ -829,10 +869,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
+  // multidimensional rope
+  m.def("apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> ()");
+  m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
+
   // multimodal rope
   m.def(
-      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> ()");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding

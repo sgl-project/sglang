@@ -777,3 +777,37 @@ def test_prefill_failure_invalidates_namespaced_reshard_cache_and_endpoint(
 
     assert set(manager.kv_reshard_connection_pool) == {("live:8999", 0)}
     mock_disconnect.assert_called_once_with("tcp://10.0.0.1:19000")
+
+
+@pytest.mark.parametrize(
+    "mode,backend,staging,message",
+    [
+        ("null", "mooncake", False, "requires PD prefill/decode mode"),
+        ("prefill", "nixl", False, "requires the mooncake transfer backend"),
+        ("decode", "mooncake", True, "mutually exclusive"),
+    ],
+)
+def test_reshard_argument_validation_uses_pd_hook(
+    mode: str, backend: str, staging: bool, message: str
+) -> None:
+    from sglang.srt.arg_groups import pd_disaggregation_hook
+
+    args = SimpleNamespace(
+        enable_prefix_mm_cache=False,
+        encoder_only=False,
+        language_only=False,
+        enable_mooncake_kv_reshard=True,
+        disaggregation_mode=mode,
+        disaggregation_transfer_backend=backend,
+    )
+    with (
+        patch.object(pd_disaggregation_hook, "resolving_view", return_value=args),
+        patch("sglang.srt.arg_groups.model_hook.handle_language_model_only"),
+        patch.object(
+            pd_disaggregation_hook.envs.SGLANG_DISAGG_STAGING_BUFFER,
+            "get",
+            return_value=staging,
+        ),
+        pytest.raises(ValueError, match=message),
+    ):
+        pd_disaggregation_hook.handle_encoder_disaggregation(args)

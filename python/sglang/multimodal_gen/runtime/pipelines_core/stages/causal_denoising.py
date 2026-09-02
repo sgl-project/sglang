@@ -654,6 +654,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
         target_dtype: torch.dtype,
         autocast_enabled: bool,
     ) -> torch.Tensor:
+        if self._component_residency_manager is not None:
+            self._manage_dit_use_site(self.transformer, "transformer", batch)
         with (
             precision_autocast_context(
                 target_dtype,

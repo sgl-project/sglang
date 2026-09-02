@@ -17,6 +17,7 @@ export const config = {
     { id: "fp8", label: "FP8" },
     { id: "bf16", label: "BF16" },
     { id: "nvfp4", label: "NVFP4" },
+    { id: "mxfp4", label: "MXFP4" },
   ],
   strategies: [
     { id: "low-latency",    label: "Low-Latency"    },
@@ -32,6 +33,7 @@ export const config = {
     "default|fp8": "zai-org/GLM-5.2-FP8",
     "default|bf16": "zai-org/GLM-5.2",
     "default|nvfp4": "nvidia/GLM-5.2-NVFP4",
+    "default|mxfp4": "amd/GLM-5.2-MXFP4",
   },
 
   placeholders: {
@@ -95,6 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260728",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -182,6 +185,11 @@ sgl-eval run aime25 \\
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"],
           disable: { hw: ["mi355x", "mi325x", "mi300x"] },
           disableReason: "MTP/EAGLE speculative decoding is not yet validated on AMD ROCm (MI300X/MI325X/MI355X): the gfx950 spec-decode draft kernel is not yet validated and at --speculative-num-steps > 3 hits a separate build issue; the DSA nextn draft path is CUDA-only." },
+        { id: "mtp-314", label: "EAGLE / MTP 3-1-4 (agentic · MI355X MXFP4)",
+          flags: ["--speculative-algorithm EAGLE", "--speculative-num-steps 3",
+                  "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 4"],
+          enable: { hw: ["mi355x"], quant: ["mxfp4"] },
+          enableReason: "Validated on MI355X gfx950 with amd/GLM-5.2-MXFP4 (InferenceX AgentX sweep, GSM8K em_strict 0.971). num-steps=3 stays within the validated gfx950 spec-decode build envelope (≤3). Pair with SGLANG_SIMULATE_ACC_LEN=2.99 for benchmarking (golden AL from golden_al_distribution/glm5.2_mtp.yaml, thinking_on, num_speculative_tokens=3)." },
       ],
     },
 
@@ -990,6 +998,105 @@ sgl-eval run aime25 \\
         "--cuda-graph-max-bs 256",
         "--max-running-requests 256",
         "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // ====================================================================
+    // AMD MI355X + MXFP4 — amd/GLM-5.2-MXFP4 (Quark). TP4: the 4-bit MoE
+    // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
+    // architecture family) — --trust-remote-code (Quark custom quant config)
+    // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
+    // newer image (v0.5.16, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
+    // mi355x cells. MTP (mtp-314, steps=3) is validated on MI355X gfx950 with
+    // this precision — see the mtp-314 cell below. Not yet benchmarked for
+    // GLM-5.2 on the base strategies → verified:false.
+    // ====================================================================
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--chunked-prefill-size 32768",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 128",
+        "--max-running-requests 80",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--mem-fraction-static 0.85",
+        "--cuda-graph-max-bs 256",
+        "--max-running-requests 256",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // MI355X + MXFP4 + MTP (mtp-314): validated AgentX recipe.
+    // steps=3 stays within the gfx950 spec-decode build envelope (≤3).
+    // mem-fraction-static 0.80: headroom for MTP draft buffer on top of
+    // 4-bit MoE weights + KV cache (matches InferenceX AgentX harness conc≤16).
+    // For benchmarking: set SGLANG_SIMULATE_ACC_LEN=2.99,
+    // SGLANG_SIMULATE_ACC_METHOD=match-expected,
+    // SGLANG_SIMULATE_ACC_TOKEN_MODE=real-draft-token
+    // (golden AL: golden_al_distribution/glm5.2_mtp.yaml, thinking_on, num_speculative_tokens=3).
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "mtp-314", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--kv-cache-dtype fp8_e4m3",
+        "--dsa-prefill-backend tilelang",
+        "--dsa-decode-backend tilelang",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--chunked-prefill-size 131072",
+        "--mem-fraction-static 0.80",
+        "--cuda-graph-max-bs 160",
+        "--max-running-requests 160",
+        "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

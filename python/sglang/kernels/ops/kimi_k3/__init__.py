@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.utils import is_npu
+
 if TYPE_CHECKING:
     import torch
+
+_is_npu = is_npu()
 
 _K3_N_GEMM_DISPATCH_MAP = {
     (144, 7168): 16,
@@ -65,12 +69,13 @@ def kimi_k3_tiny_gemm(
 
     m, k = x.shape
     n, _ = w.shape
-    if max_num_tokens := _K3_N_GEMM_DISPATCH_MAP.get((n, k)):
-        if 0 < m <= max_num_tokens:
-            return tiny_n_gemm_bf16(x, w)
-    if max_num_tokens := _K3_K_GEMM_DISPATCH_MAP.get((n, k)):
-        if 0 < m <= max_num_tokens:
-            return tiny_k_gemm_bf16(x, w)
+    if not _is_npu:
+        if max_num_tokens := _K3_N_GEMM_DISPATCH_MAP.get((n, k)):
+            if 0 < m <= max_num_tokens:
+                return tiny_n_gemm_bf16(x, w)
+        if max_num_tokens := _K3_K_GEMM_DISPATCH_MAP.get((n, k)):
+            if 0 < m <= max_num_tokens:
+                return tiny_k_gemm_bf16(x, w)
     return torch.nn.functional.linear(x, w)
 
 

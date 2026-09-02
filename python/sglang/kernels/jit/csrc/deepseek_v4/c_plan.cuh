@@ -154,11 +154,6 @@ __global__ __launch_bounds__(1024, 1)  //
     counter_c = 0;
     counter_w = 0;
   }
-  if (tx < kNumWarps) {
-    warp_max[tx] = 0;
-    warp_min[tx] = 0xFFFFFFFFu;
-  }
-
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);

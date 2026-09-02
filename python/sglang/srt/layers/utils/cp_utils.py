@@ -9,7 +9,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    _tbo_event,
     attn_cp_all_gather_into_tensor,
+    attn_cp_overlap_all_gather_into_tensor,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -284,6 +286,54 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     )
 
     return outputs
+
+
+def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
+    """Start a round-robin CP all-gather on `comm_stream`; do NOT wait for it.
+
+    Pair with cp_all_gather_rerange_finish(). Splitting launch from wait is the
+    only way an attention-side CP gather can overlap anything: the collectives
+    inside op_attn are consumed a few statements later, so issuing and waiting
+    at the same point just moves the queue (measured in perf_sweep_report §4.6).
+
+    The handle keeps both buffers alive until finish(); without that reference
+    the allocator can hand the input block back to the compute stream before the
+    comm-stream kernel has read it.
+    """
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_cp_group,
+        get_attn_cp_overlap_group,
+    )
+
+    group = get_attn_cp_overlap_group()
+    assert group is not get_attn_cp_group(), (
+        "the comm-stream path needs the duplicate attn_cp_overlap communicator; "
+        "driving one communicator from two streams deadlocks RCCL"
+    )
+
+    input_tensor = input_tensor.contiguous()
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+    comm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm_stream):
+        attn_cp_overlap_all_gather_into_tensor(output_tensor, input_tensor)
+        event = _tbo_event(event_key)
+        event.record(comm_stream)
+    return (output_tensor, input_tensor, event, cp_size)
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    out_shape = output_tensor.shape
+    return (
+        output_tensor.view(cp_size, -1, *out_shape[1:])
+        .transpose(0, 1)
+        .reshape(out_shape)
+    )
 
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):

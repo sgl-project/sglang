@@ -60,8 +60,13 @@ class ViTCudaGraphRunner:
         self.cu_full_len_kk: Dict[Hashable, torch.Tensor] = {}
         self.cu_window_len_kk: Dict[Hashable, torch.Tensor] = {}
 
-        # rotary position buffers shared across graphs
+        # Current rotary workspace plus older allocations retained by graphs
+        # captured before the workspace grew.
         self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._retired_sin_cos_ws: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._sin_cos_ws_by_graph: Dict[Hashable, Tuple[torch.Tensor, torch.Tensor]] = (
+            {}
+        )
         self.max_context_len = getattr(vit, "max_context_len", None)
 
         # Qwen2.5-VL specific viarable.
@@ -91,31 +96,67 @@ class ViTCudaGraphRunner:
     def dtype(self) -> torch.dtype:
         return self.vit.dtype
 
-    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int):
-        if self.sin_cos_ws is None:
-            max_shape = self.max_context_len or seq_len
-            max_shape = max(max_shape, seq_len)
+    def _get_sin_cos_ws(
+        self, graph_key: Hashable, seq_len: int, head_dim: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the stable rotary buffers captured by one graph."""
+        graph_ws = self._sin_cos_ws_by_graph.get(graph_key)
+        if graph_ws is not None:
+            return graph_ws
+
+        needs_new_workspace = self.sin_cos_ws is None or (
+            self.sin_cos_ws[0].size(0) < seq_len
+            or self.sin_cos_ws[0].size(1) < head_dim
+        )
+        if needs_new_workspace:
+            previous = self.sin_cos_ws
+            previous_seq_len = previous[0].size(0) if previous is not None else 0
+            previous_head_dim = previous[0].size(1) if previous is not None else 0
+            max_shape = max(
+                self.max_context_len or 0,
+                previous_seq_len * 2,
+                seq_len,
+            )
+            max_head_dim = max(previous_head_dim, head_dim)
             cos_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
+                max_shape, max_head_dim, dtype=self.dtype, device=self.device
             )
             sin_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
+                max_shape, max_head_dim, dtype=self.dtype, device=self.device
             )
+            if previous is not None:
+                # CUDA graphs retain captured addresses, so an older allocation
+                # cannot be freed when a larger request grows the workspace.
+                self._retired_sin_cos_ws.append(previous)
             self.sin_cos_ws = (cos_ws, sin_ws)
-        else:
-            if self.sin_cos_ws[0].size(0) < seq_len:
-                max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
-                cos_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                sin_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                self.sin_cos_ws = (cos_ws, sin_ws)
 
-    def _get_graph_key(self, x_3d: torch.Tensor) -> int:
-        # x_3d: [S, B, H], B=1, S as graph_key
-        return x_3d.shape[0]
+        graph_ws = (
+            self.sin_cos_ws[0][:seq_len, :head_dim],
+            self.sin_cos_ws[1][:seq_len, :head_dim],
+        )
+        self._sin_cos_ws_by_graph[graph_key] = graph_ws
+        return graph_ws
+
+    @staticmethod
+    def _sequence_layout_key(cu_seqlens: Optional[torch.Tensor]) -> Optional[tuple]:
+        if cu_seqlens is None:
+            return None
+        return tuple(int(value) for value in cu_seqlens.tolist())
+
+    def _get_graph_key(
+        self,
+        x_3d: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
+        attention_layout_key: Optional[Hashable] = None,
+    ) -> Hashable:
+        """Include attention boundaries so equal-length batches stay distinct."""
+        if attention_layout_key is None:
+            attention_layout_key = (
+                self._sequence_layout_key(cu_seqlens),
+                self._sequence_layout_key(cu_window_seqlens),
+            )
+        return (x_3d.shape[0], attention_layout_key)
 
     def _capture_context(self):
         # A DP-sharded encoder intentionally lets each rank capture only the
@@ -265,15 +306,22 @@ class ViTCudaGraphRunner:
         self,
         x_3d: torch.Tensor,  # [S, 1, H]
         cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ],  # (cos, sin), [S, D]
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-    ) -> int:
+        attention_layout_key: Optional[Hashable] = None,
+    ) -> Hashable:
         vit = self.vit
-        graph_key = self._get_graph_key(x_3d)
+        graph_key = self._get_graph_key(
+            x_3d,
+            cu_seqlens,
+            cu_window_seqlens,
+            attention_layout_key,
+        )
+        seq_len = x_3d.shape[0]
 
         if graph_key in self.block_graphs:
             return graph_key
@@ -291,7 +339,7 @@ class ViTCudaGraphRunner:
                 x_3d, device=self.device
             ).contiguous()
             self.block_ws[graph_key] = torch.empty(
-                graph_key,
+                seq_len,
                 num_heads,
                 attn_head_dim,
                 device=self.device,
@@ -315,12 +363,10 @@ class ViTCudaGraphRunner:
         self.block_input[graph_key].copy_(x_3d)
 
         if position_embeddings is not None:
-            # make sure rotary workspace
             head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+            used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
+                graph_key, seq_len, head_dim
+            )
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
             persist_position_embeddings = (used_cos_ws, used_sin_ws)
@@ -328,12 +374,10 @@ class ViTCudaGraphRunner:
                 graph_key=graph_key, position_embeddings=persist_position_embeddings
             )
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # make sure rotary workspace
             head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+            used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
+                graph_key, seq_len, head_dim
+            )
             used_cos_ws.copy_(rotary_pos_emb_cos)
             used_sin_ws.copy_(rotary_pos_emb_sin)
             self._create_graph(
@@ -347,7 +391,7 @@ class ViTCudaGraphRunner:
 
     def replay(
         self,
-        graph_key: int,
+        graph_key: Hashable,
         x_3d: torch.Tensor,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
@@ -355,20 +399,19 @@ class ViTCudaGraphRunner:
         output_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        seq_len = x_3d.shape[0]
         if position_embeddings is not None:
-            # update rotary workspace content
             head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+            used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
+                graph_key, seq_len, head_dim
+            )
             used_cos_ws.copy_(position_embeddings[0])
             used_sin_ws.copy_(position_embeddings[1])
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # update rotary workspace content
             head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+            used_cos_ws, used_sin_ws = self._get_sin_cos_ws(
+                graph_key, seq_len, head_dim
+            )
             used_cos_ws.copy_(rotary_pos_emb_cos)
             used_sin_ws.copy_(rotary_pos_emb_sin)
 
@@ -390,15 +433,21 @@ class ViTCudaGraphRunner:
         self,
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
+        attention_layout_key: Optional[Hashable] = None,
     ) -> torch.Tensor:
         # x: [seq_len, hidden] -> [S, B=1, H]
         x_3d = x.unsqueeze(1)
-        graph_key = self._get_graph_key(x_3d)
+        graph_key = self._get_graph_key(
+            x_3d,
+            cu_seqlens,
+            cu_window_seqlens,
+            attention_layout_key,
+        )
 
         if graph_key not in self.block_graphs:
             self.create_graph(
@@ -408,6 +457,7 @@ class ViTCudaGraphRunner:
                 cu_window_seqlens=cu_window_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                attention_layout_key=attention_layout_key,
             )
 
         return self.replay(
