@@ -142,14 +142,19 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
     """
 
     class _Peer:
-        def __init__(self, gate):
+        def __init__(self, gate, host_gate=None):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
+            self.host_transfer_move_gate = host_gate
 
         def _is_frontier_transparent(self):
             return False
+
+        # Borrowed, not reimplemented: a hand-written predicate here would let
+        # the stub keep passing after the real one grows another gate slot.
+        moves_blocked = MultiEndedAllocator.moves_blocked
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from
@@ -163,8 +168,8 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
 
         _growth_side_neighbor = MultiEndedAllocator._growth_side_neighbor
 
-    def _credit(self, gate):
-        peer = self._Peer(gate)
+    def _credit(self, gate, host_gate=None):
+        peer = self._Peer(gate, host_gate)
         owner = self._Owner(peer)
         return MultiEndedAllocator._peer_drainable_hole_bytes(owner)
 
@@ -175,6 +180,12 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         self.assertEqual(self._credit(gate=lambda: True), 4 * 512)
         # Gate closed: an urgent flush would move nothing, so credit nothing.
         self.assertEqual(self._credit(gate=lambda: False), 0)
+        # The HiCache gate is a SECOND slot, not a replacement: an in-flight
+        # host transfer freezes the mover just as a PD transfer does, and
+        # either one closed is enough.
+        self.assertEqual(self._credit(gate=None, host_gate=lambda: True), 4 * 512)
+        self.assertEqual(self._credit(gate=None, host_gate=lambda: False), 0)
+        self.assertEqual(self._credit(gate=lambda: True, host_gate=lambda: False), 0)
 
 
 class TestMoveGateRejectsNonPdNode(CustomTestCase):
@@ -245,9 +256,10 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     # REACHES rather than on what the stub was given.
     _MEMBER_ATTRS = ("full_attn_allocator", "swa_attn_allocator", "mamba_allocator")
 
-    # The members each composite's gate must reach. The tri-pool row is the one
-    # that matters: it inherits the setter, so an enumeration written inside
-    # that setter would silently leave the third member ungated.
+    # The members each composite's gates must reach. The tri-pool row is the
+    # regression: it inherits both setters, and while an enumeration lived
+    # inside each one, the PD setter had been widened by hand and the HiCache
+    # setter had not -- so the mamba end compacted freely under host transfers.
     _EXPECTED_COVERAGE = {
         "UnifiedMambaTokenToKVPoolAllocator": {
             "full_attn_allocator",
@@ -286,25 +298,30 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
         def gate() -> bool:
             return True
 
-        alloc.set_disagg_move_gate(gate)
+        if slot == "disagg_move_gate":
+            alloc.set_disagg_move_gate(gate)
+        else:
+            alloc.set_host_transfer_move_gate(gate)
         return {
             attr
             for attr in self._MEMBER_ATTRS
             if getattr(getattr(alloc, attr), slot) is gate
         }
 
-    def test_the_gate_reaches_every_member(self):
+    def test_every_gate_reaches_every_member(self):
         """A gate that reaches only some members is not a weaker gate, it is no
         gate: the ungated end relocates its own pages under the very transfer
-        the gate was installed for.
+        the gate was installed for. Asserted for BOTH slots because they are
+        installed by different callers and drifted apart once already.
         """
         for name, expected in self._EXPECTED_COVERAGE.items():
-            with self.subTest(composite=name):
-                self.assertEqual(
-                    self._members_reached(name, "disagg_move_gate"),
-                    expected,
-                    f"{name}.disagg_move_gate does not cover every member",
-                )
+            for slot in ("disagg_move_gate", "host_transfer_move_gate"):
+                with self.subTest(composite=name, slot=slot):
+                    self.assertEqual(
+                        self._members_reached(name, slot),
+                        expected,
+                        f"{name}.{slot} does not cover every member",
+                    )
 
     def test_gate_setters_do_not_enumerate_members_themselves(self):
         """The structural half of the rule above: a setter that names its
@@ -319,12 +336,13 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
             cls = getattr(unified_mamba, name, None) or getattr(
                 unified_hybrid_swa, name
             )
-            if "set_disagg_move_gate" not in vars(cls):
-                continue  # inherited, and the inherited one is checked above
-            with self.subTest(composite=name):
-                body = inspect.getsource(cls.set_disagg_move_gate)
-                self.assertIn("install_move_gate", body)
-                self.assertNotIn("_move_gate = ", body)
+            for setter in ("set_disagg_move_gate", "set_host_transfer_move_gate"):
+                if setter not in vars(cls):
+                    continue  # inherited, and the inherited one is checked above
+                with self.subTest(composite=name, setter=setter):
+                    body = inspect.getsource(getattr(cls, setter))
+                    self.assertIn("install_move_gate", body)
+                    self.assertNotIn("_move_gate = ", body)
 
     def test_swa_composite_translates_the_swa_side_separately(self):
         """The SWA sub-pool runs its OWN compaction, so a full-side physical id

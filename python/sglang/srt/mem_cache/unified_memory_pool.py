@@ -596,6 +596,14 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
+        # HiCache's L2 kernels address these views as
+        # `k_data_ptrs[layer] + row * token_stride_size`. That holds here: each
+        # view is contiguous in the ROW space with row stride
+        # head_num * head_dim, which is exactly the `token_stride_size` the
+        # host pool computes and the `prod(shape[1:]) * itemsize` this fills in.
+        # The base builds them at the end of its `_create_buffers`, which this
+        # override replaces.
+        self._init_data_ptrs_and_strides()
 
     def _clear_buffers(self):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
@@ -1202,6 +1210,32 @@ def _check_bs1_feasibility_floor(
     )
 
 
+def _wire_mamba_slot_allocator(
+    *,
+    mamba_end,
+    req_to_token_pool,
+    device,
+) -> UnifiedMambaSlotAllocator:
+    """Wrap a composite's mamba end in the slot allocator (PHYSICAL view) its
+    consumers read, and install the v2p translate HiCache needs.
+
+    Both belong together. The state pool is a pure physical store while the
+    HiCache controller holds VIRTUAL slot ids, so `L2TransferEngine` applies
+    `host_transfer_translate` just before each transfer; a factory that wraps
+    the allocator without installing the translate hands raw virtual ids to
+    that store, which reads correctly until the first compaction moves a slot
+    and then silently transfers the wrong state.
+    """
+    slot_allocator = UnifiedMambaSlotAllocator(
+        mamba_end,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = slot_allocator
+    req_to_token_pool.mamba_pool.host_transfer_translate = slot_allocator.translate
+    return slot_allocator
+
+
 def init_unified_mamba_pools(
     *,
     device: str,
@@ -1371,15 +1405,20 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+    # Size any HiCache host pool against the STATIC token cap, not the
+    # sub-pool's `size` (a kernel-facing row count) nor the composite's `size`
+    # (the dynamic whole-buffer view, which would ask for a host pool covering
+    # the entire buffer instead of the configured limit).
+    token_to_kv_pool.full_kv_pool.host_capacity_tokens = max_total_num_tokens
 
-    # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    mamba_slot_allocator = _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+    # `_mamba_translate` feeds the retraction CPU-copy path, which only
+    # `HybridLinearKVPool` has; the tri-pool's `UnifiedSWAKVPool` retracts
+    # differently, so this stays here rather than moving into the shared hook.
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
     # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
@@ -2031,14 +2070,11 @@ def init_unified_mamba_swa_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
-    # Wrap the composite's mamba end in the slot allocator (PHYSICAL view) the
-    # radix MambaComponent / model-side sconv reads consume.
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
 
     logger.info(
         "[unified-memory-pool] ============================================================"

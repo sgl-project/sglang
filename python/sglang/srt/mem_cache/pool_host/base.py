@@ -148,26 +148,35 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        # `size` is a TOKEN count on a static pool, but a kernel-facing ROW
+        # count on the unified pool (num_pages * blocks_per_page * page_size),
+        # which overstates the tokens by 2 * layer_num. Pools that differ
+        # publish the real capacity; sizing off `size` there asked for
+        # hundreds of GB of host memory.
+        device_capacity = device_pool.host_capacity_tokens
+        if device_capacity is None:
+            device_capacity = device_pool.size
+        self.device_capacity_tokens = device_capacity
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         # Verify there is enough available host memory.
