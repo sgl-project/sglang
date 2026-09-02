@@ -64,7 +64,7 @@ sglang serve \
   --port 30010
 ```
 
-For request and response examples, see [OpenAI-Compatible API](./openai_api).
+For request and response examples, see [OpenAI-Compatible API](/docs/sglang-diffusion/api/openai_api).
 
 <Tip>
 Use `sglang generate --help` and `sglang serve --help` for the full argument list. The CLI help output is the source of truth for exhaustive flags.
@@ -97,16 +97,16 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
-- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. A `quality=high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only high-quality paths remain compatible.
+- `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
-- `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](../models_with_ar).
+- `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
-- `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](../models_with_pe).
+- `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
 
@@ -114,11 +114,11 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--image-path {PATH} [{PATH} ...]`: input image(s) for image-to-video or image-to-image generation
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
-- `--quality {lossless,high}`: request-level quality. `lossless` (default) keeps the exact reference path, bit-exact against the reference implementation; `high` opts into the model-owned validated accelerated path, whose quality stays guaranteed but is not bit-exact. Support and validated deployment constraints are model-specific.
+- `--quality {lossless,extra-high,high}`: cumulative request-level optimization tier. `lossless` (default) keeps the selected deployment's reference path and all unconditional bit-exact replacements. `extra-high` adds only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths. `high` includes the complete `extra-high` set and may also enable model-owned approximate optimizations. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 
-For frame interpolation and upscaling, see [Post-Processing](./post_processing).
+For frame interpolation and upscaling, see [Post-Processing](/docs/sglang-diffusion/api/post_processing).
 
 ### Quantization
 
@@ -162,7 +162,7 @@ The same contract applies to every weighted component: path routing is generic,
 while quantized materialization is capability-based. Native auxiliary loaders
 whose current materializer expects plain state dicts reject unsupported
 quantization metadata before model construction. See
-[Quantized Component Repositories](../quantization#quantized-component-repositories)
+[Quantized Component Repositories](/docs/sglang-diffusion/quantization#quantized-component-repositories)
 for the current component matrix. A model cookbook is the source of truth for
 published, model-specific checkpoint examples; for example, all H3 sources and
 their exact overlays are kept in one
@@ -191,8 +191,8 @@ For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
 quantization. It is lossy and disabled by default.
 
-See [Realtime and Causal Video Models](../realtime_models) for the runtime and
-model scope, and [Quantization](../quantization) for supported quantization
+See [Realtime and Causal Video Models](/docs/sglang-diffusion/realtime_models) for the runtime and
+model scope, and [Quantization](/docs/sglang-diffusion/quantization) for supported quantization
 families and examples.
 
 ### Request logging
@@ -263,7 +263,7 @@ sglang generate \
 HTTP server-only arguments are ignored by `sglang generate`.
 </Note>
 
-For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](../cache_dit).
+For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Cache-DiT. It can run with DiT layerwise offload; it cannot run with FSDP. For the diffusers backend, use `--backend diffusers --cache-dit-config ...`. See [Cache-DiT](/docs/sglang-diffusion/cache_dit).
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
@@ -394,7 +394,7 @@ export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables](../environment_variables) for the full set of storage options.
+See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
 
 ## Component Path Overrides
 
@@ -416,7 +416,7 @@ selected loader must support that serialized format. Native plain-state loaders
 fail closed; library-managed components inherit the corresponding Transformers
 or Diffusers support. The transformer-specific `--quantization` flag does not
 select the format of component checkpoints; their own metadata does. See
-[Quantized Component Repositories](../quantization#quantized-component-repositories).
+[Quantized Component Repositories](/docs/sglang-diffusion/quantization#quantized-component-repositories).
 
 ## Component Attention Backend Overrides
 
