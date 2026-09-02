@@ -75,6 +75,12 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # commit can serve today.
     enable_remote_hint: bool = False
 
+    # Immutable identity of the bytes stored behind a hybrid cache key. It must
+    # cover the model checkpoint/revision, cache dtype and quantization, and
+    # layer/component mapping. The adapter combines it with the runtime pool
+    # manifest and rank topology before allowing hybrid peer reuse.
+    cache_abi: Optional[str] = None
+
     # Wall-clock budget for one deposit/deliver to report completion on the
     # HiCache prefetch daemon thread. A remote fetch crosses the control plane
     # plus a NIXL transfer, so this is generously above operation_timeout_ms;
