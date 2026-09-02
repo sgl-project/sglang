@@ -334,9 +334,7 @@ def _local_prefill_cuda_graph_vote(
     # dLLM phases are explicitly ineligible.
     dllm_prefill = None
     if local_batch.dllm_config is not None:
-        dllm_prefill = (
-            local_batch.is_dllm_prefill and mode == ForwardMode.EXTEND
-        )
+        dllm_prefill = local_batch.is_dllm_prefill and mode == ForwardMode.EXTEND
     return prefill_graph_runner.can_replay_locally(
         batch_size=local_batch.batch_size(),
         num_tokens=num_tokens,

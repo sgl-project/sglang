@@ -9,7 +9,6 @@ import torch
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_policy import AddReqResult
-from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context
@@ -74,6 +73,7 @@ def _make_req(rid, prefix, block_size, *, req_pool_idx=None, reuse=False):
         prefix_indices=torch.tensor(prefix, dtype=torch.int32),
         dllm_incomplete_ids=array("q", range(block_size)) if reuse else array("q"),
         inflight_middle_chunks=1 if req_pool_idx is not None else 0,
+        last_node=None,
         kv=SimpleNamespace(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(prefix) if req_pool_idx is not None else 0,
@@ -251,9 +251,15 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         manager.staging_queue = []
 
         outputs = []
+        freed = []
         scheduler = _SchedulerHarness()
         scheduler.enable_hicache_storage = False
         scheduler.dllm_manager = manager
+        # A victim with no req_pool_idx still holds uncached prefix slots, which
+        # _cleanup_dllm_req releases straight through the allocator.
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            free=lambda indices: freed.append(indices)
+        )
         scheduler.ipc_channels = SimpleNamespace(
             send_to_tokenizer=SimpleNamespace(
                 send_output=lambda msg, req: outputs.append((msg, req))
@@ -276,8 +282,10 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
         # stay managed so the freed pages can serve them next round.
         self.assertEqual(outputs, [])
         self.assertEqual(manager.waiting_queue, [victim, keep])
-        self.assertIsNone(victim.req_pool_idx)
-        self.assertIsNone(victim.kv)
+        self.assertIsNone(victim.kv.req_pool_idx)
+        self.assertEqual(victim.kv.kv_allocated_len, 0)
+        # Exactly the victim's uncached prefix slots go back to the allocator.
+        self.assertEqual([t.tolist() for t in freed], [[1]])
         self.assertEqual(victim.dllm_phase, DllmReqPhase.INCOMING_DECODE)
         self.assertEqual(len(victim.dllm_incomplete_ids), 0)
         self.assertEqual(victim.output_ids, [7, 8])

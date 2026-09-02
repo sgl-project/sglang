@@ -10,7 +10,7 @@ from sglang.srt.dllm.config import (
 )
 from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -20,11 +20,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
-from sglang.srt.runtime_context import get_context
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -112,7 +112,10 @@ class TestPrefillAdder(CustomTestCase):
         req.retracted_stain = False
         req.host_hit_length = 0
         req.storage_hit_length = 0
-        req.kv.req_pool_idx = None
+        # `spec=Req` only exposes class-level names, and `kv` is assigned in
+        # `Req.__init__`. Attach a real ReqKvInfo so the mock carries the same
+        # field names and defaults the scheduler reads.
+        req.kv = ReqKvInfo()
         req.dllm_incomplete_ids = array("q")
         req.finished.return_value = False
         req.needs_host_load_back.return_value = False
@@ -424,10 +427,10 @@ class TestPrefillAdder(CustomTestCase):
                     origin_len=20, prefix_len=0, is_prefill=False
                 )
                 retained.rid = "retained"
-                retained.req_pool_idx = 1
                 retained.dllm_incomplete_ids = array("q", range(32))
                 retained.full_untruncated_fill_ids = list(retained.dllm_incomplete_ids)
-                retained.kv = SimpleNamespace(kv_allocated_len=32)
+                retained.kv.req_pool_idx = 1
+                retained.kv.kv_allocated_len = 32
                 scheduler = SimpleNamespace(_abort_dllm_req_exact=MagicMock())
                 reqs = [fresh, retained] if fresh_first else [retained, fresh]
 
@@ -523,10 +526,10 @@ class TestPrefillAdder(CustomTestCase):
         req = self.create_dllm_req(origin_len=20, prefix_len=0, is_prefill=False)
         req.rid = rid
         req.dllm_phase = DllmReqPhase.STAGING_DECODE
-        req.req_pool_idx = 1
         req.dllm_incomplete_ids = array("q", range(32))
         req.full_untruncated_fill_ids = list(req.dllm_incomplete_ids)
-        req.kv = SimpleNamespace(kv_allocated_len=32)
+        req.kv.req_pool_idx = 1
+        req.kv.kv_allocated_len = 32
         req.inflight_middle_chunks = 0
         return req
 
@@ -965,13 +968,20 @@ class TestPrefillAdder(CustomTestCase):
                 bucket for bucket in buckets if bucket >= raw_size
             ),
         )
+        # can_run_graph delegates the local verdict to can_replay_locally; bind
+        # the real implementation so the gates under test actually run.
+        runner.can_replay_locally = lambda **kwargs: (
+            PrefillCudaGraphRunner.can_replay_locally(runner, **kwargs)
+        )
         forward_batch = SimpleNamespace(
             dllm_config=SimpleNamespace(),
             is_dllm_prefill=True,
             forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
             input_ids=[1] * 32,
             input_embeds=None,
             replace_embeds=None,
+            extend_prefix_lens_cpu=None,
             mm_inputs=None,
             capture_hidden_mode=None,
             global_num_tokens_cpu=None,
