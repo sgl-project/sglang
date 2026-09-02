@@ -89,7 +89,7 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     max_num_pages = page_table.shape[1]
     SCALE_OFFSET = block_size * head_dim
@@ -131,6 +131,89 @@ def fp8_paged_mqa_logits_torch(
         scores = scores[:, :max_seq_len]
 
     return scores
+
+
+_FP4_E2M1_MAG = None
+
+
+def _dequant_fp4_indexer(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Dequant the DSv4 FP4 indexer format to bf16.
+
+    ``packed`` [..., 64] uint8 holds 128 E2M1 codes, 2 per byte (low nibble is
+    element 2b, high nibble 2b+1); ``sf`` [...] int32 holds four UE8M0 exponents
+    (one per 32-element group). Layout is fixed by _quantize_fp4_indexer_kernel
+    in kernels/ops/attention/dsv4/fp4_indexer.py -- keep in sync.
+    """
+    global _FP4_E2M1_MAG
+    if _FP4_E2M1_MAG is None or _FP4_E2M1_MAG.device != packed.device:
+        _FP4_E2M1_MAG = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=torch.float32,
+            device=packed.device,
+        )
+    p = packed.to(torch.int32)
+    codes = torch.stack([p & 0x0F, (p >> 4) & 0x0F], dim=-1).flatten(-2)
+    vals = _FP4_E2M1_MAG[codes & 0x07] * torch.where(
+        (codes & 0x08) != 0, -1.0, 1.0
+    )
+    s = sf.to(torch.int32)
+    exps = torch.stack([(s >> (g * 8)) & 0xFF for g in range(4)], dim=-1)
+    scale = (exps << 23).view(torch.float32).repeat_interleave(32, dim=-1)
+    return (vals * scale).to(torch.bfloat16)
+
+
+def fp4_paged_mqa_logits_torch(
+    q: tuple,
+    kvcache_raw: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """FP32 reference for the gfx950 fp4 indexer score (``fp4_paged_mqa_logits_triton``).
+
+    Dequants the fp4 q/kv and scores in fp32, reproducing the native mxfp4 MFMA
+    (which accumulates in fp32) bit-for-bit; used as the golden in the unit test.
+    ``kvcache_raw`` is the raw [pages, page_size*(64+4)] uint8 pool buffer,
+    blocked as [page_size*64 fp4 | page_size*4 scale] per _store_fp4_index_k_cache_kernel.
+    """
+    _ = (deep_gemm_metadata, clean_logits)
+    q_fp8 = q[0] if isinstance(q, tuple) else q  # fp8 q [B, 1, H, HEAD]
+    batch_size, _, num_heads, _ = q_fp8.shape
+    block_size = 64
+    head_dim = 128
+    pages = kvcache_raw.shape[0]
+    kv_flat = kvcache_raw.reshape(pages, -1)
+    kv_fp4 = kv_flat[:, : block_size * 64].reshape(pages, block_size, 64)
+    kv_sf = (
+        kv_flat[:, block_size * 64 :]
+        .reshape(pages, block_size, 4)
+        .contiguous()
+        .view(torch.int32)
+        .squeeze(-1)
+    )
+    kv_values = _dequant_fp4_indexer(kv_fp4, kv_sf)  # [pages, block, 128]
+
+    max_num_pages = page_table.shape[1]
+    pages_clamped = page_table.clamp(min=0)
+    kv_g = kv_values.reshape(pages, block_size * head_dim)[pages_clamped]
+    kv_g = kv_g.reshape(batch_size, max_num_pages * block_size, head_dim)
+
+    # fp32 accumulation to match the MFMA; fp4/fp8 operands are exact in fp32.
+    q_float = q_fp8[:, 0].to(torch.float32)  # [B, H, 128]
+    scores = torch.bmm(kv_g.float(), q_float.transpose(1, 2))
+    scores = F.relu(scores)
+    scores = scores * weight.unsqueeze(1)
+    scores = scores.sum(dim=2)
+
+    padded_seq_len = max_num_pages * block_size
+    positions = torch.arange(padded_seq_len, device=scores.device).unsqueeze(0)
+    scores = scores.masked_fill(~(positions < seq_lens.reshape(-1, 1)), 0.0)
+    if padded_seq_len < max_seq_len:
+        return F.pad(scores, (0, max_seq_len - padded_seq_len), value=0.0)
+    return scores[:, :max_seq_len]
 
 
 def _aiter_fp8_paged_mqa_logits(
@@ -219,7 +302,7 @@ def fp8_paged_mqa_logits_torch_sm120(
         seq_lens = seq_lens.squeeze(-1)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     max_pages = (max_seq_len + block_size - 1) // block_size
     max_padded_seq = max_pages * block_size
@@ -729,20 +812,41 @@ class C4IndexerBackendMixin:
 
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
-            assert len(q_fp4.shape) == 3
-            assert len(q_sf.shape) == 2
-            q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
+            if q_sf is None:
+                # HIP: q kept fp8 (only KV is fp4); q_fp4 is the fp8 q [T, H, HEAD].
+                q = q_fp4.unsqueeze(1)
+            else:
+                assert len(q_fp4.shape) == 3
+                assert len(q_sf.shape) == 2
+                q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
         else:
             assert len(q_indexer.shape) == 3
             q = q_indexer.unsqueeze(1)
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        use_flydsl = False
+        fn = None
         if use_fp4_indexer:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            if is_hip():
+                if (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                ):
+                    # gfx950 decode / MTP verify: aiter's tuned flydsl fp4 score
+                    # (call site below). Prefill keeps the fused Triton fp4 score.
+                    use_flydsl = True
+                else:
+                    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                        fp4_paged_mqa_logits_triton as fn,
+                    )
+            else:
+                if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                    raise RuntimeError(
+                        "DeepSeek V4 FP4 indexer requires DeepGEMM indexer."
+                    )
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -801,6 +905,10 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        if use_flydsl:
+            # The tuned flydsl kernel is paged-only; the nonpaged fast path has
+            # no fp4 variant.
+            nonpaged_plan = None
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             logits = self._forward_nonpaged_indexer(
@@ -809,6 +917,31 @@ class C4IndexerBackendMixin:
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
                 plan=nonpaged_plan,
+            )
+        elif use_flydsl:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+                flydsl_fp4_paged_mqa_logits,
+                quantize_fp4_indexer_tensor,
+            )
+
+            kv_cache, kv_scale = token_to_kv_pool.get_index_k_flydsl_buffers(
+                layer_id=c4_indexer.layer_id,
+            )
+            # q arrives fp8 [B, NEXT_N, H, 128]; the tuned kernel wants fp4 q.
+            b_q, nn_q, h_q, _ = q.shape
+            q_fp4_flat, q_sf_flat = quantize_fp4_indexer_tensor(q.reshape(-1, 128))
+            sfo = torch.arange(4, device=q.device, dtype=torch.int32)
+            logits = flydsl_fp4_paged_mqa_logits(
+                q_fp4=q_fp4_flat.view(b_q, nn_q, h_q, 64).to(torch.uint8),
+                q_scale=((q_sf_flat.view(b_q, nn_q, h_q, 1) >> (sfo * 8)) & 0xFF).to(
+                    torch.uint8
+                ),
+                kv_cache=kv_cache,
+                kv_scale=kv_scale,
+                weights=weights,
+                seq_lens=_c4sl.reshape(-1).to(torch.int32),
+                page_table=page_table.to(torch.int32),
+                max_seq_len=indexer_metadata.max_c4_seq_len,
             )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(

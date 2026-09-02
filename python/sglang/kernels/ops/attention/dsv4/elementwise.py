@@ -239,7 +239,14 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
     positions: torch.Tensor,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     if _is_hip:
-        raise RuntimeError("DeepSeek V4 FP4 indexer requires the CUDA fused Q path.")
+        # gfx950 has no fused fp4 Q kernel. Keep q FP8 (fed straight to the ROCm
+        # fp4-KV score kernel) -- avoids a whole q fp4-quant kernel per indexer
+        # layer, and fp8 q is finer than fp4 anyway. Only the KV is fp4. q_sf
+        # None signals "fp8 q" to the score path.
+        q_fp8, weights_out = fused_q_indexer_rope_hadamard_quant(
+            q_input, weight, weight_scale, freqs_cis, positions
+        )
+        return (q_fp8, None), weights_out
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     q_fp4 = torch.empty(
         (*q_input.shape[:-1], q_input.shape[-1] // 2),
