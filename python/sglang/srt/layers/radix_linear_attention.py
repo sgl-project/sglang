@@ -111,11 +111,7 @@ class RadixLinearAttention(nn.Module):
                 )
             return output
 
-        # Target verify rebuilds query_start_loc from the physical padded input,
-        # unlike ordinary extend where it retains the logical sequence ends.
-        should_trim_padded_extend = (
-            is_extend and not forward_batch.forward_mode.is_target_verify()
-        )
+        should_trim_padded_extend = is_extend
         real_num_tokens = (
             getattr(forward_batch, "num_token_non_padded_cpu", None)
             if should_trim_padded_extend
@@ -159,6 +155,22 @@ def _linear_attention_with_output_impl(
     """Run linear attention on the real prefix and initialize physical padding."""
     real_num_tokens = min(forward_batch.num_token_non_padded_cpu, mixed_qkv.shape[0])
 
+    physical_num_tokens = mixed_qkv.shape[0]
+
+    def _real_token_prefix(tensor: torch.Tensor) -> torch.Tensor:
+        # Linear-attention gates use both token-major [T, ...] and batched
+        # [1, T, ...] layouts. Narrow the axis that represents the same
+        # physical token rows as mixed_qkv.
+        if tensor.shape[0] == physical_num_tokens:
+            return tensor[:real_num_tokens]
+        if tensor.ndim > 1 and tensor.shape[1] == physical_num_tokens:
+            return tensor[:, :real_num_tokens]
+        raise AssertionError(
+            "linear-attention input has no physical token axis: "
+            f"tensor_shape={tuple(tensor.shape)}, "
+            f"physical_num_tokens={physical_num_tokens}"
+        )
+
     original_out_cache_loc = forward_batch.out_cache_loc
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
@@ -169,8 +181,8 @@ def _linear_attention_with_output_impl(
             layer=attention_layer,
             forward_batch=forward_batch,
             mixed_qkv=mixed_qkv[:real_num_tokens],
-            a=a[:real_num_tokens],
-            b=b[:real_num_tokens],
+            a=_real_token_prefix(a),
+            b=_real_token_prefix(b),
             linear_attn_output=logical_output,
         )
     finally:
