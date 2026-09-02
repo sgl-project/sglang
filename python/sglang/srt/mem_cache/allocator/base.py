@@ -61,8 +61,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return self._kvcache
 
     def get_all_free_pages(self):
-        # Census for debug / invariant checks: allocatable + staged pages;
-        # None when the pool has no page free list.
+        # Debug / invariant census; None when the pool has no page free list.
         if self.free_pages is None:
             return None
         if self.release_pages is None or len(self.release_pages) == 0:

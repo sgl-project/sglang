@@ -48,7 +48,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             num_new_pages_item = num_new_pages_tensor.item()
         else:
             num_new_pages_item = num_new_pages
-        if self.need_sort and num_new_pages_item > len(self.free_pages):
+        if num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
@@ -116,7 +116,6 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         if num_new_pages > len(self.free_pages):
             self.merge_and_sort_free()
-
         if num_new_pages > len(self.free_pages):
             return None
 

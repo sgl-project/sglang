@@ -157,9 +157,8 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba. Allocator flavors without
-            # page free-lists (get_all_free_pages() is None) skip the page
-            # census — the dump must never crash the watchdog thread that calls it.
+            # Pools without a page free list return None; skip the census rather
+            # than crash the watchdog thread that runs this dump.
             free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
             if free_pages is None:
                 return leak, msg

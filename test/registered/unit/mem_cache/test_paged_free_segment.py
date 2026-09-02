@@ -70,8 +70,8 @@ class TestFreeSegment(unittest.TestCase):
         alloc = _make_allocator(need_sort=True)
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
         alloc.free_segment(row, start_pos=0)
-        self.assertEqual(len(alloc.release_page_chunks), 1)
-        self.assertEqual(alloc.num_release_pages, 2)
+        self.assertEqual(len(alloc.staged_pages), 1)
+        self.assertEqual(alloc.num_staged_pages, 2)
 
     def test_group_defers_until_group_end(self):
         alloc = _make_allocator()

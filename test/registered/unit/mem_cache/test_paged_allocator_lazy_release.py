@@ -40,7 +40,7 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
             allocator.free(allocated[:2])
             allocator.free(allocated[4:6])
             self.assertIs(allocator.free_pages, free_pages_before)
-            self.assertEqual(allocator.num_release_pages, 2)
+            self.assertEqual(allocator.num_staged_pages, 2)
             self.assertEqual(allocator.available_size(), 12)
             cat_mock.assert_not_called()
 
@@ -54,8 +54,8 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
             self.assertTrue(torch.equal(_page_ids(reused), torch.tensor([1, 3])))
             self.assertEqual(cat_mock.call_count, 1)
 
-        self.assertEqual(allocator.num_release_pages, 0)
-        self.assertEqual(allocator.release_page_chunks, [])
+        self.assertEqual(allocator.num_staged_pages, 0)
+        self.assertEqual(allocator.staged_pages, [])
 
     def test_census_and_clear_cover_staged_pages(self):
         allocator = _make_allocator(need_sort=True)
@@ -68,7 +68,7 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
 
         allocator.clear()
         self.assertEqual(allocator.available_size(), allocator.size)
-        self.assertEqual(allocator.release_page_chunks, [])
+        self.assertEqual(allocator.staged_pages, [])
 
     def test_no_sort_allocator_keeps_eager_prepend(self):
         allocator = _make_allocator(need_sort=False)
@@ -76,7 +76,7 @@ class TestPagedAllocatorLazyRelease(CustomTestCase):
         allocator.free(allocated)
 
         self.assertEqual(allocator.free_pages[0].item(), 1)
-        self.assertEqual(allocator.num_release_pages, 0)
+        self.assertEqual(allocator.num_staged_pages, 0)
 
 
 if __name__ == "__main__":
