@@ -404,6 +404,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         t = torch.arange(
             self.max_position_embeddings * self.scaling_factor,
             device=self.device,
@@ -418,6 +419,37 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             self.cos_cached_total = torch.cos(emb) * self.mscale
             self.sin_cached_total = torch.sin(emb) * self.mscale
         return cache
+
+    def _ensure_cos_sin_cache_length(self, max_pos: int):
+        super()._ensure_cos_sin_cache_length(max_pos)
+        # On NPU the cache is consumed through cos/sin_cached_total (emb =
+        # cat(freqs, freqs), rows scaled by mscale), which the generic
+        # extension does not grow. Extend it with the same formula.
+        if not _is_npu:
+            return
+        total = getattr(self, "cos_cached_total", None)
+        if total is None:
+            return
+        # Align with the generic cache the super() call just grew (length >
+        # max_pos), not with max_pos itself, so the two stay in lockstep.
+        target_len = self.cos_sin_cache.size(0)
+        if target_len <= total.size(0):
+            return
+        inv_freq = getattr(self, "inv_freq", None)
+        if inv_freq is None or inv_freq.device.type == "meta":
+            return
+        inv_freq = inv_freq.to(device=total.device)
+        start = total.size(0)
+        t_new = torch.arange(
+            start, target_len, dtype=torch.float32, device=total.device
+        )
+        freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
+        emb = torch.cat((freqs_new, freqs_new), dim=-1)
+        mscale = float(getattr(self, "mscale", 1.0))
+        self.cos_cached_total = torch.cat((total, torch.cos(emb) * mscale), dim=0)
+        self.sin_cached_total = torch.cat(
+            (self.sin_cached_total, torch.sin(emb) * mscale), dim=0
+        )
 
     def get_cos_cached_total(self):
         return self.cos_cached_total
@@ -667,6 +699,7 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim / (self.rotary_dim - 2)
         )
         inv_freq = self._compute_inv_freq(base)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         t = torch.arange(max_len, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -866,6 +899,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             - (self.scaling_factor - 1)
         ) ** (self.rotary_dim / (self.rotary_dim - 2))
         inv_freq = self._compute_inv_freq(base)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
         t = torch.arange(max_len, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
