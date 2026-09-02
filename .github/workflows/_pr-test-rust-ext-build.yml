@@ -14,21 +14,20 @@ name: PR Test - Build Rust Extensions
 # - The artifact hands it to the stages, which the cache cannot: it is best-effort,
 #   evictable, and this repo is at its 10 GB limit. Artifacts are durable per run.
 #
-# Two jobs, because only compiling needs the build node: exactly one runner carries
-# that label and it also serves the sgl-kernel and docker builds, so queueing there
-# on a cache hit would put its wait in front of every stage. Republishing bytes
-# needs no particular host - the glibc a module requires is recorded in the module,
-# not decided by whoever uploads it.
+# Compiling is split off from restoring and collecting because only it needs the
+# build node, and queueing there on a cache hit would put that wait in front of
+# every stage. Republishing bytes needs no particular host - the glibc a module
+# requires is recorded in the module, not decided by whoever uploads it.
 
 on:
   workflow_call:
     inputs:
       runs_on:
-        description: 'Runner label for the compile job. Must be self-hosted: its glibc has to satisfy max_glibc, and the cargo build cache needs a persistent ~/.cache.'
+        description: 'Runner label for the compile job. Its glibc has to satisfy max_glibc.'
         type: string
         required: true
       restore_runs_on:
-        description: 'Runner label for the cache-hit path. Wants free capacity and nothing else, since it neither compiles nor imports the modules.'
+        description: 'Runner label for the cache-hit path and the collect job. Wants free capacity and nothing else, since neither compiles nor imports the modules.'
         type: string
         default: ubuntu-latest
       artifact_name:
@@ -53,7 +52,7 @@ on:
     outputs:
       artifact_name:
         description: 'Artifact holding the built modules. Empty when neither job published one, whether skipped or failed; consumers that still run compile them during install.'
-        value: ${{ jobs.restore.outputs.artifact_name || jobs.compile.outputs.artifact_name }}
+        value: ${{ jobs.restore.outputs.artifact_name || jobs.collect.outputs.artifact_name }}
 
 # Reusable workflows do not inherit the caller's env; mirror what
 # check-maintenance reads.
@@ -127,7 +126,7 @@ jobs:
                   || echo "(gh cache list unavailable: token lacks actions:read)"
           fi
 
-      # No MAX_GLIBC: these are the bytes the compile job already checked before
+      # No MAX_GLIBC: these are the bytes the collect job already checked before
       # saving them under this key. The module count is still worth re-checking,
       # so a truncated entry fails here rather than as a test import error.
       - name: Stage modules for upload
@@ -155,8 +154,16 @@ jobs:
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 60
     name: Build Rust Ext
-    outputs:
-      artifact_name: ${{ steps.publish.outputs.name }}
+    # No crate sets abi3, so the pools' interpreters (h100 ships 3.10, h20 ships
+    # 3.12) each need their own module set, and each its own target dir, since
+    # PyO3's fingerprint tracks the interpreter. The two passes therefore share
+    # nothing, which is why they run as parallel jobs rather than back to back.
+    strategy:
+      # Both legs run to completion, so a failure in one still leaves the other's
+      # log to compare against.
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -164,19 +171,11 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No crate sets abi3, so build one module set per interpreter the pools
-      # run (h100 ships 3.10, h20 ships 3.12); EXT_SUFFIX keeps them apart.
-      - name: Set up Python 3.10
-        id: py310
+      - name: Set up Python ${{ matrix.python-version }}
+        id: py
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-
-      - name: Set up Python 3.12
-        id: py312
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install protoc and Rust toolchain
         run: bash scripts/ci/utils/install_rust_protoc.sh
@@ -185,43 +184,35 @@ jobs:
         run: |
           set -euxo pipefail
           export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
-          # Per-interpreter subdirs (set in the loop): PyO3's fingerprint tracks
-          # the interpreter, so a shared dir rebuilds on every ABI switch.
-          # ci_install_dependency.sh drops ${HOME}/.cache/sglang-cargo-target at 85%
-          # disk and unlocks before its own build, so a CUDA job sharing this host
-          # can delete the tree mid compile. Build in a per run dir nothing else
-          # touches. The .so cache above still carries results across runs.
-          cargo_target_root="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
-          mkdir -p "${cargo_target_root}"
+          # A hosted runner is fresh per job, so there is no shared tree to reuse or
+          # to guard against a concurrent dropper.
+          export CARGO_TARGET_DIR="${RUNNER_TEMP:-/tmp}/sglang-cargo-target-${GITHUB_RUN_ID:-norun}-$$"
+          mkdir -p "${CARGO_TARGET_DIR}"
           python3 -m pip install --upgrade pip
           command -v uv >/dev/null 2>&1 || pip install uv
-          # build_rust needs the build backend and torch, not sglang's ~294 other runtime deps.
-          # Per-job path: these runners are persistent and shared, so a fixed one
-          # both inherits the previous job's venv and races a concurrent build.
-          venv_root="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
+          # Per-job path: a self-hosted runs_on is persistent and shared, so a fixed
+          # one both inherits the previous job's venv and races a concurrent build.
+          venv="${RUNNER_TEMP:-/tmp}/sglang-ci-rust-ext-${GITHUB_RUN_ID:-norun}-$$"
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
-          trap 'rm -rf "${venv_root}" "${cargo_target_root}" || true' EXIT
-          for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
-              minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-              export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
-              venv="${venv_root}/py${minor}"
-              uv venv "${venv}" --python "${python_bin}" --seed
-              # shellcheck disable=SC1091
-              source "${venv}/bin/activate"
-              uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0" wheel
-              # torch-sys resolves libtorch from the active interpreter and bakes that
-              # path into the persistent cargo cache. venv_root is per-run and deleted on
-              # exit, so a later run reuses a "Fresh torch-sys" whose -L points at a gone
-              # directory and fails with "unable to find library -ltorch". Pin LIBTORCH and
-              # drop the torch-shim units so they rebuild against this run's venv.
-              LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
-              export LIBTORCH
-              export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
-              cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
-                  -p torch-sys -p sglang-radix-tree 2>/dev/null || true
-              (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
-              python - <<'PY'
+          trap 'rm -rf "${venv}" "${CARGO_TARGET_DIR}" || true' EXIT
+          # build_rust needs the build backend and torch, not sglang's ~294 other runtime deps.
+          uv venv "${venv}" --python "${{ steps.py.outputs.python-path }}" --seed
+          # shellcheck disable=SC1091
+          source "${venv}/bin/activate"
+          uv pip install "setuptools>=61.0" "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0" wheel
+          # torch-sys resolves libtorch from the active interpreter and bakes that
+          # path into the cargo cache. venv is per-run and deleted on exit, so a
+          # persistent target dir would reuse a "Fresh torch-sys" whose -L points at
+          # a gone directory and fail with "unable to find library -ltorch". Pin
+          # LIBTORCH and drop the torch-shim units so they rebuild against this venv.
+          LIBTORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"
+          export LIBTORCH
+          export LD_LIBRARY_PATH="${LIBTORCH}/lib:${LD_LIBRARY_PATH:-}"
+          cargo clean --release --manifest-path rust/sglang-radix-tree/Cargo.toml \
+              -p torch-sys -p sglang-radix-tree 2>/dev/null || true
+          (cd python && SGLANG_BUILD_RUST_EXTS=all python setup.py build_rust --inplace)
+          python - <<'PY'
           import importlib.util
           import os
           import pathlib
@@ -290,9 +281,54 @@ jobs:
               inspection.RustUnifiedTreeCoreBinding, "inspect_contains_node"
           )
           PY
-              deactivate
-          done
 
+      # Both globs sit under python/sglang/srt/, which upload-artifact strips as the
+      # common prefix, so the collect job restores them by unpacking back into it.
+      - name: Upload this interpreter's modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}-build-py${{ matrix.python-version }}
+          path: |
+            python/sglang/srt/rust_extensions/_*.so
+            python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
+          if-no-files-found: error
+          retention-days: 1
+
+  # The interpreters compile independently, but the suffix-set check and the cache
+  # entry both cover the whole set, so they join in one job that sees all of it.
+  collect:
+    needs: compile
+    runs-on: ${{ inputs.restore_runs_on }}
+    timeout-minutes: 15
+    name: Collect Rust Ext
+    outputs:
+      # From the last step, so a failed job publishes no name for always() consumers.
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+          # Mirrors the restore job: this one writes the entry that job reads, so
+          # both have to check out the same set for hashFiles to agree.
+          sparse-checkout: |
+            rust
+            python/setup.py
+            python/pyproject.toml
+            python/sglang/srt/rust_extensions/torch_build.py
+            .github
+            scripts/ci/utils
+          sparse-checkout-cone-mode: false
+
+      - name: Collect the per-interpreter modules
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact_name }}-build-py*
+          merge-multiple: true
+          path: python/sglang/srt
+
+      # First point that sees every interpreter, which is what the suffix-set check
+      # compares. MAX_GLIBC belongs here rather than in the restore job: these are
+      # freshly compiled bytes, not ones that already passed under this key.
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
@@ -317,6 +353,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
+          # Archive holds package-relative paths, so it unpacks into python/sglang/srt/.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1
