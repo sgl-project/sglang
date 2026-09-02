@@ -1005,6 +1005,39 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_dsv4_budget_prices_dspark_as_packed_swa_only(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        mr = _make_model_runner(
+            num_layers=3,
+            is_hybrid_swa=True,
+            swa_full_tokens_ratio=0.8,
+            speculative_algorithm="DSPARK",
+            max_speculative_num_draft_tokens=6,
+            max_running_requests=8,
+        )
+        mr.model_config.qk_nope_head_dim = 448
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.index_head_dim = 128
+        mr.model_config.window_size = 128
+        mr.model_config.compress_ratios = [0, 4, 128]
+        mr.server_args.enable_hisparse = False
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=3,
+            dflash_draft_cell_size_per_token=None,
+        )
+
+        with mock_cpu_env():
+            configurator = DSV4PoolConfigurator(mr)
+
+        target_only_bytes = configurator._get_bytes_per_full_token()
+        draft_swa_bytes = 0.8 * (448 + 64 * 2 + 8) * 3
+        self.assertEqual(
+            configurator.bytes_per_full_token,
+            target_only_bytes + draft_swa_bytes,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
