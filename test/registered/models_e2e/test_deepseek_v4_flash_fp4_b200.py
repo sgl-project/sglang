@@ -102,7 +102,7 @@ class TestDSV4FlashFP4B200DSpark(
                 "--tp",
                 "4",
                 "--speculative-algorithm",
-                "DSAPRK",
+                "DSPARK",
                 "--disable-flashinfer-autotune",
             ],
         )
