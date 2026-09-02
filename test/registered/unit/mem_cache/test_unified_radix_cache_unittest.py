@@ -280,142 +280,6 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
-class TestUnifiedTreeCoreRestoredSWALocks(CustomTestCase):
-    """Lock ownership remains stable when a tombstoned SWA node is restored."""
-
-    def _build_core(self):
-        components = {}
-        for component_type in (
-            ComponentType.FULL,
-            ComponentType.SWA,
-            ComponentType.MAMBA,
-        ):
-            component = object.__new__(COMPONENT_REGISTRY[component_type])
-            component.is_evict_device_ongoing = False
-            component._session_leaves = defaultdict(set)
-            components[component_type] = component
-
-        components[ComponentType.SWA].sliding_window_size = 4
-        components[ComponentType.SWA]._swa_kv_pool_host = None
-        components[ComponentType.MAMBA]._mamba_pool_host = None
-
-        core = UnifiedTreeCore(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=None,
-                token_to_kv_pool_allocator=None,
-                page_size=1,
-                sliding_window_size=4,
-                tree_components=(
-                    ComponentType.FULL,
-                    ComponentType.SWA,
-                    ComponentType.MAMBA,
-                ),
-            ),
-            components,
-        )
-
-        def add_node(parent, token_ids):
-            node = core._new_node()
-            node.parent = parent
-            node.key = RadixKey(array("q", token_ids))
-            parent.children[node.key.child_key(core.page_size)] = node
-            return node
-
-        # The child keeps victim internal, matching the production cascade.
-        ancestor = add_node(core.root_node, [1, 2, 3, 4])
-        victim = add_node(ancestor, [5])
-        child = add_node(victim, [6])
-
-        ancestor.component_data[ComponentType.FULL].value = torch.arange(4)
-        ancestor.component_data[ComponentType.SWA].value = torch.arange(4)
-        victim.component_data[ComponentType.FULL].value = torch.tensor([4])
-        victim.component_data[ComponentType.SWA].value = None
-        victim.component_data[ComponentType.MAMBA].value = torch.tensor([0])
-        child.component_data[ComponentType.FULL].value = torch.tensor([5])
-
-        core.component_evictable_size_[ComponentType.FULL] = 6
-        core.component_evictable_size_[ComponentType.SWA] = 4
-        core.component_evictable_size_[ComponentType.MAMBA] = 1
-        core.lru_lists[ComponentType.SWA].insert_mru(ancestor)
-        core.lru_lists[ComponentType.MAMBA].insert_mru(victim)
-        return core, ancestor, victim
-
-    def test_cascade_preserves_mamba_locked_before_swa_restore(self):
-        core, _, victim = self._build_core()
-
-        request = core.inc_lock_ref(victim.id)
-        self.assertIn(victim.id, request.skip_lock_node_ids[ComponentType.SWA])
-        mamba_cd = victim.component_data[ComponentType.MAMBA]
-        self.assertEqual(mamba_cd.lock_ref, 1)
-
-        core.set_component_device_value(victim.id, ComponentType.SWA, torch.tensor([4]))
-        tracker = {
-            component_type: 0
-            for component_type in (
-                ComponentType.FULL,
-                ComponentType.SWA,
-                ComponentType.MAMBA,
-            )
-        }
-        device_frees = defaultdict(list)
-        host_frees = defaultdict(list)
-        core._evict_component_and_detach_lru(
-            victim,
-            core.components_by_type[ComponentType.SWA],
-            target=EvictLayer.DEVICE,
-            tracker=tracker,
-            device_frees=device_frees,
-            host_frees=host_frees,
-        )
-
-        core._cascade_evict(
-            victim,
-            core.components_by_type[ComponentType.SWA],
-            tracker,
-            device_frees=device_frees,
-            host_frees=host_frees,
-        )
-        self.assertIsNone(victim.component_data[ComponentType.SWA].value)
-        self.assertIsNotNone(mamba_cd.value)
-        self.assertEqual(mamba_cd.lock_ref, 1)
-        self.assertEqual(tracker[ComponentType.MAMBA], 0)
-
-        core.dec_lock_ref(victim.id, request.to_dec_params())
-        self.assertEqual(mamba_cd.lock_ref, 0)
-
-    def test_early_release_skips_swa_restored_after_acquire(self):
-        core, ancestor, victim = self._build_core()
-
-        first_request = core.inc_lock_ref(victim.id)
-        self.assertIn(victim.id, first_request.skip_lock_node_ids[ComponentType.SWA])
-        core.set_component_device_value(victim.id, ComponentType.SWA, torch.tensor([4]))
-        second_request = core.inc_lock_ref(victim.id)
-
-        swa_cd = victim.component_data[ComponentType.SWA]
-        mamba_cd = victim.component_data[ComponentType.MAMBA]
-        self.assertEqual(swa_cd.lock_ref, 1)
-        self.assertEqual(mamba_cd.lock_ref, 2)
-
-        core.dec_swa_lock_only(
-            victim.id,
-            first_request.swa_uuid_for_lock,
-            first_request.skip_lock_node_ids,
-        )
-
-        self.assertEqual(swa_cd.lock_ref, 1)
-        self.assertEqual(mamba_cd.lock_ref, 1)
-        self.assertEqual(
-            ancestor.component_data[ComponentType.SWA].lock_ref,
-            1,
-        )
-
-        core.dec_lock_ref(victim.id, second_request.to_dec_params())
-        core.dec_lock_ref(victim.id, first_request.to_dec_params(), skip_swa=True)
-        self.assertEqual(swa_cd.lock_ref, 0)
-        self.assertEqual(mamba_cd.lock_ref, 0)
-
-
 class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
     def _build_core(self, *, is_write_back: bool):
         component_types = (ComponentType.FULL,)
@@ -2335,6 +2199,193 @@ class UnifiedRadixCacheSuite:
 
         # Clean up the forced lock so teardown/sanity is consistent.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
+
+    # ---- unified_kv + HiCache: SWA ring has no host pool ----------------------
+    #
+    # In the unified_kv layout SWA is a per-request ring that is never offloaded
+    # to host (``tree_core.has_swa_host_pool`` is False).  With HiCache on, the
+    # SWA match validator therefore accepts SWA tombstones
+    # (``swa_device_only_hicache``), and a load-back restores Full and Mamba but
+    # never SWA.  ``init_load_back`` hands that node back as ``req.last_node``,
+    # so the request lock lands on a node whose Mamba is present and whose SWA is
+    # missing: the lock takes Mamba and skips SWA.  A later request that
+    # re-prefills its trailing window through the node restores SWA under the
+    # first request's Full lock (``RecoverSWAWithLockedFull``), leaving SWA
+    # unlocked and evictable while Mamba is still locked.
+    #
+    # The fixture has no SWA host pool, so ``set_hicache_enabled()`` is exactly
+    # that layout; the unit fixture's ``init_hicache`` does not support SWA+Mamba,
+    # so the H->D copy of the load-back is driven through the tree core's own
+    # load-back spec/commit pair (the same calls ``load_back`` makes).
+
+    def _ring_mode_restore_full_and_mamba(self):
+        """Full-evict a backed-up leaf and load Full+Mamba back without SWA.
+
+        Returns ``(cache, allocator, req_to_token_pool, node, seq)`` where
+        ``node`` holds Full and Mamba on device and no SWA value at all.
+        """
+        if not self.cfg.has_swa or not self.cfg.has_mamba:
+            self.skipTest("requires SWA and Mamba components")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+
+        # One window-sized leaf so the SWA lock and match stay on a single node.
+        seq = self._make_seq(1, window_pages)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        for ct in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA):
+            self.assertIsNotNone(_device_value(cache, node, ct))
+
+        # Write-through backs up Full and Mamba; SWA has no host pool.
+        for ct in (ComponentType.FULL, ComponentType.MAMBA):
+            cache.tree_core.set_component_host_value_raw(
+                node, ct, _device_value(cache, node, ct).clone()
+            )
+        cache.tree_core.update_duplicate_tracking(node)
+
+        # Full pressure demotes the leaf D->H; its SWA is simply freed.
+        cache.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+        for ct in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA):
+            self.assertIsNone(_device_value(cache, node, ct))
+        self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+
+        cache.tree_core.set_hicache_enabled()
+        self.assertFalse(cache.tree_core.has_swa_host_pool)
+
+        # A reuse of the prefix matches the host-backed node and asks for a
+        # load-back (Mamba host hit); nothing SWA-side is requested.
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.best_match_node, node)
+        self.assertGreaterEqual(m.mamba_host_hit_length, 1)
+        self.assertEqual(m.swa_host_hit_length, 0)
+
+        # load_back(): build the spec, copy H->D, commit.  Only Full and Mamba
+        # transfers exist because SWA has no host pool in this layout.
+        kv_xfer, comp_xfers = cache.tree_core.build_load_back_spec(node)
+        self.assertNotIn(ComponentType.SWA, comp_xfers)
+        self.assertIn(ComponentType.MAMBA, comp_xfers)
+        full_allocator = getattr(allocator, "full_attn_allocator", allocator)
+        device_indices = full_allocator.alloc(len(kv_xfer.host_indices))
+        self.assertIsNotNone(device_indices)
+        mamba_indices = req_to_token_pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(mamba_indices)
+        comp_xfers[ComponentType.MAMBA][0].device_indices = mamba_indices
+        cache._apply_cache_actions(
+            cache.tree_core.commit_load_back(node, device_indices, kv_xfer, comp_xfers)
+        )
+
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        return cache, allocator, req_to_token_pool, node, seq
+
+    def test_ring_mode_match_locks_mamba_and_skips_missing_swa(self):
+        """After a ring-mode load-back the match selects the SWA-less node and
+        the request lock takes Full+Mamba while recording the SWA skip."""
+        cache, allocator, req_to_token_pool, node, seq = (
+            self._ring_mode_restore_full_and_mamba()
+        )
+
+        # The SWA validator ignores the tombstone in this layout, so the loaded
+        # node is the device match (init_load_back also returns it as last_node).
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.last_device_node, node)
+        self.assertEqual(len(m.device_indices), len(seq))
+
+        lock = cache.inc_lock_ref(m.last_device_node)
+        self.assertIn(node, lock.skip_lock_node_ids.get(ComponentType.SWA, ()))
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
+        self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
+
+        cache.dec_lock_ref(node, lock.to_dec_params())
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
+        cache.sanity_check()
+
+    def test_ring_mode_swa_evict_cascade_spares_mamba_locked_before_swa_restore(self):
+        """SWA restored under a request's Full lock is evictable while that
+        request still owns Mamba; the cascade must skip the locked Mamba."""
+        cache, allocator, req_to_token_pool, node, seq = (
+            self._ring_mode_restore_full_and_mamba()
+        )
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertEqual(m.last_device_node, node)
+        lock = cache.inc_lock_ref(m.last_device_node)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
+
+        # Another request re-prefills its trailing window through the node:
+        # the overlapping insert restores SWA under the held Full lock.
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
+        self.assertTrue(cache.tree_core.is_node_in_device_lru(node, ComponentType.SWA))
+
+        # SWA pressure: the node is Full-locked, so it is not a device leaf and
+        # the SWA walk tombstones it inline, cascading into Mamba.
+        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq)))
+        self.assertEqual(result.swa_num_tokens_evicted, len(seq))
+        self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertIsNotNone(
+            _device_value(cache, node, ComponentType.MAMBA),
+            "locked Mamba must survive the SWA cascade",
+        )
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
+        self.assertEqual(result.mamba_num_evicted, 0)
+
+        cache.dec_lock_ref(node, lock.to_dec_params())
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
+        cache.sanity_check()
+
+        # Once unlocked, a normal Mamba eviction reclaims the retained state.
+        cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertIsNone(_device_value(cache, node, ComponentType.MAMBA))
+        cache.sanity_check()
+
+    def test_ring_mode_early_release_skips_swa_restored_after_acquire(self):
+        """A request that skipped the SWA lock must not release the SWA lock a
+        later request took on the restored value."""
+        cache, allocator, req_to_token_pool, node, seq = (
+            self._ring_mode_restore_full_and_mamba()
+        )
+        first = cache.inc_lock_ref(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+        )
+        self.assertIn(node, first.skip_lock_node_ids.get(ComponentType.SWA, ()))
+
+        # SWA comes back via an overlapping insert; a second request locks it.
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        second = cache.inc_lock_ref(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).last_device_node
+        )
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 2)
+
+        # First request decodes past its window and early-releases SWA.
+        cache.dec_swa_lock_only(
+            node, first.swa_uuid_for_lock, skip_lock_node_ids=first.skip_lock_node_ids
+        )
+        self.assertEqual(
+            _device_lock_ref(cache, node, ComponentType.SWA),
+            1,
+            "second request's SWA lock must survive the first's early release",
+        )
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
+
+        cache.dec_lock_ref(node, second.to_dec_params())
+        cache.dec_lock_ref(node, first.to_dec_params(), skip_swa=True)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
+        self.assertEqual(_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
+        cache.sanity_check()
 
     def test_cascade_evict_preserves_locked_leaf_mamba(self):
         if not self.cfg.has_swa or not self.cfg.has_mamba:
