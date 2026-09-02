@@ -995,7 +995,11 @@ class SchedulerPPMixin:
                 self.ps.pp_rank * self.ps.tp_size + dp_offset,
             )
         else:
-            data = None
+            # Same two-hop fan-out as SchedulerRequestReceiver: the attn_tp
+            # hop runs first, and its source in an attn_cp_rank != 0 slice has
+            # nothing yet. broadcast_pyobj reads len(data) on the source, so
+            # start from an empty list and let the attn_cp hop fill it in.
+            data = []
 
         if self.ps.attn_tp_size > 1:
             data = broadcast_pyobj(
