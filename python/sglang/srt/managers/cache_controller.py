@@ -40,6 +40,11 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    namespace_digest,
+    normalize_dtype,
+    plan_unified_kv,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_memory, get_parallel
@@ -732,16 +737,18 @@ class HiCacheController:
         unified_layer_ranges = None
         unified_head_ranges = None
         layer_partition = storage_backend_extra_config.pop("layer_partition", None)
-        head_group_knob = storage_backend_extra_config.pop("head_group", None)
+        head_group_config = storage_backend_extra_config.pop("head_group", None)
 
-        # The knobs arrive from operator JSON: enforce exact integers, or
+        # The configs arrive from operator JSON: enforce exact integers, or
         # floats/bools would leak into key coordinates (L30.0-61 forks the
         # keyspace) and into zero-copy pointer arithmetic.
         def _is_exact_int(value) -> bool:
             return isinstance(value, int) and not isinstance(value, bool)
 
-        if head_group_knob is not None and not _is_exact_int(head_group_knob):
-            raise ValueError(f"head_group must be an integer, got {head_group_knob!r}.")
+        if head_group_config is not None and not _is_exact_int(head_group_config):
+            raise ValueError(
+                f"head_group must be an integer, got {head_group_config!r}."
+            )
         if layer_partition is not None and (
             not _is_exact_int(layer_partition) or layer_partition <= 0
         ):
@@ -750,10 +757,11 @@ class HiCacheController:
                 f"unit: layers per chunk; the model's trailing remainder "
                 f"forms a short final chunk), got {layer_partition!r}."
             )
+        unified_permute_head_groups = False
         if get_memory().hicache_storage_key_scheme == "unified":
             if tp_lcm_size:
                 raise ValueError(
-                    "tp_lcm_size is the legacy rank-suffix split-heads knob; "
+                    "tp_lcm_size is the legacy rank-suffix split-heads config; "
                     "the unified key scheme uses head_group in the extra "
                     "config "
                     "(heads per chunk, e.g. head_group = total_kv_heads / "
@@ -763,14 +771,15 @@ class HiCacheController:
                 unified_suffix,
                 unified_layer_ranges,
                 unified_head_ranges,
+                unified_permute_head_groups,
             ) = self._build_unified_suffix(
                 model_name=model_name,
                 is_rank_replicated=is_rank_replicated,
                 attn_cp_size=attn_cp_size,
-                head_group_knob=head_group_knob,
+                head_group_config=head_group_config,
                 layer_partition=layer_partition,
             )
-        elif layer_partition is not None or head_group_knob is not None:
+        elif layer_partition is not None or head_group_config is not None:
             raise ValueError(
                 "layer_partition / head_group in "
                 "--hicache-storage-backend-extra-config require "
@@ -803,6 +812,7 @@ class HiCacheController:
             unified_suffix=unified_suffix,
             unified_layer_ranges=unified_layer_ranges,
             unified_head_ranges=unified_head_ranges,
+            unified_permute_head_groups=unified_permute_head_groups,
         )
 
     def _build_unified_suffix(
@@ -810,24 +820,14 @@ class HiCacheController:
         model_name: Optional[str],
         is_rank_replicated: bool,
         attn_cp_size: int,
-        head_group_knob: Optional[int] = None,
+        head_group_config: Optional[int] = None,
         layer_partition: Optional[int] = None,
     ):
-        """Attach-time unified planning.
+        """Attach-time unified planning; the arg hook only steers.
 
-        Controller-only guards live here; the namespace/grid derivation is
-        hicache_key_scheme.plan_unified_kv. Everything unsupported
-        raises with the remedy in the message — nothing degrades silently
-        to rank-suffix keys. Returns (suffix, layer_ranges, head_ranges):
-        a single suffix string without partition knobs, else the
-        owned-chunk suffix list plus the LOCAL grid for the adapter.
+        Returns (suffix, layer_ranges, head_ranges, permute_head_groups): a
+        single suffix string without partition configs.
         """
-        from sglang.srt.mem_cache.hicache_key_scheme import (
-            namespace_digest,
-            normalize_dtype,
-            plan_unified_kv,
-        )
-
         # A unified namespace names ONE grid, so it covers a controller that
         # owns exactly one host pool. That is the plain controller and also the
         # KV-only hybrid stack (a dense model on UnifiedRadixCache, whose only
@@ -846,11 +846,13 @@ class HiCacheController:
                 f"the unified key scheme v1 supports the file and mooncake backends; "
                 f"got {self.storage_backend_type!r}."
             )
-        if (
-            head_group_knob is not None or layer_partition is not None
-        ) and self.storage_backend_type != "mooncake":
+
+        configs_fan_out = layer_partition is not None or (
+            head_group_config is not None and not is_rank_replicated
+        )
+        if configs_fan_out and self.storage_backend_type != "mooncake":
             raise NotImplementedError(
-                "unified-scheme partition knobs (head_group / layer_partition) "
+                "unified-scheme partition configs (head_group / layer_partition) "
                 "need a multi-key-per-page backend; only mooncake supports "
                 "them (the file backend stores one object per page)."
             )
@@ -870,30 +872,33 @@ class HiCacheController:
             end_layer=self.storage_host_pool.end_layer,
             is_final_stage=self.pp_rank == self.pp_size - 1,
             pool_layout=self.storage_host_pool.layout,
-            head_group_knob=head_group_knob,
+            head_group_config=head_group_config,
             layer_partition=layer_partition,
         )
-        head_cut = plan.head_ranges is not None and len(plan.head_ranges) > 1
-        if head_cut:
-            # Page blocks are head-group-major, which ONLY the pfdhg kernels can
-            # read. transfer_kv_*_direct_* move a page block verbatim, so the
-            # copy-engine path would transfer permuted bytes as if natural.
-            # Checked here rather than only in the arg hook because the hook
-            # sees inline JSON only -- '@file' configs and the runtime attach
-            # endpoint reach this point without it.
-            if self.io_backend != "kernel":
-                raise NotImplementedError(
-                    f"unified head_group stores host pages head-group-major, "
-                    f"which only --hicache-io-backend kernel can read; got "
-                    f"{self.io_backend!r}. (The copy-engine 'direct' backend "
-                    f"moves a page block verbatim and would silently transfer "
-                    f"permuted bytes.)"
-                )
-            if self.storage_host_pool.layout != "page_first_direct":
-                raise NotImplementedError(
-                    f"unified head_group requires --hicache-mem-layout "
-                    f"page_first_direct; got {self.storage_host_pool.layout!r}."
-                )
+        # Only page_first_direct stores its page block head-group-major (the
+        # one-descriptor fast path); the other layouts serve a cut head axis as
+        # several runs in their own order and need no special transfer arm.
+        head_cut = (
+            plan.head_ranges is not None
+            and len(plan.head_ranges) > 1
+            and self.storage_host_pool.layout == "page_first_direct"
+        )
+        # Head-group-major page blocks are readable ONLY by the pfdhg kernels,
+        # i.e. the 'kernel' io backend; transfer_kv_*_direct_* move a page block
+        # verbatim and would transfer permuted bytes as if natural. So the
+        # copy-engine backend keeps the natural order and pays for it in
+        # descriptors: one run per (layer, token) instead of one per chunk.
+        permute_head_groups = head_cut and self.io_backend == "kernel"
+        if head_cut and not permute_head_groups:
+            logger.warning(
+                "unified head_group on --hicache-io-backend %r cannot use the "
+                "head-group-major page order (only the 'kernel' backend's "
+                "pfdhg transfer kernels can read it), so each L3 chunk is "
+                "served as one run per (layer, token). The objects are "
+                "byte-identical, but expect orders of magnitude more transport "
+                "descriptors; use --hicache-io-backend kernel to avoid it.",
+                self.io_backend,
+            )
         if plan.adapter and getattr(
             self.storage_host_pool, "mtp_draft_device_pools", ()
         ):
@@ -901,7 +906,7 @@ class HiCacheController:
             # not named by the grid, so they would sit inside a head group's
             # region unnamed and be transferred in the wrong byte order.
             raise NotImplementedError(
-                "unified-scheme partition knobs (head_group / layer_partition) "
+                "unified-scheme partition configs (head_group / layer_partition) "
                 "do not support MTP draft pools: the draft layers are not part "
                 "of the L3 grid. Use --hicache-storage-key-scheme rank-suffix."
             )
@@ -919,7 +924,7 @@ class HiCacheController:
             plan.suffixes,
         )
         suffix = list(plan.suffixes) if plan.adapter else plan.suffixes[0]
-        return suffix, plan.layer_ranges, plan.head_ranges
+        return suffix, plan.layer_ranges, plan.head_ranges, permute_head_groups
 
     def reset(self):
         self.storage_stop_event.set()

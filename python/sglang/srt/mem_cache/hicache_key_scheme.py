@@ -14,48 +14,39 @@
 
 """Unified L3 key scheme (``--hicache-storage-key-scheme unified``).
 
-Replaces the per-backend rank/topology key suffixes (``_{tp_rank}_{tp_size}``,
-``_{pp_size}_{pp_rank}``, ``_cp{r}_{s}``, ...) with one topology-free
-coordinate::
+Replaces the rank/topology key suffixes (``_{tp_rank}_{tp_size}``,
+``_{pp_size}_{pp_rank}``, ``_cp{r}_{s}``) with one topology-free coordinate::
 
-    {page_hash}_{namespace_digest}_L{start_layer}-{end_layer}[_H{head_group_index}]
+    {page_hash}_{digest}_L{start}-{end}[_H{head_group}]_{k|v}
 
-The coordinate names *what data the object holds* (a model-global layer-range x
-kv-head-range rectangle of one page), never *who wrote it*. Any deployment
-whose shard tiles the namespace grid derives identical keys for identical
-data, which makes cross-topology reuse a pure key-selection problem.
+The trailing component is appended by the backend; this module derives the
+rest. The coordinate names what an object HOLDS -- a layer-range x
+head-range rectangle of one page -- never who wrote it, so any deployment
+whose shard tiles the grid derives the same keys for the same data.
 
-Without partition knobs, a rank owns one chunk per page (its absolute layer
-range, its head shard) and objects keep the raw pool-layout bytes. Setting
-``head_group`` (heads per chunk) and/or ``layer_partition`` (layers per
-chunk) in the extra config switches the namespace to the **layout adapter**
-(:func:`plan_unified_kv`): a rank owns the (layer window x head group)
-cross product of chunks, and every object carries the same unified byte
-order — (layer, token, head, dim) per K/V half, MLA (layer, token, dim) —
-which is ``page_first_direct``'s own page block. Only the page-first pair
-is supported (``ADAPTER_LAYOUTS``), and the host layout stays part of the
-namespace identity (``object_layout`` becomes ``unified-v2:{layout}``), so
-``page_first`` and ``page_first_direct`` deployments never share objects.
-The pool adapters skip the copy for slabs already contiguous in that order —
-on ``page_first_direct`` that is every slab whenever the fleet grid does not
-cut the kv-head axis, MLA included.
+``head_group`` / ``layer_partition`` in the extra config switch on the layout
+adapter: a rank then owns the (layer window x head group) cross product, and
+every object uses one byte order regardless of host layout, so ``page_first``
+and ``page_first_direct`` share a keyspace (``object_layout`` = "unified-v2").
+Without them the raw page block IS the object, so the host layout is part of
+the identity instead.
 
-The namespace digest prefixes every key: deployments share objects iff every
-identity field matches, so configuration differences partition into disjoint
-keyspaces instead of colliding. Notably the *logical* dtype is an identity
-field — fp8_e4m3 and fp8_e5m2 never share a keyspace even though both store
-as uint8. :func:`load_namespace_descriptor` is the out-of-band descriptor
-API, kept for richer future identities (numerics_id pinning).
+The digest prefixes every key, so any identity mismatch misses rather than
+colliding. Note dtype is the LOGICAL one: fp8_e4m3 and fp8_e5m2 never share a
+keyspace even though both store as uint8.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import msgspec
 
-# Bump when the struct schema or its encoding changes: the digest is
-# computed over the encoded struct, so any schema change must change every key.
+logger = logging.getLogger(__name__)
+
+# The digest is computed over the encoded struct, so any schema change must
+# change every key. Bump on any field change.
 _SCHEMA_VERSION = 1
 
 
@@ -64,50 +55,41 @@ class KVCacheNamespace(
 ):
     """Immutable identity of one shared L3 KV keyspace.
 
-    Everything that must be equal for two deployments' KV bytes to be
-    interchangeable, plus the shared grid that fixes chunk boundaries.
-    Field order is part of the encoding — append new fields only,
-    and bump ``schema_version`` when doing so. ``forbid_unknown_fields``
-    makes descriptor-file typos a decode error instead of a silently
-    different keyspace.
+    Everything that must match for two deployments' KV bytes to be
+    interchangeable. Field order is part of the encoding: append only, and
+    bump ``schema_version``.
     """
 
     schema_version: int = _SCHEMA_VERSION
     model_id: str
-    # Logical torch dtype of the KV cache, normalized (e.g. "bfloat16",
-    # "float8_e4m3fn") — NOT the storage view dtype (fp8 variants all store
-    # as uint8 and must not share a keyspace).
+    # Logical dtype, not the storage view: fp8 variants all store as uint8
+    # and must not share a keyspace.
     dtype: str
     page_size: int
-    # True for MLA-family pools whose KV is replicated across attn-TP ranks;
-    # such namespaces have no head axis (total_kv_heads/head_group are 0).
+    # MLA-family pools: KV replicated across attn-TP ranks, so no head axis
+    # (total_kv_heads and head_group are 0).
     rank_replicated: bool
     total_kv_heads: int
-    # Head grid: kv heads per chunk. Layer grid: layer_group > 0 = layers
-    # per chunk (the fleet's layer unit). Every stage must START on a
-    # multiple of layer_group; the model's trailing remainder simply forms a
-    # short final chunk (allowed only on the last PP stage, where the stage
-    # end is the model total). 0 = per-stage ranges (same-partition sharing
-    # only).
+    # Layers per chunk; 0 = per-stage ranges (same-partition sharing only).
+    # A stage must START on a multiple of it; only the last PP stage may end
+    # short, forming the model's trailing remainder chunk.
     layer_group: int = 0
     head_group: int
-    # Optional kernel/build ABI digest; deployments whose numerics must not
-    # mix set distinct values and thereby get distinct namespaces.
+    # Optional build/ABI digest, to keep deployments with different numerics
+    # in different namespaces.
     numerics_id: str = ""
-    # Host memory-pool layout of the stored object bytes (page_first,
-    # page_head, page_first_direct, ...). Different layouts serialize a page
-    # in different byte orders with EQUAL sizes, so without this field two
-    # deployments could exchange byte-permuted KV under identical keys.
-    # Identity field: mismatched layouts miss instead of corrupting.
+    # Byte order of the stored objects: the raw host layout without the
+    # adapter, else "unified-v2". Layouts serialize a page in different orders
+    # at EQUAL sizes, so omitting this would let two deployments exchange
+    # byte-permuted KV under identical keys.
     object_layout: str
 
 
 def namespace_digest(namespace: KVCacheNamespace) -> str:
     """Digest of the namespace encoding, used as the key prefix.
 
-    msgspec's msgpack encoding of a Struct is deterministic given the class
-    definition (fields in declaration order), which is why the schema itself
-    versions the encoding.
+    msgpack encoding of a Struct is deterministic given the class definition,
+    which is why the schema versions the encoding.
     """
     encoded = msgspec.msgpack.encode(namespace)
     return f"ukv{_SCHEMA_VERSION}-{hashlib.sha256(encoded).hexdigest()[:16]}"
@@ -116,11 +98,9 @@ def namespace_digest(namespace: KVCacheNamespace) -> str:
 def load_namespace_descriptor(path: str) -> KVCacheNamespace:
     """Load and strictly decode an out-of-band descriptor file (JSON).
 
-    Not wired to a CLI flag: the extra-config knobs (head_group,
-    layer_partition) cover today's grids, so fleet descriptor files remain a
-    follow-up for richer identities (numerics_id pinning, per-component
-    grids). Kept (and tested) now so the schema, strictness, and digest
-    semantics are pinned from the first release of the key format.
+    Not wired to a CLI flag yet -- the extra-config entries cover today's
+    grids. Kept and tested so the schema and digest semantics are pinned from
+    the first release of the key format.
     """
     with open(path, "rb") as f:
         raw = f.read()
@@ -147,16 +127,11 @@ def derive_namespace(
 ) -> KVCacheNamespace:
     """Derive the namespace from deployment facts plus the fleet agreements.
 
-    ``head_group`` is the head-grid agreement (the ``head_group`` extra-config
-    knob): deployments passing the same value land in one keyspace; without
-    it, ``head_group`` = the rank's local head count and only same-TP
-    deployments share. ``layer_group`` is the layer-unit agreement
-    (``layer_partition`` in the extra config, layers per chunk) that enables
-    PP read-back across different pipeline splits — the model's trailing
-    remainder forms a short final chunk; without it, layer chunks are
-    per-stage ranges and only same-partition deployments share.
-    All other mismatches (model, logical dtype, page size) partition into
-    disjoint keyspaces — safe, never a geometry collision.
+    ``head_group`` and ``layer_group`` are the two fleet-wide agreements:
+    deployments passing the same values share a keyspace across TP and PP
+    sizes respectively. Unset, each falls back to this rank's own shard, which
+    only same-topology deployments match. Every other mismatch (model, dtype,
+    page size) simply partitions the keyspace -- never a geometry collision.
     """
     namespace = KVCacheNamespace(
         model_id=model_id,
@@ -219,16 +194,13 @@ def build_unified_suffixes(
 ) -> list[str]:
     """Validate this rank against the namespace; return its owned key suffixes.
 
-    The attach-time compatibility check of the design's section 2.2: the
-    rank's shard must tile the grid, and every identity field must match.
-    Raises with the remedy in the message; never degrades silently.
+    The rank's shard must tile the grid and every identity field must match;
+    anything else raises with the remedy, never degrades silently.
 
-    Returns one suffix per owned chunk in layer-major/head-minor order. A rank
-    whose kv-head shard is coarser than ``head_group`` owns
-    ``local_kv_heads // head_group`` chunks (head fan-out): rank ``r`` owns
-    head groups ``[r * n, (r + 1) * n)`` — the same arithmetic as the
-    mooncake split-heads virtual ranks, re-keyed topology-free.
-    Rank-replicated namespaces return one suffix per layer window.
+    One suffix per owned chunk, layer-major / head-minor. A rank whose kv-head
+    shard is coarser than ``head_group`` owns ``local_kv_heads // head_group``
+    of them, starting at ``attn_tp_rank * that``. Rank-replicated namespaces
+    get one suffix per layer window.
     """
     _validate_grid(namespace)
     _check_identity(
@@ -249,13 +221,10 @@ def build_unified_suffixes(
 
     if not 0 <= start_layer < end_layer:
         raise ValueError(f"invalid layer range [{start_layer}, {end_layer}).")
-    # Layer coordinates are absolute ranges: any PP partition (uneven stages
-    # included) yields valid, collision-free names; differing partitions miss
-    # instead of colliding. With a layer unit declared, the stage must start
-    # on the grid and owns one chunk per contained window; the model's
-    # trailing remainder forms a short final chunk (legal only on the last
-    # pipeline stage, whose end IS the model total) — this is what lets a
-    # reader consume chunks written under a different pipeline split.
+    # Layer coordinates are ABSOLUTE ranges, so any PP split -- uneven stages
+    # included -- yields collision-free names, and a differing split misses
+    # rather than colliding. A declared layer unit is what lets a reader
+    # consume chunks written under a different split.
     if namespace.layer_group:
         lg = namespace.layer_group
         if start_layer % lg != 0:
@@ -299,9 +268,8 @@ def build_unified_suffixes(
         )
     chunks_per_rank = local_kv_heads // namespace.head_group
     first_head_index = attn_tp_rank * chunks_per_rank
-    # The general case is the cross product, layer-major / head-minor — the
-    # same order the layout adapter packs bytes in. Single-axis fan-outs
-    # are the degenerate cases (one coordinate list has length 1).
+    # Cross product, layer-major / head-minor -- the same order the layout
+    # adapter packs bytes in. Single-axis fan-out is the degenerate case.
     return [
         f"{digest}_{coord}_H{first_head_index + i}"
         for coord in layer_coords
@@ -357,21 +325,19 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     namespace: KVCacheNamespace
     # One suffix per owned chunk (layer-major, head-minor).
     suffixes: list[str]
-    # True when any partition knob is set: objects then use the unified
-    # byte order via the gather/scatter adapter (which skips the copy when
-    # the pool view already matches).
+    # Any partition config is set, so objects use the unified byte order.
     adapter: bool
     # LOCAL half-open chunk ranges for the adapter, or None without it.
     layer_ranges: list[tuple[int, int]] | None = None
     head_ranges: list[tuple[int, int]] | None = None
 
 
-# Host layouts the adapter can present in the unified byte order. Deliberately
-# only the page-first pair: their page blocks are the two orders worth storing,
-# and both are what the server-arg resolution already steers L3 deployments to.
-# Only page_first_direct stores a page block in the unified byte order, so
-# only it can serve L3 chunks as direct copies into and out of pool memory.
-ADAPTER_LAYOUTS = ("page_first_direct",)
+# Host layouts the adapter can present in the unified byte order. page_head
+# and split K/V pools have no unified page view at all. `layer_first` does,
+# but is deliberately excluded and IS reachable (kernel_ascend keeps it, and
+# the runtime attach endpoint can switch backends without re-running arg
+# resolution), so the raise below is load-bearing rather than defensive.
+ADAPTER_LAYOUTS = ("page_first", "page_first_direct")
 
 
 def plan_unified_kv(
@@ -388,62 +354,86 @@ def plan_unified_kv(
     end_layer: int,
     is_final_stage: bool,
     pool_layout: str,
-    head_group_knob: int | None = None,
+    head_group_config: int | None = None,
     layer_partition: int | None = None,
 ) -> UnifiedKVPlan:
     """Derive the namespace and this rank's chunk plan from deployment facts.
 
-    Any partition knob switches the namespace to adapter mode: objects carry
-    the unified byte order (object_layout "unified-v2:{pool_layout}"), which
-    keeps adapter chunks in their own keyspace, per host layout.
+    Any partition config switches on adapter mode, which puts chunks in their
+    own keyspace but shares it across host layouts.
     """
     adapter = layer_partition is not None or (
-        head_group_knob is not None and not rank_replicated
+        head_group_config is not None and not rank_replicated
     )
     if adapter and pool_layout not in ADAPTER_LAYOUTS:
         raise ValueError(
-            f"the unified key scheme does not support the {pool_layout!r} host "
-            f"layout; use one of {ADAPTER_LAYOUTS}. Objects are stored in "
-            f"page_first_direct's page-block order, and the host layout is part "
-            f"of the namespace identity, so the two do not share a keyspace."
+            f"the unified key scheme does not support the {pool_layout!r} "
+            f"host layout with partition configs; use --hicache-mem-layout with "
+            f"one of {ADAPTER_LAYOUTS}. Every supported layout emits the same "
+            f"object bytes and shares one keyspace; these are the ones with a "
+            f"unified page view."
         )
 
+    # head_group is the FLEET's chunk size, not a local tuning option: it
+    # fixes chunk boundaries, and boundaries are namespace identity. Its
+    # default -- this rank's head count -- means "share only with my own TP
+    # size", since a TP2 rank's [0, H/2) is not a TP4 rank's [0, H/4).
+    total_kv_heads = local_kv_heads * attn_tp_size
     head_group = local_kv_heads
-    if head_group_knob is not None and not rank_replicated:
-        if head_group_knob <= 0:
-            raise ValueError(f"head_group must be positive: {head_group_knob}")
-        if local_kv_heads % head_group_knob != 0 or head_group_knob > local_kv_heads:
+    if head_group_config is not None and not rank_replicated:
+        if head_group_config <= 0:
+            raise ValueError(f"head_group must be positive: {head_group_config}")
+        if (
+            local_kv_heads % head_group_config != 0
+            or head_group_config > local_kv_heads
+        ):
             raise ValueError(
-                f"head_group={head_group_knob} must divide this rank's "
-                f"{local_kv_heads} kv heads."
+                f"head_group={head_group_config} must divide this rank's "
+                f"{local_kv_heads} kv heads. As a fleet grid it must divide "
+                f"every member's local kv-head count, so pick "
+                f"total_kv_heads / lcm(the fleet's attn-TP sizes) -- here "
+                f"total_kv_heads={total_kv_heads}."
             )
-        head_group = head_group_knob
+        head_group = head_group_config
+    elif not rank_replicated and adapter and local_kv_heads != total_kv_heads:
+        # Correct but unshareable: another attn-TP size derives a different
+        # digest and misses everything. Nothing else reports this -- the
+        # symptom is a 0% hit rate against a populated store.
+        logger.warning(
+            "unified key scheme: head_group is unset, so this namespace is "
+            "keyed to this rank's %d of %d kv heads and can only share objects "
+            "with deployments at attn-TP %d. Set head_group in "
+            "--hicache-storage-backend-extra-config (total_kv_heads / lcm of "
+            "the fleet's attn-TP sizes) to share across TP sizes; a rank that "
+            "owns several groups simply owns several chunks.",
+            local_kv_heads,
+            total_kv_heads,
+            attn_tp_size,
+        )
     if (
         not rank_replicated
         and local_kv_heads == 1
         and attn_tp_size > 1
-        and head_group_knob is None
+        and head_group_config is None
     ):
-        # 1 head/rank is ambiguous (could be kv-head replication); an
-        # explicit head_group is the operator's attestation of sharding.
+        # Ambiguous: 1 head/rank could mean kv-head replication. An explicit
+        # head_group is the operator attesting that it is sharding.
         raise NotImplementedError(
             "the unified key scheme cannot derive a namespace at 1 kv head per rank; "
             "set head_group in the extra config, or use "
             "--hicache-storage-key-scheme rank-suffix."
         )
 
-    # The host layout stays part of the namespace identity even under the
-    # adapter: page_first and page_first_direct serialize a page differently,
-    # and we do not reuse objects across them. The "unified-v2:" prefix keeps
-    # adapter-written chunks in a different keyspace from the raw-layout
-    # objects an unpartitioned deployment writes for the same layout.
-    object_layout = f"unified-v2:{pool_layout}" if adapter else pool_layout
+    # Under the adapter every layout emits the same bytes and differs only in
+    # descriptor count, so the layout must NOT enter the namespace. Without it
+    # the raw layout IS the wire format and stays part of the identity.
+    object_layout = "unified-v2" if adapter else pool_layout
     namespace = derive_namespace(
         model_id=model_id,
         dtype=dtype,
         page_size=page_size,
         rank_replicated=rank_replicated,
-        total_kv_heads=local_kv_heads * attn_tp_size,
+        total_kv_heads=total_kv_heads,
         head_group=0 if rank_replicated else head_group,
         object_layout=object_layout,
         layer_group=layer_partition or 0,

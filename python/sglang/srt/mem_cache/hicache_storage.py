@@ -44,6 +44,11 @@ class HiCacheStorageConfig:
     # the LOCAL layer / kv-head ranges of this rank's chunks
     unified_layer_ranges: Optional[List[Tuple[int, int]]] = None
     unified_head_ranges: Optional[List[Tuple[int, int]]] = None
+    # Store a cut head axis head-group-major, making each chunk one descriptor.
+    # Only page_first_direct can be permuted, and only the pfdhg transfer
+    # kernels can read the result, so the controller sets this from the io
+    # backend. False serves the same bytes as many small runs instead.
+    unified_permute_head_groups: bool = False
 
 
 @dataclass

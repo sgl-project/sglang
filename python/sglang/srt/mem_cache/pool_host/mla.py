@@ -631,19 +631,18 @@ class MLATokenToKVPoolHost(
     def _unified_page_view(self, index: int):
         """One page's latent KV as a (1, layer, page_size, 1, dim) view.
 
-        The unified MLA order is (layer, token, dim), which is exactly a
-        ``page_first_direct`` page block, so every chunk is contiguous and MLA
-        is a direct copy for any layer partition. MLA has no kv-head axis to
-        cut, so its page blocks are never permuted. ``page_first`` stores
-        (token, layer, dim) and cannot be served by a direct copy.
+        MLA has no kv-head axis to cut, so its page blocks are never permuted;
+        the layout only decides how many byte runs a chunk takes. See
+        MHATokenToKVPoolHost._unified_page_view for the per-layout shapes.
         """
         if self.layout == "page_first_direct":
             return self.kv_buffer[index // self.page_size].unsqueeze(0)
+        if self.layout == "page_first":
+            page = self.kv_buffer[index : index + self.page_size]
+            return page.permute(1, 0, 2, 3).unsqueeze(0)
         raise ValueError(
             f"the unified key scheme does not support the {self.layout!r} host "
-            f"layout; use --hicache-mem-layout page_first_direct (its page "
-            f"block is the unified byte order, so L3 objects transfer without "
-            f"a copy)."
+            f"layout; use page_first or page_first_direct."
         )
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:

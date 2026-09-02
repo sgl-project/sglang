@@ -11,31 +11,6 @@ def is_hip() -> bool:
 _is_hip = is_hip()
 
 
-def _default_pfdhg_block_quota() -> int:
-    """CU (block) quota for the head-group-major KV transfer kernels.
-
-    Defaults to 2, the same cap as the rest of this family: the cap exists to
-    keep KV transfers from contending with the forward pass, and raising it is
-    a real trade rather than a free win (16 CTAs costs 20-30 points of
-    concurrent-GEMM throughput on decode and mid-size prefill shapes --
-    ANALYSIS_gqa_offset_h2d.md section 2).
-
-    Worth knowing when tuning: these kernels copy one head GROUP per warp, so
-    the contiguous run is ``heads_per_group * head_dim * itemsize`` -- 256 B in
-    the cross-TP GQA case, versus a whole token elsewhere. Bandwidth here
-    tracks total warps rather than run length, so this path is unusually
-    sensitive to the cap: 11.1 GB/s at quota 2 versus 49.8 at quota 16 (section
-    4). Override with SGLANG_HICACHE_BLOCK_QUOTA.
-    """
-    override = os.environ.get("SGLANG_HICACHE_BLOCK_QUOTA")
-    if override is None:
-        return 2
-    try:
-        return int(override)
-    except ValueError:
-        return 2
-
-
 def _default_mla_block_quota() -> int:
     """CU (block) quota for the MLA page_first KV gather kernel.
 
@@ -149,16 +124,10 @@ def transfer_kv_per_layer_pfdhg_lf(
     src_layout_dim: int,
     page_size: int,
     head_num: int,
-    block_quota: Optional[int] = None,
+    block_quota: int = 2,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
-    """Copy head-group-major page staging into a per-layer NHD device buffer.
-
-    The ``lf`` suffix describes the device-side per-layer organization. It does
-    not require the HiCache host pool to use the ``layer_first`` layout.
-    """
-    if block_quota is None:
-        block_quota = _default_pfdhg_block_quota()
+    """Copy head-group-major page staging into a per-layer NHD device buffer."""
     torch.ops.sgl_kernel.transfer_kv_per_layer_pfdhg_lf.default(
         src_k,
         dst_k,
@@ -188,16 +157,10 @@ def transfer_kv_all_layer_lf_pfdhg(
     num_layers: int,
     page_size: int,
     head_num: int,
-    block_quota: Optional[int] = None,
+    block_quota: int = 2,
     num_warps_per_block: int = 16 if _is_hip else 32,
 ):
-    """Write per-layer NHD device rows back into head-group-major page blocks.
-
-    D2H mirror of :func:`transfer_kv_per_layer_pfdhg_lf`. ``head_num`` is the
-    head GROUP count, so that both directions agree on one host byte order.
-    """
-    if block_quota is None:
-        block_quota = _default_pfdhg_block_quota()
+    """Write per-layer NHD device rows back into head-group-major page blocks."""
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pfdhg.default(
         src_k_layers,
         dst_k,

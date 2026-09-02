@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified_layout import KVCacheLayoutAdapter
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -711,10 +712,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.storage_config is not None
             and self.storage_config.unified_layer_ranges is not None
         ):
-            from sglang.srt.mem_cache.pool_host.unified_layout import (
-                KVCacheLayoutAdapter,
-            )
-
             # The adapter owns no buffers: both directions address the host
             # pool, which is already registered above.
             self.layout_adapter = KVCacheLayoutAdapter(
@@ -1035,11 +1032,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        if self.layout_adapter is not None:
+            # Unified layout: the compiled plan already names byte runs of the
+            # host pool, so there is nothing to pack -- both directions address
+            # pool memory directly. Producing (keys, ptrs, sizes) here is what
+            # lets get/set stay on the ordinary v1 path.
+            ptrs, sizes = self.layout_adapter.chunk_metas(host_indices)
+            return self.layout_adapter.chunk_keys(keys), ptrs, sizes
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         if isinstance(self.mha_suffix, list):
-            # Legacy split-heads (rank-suffix tp_lcm_size); unified chunk
-            # fan-out goes through the adapter path instead.
+            # Legacy split-heads (rank-suffix tp_lcm_size).
             return self._get_mha_split_heads_buffer_meta(keys, host_indices)
         return self._get_mha_buffer_meta(keys, host_indices)
 
@@ -1076,82 +1079,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
-    def _batch_set_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Layout-adapter write: put each chunk straight out of host pool memory.
-
-        The chunk pointers address the pool directly, so there is no packing
-        step -- the page block already stores the unified byte order.
-        """
-        start_time = time.perf_counter()
-        adapter = self.layout_adapter
-        ptrs, sizes = adapter.chunk_metas(host_indices)
-        key_strs = adapter.chunk_keys(keys)
-        assert len(key_strs) == len(ptrs)
-
-        exist_result = self._batch_exist(key_strs)
-        put_keys, put_ptrs, put_sizes, put_slots = [], [], [], []
-        set_results = [-1] * len(key_strs)
-        for i, key_str in enumerate(key_strs):
-            if exist_result[i] != 1:
-                put_keys.append(key_str)
-                put_ptrs.append(ptrs[i])
-                put_sizes.append(sizes[i])
-                put_slots.append(i)
-            else:
-                set_results[i] = 0
-        if put_keys:
-            group_ids = (
-                self._expand_group_ids(keys, adapter.keys_per_page)
-                if self._can_use_group_semantics()
-                else None
-            )
-            if group_ids is not None:
-                group_ids = [group_ids[i] for i in put_slots]
-            put_results = self._put_batch_zero_copy_impl(
-                put_keys, put_ptrs, put_sizes, group_ids=group_ids
-            )
-            for slot, res in zip(put_slots, put_results):
-                set_results[slot] = res
-
-        results = self._batch_postprocess(
-            set_results,
-            is_set_operate=True,
-            key_multiplier=adapter.keys_per_page,
-        )
-        if self.enable_storage_metrics:
-            self.backup_pgs.append(len(keys))
-            self.backup_bandwidth.append(
-                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
-            )
-        return results
-
-    def _batch_get_adapter(self, keys: List[str], host_indices) -> List[bool]:
-        """Layout-adapter read: get each chunk straight into host pool memory.
-
-        A direct copy -- the transport writes the pool's own pages, so nothing
-        is staged and nothing is scattered afterwards. Chunks of a page that
-        failed leave that page partially written, which is safe because the
-        caller only inserts pages whose whole leading run succeeded.
-        """
-        start_time = time.perf_counter()
-        adapter = self.layout_adapter
-        ptrs, sizes = adapter.chunk_metas(host_indices)
-        key_strs = adapter.chunk_keys(keys)
-        assert len(key_strs) == len(ptrs)
-
-        get_results = self._get_batch_zero_copy_impl(key_strs, ptrs, sizes)
-        results = self._batch_postprocess(
-            get_results,
-            is_set_operate=False,
-            key_multiplier=adapter.keys_per_page,
-        )
-        if self.enable_storage_metrics:
-            self.prefetch_pgs.append(len(keys))
-            self.prefetch_bandwidth.append(
-                len(keys) / (time.perf_counter() - start_time) * self.gb_per_page
-            )
-        return results
-
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1164,9 +1091,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
-
-        if self.layout_adapter is not None:
-            return self._batch_get_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
@@ -1182,7 +1106,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        # Derive the multiplier from the keys actually produced, as batch_set_v1
+        # does: it is the same value the suffix-shape default computes, and it
+        # keeps the unified adapter (whose fan-out is the compiled plan's, not
+        # the suffix list's) correct by construction rather than by coincidence.
+        return self._batch_postprocess(
+            get_results,
+            is_set_operate=False,
+            key_multiplier=len(key_strs) // len(keys),
+        )
 
     def batch_set_v1(
         self,
@@ -1196,9 +1128,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
-
-        if self.layout_adapter is not None:
-            return self._batch_set_adapter(keys, host_indices)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)

@@ -651,24 +651,30 @@ class MHATokenToKVPoolHost(UnifiedKVLayoutHostMixin, HostKVCache):
     def _unified_page_view(self, index: int):
         """One page's KV as a (2, layer, page_size, head, dim) view.
 
-        ``page_first_direct``'s page block IS the unified byte order, so each
-        component's block is contiguous and an L3 chunk is a single byte range
-        of pool memory -- that is what lets both transfer directions be direct
-        copies. Cutting the kv-head axis keeps that property by storing the
-        block head-group-major (see unified_layout); a chunk is still one
-        range, and the pfdhg kernels absorb the permutation.
+        The view is normalized, not necessarily contiguous: its STRIDES carry
+        the host layout, and the unified layout coalesces them into byte runs.
+        So every layout serves the same L3 object bytes, and only the number of
+        descriptors differs:
 
-        ``page_first`` stores (token, layer, head, dim), where no chunk is
-        contiguous at any page size > 1, so it cannot be served by a direct
-        copy and is rejected here rather than silently staged.
+        * ``page_first_direct`` -- ``(layer, token, head, dim)`` page blocks
+          already ARE the unified order, so a chunk is one range. This is also
+          the layout that can be stored head-group-major for a cut head axis
+          (see unified_layout), keeping it one range.
+        * ``page_first`` -- ``(token, layer, head, dim)``: layer and token are
+          transposed relative to the object order, so a chunk is one run per
+          (layer, token).
+        ``layer_first`` is refused even though a view of it is expressible:
+        see ``ADAPTER_LAYOUTS`` for why, and note it IS reachable here, so
+        this raise is load-bearing rather than defensive.
         """
         if self.layout == "page_first_direct":
             return self.kv_buffer[:, index // self.page_size]
+        if self.layout == "page_first":
+            page = self.kv_buffer[:, index : index + self.page_size]
+            return page.permute(0, 2, 1, 3, 4)
         raise ValueError(
             f"the unified key scheme does not support the {self.layout!r} host "
-            f"layout; use --hicache-mem-layout page_first_direct (its page "
-            f"block is the unified byte order, so L3 objects transfer without "
-            f"a copy)."
+            f"layout; use page_first or page_first_direct."
         )
 
     def get_page_buffer_meta(self, indices):

@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     plan_unified_kv,
 )
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
-from sglang.srt.mem_cache.pool_host.unified_layout import KVCacheLayoutAdapter
+from sglang.srt.mem_cache.pool_host.unified_layout import (
+    KVCacheLayoutAdapter,
+    UnifiedKVLayoutHostMixin,
+    UnifiedKVPageLayout,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,6 +32,22 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def _tobytes(tensor) -> bytes:
     """Raw bytes of ``tensor`` in its own dim order."""
     return tensor.contiguous().flatten().view(torch.uint8).numpy().tobytes()
+
+
+def _chunk_bytes(ptr, size) -> bytes:
+    """One chunk's object bytes, whatever descriptor form the layout emitted.
+
+    A contiguous chunk is a plain ``(int, int)``; a strided one is a
+    ``(list, list)`` -- the transport's scatter/gather form, whose runs are
+    already in unified order, so concatenating them IS the object.
+    """
+    if isinstance(ptr, list):
+        return b"".join(ctypes.string_at(p, n) for p, n in zip(ptr, size))
+    return ctypes.string_at(ptr, size)
+
+
+def _read_chunks(ptrs, sizes) -> list:
+    return [_chunk_bytes(p, s) for p, s in zip(ptrs, sizes)]
 
 
 def _assert_chunk_bytes(case, got, want, label=""):
@@ -435,9 +455,16 @@ class TestDeriveNamespace(CustomTestCase):
 
 
 class TestUnifiedKVPlan(CustomTestCase):
-    """plan_unified_kv: any partition knob selects the adapter, which stores
-    chunks in page_first_direct's page-block order and keeps the host layout
-    in the namespace identity (unified-v2:{layout})."""
+    """plan_unified_kv: any partition config selects the adapter, which names
+    byte-identical objects out of EVERY page-addressable host layout, so the
+    layout drops out of the namespace identity (object_layout "unified-v2")."""
+
+    #: The host layouts the adapter can serve, in ADAPTER_LAYOUTS order.
+    _LAYOUTS = ("page_first", "page_first_direct")
+    #: Layouts that still have no unified page view at all: page_head
+    #: interleaves the head axis above the layer axis inside a page block, and
+    #: the *_kv_split pools are two tensors rather than one.
+    _UNSERVABLE = ("page_head", "page_first_kv_split")
 
     def _plan(self, **overrides):
         kwargs = dict(
@@ -452,43 +479,53 @@ class TestUnifiedKVPlan(CustomTestCase):
             start_layer=0,
             end_layer=61,
             is_final_stage=True,
-            # The only layout the adapter can serve: its page block IS the
-            # unified byte order, so every chunk is one contiguous range.
+            # Any of _LAYOUTS would do: the plan is the same for all of them.
+            # The layout only reaches the pool, where it decides how many byte
+            # runs a chunk takes -- never what the chunk contains.
             pool_layout="page_first_direct",
         )
         kwargs.update(overrides)
         return plan_unified_kv(**kwargs)
 
-    def test_no_knobs_keeps_raw_layout(self):
+    def test_no_configs_keeps_raw_layout(self):
         plan = self._plan()
         self.assertFalse(plan.adapter)
         self.assertEqual(plan.namespace.object_layout, "page_first_direct")
         self.assertEqual(len(plan.suffixes), 1)
         self.assertIsNone(plan.layer_ranges)
         self.assertIsNone(plan.head_ranges)
-        # Without a knob there is no adapter, so no layout requirement: the
+        # Without a config there is no adapter, so no layout requirement: the
         # raw pool bytes are the object and any host layout may write them.
         raw = self._plan(pool_layout="page_first")
         self.assertFalse(raw.adapter)
         self.assertEqual(raw.namespace.object_layout, "page_first")
 
-    def test_any_knob_selects_adapter(self):
-        # head knob alone: adapter, single layer window, head chunks.
-        plan = self._plan(head_group_knob=2)
+    def test_any_config_selects_adapter(self):
+        # head config alone: adapter, single layer window, head chunks.
+        plan = self._plan(head_group_config=2)
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first_direct")
+        # The host layout is NOT in the identity any more: the adapter emits
+        # the same object bytes out of every layout it accepts.
+        self.assertEqual(plan.namespace.object_layout, "unified-v2")
         self.assertEqual(plan.layer_ranges, [(0, 61)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
         self.assertEqual(len(plan.suffixes), 2)
-        # layer knob alone: adapter, the rank's full head span as one chunk.
+        # layer config alone: adapter, the rank's full head span as one chunk.
         plan = self._plan(layer_partition=30)
         self.assertTrue(plan.adapter)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
         self.assertEqual(plan.head_ranges, [(0, 4)])
         self.assertEqual(len(plan.suffixes), 3)
         # both: full cross product, layer-major.
-        plan = self._plan(head_group_knob=2, layer_partition=30)
+        plan = self._plan(head_group_config=2, layer_partition=30)
         self.assertEqual(len(plan.suffixes), 6)
+        # ...and the plan does not depend on which host layout asks for it.
+        for layout in self._LAYOUTS:
+            other = self._plan(
+                head_group_config=2, layer_partition=30, pool_layout=layout
+            )
+            self.assertEqual(other.namespace, plan.namespace, layout)
+            self.assertEqual(other.suffixes, plan.suffixes, layout)
 
     def test_rank_replicated_layer_partition_uses_adapter(self):
         # MLA fleets may still need the adapter: the layer grid must be
@@ -500,11 +537,26 @@ class TestUnifiedKVPlan(CustomTestCase):
             layer_partition=30,
         )
         self.assertTrue(plan.adapter)
-        self.assertEqual(plan.namespace.object_layout, "unified-v2:page_first_direct")
+        self.assertEqual(plan.namespace.object_layout, "unified-v2")
         self.assertIsNone(plan.head_ranges)
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 60), (60, 61)])
+        # "regardless of the host layout" is literal: an MLA deployment on
+        # page_first derives the same namespace and the same chunk names.
+        for layout in self._LAYOUTS:
+            other = self._plan(
+                rank_replicated=True,
+                local_kv_heads=0,
+                pool_layout=layout,
+                layer_partition=30,
+            )
+            self.assertEqual(
+                namespace_digest(other.namespace),
+                namespace_digest(plan.namespace),
+                layout,
+            )
+            self.assertEqual(other.suffixes, plan.suffixes, layout)
         # head_group alone is a no-op for replicated pools (no head axis).
-        plan = self._plan(rank_replicated=True, local_kv_heads=0, head_group_knob=2)
+        plan = self._plan(rank_replicated=True, local_kv_heads=0, head_group_config=2)
         self.assertFalse(plan.adapter)
 
     def test_global_suffixes_map_to_rank_local_ranges(self):
@@ -512,7 +564,7 @@ class TestUnifiedKVPlan(CustomTestCase):
             attn_tp_rank=1,
             start_layer=30,
             end_layer=61,
-            head_group_knob=2,
+            head_group_config=2,
             layer_partition=30,
         )
         digest = namespace_digest(plan.namespace)
@@ -529,59 +581,137 @@ class TestUnifiedKVPlan(CustomTestCase):
         self.assertEqual(plan.layer_ranges, [(0, 30), (30, 31)])
         self.assertEqual(plan.head_ranges, [(0, 2), (2, 4)])
 
-    def test_host_layout_partitions_the_keyspace(self):
-        """page_first and page_first_direct serialize a page differently and we
-        do not reuse objects across them, so the layout stays in the identity
-        even where no adapter is involved."""
+    def test_host_layout_partitions_the_keyspace_without_the_adapter(self):
+        """WITHOUT the adapter the raw pool bytes are the object, so the three
+        layouts serialize a page differently and must not share keys."""
         raw = {
             namespace_digest(self._plan(pool_layout=lay).namespace)
-            for lay in ("page_first", "page_first_direct")
+            for lay in self._LAYOUTS
         }
-        self.assertEqual(len(raw), 2)
+        self.assertEqual(len(raw), len(self._LAYOUTS))
         # ...and adapter chunks never collide with the raw-layout objects an
         # unpartitioned deployment writes for the SAME layout, even when the
-        # knob is a no-op on the grid.
+        # config is a no-op on the grid.
         self.assertNotEqual(
-            namespace_digest(self._plan(head_group_knob=4).namespace),
+            namespace_digest(self._plan(head_group_config=4).namespace),
             namespace_digest(self._plan().namespace),
         )
 
-    def test_adapter_supports_only_page_first_direct(self):
-        """Every chunk is now ONE contiguous byte range of the host pool, in
-        both directions. Only page_first_direct's page block stores that byte
-        order, so every other host layout is rejected outright rather than
-        silently repacked through a staging buffer."""
+    def test_adapter_namespace_is_independent_of_the_host_layout(self):
+        """The feature. Under the adapter every host layout emits BYTE-IDENTICAL
+        objects, so the layout must not enter the namespace: a page_first writer
+        and a page_first_direct reader have to land in one keyspace and derive
+        the very same chunk names. Without the adapter it must still split
+        them, because then the raw layout IS the wire format."""
+        for config in (
+            {"head_group_config": 2},
+            {"layer_partition": 30},
+            {"head_group_config": 2, "layer_partition": 30},
+        ):
+            plans = [self._plan(pool_layout=lay, **config) for lay in self._LAYOUTS]
+            self.assertTrue(all(p.adapter for p in plans), config)
+            self.assertEqual({p.namespace.object_layout for p in plans}, {"unified-v2"})
+            self.assertEqual(
+                len({namespace_digest(p.namespace) for p in plans}), 1, config
+            )
+            self.assertEqual(len({tuple(p.suffixes) for p in plans}), 1, config)
+        # Same call, config removed: three layouts, three keyspaces.
+        self.assertEqual(
+            len(
+                {
+                    namespace_digest(self._plan(pool_layout=lay).namespace)
+                    for lay in self._LAYOUTS
+                }
+            ),
+            len(self._LAYOUTS),
+        )
+
+    def test_a_whole_shard_rank_shares_by_adopting_the_fleet_grid(self):
+        """The reuse question: can a deployment that does not itself need a
+        head cut read what a head-cut one wrote?
+
+        Only by planning at the same grid. An unset head_group defaults to this
+        rank's kv-head count, which is honest -- a TP2 rank's whole-shard
+        object covers heads [0,4) and is NOT the bytes a TP4 rank's [0,2)
+        object holds -- but it keys the namespace to one TP size. Setting the
+        same head_group everywhere is what shares, and a rank that owns several
+        groups simply owns several chunks.
+        """
+        cut = self._plan(head_group_config=1, layer_partition=30)
+        default = self._plan(layer_partition=30)
+        self.assertEqual(default.namespace.head_group, 4)  # == local_kv_heads
+        self.assertNotEqual(
+            namespace_digest(cut.namespace), namespace_digest(default.namespace)
+        )
+
+        # Same rank, same heads, now declaring the fleet grid: one keyspace.
+        adopts = self._plan(head_group_config=1, layer_partition=30)
+        self.assertEqual(
+            namespace_digest(adopts.namespace), namespace_digest(cut.namespace)
+        )
+        self.assertEqual(adopts.suffixes, cut.suffixes)
+
+        # And a narrower rank at a different attn-TP derives the SAME namespace
+        # and owns a strict subset of the chunks -- which is what makes the
+        # cache reusable across the fleet.
+        narrow = self._plan(
+            local_kv_heads=2,
+            attn_tp_size=4,
+            attn_tp_rank=1,
+            head_group_config=1,
+            layer_partition=30,
+        )
+        self.assertEqual(
+            namespace_digest(narrow.namespace), namespace_digest(cut.namespace)
+        )
+        self.assertTrue(set(narrow.suffixes) <= set(cut.suffixes))
+        self.assertLess(len(narrow.suffixes), len(cut.suffixes))
+
+    def test_adapter_supports_every_page_addressable_layout(self):
+        """A chunk is a set of byte RUNS, not one range, so the host layout no
+        longer decides whether an object can be served -- only how many
+        descriptors it takes. Both page-first layouts are accepted; page_head
+        and the split-K/V pools, which have no
+        (component, layer, token, head, dim) page view at all, are not."""
         from sglang.srt.mem_cache.hicache_key_scheme import ADAPTER_LAYOUTS
 
-        self.assertEqual(ADAPTER_LAYOUTS, ("page_first_direct",))
-        # page_first used to be a supported adapter layout (staged); it is not.
-        for knob in ({"layer_partition": 30}, {"head_group_knob": 2}):
-            with self.assertRaisesRegex(ValueError, "page_first_direct") as ctx:
-                self._plan(pool_layout="page_first", **knob)
-            self.assertIn("does not support", str(ctx.exception))
+        self.assertEqual(ADAPTER_LAYOUTS, self._LAYOUTS)
+        for layout in ADAPTER_LAYOUTS:
+            for config in ({"layer_partition": 30}, {"head_group_config": 2}):
+                plan = self._plan(pool_layout=layout, **config)
+                self.assertTrue(plan.adapter, (layout, config))
+                self.assertEqual(plan.namespace.object_layout, "unified-v2")
+        for layout in self._UNSERVABLE:
+            with self.assertRaisesRegex(ValueError, "does not support") as ctx:
+                self._plan(pool_layout=layout, head_group_config=2)
+            self.assertIn(layout, str(ctx.exception))
 
     def test_plan_validation(self):
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            self._plan(pool_layout="page_first_kv_split", layer_partition=30)
-        for unsupported in ("layer_first", "page_head", "page_first"):
+        for unsupported in self._UNSERVABLE:
             with self.assertRaisesRegex(ValueError, "does not support"):
                 self._plan(pool_layout=unsupported, layer_partition=30)
+        for supported in self._LAYOUTS:
+            self.assertTrue(
+                self._plan(pool_layout=supported, layer_partition=30).adapter
+            )
         with self.assertRaisesRegex(ValueError, "divide"):
-            self._plan(head_group_knob=3)
+            self._plan(head_group_config=3)
         with self.assertRaisesRegex(ValueError, "positive"):
-            self._plan(head_group_knob=0)
+            self._plan(head_group_config=0)
         with self.assertRaisesRegex(NotImplementedError, "1 kv head"):
             self._plan(local_kv_heads=1, attn_tp_size=8)
         # An explicit head_group attests the sharding and lifts the 1-head
         # ambiguity.
-        plan = self._plan(local_kv_heads=1, attn_tp_size=8, head_group_knob=1)
+        plan = self._plan(local_kv_heads=1, attn_tp_size=8, head_group_config=1)
         self.assertEqual(plan.head_ranges, [(0, 1)])
 
 
 class TestControllerGuards(CustomTestCase):
     """Attach-time guards of HiCacheController._build_unified_suffix."""
 
-    class _StubHostPool:
+    class _StubHostPool(UnifiedKVLayoutHostMixin):
+        """Real mixin, so set_unified_head_groups() is the production one."""
+
         def __init__(self, layout: str = "page_first_direct"):
             self.layout = layout
             self.head_num = 4
@@ -624,18 +754,92 @@ class TestControllerGuards(CustomTestCase):
         controller.pp_rank, controller.pp_size = 0, 1
         return controller
 
-    def _build(self, controller, **overrides):
+    def _build_full(self, controller, **overrides):
         from sglang.srt.managers.cache_controller import HiCacheController
 
         kwargs = dict(
             model_name="m",
             is_rank_replicated=True,
             attn_cp_size=1,
-            head_group_knob=None,
+            head_group_config=None,
             layer_partition=None,
         )
         kwargs.update(overrides)
         return HiCacheController._build_unified_suffix(controller, **kwargs)
+
+    def _build(self, controller, **overrides):
+        """(suffix, layer_ranges, head_ranges); use _build_full for permute."""
+        return self._build_full(controller, **overrides)[:3]
+
+    def _generate_config(self, pool, key_scheme="rank-suffix", extra=None):
+        """Drive _generate_storage_config with the runtime context stubbed.
+
+        The head-group reset lives here rather than in _build_unified_suffix,
+        and reaching it needs the process-global parallel/memory context, which
+        is why it went untested and shipped with a mis-scoped import.
+        """
+        from unittest import mock
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = pool
+        controller.storage_host_pool = pool
+        controller.mem_pool_device = self._StubDevicePool()
+        controller.storage_backend_type = "mooncake"
+        controller.io_backend = "kernel"
+        controller.page_size = 64
+        controller.enable_storage_metrics = False
+        controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+
+        parallel = mock.Mock(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+        memory = mock.Mock(hicache_storage_key_scheme=key_scheme)
+        mod = "sglang.srt.managers.cache_controller"
+        with mock.patch(
+            f"{mod}.is_dp_attention_enabled", return_value=False
+        ), mock.patch(f"{mod}.get_parallel", return_value=parallel), mock.patch(
+            f"{mod}.get_memory", return_value=memory
+        ):
+            return HiCacheController._generate_storage_config(
+                controller, model_name="m", storage_backend_extra_config=extra or {}
+            )
+
+    def test_head_group_order_is_reset_for_a_backend_that_declares_none(self):
+        """Detach/re-attach must not leave a permuted pool behind.
+
+        unified_head_groups survives a detach (correctly -- the pages are still
+        permuted). Attaching a backend that declares no head-group order, such
+        as rank-suffix, must therefore reset it, or the transfer kernels would
+        read head-group-major pages as natural.
+        """
+        pool = self._StubHostPool()
+        pool.unified_head_groups = 2
+        pool.slot_used = torch.zeros(8, dtype=torch.bool)
+
+        self._generate_config(pool)
+
+        self.assertEqual(pool.unified_head_groups, 1)
+
+    def test_head_group_reset_refuses_while_pages_are_resident(self):
+        """The reset must be loud, not silent, if the pool is not empty."""
+        pool = self._StubHostPool()
+        pool.unified_head_groups = 2
+        pool.slot_used = torch.zeros(8, dtype=torch.bool)
+        pool.slot_used[3] = True
+
+        with self.assertRaisesRegex(RuntimeError, "resident"):
+            self._generate_config(pool)
+        # and it must not have half-applied the change
+        self.assertEqual(pool.unified_head_groups, 2)
+
+    def test_unpermuted_pool_needs_no_reset(self):
+        """The common path: a pool already in natural order is untouched."""
+        pool = self._StubHostPool()
+        pool.slot_used = torch.ones(8, dtype=torch.bool)  # resident, but HG == 1
+
+        self._generate_config(pool)
+
+        self.assertEqual(pool.unified_head_groups, 1)
 
     def test_backend_allowlist_guard(self):
         from sglang.srt.managers.cache_controller import HiCacheController
@@ -658,7 +862,7 @@ class TestControllerGuards(CustomTestCase):
             hybrid.storage_host_pool, self._StubHostPool()
         )
         with self.assertRaisesRegex(NotImplementedError, "multi-component"):
-            self._build(hybrid, is_rank_replicated=False, head_group_knob=2)
+            self._build(hybrid, is_rank_replicated=False, head_group_config=2)
 
     def test_kv_only_hybrid_stack_is_allowed(self):
         """A dense model on UnifiedRadixCache is a hybrid controller whose pool
@@ -672,20 +876,38 @@ class TestControllerGuards(CustomTestCase):
         hybrid = self._stub_controller(FakeHybridController, "mooncake")
         hybrid.mem_pool_host = self._StubPoolGroup(hybrid.storage_host_pool)
         suffix, layer_ranges, head_ranges = self._build(
-            hybrid, is_rank_replicated=False, head_group_knob=2
+            hybrid, is_rank_replicated=False, head_group_config=2
         )
         self.assertEqual(len(suffix), 2)
         self.assertEqual(layer_ranges, [(0, 61)])
         self.assertEqual(head_ranges, [(0, 2), (2, 4)])
 
-    def test_partition_knobs_require_mooncake(self):
+    def test_partition_configs_require_mooncake(self):
         from sglang.srt.managers.cache_controller import HiCacheController
 
         file_stub = self._stub_controller(HiCacheController, "file")
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
-            self._build(file_stub, is_rank_replicated=False, head_group_knob=2)
+            self._build(file_stub, is_rank_replicated=False, head_group_config=2)
         with self.assertRaisesRegex(NotImplementedError, "multi-key"):
             self._build(file_stub, layer_partition=30)
+
+    def test_head_group_on_a_replicated_pool_does_not_require_mooncake(self):
+        """head_group is ignored on MLA-family pools -- they have no kv-head
+        axis -- so it must not be rejected for them here. The arg hook applies
+        the same carve-out, so rejecting it would kill a shared fleet
+        extra-config at attach that passed startup. layer_partition IS a real
+        fan-out for MLA and stays rejected.
+        """
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        file_stub = self._stub_controller(HiCacheController, "file")
+        suffix, layer_ranges, head_ranges = self._build(
+            file_stub, is_rank_replicated=True, head_group_config=2
+        )
+        self.assertIsInstance(suffix, str)
+        self.assertIsNone(head_ranges)
+        with self.assertRaisesRegex(NotImplementedError, "multi-key"):
+            self._build(file_stub, is_rank_replicated=True, layer_partition=30)
 
     def test_adapter_plan_on_page_first_direct(self):
         # head_group on a page_first_direct pool attaches through the adapter
@@ -694,39 +916,85 @@ class TestControllerGuards(CustomTestCase):
 
         stub = self._stub_controller(HiCacheController, "mooncake")
         suffix, layer_ranges, head_ranges = self._build(
-            stub, is_rank_replicated=False, head_group_knob=2
+            stub, is_rank_replicated=False, head_group_config=2
         )
         self.assertIsInstance(suffix, list)
         self.assertEqual(len(suffix), 2)
         self.assertEqual(layer_ranges, [(0, 61)])
         self.assertEqual(head_ranges, [(0, 2), (2, 4)])
 
-    def test_adapter_rejects_unsupported_layout_at_attach(self):
+    def test_adapter_attaches_on_every_page_addressable_layout(self):
+        """Attach no longer steers on the host layout: both page-first layouts
+        attach, and — the point — they attach to the SAME chunk names, so a
+        page_first deployment reads what a page_first_direct one wrote.
+        page_head and split-K/V pools, which have no unified page view at all,
+        are still refused."""
         from sglang.srt.managers.cache_controller import HiCacheController
 
-        # page_first is no longer an adapter layout: nothing stages any more,
-        # so a layout whose page block is not the unified order cannot serve
-        # an L3 chunk at all.
-        for layout in ("page_first", "page_first_kv_split", "layer_first"):
+        names = set()
+        for layout in ("page_first", "page_first_direct"):
+            stub = self._stub_controller(HiCacheController, "mooncake", layout=layout)
+            suffix, layer_ranges, head_ranges = self._build(
+                stub,
+                is_rank_replicated=False,
+                head_group_config=2,
+                layer_partition=30,
+            )
+            # 3 layer windows ([0,30), [30,60), the short [60,61)) x 2 groups.
+            self.assertEqual(layer_ranges, [(0, 30), (30, 60), (60, 61)], layout)
+            self.assertEqual(head_ranges, [(0, 2), (2, 4)], layout)
+            self.assertEqual(len(suffix), 6, layout)
+            names.add(tuple(suffix))
+        self.assertEqual(len(names), 1)
+
+        for layout in ("page_head", "page_first_kv_split"):
             stub = self._stub_controller(HiCacheController, "mooncake", layout=layout)
             with self.assertRaisesRegex(ValueError, "does not support"):
                 self._build(
                     stub,
                     is_rank_replicated=False,
-                    head_group_knob=2,
+                    head_group_config=2,
                     layer_partition=30,
                 )
 
-    def test_head_cut_requires_the_kernel_io_backend(self):
-        """A head cut makes the pool's page blocks head-group-major, which only
-        the pfdhg kernels can read. The copy-engine 'direct' backend moves a
-        page block verbatim and would transfer permuted bytes as if natural."""
+    def test_head_cut_permutes_only_on_page_first_direct_with_the_kernel_backend(
+        self,
+    ):
+        """A head cut makes a *page_first_direct* pool's page blocks
+        head-group-major, which only the pfdhg kernels can read; the
+        copy-engine 'direct' backend moves a page block verbatim. So the
+        permutation is taken only when both hold -- otherwise the pool keeps
+        its natural order and the same chunk is served as several runs. The
+        other layouts keep their own page order either way."""
         from sglang.srt.managers.cache_controller import HiCacheController
 
-        stub = self._stub_controller(HiCacheController, "mooncake")
-        stub.io_backend = "direct"
-        with self.assertRaisesRegex(NotImplementedError, "head-group-major"):
-            self._build(stub, is_rank_replicated=False, head_group_knob=2)
+        # page_first_direct + kernel: permuted, one descriptor per chunk.
+        kernel_stub = self._stub_controller(HiCacheController, "mooncake")
+        kernel_stub.io_backend = "kernel"
+        self.assertTrue(
+            self._build_full(
+                kernel_stub, is_rank_replicated=False, head_group_config=2
+            )[3]
+        )
+        # Same grid on the copy engine: allowed now, but NOT permuted.
+        direct_stub = self._stub_controller(HiCacheController, "mooncake")
+        direct_stub.io_backend = "direct"
+        suffix, _, head_ranges, permute = self._build_full(
+            direct_stub, is_rank_replicated=False, head_group_config=2
+        )
+        self.assertFalse(permute)
+        self.assertEqual(head_ranges, [(0, 2), (2, 4)])
+        self.assertEqual(len(suffix), 2)
+        # Same head cut, same io backend, a layout that is not permuted: fine.
+        other = self._stub_controller(
+            HiCacheController, "mooncake", layout="page_first"
+        )
+        other.io_backend = "direct"
+        suffix, _, head_ranges = self._build(
+            other, is_rank_replicated=False, head_group_config=2
+        )
+        self.assertEqual(head_ranges, [(0, 2), (2, 4)])
+        self.assertEqual(len(suffix), 2)
         # A grid that does NOT cut heads keeps the natural order, so any io
         # backend can read it.
         layer_only = self._stub_controller(HiCacheController, "mooncake")
@@ -743,7 +1011,7 @@ class TestControllerGuards(CustomTestCase):
         stub = self._stub_controller(HiCacheController, "mooncake")
         stub.storage_host_pool.kv_buffer = (1, 2)
         with self.assertRaisesRegex(NotImplementedError, "split K/V"):
-            self._build(stub, is_rank_replicated=False, head_group_knob=2)
+            self._build(stub, is_rank_replicated=False, head_group_config=2)
 
     def test_adapter_rejects_mtp_draft_pools(self):
         """Draft layers extend the host pool's layer axis but are not named by
@@ -754,8 +1022,8 @@ class TestControllerGuards(CustomTestCase):
         stub = self._stub_controller(HiCacheController, "mooncake")
         stub.storage_host_pool.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(NotImplementedError, "MTP draft"):
-            self._build(stub, is_rank_replicated=False, head_group_knob=2)
-        # ...and only under the adapter: knob-free plans are untouched (one
+            self._build(stub, is_rank_replicated=False, head_group_config=2)
+        # ...and only under the adapter: config-free plans are untouched (one
         # suffix string, no chunk grid), so MTP still works without the grid.
         stub2 = self._stub_controller(HiCacheController, "mooncake")
         stub2.storage_host_pool.mtp_draft_device_pools = (object(),)
@@ -768,7 +1036,7 @@ class TestControllerGuards(CustomTestCase):
 
         stub = self._stub_controller(HiCacheController, "mooncake")
         with self.assertRaisesRegex(ValueError, "positive"):
-            self._build(stub, is_rank_replicated=False, head_group_knob=0)
+            self._build(stub, is_rank_replicated=False, head_group_config=0)
 
 
 class TestFileBackendSuffix(CustomTestCase):
@@ -960,11 +1228,12 @@ class TestLayerPartition(CustomTestCase):
 
 
 class TestMlaLayoutAdapter(CustomTestCase):
-    """MLA unified chunks. ``page_first_direct``'s page block IS the unified
-    MLA order (layer, token, dim), so every chunk is ONE contiguous byte range
-    of host pool memory: a get lands straight in the pool and a put reads
-    straight out of it. Nothing is staged, and no other host layout can serve
-    a chunk at all."""
+    """MLA unified chunks. The unified MLA order is (layer, token, dim), which
+    IS ``page_first_direct``'s page block, so there every chunk is ONE
+    contiguous byte range of host pool memory: a get lands straight in the pool
+    and a put reads straight out of it. The other layouts store the same bytes
+    in another order, so their chunks are several byte runs of pool memory —
+    still no staging, just more descriptors."""
 
     _PS, _LAYERS, _DIM, _PAGES = 4, 6, 8, 3
 
@@ -987,13 +1256,7 @@ class TestMlaLayoutAdapter(CustomTestCase):
         pool.dtype = torch.bfloat16
         pool.size = self._PAGES * self._PS
         pool.slot_used = torch.zeros(pool.size, dtype=torch.bool)
-        if layout == "layer_first":
-            pool.kv_buffer = torch.zeros(
-                self._LAYERS, pool.size, 1, self._DIM, dtype=pool.dtype
-            )
-            for p, L in enumerate(logical):
-                pool.kv_buffer[:, p * self._PS : (p + 1) * self._PS] = L
-        elif layout == "page_first":
+        if layout == "page_first":
             pool.kv_buffer = torch.zeros(
                 pool.size, self._LAYERS, 1, self._DIM, dtype=pool.dtype
             )
@@ -1069,14 +1332,43 @@ class TestMlaLayoutAdapter(CustomTestCase):
             else:
                 self.assertTrue(torch.equal(got, L))
 
-    def test_non_direct_layouts_are_rejected(self):
-        """page_first stores (token, layer, dim): no chunk of it is contiguous
-        at page_size > 1. Nothing stages any more, so it is rejected instead."""
-        for layout in ("page_first", "layer_first"):
-            pool = self._pool(layout, self._logical())
-            with self.assertRaisesRegex(ValueError, "page_first_direct") as ctx:
-                pool.get_unified_chunk_meta(torch.arange(self._PS), self._RANGES, None)
-            self.assertIn(layout, str(ctx.exception))
+    def test_every_layout_names_the_same_chunk_bytes(self):
+        """The central invariant, for MLA: the object bytes are
+        (layer, token, dim) whatever the host layout stores, so all three name
+        byte-identical chunks and only the DESCRIPTOR COUNT differs.
+
+        ``page_first`` stores (token, layer, dim) -- layer and token are
+        transposed relative to the object order -- so a chunk is one run per
+        (layer, token), where ``page_first_direct``'s page block already IS the
+        object order and needs exactly one.
+        """
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        want = [_tobytes(L[l0:l1]) for L in logical for l0, l1 in self._RANGES]
+        for layout, runs_per_chunk in (
+            ("page_first_direct", [1, 1]),
+            ("page_first", [2 * self._PS, 4 * self._PS]),
+        ):
+            pool = self._pool(layout, logical)
+            plan = pool.build_unified_layout(self._RANGES, None)
+            self.assertFalse(plan.permuted, layout)
+            self.assertEqual([len(s.runs) for s in plan.slabs], runs_per_chunk, layout)
+            ptrs, sizes = pool.get_unified_chunk_meta(indices, self._RANGES, None)
+            # A contiguous chunk is a plain (int, int); a strided one is the
+            # transport's scatter/gather (list, list).
+            strided = layout != "page_first_direct"
+            self.assertTrue(all(isinstance(p, list) is strided for p in ptrs), layout)
+            self.assertTrue(all(isinstance(s, list) is strided for s in sizes), layout)
+            _assert_chunk_bytes(self, _read_chunks(ptrs, sizes), want, layout)
+
+    def test_layouts_that_have_no_unified_page_view_are_rejected(self):
+        """What is still refused: a layout whose page block is not a
+        (component, layer, token, head, dim) rectangle at all."""
+        pool = self._pool("page_first_direct", self._logical())
+        pool.layout = "page_first_kv_split"
+        with self.assertRaisesRegex(ValueError, "does not support") as ctx:
+            pool.get_unified_chunk_meta(torch.arange(self._PS), self._RANGES, None)
+        self.assertIn("page_first_kv_split", str(ctx.exception))
 
     def test_grid_must_tile_every_layer_of_the_pool(self):
         """A grid that names only part of the pool's layer axis (an MTP draft
@@ -1161,7 +1453,7 @@ class TestMhaDirectChunks(CustomTestCase):
         itemsize = pool.dtype.itemsize
         row = pool.page_size * pool.head_num * pool.head_dim * itemsize  # per layer
         self.assertEqual(
-            [(s.component, s.byte_offset, s.nbytes) for s in layout.slabs],
+            [(s.component, s.runs[0][0], s.nbytes) for s in layout.slabs],
             [
                 ("k", 0, 2 * row),
                 ("v", 0, 2 * row),
@@ -1186,7 +1478,7 @@ class TestMhaDirectChunks(CustomTestCase):
         group_stride = pool.layer_num * layer_stride  # 384 B
         self.assertEqual((layer_stride, group_stride), (64, 384))
         self.assertEqual(
-            [(s.component, s.byte_offset, s.nbytes) for s in layout.slabs],
+            [(s.component, s.runs[0][0], s.nbytes) for s in layout.slabs],
             [
                 # layer window [0,2)
                 ("k", 0, 2 * layer_stride),
@@ -1210,14 +1502,59 @@ class TestMhaDirectChunks(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "split K/V"):
             pool.get_unified_chunk_meta(torch.tensor([0, 1, 2, 3]), [(0, 6)], [(0, 2)])
 
-    def test_rejects_page_first(self):
-        pool = self._pool(head_num=2)
-        pool.layout = "page_first"
-        pool.kv_buffer = torch.zeros(
-            2, pool.size, pool.layer_num, pool.head_num, pool.head_dim, dtype=pool.dtype
+    def test_page_first_names_the_same_bytes_as_page_first_direct(self):
+        """``page_first`` stores (token, layer, head, dim): layer and token are
+        transposed relative to the object order, so a chunk is one run per
+        (layer, token) instead of one range. The BYTES are identical to
+        page_first_direct's -- that is exactly what lets the two layouts share
+        a keyspace, and it is checked here against the same source tensor."""
+        ranges, heads = [(0, 2), (2, 6)], [(0, 2)]
+        direct = self._pool(head_num=2)
+        page_num = direct.size // direct.page_size
+        torch.manual_seed(0)
+        # (kv, page, layer, token, head, dim) -- the natural page-block order,
+        # which is page_first_direct's buffer as-is.
+        logical = torch.randn(
+            2,
+            page_num,
+            direct.layer_num,
+            direct.page_size,
+            direct.head_num,
+            direct.head_dim,
+            dtype=direct.dtype,
         )
-        with self.assertRaisesRegex(ValueError, "page_first_direct"):
-            pool.get_unified_chunk_meta(torch.tensor([0, 1, 2, 3]), [(0, 6)], [(0, 2)])
+        direct.kv_buffer.copy_(logical)
+
+        page_first = self._pool(head_num=2)
+        page_first.layout = "page_first"
+        page_first.kv_buffer = (
+            logical.permute(0, 1, 3, 2, 4, 5)  # (kv, page, token, layer, head, dim)
+            .contiguous()
+            .view(2, direct.size, direct.layer_num, direct.head_num, direct.head_dim)
+        )
+
+        indices = torch.arange(direct.size)
+        direct_ptrs, direct_sizes = direct.get_unified_chunk_meta(
+            indices, ranges, heads
+        )
+        pf_ptrs, pf_sizes = page_first.get_unified_chunk_meta(indices, ranges, heads)
+        # One range each on page_first_direct; one run per (layer, token) on
+        # page_first, emitted as the transport's scatter/gather lists.
+        self.assertTrue(all(isinstance(p, int) for p in direct_ptrs))
+        self.assertTrue(all(isinstance(p, list) for p in pf_ptrs))
+        self.assertEqual(
+            [len(s.runs) for s in page_first.build_unified_layout(ranges, heads).slabs],
+            [2 * direct.page_size, 2 * direct.page_size]
+            + [4 * direct.page_size, 4 * direct.page_size],
+        )
+        # Same chunk sizes, same chunk bytes.
+        self.assertEqual([sum(s) for s in pf_sizes], direct_sizes)
+        _assert_chunk_bytes(
+            self,
+            _read_chunks(pf_ptrs, pf_sizes),
+            _read_chunks(direct_ptrs, direct_sizes),
+            "page_first vs page_first_direct",
+        )
 
     def test_head_ranges_must_tile_the_pools_heads(self):
         pool = self._pool(head_num=4)
@@ -1225,6 +1562,27 @@ class TestMhaDirectChunks(CustomTestCase):
             pool.build_unified_layout([(0, 6)], [(0, 2)])
         with self.assertRaisesRegex(ValueError, "uniform"):
             pool.build_unified_layout([(0, 6)], [(0, 1), (1, 4)])
+        # An empty grid is a diagnosed refusal, not an IndexError.
+        with self.assertRaises(ValueError):
+            pool.build_unified_layout([(0, 6)], [])
+
+    def test_layer_ranges_must_tile_the_pools_layers(self):
+        """Total width is not enough: an overlap that double-covers one layer
+        while leaving another unnamed sums to the right number, and would
+        transfer the unnamed layer's bytes under a name that means something
+        else.
+        """
+        pool = self._pool(head_num=4)
+        for ranges, why in (
+            ([(0, 2)], "short"),
+            ([(0, 2), (2, 8)], "long"),
+            ([(0, 4), (2, 4)], "overlap that still sums to 6"),
+            ([(0, 2), (3, 6)], "gap"),
+            ([(2, 6), (0, 2)], "out of order"),
+        ):
+            with self.assertRaisesRegex(ValueError, "tile", msg=why):
+                pool.build_unified_layout(ranges, [(0, 4)])
+        pool.build_unified_layout([(0, 2), (2, 6)], [(0, 4)])  # the valid tiling
 
 
 class TestUnifiedChunkBytes(CustomTestCase):
@@ -1256,9 +1614,14 @@ class TestUnifiedChunkBytes(CustomTestCase):
         ]
 
     def _pool(self, logical, head_groups=1, layout="page_first_direct"):
-        """A page_first_direct pool whose page blocks are stored
-        head-group-major for ``head_groups`` groups (== the natural order when
-        that is 1). This models what the pfdhg transfer kernels write."""
+        """A host pool of ``layout`` holding ``logical``'s content.
+
+        A ``page_first_direct`` pool stores its page blocks head-group-major
+        for ``head_groups`` groups (== the natural order when that is 1), which
+        models what the pfdhg transfer kernels write. The other layouts have no
+        permuted form -- they store their own order and serve a chunk as
+        several runs -- so ``head_groups`` must be 1 for them.
+        """
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
         pages, heads = len(logical), logical[0].shape[3]
@@ -1271,10 +1634,17 @@ class TestUnifiedChunkBytes(CustomTestCase):
         pool.dtype = torch.bfloat16
         pool.size = pages * self._PS
         pool.slot_used = torch.zeros(pool.size, dtype=torch.bool)
+        if layout != "page_first_direct":
+            assert head_groups == 1, f"{layout} page blocks are never permuted"
         if layout == "page_first":
+            # (kv, token, layer, head, dim)
             pool.kv_buffer = torch.zeros(
                 2, pool.size, self._LAYERS, heads, self._DIM, dtype=pool.dtype
             )
+            for p, page in enumerate(logical):
+                pool.kv_buffer[:, p * self._PS : (p + 1) * self._PS] = page.permute(
+                    0, 2, 1, 3, 4
+                )
             return pool
         pool.kv_buffer = torch.zeros(
             2, pages, self._LAYERS, self._PS, heads, self._DIM, dtype=pool.dtype
@@ -1413,12 +1783,74 @@ class TestUnifiedChunkBytes(CustomTestCase):
             "TP2 H1 vs TP4 whole shard",
         )
 
-    def test_page_first_pools_are_rejected(self):
-        pool = self._pool(self._logical(), layout="page_first")
-        with self.assertRaisesRegex(ValueError, "page_first_direct"):
-            pool.get_unified_chunk_meta(
-                torch.arange(self._PS), [(0, 6)], [(0, 2), (2, 4)]
+    #: Host layouts the adapter accepts, and how many byte runs each takes per
+    #: chunk as a function of the grid. ``P`` is the page size, ``dl`` the
+    #: chunk's layer count, ``cut`` whether the grid cuts the kv-head axis.
+    _LAYOUT_RUNS = {
+        # page blocks ARE the object order (head-group-major under a cut)
+        "page_first_direct": lambda dl, P, cut: 1,
+        # (token, layer, head, dim): layer/token transposed -> one run each
+        "page_first": lambda dl, P, cut: dl * P,
+    }
+
+    def test_every_layout_names_the_same_chunk_bytes(self):
+        """THE invariant the shared keyspace rests on: for one logical KV,
+        both host layouts name byte-identical L3 objects, on every grid. Only
+        the descriptor count differs.
+
+        The reference is plain indexing of the natural
+        ``(kv, layer, token, head, dim)`` page tensor -- the run formula is
+        never re-derived from the implementation.
+        """
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        for label, layer_ranges, head_ranges in self._GRIDS:
+            want = self._reference(logical, layer_ranges, head_ranges)
+            cut = len(head_ranges) > 1
+            for layout, runs_of in self._LAYOUT_RUNS.items():
+                groups = len(head_ranges) if layout == "page_first_direct" else 1
+                pool = self._pool(logical, head_groups=groups, layout=layout)
+                plan = pool.build_unified_layout(layer_ranges, head_ranges)
+                where = f"{label}/{layout}"
+                self.assertEqual(
+                    [len(s.runs) for s in plan.slabs],
+                    [
+                        runs_of(l1 - l0, self._PS, cut)
+                        for l0, l1 in layer_ranges
+                        for _ in head_ranges
+                        for _ in range(2)
+                    ],
+                    where,
+                )
+                ptrs, sizes = pool.get_unified_chunk_meta(
+                    indices, layer_ranges, head_ranges
+                )
+                _assert_chunk_bytes(self, _read_chunks(ptrs, sizes), want, where)
+                # ...and the chunks still tile the pool exactly.
+                self.assertEqual(
+                    sum(sum(s) if isinstance(s, list) else s for s in sizes),
+                    pool.kv_buffer.numel() * pool.dtype.itemsize,
+                    where,
+                )
+
+    def test_page_first_direct_without_a_head_cut_stays_one_descriptor(self):
+        """The fast path must not regress into scatter/gather. Without a head
+        cut a page_first_direct chunk is ONE run and chunk_metas emits a plain
+        int pointer, which is what keeps it off the transport's multi-buffer
+        path; with a cut the head-group-major block keeps it at one run too."""
+        logical = self._logical()
+        indices = torch.arange(self._PAGES * self._PS)
+        for label, layer_ranges, head_ranges in self._GRIDS:
+            pool = self._pool(logical, head_groups=len(head_ranges))
+            plan = pool.build_unified_layout(layer_ranges, head_ranges)
+            self.assertEqual(plan.permuted, len(head_ranges) > 1, label)
+            self.assertEqual(plan.descriptors_per_page, len(plan.slabs), label)
+            self.assertTrue(all(s.contiguous for s in plan.slabs), label)
+            ptrs, sizes = pool.get_unified_chunk_meta(
+                indices, layer_ranges, head_ranges
             )
+            self.assertTrue(all(isinstance(p, int) for p in ptrs), label)
+            self.assertTrue(all(isinstance(s, int) for s in sizes), label)
 
 
 class TestLayoutAdapterChunks(CustomTestCase):
@@ -1426,7 +1858,7 @@ class TestLayoutAdapterChunks(CustomTestCase):
     the pointer round trip a backend performs — no store involved. The adapter
     owns no buffers: both directions address the host pool."""
 
-    def _config(self, suffixes, layer_ranges, head_ranges, extra=None):
+    def _config(self, suffixes, layer_ranges, head_ranges, extra=None, permute=True):
         return HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
@@ -1442,6 +1874,7 @@ class TestLayoutAdapterChunks(CustomTestCase):
             unified_suffix=suffixes,
             unified_layer_ranges=layer_ranges,
             unified_head_ranges=head_ranges,
+            unified_permute_head_groups=permute,
         )
 
     def test_mla_adapter_owns_no_buffers(self):
@@ -1449,13 +1882,10 @@ class TestLayoutAdapterChunks(CustomTestCase):
         # adapter allocates nothing and registers nothing.
         mla = TestMlaLayoutAdapter()
         pool = mla._pool("page_first_direct", mla._logical())
-        registered = []
         adapter = KVCacheLayoutAdapter(
             pool,
             self._config(["ns_L0-2", "ns_L2-6"], [(0, 2), (2, 6)], None),
-            register_buffer=registered.append,
         )
-        self.assertEqual(registered, [])
         for gone in (
             "staging_set",
             "staging_get",
@@ -1512,7 +1942,7 @@ class TestLayoutAdapterChunks(CustomTestCase):
         layer_stride = gs._PS * 2 * gs._DIM * itemsize
         group_stride = gs._LAYERS * layer_stride
         self.assertEqual(
-            [(s.component, s.byte_offset, s.nbytes) for s in writer.layout.slabs],
+            [(s.component, s.runs[0][0], s.nbytes) for s in writer.layout.slabs],
             [
                 ("k", 0, 2 * layer_stride),
                 ("v", 0, 2 * layer_stride),
@@ -1577,6 +2007,83 @@ class TestLayoutAdapterChunks(CustomTestCase):
         pool = mla._pool("page_first_direct", mla._logical())
         with self.assertRaisesRegex(ValueError, "chunk suffixes"):
             KVCacheLayoutAdapter(pool, self._config("ns_L0-6", None, None))
+
+
+class TestDescriptorFormIsUniform(CustomTestCase):
+    """A batch's descriptors must all be the same shape.
+
+    ``MooncakeStore._uses_multi_buffer`` reads ``buffer_ptrs[0]`` and applies
+    that verdict to the whole batch, so a plan that emitted a plain ``int`` for
+    single-run chunks and a ``list`` for multi-run ones would hand bare
+    integers to ``batch_put_from_multi_buffers``. ``plan_unified_kv`` builds
+    layer ranges as ``(a, min(a + lg, end))``, so a grid whose partition does
+    not divide the layer count leaves a SHORT tail range -- and on the layouts
+    whose run count tracks the range width, that tail is the one chunk that
+    collapses to a single run.
+    """
+
+    _HEADS, _DIM, _TOKENS = 4, 8, 64
+
+    def _layout(self, *, layers, layer_partition, page_size):
+        """A ``page_first`` plan: (kv, token, layer, head, dim)."""
+        buffer = torch.zeros(
+            2, self._TOKENS, layers, self._HEADS, self._DIM, dtype=torch.bfloat16
+        )
+
+        def page_view(index):
+            page = buffer[:, index : index + page_size]
+            return page.permute(0, 2, 1, 3, 4)
+
+        ranges = [
+            (a, min(a + layer_partition, layers))
+            for a in range(0, layers, layer_partition)
+        ]
+        return ranges, UnifiedKVPageLayout(
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            page_view=page_view,
+            sample=page_view(0),
+            components=("k", "v"),
+            layer_ranges=ranges,
+            head_ranges=((0, self._HEADS),),
+            permuted=False,
+        )
+
+    def test_a_ragged_layer_partition_does_not_mix_pointer_forms(self):
+        # 5 layers by 2 leaves a width-1 tail; at page_size 1 that tail chunk
+        # is one run while its siblings are two, which is exactly the mix.
+        ranges, layout = self._layout(layers=5, layer_partition=2, page_size=1)
+        self.assertEqual(ranges, [(0, 2), (2, 4), (4, 5)])
+        self.assertEqual([len(slab.runs) for slab in layout.slabs], [2, 2, 2, 2, 1, 1])
+        self.assertFalse(layout.contiguous_chunks)
+
+        ptrs, sizes = layout.chunk_metas(torch.arange(1))
+        self.assertTrue(
+            all(isinstance(p, list) for p in ptrs),
+            f"mixed pointer forms: {[type(p).__name__ for p in ptrs]}",
+        )
+        self.assertTrue(all(isinstance(n, list) for n in sizes))
+        # The single-run chunk is a one-element list, not a bare int.
+        self.assertEqual([len(p) for p in ptrs], [2, 2, 2, 2, 1, 1])
+
+    def test_an_all_contiguous_plan_still_uses_plain_pointers(self):
+        # page_first_direct with no head cut: every chunk is one run, so the
+        # plan stays on the cheap single-descriptor path.
+        buffer = torch.zeros(2, 2, 6, 4, self._HEADS, self._DIM, dtype=torch.bfloat16)
+        layout = UnifiedKVPageLayout(
+            page_size=4,
+            dtype=torch.bfloat16,
+            page_view=lambda index: buffer[:, index // 4],
+            sample=buffer[:, 0],
+            components=("k", "v"),
+            layer_ranges=[(0, 4), (4, 6)],
+            head_ranges=((0, self._HEADS),),
+            permuted=False,
+        )
+        self.assertTrue(layout.contiguous_chunks)
+        ptrs, sizes = layout.chunk_metas(torch.arange(4))
+        self.assertTrue(all(isinstance(p, int) for p in ptrs))
+        self.assertTrue(all(isinstance(n, int) for n in sizes))
 
 
 if __name__ == "__main__":
