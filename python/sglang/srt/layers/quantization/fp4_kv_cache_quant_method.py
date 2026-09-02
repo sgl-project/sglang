@@ -190,12 +190,16 @@ class KVCacheQuantMethodBase(ABC):
             for access in self.active_attention_accesses()
         )
 
-    def needs_native_fp4_scales(self) -> bool:
+    def has_native_fp4_access(self) -> bool:
         """Whether a selected backend consumes native packed FP4 + scales."""
         return any(
             access.kind == KVCacheAttentionAccessKind.NATIVE_FP4
             for access in self.active_attention_accesses()
         )
+
+    def needs_native_fp4_scales(self) -> bool:
+        """Whether the pool needs a separate native FP4 scale layout."""
+        return self.has_native_fp4_access()
 
     def needs_plain_kv_dequant_read(self) -> bool:
         """Whether plain attention reads require dequantizing packed KV first."""
@@ -466,9 +470,6 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
 
     def needs_global_scale(self) -> bool:
         return True
-
-    def has_native_fp4_access(self) -> bool:
-        return super().needs_native_fp4_scales()
 
     def needs_native_fp4_scales(self) -> bool:
         """Whether SM100 TRT-LLM GenMHA's physical HND scales are needed."""

@@ -65,7 +65,7 @@ python3 -m sglang.launch_server \
 
 ### SM100 native NVFP4 recipes
 
-On SM100, FlashInfer's TRT-LLM GenMHA backend can consume the packed NVFP4 KV cache directly for both prefill and decode. Select the prefill recipe with the existing per-phase attention backend arguments.
+On SM100, prefill can either consume packed NVFP4 directly or dequantize it into an FP8 E4M3 workspace. Select the representation with `--prefill-kv-cache-dtype`; SGLang chooses the corresponding attention implementation.
 
 For native NVFP4 prefill and decode:
 
@@ -74,8 +74,7 @@ python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
     --tp-size 1 \
     --kv-cache-dtype nvfp4 \
-    --prefill-attention-backend trtllm_mha \
-    --decode-attention-backend trtllm_mha \
+    --prefill-kv-cache-dtype nvfp4 \
     --page-size 16
 ```
 
@@ -86,12 +85,11 @@ python3 -m sglang.launch_server \
     --model-path Qwen/Qwen3.5-35B-A3B-FP8 \
     --tp-size 1 \
     --kv-cache-dtype nvfp4 \
-    --prefill-attention-backend flashinfer \
-    --decode-attention-backend trtllm_mha \
+    --prefill-kv-cache-dtype fp8_e4m3 \
     --page-size 16
 ```
 
-The native recipe avoids allocating the FP8 dequantization workspace and its token-linear scale copy. The mixed recipe retains both the token-linear scales needed by FlashInfer prefill and the physical TRT-LLM scale layout needed by native decode. In both recipes, KV data remains stored as packed FP4.
+The default value, `auto`, selects native NVFP4 prefill on SM100 and FP8 E4M3 prefill on SM120. Decode consumes native NVFP4 in both recipes. The native recipe avoids the FP8 workspace and its token-linear scale copy; the FP8 recipe retains both the linear scales used during prefill and the physical scale layout used during decode. KV data remains stored as packed FP4 either way.
 
 <Note>
 Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Top-k-1 EAGLE/EAGLE3/NEXTN and breadth-1 NGRAM speculative decoding are supported: an EAGLE-family draft worker uses `trtllm_mha`, and target verification consumes the physical NVFP4 cache directly in eager execution and CUDA Graphs. Set `--speculative-ngram-max-bfs-breadth=1` for NGRAM. With the mixed FlashInfer-prefill/TRT-LLM-decode recipe, SGLang resolves `--speculative-attention-mode` to `decode` so verification does not depend on FlashInfer's transient dequantization workspace. Other speculative algorithms, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.

@@ -20,6 +20,77 @@ from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
 
+_NVFP4_PREFILL_BACKEND = {
+    "fp8_e4m3": "flashinfer",
+    "nvfp4": "trtllm_mha",
+}
+_NVFP4_PREFILL_DTYPE = {
+    backend: dtype for dtype, backend in _NVFP4_PREFILL_BACKEND.items()
+}
+
+
+def handle_nvfp4_prefill_kv_dtype(server_args: Any) -> None:
+    """Resolve the public prefill KV representation to implementation backends."""
+
+    cfg = resolving_view(server_args)
+    requested_dtype = cfg.prefill_kv_cache_dtype
+    if cfg.kv_cache_dtype != "nvfp4":
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dtype applies only with --kv-cache-dtype=nvfp4."
+            )
+        return
+
+    if requested_dtype == "auto":
+        explicit_backend = (
+            server_args.prefill_attention_backend or server_args.attention_backend
+        )
+        if explicit_backend in _NVFP4_PREFILL_DTYPE:
+            requested_dtype = _NVFP4_PREFILL_DTYPE[explicit_backend]
+        else:
+            if explicit_backend is not None:
+                raise ValueError(
+                    "NVFP4 prefill supports an FP8 E4M3 workspace or native "
+                    f"NVFP4, but backend {explicit_backend!r} provides neither."
+                )
+            requested_dtype = "nvfp4" if get_platform().is_sm100 else "fp8_e4m3"
+
+    if requested_dtype == "nvfp4" and not get_platform().is_sm100:
+        raise ValueError(
+            "Native NVFP4 prefill currently requires SM100; use "
+            "--prefill-kv-cache-dtype=fp8_e4m3 on this platform."
+        )
+
+    target_prefill_backend = _NVFP4_PREFILL_BACKEND[requested_dtype]
+    explicit_prefill_backend = server_args.prefill_attention_backend
+    if (
+        explicit_prefill_backend is not None
+        and explicit_prefill_backend != target_prefill_backend
+    ):
+        raise ValueError(
+            f"--prefill-kv-cache-dtype={requested_dtype} requires prefill "
+            f"backend {target_prefill_backend!r}, but "
+            f"--prefill-attention-backend={explicit_prefill_backend!r} was set. "
+            "Remove the backend option and select the KV dtype only."
+        )
+
+    explicit_decode_backend = server_args.decode_attention_backend
+    if explicit_decode_backend not in (None, "trtllm_mha"):
+        raise ValueError(
+            "NVFP4 decode requires --decode-attention-backend=trtllm_mha; got "
+            f"{explicit_decode_backend!r}. Remove the backend option; NVFP4 "
+            "selects the supported decode implementation automatically."
+        )
+
+    updates = {
+        "prefill_attention_backend": target_prefill_backend,
+        "decode_attention_backend": "trtllm_mha",
+    }
+    if cfg.prefill_kv_cache_dtype == "auto":
+        updates["prefill_kv_cache_dtype"] = requested_dtype
+    declare_resolution(server_args, "_handle_nvfp4_prefill_kv_dtype", **updates)
+    logger.info("NVFP4 prefill input: %s; decode input: nvfp4.", requested_dtype)
+
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
     """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
@@ -69,11 +140,12 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             and get_platform().is_sm100
             and "trtllm_mha" in (prefill_backend, decode_backend)
         )
-        uses_sm100_mixed_nvfp4 = (
-            uses_sm100_native_nvfp4
+        uses_mixed_nvfp4 = (
+            cfg.kv_cache_dtype == "nvfp4"
             and prefill_backend == "flashinfer"
             and decode_backend == "trtllm_mha"
         )
+        uses_sm100_mixed_nvfp4 = uses_sm100_native_nvfp4 and uses_mixed_nvfp4
         speculative_algorithm = (
             cfg.speculative_algorithm.upper()
             if cfg.speculative_algorithm is not None
@@ -186,14 +258,15 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "not preserve the physical block-scale layout."
             )
 
-        if (
-            prefill_backend != decode_backend and prefill_backend != "fa4"
-        ):  # Take care of prefill=fa4 later
-            logger.warning(
-                f"Attention: Using KV4 with PREFILL = {prefill_backend} "
-                f"and DECODE = {decode_backend}. "
-                f"Compatibility issues are unlikely, but may occur in rare edge cases."
-            )
+        if prefill_backend != decode_backend and prefill_backend != "fa4":
+            # NVFP4 with FP8 prefill is a supported mixed-storage recipe.
+            if not uses_mixed_nvfp4:
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {prefill_backend} "
+                    f"and DECODE = {decode_backend}. "
+                    "Compatibility issues are unlikely, but may occur in rare "
+                    "edge cases."
+                )
         else:
             if prefill_backend == "fa4":
                 if uses_mla:  # FA4 + MLA

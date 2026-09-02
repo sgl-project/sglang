@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_kv4_compatibility,
+    handle_nvfp4_prefill_kv_dtype,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
@@ -677,6 +678,93 @@ class TestKV4Compatibility(unittest.TestCase):
             attention_backend="trtllm_mha",
             **overrides,
         )
+
+    @staticmethod
+    def _make_unrouted_nvfp4_args(**overrides):
+        return ServerArgs(model_path="dummy", kv_cache_dtype="nvfp4", **overrides)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_selects_native_backends_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="nvfp4")
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_selects_fp8_prefill_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="fp8_e4m3")
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+        self.assertEqual(
+            resolution_result(args, "decode_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_auto_defaults_to_native_on_sm100(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "nvfp4")
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mha"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_auto_preserves_fp8_prefill_recipe(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_attention_backend="flashinfer",
+            decode_attention_backend="trtllm_mha",
+        )
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "fp8_e4m3")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dtype_auto_defaults_to_fp8_on_sm120(self):
+        args = self._make_unrouted_nvfp4_args()
+        handle_nvfp4_prefill_kv_dtype(args)
+        self.assertEqual(resolution_result(args, "prefill_kv_cache_dtype"), "fp8_e4m3")
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "flashinfer"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_prefill_kv_dtype_rejects_native_prefill_off_sm100(self):
+        args = self._make_unrouted_nvfp4_args(prefill_kv_cache_dtype="nvfp4")
+        with self.assertRaisesRegex(ValueError, "requires SM100"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_conflicting_prefill_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dtype="nvfp4",
+            prefill_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "Remove the backend option"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_conflicting_decode_backend(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dtype="fp8_e4m3",
+            decode_attention_backend="flashinfer",
+        )
+        with self.assertRaisesRegex(ValueError, "NVFP4 decode requires"):
+            handle_nvfp4_prefill_kv_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_prefill_kv_dtype_rejects_non_nvfp4_storage(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            prefill_kv_cache_dtype="nvfp4",
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dtype(args)
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
