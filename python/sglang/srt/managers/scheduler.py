@@ -1262,7 +1262,7 @@ class Scheduler(
                 self.profile_and_init_predictor()
             except Exception as e:
                 logger.warning(
-                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
