@@ -185,7 +185,9 @@ def _improve_topology(
     # full pass over the ranks on the usual 8-way EP setup.
     for _ in range(max(1, num_ranks)):
         feasible_delta = delta.masked_fill(~pair_mask, float("inf"))
-        feasible_delta = feasible_delta.masked_fill(feasible_delta >= -1e-12, float("inf"))
+        feasible_delta = feasible_delta.masked_fill(
+            feasible_delta >= -1e-12, float("inf")
+        )
         best_flat = int(feasible_delta.argmin())
         if not torch.isfinite(feasible_delta.flatten()[best_flat]):
             return assignment
