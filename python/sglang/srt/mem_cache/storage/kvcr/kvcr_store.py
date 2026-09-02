@@ -61,6 +61,7 @@ until the source validates every component's size against its destination.
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import socket
 import threading
@@ -157,6 +158,10 @@ _ABANDONED_OP_HISTORY = 256
 # ``submit_hint`` -- see _split_control_endpoint.
 _CONTROL_SCHEME = "tcp://"
 _UNDIALABLE_HINT_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
+# Hybrid physical keys changed once when pool qualification was introduced and
+# again here when cross-worker compatibility became part of their identity.
+_HYBRID_KEY_SCHEMA_VERSION = "v3"
 
 
 @dataclass(frozen=True)
@@ -472,6 +477,7 @@ class KVCRStore(HiCacheStorage):
         self.registered_pools: Dict[PoolName, HostKVCache] = {}
         self._pool_contexts: Dict[PoolName, _PoolContext] = {}
         self._logical_anchor = False
+        self._compatibility_digest: Optional[str] = None
         self._local_dram_buffers: Dict[int, torch.Tensor] = {}
 
         # Single-pool layouts construct KVCR in register_mem_pool_host(). A
@@ -583,6 +589,7 @@ class KVCRStore(HiCacheStorage):
         if self.mem_pool_host is None:
             raise RuntimeError("KVCRStore cannot finalize without a host-pool anchor.")
         if self._logical_anchor:
+            self._freeze_hybrid_key_namespace()
             self._build_hybrid_kvcr()
             return
         self._build_kvcr(self.mem_pool_host)
@@ -713,6 +720,55 @@ class KVCRStore(HiCacheStorage):
             if context is not None:
                 contexts[name] = context
         return contexts
+
+    def _freeze_hybrid_key_namespace(self) -> None:
+        """Bind physical component keys to this cache ABI and rank topology."""
+        if not self._pool_contexts:
+            raise RuntimeError(
+                "KVCRStore cannot build a hybrid key namespace from an empty "
+                "physical pool manifest."
+            )
+        cache_abi = self._config.cache_abi
+        if self._config.enable_remote_hint and (not cache_abi or not cache_abi.strip()):
+            raise RuntimeError(
+                "KVCR hybrid remote hints require cache_abi in "
+                "--hicache-storage-backend-extra-config. It must identify the "
+                "model revision, cache dtype/quantization, and layer mapping."
+            )
+        logical_page_size = int(getattr(self.mem_pool_host, "page_size", 0) or 0)
+        if self._config.enable_remote_hint and logical_page_size <= 0:
+            raise RuntimeError(
+                "KVCR hybrid remote hints require a positive logical anchor "
+                "page_size for cache compatibility."
+            )
+
+        storage = self._storage_config
+        identity = (
+            _HYBRID_KEY_SCHEMA_VERSION,
+            cache_abi,
+            storage.is_page_first_layout,
+            logical_page_size,
+            tuple(
+                (
+                    str(name),
+                    context.page_size,
+                    context.component_sizes,
+                )
+                for name, context in sorted(
+                    self._pool_contexts.items(), key=lambda item: str(item[0])
+                )
+            ),
+            (storage.pp_size, storage.pp_rank),
+            (storage.tp_size, storage.tp_rank),
+            (storage.attn_cp_size, storage.attn_cp_rank),
+            storage.is_mla_model,
+            storage.tp_lcm_size,
+            storage.should_split_heads,
+        )
+        digest = hashlib.sha256(msgspec.msgpack.encode(identity)).hexdigest()
+        if self._compatibility_digest not in (None, digest):
+            raise RuntimeError("KVCR hybrid key namespace changed after it was frozen.")
+        self._compatibility_digest = digest
 
     def _control_port(self) -> int:
         """Bind port for this rank's KVCR control channel.
@@ -1230,12 +1286,21 @@ class KVCRStore(HiCacheStorage):
         whole pages; their adapter strips everything after the first ``#``.
 
         The existing KV spelling is retained for single-pool and mixed-version
-        compatibility. Physical hybrid pools add a versioned pool namespace so
-        equal page hashes and component ordinals cannot alias different state.
+        compatibility. Physical hybrid pools add a versioned compatibility and
+        pool namespace so equal page hashes cannot alias another model, rank,
+        layout, pool, or component.
         """
         if pool_name == PoolName.KV:
             return _encode_key(f"{page_key}#{seg}")
-        return _encode_key(f"{page_key}#v2/{pool_name}/{seg}")
+        if self._compatibility_digest is None:
+            raise RuntimeError(
+                "KVCR hybrid component key requested before the physical pool "
+                "manifest was finalized."
+            )
+        return _encode_key(
+            f"{page_key}#{_HYBRID_KEY_SCHEMA_VERSION}/"
+            f"{self._compatibility_digest}/{pool_name}/{seg}"
+        )
 
     def _page_segment_keys(
         self,

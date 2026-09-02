@@ -111,6 +111,7 @@ def _storage_config(
         "control_port": _BASE_CONTROL_PORT,
         "control_advertise_host": "127.0.0.1",
         "enable_remote_hint": True,
+        "cache_abi": "test-cache-abi",
     }
     extra_config.update(extra)
     return HiCacheStorageConfig(
@@ -390,7 +391,7 @@ class UnusableHostPoolTest(unittest.TestCase):
 
     def test_logical_anchor_defers_core_construction(self):
         store = _store(0, 1)
-        anchor = SimpleNamespace(kv_buffer=None)
+        anchor = SimpleNamespace(kv_buffer=None, page_size=1)
 
         with mock.patch.object(store, "_build_kvcr") as build_kvcr:
             store.register_mem_pool_host(anchor)
@@ -402,7 +403,7 @@ class UnusableHostPoolTest(unittest.TestCase):
 
     def test_finalize_passes_the_complete_physical_plan_to_the_builder(self):
         store = _store(0, 1)
-        anchor = SimpleNamespace(kv_buffer=None)
+        anchor = SimpleNamespace(kv_buffer=None, page_size=1)
         c4_buffer = torch.empty(4, dtype=torch.uint8)
         c4_pool = SimpleNamespace(
             kv_buffer=c4_buffer,
@@ -638,7 +639,88 @@ class HybridPoolManifestTest(unittest.TestCase):
 
     def _collect(self):
         self.store._pool_contexts = self.store._collect_pool_contexts()
+        self.store._freeze_hybrid_key_namespace()
         return self.store._pool_contexts
+
+    def _component_key(
+        self,
+        *,
+        tp_rank=0,
+        tp_size=1,
+        dp_rank=0,
+        dp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        cache_abi="test-cache-abi",
+        page_first=True,
+        logical_page_size=2,
+        c4_page_size=2,
+        c4_components=(8, 8),
+    ):
+        store = _store(
+            tp_rank,
+            tp_size,
+            dp_rank,
+            dp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
+            cache_abi=cache_abi,
+        )
+        store._storage_config.is_page_first_layout = page_first
+        anchor = SimpleNamespace(kv_buffer=None, page_size=logical_page_size)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(
+            _ManifestPool(c4_page_size, list(c4_components)),
+            PoolName.DEEPSEEK_V4_C4,
+        )
+        store.register_mem_host_pool_v2(
+            _ManifestPool(2, [24]), PoolName.DEEPSEEK_V4_C128
+        )
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+        return store._segment_key(
+            "0123456789abcdefdeadbeef", 0, PoolName.DEEPSEEK_V4_C4
+        )
+
+    def test_remote_hybrid_requires_an_explicit_cache_abi(self):
+        for cache_abi in (None, "", "   "):
+            with self.subTest(cache_abi=cache_abi):
+                store = _store(0, 1, cache_abi=cache_abi)
+                anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+                store.register_mem_pool_host(anchor)
+                store.register_mem_host_pool_v2(anchor, PoolName.KV)
+                store.register_mem_host_pool_v2(
+                    _ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4
+                )
+
+                with (
+                    mock.patch.object(store, "_build_hybrid_kvcr"),
+                    self.assertRaisesRegex(RuntimeError, "cache_abi"),
+                ):
+                    store.finalize_mem_pool_registration()
+
+    def test_hybrid_key_namespace_is_shared_only_by_compatible_ranks(self):
+        baseline = self._component_key(dp_rank=0, dp_size=2)
+
+        self.assertEqual(baseline, self._component_key(dp_rank=1, dp_size=2))
+        self.assertEqual(baseline, self._component_key(dp_rank=0, dp_size=4))
+        incompatible = {
+            "cache ABI": self._component_key(cache_abi="other-cache-abi"),
+            "TP size": self._component_key(tp_rank=0, tp_size=2),
+            "TP rank": self._component_key(tp_rank=1, tp_size=2),
+            "CP size": self._component_key(attn_cp_rank=0, attn_cp_size=2),
+            "CP rank": self._component_key(attn_cp_rank=1, attn_cp_size=2),
+            "layout": self._component_key(page_first=False),
+            "logical page": self._component_key(logical_page_size=4),
+            "pool page": self._component_key(c4_page_size=4),
+            "component manifest": self._component_key(c4_components=(8, 16)),
+        }
+        for field, key in incompatible.items():
+            with self.subTest(field=field):
+                self.assertNotEqual(baseline, key)
+
+        self.assertIn(b"#v3/", baseline)
 
     def test_logical_anchor_v1_io_and_existence_are_virtual_successes(self):
         self.store._kvcr = _ExplodingKVCR()
@@ -805,9 +887,14 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual([len(page) for page in c128_pages], [1, 1])
         self.assertEqual({desc.size for desc in c4_descriptors.values()}, {8})
         self.assertEqual({desc.size for desc in c128_descriptors.values()}, {24})
-        self.assertTrue(all(b"#v2/deepseek_v4_c4/" in key for key in c4_descriptors))
         self.assertTrue(
-            all(b"#v2/deepseek_v4_c128/" in key for key in c128_descriptors)
+            all(b"#v3/" in key and b"/deepseek_v4_c4/" in key for key in c4_descriptors)
+        )
+        self.assertTrue(
+            all(
+                b"#v3/" in key and b"/deepseek_v4_c128/" in key
+                for key in c128_descriptors
+            )
         )
 
     def test_local_hybrid_set_folds_component_results_per_page(self):
