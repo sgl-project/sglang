@@ -304,6 +304,7 @@ class Resampler2_5(BaseResampler):
         )
         pos_embed = torch.from_numpy(pos_embed_arr).float().to(device)
         self.register_buffer("pos_embed", pos_embed, persistent=False)
+        self.pos_embed._skip_weight_check = True
 
     def _adjust_pos_cache(
         self, tgt_sizes: torch.Tensor, device: torch.types.Device
@@ -429,6 +430,7 @@ class Resampler4_5(BaseResampler):
         )
         pos_embed = torch.from_numpy(pos_embed_arr).float().to(device)
         self.register_buffer("pos_embed", pos_embed, persistent=False)
+        self.pos_embed._skip_weight_check = True
 
     def _adjust_pos_cache(
         self, tgt_sizes: torch.Tensor, device: torch.types.Device
@@ -458,6 +460,7 @@ class Resampler4_5(BaseResampler):
             .to(device)
         )
         self.register_buffer("temporal_pos_embed", pos_embed, persistent=False)
+        self.temporal_pos_embed._skip_weight_check = True
 
     def _adjust_temporal_pos_cache(
         self, max_temporal_size: int, device: torch.types.Device = "cpu"
