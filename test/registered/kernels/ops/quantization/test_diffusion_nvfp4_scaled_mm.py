@@ -3,6 +3,7 @@ import sys
 import flashinfer
 import pytest
 import torch
+import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     fused_scale_residual_norm_scale_shift,
@@ -15,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
     apply_nvfp4_gemm_prequantized,
+    apply_nvfp4_gemm_swiglu_quant,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
@@ -35,6 +37,11 @@ TEST_CASES = [
     pytest.param(512, 6144, 128, id="flux2_projection_shape"),
 ]
 FLUX2_PROJECTION_SHAPE = (512, 6144, 128)
+
+
+class _TestLinear(torch.nn.Module):
+    def forward(self, x):
+        return self.quant_method.apply(self, x), None
 
 
 def _nvfp4_supported() -> bool:
@@ -197,6 +204,8 @@ def _build_layer(
     *,
     weight_scale_device: torch.device | str | None = None,
     checkpoint_weight_scale_layout: str = "linear",
+    prepare_swiglu_fusion: bool = False,
+    accepts_prequantized_fp4: bool = False,
 ) -> tuple[ModelOptFp4LinearMethod, torch.nn.Module]:
     output_size, input_size_half = weight_fp4.shape
     input_size = input_size_half * 2
@@ -208,7 +217,9 @@ def _build_layer(
             checkpoint_weight_scale_layout=checkpoint_weight_scale_layout,
         )
     )
-    layer = torch.nn.Module()
+    layer = _TestLinear()
+    layer.quant_method = method
+    layer.params_dtype = DTYPE
     method.create_weights(
         layer,
         input_size_per_partition=input_size,
@@ -233,6 +244,9 @@ def _build_layer(
         layer.weight_scale = torch.nn.Parameter(
             layer.weight_scale.detach().to(weight_scale_device), requires_grad=False
         )
+
+    layer._interleave_for_swiglu_fusion = prepare_swiglu_fusion
+    layer._accepts_prequantized_fp4 = accepts_prequantized_fp4
 
     method.process_weights_after_loading(layer)
 
@@ -298,6 +312,91 @@ def _build_layer(
         input_global_scale.to(torch.float32),
     )
     return method, layer
+
+
+@pytest.mark.skipif(
+    not _nvfp4_supported(),
+    reason="Diffusion NVFP4 fused SwiGLU correctness requires Blackwell GPUs",
+)
+def test_flux2_fused_nvfp4_swiglu_quant_matches_unfused() -> None:
+    batch, seq_len, hidden_size, inner_size, output_size = 2, 32, 128, 128, 128
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(20260830)
+
+    x = torch.randn(
+        (batch, seq_len, hidden_size),
+        device=DEVICE,
+        dtype=DTYPE,
+        generator=generator,
+    )
+    weight_in = torch.randn(
+        (2 * inner_size, hidden_size),
+        device=DEVICE,
+        dtype=DTYPE,
+        generator=generator,
+    )
+    weight_out = torch.randn(
+        (output_size, inner_size),
+        device=DEVICE,
+        dtype=DTYPE,
+        generator=generator,
+    )
+
+    input_global_scale = _make_global_scale(x)
+    weight_in_global_scale = _make_global_scale(weight_in)
+    weight_out_global_scale = _make_global_scale(weight_out)
+    output_input_global_scale = torch.tensor(512.0, device=DEVICE, dtype=torch.float32)
+
+    weight_in_fp4, weight_in_scale = _quantize_weight_for_checkpoint(
+        weight_in, weight_in_global_scale
+    )
+    weight_out_fp4, weight_out_scale = _quantize_weight_for_checkpoint(
+        weight_out, weight_out_global_scale
+    )
+    method_in, layer_in = _build_layer(
+        weight_in_fp4,
+        weight_in_scale,
+        input_global_scale,
+        weight_in_global_scale,
+        prepare_swiglu_fusion=True,
+    )
+    method_out, layer_out = _build_layer(
+        weight_out_fp4,
+        weight_out_scale,
+        output_input_global_scale,
+        weight_out_global_scale,
+        accepts_prequantized_fp4=True,
+    )
+
+    projected = method_in.apply(layer_in, x)
+    expected = method_out.apply(
+        layer_out,
+        F.silu(projected[..., :inner_size]) * projected[..., inner_size:],
+    )
+    actual = apply_nvfp4_gemm_swiglu_quant(layer_in, layer_out, x)
+
+    assert actual.shape == expected.shape == (batch, seq_len, output_size)
+    assert torch.isfinite(actual).all()
+    assert "weight_swiglu_interleaved" in dict(layer_in.named_buffers())
+    assert "weight_scale_swiglu_interleaved" in dict(layer_in.named_buffers())
+    assert "weight_swiglu_interleaved" not in layer_in.state_dict()
+    assert "weight_scale_swiglu_interleaved" not in layer_in.state_dict()
+    diff = _calc_diff(actual, expected)
+    assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{diff=:.6f}"
+
+    weight_ptr = layer_in.weight_swiglu_interleaved.data_ptr()
+    scale_ptr = layer_in.weight_scale_swiglu_interleaved.data_ptr()
+    previous_interleaved_weight = layer_in.weight_swiglu_interleaved.clone()
+    reloaded_weight = _swap_fp4_nibbles(weight_in_fp4).clone()
+    reloaded_weight.view(torch.uint8).flatten()[0] ^= 0x11
+    layer_in.weight.data.copy_(reloaded_weight)
+    layer_in.weight_scale.data.copy_(weight_in_scale)
+    method_in.process_weights_after_loading(layer_in)
+    assert layer_in.weight_swiglu_interleaved.data_ptr() == weight_ptr
+    assert layer_in.weight_scale_swiglu_interleaved.data_ptr() == scale_ptr
+    assert not torch.equal(
+        layer_in.weight_swiglu_interleaved, previous_interleaved_weight
+    )
 
 
 def _resolve_mode(mode: str):
