@@ -3572,6 +3572,21 @@ class ServerArgs:
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
         NS("exec.features"),
     ] = False
+    enable_watermark: A[
+        bool,
+        "Enable server-wide Aaronson-Gumbel text watermarking.",
+        NS("exec.features"),
+    ] = False
+    watermark_key: A[
+        Optional[str],
+        "Hex-encoded 64-bit key for server-wide text watermarking.",
+        NS("exec.features"),
+    ] = None
+    watermark_context_window: A[
+        int,
+        "Number of preceding committed token IDs used by text watermarking.",
+        NS("exec.features"),
+    ] = 4
     enable_return_hidden_states: A[
         bool,
         "Enable returning full hidden states with responses. Equivalent to "
