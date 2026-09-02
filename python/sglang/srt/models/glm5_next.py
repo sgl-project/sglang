@@ -1176,6 +1176,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
 
     def precompile_kernels_after_loading(self) -> None:
+        """Compile and load the vision tower's lazily built kernels before pools exist."""
+        self._precompile_vision_attention_kernel()
+        self._precompile_vision_mlp_kernel()
+
+    def _precompile_vision_attention_kernel(self) -> None:
         """Load the vision tower's Triton attention kernel before pools exist.
 
         ``ModelRunner.load_model`` invokes this hook (through
@@ -1248,6 +1253,62 @@ class Glm5NextForConditionalGeneration(nn.Module):
             logger.warning(
                 "Vision-tower attention precompile failed; the kernel will be "
                 "loaded on the first image request instead",
+                exc_info=True,
+            )
+
+    def _precompile_vision_mlp_kernel(self) -> None:
+        """Compile the vision MLP's ``torch.compile``d activation before pools exist.
+
+        ``swiglu_clamped`` is compiled with dynamo's default shape policy: the
+        first call compiles a static-shape kernel and a second, different token
+        count recompiles a dynamic-shape one. Each compile runs inductor's
+        Triton autotuning, which allocates benchmark buffers on the device.
+        Without this, the first image whose token count differs from the
+        warmup image's triggers that autotune during serving with the memory
+        pools already allocated, which fails with CUDA OOM at a high
+        ``mem_fraction_static``. Running the block MLP and the patch merger
+        (the two callers, with different gate_up widths) at two token counts
+        here settles dynamo on the dynamic kernels while memory is free; the
+        inductor cache then serves later boots. Failures are logged at WARNING
+        and swallowed, as for the attention precompile.
+        """
+        if self.visual is None or not self.pp_group.is_first_rank:
+            return
+        targets = []
+        for cls, first_linear in (
+            (Glm5NextVisionMLP, "gate_up_proj"),
+            (Glm5NextVisionPatchMerger, "proj"),
+        ):
+            module = next(
+                (m for m in self.visual.modules() if isinstance(m, cls)), None
+            )
+            if module is not None:
+                targets.append((module, getattr(module, first_linear).input_size))
+        if not targets:
+            return
+        try:
+            device = self.visual.device
+            dtype = self.visual.dtype
+            with torch.no_grad():
+                for module, in_features in targets:
+                    for tokens in (64, 4096):
+                        module(
+                            torch.zeros(
+                                (tokens, in_features), dtype=dtype, device=device
+                            )
+                        )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            log_info_on_rank0(
+                logger,
+                "Precompiled the vision-tower MLP and patch-merger activation "
+                "kernels (static and dynamic token counts) before memory-pool "
+                "allocation.",
+            )
+        except Exception:
+            logger.warning(
+                "Vision-tower MLP precompile failed; the activation will be "
+                "compiled on the first image request instead",
                 exc_info=True,
             )
 

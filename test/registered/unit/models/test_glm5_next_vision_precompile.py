@@ -51,6 +51,31 @@ class _FakeVisionTower(nn.Module):
         return self.proj.weight.device
 
 
+class _RecordingActivationModule(nn.Module):
+    """Stands in for the block MLP or the patch merger: records the token
+    counts it is run at and exposes the first linear's input width."""
+
+    def __init__(self, first_linear: str, in_features: int, calls: list):
+        nn.Module.__init__(self)
+        setattr(self, first_linear, SimpleNamespace(input_size=in_features))
+        self.calls = calls
+        self.in_features = in_features
+
+    def forward(self, x):
+        self.calls.append((tuple(x.shape), x.dtype, x.device))
+        return x
+
+
+class _RecordingMLP(_RecordingActivationModule, glm5_next.Glm5NextVisionMLP):
+    def __init__(self, in_features, calls):
+        _RecordingActivationModule.__init__(self, "gate_up_proj", in_features, calls)
+
+
+class _RecordingMerger(_RecordingActivationModule, glm5_next.Glm5NextVisionPatchMerger):
+    def __init__(self, in_features, calls):
+        _RecordingActivationModule.__init__(self, "proj", in_features, calls)
+
+
 def _make_model(visual, is_first_rank: bool = True):
     model = glm5_next.Glm5NextForConditionalGeneration.__new__(
         glm5_next.Glm5NextForConditionalGeneration
@@ -114,6 +139,45 @@ class TestGlm5NextVisionPrecompile(CustomTestCase):
             _make_model(visual, is_first_rank=False), lambda *a, **k: calls.append(a)
         )
         self.assertEqual(calls, [])
+
+    def test_mlp_and_merger_run_at_two_token_counts(self):
+        # Two distinct token counts make dynamo compile the static kernel and
+        # then settle on the dynamic one before the pools exist.
+        mlp_calls, merger_calls = [], []
+        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
+        visual.mlp = _RecordingMLP(3072, mlp_calls)
+        visual.merger = _RecordingMerger(1536, merger_calls)
+        self._run_hook(_make_model(visual), lambda *a, **k: None)
+        self.assertEqual(
+            [shape for shape, _, _ in mlp_calls], [(64, 3072), (4096, 3072)]
+        )
+        self.assertEqual(
+            [shape for shape, _, _ in merger_calls], [(64, 1536), (4096, 1536)]
+        )
+        for _, dtype, device in mlp_calls + merger_calls:
+            self.assertEqual(dtype, torch.bfloat16)
+            self.assertEqual(device, visual.device)
+
+    def test_mlp_precompile_skips_without_the_modules_or_off_first_rank(self):
+        calls = []
+        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
+        self._run_hook(_make_model(visual), lambda *a, **k: None)  # no modules
+        visual.mlp = _RecordingMLP(3072, calls)
+        self._run_hook(_make_model(visual, is_first_rank=False), lambda *a, **k: None)
+        self.assertEqual(calls, [])
+
+    def test_mlp_failure_is_logged_not_raised(self):
+        class _Failing(_RecordingMLP):
+            def forward(self, x):
+                raise RuntimeError("mlp compile failed")
+
+        visual = _FakeVisionTower(hidden_size=1536, num_heads=12, backend="fa3")
+        visual.mlp = _Failing(3072, [])
+        with self.assertLogs(glm5_next.logger, level="WARNING") as logs:
+            self._run_hook(_make_model(visual), lambda *a, **k: None)
+        self.assertTrue(
+            any("MLP precompile failed" in line for line in logs.output), logs.output
+        )
 
     def test_kernel_failure_is_logged_not_raised(self):
         def stub(*args, **kwargs):
