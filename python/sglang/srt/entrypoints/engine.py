@@ -23,6 +23,7 @@ import asyncio
 import atexit
 import dataclasses
 import gc
+import inspect
 import logging
 import multiprocessing as mp
 import os
@@ -96,7 +97,11 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     run_multi_detokenizer_router_process,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (  # noqa: F401
+    ResponseHandler,
+    ResponseHandlerOutput,
+    TokenizerManager,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -241,10 +246,14 @@ class Engine(EngineScoreMixin, EngineBase):
     # placement group. Not config — a live cluster object.
     _placement_group = None
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, response_handler: Optional[ResponseHandler] = None, **kwargs):
         """
         The arguments of this function is the same as `sglang/srt/server_args.py::ServerArgs`.
         Please refer to `ServerArgs` for the documentation.
+
+        ``response_handler`` is an Engine-only extension point for synchronous,
+        non-blocking delivery of intermediate streaming output batches. When it
+        is set, streaming iterators receive terminal and error outputs only.
         """
 
         # Ensure plugins are loaded before ServerArgs construction,
@@ -263,6 +272,16 @@ class Engine(EngineScoreMixin, EngineBase):
             server_args = self.server_args_class(**kwargs)
         self.server_args = server_args
         logger.info(f"server_args={server_args.resolved_dict()}")
+
+        if response_handler is not None:
+            handle_batch = getattr(response_handler, "handle_batch", None)
+            if not callable(handle_batch):
+                raise TypeError("response_handler must define handle_batch()")
+            if inspect.iscoroutinefunction(handle_batch):
+                raise TypeError("response_handler.handle_batch() must be synchronous")
+            if server_args.tokenizer_worker_num != 1:
+                raise ValueError("response_handler requires tokenizer_worker_num=1")
+        self.response_handler = response_handler
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -295,6 +314,8 @@ class Engine(EngineScoreMixin, EngineBase):
             placement_group=self._placement_group,
         )
         self.tokenizer_manager = tokenizer_manager
+        if tokenizer_manager is not None:
+            tokenizer_manager.response_handler = response_handler
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         # Engine-spawned weight cache daemons owned by *this* instance (empty

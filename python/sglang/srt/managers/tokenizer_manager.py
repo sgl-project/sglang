@@ -34,7 +34,18 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import fastapi
 import numpy as np
@@ -217,6 +228,24 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_sampling_mask",
     "output_token_sampling_logprobs",
 )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ResponseHandlerOutput:
+    """One materialized intermediate streaming output."""
+
+    rid: str
+    output: Dict[str, Any]
+
+
+class ResponseHandler(Protocol):
+    """Synchronous handler for one detokenizer output batch.
+
+    ``handle_batch`` runs on the tokenizer-manager event loop. Implementations
+    must not block.
+    """
+
+    def handle_batch(self, outputs: Sequence[ResponseHandlerOutput]) -> None: ...
 
 
 @dataclasses.dataclass
@@ -427,6 +456,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.preferred_sampling_params = get_serving().preferred_sampling_params
         self.crash_dump_folder = get_observability().crash_dump_folder
+        self.response_handler: Optional[ResponseHandler] = None
 
         # Init model config
         self.init_model_config()
@@ -776,6 +806,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if self.response_handler is not None and isinstance(obj, GenerateReqInput):
+            if obj.parallel_sample_num != 1:
+                raise ValueError("response_handler does not support parallel sampling")
+            if not obj.is_single:
+                raise ValueError(
+                    "response_handler does not support batched generation requests"
+                )
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -2197,6 +2234,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
         else:
             customized_info = None
+        response_handler = self.response_handler
+        response_handler_outputs: Optional[List[ResponseHandlerOutput]] = (
+            [] if response_handler is not None else None
+        )
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
@@ -2473,7 +2514,29 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
-            if out_dict is not None:
+            is_intermediate_stream = (
+                response_handler_outputs is not None
+                and out_dict is not None
+                and not state.finished
+                and getattr(state.obj, "stream", False)
+            )
+            if is_intermediate_stream:
+                if "text" in out_dict and out_dict["text"] is None:
+                    out_dict = dict(out_dict)
+                    out_dict["text"] = state.get_text()
+                if out_dict.get("output_ids") is state.output_ids:
+                    out_dict = dict(out_dict)
+                    out_dict["output_ids"] = state.output_ids.copy()
+
+                if not state.time_stats.response_sent_to_client_time:
+                    state.time_stats.set_response_sent_to_client_time()
+                    out_dict["meta_info"][
+                        "response_sent_to_client_ts"
+                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                response_handler_outputs.append(
+                    ResponseHandlerOutput(rid=rid, output=out_dict)
+                )
+            elif out_dict is not None:
                 state.out_list.append(out_dict)
                 pending_notify[rid] = state
 
@@ -2489,6 +2552,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+        if response_handler_outputs:
+            assert response_handler is not None
+            try:
+                response_handler.handle_batch(tuple(response_handler_outputs))
+            except Exception as error:
+                logger.exception(
+                    "The response handler failed; aborting affected requests"
+                )
+                message = f"Response handler failed: {error}"
+                for output in response_handler_outputs:
+                    state = self.rid_to_state.get(output.rid)
+                    if state is None:
+                        continue
+                    self.abort_request(output.rid)
+                    self._handle_abort_req(
+                        AbortReq(
+                            rid=output.rid,
+                            finished_reason={
+                                "type": "abort",
+                                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+                                "message": message,
+                            },
+                            abort_message=message,
+                        )
+                    )
+                    # The handler may have delivered part of the batch before
+                    # it raised. The terminal error must not replay that text
+                    # or those token IDs.
+                    state.out_list[-1]["text"] = ""
+                    state.out_list[-1]["output_ids"] = []
 
         # handle_loop awaits next recv immediately
         for s in pending_notify.values():

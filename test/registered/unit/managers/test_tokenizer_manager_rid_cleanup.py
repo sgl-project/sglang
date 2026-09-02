@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import unittest
+from http import HTTPStatus
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -136,6 +137,7 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     tm.skip_tokenizer_init = False
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
+    tm.response_handler = None
     tm.send_to_scheduler = MagicMock()
     return tm
 
@@ -167,8 +169,14 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
-def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
-    """Create a minimal BatchStrOutput for a single request.
+def _make_batch_str_outputs(
+    rids: list[str],
+    finished_reasons: list,
+    *,
+    output_strs: list[str] | None = None,
+    output_ids: list[list[int]] | None = None,
+) -> BatchStrOutput:
+    """Create a minimal BatchStrOutput for one or more requests.
 
     Uses struct field introspection so that new or renamed fields in
     BatchStrOutput don't break this test.  Only the fields that matter for
@@ -176,29 +184,24 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     all others receive type-appropriate defaults based on naming patterns.
     Fields with class-level defaults are left alone automatically.
     """
-    if finished_reason is _NOT_FINISHED:
-        fr = None
-    elif finished_reason is None:
-        fr = {"type": "length"}
-    else:
-        fr = finished_reason
-
     kwargs = {}
     for f in msgspec.structs.fields(BatchStrOutput):
         if f.name == "rids":
-            kwargs[f.name] = [rid]
+            kwargs[f.name] = rids
         elif f.name == "finished_reasons":
-            kwargs[f.name] = [fr]
+            kwargs[f.name] = finished_reasons
         elif f.name == "output_strs":
-            kwargs[f.name] = ["hello"]
+            kwargs[f.name] = output_strs or ["hello"] * len(rids)
+        elif f.name == "output_ids":
+            kwargs[f.name] = output_ids or [[] for _ in rids]
         elif f.name in _PER_REQUEST_INT_FIELDS:
-            kwargs[f.name] = [0]
+            kwargs[f.name] = [0] * len(rids)
         elif f.name in _PER_REQUEST_FLOAT_FIELDS:
-            kwargs[f.name] = [0.0]
+            kwargs[f.name] = [0.0] * len(rids)
         elif f.name in _PER_REQUEST_NESTED_LIST_FIELDS:
-            kwargs[f.name] = [[]]
+            kwargs[f.name] = [[] for _ in rids]
         elif f.name in _PER_REQUEST_OPTIONAL_FIELDS:
-            kwargs[f.name] = [None]
+            kwargs[f.name] = [None] * len(rids)
         # Fields with class defaults — skip, let the default be used
         elif (
             f.default is not msgspec.NODEFAULT
@@ -210,9 +213,20 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
         # List[List[...]] and is unlikely to crash on [i] indexing for
         # List[int] either (the inner [] just means "no data").
         else:
-            kwargs[f.name] = [[]]
+            kwargs[f.name] = [[] for _ in rids]
 
     return BatchStrOutput(**kwargs)
+
+
+def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
+    """Create a minimal BatchStrOutput for a single request."""
+    if finished_reason is _NOT_FINISHED:
+        fr = None
+    elif finished_reason is None:
+        fr = {"type": "length"}
+    else:
+        fr = finished_reason
+    return _make_batch_str_outputs([rid], [fr])
 
 
 class TestRidToStateCleanupOnAbort(CustomTestCase):
@@ -317,6 +331,111 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestResponseHandler(CustomTestCase):
+    def test_receives_one_materialized_intermediate_batch(self):
+        tm = _make_tokenizer_manager(self)
+        calls = []
+
+        class Handler:
+            def handle_batch(self, outputs):
+                calls.append(outputs)
+
+        tm.response_handler = Handler()
+        rids = ["stream_a", "stream_b", "final"]
+        states = {rid: _make_req_state(rid) for rid in rids}
+        for state in states.values():
+            state.obj.stream = True
+        tm.rid_to_state.update(states)
+
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_outputs(
+                    rids,
+                    [None, None, {"type": "length"}],
+                    output_strs=["a", "b", "done"],
+                    output_ids=[[1], [2], [3]],
+                )
+            )
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item.rid for item in calls[0]], rids[:2])
+        self.assertEqual([item.output["text"] for item in calls[0]], ["a", "b"])
+        self.assertEqual([item.output["output_ids"] for item in calls[0]], [[1], [2]])
+        self.assertTrue(
+            all(
+                "response_sent_to_client_ts" in item.output["meta_info"]
+                for item in calls[0]
+            )
+        )
+
+        states["stream_a"].output_ids.append(9)
+        self.assertEqual(calls[0][0].output["output_ids"], [1])
+        self.assertFalse(states["stream_a"].event.is_set())
+        self.assertFalse(states["stream_b"].event.is_set())
+        self.assertTrue(states["final"].event.is_set())
+        self.assertEqual(len(states["final"].out_list), 1)
+        self.assertNotIn("final", tm.rid_to_state)
+
+    def test_exception_aborts_without_replaying_intermediate_output(self):
+        tm = _make_tokenizer_manager(self)
+
+        class Handler:
+            def handle_batch(self, outputs):
+                raise RuntimeError("delivery failed")
+
+        tm.response_handler = Handler()
+        tm.abort_request = Mock()
+        rids = ["failed_a", "failed_b"]
+        states = {rid: _make_req_state(rid) for rid in rids}
+        for state in states.values():
+            state.obj.stream = True
+        tm.rid_to_state.update(states)
+
+        with self.assertLogs(level="ERROR"):
+            asyncio.run(
+                tm._handle_batch_output(
+                    _make_batch_str_outputs(
+                        rids,
+                        [None, None],
+                        output_ids=[[1], [2]],
+                    )
+                )
+            )
+
+        self.assertEqual(
+            {call.args[0] for call in tm.abort_request.call_args_list}, set(rids)
+        )
+        for rid, state in states.items():
+            self.assertNotIn(rid, tm.rid_to_state)
+            self.assertTrue(state.finished)
+            self.assertTrue(state.event.is_set())
+            self.assertEqual(len(state.out_list), 1)
+            self.assertEqual(state.out_list[0]["text"], "")
+            self.assertEqual(state.out_list[0]["output_ids"], [])
+            finish_reason = state.out_list[0]["meta_info"]["finish_reason"]
+            self.assertEqual(finish_reason["type"], "abort")
+            self.assertEqual(
+                finish_reason["status_code"], HTTPStatus.INTERNAL_SERVER_ERROR
+            )
+
+    def test_no_handler_keeps_existing_notification_path(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "normal_stream"
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        tm.rid_to_state[rid] = state
+
+        asyncio.run(
+            tm._handle_batch_output(
+                _make_batch_str_outputs([rid], [None], output_ids=[[1]])
+            )
+        )
+
+        self.assertTrue(state.event.is_set())
+        self.assertEqual(len(state.out_list), 1)
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
@@ -452,6 +571,40 @@ def _make_generate_obj(rid, is_single):
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
     return obj
+
+
+class TestResponseHandlerRequestValidation(CustomTestCase):
+    def _assert_rejected(self, obj, message):
+        tm = _make_tm_for_generate(self)
+        tm.response_handler = Mock()
+
+        async def consume_first():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, message):
+            asyncio.run(consume_first())
+
+    def test_batched_prompt_is_rejected(self):
+        self._assert_rejected(
+            GenerateReqInput(
+                input_ids=[[1], [2]],
+                sampling_params=[{}, {}],
+                stream=True,
+                rid=["batch_a", "batch_b"],
+            ),
+            "batched generation requests",
+        )
+
+    def test_parallel_sampling_is_rejected(self):
+        self._assert_rejected(
+            GenerateReqInput(
+                input_ids=[1],
+                sampling_params={"n": 2},
+                stream=True,
+                rid="parallel",
+            ),
+            "parallel sampling",
+        )
 
 
 class TestDiscardPendingReqStates(CustomTestCase):
