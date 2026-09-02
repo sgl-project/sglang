@@ -1371,9 +1371,8 @@ class Req(ReqDllmMixin):
         appending only the new output tokens.
 
         Falls back to a full rebuild when the in-place append is invalid:
-        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
-          origin_input_ids directly, so extending in place would write output
-          tokens into the origin;
+        - aliasing: full_untruncated_fill_ids is origin_input_ids itself, so
+          extending in place would write output tokens into the origin;
         - lengths disagree: fresh req (array still empty), retraction
           (output_ids reset to empty), or set_finish_with_abort (origin
           replaced by a 1-token stub).

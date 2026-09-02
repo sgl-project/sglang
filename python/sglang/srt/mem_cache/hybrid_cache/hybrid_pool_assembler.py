@@ -470,6 +470,72 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+@dataclass(frozen=True)
+class _IndexerRegion:
+    """One page-contiguous indexer buffer group to mirror on the host."""
+
+    name: PoolName
+    device_buffers: list
+    item_bytes: int
+    # FP4 page rows group their slots instead of laying tokens out flat, so the
+    # fused-row token-granular copy does not apply and transfers must be whole
+    # pages. The fused FP8 row has no such restriction.
+    page_aligned_only: bool
+
+
+def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
+    """
+    Resolve the indexer HiCache regions, hiding the FP8/FP4 split from the
+    stack builder. FP8 keeps key and scale fused in one buffer, while FP4
+    stores payload and scale separately, so it maps to two host pools.
+    """
+    import torch
+
+    pool = kvcache.c4_indexer_kv_pool
+    fused = pool.index_k_with_scale_buffer
+    if fused is not None:
+        return [
+            _IndexerRegion(
+                name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+                device_buffers=fused,
+                item_bytes=fused[0].shape[1] * fused[0].element_size(),
+                page_aligned_only=False,
+            )
+        ]
+
+    payload_ref = pool.index_k_payload_buffer[0]
+    scale_ref = pool.index_k_scale_buffer[0]
+    # A page row covers ``page_slots`` C4 slots, i.e. one tree page of tokens
+    # after 4:1 compression.
+    page_slots = payload_ref.shape[3]
+    if scale_ref.shape[3] != page_slots:
+        raise ValueError(
+            "FP4 indexer payload and scale must agree on slots per page: "
+            f"payload={page_slots}, scale={scale_ref.shape[3]}"
+        )
+    if page_size % page_slots != 0:
+        raise ValueError(
+            f"Tree page size {page_size} must be a multiple of the FP4 indexer "
+            f"slots per page {page_slots}"
+        )
+    payload = [b.view(torch.uint8).flatten(1) for b in pool.index_k_payload_buffer]
+    scale = [b.view(torch.uint8).flatten(1) for b in pool.index_k_scale_buffer]
+    return [
+        _IndexerRegion(
+            name=PoolName.DEEPSEEK_V4_C4_INDEXER,
+            device_buffers=payload,
+            item_bytes=payload[0].shape[1],
+            page_aligned_only=True,
+        ),
+        _IndexerRegion(
+            name=PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            device_buffers=scale,
+            item_bytes=scale[0].shape[1],
+            page_aligned_only=True,
+        ),
+    ]
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -582,36 +648,34 @@ def build_deepseek_v4_hicache_stack(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
         )
-        c4_indexer_host_pool = DeepSeekV4PagedHostPool(
-            pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER),
-            device_buffers=kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            item_bytes=(
-                kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].shape[1]
-                * kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer[0].element_size()
-            ),
-            num_host_pages=num_host_pages,
-            slot_page_size=page_size,
-            layout=get_memory().hicache_mem_layout,
-            allocator_type=_get_allocator_type(),
+        entries.append(
+            build_pool_entry(
+                name=PoolName.DEEPSEEK_V4_C4,
+                host_pool=c4_host_pool,
+                device_pool=kvcache.c4_kv_pool,
+                layer_mapping=c4_layer_mapping,
+                transfer_layer_num=transfer_layer_num,
+            )
         )
-        entries.extend(
-            [
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            entries.append(
                 build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    host_pool=c4_host_pool,
-                    device_pool=kvcache.c4_kv_pool,
-                    layer_mapping=c4_layer_mapping,
-                    transfer_layer_num=transfer_layer_num,
-                ),
-                build_pool_entry(
-                    name=PoolName.DEEPSEEK_V4_C4_INDEXER,
-                    host_pool=c4_indexer_host_pool,
+                    name=region.name,
+                    host_pool=DeepSeekV4PagedHostPool(
+                        pool_name=str(region.name),
+                        device_buffers=region.device_buffers,
+                        item_bytes=region.item_bytes,
+                        num_host_pages=num_host_pages,
+                        slot_page_size=page_size,
+                        layout=get_memory().hicache_mem_layout,
+                        allocator_type=_get_allocator_type(),
+                        page_aligned_only=region.page_aligned_only,
+                    ),
                     device_pool=kvcache.c4_indexer_kv_pool,
                     layer_mapping=c4_layer_mapping,
                     transfer_layer_num=transfer_layer_num,
-                ),
-            ]
-        )
+                )
+            )
 
         if not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -1279,6 +1343,7 @@ class _DeepSeekV4Strategy(StackStrategy):
             for name, src in (
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),

@@ -158,7 +158,7 @@ python3 -m sglang.bench_serving \\
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --model {{MODEL_NAME}} \\

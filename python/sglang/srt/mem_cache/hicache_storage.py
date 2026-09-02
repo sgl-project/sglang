@@ -66,6 +66,9 @@ class PoolName(str, Enum):
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
     DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    # FP4 indexer splits the indexer cache into separate payload/scale buffers,
+    # so it needs a second pool alongside DEEPSEEK_V4_C4_INDEXER.
+    DEEPSEEK_V4_C4_INDEXER_SCALE = "deepseek_v4_c4_indexer_scale"
     DEEPSEEK_V4_C128 = "deepseek_v4_c128"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
