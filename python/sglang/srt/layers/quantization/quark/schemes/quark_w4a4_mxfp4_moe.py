@@ -23,10 +23,10 @@ from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import is_gfx95_supported
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -45,8 +45,29 @@ __all__ = ["QuarkW4A4MXFp4MoE"]
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
+
+
+# gfx1250's grouped MoE GEMM reads weight scales in the n32k4 layout
+# (moe_shuffle_scale -> shuffle_scale_n32k4), not the e8m0_shuffle layout used by
+# gfx950. Using the wrong layout silently corrupts the dequant scales.
+_is_gfx1250 = is_gfx1250_supported()
+
+# The gfx1250 a8w4 grouped MoE kernel consumes (16,16)-preshuffled FP4 weights
+# (see aiter op_tests/test_flydsl_grouped_gemm_gfx1250.py, which always does
+# shuffle_weight(w, layout=(16,16)); the DSv4 fp8.py path shuffles the same way
+# when AITER_FORCE_A8W4 is set). Historically this scheme only shuffled on gfx95
+# (_is_shuffle_moe_mxfp4), so on gfx1250 the raw (unshuffled) weight layout was
+# fed to a kernel expecting the shuffled one -> garbage. Mirror DSv4: shuffle
+# whenever the a8w4 path is forced on gfx1250. SGLANG_MOE_SHUFFLE_GFX1250=false
+# reproduces the old (unshuffled) behavior for A/B comparison.
+_use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
+_shuffle_moe_gfx1250 = (
+    _is_gfx1250
+    and _use_aiter_a8w4
+    and get_bool_env_var("SGLANG_MOE_SHUFFLE_GFX1250", "true")
+)
 
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -814,18 +835,40 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w2_weight_scale.dtype == torch.uint8
 
         # Pre-shuffle weight scales
-        s0, s1, _ = layer.w13_weight_scale.shape
-        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
-        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+        if _is_gfx1250:
+            # gfx1250 grouped MoE GEMM consumes B-scales in the n32k4 layout.
+            num_experts = layer.w13_weight_scale.shape[0]
+            layer.w13_weight_scale.data = moe_shuffle_scale(
+                layer.w13_weight_scale.contiguous(),
+                experts_cnt=num_experts,
+                is_guinterleave=True,
+                gate_up=True,
+            )
+            layer.w2_weight_scale.data = moe_shuffle_scale(
+                layer.w2_weight_scale.contiguous(), experts_cnt=num_experts
+            )
+        else:
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
 
-        s0, s1, _ = layer.w2_weight_scale.shape
-        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
-        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
-
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
         # Pre-shuffle weight
-        if _is_shuffle_moe_mxfp4:
+        if _is_gfx1250:
+            # gfx1250 grouped kernel expects GUGU (gate/up row-interleaved) layout.
+            # moe_shuffle_weight does interleave_gate_up_rows then tile shuffle,
+            # which is what grouped_gemm_gfx1250_a8w4 reads.
+            layer.w13_weight.data = moe_shuffle_weight(
+                layer.w13_weight.contiguous(), is_guinterleave=True, gate_up=True
+            )
+            layer.w2_weight.data = moe_shuffle_weight(layer.w2_weight.contiguous())
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+        elif _is_shuffle_moe_mxfp4:
             layer.w13_weight.data = shuffle_weight(
                 layer.w13_weight.contiguous(), (16, 16)
             )
@@ -879,6 +922,13 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
+        if _is_gfx1250:
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            _fused_moe_kwargs = {"gate_mode": GateMode.INTERLEAVE.value}
+        else:
+            _fused_moe_kwargs = None
+
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -886,5 +936,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu,
+            fused_moe_kwargs=_fused_moe_kwargs,
         )
         return self.runner.run(dispatch_output, quant_info)
