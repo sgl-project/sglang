@@ -246,6 +246,43 @@ class ChatToolForwardingTestCase(CustomTestCase):
         self.assertEqual(request_prompts, [[4, 5, 6]])
         self.assertEqual(engine_prompts, [[4, 5, 6]])
 
+    def test_make_request_normalizes_none_stream_to_false(self):
+        """A forwarded request may carry ``stream=None`` — sgl-model-gateway
+        rewrites an unset stream to None while proxying. ``ChatCompletionRequest``
+        declares ``stream: bool`` (non-Optional), so forwarding ``None`` verbatim
+        raises a Pydantic ValidationError and the client gets a 400. _make_request
+        normalizes None -> False at the hop. Regression for issue #34209."""
+        serving = make_serving()
+        seen = {}
+
+        def fake_process(chat_request, is_multimodal):
+            seen["stream"] = chat_request.stream
+            return MessageProcessingResult(
+                prompt="prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+
+        serving._process_messages = Mock(side_effect=fake_process)
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=None,  # gateway-rewritten unset stream
+            store=False,
+        )
+
+        # Pre-fix: ChatCompletionRequest(stream=None) raised ValidationError
+        # before _process_messages ran.
+        asyncio.run(
+            serving._make_request(request, None, serving.tokenizer_manager.tokenizer)
+        )
+
+        self.assertIs(seen["stream"], False)
+
 
 class ReasoningRequestForwardingTestCase(unittest.TestCase):
     def test_create_responses_uses_processed_reasoning_state(self):
