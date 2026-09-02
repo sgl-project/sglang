@@ -281,6 +281,14 @@ class TreeNode:
         self.event_hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # Logical-page KV sharding: rotation base of the chain this node's
+        # KV pages belong to — the owner rank of position-page P along the
+        # chain is (rotation_base + P) % shard_size. A host-side mirror of
+        # the loc-derived owners (node.value is a device tensor; reading it
+        # would put a D2H sync on the alloc path): set at insert from the
+        # inserting request's host base, copied on split, read through
+        # req.last_node at alloc time. None when sharding is off.
+        self.rotation_base: Optional[int] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -473,10 +481,19 @@ class RadixCache(BasePrefixCache):
             # Debug/test fallback: use token ids themselves as values.
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len, last_node = self._insert_helper(
-            self.root_node, key, value, priority, chunked
+        prefix_len, last_node, tail_declined = self._insert_helper(
+            self.root_node,
+            key,
+            value,
+            priority,
+            chunked,
+            rotation_base=params.rotation_base,
         )
-        return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
+        return InsertResult(
+            prefix_len=prefix_len,
+            last_device_node=last_node,
+            rotation_tail_declined=tail_declined,
+        )
 
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
@@ -514,9 +531,20 @@ class RadixCache(BasePrefixCache):
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=radix_key,
+                    value=values,
+                    priority=priority,
+                    rotation_base=req.kv_rotation_base,
+                )
             )
-            freed_end = result.prefix_len
+            if result.rotation_tail_declined:
+                # The un-matched tail was refused (rotation-base discontinuity
+                # with the matched chain), so its pages stayed request-owned:
+                # free them here together with the duplicates.
+                freed_end = key_len
+            else:
+                freed_end = result.prefix_len
         else:
             freed_end = key_len
 
@@ -560,8 +588,20 @@ class RadixCache(BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
+                rotation_base=req.kv_rotation_base,
             )
         )
+        if result.rotation_tail_declined:
+            # Rotation-base discontinuity with the matched chain (pipelined
+            # batches raced this request's insert against another chain over
+            # the same prefix). Adopting the canonical locs would leave this
+            # request's row mixing two rotation runs, which the cyclic-owner
+            # gather contract forbids — keep the request entirely on its own
+            # pages: no dedup free, no rebind, no protection change. The
+            # final cache_finished_req releases everything past the
+            # protected prefix.
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            return
         new_prefix_len = result.prefix_len
 
         self.token_to_kv_pool_allocator.free_segment(
@@ -734,6 +774,9 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # The rotation base is constant along a chain (position-page P keeps
+        # owner (b + P) % N on both sides of the split).
+        new_node.rotation_base = child.rotation_base
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -764,6 +807,7 @@ class RadixCache(BasePrefixCache):
         value,
         priority: int = 0,
         chunked: bool = False,
+        rotation_base: Optional[int] = None,
     ):
         # Convert None priority to 0
         if priority is None:
@@ -773,7 +817,7 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0, node
+            return 0, node, False
 
         child_key = key.child_key(self.page_size)
 
@@ -798,10 +842,29 @@ class RadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
+            if (
+                rotation_base is not None
+                and node is not self.root_node
+                and node.rotation_base != rotation_base
+            ):
+                # Logical-page KV sharding: the tail's pages were allocated
+                # under a different rotation base than the chain it would
+                # attach to (two requests sharing a prefix were planned in
+                # pipelined batches before either's insert landed, or the
+                # match was capped below the cached prefix). Grafting it
+                # would create a cached path whose page owners are not one
+                # cyclic run — the padded-allgather / k//N translation
+                # contract — so later readers would crash on a negative pad
+                # or silently read the wrong rank's scratch rows. Decline:
+                # the tail stays request-owned and uncached.
+                return total_prefix_length, node, True
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            # Chain-constant under sharding: the decline guard above
+            # guarantees the tail continues the matched prefix's rotation.
+            new_node.rotation_base = rotation_base
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
@@ -810,7 +873,7 @@ class RadixCache(BasePrefixCache):
             # Hash will be computed lazily during event emission
             self.kv_events.record_store(new_node)
             node = new_node
-        return total_prefix_length, node
+        return total_prefix_length, node, False
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
