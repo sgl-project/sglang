@@ -386,10 +386,8 @@ sgl-eval run gsm8k \\
     // RadixArk NVFP4 W4A4 checkpoint (ModelOpt 0.46.0, abs-max, group size
     // 16): routed and shared experts plus the dense MLPs are FP4; attention,
     // router, MTP, embeddings, and the vision tower stay BF16. Validated on
-    // 4x GB300 on the stock image with both KV/DSA pairings: the speed rows
-    // were measured with BF16 KV + TileLang DSA, while FP8 KV + TRT-LLM DSA
-    // passed smoke, a 200-example GSM8K check, a 600-request soak, and the
-    // TB2.1 run without separate speed measurements.
+    // 4x GB300 and 4x B300 with both KV/DSA pairings; the benchmark rows
+    // carry measured speed for both pairings on the current release image.
     {
       match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4" },
       nnodes: 1,
