@@ -2161,6 +2161,16 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             get_global_forced_attn_backend()
             or self._component_attention_backend_override
         )
+        if selected_backend is None:
+            selected_backend = next(
+                (
+                    module._selected_attention_backend
+                    for module in self.modules()
+                    if isinstance(module, MiniMaxH3Attention)
+                    and module._selected_attention_backend is not None
+                ),
+                None,
+            )
         backend = get_attn_backend(
             self.arch.attention_head_dim,
             _BF16_DTYPE,
