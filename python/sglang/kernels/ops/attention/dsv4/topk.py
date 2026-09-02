@@ -88,7 +88,9 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
     module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
-    module.topk_plan(seq_lens, metadata, static_threshold)
+    # ROCm compiles out the cluster path, the only consumer of this plan.
+    if not is_hip_runtime():
+        module.topk_plan(seq_lens, metadata, static_threshold)
     return metadata
 
 
