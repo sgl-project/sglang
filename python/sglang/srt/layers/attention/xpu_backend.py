@@ -624,21 +624,21 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                expand = self.forward_metadata_spec_decode_expand
                 o_expand, lse_expand = self._cascade_expand_attn(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
-                    value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    expand.page_table,
-                    expand.cache_seqlens_int32,
+                    key_cache,
+                    value_cache,
+                    self.forward_metadata_spec_decode_expand,
                     layer.scaling,
                     layer.logit_cap,
+                    window_size,
+                    sinks,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
-                    lse_expand.contiguous(),
+                    lse_expand,
                 )
             else:
                 o = result
@@ -772,66 +772,64 @@ class XPUAttentionBackend(AttentionBackend):
     def _cascade_expand_attn(
         self,
         q: torch.Tensor,
-        k_flat: torch.Tensor,
-        v_flat: torch.Tensor,
-        page_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        expand: FlashAttentionMetadata,
         scale: float,
         softcap: float,
+        window_size: tuple[int, int],
+        sinks: Optional[torch.Tensor],
     ):
         """Tree-branch ("expand") half of cascade target-verify / draft-decode.
 
         The expand ``page_table`` stores *token-slot* indices (absolute positions
-        in the flat KV cache), not paged block indices, so it cannot be fed to the
-        paged decode kernel on XPU (which has no ``page_size == 1`` variant -- only
-        64/128). Feeding token-slots as block indices makes every branch key
-        resolve to ``page_table[row, 0]``'s block, so the scattered draft slots are
-        never read (tree-verify KV mis-indexing).
+        in the flat KV cache), not paged block indices, so the cache has to be
+        handed to the kernel as a ``page_size == 1`` paged cache. Passing the
+        token-slots against the backend's real ``page_size`` view instead makes
+        every branch key resolve to ``page_table[row, 0]``'s block, so the
+        scattered draft slots are never read (tree-verify KV mis-indexing).
 
-        Each query row attends to only a small set (<= ``speculative_num_draft_
-        tokens``) of scattered branch slots. We gather them densely into a *ragged*
-        buffer (valid slots packed per row, matching ``cu_seqlens_k``) and run the
-        non-paged varlen decode kernel (``flash_attn_varlen_func`` with
-        ``return_softmax_lse=True``), which stays in bf16 with no padding. The
-        result is merged with the paged prefix pass via ``merge_state_v2``.
+        The paged decode kernel has no ``page_size == 1`` variant (only 64/128),
+        so sgl-kernel-xpu routes that shape through its gather-and-varlen
+        workaround (sgl-project/sgl-kernel-xpu#454): the scattered slots are
+        gathered into a dense ragged buffer in ``cu_seqlens_k`` order and run
+        through the non-paged varlen kernel. That relies on the expand
+        ``page_table`` packing its valid entries first per row, which is how
+        both the draft-decode and target-verify metadata build it.
         """
-        num_rows = q.shape[0]
-        pt = page_table.to(torch.long)
-        seqlens = cache_seqlens.to(torch.long)
-        m = pt.shape[1]
+        # The workaround dispatches to the non-paged varlen kernel, which has no
+        # sink-logit support; drop-on-the-floor here would silently unsink the
+        # branch half of the merge.
+        assert (
+            sinks is None
+        ), "cascade expand attention does not support attention sinks"
 
-        # Gather the scattered branch KV into a dense ragged buffer. ``valid`` is
-        # row-major and the page_table packs valid entries first per row, so
-        # ``pt[valid]`` yields slots in exactly cu_seqlens_k order.
-        valid = torch.arange(m, device=pt.device).unsqueeze(0) < seqlens.unsqueeze(1)
-        flat_slots = pt[valid]
-        k_ragged = k_flat.index_select(0, flat_slots).contiguous()
-        v_ragged = v_flat.index_select(0, flat_slots).contiguous()
-
-        cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens.to(torch.int32), dim=0, dtype=torch.int32),
-            (1, 0),
+        # (num_pages, page_size, H, D) -> (num_tokens, 1, H, D): a view, since the
+        # caller's cache is itself a view of the flat KV buffer.
+        k_cache_unpaged = key_cache.reshape(
+            -1, 1, key_cache.shape[-2], key_cache.shape[-1]
         )
-        cu_seqlens_q = torch.arange(0, num_rows + 1, dtype=torch.int32, device=q.device)
-        max_seqlen_k = int(seqlens.max().item()) if num_rows > 0 else 0
+        v_cache_unpaged = value_cache.reshape(
+            -1, 1, value_cache.shape[-2], value_cache.shape[-1]
+        )
 
-        # GQA/MQA is handled inside the kernel via q_group_size = Hq // Hk, so we
-        # pass K/V with their native Hk heads (no repeat_interleave needed).
-        out, lse, *_ = flash_attn_varlen_func(
-            q=q.contiguous(),
-            k=k_ragged,
-            v=v_ragged,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=1,
-            max_seqlen_k=max_seqlen_k,
+        o_expand, lse_expand, *_ = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache_unpaged,
+            v_cache=v_cache_unpaged,
+            page_table=expand.page_table,
+            cache_seqlens=expand.cache_seqlens_int32,
+            cu_seqlens_q=expand.cu_seqlens_q,
+            cu_seqlens_k_new=None,
+            max_seqlen_q=expand.max_seq_len_q,
             softmax_scale=scale,
             causal=False,
+            window_size=window_size,
             softcap=softcap,
             return_softmax_lse=True,
         )
-        # varlen returns softmax_lse as (Hq, total_q); transpose to (num_rows, Hq).
-        return out, lse.transpose(0, 1).contiguous()
+        # softmax_lse comes back as (Hq, total_q); merge_state wants (total_q, Hq).
+        return o_expand, lse_expand.T.contiguous()
 
     def forward_decode(
         self,
@@ -1023,21 +1021,21 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    expand = self.forward_metadata_spec_decode_expand
                     o_expand, lse_expand = self._cascade_expand_attn(
                         q_reshaped,
-                        key_cache.reshape(-1, layer.tp_k_head_num, layer.head_dim),
-                        value_cache.reshape(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        expand.page_table,
-                        expand.cache_seqlens_int32,
+                        key_cache,
+                        value_cache,
+                        self.forward_metadata_spec_decode_expand,
                         layer.scaling,
                         layer.logit_cap,
+                        window_size,
+                        sinks,
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
-                        lse_expand.contiguous(),
+                        lse_expand,
                     )
                 else:
                     o = result
