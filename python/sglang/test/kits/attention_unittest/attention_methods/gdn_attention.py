@@ -30,7 +30,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -270,7 +270,8 @@ class MockGDNModelRunner(ModelRunner):
             # derives it from hf_config + page_size, which needs a real model.
             _mamba_cache_chunk_size=64,
         )
-        self.server_args = self._server_args_override.install()
+        self._server_args_override.install()
+        self.server_args = get_server_args()
         cache_shape = Mamba2StateShape.create(
             tp_world_size=1,
             intermediate_size=case.num_v_heads * head_v_dim,
