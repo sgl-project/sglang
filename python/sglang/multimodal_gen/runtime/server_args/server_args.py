@@ -1788,16 +1788,7 @@ class ServerArgs(DisaggServerArgsMixin):
         component_paths: dict[str, str] = {}
         component_weights_paths = dict(self.component_weights_paths)
         for component, path in self.component_paths.items():
-            supports_weight_file_override = (
-                is_dit_component_name(component)
-                or is_text_encoder_component_name(component)
-                or is_image_encoder_component_name(component)
-                or is_vae_component_name(component)
-            )
-            if (
-                not supports_weight_file_override
-                or not is_explicit_weight_file_reference(path)
-            ):
+            if not is_explicit_weight_file_reference(path):
                 component_paths[component] = path
                 continue
             existing = component_weights_paths.get(component)

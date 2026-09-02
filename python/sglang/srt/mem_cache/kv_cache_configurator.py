@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_context,
     get_disagg,
     get_exec,
@@ -83,6 +84,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
+    cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
@@ -293,8 +295,24 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
+    def _build_mha_quant_method(self, *, num_layers: int):
+        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+            return get_kv_cache_quant_method("cpu_fp8_e4m3")
+        return self._build_fp4_quant_method(num_layers=num_layers)
+
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if self.use_mla_backend:
+                raise ValueError("CPU FP8 KV cache is only supported for MHA.")
+            if not cpu_has_amx_support():
+                raise ValueError("CPU FP8 KV cache requires Intel AMX support.")
+            configured_backends = set(attention_backends())
+            if configured_backends - {"intel_amx"}:
+                raise ValueError(
+                    "CPU FP8 KV cache requires the intel_amx attention backend."
+                )
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
@@ -1228,14 +1246,15 @@ class KVCacheConfigurator:
                     mha_pool_class=mha_pool_class,
                 )
             else:
-                quant_method = None
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                quant_method = self._build_mha_quant_method(
+                    num_layers=self.layer_info.num_effective_layers
+                )
+                if quant_method is not None and is_float4_e2m1fn_x2(
+                    self.kv_cache_dtype
+                ):
                     assert (
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
-                    quant_method = self._build_fp4_quant_method(
-                        num_layers=self.layer_info.num_effective_layers
-                    )
                 token_to_kv_pool = self._build_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
@@ -1740,7 +1759,7 @@ class KVCacheConfigurator:
                 if self.layer_info.start_layer <= i < self.layer_info.end_layer
             ]
         )
-        quant_method = self._build_fp4_quant_method(
+        quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale

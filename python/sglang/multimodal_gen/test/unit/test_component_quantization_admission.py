@@ -5,6 +5,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+from torch import nn
+
 from sglang.multimodal_gen.runtime.loader.component_loaders.adapter_loader import (
     AdapterLoader,
 )
@@ -14,6 +17,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.bridge_loader import
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     ComponentLoader,
+    NativeComponentLoaderRequired,
     PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.diffusion_decoder_loader import (
@@ -38,6 +42,42 @@ class _TestLoader(PlainStateDictComponentLoader):
     pass
 
 
+class _WeightOverrideLoader(PlainStateDictComponentLoader):
+    def __init__(self, error: Exception):
+        super().__init__()
+        self.error = error
+        self.native_called = False
+
+    def load_customized(self, *args, **kwargs):
+        raise self.error
+
+    def load_native(self, *args, **kwargs):
+        self.native_called = True
+        return object()
+
+
+class _ModuleLoader(ComponentLoader):
+    def load_customized(self, *args, **kwargs):
+        return nn.Linear(1, 1)
+
+
+def _loader_server_args(component_weights_paths, *, fsdp_requested=False):
+    disabled_components = set()
+    return SimpleNamespace(
+        component_precisions={},
+        component_quantizations={},
+        component_weights_paths=component_weights_paths,
+        pipeline_config=SimpleNamespace(native_only_components=()),
+        resolve_component_attention_backend=lambda _name: (None, None),
+        requested_component_attention_backend=lambda _name: None,
+        should_direct_gpu_weight_load_component=lambda _name: False,
+        should_start_component_on_cpu=lambda _name: True,
+        should_use_fsdp_for_component=lambda _name: fsdp_requested,
+        disable_fsdp_for_component=lambda name: disabled_components.add(name),
+        disabled_components=disabled_components,
+    )
+
+
 class TestComponentQuantizationAdmission(unittest.TestCase):
     def test_plain_loader_admits_its_exact_precision(self):
         server_args = SimpleNamespace(component_precisions={"vocoder": "fp16"})
@@ -60,6 +100,7 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         server_args = SimpleNamespace(
             component_precisions={},
             component_quantizations={},
+            component_weights_paths={},
             should_direct_gpu_weight_load_component=lambda component: component
             == "vocoder",
         )
@@ -75,12 +116,14 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         server_args = SimpleNamespace(
             component_precisions={},
             component_quantizations={},
+            component_weights_paths={},
             should_direct_gpu_weight_load_component=lambda component: component
             == "audio_vae",
         )
 
         with self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "does not support direct GPU"
+            ComponentCheckpointUnsupportedError,
+            "Direct GPU loading is not implemented",
         ):
             VAELoader().load("/model/audio_vae", server_args, "audio_vae", "diffusers")
 
@@ -107,6 +150,71 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
                 "/cache/vocoder.safetensors",
             )
 
+    def test_unsupported_loader_rejects_weight_override_before_loading(self):
+        server_args = _loader_server_args({"pe": "/weights/model.safetensors"})
+
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            r"--component-paths\.pe.*config and weights",
+        ):
+            ComponentLoader().load("/base/pe", server_args, "pe", "transformers")
+
+    def test_weight_override_failure_never_falls_back_to_base_component(self):
+        loader = _WeightOverrideLoader(ValueError("incompatible checkpoint"))
+        server_args = _loader_server_args(
+            {"text_encoder": "/weights/model.safetensors"}
+        )
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.current_platform.get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            self.assertRaisesRegex(RuntimeError, "fallback would ignore it"),
+        ):
+            loader.load(
+                "/base/text_encoder", server_args, "text_encoder", "transformers"
+            )
+
+        self.assertFalse(loader.native_called)
+
+    def test_library_fallback_requires_a_complete_component_override(self):
+        loader = _WeightOverrideLoader(
+            NativeComponentLoaderRequired("delegate to Transformers")
+        )
+        server_args = _loader_server_args(
+            {"text_encoder": "/weights/model.safetensors"}
+        )
+
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.current_platform.get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError,
+                r"--component-paths\.text_encoder.*config and weights",
+            ),
+        ):
+            loader.load(
+                "/base/text_encoder", server_args, "text_encoder", "transformers"
+            )
+
+        self.assertFalse(loader.native_called)
+
+    def test_materialized_module_decides_fsdp_support(self):
+        server_args = _loader_server_args({}, fsdp_requested=True)
+        with patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "component_loader.current_platform.get_available_gpu_memory",
+            side_effect=(10.0, 9.0),
+        ):
+            _ModuleLoader().load("/base/module", server_args, "module", "diffusers")
+
+        self.assertEqual(server_args.disabled_components, {"module"})
+
     def test_plain_checkpoint_config_is_accepted(self):
         config = {"_class_name": "TestModel"}
 
@@ -118,6 +226,76 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             loaded = _TestLoader().load_component_config("/model/component", "test")
 
         self.assertIs(loaded, config)
+
+    def test_bridge_consumes_exact_component_weight_override(self):
+        loader = BridgeLoader()
+        bridge_config = SimpleNamespace(update_model_arch=lambda _config: None)
+        server_args = SimpleNamespace(
+            component_weights_paths={
+                "dual_tower_bridge": "owner/repo/bridge.safetensors"
+            },
+            model_paths={},
+            pipeline_config=SimpleNamespace(bridge_config=bridge_config),
+            should_use_fsdp_for_component=lambda _name: False,
+            should_start_component_on_cpu=lambda _name: False,
+            hsdp_replicate_dim=1,
+            hsdp_shard_dim=1,
+            pin_cpu_memory=False,
+        )
+
+        with (
+            patch.object(
+                loader,
+                "load_component_config",
+                return_value={"_class_name": "MOVADualTowerModel"},
+            ),
+            patch.object(
+                loader,
+                "resolve_component_weights_path",
+                return_value="/cache/bridge.safetensors",
+            ) as resolve_weights,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "bridge_loader._list_safetensors_files",
+                return_value=["/cache/bridge.safetensors"],
+            ) as list_weights,
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "bridge_loader.ModelRegistry.resolve_model_cls",
+                return_value=(nn.Linear, None),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "bridge_loader.resolve_precision",
+                return_value=torch.bfloat16,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "bridge_loader.get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "bridge_loader.maybe_load_fsdp_model",
+                return_value=nn.Linear(1, 1),
+            ) as load_weights,
+        ):
+            loaded = loader.load_customized(
+                "/base/dual_tower_bridge",
+                server_args,
+                "dual_tower_bridge",
+            )
+
+        self.assertIsInstance(loaded, nn.Linear)
+        resolve_weights.assert_called_once_with(
+            "/base/dual_tower_bridge", server_args, "dual_tower_bridge"
+        )
+        list_weights.assert_called_once_with("/cache/bridge.safetensors")
+        self.assertEqual(
+            load_weights.call_args.kwargs["weight_dir_list"],
+            ["/cache/bridge.safetensors"],
+        )
+        self.assertFalse(load_weights.call_args.kwargs["fsdp_inference"])
 
     def test_all_quantization_metadata_layouts_fail_closed(self):
         configs = {
@@ -217,7 +395,6 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
         load_weights.assert_not_called()
 
     def test_upsampler_uses_exact_component_weight_override(self):
-        self.assertTrue(UpsamplerLoader.supports_component_weight_override)
         server_args = SimpleNamespace(
             component_weights_paths={"spatial_upsampler": "owner/repo/upsampler"}
         )
