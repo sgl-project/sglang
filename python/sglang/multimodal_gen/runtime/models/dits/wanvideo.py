@@ -1339,12 +1339,14 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # Initialize Wan-specific parameters
         teacache_params = ctx.teacache_params
         use_ret_steps = teacache_params.use_ret_steps
-        start_skipping, end_skipping = teacache_params.get_skip_boundaries(
-            ctx.num_inference_steps, ctx.do_cfg
-        )
 
-        # Determine boundary step
-        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        # Boundary on the global step, not the expert-local cnt: the MoE
+        # low-noise expert's cnt starts at 0 mid-schedule, so a cnt-based
+        # boundary would force its early local steps and never force the final
+        # global step.
+        is_boundary_step = teacache_params.is_step_boundary(
+            ctx.current_timestep, ctx.num_inference_steps
+        )
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]

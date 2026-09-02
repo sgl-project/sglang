@@ -117,9 +117,20 @@ class TeaCacheCalibrator:
         # expert -> {"prev": {branch_key: (prev_e, prev_x)},
         #            "rows": {step_index: [count, diff_tm_mean, diff_x_mean]}}
         self._experts: dict[str, dict] = {}
+        self._seen_nonzero_step = False
 
     def _expert(self, expert: str) -> dict:
         return self._experts.setdefault(expert, {"prev": {}, "rows": {}})
+
+    def begin_sample(self) -> None:
+        """Drop carried predecessors for every expert at a sample boundary.
+
+        The MoE low-noise expert's first call happens at a later global step, so
+        its ``prev`` would otherwise diff against the previous sample's last step.
+        """
+        for state in self._experts.values():
+            state["prev"].clear()
+        self._seen_nonzero_step = False
 
     def record(
         self,
@@ -135,10 +146,16 @@ class TeaCacheCalibrator:
         The first call of each (expert, branch) has no predecessor and yields a
         zero diff, which is harmless since early steps are always computed.
         """
+        # A global step 0 after any higher step is a new sample: drop every
+        # expert's predecessor (the low-noise expert never records step 0 itself).
+        if step_index == 0 and self._seen_nonzero_step:
+            self.begin_sample()
+        if step_index > 0:
+            self._seen_nonzero_step = True
+
         state = self._expert(expert)
         branch_key = "neg" if is_cfg_negative else "pos"
-        # step 0 starts a new sample: ignore the prior sample's last step.
-        prev = None if step_index == 0 else state["prev"].get(branch_key)
+        prev = state["prev"].get(branch_key)
 
         e = modulated_inp.detach()
         x = output.detach()

@@ -6,6 +6,7 @@ import unittest
 import numpy as np
 import torch
 
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 from sglang.multimodal_gen.runtime.cache.teacache_calibrate import (
     SINGLE_EXPERT,
     TeaCacheCalibrator,
@@ -106,6 +107,61 @@ class TestCalibratorFit(unittest.TestCase):
         # count=2, mean of diff_tm (1.0, 2.0) = 1.5
         self.assertEqual(row[0], 2)
         self.assertAlmostEqual(row[1], 1.5, places=5)
+
+
+class TestMoEStepBoundary(unittest.TestCase):
+    """Boundaries key on the global step, so a MoE two-expert schedule forces
+    the first steps and the final step regardless of which expert runs them."""
+
+    def test_two_expert_transition_and_final_step(self):
+        params = TeaCacheParams(start_skipping=2, end_skipping=-1)
+        n = 40  # high expert ~steps 0..26, low expert ~27..39
+        # First steps (high expert) are boundaries.
+        self.assertTrue(params.is_step_boundary(0, n))
+        self.assertTrue(params.is_step_boundary(1, n))
+        self.assertFalse(params.is_step_boundary(2, n))
+        # Low expert's first steps are NOT early boundaries (bug when keyed on
+        # the expert-local cnt, which restarts at 0 mid-schedule).
+        self.assertFalse(params.is_step_boundary(27, n))
+        self.assertFalse(params.is_step_boundary(28, n))
+        # The final global step IS forced (the low expert's local cnt never
+        # reaches 39, so a cnt-based boundary would skip it).
+        self.assertTrue(params.is_step_boundary(39, n))
+
+
+class TestCalibratorSampleBoundary(unittest.TestCase):
+    """Every expert's predecessor is dropped at a sample boundary, so the MoE
+    low-noise expert's first step is not diffed across prompts."""
+
+    def _run_prompt(self, calib, high_val, low_val):
+        # global steps 0..1 -> high expert, 2..3 -> low expert
+        for step in (0, 1):
+            calib.record(
+                torch.full((4,), float(high_val + step)),
+                torch.full((4,), float(high_val + step)),
+                step_index=step,
+                is_cfg_negative=False,
+                expert="high",
+            )
+        for step in (2, 3):
+            calib.record(
+                torch.full((4,), float(low_val + step)),
+                torch.full((4,), float(low_val + step)),
+                step_index=step,
+                is_cfg_negative=False,
+                expert="low",
+            )
+
+    def test_low_expert_first_step_not_diffed_across_prompts(self):
+        calib = TeaCacheCalibrator(degree=4)
+        self._run_prompt(calib, high_val=1.0, low_val=100.0)
+        self._run_prompt(calib, high_val=1.0, low_val=500.0)
+        # Low expert's first global step (2) must record a zero diff on both
+        # prompts; without the per-sample reset, prompt 2 would diff 500 vs the
+        # prompt-1 low tail and blow up.
+        low_step2 = calib._experts["low"]["rows"][2]
+        self.assertEqual(low_step2[1], 0.0)
+        self.assertEqual(low_step2[2], 0.0)
 
 
 if __name__ == "__main__":

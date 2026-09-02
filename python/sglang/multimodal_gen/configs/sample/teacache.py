@@ -98,3 +98,14 @@ class TeaCacheParams(CacheParams):
             end_skipping *= 2
 
         return start_skipping, end_skipping
+
+    def is_step_boundary(self, current_timestep: int, num_inference_steps: int) -> bool:
+        """Force-compute boundary keyed on the global step index.
+
+        Uses the per-step (non-CFG-doubled) boundaries so it is correct for MoE
+        dual-transformer schedules, where an expert's local counter starts at 0
+        mid-schedule: the global step still forces the first steps and the final
+        step regardless of which expert runs them.
+        """
+        start, end = self.get_skip_boundaries(num_inference_steps, do_cfg=False)
+        return current_timestep < start or current_timestep >= end

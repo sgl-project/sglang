@@ -244,6 +244,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support trajectory output for its coupled "
                 "video/audio denoise state"
             )
+        if self.enable_teacache and self.quality == "lossless":
+            raise ValueError(
+                "MiniMax H3 TeaCache is lossy and conflicts with "
+                "quality='lossless' (the exact-reference contract); request a "
+                "non-lossless quality tier to enable it"
+            )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
             if seed > _MINIMAX_H3_MAX_SIGNED_SEED:
