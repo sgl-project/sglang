@@ -255,25 +255,34 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
-    # Only monolithic decode cuda-graph capture is wired; piecewise prefill
-    # capture is not. Guard when the user opts into it.
+    # Prefill cuda-graph capture IS wired for the unified pool: the captured
+    # batch reads `out_cache_loc` out of the registry slot, which
+    # `populate_from_forward_batch` refills from the already-rebound (kernel-
+    # facing) loc before every replay, and the read tables are refilled
+    # out-of-graph from the live v2p.
+    #
+    # The FULL backend is the one exception, and not for a unified reason: its
+    # metadata path (`_init_full_cg_prefill_metadata`) exists only on the
+    # fa3/fa4 family. Any other backend lands in the decode-shaped
+    # `_apply_cuda_graph_metadata`, which has no EXTEND branch at all. Inkling
+    # declares FULL as a MODEL default, indistinguishable here from a flag the
+    # user typed, so warn and fall back rather than refuse to boot.
     _cg_cfg = cfg.cuda_graph_config
-    if _cg_cfg is not None and _cg_cfg.prefill.backend != Backend.DISABLED:
-        if cfg.cuda_graph_backend_prefill is not None:
-            raise ValueError(
-                "--enable-unified-memory supports decode cuda-graph "
-                "capture only; prefill capture is not wired (the prefill "
-                "graph runner bypasses the unified virtual->physical loc "
-                "rebind). Got --cuda-graph-backend-prefill="
-                f"{cfg.cuda_graph_backend_prefill!r}; pass "
-                "--cuda-graph-backend-prefill=disabled."
+    if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.FULL:
+        full_cg_backends = {"fa3", "fa4"}
+        backends = set(attention_backends_of(resolved_view(server_args)))
+        backends.discard(None)
+        if not backends <= full_cg_backends:
+            _cg_cfg.prefill.backend = Backend.DISABLED
+            logger.warning(
+                "--enable-unified-memory: disabling the FULL prefill "
+                "cuda-graph backend. It builds its block table in "
+                "_init_full_cg_prefill_metadata, which only %s implement; the "
+                "resolved attention backends are %s. Decode capture and the "
+                "other prefill backends are unaffected.",
+                sorted(full_cg_backends),
+                sorted(backends),
             )
-        _cg_cfg.prefill.backend = Backend.DISABLED
-        logger.warning(
-            "--enable-unified-memory: disabling prefill cuda-graph "
-            "capture (not wired for the unified pool's loc rebind); "
-            "decode capture is unaffected."
-        )
 
 
 def _validate_unified_memory_dcp(server_args: Any) -> None:

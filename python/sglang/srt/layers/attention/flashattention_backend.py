@@ -26,6 +26,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
     cp_attn_forward_extend,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVReadTables
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -649,8 +650,26 @@ class FlashAttentionBackend(AttentionBackend):
         m.cu_seqlens_q[1:].copy_(
             torch.cumsum(forward_batch.extend_seq_lens[:bs], dim=0)
         )
+        translating = self.kv_index_translator.is_translating
         max_seq_len_k = int(forward_batch.seq_lens_cpu[:bs].max().item())
-        if max_seq_len_k > 0:
+        if translating:
+            # Unified pool: the block table is a TRANSLATED page table, built
+            # straight into these capture-stable buffers from the LIVE v2p, so
+            # a page relocated by compaction since capture is picked up. Same
+            # substitution the eager extend branch makes in its `_unified_read`
+            # fixup; `build_index_table` emits page-granular kernel-facing ids
+            # directly, so there is no `// page_size` to undo.
+            self.kv_index_translator.build_index_table(
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=forward_batch.seq_lens[:bs],
+                into=KVReadTables(
+                    full=m.page_table,
+                    sliding_window=(
+                        m.swa_page_table if self.use_sliding_window_kv_pool else None
+                    ),
+                ),
+            )
+        elif max_seq_len_k > 0:
             # Build the block table like the eager extend branch: take every
             # page_size-th token slot from req_to_token and divide by page_size.
             # Identity for page_size == 1 (strided is 0..max_seq_len_k-1, //1).
@@ -676,11 +695,21 @@ class FlashAttentionBackend(AttentionBackend):
                 self.full_cg_prefill_swa_out_cache_loc.shape[0],
                 "full-CG prefill SWA write-location buffer",
             )
-            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            # Under the unified pool `out_cache_loc` was rebound to FULL-side
+            # KERNEL-FACING ids at ForwardBatch construction, so the full->swa
+            # map cannot be re-run on it -- those values index far past the swa
+            # v2p table (a device-side "index out of bounds" assert). Phase 2 of
+            # the write contract derives the swa loc from them instead.
+            swa_write_loc = (
+                self.kv_index_translator.sliding_window_write_loc_for(
+                    forward_batch.out_cache_loc
+                )
+                if translating
+                else self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
