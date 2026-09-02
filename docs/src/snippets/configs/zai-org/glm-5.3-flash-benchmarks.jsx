@@ -1,7 +1,7 @@
 export const benchmarks = [
   {
     match: { hw: "gb300", strategy: "low-latency" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -12,18 +12,18 @@ export const benchmarks = [
           max_concurrency: 16,
           num_prompts: 80,
         },
-        ttft_ms: 598.41,
-        tpot_ms: 6.43,
-        tokens_per_sec_per_gpu: 2280.83,
+        ttft_ms: 460.44,
+        tpot_ms: 6.32,
+        tokens_per_sec_per_gpu: 2464.5,
       },
     ],
     accuracy: { gsm8k_pct: 97.50 },
     notes:
-      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) on the current release-image tree (d6ab04bdf1), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept length confirmed 3.00 in the bench summary and server log): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,824.66 aggregate output tok/s after two discarded warmups. Simulated accept length makes this a throughput-mechanism number. Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems.",
+      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) on the current release image (tree fe236ea6c3), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept length confirmed 3.00 in the bench summary and server log): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,971.60 aggregate output tok/s after two discarded warmups — 8.0% above the previous image's 1,824.66, with the gain mostly in TTFT (460.44 ms vs 598.41 ms, -23%). Simulated accept length makes this a throughput-mechanism number. Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems.",
   },
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -34,17 +34,17 @@ export const benchmarks = [
           max_concurrency: 16,
           num_prompts: 80,
         },
-        ttft_ms: 609.9,
-        tpot_ms: 6.25,
-        tokens_per_sec_per_gpu: 2317.35,
+        ttft_ms: 459.5,
+        tpot_ms: 6.04,
+        tokens_per_sec_per_gpu: 2551.81,
       },
     ],
     notes:
-      "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,853.88 aggregate output tok/s — 1.6% above the BF16 + TileLang Low Latency row, with mean TPOT 6.25 ms vs 6.43 ms. Draft and target full-graph capture succeeded for this combination. The speed rows were measured with the NEXTN spelling and --disable-shared-experts-fusion, which resolve to the same runtime path as the published command on this tree.",
+      "The Low Latency recipe with FP8 KV + TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release image (tree fe236ea6c3), adaptive MTP 5/1/6 with SGLANG_SIMULATE_ACC_LEN=3 (accept 3.00): 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 2,041.45 aggregate output tok/s — 10.1% above the previous image's 1,853.88, with the gain mostly in TTFT (459.50 ms vs 609.90 ms, -25%) — and 3.5% above the BF16 + TileLang Low Latency row on the same image, with mean TPOT 6.04 ms vs 6.32 ms. Draft and target full-graph capture succeeded for this combination.",
   },
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "fp8-trtllm", dcp: "4", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -55,17 +55,17 @@ export const benchmarks = [
           max_concurrency: 16,
           num_prompts: 80,
         },
-        ttft_ms: 534.1,
-        tpot_ms: 7.31,
-        tokens_per_sec_per_gpu: 2100.76,
+        ttft_ms: 364.2,
+        tpot_ms: 6.15,
+        tokens_per_sec_per_gpu: 2594.11,
       },
     ],
     notes:
-      "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,680.61 aggregate output tok/s at a 3.937 accept length — about 10% below the non-DCP FP8 Low Latency row. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch.",
+      "The Low Latency recipe with FP8 KV + TRT-LLM DSA and DCP4 (--dcp-size 4 --dcp-comm-backend a2a --dcp-replicate-q-proj) on 4x GB300, final weights (c5b82b63e37b) on the current release image (tree fe236ea6c3), adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 2,075.29 aggregate output tok/s at a ~3.9 accept length — 23.5% above the previous image's 1,680.61 and now at parity with the non-DCP FP8 Low Latency row on this image; the old ~10% DCP deficit no longer holds. TRT-LLM DSA DCP decode returns the LSE natively, so this arm needs no patch.",
   },
   {
     match: { hw: "gb300", strategy: "low-latency", kvDsaPair: "bf16-tilelang", dcp: "4", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -76,17 +76,17 @@ export const benchmarks = [
           max_concurrency: 16,
           num_prompts: 80,
         },
-        ttft_ms: 510.0,
-        tpot_ms: 8.0,
-        tokens_per_sec_per_gpu: 1957.25,
+        ttft_ms: 288.29,
+        tpot_ms: 6.93,
+        tokens_per_sec_per_gpu: 2414.1,
       },
     ],
     notes:
-      "The Low Latency recipe with BF16 KV + TileLang DSA and DCP4 on 4x GB300, final weights (c5b82b63e37b) on the d6ab04bdf1 tree, adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,565.8 aggregate output tok/s at a 3.90 accept length. TileLang DSA DCP decode needs the LSE fix that ships in the current release image.",
+      "The Low Latency recipe with BF16 KV + TileLang DSA and DCP4 on 4x GB300, final weights (c5b82b63e37b) on the current release image (tree fe236ea6c3), adaptive MTP 5/1/6 with full decode graph: 80 random requests at 1,024 input / 256 output tokens and concurrency 16 produced 1,931.28 aggregate output tok/s at a 3.90 accept length — 23.3% above the previous image's 1,565.8. TileLang DSA DCP decode needs the LSE fix that ships in the current release image.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -128,11 +128,11 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 97.50 },
     notes:
-      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b) on the current release-image tree (d6ab04bdf1), speculative decoding off, after two discarded warmups per row: 1,161.22 / 2,660.24 / 4,828.33 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens). The server ran exactly the published cell command. Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,202.07 / 2,696.20 / 4,634.47 tok/s — within 4% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
+      "Measured on 4x GB300 (TP4/EP4) with the final weights (zai-org/GLM-5.3-Flash, c5b82b63e37b), speculative decoding off, after two discarded warmups per row: 1,161.22 / 2,660.24 / 4,828.33 aggregate output tok/s at concurrency 16 / 64 / 256 (80 / 320 / 1,280 random requests at 1,024 input / 256 output tokens); re-verified on the current release image (tree fe236ea6c3) within 3%. The server ran exactly the published cell command. Throughput at 256 is still scaling but sublinear (prefill queueing). Accuracy is from the shared non-simulated full GSM8K gate: 97.50% with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,202.07 / 2,696.20 / 4,634.47 tok/s — within 4% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
   },
   {
     match: { hw: "gb300", strategy: "high-throughput", kvDsaPair: "fp8-trtllm", quant: "fp8" },
-    sglang_version: "d6ab04bdf1",
+    sglang_version: "fe236ea6c3",
     latencyPercentile: "Mean",
     speed: [
       {
@@ -174,7 +174,7 @@ export const benchmarks = [
     ],
     accuracy: { gsm8k_pct: 97.35 },
     notes:
-      "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b) on the current release-image tree (d6ab04bdf1), same protocol as the BF16 rows: 1,227.07 / 2,738.61 / 4,977.02 aggregate output tok/s at concurrency 16 / 64 / 256 — 2.9–5.7% above BF16 + TileLang across the curve, and the FP8 pool holds 12.6M tokens per rank vs 7.0M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,263.85 / 2,763.31 / 4,773.95 tok/s — within 5% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
+      "FP8 KV cache with TRT-LLM DSA on 4x GB300, final weights (c5b82b63e37b), same protocol as the BF16 rows: 1,227.07 / 2,738.61 / 4,977.02 aggregate output tok/s at concurrency 16 / 64 / 256 (re-verified on the current release image, tree fe236ea6c3, within 3%) — 2.9–5.7% above BF16 + TileLang across the curve, and the FP8 pool holds 12.6M tokens per rank vs 7.0M at BF16 (1.8x capacity at identical pool bytes). Accuracy is the full GSM8K gate on this variant: 97.35% vs 97.50% on BF16 KV, a 0.15-point gap inside sampling noise, with a 100% stop rate over all 1,319 problems. With HiCache L1+L2 (32 GB host tier, 16k prefill chunks) the same protocol measured 1,263.85 / 2,763.31 / 4,773.95 tok/s — within 5% of the non-HiCache rows; the random dataset has no prefix reuse, so L2 benefit was not exercised.",
   },
   {
     match: { hw: "gb300", strategy: "low-latency", quant: "nvfp4", kvDsaPair: "bf16-tilelang" },
