@@ -313,3 +313,22 @@ class NixlFileManager:
         except Exception as e:
             logger.error(f"Failed to close file descriptor {fd}: {e}")
             return False
+
+    def get_temp_file_path(self, file_path: str) -> str:
+        return file_path + ".tmp"
+
+    def finalize_temp_file(self, temp_path: str, final_path: str) -> bool:
+        """Atomically rename temp file to final path."""
+        try:
+            os.rename(temp_path, final_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to finalize {temp_path} -> {final_path}: {e}")
+            self.remove_file(temp_path)
+            return False
+
+    def remove_file(self, file_path: str) -> None:
+        try:
+            os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Failed to remove {file_path}: {e}")
