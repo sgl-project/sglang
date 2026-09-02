@@ -182,6 +182,7 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return

@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
@@ -7656,6 +7657,9 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
         alloc.free_full.assert_called_once_with(incoming_full)
+        # Never by indexing the tensor: the unified composite has no
+        # `full_to_swa_index_mapping` to index into.
+        alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()
         # not the inner allocator (skips the free-group defer) and not both halves
         alloc.full_attn_allocator.free.assert_not_called()
         alloc.free.assert_not_called()
@@ -8003,13 +8007,10 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, _ = build_fixture(self.cfg)
         seq = list(range(1, self.cfg.sliding_window_size + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=self._alloc(allocator, len(seq)),
-                swa_evicted_seqlen=len(seq),
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        # Window eviction already released the peers below the floor.
+        allocator.free_swa(evicted)
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=len(seq)))
         (leaf,) = _node_children(cache, cache.root_node_handle())
         lock_result = cache.inc_lock_ref(leaf) if lock_full else None
         try:
@@ -8041,11 +8042,9 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, _ = build_fixture(self.cfg)
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=sw
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        allocator.free_swa(evicted[:sw])
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         value = self._alloc(allocator, len(seq))
         full_available = allocator.full_attn_allocator.available_size()
         swa_available = allocator.swa_attn_allocator.available_size()
@@ -8069,11 +8068,9 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=sw
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        allocator.free_swa(evicted[:sw])
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         (prefix_node,) = _node_children(cache, cache.root_node_handle())
         (window_node,) = _node_children(cache, prefix_node)
         self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
@@ -8091,6 +8088,32 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
         self.assertIsNotNone(_device_value(cache, window_node, ComponentType.SWA))
         self.assertIsNotNone(_device_value(cache, window_node, ComponentType.FULL))
+        cache.sanity_check()
+
+    def test_dup_slice_below_eviction_floor_frees_full_only(self):
+        """A re-insert whose duplicate slice starts below the request's eviction
+        floor gives back only the full side there: those SWA peers are gone."""
+        sw = self.cfg.sliding_window_size
+        cache, allocator, _ = build_fixture(self.cfg)
+        seq = list(range(1, 2 * sw + 1))
+        key = RadixKey(array("q", seq))
+        cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
+
+        value = self._alloc(allocator, len(seq))
+        # Window eviction already released the peers below the floor.
+        allocator.free_swa(value[:sw])
+        with mock.patch.object(
+            cache, "_apply_cache_action", wraps=cache._apply_cache_action
+        ) as spy:
+            cache.insert(InsertParams(key=key, value=value, swa_evicted_seqlen=sw))
+        actions = [c.args[0] for c in spy.call_args_list]
+
+        full_only = [
+            i for a in actions if isinstance(a, FreeDeviceKVFullOnly) for i in a.indices
+        ]
+        both = [i for a in actions if isinstance(a, FreeDeviceKV) for i in a.indices]
+        torch.testing.assert_close(torch.cat(full_only), value[:sw])
+        torch.testing.assert_close(torch.cat(both), value[sw:])
         cache.sanity_check()
 
     def test_dec_swa_lock_only_early_release_keeps_full_lock(self):

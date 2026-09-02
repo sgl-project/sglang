@@ -38,6 +38,7 @@ from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecuto
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
 )
@@ -1875,19 +1876,41 @@ class BaseMultimodalProcessor(ABC):
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
     ) -> List[MultimodalDataItem]:
-        """Wrap final GPU features for dispatch to the scheduler."""
+        """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
-        for item in mm_items:
-            if isinstance(item.feature, torch.Tensor):
-                item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-            if isinstance(item.precomputed_embeddings, torch.Tensor):
-                item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
-                    item.precomputed_embeddings
+        updates = []
+        try:
+            for item in mm_items:
+                fields = (
+                    ("feature", item.feature),
+                    ("precomputed_embeddings", item.precomputed_embeddings),
                 )
+                for field, tensor in fields:
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    wrapped = self._wrap_tensor_for_cuda_ipc(tensor)
+                    setattr(item, field, wrapped)
+                    updates.append((item, field, tensor, wrapped))
+        except BaseException as error:
+            rollback_errors = []
+            for item, field, tensor, wrapped in reversed(updates):
+                try:
+                    if isinstance(wrapped, CudaIpcTensorTransportProxy):
+                        self.cudaipc_mmfeature_pool.cancel_proxy(wrapped)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+                finally:
+                    setattr(item, field, tensor)
+            if rollback_errors:
+                error.add_note(
+                    f"{len(rollback_errors)} CUDA IPC rollback operation(s) also failed"
+                )
+                raise error from rollback_errors[0]
+            raise
         return mm_items
 
     async def process_and_combine_mm_data_async(
