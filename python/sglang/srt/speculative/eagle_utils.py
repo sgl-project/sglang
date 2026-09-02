@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import top_k_renorm_probs, top_p_renorm_probs
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
+)
+from sglang.kernels.ops.speculative.tree_sampling import (
+    tree_speculative_sampling_target_only_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -339,6 +343,21 @@ def sgl_build_tree_kernel_triton(
         ),
         selected_index_stride=selected_index.stride(0),
     )
+
+
+def _get_spec_sampling_verify_fn(use_rejection_sampling: bool):
+    if use_rejection_sampling:
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        return chain_speculative_sampling_triton
+    if _is_hip:
+        return tree_speculative_sampling_target_only_triton
+
+    from sgl_kernel import tree_speculative_sampling_target_only
+
+    return tree_speculative_sampling_target_only
 
 
 def verify_tree_greedy_triton(
@@ -740,7 +759,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -770,23 +789,9 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        from sglang.kernels.ops.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
-
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        sampling_fn = _get_spec_sampling_verify_fn(use_rejection_sampling)
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
@@ -797,15 +802,16 @@ def eagle_sample(
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
+            target_probs = top_k_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, verify_input.draft_token_num, dim=0
                 ),
+                max_top_k=sampling_info.max_top_k,
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
         if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
+            target_probs = top_p_renorm_probs(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ps, verify_input.draft_token_num, dim=0
