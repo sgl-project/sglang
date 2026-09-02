@@ -1,8 +1,9 @@
 """Single-adapter LoRA backend for UNO draft forwards.
 
-LoRA-A is always overlapped with the base GEMM on an auxiliary CUDA stream.
-Single-request batches operate only on draft rows; larger batches use one
-``mm``/``addmm_`` over all rows and zero the seed-row LoRA hidden states
+Parallel-linear layers overlap LoRA-A with the base GEMM on an auxiliary CUDA
+stream. Other dense LoRA layers use the inherited Triton implementation.
+Single-request cuBLAS batches operate only on draft rows; larger batches use
+one ``mm``/``addmm_`` over all rows and zero the seed-row LoRA hidden states
 between the two GEMMs.
 """
 
@@ -14,6 +15,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 @dataclass(frozen=True)
@@ -35,9 +37,6 @@ class _UnoSingleAdapterRoute:
 
 @dataclass(frozen=True)
 class _PendingLoRAA:
-    x: torch.Tensor
-    weights: torch.Tensor
-    num_slices: int
     output: torch.Tensor
     producer_stream: torch.cuda.Stream
 
@@ -68,9 +67,11 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         # replayed graphs do not serialize or interfere through one shared stream.
         self._lora_a_streams: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
         self._pending_lora_a: Optional[_PendingLoRAA] = None
+        self._use_cublas_lora_b = False
 
     def reset_batch_state(self):
         self._pending_lora_a = None
+        self._use_cublas_lora_b = False
         super().reset_batch_state()
 
     def validate_lora_targets(
@@ -80,19 +81,20 @@ class UnoCublasLoRABackend(TritonLoRABackend):
     ) -> None:
         """Reject target layers that cannot honor UNO's token-row routing."""
 
-        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+        from sglang.srt.layers.linear import (
+            ColumnParallelLinear,
+            ReplicatedLinear,
+            RowParallelLinear,
+        )
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.utils import get_layer_id
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
         unsupported: list[str] = []
-        if "lm_head" in target_modules:
-            lm_head = getattr(base_model, "lm_head", None)
-            unsupported.append(f"lm_head ({type(lm_head).__name__})")
-        if "embed_tokens" in target_modules:
-            unsupported.append("embed_tokens (VocabParallelEmbedding)")
-
-        supported = (ColumnParallelLinear, RowParallelLinear)
+        # Embedding and LM-head wrappers use the inherited Triton kernels and
+        # are handled separately by LoRAManager. Decoder-layer projections use
+        # either the overlapped cuBLAS path or the Triton ReplicatedLinear path.
+        supported = (ColumnParallelLinear, RowParallelLinear, ReplicatedLinear)
         target_moe = {"gate_up_proj", "down_proj"}.issubset(target_modules)
         for module_name, module in base_model.named_modules():
             parts = module_name.split(".")
@@ -111,8 +113,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
 
         if unsupported:
             raise ValueError(
-                "UNO's LoRA backend supports only ColumnParallelLinear and "
-                "RowParallelLinear targets; unsupported target modules: "
+                "UNO's LoRA backend cannot execute these target modules: "
                 + ", ".join(sorted(set(unsupported)))
             )
 
@@ -255,43 +256,61 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
         stack_num: int = 1,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return self._consume_lora_a_overlap(
-            x,
-            weights,
-            num_slices=stack_num,
-        )
+        pending = self._pending_lora_a
+        if pending is None:
+            self._use_cublas_lora_b = False
+            return super().run_lora_a_sgemm(
+                x,
+                weights,
+                pruned_batch_info,
+                stack_num,
+                *args,
+                **kwargs,
+            )
+
+        output = self._consume_lora_a_overlap(pending)
+        self._use_cublas_lora_b = True
+        return output
 
     def run_lora_b_sgemm(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        if not self._use_cublas_lora_b:
+            return super().run_lora_b_sgemm(
+                x,
+                weights,
+                base_output,
+                pruned_batch_info,
+                *args,
+                **kwargs,
+            )
+
+        self._use_cublas_lora_b = False
         return self._run_lora_b(x, weights, base_output)
 
     def _run_stacked_lora(
         self,
         *,
-        x: torch.Tensor,
-        lora_a: torch.Tensor,
         lora_b: torch.Tensor,
         base_output: torch.Tensor,
         output_offset,
         output_offset_cpu,
         num_slices: int,
+        pending: _PendingLoRAA,
     ) -> torch.Tensor:
         route = self._route()
-        hidden = self._consume_lora_a_overlap(
-            x,
-            lora_a,
-            num_slices=num_slices,
-        )
+        hidden = self._consume_lora_a_overlap(pending)
         offsets = self._output_offsets(output_offset_cpu, output_offset)
         for slice_index in range(num_slices):
             input_start = slice_index * route.rank
@@ -318,21 +337,35 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         x: torch.Tensor,
         qkv_lora_a: torch.Tensor,
         qkv_lora_b: torch.Tensor,
-        output_offset=None,
-        output_offset_cpu=None,
+        output_offset: torch.Tensor,
+        max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         n_slices: int = 3,
         *args,
+        output_offset_cpu=None,
         **kwargs,
     ) -> torch.Tensor:
+        pending = self._pending_lora_a
+        if pending is None:
+            return super().run_qkv_lora(
+                x,
+                qkv_lora_a,
+                qkv_lora_b,
+                output_offset,
+                max_qkv_out_dim,
+                base_output,
+                n_slices,
+                *args,
+                **kwargs,
+            )
+
         return self._run_stacked_lora(
-            x=x,
-            lora_a=qkv_lora_a,
             lora_b=qkv_lora_b,
             base_output=base_output,
             output_offset=output_offset,
             output_offset_cpu=output_offset_cpu,
             num_slices=n_slices,
+            pending=pending,
         )
 
     def run_gate_up_lora(
@@ -340,20 +373,30 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         x: torch.Tensor,
         gate_up_lora_a: torch.Tensor,
         gate_up_lora_b: torch.Tensor,
-        output_offset=None,
-        output_offset_cpu=None,
         base_output: torch.Tensor = None,
         *args,
+        output_offset=None,
+        output_offset_cpu=None,
         **kwargs,
     ) -> torch.Tensor:
+        pending = self._pending_lora_a
+        if pending is None:
+            return super().run_gate_up_lora(
+                x,
+                gate_up_lora_a,
+                gate_up_lora_b,
+                base_output,
+                *args,
+                **kwargs,
+            )
+
         return self._run_stacked_lora(
-            x=x,
-            lora_a=gate_up_lora_a,
             lora_b=gate_up_lora_b,
             base_output=base_output,
             output_offset=output_offset,
             output_offset_cpu=output_offset_cpu,
             num_slices=2,
+            pending=pending,
         )
 
     def start_lora_a_overlap(
@@ -397,30 +440,16 @@ class UnoCublasLoRABackend(TritonLoRABackend):
             self._compute_lora_a(lora_input, active_a, route, output=output)
 
         self._pending_lora_a = _PendingLoRAA(
-            x=x,
-            weights=weights,
-            num_slices=num_slices,
             output=output,
             producer_stream=stream,
         )
 
     def _consume_lora_a_overlap(
         self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        *,
-        num_slices: int,
+        pending: _PendingLoRAA,
     ) -> torch.Tensor:
-        pending = self._pending_lora_a
-        if pending is None:
-            raise RuntimeError("UNO LoRA-A overlap was not launched.")
-        if (
-            pending.x is not x
-            or pending.weights is not weights
-            or pending.num_slices != num_slices
-        ):
-            raise RuntimeError("UNO LoRA-A overlap was consumed by another layer.")
-
         self._pending_lora_a = None
-        torch.cuda.current_stream(x.device).wait_stream(pending.producer_stream)
+        torch.cuda.current_stream(pending.output.device).wait_stream(
+            pending.producer_stream
+        )
         return pending.output

@@ -2,7 +2,9 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -14,6 +16,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,6 +28,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class TestUnoLoRATargets(CustomTestCase):
     def setUp(self):
         self.backend = UnoCublasLoRABackend.__new__(UnoCublasLoRABackend)
+        self.backend._pending_lora_a = None
+        self.backend._use_cublas_lora_b = False
 
     @staticmethod
     def _model(modules, **attributes):
@@ -33,7 +38,7 @@ class TestUnoLoRATargets(CustomTestCase):
             **attributes,
         )
 
-    def test_supported_parallel_linear_targets_are_accepted(self):
+    def test_supported_dense_targets_are_accepted(self):
         modules = [
             (
                 "model.layers.0.qkv_proj",
@@ -43,42 +48,42 @@ class TestUnoLoRATargets(CustomTestCase):
                 "model.layers.0.o_proj",
                 RowParallelLinear.__new__(RowParallelLinear),
             ),
+            (
+                "model.layers.0.fused_qkv_a_proj_with_mqa",
+                ReplicatedLinear.__new__(ReplicatedLinear),
+            ),
+            (
+                "model.embed_tokens",
+                VocabParallelEmbedding.__new__(VocabParallelEmbedding),
+            ),
         ]
         self.backend.validate_lora_targets(
-            base_model=self._model(modules),
-            target_modules={"qkv_proj", "o_proj"},
+            base_model=self._model(
+                modules,
+                lm_head=ParallelLMHead.__new__(ParallelLMHead),
+            ),
+            target_modules={
+                "qkv_proj",
+                "o_proj",
+                "fused_qkv_a_proj_with_mqa",
+                "embed_tokens",
+                "lm_head",
+            },
         )
 
     def test_unsupported_targets_are_rejected(self):
         cases = {
-            "lm_head": (
-                self._model([], lm_head=ParallelLMHead.__new__(ParallelLMHead)),
-                {"lm_head"},
-                "ParallelLMHead",
-            ),
-            "embedding": (
+            "unknown decoder layer": (
                 self._model(
                     [
                         (
-                            "model.embed_tokens",
-                            VocabParallelEmbedding.__new__(VocabParallelEmbedding),
+                            "model.layers.0.custom_proj",
+                            torch.nn.Linear(2, 2),
                         )
                     ]
                 ),
-                {"embed_tokens"},
-                "embed_tokens",
-            ),
-            "replicated linear": (
-                self._model(
-                    [
-                        (
-                            "model.layers.0.fused_qkv_a_proj_with_mqa",
-                            ReplicatedLinear.__new__(ReplicatedLinear),
-                        )
-                    ]
-                ),
-                {"fused_qkv_a_proj_with_mqa"},
-                "ReplicatedLinear",
+                {"custom_proj"},
+                "Linear",
             ),
             "fused MoE": (
                 self._model(
@@ -100,6 +105,118 @@ class TestUnoLoRATargets(CustomTestCase):
                     base_model=model,
                     target_modules=targets,
                 )
+
+    def test_nonoverlap_dense_calls_fall_back_to_triton(self):
+        x = object()
+        weights = object()
+        hidden = object()
+        base_output = object()
+        pruned_batch_info = object()
+        expected = object()
+
+        with (
+            patch.object(
+                TritonLoRABackend,
+                "run_lora_a_sgemm",
+                return_value=hidden,
+            ) as run_lora_a,
+            patch.object(
+                TritonLoRABackend,
+                "run_lora_b_sgemm",
+                return_value=expected,
+            ) as run_lora_b,
+        ):
+            actual_hidden = self.backend.run_lora_a_sgemm(
+                x,
+                weights,
+                pruned_batch_info=pruned_batch_info,
+            )
+            actual = self.backend.run_lora_b_sgemm(
+                actual_hidden,
+                weights,
+                base_output=base_output,
+                pruned_batch_info=pruned_batch_info,
+            )
+
+        self.assertIs(actual_hidden, hidden)
+        self.assertIs(actual, expected)
+        run_lora_a.assert_called_once_with(
+            x,
+            weights,
+            pruned_batch_info,
+            1,
+        )
+        run_lora_b.assert_called_once_with(
+            hidden,
+            weights,
+            base_output,
+            pruned_batch_info,
+        )
+
+    def test_overlap_launch_selects_cublas(self):
+        pending = object()
+        x = object()
+        weights = object()
+        hidden = object()
+        base_output = object()
+        expected = object()
+        self.backend._pending_lora_a = pending
+        self.backend._consume_lora_a_overlap = MagicMock(return_value=hidden)
+        self.backend._run_lora_b = MagicMock(return_value=expected)
+
+        with (
+            patch.object(TritonLoRABackend, "run_lora_a_sgemm") as run_lora_a,
+            patch.object(TritonLoRABackend, "run_lora_b_sgemm") as run_lora_b,
+        ):
+            actual_hidden = self.backend.run_lora_a_sgemm(x, weights)
+            actual = self.backend.run_lora_b_sgemm(
+                actual_hidden,
+                weights,
+                base_output=base_output,
+            )
+
+        self.assertIs(actual_hidden, hidden)
+        self.assertIs(actual, expected)
+        self.backend._consume_lora_a_overlap.assert_called_once_with(pending)
+        self.backend._run_lora_b.assert_called_once_with(
+            hidden,
+            weights,
+            base_output,
+        )
+        self.assertFalse(self.backend._use_cublas_lora_b)
+        run_lora_a.assert_not_called()
+        run_lora_b.assert_not_called()
+
+    def test_nonoverlap_qkv_call_falls_back_to_triton(self):
+        expected = object()
+        args = {
+            "x": object(),
+            "qkv_lora_a": object(),
+            "qkv_lora_b": object(),
+            "output_offset": object(),
+            "output_offset_cpu": object(),
+            "max_qkv_out_dim": 128,
+            "base_output": object(),
+            "n_slices": 2,
+        }
+
+        with patch.object(
+            TritonLoRABackend,
+            "run_qkv_lora",
+            return_value=expected,
+        ) as run_qkv_lora:
+            actual = self.backend.run_qkv_lora(**args)
+
+        self.assertIs(actual, expected)
+        run_qkv_lora.assert_called_once_with(
+            args["x"],
+            args["qkv_lora_a"],
+            args["qkv_lora_b"],
+            args["output_offset"],
+            128,
+            args["base_output"],
+            2,
+        )
 
     def test_manager_preflights_targets_before_wrapping(self):
         manager = LoRAManager.__new__(LoRAManager)
