@@ -2195,7 +2195,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     weight_loader(lm_head_param, loaded_weight)
             layer_id = get_layer_id(name)
             if (
-                layer_id is not None
+                name.startswith("model.layers.")
+                and layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
@@ -2458,7 +2459,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
             layer_id = get_layer_id(name)
             if (
-                layer_id is not None
+                name.startswith("model.layers.")
+                and layer_id is not None
                 and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
