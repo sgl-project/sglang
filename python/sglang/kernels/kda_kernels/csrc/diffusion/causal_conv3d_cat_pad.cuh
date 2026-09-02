@@ -1,3 +1,4 @@
+// KDA provenance: BBuf/KDA-Pilot, merged in SGLang PR #29281.
 // Native CUDA fast path for Cosmos3 VAE causal-Conv3D cat/pad copy.
 //
 // The op writes the output of:
