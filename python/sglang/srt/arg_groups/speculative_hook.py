@@ -183,6 +183,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args,
         )
 
+    # NVFP4 speculative forwards cannot use FlashInfer's host-prepared dequant
+    # workspace. Resolve them to TRTLLM MHA's native FP4 multi-token decode path
+    # after per-algorithm defaults have settled.
+    from sglang.srt.arg_groups.overrides import _nvfp4_speculative_attention_mode
+
+    run_post_process_pass(server_args, _nvfp4_speculative_attention_mode)
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
