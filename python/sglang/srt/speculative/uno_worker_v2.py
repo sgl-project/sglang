@@ -96,9 +96,7 @@ class UnoWorkerV2(BaseSpecWorker):
         self.candidate_top_k = (
             int(get_spec().speculative_eagle_topk) if self.tree_mode else 1
         )
-        self.tree_depth = (
-            int(get_spec().speculative_num_steps) if self.tree_mode else 1
-        )
+        self.tree_depth = int(get_spec().speculative_num_steps) if self.tree_mode else 1
         self.num_speculative_proposals = self.forward_width - 1
         self.tail_width = self.forward_width + 1
 
@@ -477,9 +475,8 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_seq_lens_cpu = None
             draft_seq_lens_sum = None
 
-        draft_positions = (
-            committed_seq_lens.to(torch.int64)[:, None]
-            + (self._tail_offsets[None, : self.forward_width])
+        draft_positions = committed_seq_lens.to(torch.int64)[:, None] + (
+            self._tail_offsets[None, : self.forward_width]
         )
         req_pool_indices_long = batch.req_pool_indices.to(torch.int64)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
@@ -584,6 +581,7 @@ class UnoWorkerV2(BaseSpecWorker):
             device=self.device,
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
+            uno_target_max_top_k=draft_state.max_top_k,
         )
 
         packed = pack_uno_tree_result(
@@ -602,7 +600,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
 
-        # Preserve EAGLE's verify ForwardBatch keep-alives verbatim. FutureMap
+        # Preserve EAGLE's verify ForwardBatch keep-alive refs verbatim. FutureMap
         # relays the wrapped bonus; on_publish above relays the new frontier.
         return GenerationBatchResult(
             logits_output=eagle_result.logits_output,
@@ -665,8 +663,8 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_seq_lens_sum = None
             verify_seq_lens_sum = None
 
-        logical_positions = (
-            committed_seq_lens.to(torch.int64)[:, None] + (self._tail_offsets[None, :])
+        logical_positions = committed_seq_lens.to(torch.int64)[:, None] + (
+            self._tail_offsets[None, :]
         )
         req_pool_indices_long = batch.req_pool_indices.to(torch.int64)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token

@@ -483,6 +483,25 @@ def sample_uno_clean_root(
     return candidates[:, 0]
 
 
+def sample_uno_tree_target_tokens(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    batch_size: int,
+    verify_width: int,
+    max_top_k: int,
+) -> torch.Tensor:
+    """Sample one target token per verify node from compact top-k support."""
+    support_ids, support_probs = _build_sparse_target_support(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        batch_size=batch_size,
+        forward_width=verify_width,
+        max_top_k=max_top_k,
+    )
+    return _sample_from_support(support_ids, support_probs)
+
+
 def pack_uno_tree_result(
     *,
     clean_root_tokens: torch.Tensor,

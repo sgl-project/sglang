@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+from flashinfer import top_k as _flashinfer_top_k
 from torch import Tensor
 
 
@@ -349,7 +350,9 @@ def _build_tree_kernel(
             + batch * PROB_BATCH_STRIDE
             + selected_depth * PROB_DEPTH_STRIDE
             + selected_rank * PROB_RANK_STRIDE
-        ).to(tl.float32)
+        ).to(
+            tl.float32
+        )
         selected_token = tl.load(
             top_token_ids
             + batch * TOKEN_BATCH_STRIDE
@@ -525,15 +528,16 @@ def build_uno_tree_proposal(
         )
 
     candidate_shape = (batch_size, num_depths, candidate_top_k)
-    top_values = buffer("top_values", candidate_shape, draft_logits.dtype)
-    top_token_ids = buffer("top_token_ids", candidate_shape, torch.long)
-    torch.topk(
-        draft_logits,
-        k=candidate_top_k,
-        dim=-1,
+    flat_logits = draft_logits.contiguous().view(batch_size * num_depths, vocab_size)
+    flat_top_values, flat_top_token_ids = _flashinfer_top_k(
+        flat_logits,
+        candidate_top_k,
         sorted=True,
-        out=(top_values, top_token_ids),
+        deterministic=False,
     )
+    top_values = flat_top_values.view(candidate_shape)
+    top_token_ids = buffer("top_token_ids", candidate_shape, torch.long)
+    top_token_ids.copy_(flat_top_token_ids.view(candidate_shape))
     top_log_probs = buffer("top_log_probs", candidate_shape, torch.float32)
     num_partial_blocks = (vocab_size + 8191) // 8192
     partial_shape = (batch_size * num_depths, num_partial_blocks)
