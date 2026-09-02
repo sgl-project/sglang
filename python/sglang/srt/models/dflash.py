@@ -213,6 +213,7 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
         )
 
         self.scaling = head_dim**-0.5
@@ -226,6 +227,8 @@ class DFlashAttention(nn.Module):
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+        self.v_scale: Optional[float] = draft_cfg.attention_value_scale
         self.attention_sink_bias = None
         if is_nemotron_35_draft_config(config) and bool(
             getattr(config, "attention_sink_bias", False)
@@ -237,6 +240,16 @@ class DFlashAttention(nn.Module):
                     "--speculative-draft-attention-backend trtllm_mha, "
                     f"got {draft_attention_backend!r}."
                 )
+            self.attention_sink_bias = nn.Parameter(
+                torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
+            )
+            set_weight_attrs(
+                self.attention_sink_bias,
+                {"weight_loader": sharded_weight_loader(0)},
+            )
+        elif draft_cfg.attention_sink_bias:
+            # MiMo DFlash drafts train a per-head attention sink bias; each TP
+            # rank owns its slice of the all-heads checkpoint tensor.
             self.attention_sink_bias = nn.Parameter(
                 torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False
             )
@@ -302,6 +315,8 @@ class DFlashAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         if self.attention_sink_bias is None:
             attn_output = self.attn(q, k, v, forward_batch)
         else:
@@ -335,11 +350,14 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            return k, v
-
-        # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
-        qkv, _ = self.qkv_proj(hidden_states)
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
+            qkv, _ = self.qkv_proj(hidden_states)
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Keep V scaling consistent with forward(): ctx K/V materialized into the
+        # draft cache must use the same value_scale so ctx and self-generated V align.
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:

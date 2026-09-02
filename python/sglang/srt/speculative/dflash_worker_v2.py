@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
@@ -359,6 +360,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if hasattr(target_model, "get_dflash_noise_embedding_scale")
             else 1.0
         )
+        # Merge the trained mask embedding (mask_embedding.pt) into the target
+        # embedding table before snapshotting it, so the draft's MASK block positions
+        # use the learned vector instead of the target's untrained mask-token row.
+        self._maybe_merge_trained_mask_embedding()
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -996,6 +1001,79 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs,
             )
 
+    def _maybe_merge_trained_mask_embedding(self) -> None:
+        """Merge a trained mask embedding into the target model's embedding table.
+
+        During DFlash training the mask-token embedding can be trained separately and
+        saved as ``mask_embedding.pt`` in the draft checkpoint directory. If present,
+        overwrite the corresponding row in the target embedding table so inference uses
+        the learned representation (the target's own mask-token row is typically an
+        untrained added-vocab slot ~= 0).
+
+        Handles VocabParallelEmbedding TP sharding: each rank only updates the row if
+        the mask token falls within its local shard range.
+        """
+        self._per_position_mask_embeddings = None
+
+        draft_model_path = self.server_args.speculative_draft_model_path
+        if draft_model_path is None:
+            return
+
+        mask_emb_path = os.path.join(draft_model_path, "mask_embedding.pt")
+        if not os.path.exists(mask_emb_path):
+            return
+
+        saved = torch.load(mask_emb_path, map_location=self.device, weights_only=True)
+        embedding_tensor = saved["embedding"]
+        saved_token_id = int(saved["mask_token_id"])
+
+        if saved_token_id != self._mask_token_id:
+            raise ValueError(
+                f"DFLASH mask_embedding.pt was trained with mask_token_id={saved_token_id}, "
+                f"but the current resolved mask_token_id={self._mask_token_id}. "
+                "These must match."
+            )
+
+        target_model = self._target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+
+        if saved.get("per_position"):
+            self._per_position_mask_embeddings = embedding_tensor.to(
+                embed_module.weight.dtype
+            )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "Loaded per-position mask embeddings (shape=%s, source=%s)",
+                    list(self._per_position_mask_embeddings.shape),
+                    mask_emb_path,
+                )
+            return
+
+        token_id = self._mask_token_id
+        shard_indices = getattr(embed_module, "shard_indices", None)
+        with torch.no_grad():
+            if shard_indices is not None:
+                # VocabParallelEmbedding: only update if this token is in our shard.
+                start = shard_indices.org_vocab_start_index
+                end = shard_indices.org_vocab_end_index
+                if start <= token_id < end:
+                    local_idx = token_id - start
+                    embed_module.weight[local_idx].copy_(
+                        embedding_tensor.to(embed_module.weight.dtype)
+                    )
+            else:
+                embed_module.weight[token_id].copy_(
+                    embedding_tensor.to(embed_module.weight.dtype)
+                )
+
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "Merged trained mask embedding into target model "
+                "(mask_token_id=%s, source=%s)",
+                self._mask_token_id,
+                mask_emb_path,
+            )
+
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
@@ -1587,6 +1665,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
+                # Match forward()/kv_proj_only(): scale ctx V so ctx and
+                # self-generated V stay aligned in the draft KV cache.
+                if attn.v_scale is not None:
+                    v = v * attn.v_scale
             else:
                 k, v = attn.kv_proj_only(layer_ctx_hidden)
                 k = attn.apply_k_norm(k)
