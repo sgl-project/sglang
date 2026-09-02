@@ -381,9 +381,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {cfg.speculative_moe_a2a_backend!r})."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
+            "Currently DSpark speculative decoding only supports pp_size == 1, "
+            "except on the PD-disaggregated prefill role, where the draft head "
+            "runs whole on the last pipeline stage."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -641,6 +643,19 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
 
+    if cfg.pp_size != 1:
+        # `check_server_args` allows pp_size > 1 with speculative decoding on the
+        # PD-prefill role, where the draft runs whole on the last stage. The
+        # eagle family cannot use that exception yet: `init_lm_head` pulls the
+        # target's `get_embed_and_head()`, and a pipeline-split target holds
+        # `embed_tokens` only on the first stage (`PPMissingLayer` elsewhere), so
+        # the last stage -- the one hosting the draft -- raises AttributeError.
+        raise ValueError(
+            "Currently eagle-family speculative decoding only supports "
+            "pp_size == 1: the draft head shares the target's embed_tokens and "
+            "lm_head, which a pipeline-split target does not hold on one stage."
+        )
+
     if (
         cfg.speculative_algorithm == "STANDALONE"
         and resolved_view(server_args).enable_dp_attention
@@ -823,6 +838,16 @@ def _handle_ngram(server_args: ServerArgs) -> None:
     if cfg.device not in ("cuda", "cpu"):
         raise ValueError(
             "Ngram speculative decoding only supports CUDA or CPU devices."
+        )
+
+    if cfg.pp_size != 1:
+        # `check_server_args` allows pp_size > 1 with speculative decoding on the
+        # PD-prefill role, but the pipeline relay of the draft tensors assumes an
+        # `EagleDraftInput`-shaped draft input (topk_p / accept_tokens), which
+        # `NgramVerifyInput` does not provide.
+        raise ValueError(
+            "Currently ngram speculative decoding only supports pp_size == 1: "
+            "the pipeline draft-tensor relay expects an eagle-shaped draft input."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)

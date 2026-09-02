@@ -26,7 +26,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_tp_group, get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -2006,6 +2006,19 @@ class KVCacheConfigurator:
                     )
         return token_to_kv_pool_allocator
 
+    def _pool_sync_group(self):
+        """Group over which pool-sizing collectives are reduced.
+
+        Normally the WORLD group, so every rank agrees on one pool size. A draft
+        runner under pipeline parallelism is the exception: it exists only on the
+        stage(s) that build a draft (PD-prefill builds it on the last stage
+        only), so a WORLD reduction would be issued by a subset of ranks and
+        desynchronize the group. Its stage-local TP group is the correct scope.
+        """
+        if self.is_draft_worker and get_parallel().pp_size > 1:
+            return get_tp_group()
+        return get_world_group()
+
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
@@ -2016,11 +2029,12 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        sync_group = self._pool_sync_group()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=sync_group.world_size > 1,
+            cpu_group=sync_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -2109,8 +2123,10 @@ class KVCacheConfigurator:
                 )
             token_capacity = min(token_capacity, user_limit)
 
-        # Sync across PP ranks (each may have different layer counts)
-        if get_parallel().pp_size > 1:
+        # Sync across PP ranks (each may have different layer counts). A draft
+        # runner is always pp_size=1, so it has nothing to reconcile and must not
+        # join a group it may not be present on every rank of.
+        if get_parallel().pp_size > 1 and not self.is_draft_worker:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

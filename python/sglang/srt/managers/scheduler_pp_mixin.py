@@ -1193,6 +1193,13 @@ class SchedulerPPMixin:
                 num_tokens_for_logprob_per_req=1,
             )
             batch.spec_info = next_draft_input
+        elif batch.spec_info is not None:
+            # DSpark's draft input carries no topk_p/hidden_states (the target
+            # hidden is injected into the draft KV instead), so the ring has
+            # nothing to rebuild from. run_batch already stored this iteration's
+            # draft input on the batch, and the PD result processor asserts the
+            # result and the batch hold the same object.
+            next_draft_input = batch.spec_info
 
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion

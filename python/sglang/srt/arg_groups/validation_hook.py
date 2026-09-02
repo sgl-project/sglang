@@ -50,8 +50,14 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         assert (
-            cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
-        ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            cfg.disable_overlap_schedule
+        ), "Pipeline parallelism is not compatible with overlap schedule"
+        if cfg.speculative_algorithm is not None:
+            assert cfg.disaggregation_mode == "prefill", (
+                "Pipeline parallelism + speculative decoding is only supported on "
+                "the PD-disaggregated prefill role, where the draft head runs "
+                "whole on the last pipeline stage."
+            )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "

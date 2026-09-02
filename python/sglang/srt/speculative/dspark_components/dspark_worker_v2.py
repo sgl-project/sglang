@@ -142,6 +142,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
                 draft_worker_cls=draft_worker_cls,
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -466,26 +467,34 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
+        # Under PD-prefill PP the target runs across stages, so its forward
+        # needs the proxy tensors handed down by the previous stage. The draft
+        # head is not pipeline-parallel and never takes them.
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
                 self.target_worker.forward_batch_generation(
-                    batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    batch,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch_output = self.target_worker.forward_batch_generation(
-            batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            batch,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids

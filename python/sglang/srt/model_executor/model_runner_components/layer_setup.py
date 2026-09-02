@@ -196,6 +196,13 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    from sglang.srt.runtime_context import get_disagg
+
+    # PD-prefill is the one role where a pipeline-split target may coexist with
+    # speculative decoding: the draft head runs as its own pp_size=1 runner on
+    # the last stage, so the target stages never need the MTP layer themselves.
+    if get_disagg().disaggregation_mode == "prefill":
+        return
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())

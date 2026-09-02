@@ -976,6 +976,22 @@ class Scheduler(
             self.external_corpus_manager = None
             return
 
+        # PD-prefill with pipeline parallelism: the draft head is a pp_size=1
+        # runner that reads the target's `lm_head` / `embed_tokens`, which only
+        # the last stage holds (`PPMissingLayer` elsewhere). Non-last stages
+        # therefore run target-only; every init and forward path below already
+        # guards on `draft_worker is not None`.
+        # NOTE: self.disaggregation_mode is assigned later than
+        # init_model_worker(), so read the config bag directly here.
+        if (
+            self.ps.pp_size > 1
+            and self.ps.pp_rank != self.ps.pp_size - 1
+            and get_disagg().disaggregation_mode == "prefill"
+        ):
+            self.draft_worker = None
+            self.external_corpus_manager = None
+            return
+
         # Launch a draft worker for speculative decoding. It builds its draft
         # from this process's own config: what differs for the draft — the
         # target's context length, the draft load format, its attention backend
@@ -1082,7 +1098,10 @@ class Scheduler(
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.draft_worker is None:
+            # A live spec algorithm with no draft worker means this rank is a
+            # non-last PD-prefill pipeline stage (see maybe_init_draft_worker):
+            # it runs target-only, so the target worker is the model worker.
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -4155,7 +4174,7 @@ class Scheduler(
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif not batch.spec_algorithm.is_none():
+            elif not batch.spec_algorithm.is_none() and self.draft_worker is not None:
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
@@ -4182,9 +4201,13 @@ class Scheduler(
                         return_hidden_states=batch.return_hidden_states,
                     )
             else:
+                # A spec algorithm with no draft worker on this rank is a
+                # non-last PD-prefill pipeline stage: it runs the target only
+                # and therefore needs the pipeline proxy tensors, exactly like
+                # the non-spec path.
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
+                    if self.spec_algorithm.is_none() or self.draft_worker is None
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
