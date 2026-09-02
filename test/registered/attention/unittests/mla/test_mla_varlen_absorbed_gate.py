@@ -8,17 +8,22 @@ forward_extend() reaches it at all.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
+from sglang.srt.layers.attention.flashinfer_mla_backend import (
+    FlashInferMLAAttnBackend,
+)
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
-    varlen_absorbed_mla_shape_ok,
+    _get_cute_dsl_workspace_buffer,
+    _get_varlen_absorbed_workspace_buffer,
     varlen_absorbed_mla_supported,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import FP4_KV_CACHE_DTYPES
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -172,47 +177,171 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
             self.assertFalse(varlen_absorbed_mla_supported(torch.float8_e4m3fn))
 
 
-class TestVarlenAbsorbedMLAShapeGate(CustomTestCase):
-    """varlen_absorbed_mla_shape_ok() mirrors flashinfer 0.6.17's own trtllm-gen
-    MLA decode dispatch conditions (mla/_core.py, trtllm_batch_decode_with_kv_cache_mla).
-    _run_varlen_absorbed_kernel has no cute-dsl fallback, so a shape flashinfer
-    would silently redirect away from trtllm-gen must be excluded before that
-    call, not discovered by it. Kimi-K3 under wide-EP DP-attention
-    (num_attention_heads=96, attn_tp_size=1) is the regression this closes.
-    """
+class TestVarlenAbsorbedMLARouting(CustomTestCase):
+    _BACKEND = "sglang.srt.layers.attention.trtllm_mla_backend"
 
-    def test_num_heads_q_exclusion_boundaries(self):
-        # Strict inequality: 64 and 128 themselves are outside the exclusion.
-        cases = [
-            (12, True),  # Case18 plain TP8 on Kimi-K3 (96 // 8)
-            (64, True),  # boundary, not excluded
-            (65, False),
-            (96, False),  # Kimi-K3 DEP16 (96 // 1); the crash this test pins
-            (127, False),
-            (128, True),  # boundary, not excluded
-            (256, True),
-        ]
-        for num_heads_q, expected in cases:
-            with self.subTest(num_heads_q=num_heads_q):
-                self.assertEqual(
-                    varlen_absorbed_mla_shape_ok(num_heads_q, page_size=64),
-                    expected,
+    def _assert_paged_fallback(self, *, dcp_enabled, skip_softmax):
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.backend = "trtllm-gen"
+        backend.disable_chunked_prefix_cache = False
+        backend._varlen_absorbed_arch_dtype_ok = True
+
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_prefix_lens_cpu=[0],
+            extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens_cpu=[3],
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            spec_info=None,
+        )
+
+        with (
+            patch(f"{self._BACKEND}.is_in_tc_piecewise_cuda_graph", return_value=True),
+            patch(f"{self._BACKEND}.is_in_breakable_cuda_graph", return_value=False),
+            patch(
+                f"{self._BACKEND}.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
+            ),
+            patch(
+                f"{self._BACKEND}.envs."
+                "SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get",
+                return_value=skip_softmax,
+            ),
+            patch.object(
+                FlashInferMLAAttnBackend, "init_forward_metadata"
+            ) as paged_fallback,
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+        paged_fallback.assert_called_once_with(forward_batch)
+        self.assertTrue(backend.forward_prefill_metadata.fallback_to_flashinfer_impl)
+        self.assertIsNone(backend.forward_prefill_metadata.block_kv_indices)
+
+    def test_dcp_keeps_the_paged_fallback(self):
+        self._assert_paged_fallback(dcp_enabled=True, skip_softmax=None)
+
+    def test_skip_softmax_keeps_the_paged_fallback(self):
+        self._assert_paged_fallback(dcp_enabled=False, skip_softmax=1.0)
+
+
+class TestVarlenAbsorbedMLADispatchContract(CustomTestCase):
+    def _backend(self):
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.backend = "trtllm-gen"
+        backend.workspace_buffer = sentinel.workspace_buffer
+        backend._varlen_absorbed_workspace_buffer = sentinel.varlen_workspace_buffer
+        backend._multi_ctas_kv_counter_buffer = sentinel.counter_buffer
+        backend.qk_nope_head_dim = 128
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend._compute_decode_bmm1_scale = MagicMock(return_value=1.0)
+        return backend
+
+    def _call(self, backend, *, varlen, return_lse=False):
+        kwargs = {}
+        if varlen:
+            kwargs.update(
+                cum_seq_lens_q=torch.tensor([0, 2, 3], dtype=torch.int32),
+                max_q_len=2,
+            )
+        with patch(
+            "sglang.srt.layers.attention.trtllm_mla_backend.flashinfer.decode."
+            "trtllm_batch_decode_with_kv_cache_mla",
+            return_value=sentinel.output,
+        ) as kernel:
+            output = backend._call_trtllm_batch_decode_mla(
+                query=torch.empty(3, 96, 576),
+                kv_cache=torch.empty(1),
+                block_tables=torch.empty(1),
+                seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+                max_seq_len=1,
+                layer=SimpleNamespace(),
+                return_lse=return_lse,
+                **kwargs,
+            )
+        self.assertIs(output, sentinel.output)
+        return kernel.call_args.kwargs
+
+    def test_varlen_call_allows_flashinfer_auto_dispatch(self):
+        kwargs = self._call(self._backend(), varlen=True)
+        self.assertNotIn("backend", kwargs)
+        self.assertNotIn("multi_ctas_kv_counter_buffer", kwargs)
+        self.assertIs(kwargs["workspace_buffer"], sentinel.varlen_workspace_buffer)
+        self.assertEqual(kwargs["max_q_len"], 2)
+        self.assertTrue(torch.equal(kwargs["cum_seq_lens_q"], torch.tensor([0, 2, 3])))
+
+    def test_dense_call_keeps_explicit_trt_counter(self):
+        kwargs = self._call(self._backend(), varlen=False)
+        self.assertEqual(kwargs["backend"], "trtllm-gen")
+        self.assertIs(kwargs["multi_ctas_kv_counter_buffer"], sentinel.counter_buffer)
+        self.assertIs(kwargs["workspace_buffer"], sentinel.workspace_buffer)
+
+    def test_cute_and_varlen_workspaces_are_separate_and_shared(self):
+        buffers = {}
+
+        def get_buffer(name, factory):
+            if name not in buffers:
+                buffers[name] = factory()
+            return buffers[name]
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.trtllm_mla_backend.get_buffer",
+                side_effect=get_buffer,
+            ),
+            patch(
+                "sglang.srt.layers.attention.trtllm_mla_backend.torch.zeros",
+                side_effect=[sentinel.cute_workspace, sentinel.varlen_workspace],
+            ) as zeros,
+        ):
+            first = _get_cute_dsl_workspace_buffer(1024, torch.device("cuda"))
+            second = _get_cute_dsl_workspace_buffer(1024, torch.device("cuda"))
+            varlen_first = _get_varlen_absorbed_workspace_buffer(
+                1024, torch.device("cuda")
+            )
+            varlen_second = _get_varlen_absorbed_workspace_buffer(
+                1024, torch.device("cuda")
+            )
+
+        self.assertIs(first, sentinel.cute_workspace)
+        self.assertIs(second, first)
+        self.assertIs(varlen_second, varlen_first)
+        self.assertIsNot(varlen_first, first)
+        self.assertEqual(zeros.call_count, 2)
+
+    def test_return_lse_is_forwarded_to_flashinfer(self):
+        for return_lse in (False, True):
+            with self.subTest(return_lse=return_lse):
+                kwargs = self._call(
+                    self._backend(), varlen=False, return_lse=return_lse
                 )
+                self.assertIs(kwargs["return_lse"], return_lse)
 
-    def test_page_size_must_be_32_or_64(self):
-        for page_size, expected in ((32, True), (64, True), (16, False), (128, False)):
-            with self.subTest(page_size=page_size):
-                self.assertEqual(
-                    varlen_absorbed_mla_shape_ok(num_heads_q=12, page_size=page_size),
-                    expected,
-                )
+    def test_run_decode_kernel_forwards_return_lse(self):
+        backend = self._backend()
+        with (
+            patch(
+                "sglang.srt.layers.attention.trtllm_mla_backend.get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=True),
+            ),
+            patch.object(
+                backend,
+                "_call_trtllm_batch_decode_mla",
+                return_value=(sentinel.output, sentinel.lse),
+            ) as kernel,
+        ):
+            output = backend._run_decode_kernel(
+                query=torch.empty(2, 96, 576),
+                kv_cache=torch.empty(1),
+                block_tables=torch.empty(1),
+                seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+                max_seq_len=1,
+                layer=SimpleNamespace(),
+                return_lse=True,
+            )
 
-    def test_either_condition_alone_excludes(self):
-        # A shape can fail on num_heads_q, page_size, or both -- any one is
-        # enough to exclude it, not both required.
-        self.assertFalse(varlen_absorbed_mla_shape_ok(96, page_size=64))
-        self.assertFalse(varlen_absorbed_mla_shape_ok(12, page_size=16))
-        self.assertFalse(varlen_absorbed_mla_shape_ok(96, page_size=16))
+        self.assertEqual(output, (sentinel.output, sentinel.lse))
+        self.assertIs(kernel.call_args.kwargs["return_lse"], True)
 
 
 if __name__ == "__main__":
