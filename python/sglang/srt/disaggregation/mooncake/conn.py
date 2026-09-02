@@ -2027,11 +2027,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def _handle_deferred_abort_notification(
         self, notification: AbortNotification, room_active: bool
     ) -> None:
-        if notification.decode_ip is None or notification.decode_port is None:
-            return
         room = notification.room
         if room_active:
             self.update_status(room, KVPoll.Failed)
+
+        if notification.decode_ip is None or notification.decode_port is None:
+            return
+        if room_active:
             self.register_deferred_ack_target(
                 room, notification.decode_ip, notification.decode_port
             )
@@ -2064,6 +2066,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return
         try:
             na = NetworkAddress(notification.decode_ip, notification.decode_port)
+            # Deferred ACKs carry a rank; the feature-off wire format does not.
             self._send_multipart_locked(
                 na.to_tcp(),
                 [ABORT_ACK_TAG, str(room).encode("ascii")],

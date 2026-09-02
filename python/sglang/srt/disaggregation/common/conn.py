@@ -9,6 +9,7 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -146,8 +147,7 @@ class PrefillRankInfo:
         self.rank_port = int(self.rank_port)
 
 
-@dataclasses.dataclass(frozen=True)
-class AbortNotification:
+class AbortNotification(msgspec.Struct, frozen=True):
     room: int
     decode_ip: Optional[str] = None
     decode_port: Optional[int] = None
@@ -189,8 +189,7 @@ class AbortNotification:
         return frames
 
 
-@dataclasses.dataclass(frozen=True)
-class AbortAck:
+class AbortAck(msgspec.Struct, frozen=True):
     room: int
     prefill_rank: int
 

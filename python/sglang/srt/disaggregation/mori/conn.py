@@ -1746,46 +1746,37 @@ class MoriKVManager(CommonKVManager):
                 target_infos_snapshot = list(transfer_infos.values())
 
         result_statuses: List[TransferStatus] = []
-        try:
-            for target in targets:
-                info = target.info
-                peer_info = target.peer_info
+        for target in targets:
+            info = target.info
+            peer_info = target.peer_info
 
-                if not info.is_dummy:
-                    dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    result_statuses.extend(
-                        self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
-                    )
+            if not info.is_dummy:
+                dst_indices_chunk = info.dst_kv_indices[index_slice]
+                result_statuses.extend(
+                    self.send_kvcache(peer_info, kv_indices, dst_indices_chunk)
+                )
 
-                if (
-                    is_last_chunk
-                    and state_indices is not None
-                    and not info.is_dummy
-                    and self.state_mem_descs
-                ):
-                    result_statuses.extend(
-                        self.send_state(
-                            peer_info, state_indices, info.dst_state_indices
-                        )
-                    )
+            if (
+                is_last_chunk
+                and state_indices is not None
+                and not info.is_dummy
+                and self.state_mem_descs
+            ):
+                result_statuses.extend(
+                    self.send_state(peer_info, state_indices, info.dst_state_indices)
+                )
 
-                if (
-                    is_last_chunk
-                    and aux_index is not None
-                    and info.dst_aux_index >= 0
-                    and self.pp_group.is_last_rank
-                ):
-                    result_statuses.extend(
-                        self.send_aux(
-                            peer_info, aux_index, info.dst_aux_index, bootstrap_room
-                        )
+            if (
+                is_last_chunk
+                and aux_index is not None
+                and info.dst_aux_index >= 0
+                and self.pp_group.is_last_rank
+            ):
+                result_statuses.extend(
+                    self.send_aux(
+                        peer_info, aux_index, info.dst_aux_index, bootstrap_room
                     )
-        except Exception as e:
-            logger.exception(
-                "Mori KV transfer submission failed for bootstrap_room=%s",
-                bootstrap_room,
-            )
-            raise RuntimeError(f"Transfer submission failed: {e}") from e
+                )
 
         return result_statuses, target_infos_snapshot
 
