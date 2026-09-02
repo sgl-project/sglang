@@ -25,6 +25,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -32,7 +33,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64):
+class _FakeShardPool(PageInterleaveKVPoolMixin):
+    pass
+
+
+def _make_prefill_aware_swa_runner(
+    *, pool_size: int, max_context_len: int = 64, token_to_kv_pool=None
+):
     """A minimal fake ModelRunner that reaches FlashAttentionBackend.__init__'s
     is_prefill_aware_swa branch (mirrors how models like
     python/sglang/srt/models/unlimited_ocr.py opt in)."""
@@ -63,7 +70,7 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
         enable_prefill_cp=False,
         enable_dp_attention=False,
     )
-    token_to_kv_pool = object()
+    token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
     token_to_kv_pool_allocator = object()
     return SimpleNamespace(
         sliding_window_size=None,
@@ -94,6 +101,16 @@ def _make_prefill_aware_swa_runner(*, pool_size: int, max_context_len: int = 64)
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPrefillAwareSwaPrefillLensBound(CustomTestCase):
+    def test_sharded_pool_requests_cpu_sequence_lengths(self):
+        runner = _make_prefill_aware_swa_runner(
+            pool_size=8, token_to_kv_pool=_FakeShardPool()
+        )
+
+        with get_context().override_server_args():
+            backend = FlashAttentionBackend(runner)
+
+        self.assertTrue(backend.needs_cpu_seq_lens)
+
     def test_buffer_covers_full_req_pool_idx_range(self):
         pool_size = 8
         runner = _make_prefill_aware_swa_runner(pool_size=pool_size)

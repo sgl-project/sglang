@@ -50,6 +50,10 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -239,6 +243,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
+        self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -812,6 +818,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if self._kv_shard_pool is not None:
+            prepare_kv_shard_forward(
+                self._kv_shard_pool,
+                self.req_to_token,
+                forward_batch,
+            )
+
         self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
