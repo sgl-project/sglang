@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel
     ConvRotInt8CustomKernelLinearMethod,
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
+    apply_convrot_int8_shared_input_out,
     convrot_int8_fuses_gelu_input,
     convrot_int8_shares_input,
 )
@@ -29,6 +30,7 @@ _LOAD_SGL_KERNEL = (
 )
 
 QWEN_IMAGE_IGNORED_LAYERS = ["img_mod", "txt_mod", "txt_mlp.net.2"]
+_PREQUANT_OPS = ("convrot_int8_linear_prequant", "convrot_int8_linear_prequant_out")
 
 
 def _kernel_available() -> bool:
@@ -40,7 +42,7 @@ def _kernel_available() -> bool:
         import sgl_kernel  # noqa: F401
     except ImportError:
         return False
-    return hasattr(torch.ops.sgl_kernel, "convrot_int8_linear_prequant")
+    return all(hasattr(torch.ops.sgl_kernel, op) for op in _PREQUANT_OPS)
 
 
 requires_kernel = pytest.mark.skipif(
@@ -169,6 +171,35 @@ def test_shared_input_helper_is_bitwise_three_layer_calls():
     shared = apply_convrot_int8_shared_input(x=x, layers=layers)
     for out, layer in zip(shared, layers):
         assert torch.equal(out, layer(x)[0])
+
+
+@requires_kernel
+def test_shared_input_out_helper_is_bitwise_into_joint_buffer_slices():
+    """The joint text-image Q/K/V path writes each projection into a row slice
+    of one larger buffer; the slice write must equal the allocating helper."""
+    config = ConvRotInt8CustomKernelConfig()
+    layers = [
+        _quantized_layer(config, 3072, 3072, f"attn.to_{n}", seed=10 + i)[0]
+        for i, n in enumerate("qkv")
+    ]
+    seq_len_txt, seq_len_img = 20, 4096
+    x = torch.randn(1, seq_len_img, 3072, device="cuda", dtype=torch.bfloat16)
+    bufs = [
+        torch.zeros(
+            1, seq_len_txt + seq_len_img, 3072, device="cuda", dtype=torch.bfloat16
+        )
+        for _ in layers
+    ]
+
+    apply_convrot_int8_shared_input_out(
+        x=x, layers=layers, outs=[buf[:, seq_len_txt:] for buf in bufs]
+    )
+    for out, buf, layer in zip(
+        apply_convrot_int8_shared_input(x=x, layers=layers), bufs, layers
+    ):
+        assert torch.equal(buf[:, seq_len_txt:], out)
+        assert torch.equal(buf[:, seq_len_txt:], layer(x)[0])
+        assert not buf[:, :seq_len_txt].any()
 
 
 @requires_kernel

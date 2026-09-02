@@ -90,6 +90,7 @@ def _attention(*, bias: bool = True) -> QwenImageCrossAttention:
     attn.use_fused_added_qkv = False
     attn._unquantized_added_qkv_is_packed = False
     attn.separate_unquantized_qkv_proj = True
+    attn.separate_convrot_qkv_proj = False
     for name in ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj"):
         setattr(attn, name, _linear(bias=bias))
     for name in ("norm_q", "norm_k", "norm_added_q", "norm_added_k"):
@@ -167,6 +168,20 @@ class TestQwenImageJointQkvBuffers(CustomTestCase):
             self._forward(attn, encoder_hidden_states_mask=mask)
         project.assert_not_called()
         self.assertIsNotNone(attn.attn.calls[0][3]["q_prefix"])
+
+    def test_stale_convrot_flag_falls_through_to_per_layer_projections(self):
+        """LoRA mounting swaps the projections after construction, so the
+        ConvRot flag alone must not select the shared-input helper."""
+        attn = _attention()
+        attn.separate_unquantized_qkv_proj = False
+        mask = torch.ones(1, SEQ_TXT, dtype=torch.bool, device="cuda")
+        outputs = []
+        for convrot in (False, True):
+            torch.manual_seed(20260902)
+            attn.separate_convrot_qkv_proj = convrot
+            outputs.append(self._forward(attn, encoder_hidden_states_mask=mask))
+        self.assertTrue(torch.equal(outputs[0][0], outputs[1][0]))
+        self.assertTrue(torch.equal(outputs[0][1], outputs[1][1]))
 
     def test_joint_projection_without_bias_matches_reference(self):
         attn = _attention(bias=False)

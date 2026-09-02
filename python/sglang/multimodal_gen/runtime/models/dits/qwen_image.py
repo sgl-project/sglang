@@ -84,7 +84,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
     apply_convrot_int8_gelu_input,
+    apply_convrot_int8_shared_input,
+    apply_convrot_int8_shared_input_out,
     convrot_int8_fuses_gelu_input,
+    convrot_int8_shares_input,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
@@ -747,7 +750,7 @@ def _use_joint_qkv_buffers(
     # Batch 1 keeps each slice contiguous for the out= writes and the in-place
     # QK-norm; SP>1 and masked sequences never take join_seqs.
     return (
-        attn.separate_unquantized_qkv_proj
+        (attn.separate_unquantized_qkv_proj or attn.separate_convrot_qkv_proj)
         and not masked
         and hidden_states.shape[0] == 1
         and hidden_states.is_contiguous()
@@ -793,6 +796,18 @@ def _project_qkv_into_joint_buffers(
     to_q, to_k, to_v, add_q_proj, add_k_proj, add_v_proj = _joint_qkv_layers(attn)
     img_layers = (to_q, to_k, to_v)
     txt_layers = (add_q_proj, add_k_proj, add_v_proj)
+    if attn.separate_convrot_qkv_proj:
+        apply_convrot_int8_shared_input_out(
+            x=hidden_states,
+            layers=img_layers,
+            outs=[buf[:, seq_len_txt:] for buf in bufs],
+        )
+        apply_convrot_int8_shared_input_out(
+            x=encoder_hidden_states,
+            layers=txt_layers,
+            outs=[buf[:, :seq_len_txt] for buf in bufs],
+        )
+        return bufs
     for buf, img_layer, txt_layer in zip(bufs, img_layers, txt_layers):
         _project_into(x=hidden_states, layer=img_layer, out=buf[:, seq_len_txt:])
         _project_into(
@@ -874,6 +889,7 @@ class QwenImageCrossAttention(nn.Module):
         self.local_num_heads = self.num_heads // tp_size
         self._unquantized_added_qkv_is_packed = False
         self.separate_unquantized_qkv_proj = False
+        self.separate_convrot_qkv_proj = False
 
         if self.use_fused_qkv:
             # Use fused QKV projection for nunchaku quantization
@@ -968,6 +984,13 @@ class QwenImageCrossAttention(nn.Module):
                         isinstance(layer.quant_method, UnquantizedLinearMethod)
                         for layer in _joint_qkv_layers(self)
                     )
+                )
+                # Six ConvRot INT8 linears share one rotated+quantized input per
+                # stream and also write straight into the joint buffers.
+                self.separate_convrot_qkv_proj = (
+                    not self.use_fused_qkv
+                    and not self.use_fused_qkv_epilogue
+                    and convrot_int8_shares_input(_joint_qkv_layers(self))
                 )
 
         if context_pre_only is not None and not context_pre_only:
@@ -1107,6 +1130,20 @@ class QwenImageCrossAttention(nn.Module):
             )
             txt_query, txt_key, txt_value = self._get_added_qkv_projections(
                 encoder_hidden_states
+            )
+        elif self.separate_convrot_qkv_proj and convrot_int8_shares_input(
+            _joint_qkv_layers(self)
+        ):
+            # Same rotate-once projections as the joint-buffer path, into fresh
+            # tensors when the joint layout is not applicable (SP, masks, B>1).
+            # Re-checked per call: LoRA mounting swaps the projections for
+            # wrappers that add their delta in forward.
+            img_query, img_key, img_value = apply_convrot_int8_shared_input(
+                x=hidden_states, layers=(self.to_q, self.to_k, self.to_v)
+            )
+            txt_query, txt_key, txt_value = apply_convrot_int8_shared_input(
+                x=encoder_hidden_states,
+                layers=(self.add_q_proj, self.add_k_proj, self.add_v_proj),
             )
         else:
             (

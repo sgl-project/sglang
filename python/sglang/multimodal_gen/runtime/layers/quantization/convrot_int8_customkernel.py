@@ -37,6 +37,7 @@ __all__ = [
     "ConvRotInt8CustomKernelLinearMethod",
     "apply_convrot_int8_gelu_input",
     "apply_convrot_int8_shared_input",
+    "apply_convrot_int8_shared_input_out",
     "convrot_int8_fuses_gelu_input",
     "convrot_int8_shares_input",
 ]
@@ -49,6 +50,7 @@ _REQUIRED_OPS = (
     "convrot_int8_fused_linear",
     "convrot_int8_fused_linear_gelu_input",
     "convrot_int8_linear_prequant",
+    "convrot_int8_linear_prequant_out",
 )
 
 
@@ -210,6 +212,31 @@ def apply_convrot_int8_shared_input(
         )
         outs.append(_like_input(out=out, x=x))
     return outs
+
+
+def apply_convrot_int8_shared_input_out(
+    x: torch.Tensor, layers: Sequence[LinearBase], outs: Sequence[torch.Tensor]
+) -> None:
+    """Writes ``layer(x)[0]`` into ``out`` for each (layer, out) pair with ``x``
+    rotated and quantized once; ``out`` must be a contiguous BF16 slice shaped
+    like ``layer(x)[0]``. Bitwise identical to ``apply_convrot_int8_shared_input``
+    and to ``layer(x)``; see ``convrot_int8_linear_prequant_out`` in sgl-kernel.
+    """
+    group_size = layers[0].quant_method.quant_config.group_size
+    x_q, x_scale = torch.ops.sgl_kernel.convrot_rotate_quantize_activation(
+        _as_rows(x), group_size
+    )
+    for layer, out in zip(layers, outs, strict=True):
+        # view() rather than reshape(): a copy here would silently drop the write.
+        torch.ops.sgl_kernel.convrot_int8_linear_prequant_out(
+            x_q,
+            x_scale,
+            layer.weight,
+            layer.weight_scale,
+            layer.bias,
+            group_size,
+            out.view(-1, out.shape[-1]),
+        )
 
 
 def convrot_int8_fuses_gelu_input(layer: torch.nn.Module) -> bool:
