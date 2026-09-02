@@ -226,9 +226,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
-            # Per-room count of chunks not yet transferred; teardown waits for
-            # zero so a deferred chunk is not dropped by an early conclude.
-            self._staging_outstanding = defaultdict(int)
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1661,8 +1658,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk: Optional[TransferKVChunk] = None
             try:
-                kv_chunk: TransferKVChunk = queue.get()
+                kv_chunk = queue.get()
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2002,6 +2000,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                if kv_chunk is not None:
+                    self.poison_deferred_ack_room(kv_chunk.room)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
@@ -2031,20 +2031,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if room_active:
             self.update_status(room, KVPoll.Failed)
 
-        if notification.decode_ip is None or notification.decode_port is None:
+        ack_target = notification.deferred_ack_target()
+        if ack_target is None:
             return
+        self.register_deferred_ack_target(room, ack_target)
+        self._maybe_ack_drained_abort(room)
         if room_active:
-            self.register_deferred_ack_target(
-                room, notification.decode_ip, notification.decode_port
-            )
-            self._maybe_ack_drained_abort(room)
             logger.debug(
                 "Received abort notification for room %s, marked as Failed; "
                 "ACK deferred until transfer drains",
                 room,
             )
-        elif self._staging_outstanding.get(room, 0) == 0:
-            self._send_abort_ack(notification.decode_ip, notification.decode_port, room)
 
     def _handle_legacy_abort_notification(
         self, notification: AbortNotification, room_active: bool

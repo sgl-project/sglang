@@ -493,7 +493,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.exceptions: Dict[int, Exception] = {}
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
-            self._staging_outstanding = defaultdict(int)
             # Mirror mooncake: one staging buffer per worker queue, all
             # built before workers spawn so each worker owns a private
             # buffer (no cross-worker contention on the staging ring).
@@ -1403,7 +1402,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
                 # No ack here on purpose: the DONE barrier bails on the first
-                # ERR, so siblings may still be writing; fall back to the timeout.
+                # ERR, so siblings may still be writing. The target cannot ever
+                # produce a safe ACK; discard it and fall back to the timeout.
+                self.poison_deferred_ack_room(room)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2692,37 +2693,23 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"ignoring (already completed or unknown)"
             )
 
-        self._handle_deferred_abort_ack(notification, room_active)
+        self._handle_deferred_abort_ack(notification)
         return True
 
-    def _handle_deferred_abort_ack(
-        self, notification: AbortNotification, room_active: bool
-    ) -> None:
+    def _handle_deferred_abort_ack(self, notification: AbortNotification) -> None:
         room_to_be_aborted = notification.room
-        # Deferred KV release: register only after the status flip above (see
-        # register_deferred_ack_target), then try once -- the room may already be
-        # quiescent and never revisited by the worker. A concluded/unknown room is
-        # acked only when nothing is still counted for it: the ERR path abandons
-        # sibling handles that may still be writing and clear() then drops the
-        # room, so "unknown" alone does not imply quiescent.
-        if (
-            self.enable_deferred_decode_kv_release
-            and notification.decode_ip is not None
-            and notification.decode_port is not None
-        ):
-            if room_active:
-                self.register_deferred_ack_target(
-                    room_to_be_aborted,
-                    notification.decode_ip,
-                    notification.decode_port,
-                )
-                self._maybe_ack_drained_abort(room_to_be_aborted)
-            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                self._send_abort_ack(
-                    notification.decode_ip,
-                    notification.decode_port,
-                    room_to_be_aborted,
-                )
+        if not self.enable_deferred_decode_kv_release:
+            return
+        ack_target = notification.deferred_ack_target()
+        if ack_target is None:
+            return
+
+        # The active-room status flip happens before registration. Success or a
+        # missing status does not imply quiescence: clear() can remove the room
+        # while a counted handle is still writing. The immediate retry closes
+        # both races where the worker drains before or during registration.
+        self.register_deferred_ack_target(room_to_be_aborted, ack_target)
+        self._maybe_ack_drained_abort(room_to_be_aborted)
 
     def _start_bootstrap_thread(self):
         def bootstrap_thread():

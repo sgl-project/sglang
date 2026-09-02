@@ -7,7 +7,6 @@ import struct
 import threading
 import time
 import uuid
-from collections import defaultdict
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
@@ -31,6 +30,7 @@ from mori.io import (
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
+    AckTarget,
     AbortNotification,
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -328,7 +328,6 @@ class MoriKVManager(CommonKVManager):
             ]
             self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
             self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
-            self._staging_outstanding = defaultdict(int)
             self._abort_ack_lock = threading.Lock()
             self._room_status_notified: Dict[int, bool] = {}
             self._room_notify_lock = threading.Lock()
@@ -518,7 +517,7 @@ class MoriKVManager(CommonKVManager):
                 self._staging_outstanding.pop(room)
                 target = self._deferred_ack_targets.pop(room, None)
         if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+            self._send_abort_ack(room, target)
 
     def _process_transfer_chunk(self, kv_chunk: TransferKVChunk) -> bool:
         room = kv_chunk.room
@@ -884,26 +883,24 @@ class MoriKVManager(CommonKVManager):
                 bootstrap_room,
             )
 
-        self._arm_abort_ack(
-            bootstrap_room, notification.decode_ip, notification.decode_port
-        )
+        self._arm_abort_ack(bootstrap_room, notification)
 
     def _arm_abort_ack(
         self,
         bootstrap_room: int,
-        decode_ip: Optional[str],
-        decode_port: Optional[int],
+        notification: AbortNotification,
     ) -> None:
         if not self.enable_deferred_decode_kv_release:
             return
-        if decode_ip is None or decode_port is None:
+        ack_target: Optional[AckTarget] = notification.deferred_ack_target()
+        if ack_target is None:
             return
 
         with self._abort_ack_lock:
             if self._staging_outstanding.get(bootstrap_room, 0) > 0:
-                self._deferred_ack_targets[bootstrap_room] = (decode_ip, decode_port)
+                self._deferred_ack_targets[bootstrap_room] = ack_target
                 return
-        self._send_abort_ack(decode_ip, decode_port, bootstrap_room)
+        self._send_abort_ack(bootstrap_room, ack_target)
 
     def _start_bootstrap_thread(self) -> None:
         def bootstrap_worker():
@@ -1870,16 +1867,7 @@ class MoriKVSender(CommonKVSender):
     def clear(self) -> None:
         if self.kv_mgr.enable_deferred_decode_kv_release:
             with self.kv_mgr._abort_ack_lock:
-                # Keep the endpoint while a drainer can still produce its ACK.
-                target = self.kv_mgr._deferred_ack_targets.pop(
-                    self.bootstrap_room, None
-                )
                 super().clear()
-                if (
-                    target is not None
-                    and self.kv_mgr._staging_outstanding.get(self.bootstrap_room, 0) > 0
-                ):
-                    self.kv_mgr._deferred_ack_targets[self.bootstrap_room] = target
         else:
             super().clear()
         with self.kv_mgr._room_notify_lock:
