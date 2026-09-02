@@ -229,34 +229,8 @@ class GptOssSparseMoeBlock(nn.Module):
                 != "mxfp4"
             }
             if quant_config_name == "mxfp4" and is_xpu():
-                # gpt-oss-120b-dedicated fix (deliberately scoped to this
-                # model, not a shared Mxfp4MoEMethod/quantization change):
-                # SGLang's XPU MXFP4 MoE kernel
-                # (sgl_kernel.fused_experts(..., use_mxfp4_w4a16=True) ->
-                # moe_grouped_mm_nt_xe20_w4a16) requires each rank's
-                # intermediate size to be a multiple of the MXFP4 group size
-                # (mxfp4_block=32). This model's `intermediate_size=2880`
-                # isn't evenly divisible into a 32-aligned chunk for every
-                # `tp_size`/`ep_size` combo (e.g. `tp_size=8`: `2880/8=360`,
-                # `360/32=11.25`), which used to crash `FusedMoE`'s weight
-                # loader with a tensor-shape mismatch as soon as
-                # `intermediate_size // moe_tp_size` came out unaligned.
-                #
-                # `_load_mxfp4_experts_weights` below already computes each
-                # rank's *loaded* shard width with exactly this alignment
-                # (`per_rank_intermediate_size = ceil(intermediate_size /
-                # mxfp4_block / moe_tp_size) * mxfp4_block`) when slicing the
-                # checkpoint. The mismatch was that `FusedMoE.__init__`
-                # allocates its weight/scale/bias buffers from the *raw*
-                # `intermediate_size // moe_tp_size` (no rounding). Passing
-                # an already-padded `intermediate_size` here (matching the
-                # loader's own formula) makes the two agree, so the buffer is
-                # always >= what the loader ever tries to write into it.
-                # `_load_mxfp4_experts_weights` still slices the real
-                # checkpoint using the unpadded `self.config.intermediate_size`,
-                # so the extra padded rows/columns are simply left at their
-                # zero-initialized default and contribute nothing through
-                # down_proj -- real (unpadded) experts are unaffected.
+                # Keep GPT-OSS XPU MXFP4 shards 32-aligned so FusedMoE's
+                # buffers match the padded checkpoint slices.
                 mxfp4_block = 32
                 moe_tp_size = get_parallel().moe_tp_size
                 intermediate_size_block = config.intermediate_size // mxfp4_block
