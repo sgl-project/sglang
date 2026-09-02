@@ -27,6 +27,8 @@ Pattern follows `test/registered/layers/mamba/test_mamba2_mixer.py` —
 plays poorly with arbitrary subprocess launchers.
 """
 
+import logging
+
 import pytest
 import torch
 
@@ -173,8 +175,8 @@ def test_solve_ipm_matches_torch_reference():
     max_diff = (cuda_x - torch_x).abs().max().item()
     print(
         f"\n[ipm-compare] converged={converged}  max|cuda-torch|={max_diff:.3e}  "
-        f"cuda={[round(v,4) for v in cuda_x.tolist()]}  "
-        f"torch={[round(v,4) for v in torch_x.tolist()]}"
+        f"cuda={[round(v, 4) for v in cuda_x.tolist()]}  "
+        f"torch={[round(v, 4) for v in torch_x.tolist()]}"
     )
     assert converged, (
         "IPM returned the 0.5 non-convergence sentinel — the comparison would "
@@ -183,6 +185,58 @@ def test_solve_ipm_matches_torch_reference():
     assert torch.allclose(
         cuda_x, torch_x, atol=1e-2, rtol=1e-2
     ), f"fused IPM diverges from torch reference: max abs diff {max_diff:.3e}"
+
+
+def test_budget_bytes_for_device(monkeypatch, caplog):
+    """Cover live device properties, index resolution, and legacy fallback."""
+    from sglang.kernels.ops.lplb import shmem_budget
+
+    class _Props:
+        def __init__(self, optin_bytes):
+            self.shared_memory_per_block_optin = optin_bytes
+
+    props = {0: _Props(227 * 1024), 1: _Props(99 * 1024)}
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: props[d])
+    shmem_budget._budget_bytes_for_device.cache_clear()
+
+    assert shmem_budget.budget_bytes_for_device(torch.device("cuda", 0)) == 223 * 1024
+    assert (
+        shmem_budget.budget_bytes_for_device("cuda:0")
+        == shmem_budget.GPU_BUDGETS_BYTES["h100"]
+    )
+    assert (
+        shmem_budget.budget_bytes_for_device("cuda:1") == 99 * 1024 - 4096 == 95 * 1024
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert shmem_budget.budget_bytes_for_device("cuda") == 99 * 1024 - 4096
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    assert shmem_budget.budget_bytes_for_device("cuda") == 223 * 1024
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda d: object())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d: (9, 0))
+    shmem_budget._budget_bytes_for_device.cache_clear()
+    with caplog.at_level(
+        logging.WARNING, logger="sglang.kernels.ops.lplb.shmem_budget"
+    ):
+        assert (
+            shmem_budget.budget_bytes_for_device("cuda:0")
+            == shmem_budget.GPU_BUDGETS_BYTES["h100"]
+        )
+    assert any(
+        "shared_memory_per_block_optin" in m and "falling back" in m
+        for m in caplog.messages
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda d: (12, 0))
+    shmem_budget._budget_bytes_for_device.cache_clear()
+    with pytest.raises(
+        RuntimeError,
+        match=r"unrecognized SM major 12.*no safe shared-memory budget",
+    ):
+        shmem_budget.budget_bytes_for_device("cuda:2")
+
+    shmem_budget._budget_bytes_for_device.cache_clear()
 
 
 @pytest.mark.skipif(
