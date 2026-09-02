@@ -11,8 +11,12 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
     _SageAttentionBackendResolver,
+    _SpargeAttentionBackendResolver,
 )
-from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import (
+    AttentionBackendEnum,
+    DeviceCapability,
+)
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -24,6 +28,7 @@ class FakeCudaPlatform(CudaPlatformBase):
     is_blackwell_device = False
     is_hopper_device = False
     supports_flash_attention = True
+    device_capability = DeviceCapability(8, 0)
 
     @classmethod
     def is_sm120(cls):
@@ -45,6 +50,10 @@ class FakeCudaPlatform(CudaPlatformBase):
     ) -> bool:
         return cls.supports_flash_attention
 
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0):
+        return cls.device_capability
+
 
 class TestCudaAttentionBackendSelection(unittest.TestCase):
     def setUp(self):
@@ -52,6 +61,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.is_blackwell_device = False
         FakeCudaPlatform.is_hopper_device = False
         FakeCudaPlatform.supports_flash_attention = True
+        FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
         _cached_get_attn_backend.cache_clear()
 
     def resolve(
@@ -141,6 +151,38 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 _SageAttentionBackendResolver.resolve(FakeCudaPlatform),
                 AttentionBackendEnum.FA,
             )
+
+    def test_sparge_attention_resolver(self):
+        module = types.ModuleType("spas_sage_attn")
+        module.spas_sage2_attn_meansim_topk_cuda = object()
+        backend_module = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends.sparge_attn"
+        )
+        try:
+            with patch.dict(sys.modules, {"spas_sage_attn": module}):
+                self.assertEqual(
+                    self.resolve(AttentionBackendEnum.SPARGE_ATTN),
+                    f"{backend_module}.SpargeAttentionBackend",
+                )
+        finally:
+            sys.modules.pop(backend_module, None)
+
+    def test_sparge_attention_rejects_pre_ampere_cuda(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(7, 5)
+        with self.assertRaisesRegex(ValueError, "found 7.5"):
+            _SpargeAttentionBackendResolver.resolve(FakeCudaPlatform)
+
+    def test_sparge_attention_rejects_unsupported_blackwell_cuda(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(10, 0)
+        with self.assertRaisesRegex(ValueError, "found 10.0"):
+            _SpargeAttentionBackendResolver.resolve(FakeCudaPlatform)
+
+    def test_sparge_attention_missing_dependency_fails_closed(self):
+        with patch.dict(sys.modules, {"spas_sage_attn": None}):
+            with self.assertRaisesRegex(
+                ImportError, "SpargeAttention is not installed"
+            ):
+                _SpargeAttentionBackendResolver.resolve(FakeCudaPlatform)
 
     def test_explicit_backend_rejected_by_a_model_fails_closed(self):
         with self.assertRaisesRegex(

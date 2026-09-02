@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.kda_kernels import _cuda_source
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -81,7 +82,7 @@ def norm_scale_shift_module() -> Module:
         )
     return load_jit(
         "norm_scale_shift_native",
-        cuda_files=["diffusion/norm_scale_shift.cuh"],
+        cuda_files=[_cuda_source("diffusion/norm_scale_shift.cuh")],
         cuda_wrappers=[
             (
                 "nss_bf16_row",
@@ -118,7 +119,7 @@ _module = norm_scale_shift_module
 def norm_scale_shift_nvfp4_module() -> Module:
     return load_jit(
         "norm_scale_shift_nvfp4_native",
-        cuda_files=["diffusion/norm_scale_shift.cuh"],
+        cuda_files=[_cuda_source("diffusion/norm_scale_shift.cuh")],
         cuda_wrappers=[
             (
                 "srnss_nvfp4_row",
@@ -220,6 +221,33 @@ def try_fused_scale_residual_norm_scale_shift(
         float(eps),
     )
     return y, residual_out
+
+
+def kda_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
+    """Run the KDA B200 native CUDA path introduced by PR #27392.
+
+    Unlike ``try_fused_norm_scale_shift``, this explicit backend entry point
+    fails on unsupported inputs instead of silently returning ``None`` for a
+    caller-owned fallback.
+    """
+    out = try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps)
+    if out is None:
+        raise RuntimeError("unsupported input for KDA norm-scale-shift CUDA")
+    return out
+
+
+def kda_scale_residual_norm_scale_shift(
+    residual, x, gate, weight, bias, scale, shift, norm_type, eps
+):
+    """Run the KDA B200 residual + norm + scale/shift path from PR #27392."""
+    out = try_fused_scale_residual_norm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, norm_type, eps
+    )
+    if out is None:
+        raise RuntimeError(
+            "unsupported input for KDA scale-residual-norm-scale-shift CUDA"
+        )
+    return out
 
 
 def try_fused_norm_scale_shift_fp8(
