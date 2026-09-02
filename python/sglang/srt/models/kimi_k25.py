@@ -247,6 +247,7 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             .unsqueeze(1),
             persistent=False,
         )
+        self.time_weight._skip_weight_check = True
 
         self.reset_parameters()
 
