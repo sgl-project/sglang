@@ -1,24 +1,28 @@
 #!/bin/bash
 # Shared `git clone` helper for CI install scripts.
 # GitHub rate limits anonymous git-over-HTTPS per source IP; shared runner egress
-# trips it as "could not read Username for 'https://github.com'". With GH_TOKEN
-# or GITHUB_TOKEN set, github.com requests are authenticated instead.
+# trips it as "could not read Username for 'https://github.com'". Clones reuse
+# the job token that actions/checkout persisted into this repo's .git/config, so
+# a checkout with persist-credentials: false stays anonymous by design.
 
 _git_with_github_auth() {
-  # Disable xtrace before touching the token so neither it nor its base64
-  # form is echoed.
+  # Disable xtrace before touching the auth header so it is not echoed.
   local xtrace=0
   [[ $- == *x* ]] && xtrace=1
   { set +x; } 2>/dev/null
 
+  local repo_root
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+  local header
+  header="$(git -C "$repo_root" config --local --get http.https://github.com/.extraheader 2>/dev/null || true)"
+
   local rc=0
-  local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  if [ -z "$token" ]; then
+  if [ -z "$header" ]; then
     "$@" || rc=$?
   else
     GIT_CONFIG_COUNT=1 \
     GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-    GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')" \
+    GIT_CONFIG_VALUE_0="$header" \
       "$@" || rc=$?
   fi
 

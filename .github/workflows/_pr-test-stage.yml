@@ -163,9 +163,6 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
-        env:
-          # Read by scripts/ci/utils/git_clone_with_retry.sh.
-          GH_TOKEN: ${{ github.token }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 

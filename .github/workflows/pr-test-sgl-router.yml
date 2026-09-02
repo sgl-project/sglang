@@ -382,8 +382,6 @@ jobs:
       # new ServerArgs field (e.g. `disaggregation_mode` /
       # `disaggregation_bootstrap_port`) added in the branch.
       - name: Install SGLang dependencies
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
