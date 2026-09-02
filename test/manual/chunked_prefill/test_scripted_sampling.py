@@ -3,7 +3,6 @@ import unittest
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 from sglang.srt.utils import is_xpu
 from sglang.test.scripted_runtime.context import ScriptedContext
-from sglang.test.scripted_runtime.http_server import DEFAULT_RUN_TIMEOUT_S
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
 from sglang.test.scripted_runtime_chunked_helpers import (
     DEFAULT_CHUNK_SIZE,
@@ -12,6 +11,11 @@ from sglang.test.scripted_runtime_chunked_helpers import (
     run_until,
     run_until_finished,
 )
+
+_is_xpu = is_xpu()
+
+# Measured on the XPU canary runner; DEFAULT_RUN_TIMEOUT_S is not enough there.
+XPU_RUN_TIMEOUT_S: float = 1400.0
 
 
 class TestSamplingBasic(ScriptedTestCase):
@@ -54,10 +58,14 @@ class TestSamplingBasic(ScriptedTestCase):
             f"{len(r.req.output_ids)}"
         )
 
+    @unittest.skipIf(_is_xpu, "Non-XPU runners only")
     def test_max_new_tokens_1000_long_chunked(self):
-        timeout_s = 1400.0 if is_xpu() else DEFAULT_RUN_TIMEOUT_S
+        self.server.execute_script(self._script_max_new_tokens_1000_long_chunked)
+
+    @unittest.skipUnless(_is_xpu, "XPU runner only")
+    def test_max_new_tokens_1000_long_chunked_xpu(self):
         self.server.execute_script(
-            self._script_max_new_tokens_1000_long_chunked, timeout_s=timeout_s
+            self._script_max_new_tokens_1000_long_chunked, timeout_s=XPU_RUN_TIMEOUT_S
         )
 
     @staticmethod
