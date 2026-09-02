@@ -915,6 +915,21 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
 
+        logical_count_by_rank = None
+        if get_exec().moe.eplb_algorithm == "topology_aware":
+            # Keep the sender dimension for the topology-aware planner.  The
+            # regular EPLB path still uses the cheaper all-reduce below.
+            local_logical_count = logical_count_of_buffered_step.sum(dim=0)
+            from sglang.srt.distributed import get_moe_ep_group
+
+            ep_group = get_moe_ep_group()
+            gathered = ep_group.all_gather(local_logical_count, dim=0)
+            logical_count_by_rank = gathered.reshape(
+                ep_group.world_size,
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_logical_experts,
+            )
+
         if self._first_dump:
             self._first_dump = False
             torch.get_device_module().empty_cache()
@@ -928,6 +943,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if logical_count_by_rank is not None:
+            output["logical_count_by_rank"] = logical_count_by_rank
 
         if output_mode == "file":
             if self._rank == 0:

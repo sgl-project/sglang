@@ -126,6 +126,7 @@ class EPLBManager:
             output_mode="object"
         )
         logical_count = dump_record_output["logical_count"]
+        logical_count_by_rank = dump_record_output.get("logical_count_by_rank")
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
         ]
@@ -136,6 +137,7 @@ class EPLBManager:
 
         expert_location_metadata = self._compute_expert_location_metadata(
             logical_count,
+            logical_count_by_rank=logical_count_by_rank,
             broadcast_over_world=is_post_scale_rebalance,
         )
 
@@ -188,12 +190,13 @@ class EPLBManager:
         logger.info(msg)
 
     def _compute_expert_location_metadata(
-        self, logical_count, *, broadcast_over_world: bool
+        self, logical_count, *, logical_count_by_rank=None, broadcast_over_world: bool
     ) -> ExpertLocationMetadata:
         if not broadcast_over_world:
             return ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                logical_count_by_rank=logical_count_by_rank,
             )
 
         current_metadata = get_global_expert_location_metadata()
@@ -204,6 +207,7 @@ class EPLBManager:
             computed_metadata = ExpertLocationMetadata.init_by_eplb(
                 self._model_config,
                 logical_count,
+                logical_count_by_rank=logical_count_by_rank,
                 # Arbitrary append topologies may not preserve node divisibility.
                 use_flat_topology=True,
             )

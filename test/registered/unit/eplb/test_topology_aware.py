@@ -13,6 +13,7 @@ from sglang.srt.eplb.topology import load_rank_cost_matrix
 from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     rebalance_experts_topology_aware,
 )
+from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm, rebalance_experts
 
 
 class TestTopologyAwarePlacement(unittest.TestCase):
@@ -81,6 +82,35 @@ class TestTopologyAwarePlacement(unittest.TestCase):
         second = rebalance_experts_topology_aware(counts, costs)
         for first_value, second_value in zip(first, second):
             self.assertTrue(torch.equal(first_value, second_value))
+
+    def test_public_algorithm_dispatch(self):
+        counts = torch.tensor([[[2, 0], [0, 2]]], dtype=torch.int64)
+        costs = torch.tensor([[0.0, 3.0], [3.0, 0.0]])
+        direct = rebalance_experts_topology_aware(counts, costs)
+        dispatched = rebalance_experts(
+            tokens_per_expert=counts.sum(dim=1),
+            num_physical_experts=2,
+            num_local_physical_experts=1,
+            num_groups=None,
+            num_nodes=1,
+            algorithm=EplbAlgorithm.topology_aware,
+            tokens_per_source_expert=counts,
+            rank_cost_matrix=costs,
+        )
+        for direct_value, dispatched_value in zip(direct, dispatched):
+            self.assertTrue(torch.equal(direct_value, dispatched_value))
+
+    def test_public_algorithm_requires_topology_inputs(self):
+        counts = torch.ones((1, 2), dtype=torch.int64)
+        with self.assertRaisesRegex(ValueError, "source-rank expert counts"):
+            rebalance_experts(
+                tokens_per_expert=counts,
+                num_physical_experts=2,
+                num_local_physical_experts=1,
+                num_groups=None,
+                num_nodes=1,
+                algorithm=EplbAlgorithm.topology_aware,
+            )
 
     def test_rejects_replication_until_supported(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)

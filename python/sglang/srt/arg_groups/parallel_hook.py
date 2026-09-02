@@ -528,6 +528,37 @@ def handle_eplb_and_dispatch(server_args: Any):
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
         )
 
+    if cfg.eplb_algorithm == "topology_aware":
+        if not cfg.enable_eplb:
+            raise ValueError(
+                "--eplb-algorithm topology_aware requires --enable-eplb"
+            )
+        if cfg.eplb_topology is None:
+            raise ValueError(
+                "--eplb-algorithm topology_aware requires --eplb-topology"
+            )
+        if cfg.ep_num_redundant_experts != 0:
+            raise ValueError(
+                "topology-aware EPLB currently requires --ep-num-redundant-experts 0"
+            )
+        if cfg.elastic_ep_backend is not None:
+            raise ValueError(
+                "topology-aware EPLB currently does not support elastic EP"
+            )
+        if cfg.moe_dp_size != 1:
+            raise ValueError(
+                "topology-aware EPLB currently requires --moe-data-parallel-size 1"
+            )
+        if resolved_view(server_args).ep_size != cfg.tp_size:
+            raise ValueError(
+                "topology-aware EPLB currently requires ep_size == tp_size"
+            )
+        if cfg.expert_distribution_recorder_mode not in ("stat", "stat_approx"):
+            raise ValueError(
+                "topology-aware EPLB requires expert distribution recorder mode "
+                "'stat' or 'stat_approx'"
+            )
+
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
