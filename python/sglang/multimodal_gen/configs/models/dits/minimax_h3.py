@@ -46,6 +46,7 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
                 3,
             ),
             r"^transformer_blocks\.(\d+)\.attn\.to_out\.0\.(.*)$": r"blocks.\1.attn.out_proj.\2",
+            r"^transformer_blocks\.(\d+)\.attn\.to_gate_compress\.(.*)$": r"blocks.\1.attn.to_gate_compress.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_q\.(.*)$": r"blocks.\1.attn.q_norm.\2",
             r"^transformer_blocks\.(\d+)\.attn\.norm_k\.(.*)$": r"blocks.\1.attn.k_norm.\2",
             r"^transformer_blocks\.(\d+)\.ff\.net\.0\.proj\.(.*)$": r"blocks.\1.mlp.fc1.\2",

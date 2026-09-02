@@ -252,6 +252,33 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
             raise ImportError("Video Sparse Attention backend is not installed.") from e
 
 
+class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from fastvideo_kernel.block_sparse_attn import (  # noqa: F401
+                block_sparse_attn,
+            )
+
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
+                MiniMaxH3VSABackend,
+            )
+
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends."
+                "video_sparse_attn_h3.MiniMaxH3VSABackend"
+            )
+        except ImportError as e:
+            logger.error("Failed to import VSA-H3 attention backend: %s", str(e))
+            raise ImportError(
+                "VSA-H3 requires fastvideo_kernel.block_sparse_attn. "
+                "Install fastvideo-kernel (Triton 64-token path; sm100a is "
+                "not used on H200)."
+            ) from e
+
+
 class _CubeSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.CUBE_SPARSE_ATTN
 
@@ -435,6 +462,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _SageAttention3BackendResolver,
         _SpargeAttentionBackendResolver,
         _VideoSparseAttentionBackendResolver,
+        _VideoSparseAttentionH3BackendResolver,
         _CubeSparseAttentionBackendResolver,
         _SparseVideoGen2AttentionBackendResolver,
         _SolAttnBackendResolver,

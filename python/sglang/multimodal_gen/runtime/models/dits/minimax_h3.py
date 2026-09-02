@@ -77,6 +77,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.interface import is_vsa_h3_backend
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -128,6 +129,29 @@ def _diffusers_h3_checkpoint(
 
 
 _BF16_DTYPE = torch.bfloat16
+
+
+def _requested_vsa_h3() -> bool:
+    names: list[str] = []
+    component = get_component_forced_attn_backend()
+    if component is not None:
+        names.append(component.name.lower())
+    try:
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        args = get_global_server_args()
+    except ValueError:
+        args = None
+    if args is not None:
+        backends = getattr(args, "component_attention_backends", None) or {}
+        transformer_backend = backends.get("transformer")
+        if transformer_backend:
+            names.append(str(transformer_backend).lower())
+        if args.attention_backend:
+            names.append(str(args.attention_backend).lower())
+    return any(is_vsa_h3_backend(name) for name in names)
+
+
 _FP32_DTYPE = torch.float32
 _MPS_MLP_TOKEN_CHUNK_SIZE = 128
 # keep MPS activation chunks below the allocator high-watermark; CUDA keeps
@@ -592,6 +616,7 @@ def _minimax_h3_attention_core_impl(
     ulysses_active: bool,
     subblock_sparse_query_block_mask: torch.Tensor | None = None,
     ring_active: bool = False,
+    gate_compress: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dynamic varlen attention and Ulysses/Ring collectives.
 
@@ -602,13 +627,23 @@ def _minimax_h3_attention_core_impl(
 
     if ulysses_active:
         from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all,
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
         )
 
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        # Same Ulysses swap as Q: full sequence, local heads.
+        if gate_compress is not None:
+            gate_compress = _usp_input_all_to_all(
+                gate_compress.unsqueeze(0), head_dim=2
+            )[0]
 
     if attention._attention_impl is None:
+        # Token-refiner FA routing lives in `_set_attention_backend`
+        # (cube) and `_resolve_attention_backend_once` (VSA-H3). Keep
+        # the transformer-scoped selection so a component override is
+        # not dropped on this lazy path.
         attention._set_attention_backend(
             get_attn_backend(
                 attention.head_dim,
@@ -667,6 +702,19 @@ def _minimax_h3_attention_core_impl(
                 first_segment_sparse_query_block_mask=(
                     subblock_sparse_query_block_mask
                 ),
+            )
+        elif (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+        ):
+            out = attention._attention_impl.forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+                gate_compress=gate_compress,
             )
         else:
             out = attention._attention_impl.forward_varlen(
@@ -767,11 +815,28 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.out_proj",
         )
+        # VSA-H3 gate; base checkpoint has none, so missing weights stay zero.
+        self.to_gate_compress: ColumnParallelLinear | None = None
+        self._gate_compress_active: bool | None = None
+        if not prefix.startswith("token_refiner") and _requested_vsa_h3():
+            self.to_gate_compress = ColumnParallelLinear(
+                arch.hidden_size,
+                self.inner_dim,
+                bias=False,
+                gather_output=False,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_compress",
+            )
+            self.to_gate_compress.weight.missing_param_init = "zeros"
 
     def _set_attention_backend(self, backend) -> None:
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
             and not self._cube_sparse_capable
+        ) or (
+            backend.get_enum() is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+            and self.prefix.startswith("token_refiner")
         ):
             backend = get_attn_backend(
                 self.head_dim,
@@ -791,6 +856,14 @@ class MiniMaxH3Attention(nn.Module):
         # the resolved enum alongside the impl instance instead of a second
         # get_attn_backend() call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
+
+    def _gate_active(self) -> bool:
+        if self.to_gate_compress is None:
+            return False
+        if self._gate_compress_active is None:
+            weight = self.to_gate_compress.weight
+            self._gate_compress_active = bool((weight != 0).any())
+        return self._gate_compress_active
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         weight = self.qkv_proj.weight
@@ -1032,6 +1105,11 @@ class MiniMaxH3Attention(nn.Module):
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
+        gate_compress = None
+        if self.to_gate_compress is not None and self._gate_active():
+            gate_compress, _ = self.to_gate_compress(x)
+            gate_compress = gate_compress.view(total, self.num_heads, self.head_dim)
+
         attention_core = (
             _minimax_h3_attention_core_bcg
             if self.bcg_breakpoint
@@ -1048,6 +1126,7 @@ class MiniMaxH3Attention(nn.Module):
             subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
             ulysses_active=ulysses_active,
             ring_active=ring_active,
+            gate_compress=gate_compress,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -2108,9 +2187,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             selected_attention_backend=selected_backend,
             attention_requirements=AttentionRequirements(packed_varlen=True),
         )
+        # Token refiner stays FA.
+        refiner_backend = backend
+        if backend.get_enum() is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+            refiner_backend = get_attn_backend(
+                self.arch.attention_head_dim,
+                _BF16_DTYPE,
+                selected_attention_backend=AttentionBackendEnum.FA,
+                attention_requirements=AttentionRequirements(packed_varlen=True),
+            )
         for module in self.modules():
             if isinstance(module, MiniMaxH3Attention):
-                module._set_attention_backend(backend)
+                chosen = (
+                    refiner_backend
+                    if module.prefix.startswith("token_refiner")
+                    else backend
+                )
+                module._set_attention_backend(chosen)
         self._resolved_attention_backend = backend.get_enum()
 
     def _mark_missing_params_required(self) -> None:
@@ -2200,6 +2293,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         device: torch.device,
     ) -> torch.Tensor:
         """Project and refine request-static text conditioning once."""
+        self._resolve_attention_backend_once()
         self.materialize_mps_non_layer_weights(
             "condition_proj", "token_refiner.final_norm"
         )

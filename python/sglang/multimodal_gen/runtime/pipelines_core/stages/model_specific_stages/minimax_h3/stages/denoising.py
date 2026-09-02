@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms.interface import is_vsa_h3_backend
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -448,6 +449,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         self._minimax_h3_quality = "lossless"
         self._minimax_h3_cache_mode: str | None = None
+        self._vsa_h3_metadata_builder = None
 
     def _owns_compile_warmup_lifecycle(self) -> bool:
         return True
@@ -815,6 +817,42 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         ):
             yield
 
+    def _vsa_h3_attn_metadata(
+        self,
+        call_kwargs: dict[str, Any],
+        step_index: int,
+        batch: Req,
+    ):
+        args = self.server_args
+        backend = (args.component_attention_backends or {}).get(
+            "transformer", args.attention_backend
+        )
+        if not is_vsa_h3_backend(backend):
+            return None
+
+        from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+            MiniMaxH3VSAMetadataBuilder,
+            h3_vsa_prefix_segments,
+        )
+
+        if self._vsa_h3_metadata_builder is None:
+            self._vsa_h3_metadata_builder = MiniMaxH3VSAMetadataBuilder()
+        cfg = args.attention_backend_config or {}
+        _, _, t, h, w = batch.raw_latent_shape
+        return self._vsa_h3_metadata_builder.build(
+            current_timestep=step_index,
+            raw_latent_shape=(int(t), int(h), int(w)),
+            patch_size=(1, 2, 2),
+            VSA_sparsity=float(cfg.get("VSA_sparsity", 0.9)),
+            prefix_segments=h3_vsa_prefix_segments(
+                int(call_kwargs["text_pos_info"]["position_ids"].numel()),
+                int((~call_kwargs["update_mask"].reshape(-1)).sum().item()),
+                int(call_kwargs["audio_pos_info"]["position_ids"].numel()),
+            ),
+            device=current_platform.get_local_torch_device(),
+            tile_size=int(cfg.get("tile_size", 64)),
+        )
+
     def _forward_dit(
         self,
         model: Any,
@@ -829,6 +867,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         from sglang.multimodal_gen.runtime.managers.forward_context import (
             set_forward_context,
         )
+
+        attn_metadata = self._vsa_h3_attn_metadata(call_kwargs, step_index, batch)
 
         with set_forward_context(
             current_timestep=step_index,

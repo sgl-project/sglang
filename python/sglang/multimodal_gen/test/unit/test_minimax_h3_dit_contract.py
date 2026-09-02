@@ -441,7 +441,7 @@ def test_model_lazy_resolver_keeps_transformer_scoped_backend():
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
-            "get_component_forced_attn_backend",
+            "claim_deferred_component_attn_backend",
             return_value=AttentionBackendEnum.CUBE_SPARSE_ATTN,
         ),
         torch.device("meta"),

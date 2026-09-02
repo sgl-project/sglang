@@ -7,6 +7,9 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 import torch
 from diffusers.loaders import lora_conversion_utils as lcu
 
+from sglang.multimodal_gen.runtime.pipelines_core.lora.adapter_dense_payload import (
+    is_dense_payload_key,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     apply_peft_config,
     normalize_peft_keys,
@@ -551,6 +554,17 @@ def normalize_lora_state_dict(
     log = logger or globals()["logger"]
 
     state_dict = normalize_peft_keys(state_dict)
+    dropped = [name for name in state_dict if is_dense_payload_key(name)]
+    if dropped:
+        state_dict = {
+            name: tensor
+            for name, tensor in state_dict.items()
+            if not is_dense_payload_key(name)
+        }
+        log.info(
+            "[LoRAFormatAdapter] ignored %d whole-parameter keys (.diff/.set_weight)",
+            len(dropped),
+        )
     keys = list(state_dict.keys())
     log.info(
         "[LoRAFormatAdapter] normalize_lora_state_dict called, #keys=%d",

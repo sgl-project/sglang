@@ -956,6 +956,8 @@ class ServerArgs(DisaggServerArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        if self.attention_backend in ["vsa_h3", "vsa-h3"]:
+            self.attention_backend = "video_sparse_attn_h3"
         self.component_attention_backends = (
             self._normalize_component_attention_backends(
                 self.component_attention_backends
@@ -979,6 +981,8 @@ class ServerArgs(DisaggServerArgsMixin):
             self.attention_backend_config = addict.Dict(
                 self._parse_attention_backend_config(self.attention_backend_config)
             )
+        elif not isinstance(self.attention_backend_config, addict.Dict):
+            self.attention_backend_config = addict.Dict(self.attention_backend_config)
 
         if self.backend != Backend.DIFFUSERS and isinstance(
             self.pipeline_config, LTX2PipelineConfig
@@ -1058,6 +1062,8 @@ class ServerArgs(DisaggServerArgsMixin):
         normalized = backend.strip().lower()
         if normalized in ("fa3", "fa4"):
             normalized = "fa"
+        elif normalized in ("vsa_h3", "vsa-h3"):
+            normalized = "video_sparse_attn_h3"
         elif normalized == "cudnn_sdpa":
             normalized = "torch_cudnn_sdpa"
         try:
