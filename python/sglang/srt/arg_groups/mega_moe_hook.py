@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 def handle_mega_moe(server_args: ServerArgs) -> None:
     handle_moe_runner_backend_alias(server_args)
+    handle_flashinfer_megamoe(server_args)
     check_mega_moe_compat(server_args)
 
 
@@ -35,6 +36,9 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
             "decomposition; disable --enable-two-batch-overlap and "
             "--enable-single-batch-overlap."
         )
+    if cfg.moe_runner_backend == "flashinfer_megamoe":
+        # The SM120 adapter validates its device when finalizing weights.
+        return
     platform = get_platform()
     if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
         raise ValueError(
@@ -99,19 +103,27 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     if cfg.moe_a2a_backend != "megamoe":
         return
 
+    flashinfer = cfg.moe_runner_backend == "flashinfer_megamoe"
+    capacity_arg = (
+        "--flashinfer-megamoe-max-num-tokens"
+        if flashinfer
+        else "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK"
+    )
     max_tokens_per_rank = (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        cfg.flashinfer_megamoe_max_num_tokens
+        if flashinfer
+        else envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "
-                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to cover the "
+                f"{capacity_arg} to cover the "
                 "largest decode / verify forward on one rank. Current values: "
                 f"decode cuda graph max bs x tokens per request = {decode_tokens}, "
-                f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-                f"{max_tokens_per_rank}. Raise the env var to at least "
+                f"{capacity_arg}="
+                f"{max_tokens_per_rank}. Raise the capacity to at least "
                 f"{decode_tokens} or lower --cuda-graph-max-bs / "
                 "--speculative-num-draft-tokens."
             )
@@ -174,7 +186,7 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     if max_tokens_per_rank < required_tokens_per_rank:
         raise ValueError(
             f"{model_label} with MegaMoE requires "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
+            f"{capacity_arg} to "
             "cover each rank's effective prefill token budget. "
             f"Current values: chunked_prefill_size="
             f"{cfg.chunked_prefill_size}, "
@@ -182,9 +194,9 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             f"token_partition_size={token_partition_size}, "
             f"token_alignment={token_alignment}, "
             f"required_per_rank={required_tokens_per_rank}, "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{capacity_arg}="
             f"{max_tokens_per_rank}. Set "
-            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
+            f"{capacity_arg} to at "
             f"least {required_tokens_per_rank}, or lower "
             "--chunked-prefill-size until the effective per-rank budget fits."
         )
@@ -207,4 +219,40 @@ def handle_moe_runner_backend_alias(server_args: ServerArgs) -> None:
         "handle_moe_runner_backend_alias",
         moe_runner_backend="auto",
         moe_a2a_backend="megamoe",
+    )
+
+
+def handle_flashinfer_megamoe(server_args: ServerArgs) -> None:
+    """Bind the FlashInfer MegaMoE runner to SGLang's fused MegaMoE path."""
+    cfg = resolving_view(server_args)
+    # Upstream's SM100 implementation uses its own A2A backend.
+    if cfg.moe_a2a_backend == "flashinfer_megamoe":
+        return
+    if cfg.moe_runner_backend != "flashinfer_megamoe":
+        return
+
+    if cfg.moe_a2a_backend not in ("none", "megamoe"):
+        raise ValueError(
+            "--moe-runner-backend flashinfer_megamoe owns dispatch and combine; "
+            "it cannot be combined with --moe-a2a-backend "
+            f"{cfg.moe_a2a_backend!r}."
+        )
+    if cfg.enable_eplb or cfg.ep_num_redundant_experts != 0:
+        raise ValueError(
+            "FlashInfer MegaMoE currently requires an even, non-replicated "
+            "expert placement; disable EPLB and redundant experts."
+        )
+    if cfg.flashinfer_megamoe_max_num_tokens <= 0:
+        raise ValueError("--flashinfer-megamoe-max-num-tokens must be positive")
+
+    if not cfg.disable_shared_experts_fusion:
+        logger.warning(
+            "FlashInfer MegaMoE computes the shared expert separately from the "
+            "routed MegaMoE kernel; enabling --disable-shared-experts-fusion."
+        )
+    declare_resolution(
+        server_args,
+        "handle_flashinfer_megamoe",
+        moe_a2a_backend="megamoe",
+        disable_shared_experts_fusion=True,
     )

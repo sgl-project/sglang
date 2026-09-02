@@ -738,6 +738,11 @@ class ExecMoe(msgspec.Struct):
         "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
         "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
     ] = "default"
+    flashinfer_megamoe_max_num_tokens: A[
+        int,
+        "Maximum number of input tokens per EP rank in the FlashInfer "
+        "MXFP4-weight x MXFP8-activation MegaMoE symmetric workspace.",
+    ] = 8192
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",

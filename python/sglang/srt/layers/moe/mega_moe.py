@@ -30,7 +30,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
@@ -43,6 +43,12 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+
+
+def _get_mega_moe_max_tokens_per_rank() -> int:
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        return get_exec().moe.flashinfer_megamoe_max_num_tokens
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 
 
 def _mega_moe_mma_type(experts=None) -> str:
@@ -145,6 +151,8 @@ def _get_mega_moe_symm_buffer(
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        return True
     if _device_sm == 90:
         return is_sm90_fp8_mega_moe_available(experts)
     # The SM100 mega kernels exist for compute capability 10.x only.
@@ -156,6 +164,9 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         return False
     if not is_mega_moe_experts_ready(moe.experts):
         return False
+    # FlashInfer owns the source weights; no ordinary FusedMoE fallback.
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        return True
     if get_is_capture_mode():
         return True
 
@@ -164,7 +175,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
-    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    cap = _get_mega_moe_max_tokens_per_rank()
     return max_tokens_per_rank <= cap
 
 
@@ -268,6 +279,40 @@ def run_mega_routed_experts(
     routed_scaling_factor: float = 1.0,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
+    if get_moe_runner_backend().is_flashinfer_megamoe():
+        from sglang.srt.layers.moe.flashinfer_mega_moe import (
+            run_flashinfer_megamoe,
+        )
+
+        global_num_tokens = get_dp_global_num_tokens()
+        compile_tokens_per_rank = max([num_tokens, *(global_num_tokens or [])])
+        capacity = _get_mega_moe_max_tokens_per_rank()
+        if compile_tokens_per_rank > capacity:
+            raise ValueError(
+                "FlashInfer MegaMoE token capacity exceeded: "
+                f"required={compile_tokens_per_rank}, capacity={capacity}. Raise "
+                "--flashinfer-megamoe-max-num-tokens or reduce the per-rank "
+                "prefill/decode admission limit."
+            )
+        y = run_flashinfer_megamoe(
+            experts,
+            hidden_states,
+            topk_ids=(
+                topk_ids.to(torch.int64)
+                if topk_ids is not None
+                else hidden_states.new_empty((0, top_k), dtype=torch.int64)
+            ),
+            topk_weights=(
+                topk_weights.to(torch.float32)
+                if topk_weights is not None
+                else hidden_states.new_empty((0, top_k), dtype=torch.float32)
+            ),
+            compile_tokens_per_rank=compile_tokens_per_rank,
+        )
+        if routed_scaling_factor != 1.0:
+            y.mul_(routed_scaling_factor)
+        return y
+
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
