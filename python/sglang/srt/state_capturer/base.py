@@ -80,8 +80,6 @@ class BaseHostCache:
         self._log_allocation()
 
     def destroy(self):
-        # Same reason as HostKVCache.destroy: a cudaHostRegister'd range left to
-        # SIGKILL reclaim can stall teardown for tens of seconds. Idempotent.
         if self.buffer is None:
             return
         if _is_cuda or _is_hip:
