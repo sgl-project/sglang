@@ -1198,10 +1198,16 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
       int64_t bos = cu_seqlens_ptr[i_n];
       int64_t T = cu_seqlens_ptr[i_n + 1] - bos;
 
+      // A padded row carries a negative slot: it owns no state, so it starts
+      // from zero and commits nothing, as the CUDA kernel does.
       int32_t state_idx = initial_state_indices_ptr[i_n];
       float* h = h_buf.data();
-      std::memcpy(
-          h, state_ptr + state_idx * state_slot_stride + ni * state_entry_size, state_entry_size * sizeof(float));
+      if (state_idx >= 0) {
+        std::memcpy(
+            h, state_ptr + state_idx * state_slot_stride + ni * state_entry_size, state_entry_size * sizeof(float));
+      } else {
+        std::fill(h, h + state_entry_size, 0.f);
+      }
 
       int32_t cache_idx = (isi_ptr != nullptr) ? isi_ptr[i_n] : -1;
       int64_t qk_head = ni / group_size;
@@ -1295,7 +1301,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         }
       }
 
-      if (!disable_state_update) {
+      if (!disable_state_update && state_idx >= 0) {
         std::memcpy(
             state_ptr + state_idx * state_slot_stride + ni * state_entry_size, h, state_entry_size * sizeof(float));
       }
@@ -1768,6 +1774,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     parent_ptr = rpt.data_ptr<int64_t>();
     parent_stride = rpt.stride(0);
   }
+
+  // Tokens are addressed as one flat [total_tokens] run, so a batch dim wider
+  // than one has to be packed against the token dim.
+  auto token_packed = [](const at::Tensor& t) { return t.size(0) == 1 || t.stride(0) == t.size(1) * t.stride(1); };
+  TORCH_CHECK(
+      token_packed(q) && token_packed(k) && token_packed(v),
+      "fused_sigmoid_gating_delta_rule_update_cpu: expect q/k/v tokens packed across the batch dim.");
 
   int64_t q_stride_token = q.stride(1);
   int64_t q_stride_head = q.stride(2);

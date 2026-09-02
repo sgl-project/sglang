@@ -407,6 +407,13 @@ void causal_conv1d_update_kernel_impl(
         const bool has_initial_states_value = true;
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
 
+        // A padded row carries a negative slot: it owns no conv state, so it
+        // is skipped and its output left alone, as the CUDA kernel does.
+        if (conv_state_index < 0) {
+          data_index_step(bs, batch, nb, NB);
+          continue;
+        }
+
         switch (width << 4 | nb_size >> 4) {
           case 0x42:
             LAUNCH_TINYGEMM_KERNEL(4, 32);
@@ -429,8 +436,11 @@ void causal_conv1d_update_kernel_impl(
   // update conv_states
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t bs = begin; bs < end; ++bs) {
-      // update old states, range [1, width - 1)
       int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+      if (conv_state_index < 0) {
+        continue;
+      }
+      // update old states, range [1, width - 1)
       for (int64_t w = 1; w < width - 1; ++w) {
         std::memcpy(CONV_STATE_INDEXR(w - 1), CONV_STATE_INDEXR(w), dim * sizeof(scalar_t));
       }
@@ -787,11 +797,12 @@ at::Tensor causal_conv1d_fwd_cpu(
 // API aligned with GPUs
 //
 //   x: (batch, dim) or (batch, dim, seqlen)
-//   conv_state: (..., dim, state_len), where state_len >= width - 1
+//   conv_state: (..., dim, state_len), where state_len == width - 1
 //   weight: (dim, width)
 //   bias: (dim,)
 //   cache_seqlens: (batch,), dtype int32.
-//   conv_state_indices: (batch,), dtype int32
+//   conv_state_indices: (batch,), dtype int32; a negative entry marks a padded
+//       row, which owns no conv state and is skipped
 //   pad_slot_id: int
 //   intermediate_conv_window: (cache_size, steps, dim, state_len); per-step
 //       post-update conv windows for speculative verify rollback
@@ -851,6 +862,9 @@ at::Tensor causal_conv1d_update_cpu(
       "causal_conv1d_update_cpu: retrieve_next_token, retrieve_next_sibling and "
       "retrieve_parent_token must be passed together.");
   TORCH_CHECK(!(is_tree && x.dim() == 2), "causal_conv1d_update_cpu: tree verify expects multi-token input.");
+  TORCH_CHECK(
+      !(x.dim() == 2 && intermediate_conv_window.has_value()),
+      "causal_conv1d_update_cpu: the single-token path caches no conv window.");
 
   if (x.dim() == 2) {
     CHECK_CONTIGUOUS(x);
@@ -973,8 +987,9 @@ at::Tensor causal_conv1d_update_cpu(
           std::vector<const scalar_t*> cols(state_len);
           for (int64_t b = begin; b < end; ++b) {
             int32_t idx = intermediate_indices_ptr[b];
-            if (idx < 0) continue;
             int32_t cs_idx = csi_ptr ? csi_ptr[b] : static_cast<int32_t>(b);
+            // a padded row has no window to cache, and no slot to cache it in
+            if (idx < 0 || cs_idx < 0) continue;
             const scalar_t* row = cs_ptr + cs_idx * entry_size;
             for (int64_t w = 0; w < state_len; ++w) {
               cols[w] = row + w * dim;

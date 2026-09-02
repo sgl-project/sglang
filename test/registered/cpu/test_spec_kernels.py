@@ -1622,6 +1622,94 @@ class TestFusedSigmoidGatingDeltaRuleVerify(CustomTestCase):
             intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
         )
 
+    def test_pad_slot_starts_from_zero_and_commits_nothing(self):
+        # A padded row carries state slot -1 while its intermediate index still
+        # points at the pool's discard row. The row owns no state: it starts
+        # from zeros and writes none back, as the CUDA kernel does.
+        B, T = 2, 3
+        HK, HV, K, V = 2, 4, 32, 32
+        total_tokens = B * T
+        num_slots, cache_size = 4, 3
+        dtype = torch.bfloat16
+
+        q = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        k = torch.rand(1, total_tokens, HK, K, dtype=dtype) * 0.1
+        v = torch.rand(1, total_tokens, HV, V, dtype=dtype) * 0.1
+        a = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        b = torch.rand(total_tokens, HV, dtype=dtype) * 0.1
+        A_log = torch.rand(HV, dtype=torch.float32) * 0.1
+        dt_bias = torch.rand(HV, dtype=dtype) * 0.1
+        cu_seqlens = torch.tensor([0, T, 2 * T], dtype=torch.int32)
+        cache_indices = torch.tensor([2, -1], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 2], dtype=torch.int32)
+
+        # The pool sits behind a guard slot, so a write through slot -1 lands
+        # in the guard instead of in memory this test does not own.
+        pool_init = torch.rand(num_slots + 1, HV, K, V, dtype=torch.float32) * 0.05
+
+        # the padded row's reference state is zeros, not the guard slot
+        ref_states = torch.cat(
+            [pool_init[1:], torch.zeros(1, HV, K, V, dtype=torch.float32)]
+        )
+        ref_indices = torch.tensor([2, num_slots], dtype=torch.int32)
+        out_ref, buffer_ref = self._ref_delta_rule_verify(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            ref_states,
+            ref_indices,
+            cu_seqlens,
+            intermediate_state_indices,
+            cache_size,
+        )
+
+        atol = rtol = precision[dtype]
+        for disable_state_update in [True, False]:
+            with self.subTest(disable_state_update=disable_state_update):
+                pool = pool_init.clone()
+                ssm_states = pool[1:]
+                intermediate_states_buffer = torch.zeros(
+                    cache_size, T, HV, K, V, dtype=torch.float32
+                )
+                core_attn_out = (
+                    torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+                        A_log=A_log,
+                        dt_bias=dt_bias,
+                        q=q,
+                        k=k,
+                        v=v,
+                        a=a,
+                        b=b,
+                        initial_state_source=ssm_states,
+                        initial_state_indices=cache_indices,
+                        cu_seqlens=cu_seqlens,
+                        use_qk_l2norm_in_kernel=True,
+                        disable_state_update=disable_state_update,
+                        intermediate_states_buffer=intermediate_states_buffer,
+                        intermediate_state_indices=intermediate_state_indices,
+                        cache_steps=T,
+                    )
+                )
+
+                torch.testing.assert_close(
+                    core_attn_out.float(), out_ref, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    intermediate_states_buffer, buffer_ref, atol=1e-3, rtol=1e-3
+                )
+                # nothing may reach the guard slot, and only the one real
+                # sequence may update the pool
+                torch.testing.assert_close(pool[0], pool_init[0], atol=0, rtol=0)
+                for slot in range(1, num_slots + 1):
+                    updated = slot == 3 and not disable_state_update
+                    self.assertEqual(
+                        torch.equal(pool[slot], pool_init[slot]), not updated
+                    )
+
 
 class TestCausalConv1dUpdateMultiToken(CustomTestCase):
     def setUp(self):
@@ -1829,6 +1917,89 @@ class TestCausalConv1dUpdateMultiToken(CustomTestCase):
                 torch.testing.assert_close(
                     intermediate_conv_window, window_ref, atol=atol, rtol=rtol
                 )
+
+    def test_multi_token_skips_pad_slots(self):
+        # A padded row carries conv slot -1 while its intermediate index still
+        # points at the discard window row. The row owns no conv state, so the
+        # kernel neither updates one nor caches a window; its output is left
+        # alone, as the CUDA kernel does, because the caller discards it.
+        batch, dim, width, seqlen = 3, 32, 4, 3
+        num_entries, cache_size = 5, 4
+        dtype = torch.bfloat16
+        state_len = width - 1
+        padded_row = 1
+
+        x = torch.randn(batch, dim, seqlen, dtype=dtype)
+        weight = torch.randn(dim, width, dtype=dtype)
+        bias = torch.randn(dim, dtype=dtype)
+        conv_state_indices = torch.tensor([3, -1, 0], dtype=torch.int32)
+        intermediate_state_indices = torch.tensor([1, 3, 0], dtype=torch.int32)
+        packed_weight = torch.ops.sgl_kernel.causal_conv1d_weight_pack(weight)
+
+        # The pool sits behind a guard entry, so a write through slot -1 lands
+        # in the guard instead of in memory this test does not own.
+        pool_init = torch.randn(num_entries + 1, dim, state_len, dtype=dtype)
+        pool = pool_init.clone()
+        conv_states = pool[1:]
+
+        # reference: sequential single-token updates over the real rows only
+        real_rows = [i for i in range(batch) if i != padded_row]
+        conv_state_ref = conv_states[
+            conv_state_indices[real_rows].to(torch.int64)
+        ].clone()
+        window_ref = torch.zeros(cache_size, seqlen, dim, state_len, dtype=dtype)
+        out_ref = torch.empty(len(real_rows), dim, seqlen, dtype=dtype)
+        for t in range(seqlen):
+            x_cat = torch.cat(
+                [conv_state_ref, x[real_rows, :, t].unsqueeze(-1)], dim=-1
+            )
+            conv_state_ref = x_cat[:, :, -state_len:].clone()
+            out_t = F.conv1d(
+                x_cat.float(),
+                weight.float().unsqueeze(1),
+                bias.float(),
+                padding=0,
+                groups=dim,
+            )[:, :, -1]
+            out_ref[:, :, t] = F.silu(out_t).to(dtype)
+            for i, row in enumerate(real_rows):
+                window_ref[int(intermediate_state_indices[row]), t] = conv_state_ref[i]
+
+        intermediate_conv_window = torch.zeros(
+            cache_size, seqlen, dim, state_len, dtype=dtype
+        )
+        out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+            x,
+            conv_states,
+            packed_weight,
+            bias,
+            True,  # silu_activation
+            None,  # cache_seqlens
+            conv_state_indices,
+            PAD_SLOT_ID,
+            True,  # is_vnni
+            intermediate_conv_window,
+            intermediate_state_indices,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out[real_rows], out_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            conv_states[conv_state_indices[real_rows].to(torch.int64)],
+            conv_state_ref,
+            atol=atol,
+            rtol=rtol,
+        )
+        torch.testing.assert_close(
+            intermediate_conv_window, window_ref, atol=atol, rtol=rtol
+        )
+        # nothing may reach the guard entry, and the untouched pool entries
+        # must keep their contents
+        torch.testing.assert_close(pool[0], pool_init[0], atol=0, rtol=0)
+        for entry in (2, 5):
+            torch.testing.assert_close(
+                conv_states[entry - 1], pool_init[entry], atol=0, rtol=0
+            )
 
 
 class TestMambaStateScatterWithMask(CustomTestCase):
