@@ -278,9 +278,10 @@ def _seeded_rng(seed: int, *, device: str | torch.device):
 
 
 @contextmanager
-def _single_rank_graph_capture():
-    stream = torch.cuda.Stream()
-    yield SimpleNamespace(stream=stream)
+def _single_rank_graph_capture(stream=None):
+    # Mirrors `graph_capture(stream=None)`: capture runs on the caller's stream
+    # when it leases one, so the shim stays valid for both call shapes.
+    yield SimpleNamespace(stream=stream if stream is not None else torch.cuda.Stream())
 
 
 def _reset_cuda_graph_test_buffers() -> None:
@@ -359,7 +360,6 @@ def _build_eagle_draft_fixture(
     )
     _configure_runner_for_eagle_draft(fixture.runner, case, settings)
     draft_attn_backend = DraftBackendFactory(
-        fixture.runner.server_args,
         fixture.runner,
         settings.topk,
         settings.speculative_num_steps,

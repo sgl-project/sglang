@@ -93,7 +93,7 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             },
         ]
         handle = _make_runtime_handle(responses)
-        obj = SimpleNamespace(rid="logical", batch_size=1, parallel_sample_num=2)
+        obj = SimpleNamespace(rid="logical", sampling_params={"n": 2})
 
         asyncio.run(
             handle._run_generate(

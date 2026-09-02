@@ -6,22 +6,18 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "audio-video", "lip-sync", "environment audio"]} />
+<DiffusionModelTags tags={["video + audio", "joint generation", "lip-sync", "environment sound", "up to 8 seconds"]} />
 
 ## 1. Model Introduction
 
-[MOVA](https://github.com/OpenMOSS/MOVA) (MOSS Video and Audio) is a foundation model developed by the SII-OpenMOSS Team, designed to break the "silent era" of open-source video generation. Unlike cascaded pipelines that generate sound as an afterthought, MOVA synthesizes video and audio simultaneously in a single inference pass for perfect alignment. It adopts an Asymmetric Dual-Tower Architecture, fusing pre-trained video and audio towers through a bidirectional cross-attention mechanism to maintain tight synchronization between video and audio during generation.
+[MOVA](https://github.com/OpenMOSS/MOVA) generates video and audio together with an asymmetric dual-tower model connected by bidirectional cross-attention. Its strongest use cases are speaking subjects, visible sound-producing events, and scenes where ambient audio must track the picture rather than be synthesized by a later cascade.
 
-[MOVA-360p](https://huggingface.co/OpenMOSS-Team/MOVA-360p) is suitable for fast inference and resource-constrained environments. [MOVA-720p](https://huggingface.co/OpenMOSS-Team/MOVA-720p) provides higher resolution video generation. Both versions support generating up to 8 seconds of video-audio content.
+The public 360p and 720p checkpoints both generate up to 8 seconds. Choose 360p for the lighter deployment and 720p for output resolution; MOVA is less suitable when the task needs long-form continuity or the richer image/video/audio reference conditioning provided by H3.
 
-**Key Features:**
-
-- **Native Bimodal Generation**: Generates high-fidelity video and synchronized audio in a single inference pass, eliminating error accumulation from cascaded pipelines
-- **Precise Lip-Sync**: Achieves state-of-the-art performance in multilingual lip-synchronization (LSE-D: 7.094, LSE-C: 7.452 with Dual CFG on Verse-Bench Set3)
-- **Environment-Aware Sound Effects**: Generates corresponding environmental sound effects including physical interaction sounds, ambient sounds, and spatial/textural sound feedback
-- **Fully Open-Source**: Model weights, inference code, training pipelines, and LoRA fine-tuning scripts are all open-sourced
-
-For more details, please refer to the [MOVA-360p HuggingFace page](https://huggingface.co/OpenMOSS-Team/MOVA-360p), the [MOVA-720p HuggingFace page](https://huggingface.co/OpenMOSS-Team/MOVA-720p), the [GitHub repository](https://github.com/OpenMOSS/MOVA), and the [technical report (arXiv)](https://arxiv.org/abs/2602.08794).
+| Checkpoint | Best fit | Output limit |
+| --- | --- | --- |
+| `OpenMOSS-Team/MOVA-360p` | Faster, lower-memory joint audiovisual generation | Up to 8 seconds at 360p |
+| `OpenMOSS-Team/MOVA-720p` | Higher-resolution lip-sync and environment audio | Up to 8 seconds at 720p |
 
 ## 2. SGLang-diffusion Installation
 

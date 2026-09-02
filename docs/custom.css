@@ -168,21 +168,678 @@ html.dark table tbody tr:nth-child(even) td,
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin: -1.5rem 0 0;
+  margin: 8px 0 30px;
 }
 
 .sgd-model-tags .sgd-chip {
   margin: 0;
+  padding: 4px 9px;
+  border: 0;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
 }
 
 .sgd-model-tags + h2 {
-  margin-top: 0.75rem;
+  margin-top: 0;
 }
 
 .prose:has(.sgd-model-tags) {
   overflow-x: clip;
   overflow-y: visible;
 }
+
+/* Legacy command visualizer controls. New diffusion pages can opt into the
+   scoped editorial builder below without changing older configs. */
+.sg-command-visualizer:not(.sgd-command-builder) :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab) {
+  transition: transform 160ms ease-out, border-color 160ms ease-out,
+    background-color 160ms ease-out, color 160ms ease-out;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .sg-command-visualizer:not(.sgd-command-builder) :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab):hover {
+    transform: translateY(-1px) scale(1.015);
+  }
+}
+
+.sg-command-visualizer:not(.sgd-command-builder) :where(button:not(:disabled), .sg-command-visualizer-choice[aria-disabled="false"], .sg-command-visualizer-tab):active {
+  transform: translateY(0) scale(0.985);
+}
+
+.sg-command-visualizer:not(.sgd-command-builder) :where(button, .sg-command-visualizer-choice, .sg-command-visualizer-tab):focus-visible {
+  outline: 2px solid #e2775f;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sg-command-visualizer:not(.sgd-command-builder) :where(button, .sg-command-visualizer-choice, .sg-command-visualizer-tab) {
+    transition: none;
+    transform: none !important;
+  }
+}
+
+/* Premium responsive diffusion command builder. The component is its own
+   query container because Mintlify's content column is narrower than the
+   browser viewport whenever either navigation rail is present. */
+.sgd-command-builder {
+  container: command-builder / inline-size;
+  --sgdb-surface: white;
+  --sgdb-raised: white;
+  --sgdb-ink: oklch(22% 0.02 258);
+  --sgdb-muted: oklch(50% 0.02 258);
+  --sgdb-line: oklch(90% 0.008 258);
+  --sgdb-brand: oklch(57% 0.15 35);
+  /* Accents stay in the brand's warm family — the materials are cool
+     neutrals, so identity comes from where the orange lands, not from
+     tinting the surfaces. Serve = brand orange, Request = amber. */
+  --sgdb-serve: oklch(56% 0.13 40);
+  --sgdb-request: oklch(60% 0.12 62);
+  --sgdb-ok: oklch(52% 0.11 153);
+  --sgdb-warn: oklch(59% 0.12 78);
+  --sgdb-error: oklch(53% 0.16 25);
+  /* Glass material system. A recessed well is a cool translucent tint (warm
+     greys read muddy); the raised thumb is a glass slab: gradient fill, a
+     specular top edge, a hairline ring, and a soft cast. The pair is
+     redeclared for dark, where the glass is built from white overlays. */
+  --sgdb-well: oklch(45% 0.03 258 / 0.08);
+  --sgdb-well-inset: inset 0 1px 2px oklch(30% 0.03 258 / 0.07);
+  --sgdb-thumb-bg: linear-gradient(180deg, white, oklch(98.5% 0.003 258));
+  --sgdb-thumb-shadow: 0 0 0 0.5px oklch(30% 0.02 258 / 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9),
+    0 1px 1px oklch(30% 0.02 258 / 0.07),
+    0 4px 12px oklch(30% 0.02 258 / 0.1);
+  /* Hover tone for anything that sits inside a tinted well. */
+  --sgdb-pick-hover: oklch(45% 0.03 258 / 0.05);
+  --sgdb-code-bg: oklch(97.5% 0.004 258);
+  --sgdb-code-inset: oklch(30% 0.03 258 / 0.06);
+  /* Colours settle on a decelerating curve; things that move get a spring —
+     a touch of overshoot is what reads as alive rather than mechanical. */
+  --sgdb-ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --sgdb-ease-dur: 200ms;
+  --sgdb-spring: cubic-bezier(0.3, 1.35, 0.45, 1);
+  --sgdb-spring-dur: 460ms;
+  max-width: 100%;
+  margin: 24px 0 40px;
+  overflow: clip;
+  border: 1px solid var(--sgdb-line);
+  border-radius: 16px;
+  background: var(--sgdb-surface);
+  box-shadow: 0 1px 2px oklch(30% 0.03 258 / 0.04),
+    0 12px 32px -12px oklch(30% 0.03 258 / 0.12);
+  color: var(--sgdb-ink);
+}
+
+.sgd-command-builder *, .sgd-command-builder *::before, .sgd-command-builder *::after { box-sizing: border-box; }
+/* Form controls inherit the page typeface instead of the browser's. Wrapped in
+   :where() so the rule weighs (0,1,0) and every single-class control rule below
+   still wins on order. Written as `.sgd-command-builder button` it weighed
+   (0,1,1) and, being a `font` shorthand, silently reset the font-size and
+   font-weight of anything selected by one class — `.sgd-builder-copy` and
+   `.sgd-builder-text-action` asked for 11px/680 and rendered 16px/400. */
+.sgd-command-builder :where(button, input, select) { font: inherit; }
+
+/* Segmented control with one glass pill that glides between scopes — the
+   pill is a single ::before positioned off the active button via :has(),
+   so the slide is pure CSS and springs into place. */
+.sgd-builder-scope-tabs {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 12px 12px 0;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
+}
+
+.sgd-builder-scope-tabs::before {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  width: calc((100% - 6px) / 3);
+  border-radius: 8px;
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
+  content: "";
+  /* Glide and settle, no overshoot: a scope switch is a frequent functional
+     action, so the slide itself carries the life and a bounce would be noise. */
+  transition: transform 300ms var(--sgdb-ease);
+}
+
+.sgd-builder-scope-tabs:has(> button:nth-child(2)[data-active="true"])::before { transform: translateX(100%); }
+.sgd-builder-scope-tabs:has(> button:nth-child(3)[data-active="true"])::before { transform: translateX(200%); }
+
+.sgd-builder-scope-tabs button {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--sgdb-muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 590;
+  white-space: nowrap;
+  transition: color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
+
+.sgd-builder-scope-tabs button[data-active="true"] { color: var(--sgdb-ink); }
+.sgd-builder-main { display: flex; min-width: 0; flex-direction: column; }
+.sgd-builder-controls, .sgd-builder-output-rail { min-width: 0; }
+.sgd-builder-controls { container: builder-controls / inline-size; padding: 4px 16px 20px; }
+
+.sgd-builder-scope-panel { display: grid; gap: 0; }
+.sgd-builder-recipe {
+  display: flex;
+  min-width: 0;
+  padding: 11px 0;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--sgdb-line);
+}
+.sgd-builder-recipe > div:first-child { display: grid; min-width: 0; gap: 3px; }
+.sgd-builder-recipe > div:first-child span { color: var(--sgdb-muted); font-size: 10.5px; }
+.sgd-builder-recipe > div:first-child strong { font-size: 12px; font-weight: 590; line-height: 1.4; }
+.sgd-builder-recipe > div:last-child { display: flex; flex: none; gap: 10px; align-items: center; }
+.sgd-builder-recipe > div:last-child > small { color: var(--sgdb-muted); font-size: 10px; }
+.sgd-builder-section { min-width: 0; padding: 13px 0; border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-section:last-child { border-bottom: 0; }
+.sgd-builder-section-heading { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+.sgd-builder-section-heading > span { font-size: 12px; font-weight: 590; }
+.sgd-builder-section-heading > small { color: var(--sgdb-muted); font-size: 11px; line-height: 1.35; text-align: right; }
+
+/* One tinted well per group instead of a border on every option. Thirteen
+   outlined boxes competed with each other and with the panel frame; the well
+   carries the grouping so each option only has to carry its own state. */
+.sgd-builder-hardware-grid, .sgd-builder-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
+}
+.sgd-builder-hardware, .sgd-builder-choice {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  overflow: hidden;
+  /* Rows in the same grid track stretch to the tallest sibling; center the
+     label stack so a single-line option does not ride the top of its cell. */
+  align-content: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  /* Unselected stays legible — a deselected option is still a real choice, so
+     it sits just below the ink, not down at the muted caption level. */
+  color: color-mix(in oklch, var(--sgdb-ink) 72%, transparent);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.25;
+  text-align: left;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
+
+/* Hardware label and its VRAM share one line — the second text row bought
+   no clarity, only cell height. Choice subtitles (checkpoint names) keep
+   their own line: they are long enough to need it. */
+.sgd-builder-hardware { display: flex; min-height: 34px; flex-flow: row wrap; align-items: baseline; gap: 5px; }
+.sgd-builder-hardware strong { font-size: 12.5px; font-weight: 590; letter-spacing: -0.01em; }
+.sgd-builder-hardware small, .sgd-builder-choice small { margin-top: 1px; color: var(--sgdb-muted); font-size: 10.5px; }
+.sgd-builder-hardware small { margin-top: 0; }
+
+/* The radio ring is gone — the fill is the affordance. Kept in the DOM (the
+   JSX renders it) but collapsed, so no markup change is needed. */
+.sgd-builder-choice-dot { display: none; }
+
+.sgd-builder-hardware[data-selected="true"], .sgd-builder-choice[data-selected="true"] {
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
+  color: var(--sgdb-ink);
+}
+
+.sgd-builder-hardware:disabled,
+.sgd-builder-choice:disabled,
+.sgd-builder-choice[data-blocked="true"] { cursor: not-allowed; opacity: 0.42; }
+
+/* Tap/click feedback for a blocked option — the reason the tooltip carries,
+   surfaced where touch readers can see it. */
+.sgd-builder-blocked-note {
+  margin: 8px 2px 0;
+  color: var(--sgdb-warn);
+  font-size: 11px;
+  line-height: 1.45;
+  animation: sgdb-note-in 220ms var(--sgdb-ease);
+}
+@keyframes sgdb-note-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* A soft (selectable-but-unverified) pick declares itself in place. */
+.sgd-builder-choice[data-soft="true"][data-selected="true"]::after {
+  content: "Not verified yet";
+  color: var(--sgdb-warn);
+  font-size: 10px;
+  line-height: 1.3;
+  margin-top: 1px;
+}
+.sgd-builder-resource-grid { display: grid; gap: 8px; }
+.sgd-builder-stepper-field {
+  display: flex;
+  min-height: 42px;
+  padding: 5px 6px 5px 12px;
+  align-items: center;
+  justify-content: space-between;
+  border: 0;
+  border-radius: 10px;
+  background: var(--sgdb-well);
+  box-shadow: var(--sgdb-well-inset);
+}
+.sgd-builder-stepper-field > div:first-child { display: grid; gap: 2px; }
+.sgd-builder-stepper-field span { font-size: 12px; font-weight: 500; }
+.sgd-builder-stepper-field small { color: var(--sgdb-muted); font-size: 10px; }
+/* One integrated control: a single raised track with a hairline between the
+   two halves, rather than two separately outlined 34px blocks. */
+.sgd-builder-stepper {
+  display: grid;
+  grid-template-columns: 28px 40px 28px;
+  align-items: center;
+  border-radius: 8px;
+  background: var(--sgdb-thumb-bg);
+  box-shadow: var(--sgdb-thumb-shadow);
+}
+.sgd-builder-stepper button, .sgd-builder-request-stepper button {
+  min-width: 28px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--sgdb-ink);
+  cursor: pointer;
+  font-size: 14px;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
+.sgd-builder-stepper input {
+  width: 40px;
+  height: 30px;
+  padding: 0;
+  border-right: 0.5px solid color-mix(in oklch, var(--sgdb-ink) 10%, transparent);
+  border-left: 0.5px solid color-mix(in oklch, var(--sgdb-ink) 10%, transparent);
+  border-top: 0;
+  border-bottom: 0;
+  border-radius: 0;
+  appearance: textfield;
+  background: transparent;
+  color: var(--sgdb-ink);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 590;
+  line-height: 30px;
+  text-align: center;
+}
+.sgd-builder-stepper input::-webkit-inner-spin-button,
+.sgd-builder-stepper input::-webkit-outer-spin-button { margin: 0; appearance: none; }
+.sgd-builder-stepper button:disabled, .sgd-builder-request-stepper button:disabled { opacity: 0.32; cursor: not-allowed; }
+.sgd-builder-resource-summary { margin: 8px 0 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.4; }
+
+.sgd-builder-topology-toggle { margin-top: 10px; }
+.sgd-builder-text-action {
+  justify-self: start;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--sgdb-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+}
+.sgd-builder-text-action:disabled { cursor: not-allowed; opacity: 0.4; }
+.sgd-builder-advanced { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--sgdb-line); }
+.sgd-builder-advanced > p { margin: 0 0 12px; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
+.sgd-builder-topology-inputs { display: grid; gap: 8px; }
+.sgd-builder-topology-inputs label { display: grid; gap: 5px; color: var(--sgdb-muted); font-size: 10.5px; }
+.sgd-builder-topology-inputs select {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 8px;
+  border: 1px solid var(--sgdb-line);
+  border-radius: 6px;
+  background: var(--sgdb-raised);
+  color: var(--sgdb-ink);
+  font-size: 12px;
+}
+.sgd-builder-messages { margin-top: 12px; padding: 8px 10px; border-radius: 6px; background: color-mix(in oklch, var(--sgdb-warn) 9%, transparent); color: color-mix(in oklch, var(--sgdb-warn) 75%, var(--sgdb-ink)); }
+.sgd-builder-messages[data-state="error"] { background: color-mix(in oklch, var(--sgdb-error) 9%, transparent); color: color-mix(in oklch, var(--sgdb-error) 78%, var(--sgdb-ink)); }
+.sgd-builder-messages p { margin: 0; font-size: 11px; line-height: 1.45; }
+.sgd-builder-messages p + p { margin-top: 5px; }
+
+.sgd-builder-setting-layout, .sgd-builder-setting-list, .sgd-builder-setting-item { min-width: 0; }
+.sgd-builder-setting-item { border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-setting-item:last-child { border-bottom: 0; }
+.sgd-builder-setting-row {
+  display: grid;
+  grid-template-columns: minmax(76px, auto) minmax(0, 1fr) auto auto;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px;
+  gap: 8px;
+  align-items: center;
+  border: 0;
+  border-bottom: 0;
+  border-radius: 8px;
+  background: transparent;
+  transition: background-color var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease);
+  color: var(--sgdb-ink);
+  cursor: pointer;
+  text-align: left;
+}
+.sgd-builder-setting-row > span:first-child { color: var(--sgdb-muted); font-size: 11px; }
+.sgd-builder-setting-row strong { overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.sgd-builder-setting-row small { color: var(--sgdb-ok); font-size: 10px; font-weight: 500; }
+.sgd-builder-setting-row > span:last-child { color: var(--sgdb-muted); font-size: 17px; }
+.sgd-builder-setting-row[data-active="true"] { background: color-mix(in oklch, var(--sgdb-serve) 4%, transparent); color: var(--sgdb-serve); }
+
+.sgd-builder-context { padding: 16px 0 4px; }
+.sgd-builder-context--inline { padding: 12px 4px 16px; border-top: 1px solid var(--sgdb-line); }
+.sgd-builder-context--rail { display: none; }
+.sgd-builder-context-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.sgd-builder-context-heading > div > span { font-size: 13px; font-weight: 590; }
+.sgd-builder-context-heading p { margin: 4px 0 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.45; }
+.sgd-builder-context-heading > small { flex: none; color: var(--sgdb-muted); font-size: 10px; }
+.sgd-builder-context-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.sgd-builder-context-note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--sgdb-line); }
+.sgd-builder-context-note p { margin: 0; color: var(--sgdb-muted); font-size: 11px; line-height: 1.5; }
+.sgd-builder-context-note a {
+  display: inline-flex;
+  margin-top: 8px;
+  min-height: 24px;
+  align-items: center;
+  gap: 5px;
+  color: var(--sgdb-serve);
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: color var(--sgdb-ease-dur) var(--sgdb-ease);
+}
+.sgd-builder-context-note a + a { margin-left: 16px; }
+.sgd-builder-context-note a svg { flex: none; transition: transform var(--sgdb-ease-dur) var(--sgdb-ease); }
+/* Hover answers: the label underlines and the glyph leans in. */
+.sgd-builder-context-note a:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.sgd-builder-context-note a:hover svg { transform: translateX(1px) scale(1.08); }
+.sgd-builder-scope-panel[data-scope="request"] .sgd-builder-context-note a { color: var(--sgdb-request); }
+.sgd-builder-request-stepper { display: grid; grid-template-columns: 40px 52px 40px auto; gap: 6px; align-items: center; margin-top: 14px; }
+.sgd-builder-request-stepper input {
+  width: 52px;
+  min-width: 0;
+  height: 34px;
+  padding: 0 4px;
+  border: 1px solid var(--sgdb-line);
+  border-radius: 6px;
+  appearance: textfield;
+  background: var(--sgdb-surface);
+  color: var(--sgdb-ink);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 590;
+  text-align: center;
+}
+.sgd-builder-request-stepper input::-webkit-inner-spin-button,
+.sgd-builder-request-stepper input::-webkit-outer-spin-button { margin: 0; appearance: none; }
+.sgd-builder-request-stepper > span { margin-left: 4px; color: var(--sgdb-muted); font-size: 11px; }
+.sgd-builder-request-setting { border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-request-setting:last-child { border-bottom: 0; }
+.sgd-builder-request-setting .sgd-builder-context { padding: 16px 0; }
+
+/* stretch + the code area flexing below keep side-by-side cards the same
+   height, so their footers sit on one line instead of ragged bottoms. */
+.sgd-builder-output-rail { display: grid; gap: 12px; padding: 0 12px 16px; align-items: stretch; }
+.sgd-builder-output {
+  --output-accent: var(--sgdb-serve);
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--sgdb-line);
+  border-radius: 12px;
+  background: var(--sgdb-raised);
+  box-shadow: 0 1px 2px oklch(30% 0.03 258 / 0.05);
+  transition: border-color 160ms ease-out, transform 160ms ease-out;
+}
+.sgd-builder-output[data-output="request"] { --output-accent: var(--sgdb-request); }
+.sgd-builder-output[data-emphasized="true"] { border-color: color-mix(in oklch, var(--output-accent) 24%, var(--sgdb-line)); }
+.sgd-builder-output > header { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 8px; align-items: center; min-height: 50px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-output[data-emphasized="true"] > header {
+  background: linear-gradient(180deg,
+    color-mix(in oklch, var(--output-accent) 7%, transparent),
+    color-mix(in oklch, var(--output-accent) 2%, transparent));
+}
+/* Neutral step disc — the accents stay reserved for state (active tab, status),
+   so a static ordinal does not compete with them. */
+.sgd-builder-output-index { display: grid; width: 20px; height: 20px; place-items: center; border: 0; border-radius: 50%; background: var(--sgdb-well); color: var(--sgdb-muted); font-size: 10px; font-weight: 590; font-variant-numeric: tabular-nums; }
+.sgd-builder-output-title { display: flex; min-width: 0; gap: 7px; align-items: baseline; }
+.sgd-builder-output-title strong { font-size: 13px; font-weight: 590; }
+.sgd-builder-output-title span { color: var(--sgdb-muted); font-size: 10.5px; }
+.sgd-builder-status { display: inline-flex; gap: 5px; align-items: center; color: var(--sgdb-muted); font-size: 10px; white-space: nowrap; }
+.sgd-builder-status > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--sgdb-warn);
+  box-shadow: 0 0 6px color-mix(in oklch, var(--sgdb-warn) 60%, transparent);
+}
+.sgd-builder-status[data-status="verified"] > span { background: var(--sgdb-ok); }
+.sgd-builder-status[data-status="error"] > span { background: var(--sgdb-error); }
+.sgd-builder-output-tabs { display: flex; min-height: 38px; padding: 5px 10px; gap: 14px; align-items: center; border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-output-tabs button { min-height: 28px; padding: 0; border: 0; border-bottom: 1px solid transparent; background: transparent; color: var(--sgdb-muted); cursor: pointer; font-size: 10.5px; font-weight: 500; }
+.sgd-builder-output-tabs button[data-selected="true"] { border-bottom-color: var(--output-accent); color: var(--sgdb-ink); }
+.sgd-builder-node-fields { display: grid; grid-template-columns: minmax(0, 1fr) 84px; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-node-fields label { display: grid; min-width: 0; gap: 4px; color: var(--sgdb-muted); font-size: 10px; }
+.sgd-builder-node-fields input { width: 100%; min-width: 0; min-height: 34px; padding: 0 7px; border: 1px solid var(--sgdb-line); border-radius: 6px; background: var(--sgdb-surface); color: var(--sgdb-ink); font-size: 11px; }
+/* Positioning context for the floating copy control; grid so the pre keeps
+   min-width:0 scrolling. flex:1 lets the code area absorb the height
+   difference between side-by-side cards. */
+.sgd-builder-code { position: relative; display: grid; min-width: 0; flex: 1 1 auto; }
+.sgd-builder-code > pre {
+  height: 100%;
+  max-height: calc(13.95em + 24px);
+  min-width: 0;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  background: var(--sgdb-code-bg);
+  box-shadow: inset 0 1px 3px var(--sgdb-code-inset);
+  color: var(--sgdb-ink);
+  font-size: clamp(11.5px, 1.2cqi, 12.5px);
+  line-height: 1.55;
+  white-space: pre;
+}
+.sgd-builder-code > pre::-webkit-scrollbar-corner { background: transparent; }
+.sgd-builder-code > pre.is-expanded { height: auto; max-height: 70vh; }
+.sgd-builder-output code { background: transparent; color: inherit; font: inherit; font-variant-ligatures: none; }
+.sgd-builder-output-error { padding: 8px 10px; border-top: 1px solid color-mix(in oklch, var(--sgdb-error) 35%, var(--sgdb-line)); background: color-mix(in oklch, var(--sgdb-error) 8%, transparent); color: var(--sgdb-error); font-size: 10.5px; line-height: 1.4; }
+.sgd-builder-output > footer { display: flex; min-height: 44px; padding: 5px 10px; align-items: center; justify-content: space-between; border-top: 1px solid var(--sgdb-line); }
+.sgd-builder-output > footer > div { display: flex; margin-left: auto; gap: 12px; align-items: center; }
+/* Copy floats inside the code area (top-right), revealed on hover — the
+   standard code-block pattern. A frosted chip keeps the glyph legible over
+   scrolled code without drawing a box when idle. */
+.sgd-builder-copy {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: grid;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: var(--sgdb-thumb-bg);
+  -webkit-backdrop-filter: blur(8px) saturate(1.4);
+  backdrop-filter: blur(8px) saturate(1.4);
+  box-shadow: var(--sgdb-thumb-shadow);
+  color: var(--sgdb-muted);
+  cursor: pointer;
+  opacity: 0;
+  place-items: center;
+  transform: translateY(2px) scale(0.9);
+  transition: opacity var(--sgdb-ease-dur) var(--sgdb-ease),
+    color var(--sgdb-ease-dur) var(--sgdb-ease),
+    transform var(--sgdb-spring-dur) var(--sgdb-spring);
+}
+.sgd-builder-code:hover > .sgd-builder-copy,
+.sgd-builder-copy:focus-visible,
+.sgd-builder-copy[data-copied="true"] { opacity: 1; transform: translateY(0) scale(1); }
+/* No hover on touch — the control must stay visible. */
+@media (hover: none) {
+  .sgd-builder-copy { opacity: 1; transform: none; }
+}
+.sgd-builder-copy:disabled { cursor: not-allowed; color: color-mix(in oklch, var(--sgdb-muted) 45%, transparent); }
+/* Both glyphs share the cell; the swap is a settle-in scale rather than a
+   hard display switch. */
+.sgd-builder-copy svg {
+  grid-area: 1 / 1;
+  pointer-events: none;
+  transition: opacity 140ms var(--sgdb-ease), transform 220ms var(--sgdb-ease);
+}
+.sgd-builder-copy .sgd-builder-copy-check { opacity: 0; transform: scale(0.5); }
+.sgd-builder-copy[data-copied="true"] { color: var(--sgdb-ok); }
+.sgd-builder-copy[data-copied="true"] .sgd-builder-copy-glyph { opacity: 0; transform: scale(0.5); }
+.sgd-builder-copy[data-copied="true"] .sgd-builder-copy-check { opacity: 1; transform: scale(1); }
+
+/* Hover only changes tone. Lifting the card on hover (translateY) made the
+   whole grid twitch as the pointer crossed it. */
+@media (hover: hover) and (pointer: fine) {
+  .sgd-command-builder button:not(:disabled):not([data-blocked="true"]):hover { color: var(--sgdb-ink); }
+  .sgd-builder-scope-tabs button:not(:disabled):hover { color: var(--sgdb-ink); }
+  .sgd-builder-hardware:not(:disabled):not([data-selected="true"]):hover,
+  .sgd-builder-choice:not(:disabled):not([data-blocked="true"]):not([data-selected="true"]):hover {
+    background: var(--sgdb-pick-hover);
+  }
+  .sgd-builder-setting-row:not(:disabled):hover { background: color-mix(in oklch, var(--sgdb-serve) 5%, transparent); }
+  .sgd-builder-stepper button:not(:disabled):hover,
+  .sgd-builder-request-stepper button:not(:disabled):hover { background: var(--sgdb-pick-hover); }
+  .sgd-builder-copy:not(:disabled):hover { color: var(--sgdb-ink); }
+  .sgd-builder-copy[data-copied="true"]:hover { color: var(--sgdb-ok); }
+  .sgd-builder-text-action:not(:disabled):hover { color: var(--output-accent, var(--sgdb-brand)); }
+}
+
+.sgd-command-builder :where(button, input, select, a):focus-visible { outline: 2px solid color-mix(in oklch, var(--sgdb-brand) 76%, white); outline-offset: 2px; }
+/* Press reads as the control yielding under the finger, not jumping. */
+.sgd-command-builder button:not(:disabled):not([data-blocked="true"]):active { transform: scale(0.97); transition-duration: 60ms; }
+
+@container builder-controls (min-width: 560px) {
+  .sgd-builder-scope-panel[data-scope="base"] { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; }
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-recipe { grid-column: 1 / -1; }
+  /* Half a column cannot host two steppers side by side — stack them. */
+  .sgd-builder-scope-panel[data-scope="base"] .sgd-builder-resource-grid { grid-template-columns: minmax(0, 1fr); }
+  .sgd-builder-setting-layout { display: grid; grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr); }
+  .sgd-builder-setting-list { padding-right: 16px; border-right: 1px solid var(--sgdb-line); }
+  .sgd-builder-context--inline { display: none; }
+  .sgd-builder-context--rail { display: block; padding: 12px 0 4px 16px; }
+  .sgd-builder-request-direct { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sgd-builder-request-setting { padding-right: 16px; border-right: 1px solid var(--sgdb-line); border-bottom: 0; }
+  .sgd-builder-request-setting + .sgd-builder-request-setting { padding-right: 0; padding-left: 16px; border-right: 0; }
+}
+
+/* Container queries measure the content box; subtract the two 1px borders so
+   the documented 420 / 720 / 960px outer widths switch at the intended point. */
+@container command-builder (max-width: 717px) {
+  .sgd-builder-output-rail { display: contents; }
+  .sgd-builder-controls { order: 0; }
+  .sgd-builder-output { width: calc(100% - 24px); margin: 12px 12px 16px; order: 1; }
+  .sgd-builder-main[data-scope="serve"] .sgd-builder-output[data-output="serve"],
+  .sgd-builder-main[data-scope="request"] .sgd-builder-output[data-output="request"] { order: -1; }
+}
+
+@container command-builder (min-width: 718px) and (max-width: 957px) {
+  .sgd-builder-output-rail { order: -1; padding-top: 12px; }
+  .sgd-builder-main[data-scope="base"] .sgd-builder-output-rail { order: 1; padding-top: 0; }
+  .sgd-builder-output[data-emphasized="false"] { order: 1; }
+}
+
+@container command-builder (min-width: 418px) {
+  .sgd-builder-scope-tabs { margin-inline: 16px; }
+  .sgd-builder-scope-tabs button { font-size: 13px; }
+  .sgd-builder-hardware-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .sgd-builder-resource-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sgd-builder-topology-inputs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@container command-builder (min-width: 718px) {
+  .sgd-builder-scope-panel[data-scope="base"] { grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: 16px; }
+  .sgd-builder-scope-panel[data-scope="base"] > :where(.sgd-builder-recipe, .sgd-builder-section) { grid-column: 1 / -1; }
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-section:nth-last-child(-n + 2) { grid-column: span 6; }
+  .sgd-builder-output-rail { grid-template-columns: minmax(0, 1fr); }
+  .sgd-builder-main[data-scope="base"] .sgd-builder-output-rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sgd-builder-choice-grid[data-density="compact"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@container command-builder (min-width: 958px) {
+  .sgd-builder-scope-tabs { margin-inline: 20px; }
+  .sgd-builder-scope-tabs button { font-size: 14px; }
+  .sgd-builder-main { display: grid; grid-template-columns: minmax(0, 38fr) minmax(0, 62fr); }
+  .sgd-builder-controls { padding: 8px 20px 24px; border-right: 1px solid var(--sgdb-line); }
+  .sgd-builder-output-rail { grid-template-columns: minmax(0, 1fr); padding: 16px; }
+  .sgd-builder-scope-panel[data-scope="base"] { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-recipe,
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-section,
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-section:nth-last-child(-n + 2) { grid-column: 1; }
+  .sgd-builder-hardware-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sgd-builder-output { box-shadow: 0 1px 2px color-mix(in oklch, var(--sgdb-ink) 5%, transparent); }
+}
+
+html.dark .sgd-command-builder, [data-theme="dark"] .sgd-command-builder {
+  --sgdb-surface: oklch(24% 0.015 258);
+  --sgdb-raised: oklch(27% 0.015 258);
+  --sgdb-ink: oklch(94% 0.006 80);
+  --sgdb-muted: oklch(71% 0.012 258);
+  --sgdb-line: rgba(255, 255, 255, 0.09);
+  --sgdb-brand: oklch(70% 0.14 40);
+  --sgdb-serve: oklch(74% 0.11 45);
+  --sgdb-request: oklch(77% 0.1 64);
+  --sgdb-ok: oklch(74% 0.11 153);
+  --sgdb-warn: oklch(76% 0.11 78);
+  --sgdb-error: oklch(73% 0.14 25);
+  /* Dark glass is built from white overlays: the thumb is a translucent
+     gradient with a specular top edge, wells recess into real black, and
+     the panel carries its own top highlight so it reads as a lit slab
+     rather than a flat grey rectangle on a near-identical page. */
+  --sgdb-well: rgba(0, 0, 0, 0.32);
+  --sgdb-well-inset: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  --sgdb-thumb-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.07));
+  --sgdb-thumb-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    0 2px 8px rgba(0, 0, 0, 0.35);
+  --sgdb-pick-hover: rgba(255, 255, 255, 0.06);
+  --sgdb-code-bg: oklch(18% 0.012 258);
+  --sgdb-code-inset: rgba(0, 0, 0, 0.5);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 16px 40px -16px rgba(0, 0, 0, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sgd-command-builder *, .sgd-command-builder *::before, .sgd-command-builder *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+
 
 .sgd-muted {
   color: rgb(107, 114, 128);
@@ -217,6 +874,13 @@ html.dark .sgd-chip,
   border-color: rgba(251, 146, 60, 0.3);
   background: rgba(251, 146, 60, 0.12);
   color: rgb(253, 186, 116);
+}
+
+html.dark .sgd-model-tags .sgd-chip,
+[data-theme="dark"] .sgd-model-tags .sgd-chip {
+  border: 0;
+  background: rgba(129, 140, 248, 0.18);
+  color: rgb(199, 210, 254);
 }
 
 html.dark .sgd-muted,

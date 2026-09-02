@@ -19,7 +19,12 @@ Measured avg_kl_div:
            test_prefill_cache_hit             6.22e-06    4.40e-06        0.0
            test_decode_cache_hit                   0.0         0.0        0.0
            multiturn branching                     0.0    2.01e-07        0.0
+           lazy test_prefill_cache_hit        5.56e-06         n/a        0.0
   #29792   multiturn branching       9.43e-06/1.16e-05    5.14e-04        0.0
+
+The lazy row was measured in the same session as the 1.18e-05 the non-lazy
+`test_prefill_cache_hit` read on that GPU, so read the pair as "both fire",
+not as one being weaker.
 
 `test_prefill_cache_hit` is the only case that fires on both, so read the rest as
 extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
@@ -35,9 +40,11 @@ as tests.
 
 import os
 import random
+import re
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     make_mamba_decode_assert,
@@ -62,9 +69,11 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
+    unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2300, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -92,7 +101,9 @@ def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
-def _base_args() -> list[str]:
+def _base_args(
+    mamba_strategy: str = "extra_buffer", *, mem_fraction_static: float = 0.6
+) -> list[str]:
     return [
         "--trust-remote-code",
         "--attention-backend",
@@ -100,7 +111,7 @@ def _base_args() -> list[str]:
         "--page-size",
         str(PAGE_SIZE),
         "--mamba-radix-cache-strategy",
-        "extra_buffer",
+        mamba_strategy,
         "--swa-full-tokens-ratio",
         "0.1",
         "--mamba-full-memory-ratio",
@@ -109,11 +120,22 @@ def _base_args() -> list[str]:
         # the static pool leaves ~19 GB for the prefill graphs, the fa4 workspace
         # and the chunked-prefill activations, which is what this config needs.
         "--mem-fraction-static",
-        "0.6",
+        str(mem_fraction_static),
         "--mamba-track-interval",
         str(TRACK_INTERVAL),
         "--enable-deterministic-inference",
     ]
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
 
 
 class TestUnifiedHybridBitExact(CustomTestCase):
@@ -127,6 +149,8 @@ class TestUnifiedHybridBitExact(CustomTestCase):
     test_decode_cache_hit stays 0.0 even with the fix reverted, so it covers
     decode-region state reuse in general rather than that regression.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -147,13 +171,13 @@ class TestUnifiedHybridBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def _run(self, helper):
         helper(
@@ -175,6 +199,40 @@ class TestUnifiedHybridBitExact(CustomTestCase):
         self._run(assert_decode_cache_hit)
 
 
+class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
+    """Same exactness bar on the lazy extra-buffer strategy.
+
+    Lazy is a different code path, not the same code under a flag: a request
+    holds one ping-pong slot instead of two and the second is allocated only on
+    the forward that crosses a track boundary, then freed again afterwards. The
+    checkpoint therefore lands in a slot chosen per forward rather than one the
+    request owns for its lifetime, and picking the wrong one restores another
+    request's conv window.
+
+    Admitted the same way the class it inherits from was: reverting #34184 takes
+    test_prefill_cache_hit here to 5.56e-06, so this is a guard for that class of
+    bug on the lazy path rather than coverage of a path nothing checks.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args("extra_buffer_lazy") + [
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
+        )
+
+
 class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     """Same exactness bar with the host tier in the loop, over interleaved
     branches so hits land at many prefix lengths rather than one aligned one.
@@ -187,6 +245,8 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     Runs the multi-turn branching harness because the single-turn helpers above
     cannot produce a non-aligned hit length, which this regression needs.
     """
+
+    tree_core_backend = "python"
 
     @classmethod
     def setUpClass(cls):
@@ -222,7 +282,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(
             tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
@@ -231,7 +291,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_multiturn_decode_cache_hit_branching(self):
         groups, branches = 3, 3
@@ -258,6 +318,102 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedHybridMTPBitExact(CustomTestCase):
+    """Same exactness bar with MTP driving the decode loop.
+
+    Speculative decoding advances several tokens per forward, so a track
+    boundary can be crossed inside a verify step and the checkpoint is written
+    from the verify path. #29792 was a wrong-slot pick in the non-spec save;
+    nothing exercises the spec-side save today.
+
+    `--speculative-num-steps 2` is load-bearing rather than incidental: it
+    matches the two MTP heads this checkpoint ships, and a third step has no
+    weights and the draft head refuses to start.
+
+    Reaching the exact bar also needs the sheared relative-bias path out of the
+    way, since its bias tile geometry follows the query count. Deterministic
+    mode now selects the invariant path on its own, so this class carries no
+    environment override; a regression there surfaces here as a nonzero KL.
+    """
+
+    tree_core_backend = "python"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        # Target FullCG and both MTP draft workers retain graph pools, so this
+        # class needs more dynamic-memory headroom than the non-spec tests.
+        other_args = _base_args(mem_fraction_static=0.58) + [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--enable-multi-layer-eagle",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "3",
+            "--chunked-prefill-size",
+            "16384",
+            "--enable-metrics",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+
+    def _run(self, helper):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
+        helper(
+            self.base_url,
+            {self.model: {"kl_div": KL_DIV_THRESHOLD}},
+            self.model,
+            max_samples=32,
+            max_new_tokens=MAX_NEW_TOKENS,
+            trust_remote_code=True,
+        )
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "MTP target prefill did not replay the configured Full CUDA graph.",
+        )
+
+    def test_logprobs_match(self):
+        self._run(assert_logprobs_match)
+
+    def test_decode_cache_hit(self):
+        self._run(assert_decode_cache_hit)
+
+
+class TestRustUnifiedHybridBitExact(TestUnifiedHybridBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridLazyBitExact(TestUnifiedHybridLazyBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridHiCacheBitExact(TestUnifiedHybridHiCacheBitExact):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedHybridMTPBitExact(TestUnifiedHybridMTPBitExact):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":
