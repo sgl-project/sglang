@@ -918,6 +918,7 @@ def gdn_wide_vec_kernel(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    phase_b_unroll: cutlass.Constexpr[int],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     replayssm_rawv: cute.Tensor,
@@ -1680,7 +1681,7 @@ def gdn_wide_vec_kernel(
                 _loop_limit = T_decode_const  # constexpr int — propagates as constexpr
             for i_t_offset in cutlass.range(
                 _loop_limit,
-                unroll=1,
+                unroll=phase_b_unroll,
                 unroll_full=(T_decode_const <= 1) and not per_request_accepted_steps,
             ):
                 if cutlass.const_expr(per_request_fused):
@@ -2615,6 +2616,7 @@ def _run_wide_vec(
     disable_output: cutlass.Constexpr[bool],
     recovery_steps: cutlass.Constexpr[int],
     per_request_accepted_steps: cutlass.Constexpr[bool],
+    phase_b_unroll: cutlass.Constexpr[int],
     per_token_pool_scatter: cutlass.Constexpr[bool],
     per_token_pool_scatter_flat: cutlass.Constexpr[bool],
     replayssm_rawv: cute.Tensor,
@@ -2668,6 +2670,7 @@ def _run_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        phase_b_unroll,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         replayssm_rawv,
@@ -2957,6 +2960,15 @@ def _get_bf16_mtp_config(
 # picking is done by `_select_wide_vec_tile_v` below.
 _WIDE_VEC_WORK_UNITS_THRESHOLD = 128
 
+# The ReplaySSM verify path uses a short Phase-B loop while also writing its
+# raw ring. Two-way unrolling exposes useful ILP in the measured T=3..8 range
+# without the register-pressure regressions measured at larger factors. Keep
+# shapes outside that range and non-replay modes on the generic schedule.
+_WIDE_VEC_PHASE_B_DEFAULT_UNROLL = 1
+_WIDE_VEC_PHASE_B_REPLAY_UNROLL = 2
+_WIDE_VEC_PHASE_B_REPLAY_MIN_SEQ_LEN = 3
+_WIDE_VEC_PHASE_B_REPLAY_MAX_SEQ_LEN = 8
+
 
 def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
     """Pick a wide_vec tile_v by `work_units = B * HV`, or return None to
@@ -2984,6 +2996,25 @@ def _select_wide_vec_tile_v(B: int, HV: int) -> Optional[int]:
     if work_units >= _WIDE_VEC_WORK_UNITS_THRESHOLD:
         return 32
     return None
+
+
+def _select_wide_vec_phase_b_unroll(
+    seq_len: int,
+    cache_ring: bool,
+) -> int:
+    """Select the compile-time Phase-B schedule for the wide-vector kernel.
+
+    Use the tuned schedule only for the measured ReplaySSM ring-write domain;
+    retain the generic one-way schedule as an explicit fallback.
+    """
+    if (
+        cache_ring
+        and _WIDE_VEC_PHASE_B_REPLAY_MIN_SEQ_LEN
+        <= seq_len
+        <= _WIDE_VEC_PHASE_B_REPLAY_MAX_SEQ_LEN
+    ):
+        return _WIDE_VEC_PHASE_B_REPLAY_UNROLL
+    return _WIDE_VEC_PHASE_B_DEFAULT_UNROLL
 
 
 # ==============================================================================
@@ -3227,6 +3258,11 @@ def gated_delta_rule_mtp_wide_vec(
         ), f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
         assert ssm_state_indices.device == q.device
 
+    phase_b_unroll = _select_wide_vec_phase_b_unroll(
+        seq_len=T_val,
+        cache_ring=cache_ring,
+    )
+
     # Contiguous pool -> sentinel keys + slot dim marked dynamic (pool-size
     # agnostic); padded/strided pool keeps real pool_size/stride in the key.
     contiguous_pool = initial_state_source.is_contiguous()
@@ -3257,6 +3293,7 @@ def gated_delta_rule_mtp_wide_vec(
         disable_output,
         recovery_steps,
         per_request_accepted_steps,
+        phase_b_unroll,
         per_token_pool_scatter,
         per_token_pool_scatter_flat,
         cache_ring,
@@ -3355,6 +3392,7 @@ def gated_delta_rule_mtp_wide_vec(
                 disable_output,
                 recovery_steps,
                 per_request_accepted_steps,
+                phase_b_unroll,
                 per_token_pool_scatter,
                 per_token_pool_scatter_flat,
                 rawv_,
