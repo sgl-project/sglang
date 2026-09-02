@@ -246,6 +246,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_weights_paths={},
             component_quantizations={},
             component_precisions={},
             pipeline_config=SimpleNamespace(
