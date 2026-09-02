@@ -176,6 +176,15 @@ SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
 #endif
 }
 
+#ifdef USE_ROCM
+/// One step of a DPP scan: move `v` across lanes by `kCtrl` and add it back.
+template <int kCtrl, int kRowMask>
+SGL_DEVICE uint32_t dpp_shift_add(uint32_t v) {
+  const int moved = __builtin_amdgcn_update_dpp(0, static_cast<int>(v), kCtrl, kRowMask, 0xF, false);
+  return v + static_cast<uint32_t>(moved);
+}
+#endif
+
 /// Inclusive prefix sum across a whole hardware wave.
 ///
 /// warp_inclusive_sum above is fixed at 32 lanes because kWarpThreads is 32
@@ -184,12 +193,23 @@ SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
 /// real wave, which is what lets the radix select's prefix fit in a single wave.
 SGL_DEVICE uint32_t wave_inclusive_sum(uint32_t val) {
 #ifdef USE_ROCM
-  const uint32_t lane = __lane_id();
-#pragma unroll
-  for (uint32_t off = 1; off < kWaveThreads; off <<= 1) {
-    const uint32_t n = __shfl_up(val, off, kWaveThreads);
-    if (lane >= off) val += n;
-  }
+  // Built from DPP-modified adds rather than __shfl_up. __shfl_up lowers to
+  // ds_bpermute, which routes the lane crossing through the LDS crossbar and
+  // pays LDS latency even though it touches no memory; a DPP modifier fetches
+  // the neighbouring lane during instruction issue, at plain VALU rate.
+  //
+  // A "row" is 16 lanes on CDNA, so the four row_shr steps scan each row on its
+  // own and the two row_bcast steps carry the row totals across the wave:
+  // row_bcast:15 adds row 0's total into row 1 and row 2's into row 3, then
+  // row_bcast:31 adds the first half's total into rows 2 and 3. Lanes that a
+  // row_mask disables, and lanes whose source is out of range, both resolve to
+  // `old` -- zero here, the identity for the add.
+  val = dpp_shift_add<0x111, 0xF>(val);  // row_shr:1
+  val = dpp_shift_add<0x112, 0xF>(val);  // row_shr:2
+  val = dpp_shift_add<0x114, 0xF>(val);  // row_shr:4
+  val = dpp_shift_add<0x118, 0xF>(val);  // row_shr:8
+  val = dpp_shift_add<0x142, 0xA>(val);  // row_bcast:15 -> rows 1 and 3
+  val = dpp_shift_add<0x143, 0xC>(val);  // row_bcast:31 -> rows 2 and 3
   return val;
 #else
   return warp_inclusive_sum(threadIdx.x % kWarpThreads, val);
