@@ -282,5 +282,107 @@ class TestFilterBatchHostIndices(CustomTestCase):
         torch.testing.assert_close(a.future_indices, b.future_indices)
 
 
+@unittest.skipUnless(_HAS_CUDA, "MRoPE delta upload requires CUDA")
+class TestMropeDeltaOnDevice(CustomTestCase):
+    def test_reuses_device_copy_until_refreshed(self):
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+        from sglang.srt.model_executor.forward_batch_info import _mrope_delta_on_device
+
+        mm_input = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[3]], dtype=torch.int64),
+        )
+
+        first = _mrope_delta_on_device(mm_input, "cuda")
+        self.assertEqual(first.device.type, "cuda")
+        torch.testing.assert_close(first.cpu(), torch.tensor([[3]], dtype=torch.int64))
+
+        # Decode steps read the same tensor: no second upload.
+        self.assertIs(_mrope_delta_on_device(mm_input, "cuda"), first)
+
+        # A new extend re-reads whatever the CPU source now holds.
+        mm_input.mrope_position_delta = torch.tensor([[7]], dtype=torch.int64)
+        refreshed = _mrope_delta_on_device(mm_input, "cuda", refresh=True)
+        self.assertIsNot(refreshed, first)
+        torch.testing.assert_close(
+            refreshed.cpu(), torch.tensor([[7]], dtype=torch.int64)
+        )
+
+
+class TestMultimodalMropeCacheInvalidation(CustomTestCase):
+    def test_merge_invalidates_derived_caches(self):
+        from sglang.srt.managers.schedule_batch import MultimodalInputs
+
+        left = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[2]], dtype=torch.int64),
+            mrope_position_delta_repeated_cache=torch.tensor([[1]], dtype=torch.int64),
+            mrope_position_delta_device=torch.tensor([[2]], dtype=torch.int64),
+        )
+        right = MultimodalInputs(
+            mm_items=[],
+            mrope_position_delta=torch.tensor([[5]], dtype=torch.int64),
+        )
+
+        left.merge(right)
+
+        torch.testing.assert_close(
+            left.mrope_position_delta,
+            torch.tensor([[2], [5]], dtype=torch.int64),
+        )
+        self.assertIsNone(left.mrope_position_delta_repeated_cache)
+        self.assertIsNone(left.mrope_position_delta_device)
+
+
+class TestDFlashFlashInferHostPlanning(CustomTestCase):
+    def test_sliding_window_uses_cpu_known_paged_lengths(self):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferIndicesUpdaterPrefill,
+        )
+
+        updater = object.__new__(FlashInferIndicesUpdaterPrefill)
+        updater.sliding_window_size = 4
+        updater._swa_kv_pool = None
+        updater.prefill_wrapper_ragged = object()
+        updater.kv_indptr = [object(), object()]
+        updater.qo_indptr = [object(), object()]
+        calls = []
+
+        def record_call(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        updater.call_begin_forward = record_call
+        seq_lens = torch.tensor([3, 7], dtype=torch.int64)
+        seq_lens_cpu = seq_lens.clone()
+        wrappers = [object(), object()]
+
+        updater.update_sliding_window(
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=10,
+            prefix_lens=None,
+            prefill_wrappers=wrappers,
+            use_ragged=False,
+            encoder_lens=None,
+            spec_info=SimpleNamespace(num_accept_tokens=None),
+            kv_view=object(),
+        )
+
+        self.assertEqual(len(calls), 2)
+        # Window wrapper: lengths clamped to the window, summed on the host, and
+        # handed down so the sync-free plan can rebuild kv_lens from them.
+        torch.testing.assert_close(calls[0][0][3], torch.tensor([3, 4]))
+        self.assertEqual(calls[0][0][4], 7)
+        torch.testing.assert_close(
+            calls[0][1]["paged_kernel_lens_cpu"], torch.tensor([3, 4])
+        )
+        # Full-attention wrapper: device lengths are plain seq_lens, so there is
+        # no clamped prefix to pass -- the plan reads seq_lens_cpu directly.
+        torch.testing.assert_close(calls[1][0][3], seq_lens)
+        self.assertEqual(calls[1][0][4], 10)
+        self.assertIsNone(calls[1][1]["paged_kernel_lens_cpu"])
+
+
 if __name__ == "__main__":
     unittest.main()

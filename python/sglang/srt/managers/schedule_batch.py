@@ -650,6 +650,9 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    # Device copy of mrope_position_delta, refilled from the CPU source on every
+    # extend so the decode loop never re-uploads this per-request constant.
+    mrope_position_delta_device: Optional[torch.Tensor] = None
 
     # Moss-VL related
     vision_position_ids: Optional[torch.Tensor] = None
@@ -809,6 +812,10 @@ class MultimodalInputs:
                 self.mrope_position_delta = torch.cat(
                     [self.mrope_position_delta, other.mrope_position_delta], dim=0
                 )
+            # The merged source has a new layout, so anything derived from the
+            # pre-merge value is stale.
+            self.mrope_position_delta_repeated_cache = None
+            self.mrope_position_delta_device = None
 
         for key, val in other.__dict__.items():
             if "_id" in key:

@@ -210,14 +210,14 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
 ) -> None:
-    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
-    draft-extend CUDA graph (FlashInfer fa2, cuda-graph mode only).
+    """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for EAGLE-style
+    draft-extend and DFlash target-verify CUDA graph replay (FlashInfer fa2 only).
 
     Upstream plan() always does qo/paged_kv/last_page_len ``.to("cpu")`` to build
     its host scheduling metadata, a blocking D2H that drains the GPU queue every
-    replay. The caller passes host-known qo/kv layout in, so we call the underlying
-    ``_cached_module.plan`` directly with no readback; the ``_plan_info`` produced
-    is identical to plan()'s.
+    replay. The caller passes exact or conservative host-known scheduling metadata,
+    so we call ``_cached_module.plan`` directly with no readback. Device indptr and
+    indices remain authoritative for attention addressing.
     """
     assert self.is_cuda_graph_enabled, "fast_prefill_plan is cuda-graph only"
     assert (
@@ -832,16 +832,16 @@ class FlashInferAttnBackend(AttentionBackend):
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
             and getattr(spec_info, "custom_mask", None) is None
             and self.prefill_backend == "fa2"
-            # Host-rebuilt layout only matches full attention (single wrapper);
-            # SWA/cross-attn keep the plain plan().
-            and self.dispatch_reason is None
+            # SWA rebuilds from the window-clamped host lengths assembled
+            # below; cross-attn has no host-rebuildable layout at all.
+            and self.dispatch_reason in (None, WrapperDispatch.SLIDING_WINDOW)
         ):
             # DFLASH target-verify replays are shape-static per
             # (bs, draft_token_num): qo_indptr is a constant arange stride of
             # num_tokens_per_req, and the batch carries seq_lens_cpu =
             # prefix + draft_token_num (dspark_draft._run_forward /
             # dspark_verify.run_non_compact / dflash_worker_v2 all add the
-            # verify window host-side), which equals the device kv length
+            # verify window host-side), which bounds the device kv length
             # generate_attn_arg_prefill produces. The host-kwargs assembly in
             # call_begin_forward therefore applies verbatim; installing the
             # sync-free plan removes three blocking .to("cpu") reads per
@@ -1981,6 +1981,7 @@ class FlashInferIndicesUpdaterPrefill:
         assert sliding_window_size is not None
         for wrapper_id in range(2):
             swa_paged_custom_mask = None
+            paged_kernel_lens_cpu = None
             if wrapper_id == 0:
                 if use_ragged:
                     # K for extend tokens is written after the paged wrapper runs, so
@@ -2005,9 +2006,10 @@ class FlashInferIndicesUpdaterPrefill:
                     if prefix_is_full_seq and seq_lens_cpu is not None:
                         # prefix_lens is seq_lens, so the trim is min(seq_lens, window);
                         # summing the host mirror avoids draining the stream.
-                        paged_kernel_lens_sum = int(
-                            torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
+                        paged_kernel_lens_cpu = torch.clamp(
+                            seq_lens_cpu, max=sliding_window_size
                         )
+                        paged_kernel_lens_sum = int(paged_kernel_lens_cpu.sum())
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     kv_start_idx = seq_lens - paged_kernel_lens
@@ -2037,6 +2039,8 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
+                seq_lens_cpu=seq_lens_cpu,
+                paged_kernel_lens_cpu=paged_kernel_lens_cpu,
                 # paged-only SWA path only; ragged keeps its custom prefix
                 # mask, spec-verify keeps its tree mask
                 window_left=(
@@ -2163,6 +2167,7 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
         seq_lens_cpu: Optional[torch.Tensor] = None,
+        paged_kernel_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
         *,
@@ -2297,7 +2302,14 @@ class FlashInferIndicesUpdaterPrefill:
             assert (
                 use_custom_mask is None
             ), "fast_prefill_plan does not support custom_mask; keep the plain plan()"
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            if paged_kernel_lens_cpu is not None:
+                # SWA clamped the prefix, so seq_lens_cpu no longer tracks the
+                # device kv length; rebuild from clamped prefix + verify block.
+                kv_lens_host = (
+                    paged_kernel_lens_cpu.to(torch.int32) + num_tokens_per_req
+                )
+            else:
+                kv_lens_host = seq_lens_cpu.to(torch.int32)
             qo_indptr_host = torch.arange(
                 0,
                 (bs + 1) * num_tokens_per_req,
@@ -2306,13 +2318,13 @@ class FlashInferIndicesUpdaterPrefill:
                 device="cpu",
             )
             kv_indptr_host = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
-            kv_indptr_host[1:] = torch.cumsum(seq_lens_cpu_i32, dim=0)
+            kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
             paged_plan_kwargs = dict(
                 qo_indptr_host=qo_indptr_host,
                 kv_indptr_host=kv_indptr_host,
-                kv_lens_host=seq_lens_cpu_i32,
+                kv_lens_host=kv_lens_host,
                 max_q_len=num_tokens_per_req,
-                max_kv_len=int(seq_lens_cpu_i32.max()),
+                max_kv_len=int(kv_lens_host.max()),
             )
 
         if window_left >= 0:

@@ -38,6 +38,8 @@ NUM_QO_HEADS = 8
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 DTYPE = torch.float16
+# Sits between SEQ_LENS' min and max so the clamp binds on some requests only.
+WINDOW = 32
 
 
 @unittest.skipUnless(_HAS_FLASHINFER, "requires flashinfer")
@@ -109,7 +111,7 @@ class TestFastPrefillPlan(CustomTestCase):
             ),
         )
 
-    def _real_plan(self, w):
+    def _real_plan(self, w, window_left=-1):
         w.plan(
             self.qo_indptr,
             self.kv_indptr,
@@ -122,25 +124,40 @@ class TestFastPrefillPlan(CustomTestCase):
             causal=True,
             q_data_type=DTYPE,
             kv_data_type=DTYPE,
+            window_left=window_left,
         )
 
     def _forward(self, w):
         return w.run(self.q, (self.k_cache, self.v_cache))
 
-    def _out_upstream(self):
+    def _out_upstream(self, window_left=-1):
         """Ground truth: a wrapper planned only by upstream plan()."""
         w = self._new_wrapper()
-        self._real_plan(w)
+        self._real_plan(w, window_left=window_left)
         return self._forward(w)
 
-    def _out_fast(self, *, kv_indices=None):
+    def _out_fast(
+        self,
+        *,
+        kv_indices=None,
+        kv_indptr_host=None,
+        kv_lens_host=None,
+        max_kv_len=None,
+        window_left=-1,
+    ):
         """Same attention, planned via the host-known fast path. One real plan()
         first populates `_cached_module` (mirrors capture), then fast_prefill_plan
         re-plans from host metadata."""
         if kv_indices is None:
             kv_indices = self.kv_indices
+        if kv_indptr_host is None:
+            kv_indptr_host = self.kv_indptr_host
+        if kv_lens_host is None:
+            kv_lens_host = self.kv_lens_host
+        if max_kv_len is None:
+            max_kv_len = self.max_kv_len
         w = self._new_wrapper()
-        self._real_plan(w)
+        self._real_plan(w, window_left=window_left)
         fast_prefill_plan(
             w,
             self.qo_indptr,
@@ -155,10 +172,11 @@ class TestFastPrefillPlan(CustomTestCase):
             q_data_type=DTYPE,
             kv_data_type=DTYPE,
             qo_indptr_host=self.qo_indptr_host,
-            kv_indptr_host=self.kv_indptr_host,
-            kv_lens_host=self.kv_lens_host,
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
             max_q_len=self.max_q_len,
-            max_kv_len=self.max_kv_len,
+            max_kv_len=max_kv_len,
+            window_left=window_left,
         )
         return self._forward(w)
 
@@ -167,6 +185,38 @@ class TestFastPrefillPlan(CustomTestCase):
         # the same attention output.
         out_upstream = self._out_upstream()
         out_fast = self._out_fast()
+        torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
+
+    def test_dflash_full_attention_conservative_bound_matches_upstream(self):
+        # DFlash overlap may expose a host planning bound that is larger than
+        # the exact device layout. The host values only schedule work; the
+        # device indptr/indices remain authoritative for attention addressing.
+        kv_lens_host = self.kv_lens_host + NUM_TOKENS_PER_REQ
+        kv_indptr_host = torch.zeros(self.bs + 1, dtype=torch.int32, device="cpu")
+        kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
+
+        out_upstream = self._out_upstream()
+        out_fast = self._out_fast(
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
+            max_kv_len=int(kv_lens_host.max()),
+        )
+        torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
+
+    def test_dflash_swa_conservative_bound_matches_upstream(self):
+        # Separate from the full-attention bound above because window_left caps
+        # effective_kv_len, sending the scheduler down a different kv-chunk split.
+        kv_lens_host = torch.clamp(self.kv_lens_host, max=WINDOW) + NUM_TOKENS_PER_REQ
+        kv_indptr_host = torch.zeros(self.bs + 1, dtype=torch.int32, device="cpu")
+        kv_indptr_host[1:] = torch.cumsum(kv_lens_host, dim=0)
+
+        out_upstream = self._out_upstream(window_left=WINDOW)
+        out_fast = self._out_fast(
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
+            max_kv_len=int(kv_lens_host.max()),
+            window_left=WINDOW,
+        )
         torch.testing.assert_close(out_fast, out_upstream, rtol=0, atol=0)
 
     def test_mutation_changes_output(self):
