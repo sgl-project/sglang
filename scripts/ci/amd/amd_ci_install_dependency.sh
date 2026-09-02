@@ -187,10 +187,6 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
-# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
-install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
-
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
