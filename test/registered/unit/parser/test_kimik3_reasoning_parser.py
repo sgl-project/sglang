@@ -74,6 +74,25 @@ def test_non_stream_tools_channel_passthrough() -> None:
     assert result.normal_text == f"reply{tools_channel}"
 
 
+@pytest.mark.parametrize(
+    ("marker", "content"),
+    [
+        (RESPONSE_OPEN, ""),
+        (TOOLS_OPEN, TOOLS_OPEN),
+        (RESPONSE_CLOSE, ""),
+        (MESSAGE_CLOSE, ""),
+    ],
+)
+def test_non_stream_channel_marker_implicitly_ends_reasoning(
+    marker: str, content: str
+) -> None:
+    result = KimiK3Detector(force_reasoning=True).detect_and_parse(
+        f"{THINK_OPEN}thought{marker}"
+    )
+    assert result.reasoning_text == "thought"
+    assert result.normal_text == content
+
+
 def test_non_stream_recovers_missing_think_separator() -> None:
     detector = KimiK3Detector(force_reasoning=True)
     result = detector.detect_and_parse(
@@ -141,6 +160,24 @@ def test_streaming_tools_channel_passthrough() -> None:
     reasoning, content = _stream(detector, _chunks(text, 5))
     assert reasoning == "thought"
     assert content == f"reply{tools_channel}"
+
+
+@pytest.mark.parametrize(
+    ("marker", "content"),
+    [
+        (RESPONSE_OPEN, ""),
+        (TOOLS_OPEN, TOOLS_OPEN),
+        (RESPONSE_CLOSE, ""),
+        (MESSAGE_CLOSE, ""),
+    ],
+)
+def test_streaming_channel_marker_implicitly_ends_reasoning(
+    marker: str, content: str
+) -> None:
+    detector = KimiK3Detector(force_reasoning=True)
+    reasoning, normal = _stream(detector, _chunks(f"{THINK_OPEN}thought{marker}", 3))
+    assert reasoning == "thought"
+    assert normal == content
 
 
 def test_streaming_recovers_missing_think_separator() -> None:
