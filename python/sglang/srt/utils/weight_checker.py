@@ -64,6 +64,25 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
+def _padded(nbytes: int, align: int) -> int:
+    return (nbytes + align - 1) // align * align
+
+
+class _ArenaAllocator:
+    """Bump-allocates aligned views out of one mmap arena, so the whole snapshot is one munmap."""
+
+    def __init__(self, total_bytes: int, align: int):
+        self.arena = alloc_mmap((max(total_bytes, align),), torch.uint8)
+        self._align = align
+        self._pointer = 0
+
+    def allocate(self, like: torch.Tensor) -> torch.Tensor:
+        start = self._pointer
+        self._pointer += _padded(like.nbytes, self._align)
+        assert self._pointer <= len(self.arena)
+        return self.arena[start : start + like.nbytes].view(like.dtype).view(like.shape)
+
+
 class WeightChecker:
     def __init__(self, *, get_model: Callable[[], Any], ps: Any):
         self._get_model = get_model
@@ -89,24 +108,20 @@ class WeightChecker:
     def _snapshot(self):
         named_params = [(name, param.data) for name, param in self._model_state()]
         align = 64  # torch CPU-allocator alignment
-        offsets, total = [], 0
-        for _, param in named_params:
-            offsets.append(total)
-            total += (param.nbytes + align - 1) // align * align
-        self._snapshot_arena = alloc_mmap((max(total, align),), torch.uint8)
+        allocator = _ArenaAllocator(
+            sum(_padded(p.nbytes, align) for _, p in named_params), align
+        )
         snapshot_tensors = {}
-        for (name, param), offset in zip(named_params, offsets):
-            view = (
-                self._snapshot_arena[offset : offset + param.nbytes]
-                .view(param.dtype)
-                .view(param.shape)
-            )
+        for name, param in named_params:
+            view = allocator.allocate(param)
             view.copy_(param.detach())
             snapshot_tensors[name] = view
-        self._snapshot_tensors = snapshot_tensors
-        assert len(self._snapshot_tensors) == len(
+        assert len(snapshot_tensors) == len(
             named_params
         ), f"should not have duplicated tensor name"
+        # publish only after every copy succeeded, so a failed snapshot holds no arena
+        self._snapshot_arena = allocator.arena
+        self._snapshot_tensors = snapshot_tensors
 
     def _reset_tensors(self):
         for name, param in self._model_state():

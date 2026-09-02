@@ -517,6 +517,15 @@ class TestSnapshot(_WeightCheckerTestBase):
             self.model.w.data.fill_(99.0)
         torch.testing.assert_close(self.checker._snapshot_tensors["w"], original_w)
 
+    def test_failed_snapshot_holds_no_arena(self):
+        """A copy that raises mid-snapshot must not leave the model-sized arena
+        reachable from the checker, or the retry allocates a second one."""
+        with patch.object(torch.Tensor, "copy_", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.checker._snapshot()
+        self.assertIsNone(self.checker._snapshot_arena)
+        self.assertIsNone(self.checker._snapshot_tensors)
+
 
 class TestResetTensors(_WeightCheckerTestBase):
 
