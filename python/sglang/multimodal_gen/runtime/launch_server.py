@@ -8,6 +8,7 @@ import time
 
 import uvicorn
 
+from sglang.multimodal_gen.plugins import load_plugins
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
@@ -94,6 +95,7 @@ def _kill_alive_processes(processes, timeout_s: float) -> None:
 
 
 def _run_http_server_process(server_args: ServerArgs) -> None:
+    load_plugins()
     kill_itself_when_parent_died()
     launch_http_server_only(server_args)
 
@@ -826,6 +828,7 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    load_plugins()
     server_args = prepare_server_args(sys.argv[1:])
 
     try:

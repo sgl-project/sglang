@@ -35,6 +35,8 @@ _plugins_loaded = False
 def load_plugins_by_group(
     group: str,
     excluded_dists: set[str] | None = None,
+    *,
+    exclusion_reason: str = "SGLANG_PLATFORM",
 ) -> dict[str, tuple[Callable[[], Any], str | None]]:
     """
     Discover and load plugins registered under the given entry point group.
@@ -44,6 +46,7 @@ def load_plugins_by_group(
         excluded_dists: Distribution names to skip. Plugins from these
             distributions are never ``ep.load()``-ed (avoids importing
             their modules and pulling hardware-specific dependencies).
+        exclusion_reason: Reason included in exclusion log messages.
 
     Returns:
         Dictionary mapping plugin name to ``(callable, dist_name)``.
@@ -71,9 +74,10 @@ def load_plugins_by_group(
         dist_name = ep.dist.name if ep.dist else None
         if excluded_dists and dist_name in excluded_dists:
             logger.info(
-                "Skipping plugin %s (dist %s excluded by SGLANG_PLATFORM)",
+                "Skipping plugin %s (dist %s excluded by %s)",
                 ep.name,
                 dist_name,
+                exclusion_reason,
             )
             continue
         try:
@@ -98,6 +102,26 @@ def _get_excluded_dists() -> set[str]:
         return set()
     platform_eps = entry_points(group=PLATFORM_PLUGINS_GROUP)
     return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
+
+
+def execute_plugin_callbacks(
+    plugins: dict[str, tuple[Callable[[], Any], str | None]],
+    registry: type[HookRegistry],
+    logger: logging.Logger,
+    plugin_label: str,
+) -> None:
+    for name, (func, dist_name) in plugins.items():
+        source = HookSource(plugin_name=name, dist_name=dist_name)
+        token = _current_plugin_source.set(source)
+        try:
+            func()
+            logger.info("Executed %s plugin: %s", plugin_label, name)
+        except Exception:
+            logger.exception("Failed to execute %s plugin: %s", plugin_label, name)
+        finally:
+            _current_plugin_source.reset(token)
+
+    registry.apply_hooks()
 
 
 def load_plugins():
@@ -126,16 +150,4 @@ def load_plugins():
         excluded_dists=_get_excluded_dists(),
     )
 
-    for name, (func, dist_name) in plugins.items():
-        source = HookSource(plugin_name=name, dist_name=dist_name)
-        token = _current_plugin_source.set(source)
-        try:
-            func()
-            logger.info("Executed general plugin: %s", name)
-        except Exception:
-            logger.exception("Failed to execute general plugin: %s", name)
-        finally:
-            _current_plugin_source.reset(token)
-
-    # Apply all registered hooks (idempotent — already-patched targets are skipped).
-    HookRegistry.apply_hooks()
+    execute_plugin_callbacks(plugins, HookRegistry, logger, "general")

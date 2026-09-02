@@ -1189,6 +1189,10 @@ def run_scheduler_process(
     Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
     Ranks > 0 act as slaves, waiting for tasks from the master.
     """
+    from sglang.multimodal_gen.plugins import load_plugins
+
+    load_plugins()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()

@@ -39,44 +39,38 @@ The framework provides two plugin types, both discovered via Python's standard `
 
 ### Principles
 
-- **Non-intrusive**: Existing CUDA/ROCm/NPU/XPU code remains unchanged. OOT code paths are added alongside existing hardware-specific logic.
-- **Zero configuration**: Plugins are automatically discovered after `pip install`, no sglang code changes required.
-- **Environment variable control**: `SGLANG_PLATFORM` selects or validates the active platform plugin; `SGLANG_PLUGINS` (comma-separated) controls which general plugins to load.
+- **Non-intrusive**: Built-in platforms remain the fallback when no OOT platform activates.
+- **Install-time discovery**: Plugins are discovered from Python entry points after installation.
+- **Environment variable control**: `SGLANG_PLATFORM` selects an SRT platform, `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` selects a diffusion platform, and `SGLANG_PLUGINS` filters general plugins in either hook group.
 
-### Current Scope & Future Direction
+### Current scope
 
-The plugin system currently targets **out-of-tree (OOT) hardware platforms** — enabling new devices to integrate with SGLang without any changes to the main repository. The main-repo hardware paths (CUDA, ROCm, NPU, XPU, etc.) continue to use the existing `is_cuda()`/`is_npu()`/… utility functions.
-
-As the plugin interfaces mature and stabilize, in-tree hardware backends can be gradually migrated to the same plugin architecture. This would replace the scattered `if device == "cuda" … elif device == "npu" …` branches throughout the codebase with a single polymorphic dispatch through the platform interface, making each hardware backend self-contained and the core engine hardware-agnostic.
+The platform plugin system targets **out-of-tree (OOT) hardware platforms**. Diffusion support is experimental and covers the seams documented below, not every device-specific branch.
 
 ## Architecture
 
-### Platform Hierarchy
+### Runtime-specific platform interfaces
 
-The platform hierarchy uses a DeviceMixin pattern to share device operations between SRT (LLM inference) and Multimodal subsystems:
+SRT and diffusion have separate platform base classes and platform identity types in `sglang.srt.platforms` and `sglang.multimodal_gen.runtime.platforms`. A package supporting both runtimes should define separate platform classes and use each runtime's own `PlatformEnum.OOT` value.
 
+Each platform entry point resolves to a zero-argument activation callback:
+
+```python
+def activate() -> str | None:
+    """Return the platform class qualname when this hardware is available."""
 ```
-DeviceMixin (shared device identity + operations)
-├── SRTPlatform(DeviceMixin)           # + graph runner, KV pool, …
-│   └── MySRTPlatform(SRTPlatform, MyDeviceMixin)   # OOT plugin
-└── MMPlatform(DeviceMixin)            # + attention backend, VAE, … (future)
-    └── MyMMPlatform(MMPlatform, MyDeviceMixin)      # OOT plugin
-```
 
-Key design points:
-- **DeviceMixin** provides platform identity queries (`is_cuda()`, `is_npu()`, etc.) and device operations (`set_device()`, `get_device_name()`, etc.)
-- **SRTPlatform** adds SRT-specific factory methods, capability flags, and lifecycle hooks
-- OOT plugins implement a **device mixin** (vendor-specific operations) and compose it with **SRTPlatform** via multiple inheritance
-- All methods are **instance methods** (not classmethods), called through the `current_platform` singleton
-- Device operations and factory methods raise `NotImplementedError` by default (fail-fast)
-- Capability flags use safe conservative defaults (`False`/`pass`)
-- Methods are annotated `[Active]` (called by SGLang core) or `[Planned]` (reserved for future migration)
+Return a fully qualified class name when the provider can run, or `None` otherwise. Keep activation import-safe: do not access `current_platform` or initialize runtime or device state. Use the runtime's general plugin callback to register hooks; SRT platforms may also use `SRTPlatform.init_backend()`.
 
-### Platform Discovery (`current_platform`)
+Explicit selection enumerates entry-point metadata and imports only the selected callback. Automatic selection invokes installed platform callbacks to determine which provider is active.
+
+Diffusion reserves `cpu`, `cuda`, `rocm`, `xpu`, `mps`, `npu`, and `musa`. Automatic discovery also rejects duplicate entry-point names; explicit selection validates only the selected name and does not import unrelated providers.
+
+#### SRT selection
 
 `current_platform` is a **lazy singleton** in `sglang.srt.platforms`. On first access it resolves the active platform through the following priority chain:
 
-```
+```text
 entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadata only)
   │
   ├─ SGLANG_PLATFORM set (front-loading filter):
@@ -94,9 +88,22 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
       └─ N activated → RuntimeError (must set SGLANG_PLATFORM)
 ```
 
+#### Diffusion selection
+
+SGLang Diffusion resolves its platform in this order:
+
+1. When `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` names `cpu`, `cuda`, `rocm`, `mps`, `npu`, or `musa`, select that built-in platform without hardware probing. XPU remains automatic-only, preserving the existing selector behavior.
+2. When it contains another name, load only the matching `sglang.multimodal_gen.platforms` entry point. An unknown name or a callback that returns `None` is an error.
+3. When it is unset, activate installed diffusion platform plugins. No active plugin continues to built-in detection, one selects that plugin, and multiple active plugins raise an error that asks you to set the selector.
+4. Try built-in platforms in order: MPS, XPU, ROCm, CUDA, NPU, MUSA, then CPU.
+
+The existing override variable is therefore the single explicit selector for supported built-in aliases and OOT entry-point names.
+
 ### Plugin Loading Flow
 
-`load_plugins()` discovers and executes general plugins, then applies all registered hooks. It is called at four points:
+Each runtime has a process-local hook registry and `load_plugins()` function. They share the same hook behavior but discover callbacks from `sglang.srt.plugins` and `sglang.multimodal_gen.plugins`, respectively. Both honor `SGLANG_PLUGINS`.
+
+The loader is called at these SRT entry points:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -113,7 +120,7 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
   </thead>
   <tbody>
     <tr>
-      <td><code>cli/serve.py</code> serve()</td>
+      <td><code>cli/serve.py</code> <code>serve()</code></td>
       <td>Main</td>
       <td>Before <code>prepare_server_args()</code></td>
     </tr>
@@ -135,7 +142,7 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
   </tbody>
 </table>
 
-> **Note**: `load_plugins()` is idempotent (guarded by `_plugins_loaded` flag). In spawn'd subprocesses the flag resets, so plugins are correctly re-loaded.
+> **Note**: `load_plugins()` is idempotent within a process. Spawned subprocesses have their own loader state.
 
 ```
 load_plugins()
@@ -147,15 +154,17 @@ load_plugins()
   └── HookRegistry.apply_hooks()                  → monkey-patch targets
 ```
 
+Diffusion invokes its loader from CLI, `DiffGenerator.from_pretrained()`, `DiffGenerator.from_server_args()`, scheduler subprocesses, and HTTP child processes.
+
 ---
 
 ## Plugin Type 1: Hardware Platform Plugin
 
 ### Description
 
-A hardware platform plugin registers an `SRTPlatform` subclass that tells SGLang how to interact with a specific hardware backend.
+A hardware platform plugin registers an SRT `SRTPlatform` subclass, a diffusion `Platform` subclass, or both. The selected class tells that runtime how to interact with a specific hardware backend.
 
-### Quick Start
+### SRT quick start
 
 **1. Create a minimal package:**
 
@@ -230,7 +239,7 @@ pip install -e my_platform_plugin/
 python -c "from sglang.srt.platforms import current_platform; print(current_platform)"
 ```
 
-### Platform Interface Reference
+### SRT platform interface reference
 
 #### Identity Queries (from DeviceMixin)
 
@@ -578,7 +587,7 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
   </tbody>
 </table>
 
-### Environment Variables
+### Platform and plugin environment variables
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -598,10 +607,100 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
     </tr>
     <tr>
       <td><code>SGLANG_PLUGINS</code></td>
-      <td>Comma-separated whitelist of general plugin names to load (group: <code>sglang.srt.plugins</code>). If unset, all discovered general plugins are loaded.</td>
+      <td>Comma-separated whitelist of general plugin names to load from either hook group. It also filters automatic SRT platform discovery when <code>SGLANG_PLATFORM</code> is unset; explicit platform selection ignores it.</td>
     </tr>
   </tbody>
 </table>
+
+### Add diffusion support
+
+A package may support SRT, SGLang Diffusion, or both. Diffusion uses a zero-argument `Platform` subclass and separate platform and hook entry points:
+
+```toml
+[project.entry-points."sglang.multimodal_gen.platforms"]
+my_device = "my_platform_plugin:activate_diffusion"
+
+[project.entry-points."sglang.multimodal_gen.plugins"]
+my_device = "my_platform_plugin:register_hooks"
+```
+
+Keep activation import-safe and return the fully qualified class name only when the backend is available:
+
+```python
+def activate_diffusion() -> str | None:
+    try:
+        import my_device_runtime
+    except ImportError:
+        return None
+    if not my_device_runtime.is_available():
+        return None
+    return "my_platform_plugin.diffusion_platform.MyDiffusionPlatform"
+```
+
+The referenced class must be zero-argument constructible:
+
+```python
+from sglang.multimodal_gen.runtime.platforms import Platform, PlatformEnum
+
+class MyDiffusionPlatform(Platform):
+    _enum = PlatformEnum.OOT
+    device_name = "my_device"
+    device_type = "my_device"
+    dispatch_key = "PrivateUse1"
+```
+
+Set `dispatch_key` explicitly; the inherited compatibility default raises when direct OOT `torch.library` registration uses it. Bring up the remaining contract in dependency order:
+
+1. Implement `get_device_name()`, `get_device_total_memory()`, and `get_available_gpu_memory()` before constructing `ServerArgs`.
+2. Implement `get_device()` and `get_local_torch_device()` before worker binding.
+3. Configure distributed initialization, attention selection, and custom-op implementations for supported workloads.
+4. Run an end-to-end workload and audit model-specific kernels, compilation, and remaining device-family branches.
+
+Use the hook callback for custom-op implementations and other uncovered seams:
+
+```python
+def register_hooks() -> None:
+    from my_platform_plugin.ops import rms_norm_forward
+    from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+    from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
+
+    CustomOp.register_oot_forward(RMSNorm, fn=rms_norm_forward, platform_key="my_device")
+```
+
+The function receives the operation instance before its normal arguments. Registration matches the exact operation class and a platform key equal to `device_name`; otherwise dispatch uses `forward_oot()`, whose base implementation calls `forward_native()`.
+
+Callbacks run in launchers and workers before scheduler or model construction. Because they are not worker-only, register a `BEFORE` or `AROUND` hook on `GPUWorker.init_device_and_model()` for rank-aware initialization. When `SGLANG_DIFFUSION_PLATFORM_OVERRIDE` is set, callbacks from other platform distributions are skipped.
+
+#### Diffusion platform contract
+
+**Active** interfaces are called through `current_platform`. **Compatibility** interfaces are retained adapters; unlisted `Platform` methods are not a stable OOT contract.
+
+| Status | Area | Interface |
+| --- | --- | --- |
+| Active | Configuration | `apply_server_args_defaults()` |
+| Active | Device and memory | `get_device()`, `set_device()`, `get_local_torch_device()`, `get_device_name()`, `get_device_uuid()`, `get_device_total_memory()`, `get_available_gpu_memory()`, `get_device_capability()` |
+| Active | Distributed | `get_torch_distributed_backend_str()`, `supports_distributed_device_id()`, `get_all_to_all_communicator_cls()`, `get_cpu_architecture()` |
+| Active | Dispatch and model | `dispatch_key` (read by `get_torch_library_dispatch_key()`), `get_attn_backend_cls_str()`, `verify_model_arch()`, `optimize_vae()` |
+| Active | Execution | `get_compile_backend()`, `get_compile_options()`, `inference_mode()`, `seed_everything()`, `enable_dit_layerwise_offload_by_default()` |
+| Compatibility | Communicator | `get_device_communicator_cls()` remains the fallback used by `get_all_to_all_communicator_cls()` for existing platform subclasses. New OOT platforms should override the latter. |
+
+Install the package, restart Python to refresh entry-point metadata, and verify explicit selection:
+
+```bash
+pip install -e my_platform_plugin/
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE=my_device python -c \
+  "from sglang.multimodal_gen.runtime.platforms import current_platform; print(current_platform)"
+```
+
+### Diffusion platform limitations
+
+- SRT and diffusion require separate platform classes.
+- Only one external platform can be active per process; set the runtime selector if multiple callbacks activate.
+- `get_all_to_all_communicator_cls()` controls only `all_to_all_4D()`, not every collective, graph-capture, or synchronization path; `get_device_communicator_cls()` remains for compatibility.
+- Compile settings affect only `build_torch_compile_kwargs()` callers; audit static `@torch.compile` decorators and other direct compile paths.
+- Explicit attention selectors accept only `AttentionBackendEnum` names. Returning a custom backend works when none is selected; selecting it by name requires a hook or downstream patch.
+- Device-family branches remain outside the interface. Each supported workload needs a native fallback or an actionable unsupported-feature error.
+- The diffusion `PlatformEnum.OOT` identifies an external provider. Override built-in identity predicates only after auditing every enabled branch.
 
 ---
 
@@ -609,7 +708,9 @@ python -c "from sglang.srt.platforms import current_platform; print(current_plat
 
 ### Description
 
-General function plugins inject behavior into sglang **without requiring a custom platform**. Use cases include:
+General function plugins inject behavior into SRT or diffusion **without requiring a custom platform**. Use `sglang.srt.plugins` for SRT and `sglang.multimodal_gen.plugins` for diffusion. The examples below use SRT; swap the group and imports for diffusion.
+
+Use cases include:
 
 - **Observability**: Add logging, metrics, and tracing to any function
 - **Behavior modification**: Modify function arguments or return values
@@ -766,7 +867,7 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
 - **Dotted**: `sglang.srt.managers.scheduler.Scheduler.__init__`
 - **Entry-points style**: `sglang.srt.managers.scheduler:Scheduler.__init__` (colon treated as dot)
 
-### Common Hook Targets
+### Common SRT Hook Targets
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -837,7 +938,7 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
   <tbody>
     <tr>
       <td><code>sglang/srt/platforms/device_mixin.py</code></td>
-      <td><code>PlatformEnum</code> + <code>DeviceMixin</code> base class</td>
+      <td><code>DeviceMixin</code> base class and SRT platform identity types</td>
     </tr>
     <tr>
       <td><code>sglang/srt/platforms/interface.py</code></td>
@@ -846,6 +947,18 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
     <tr>
       <td><code>sglang/srt/platforms/__init__.py</code></td>
       <td><code>current_platform</code> lazy singleton + discovery logic</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/interface.py</code></td>
+      <td>Diffusion <code>Platform</code> base class</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/__init__.py</code></td>
+      <td>Diffusion <code>current_platform</code> lazy singleton and built-in fallback order</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/plugins.py</code></td>
+      <td>Diffusion general-plugin loader and hook registry</td>
     </tr>
     <tr>
       <td><code>sglang/srt/plugins/__init__.py</code></td>

@@ -112,6 +112,10 @@ def _run_diffusion(request: ServeRequest) -> None:
         _print_diffusion_help(request)
         return
 
+    from sglang.multimodal_gen.plugins import load_plugins
+
+    load_plugins()
+
     from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
         add_multimodal_gen_serve_args,
         execute_serve_cmd,

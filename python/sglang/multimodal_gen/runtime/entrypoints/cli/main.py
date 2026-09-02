@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
 
+from sglang.multimodal_gen.plugins import load_plugins
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.generate import GenerateSubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
@@ -35,6 +36,7 @@ def main() -> None:
         cmds[args.subparser].validate(args)
 
     if hasattr(args, "dispatch_function"):
+        load_plugins()
         args.dispatch_function(args, unknown_args=unknown_args)
     else:
         parser.print_help()

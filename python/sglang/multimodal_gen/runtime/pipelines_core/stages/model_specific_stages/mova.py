@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 
 import torch
 import torch.nn as nn
@@ -72,8 +71,10 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_kwargs,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
-from sglang.srt.utils.common import get_compiler_backend
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
@@ -260,29 +261,19 @@ class MOVADenoisingStage(PipelineStage):
                 module.__class__.__name__,
             )
             return
-        compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_TORCH_COMPILE_MODE",
+            config=model_config,
+            default="max-autotune-no-cudagraphs",
+            module=module,
+            enable_inductor_compute_comm_overlap=True,
+        )
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
             logger.info(
                 "Compiling %s with torchair backend on NPU",
                 module.__class__.__name__,
             )
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                model_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
-            )
-            compile_kwargs["mode"] = mode
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
