@@ -18,12 +18,9 @@ gets more pages out of a shared byte budget depends on the layer split, and a
 model with few full-attention layers and many sliding ones (gemma-4: 10 and 50)
 gives the full side an order of magnitude more.
 
-The id space also rotates -- the owner hands ids out from the front of its free
-list and freed ids return to the back -- so the cursor sweeps the owner's whole
-range over time even when only a few pages are live. Sizing the swa table by
-its own pages therefore fails after enough churn rather than at once, and on
-GPU it fails as a `tl.store` past the end of the table: an unchecked write, not
-a raised index.
+Reaching an id that high takes cumulative allocation, so a narrow table fails
+after churn rather than at once -- and on GPU it fails as a `tl.store` past the
+end of the table: an unchecked write, not a raised index.
 
     python -m pytest test/registered/unit/mem_cache/test_unified_swa_shared_virtual_ids.py -v
 """

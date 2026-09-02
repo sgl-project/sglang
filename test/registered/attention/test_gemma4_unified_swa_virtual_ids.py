@@ -29,11 +29,8 @@ churn past `swa.num_pages`. `--max-total-tokens 60000` puts that within one
 200-example GSM8K run; at this model's default budget the swa table is 3.8M
 entries and it would take dozens.
 
-Every argument below is load-bearing and this exact configuration is the one
-that was verified red on the narrow table (score 0.16, scheduler gone) and green
-with the fix (0.865-0.880 over four runs, against 0.870 on the static pool at
-the same budget). Substituting synthetic prompts or a bigger pool made it pass
-both ways.
+Every argument below is load-bearing: a larger pool, or synthetic prompts in
+place of this eval, and the narrow table passes.
 
     python -m pytest test/registered/attention/test_gemma4_unified_swa_virtual_ids.py -v
 """
@@ -53,10 +50,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=65, stage="base-b", runner_config="1-gpu-large")
 
-# Healthy: 0.865-0.880 over four runs with the fix, 0.870 on the static pool at
-# the same budget. Broken: 0.05-0.21, the scheduler having died mid-run. 0.82
-# leaves ~2 sigma under the observed floor (200 examples, 1 sigma ~= 0.024) and
-# 4x over the worst failure.
+# Healthy 0.865-0.880 (static pool 0.870); a died-mid-run server scores
+# 0.05-0.21. 1 sigma over 200 examples is ~0.024.
 SCORE_THRESHOLD = 0.82
 
 
@@ -76,8 +71,8 @@ class TestGemma4UnifiedSwaVirtualIds(CustomTestCase):
                 "--disable-radix-cache",
                 "--mem-fraction-static",
                 "0.8",
-                # The small pool is the trigger, not a convenience: it is what
-                # brings `swa.num_pages` within one eval's worth of churn.
+                # The trigger: this is what brings `swa.num_pages` within one
+                # eval's worth of churn.
                 "--max-total-tokens",
                 "60000",
             ],

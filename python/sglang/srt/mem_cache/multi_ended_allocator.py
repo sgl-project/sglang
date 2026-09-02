@@ -333,12 +333,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ) // self.pool_page_size
         self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
-        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id, and for a
-        # non-owner the two counts are unrelated: it consumes ids minted by the
-        # composite's owner, whose per-page byte cost -- and so page count --
-        # depends on its own layer share. Either side can be the larger. Sizing
-        # v2p by this pool's page count leaves the top of the shared id space
-        # off the end of the table whenever the owner has more pages.
+        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A
+        # non-owner consumes the owner's ids, so its v2p spans the owner's
+        # count; the two are unrelated and either can be the larger.
         self.num_virtual_ids = (
             self.num_pages if virtual_num_pages is None else virtual_num_pages
         )
@@ -3219,8 +3216,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
-            # `alloc` binds the virtual pages full mints, so the swa side has to
-            # be able to address full's whole id space, not just its own pages.
+            # swa binds the virtual pages full mints, so it must address
+            # full's whole id space.
             virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
         )
         self._wire_peers()
