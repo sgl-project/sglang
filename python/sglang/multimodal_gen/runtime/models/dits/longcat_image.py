@@ -222,7 +222,7 @@ class _LongCatFFN(nn.Module):
             ]
         )
         self.act = nn.GELU(approximate="tanh")
-        # quality="high" site: up-proj GEMM + tanh-GELU cublasLt epilogue. Off by
+        # extra-high/high site: up-proj GEMM + tanh-GELU epilogue. Off by
         # default; the denoising stage mounts it per batch. The ModuleDict holds
         # `proj` in _modules, so getattr resolves it for the fusion helper.
         mark_fused_gelu_site(self.net[0], "proj")
@@ -511,7 +511,7 @@ class _SingleTransformerBlock(nn.Module):
             prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
-        # quality="high" site: proj_mlp GEMM + tanh-GELU cublasLt epilogue,
+        # extra-high/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
         mark_fused_gelu_site(self, "proj_mlp")
         # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
