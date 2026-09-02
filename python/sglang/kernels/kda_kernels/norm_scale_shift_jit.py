@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.kda_kernels import _cuda_source
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -81,7 +82,7 @@ def norm_scale_shift_module() -> Module:
         )
     return load_jit(
         "norm_scale_shift_native",
-        cuda_files=["diffusion/norm_scale_shift.cuh"],
+        cuda_files=[_cuda_source("diffusion/norm_scale_shift.cuh")],
         cuda_wrappers=[
             (
                 "nss_bf16_row",
@@ -118,7 +119,7 @@ _module = norm_scale_shift_module
 def norm_scale_shift_nvfp4_module() -> Module:
     return load_jit(
         "norm_scale_shift_nvfp4_native",
-        cuda_files=["diffusion/norm_scale_shift.cuh"],
+        cuda_files=[_cuda_source("diffusion/norm_scale_shift.cuh")],
         cuda_wrappers=[
             (
                 "srnss_nvfp4_row",
