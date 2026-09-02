@@ -22,7 +22,12 @@ The router is configured entirely through CLI flags (run
 `--model-id` is required, along with exactly one discovery backend.
 `--tokenizer-path` is optional: give it a local `tokenizer.json` path or a
 HuggingFace repo id, and when omitted the router downloads the tokenizer
-for `--model-id` from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`).
+for `--model-id` from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). Only
+cache-aware routing (`cache_aware_zmq`, the KV indexer) actually needs the
+tokenizer; with a load-only policy a failed load is logged and the router
+starts without it (no `input_ids` offload, `/v1/tokenize` returns 404), and
+`--tokenizer-path none` skips loading entirely — useful for models whose repo
+ships no `tokenizer.json` (e.g. tiktoken-based Kimi).
 
 Static worker list:
 

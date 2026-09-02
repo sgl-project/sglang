@@ -84,11 +84,72 @@ impl std::fmt::Debug for TokenizerRegistry {
     }
 }
 
+/// Whether the routing configuration needs prompt tokens (prefix hashing).
+fn tokenizer_required_for_routing(m: &crate::config::ModelConfig) -> bool {
+    use crate::config::PolicyKind;
+    m.policy == PolicyKind::CacheAwareZmq
+        || m.decode_policy == Some(PolicyKind::CacheAwareZmq)
+        || m.cache_aware
+            .as_ref()
+            .is_some_and(|c| c.kv_indexer_endpoint.is_some())
+}
+
+trait NoneSentinel {
+    fn eq_ignore_ascii_code_insensitive_none(&self) -> bool;
+}
+
+impl NoneSentinel for String {
+    /// `--tokenizer-path none` (any case) disables tokenizer loading.
+    fn eq_ignore_ascii_code_insensitive_none(&self) -> bool {
+        self.trim().eq_ignore_ascii_case("none")
+    }
+}
+
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
         let me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        // The tokenizer is only REQUIRED when routing itself consumes prompt
+        // tokens: cache-aware (prefix-hash) policies and the external KV
+        // indexer. Load-only policies (round_robin / random / power_of_two /
+        // load_based / sticky) route without it; the tokenizer then merely
+        // enables the optional `input_ids` offload and `/v1/tokenize`. So a
+        // model whose HF repo ships no `tokenizer.json` (e.g. tiktoken-based
+        // Kimi) can still be routed: `--tokenizer-path none` skips loading,
+        // and a failed load degrades to "no tokenizer" with a warning instead
+        // of aborting startup.
+        let tokens_required = tokenizer_required_for_routing(m);
+        if m.tokenizer_path.eq_ignore_ascii_code_insensitive_none() {
+            if tokens_required {
+                anyhow::bail!(
+                    "--tokenizer-path none is incompatible with cache-aware routing \
+                     (policy {:?} / decode policy {:?} / KV indexer) — those hash prompt tokens",
+                    m.policy,
+                    m.decode_policy
+                );
+            }
+            tracing::info!(model = %m.id,
+                "tokenizer disabled (--tokenizer-path none); chat traffic routes by load only, \
+                 /v1/tokenize is unavailable for this model");
+            return Ok(me);
+        }
+        let t = match adapter::load(&m.tokenizer_path) {
+            Ok(t) => t,
+            Err(e) if !tokens_required => {
+                tracing::warn!(model = %m.id, tokenizer_path = %m.tokenizer_path,
+                    error = %format_args!("{e:#}"),
+                    "tokenizer unavailable; continuing without it (load-only policy): no input_ids \
+                     offload, no chat-template routing, /v1/tokenize returns 404 for this model. \
+                     Pass --tokenizer-path <tokenizer.json | HF repo> to enable them.");
+                return Ok(me);
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "tokenizer is required for policy {:?} / decode policy {:?}",
+                    m.policy, m.decode_policy
+                )))
+            }
+        };
         me.inner.insert(m.id.clone(), t);
         // Resolve the chat encoder, best-effort: a Jinja template from
         // tokenizer_config.json, else a built-in encoder for a recognized model
@@ -249,6 +310,46 @@ mod tests {
     }
 
     #[test]
+    fn missing_tokenizer_degrades_for_load_only_policy() {
+        // A path-shaped source that does not exist fails locally (no network).
+        let mut c = cfg();
+        c.model.tokenizer_path = "/nonexistent/dir/tokenizer.json".into();
+        c.model.policy = PolicyKind::PowerOfTwo;
+        let r = TokenizerRegistry::load_from_config(&c)
+            .expect("load-only policy must not need a tokenizer");
+        assert!(r.get("tiny").is_none());
+        assert!(!r.has_chat_encoder("tiny"));
+    }
+
+    #[test]
+    fn missing_tokenizer_is_fatal_for_cache_aware_policy() {
+        let mut c = cfg();
+        c.model.tokenizer_path = "/nonexistent/dir/tokenizer.json".into();
+        c.model.policy = PolicyKind::CacheAwareZmq;
+        let err = TokenizerRegistry::load_from_config(&c)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("required"), "got: {err}");
+        // …and when only the DECODE policy is cache-aware.
+        let mut c = cfg();
+        c.model.tokenizer_path = "/nonexistent/dir/tokenizer.json".into();
+        c.model.decode_policy = Some(PolicyKind::CacheAwareZmq);
+        assert!(TokenizerRegistry::load_from_config(&c).is_err());
+    }
+
+    #[test]
+    fn tokenizer_path_none_skips_loading() {
+        let mut c = cfg();
+        c.model.tokenizer_path = "none".into();
+        let r = TokenizerRegistry::load_from_config(&c).unwrap();
+        assert!(r.get("tiny").is_none());
+        let mut c = cfg();
+        c.model.tokenizer_path = "NONE".into();
+        c.model.policy = PolicyKind::CacheAwareZmq;
+        assert!(TokenizerRegistry::load_from_config(&c).is_err());
+    }
+
+    #[test]
     fn loads_from_config() {
         let r = TokenizerRegistry::load_from_config(&cfg()).unwrap();
         assert!(r.get("tiny").is_some());
@@ -367,9 +468,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_errors() {
+    fn missing_file_errors_when_routing_needs_tokens() {
+        // Cache-aware routing hashes prompt tokens, so a missing tokenizer is
+        // fatal there (load-only policies degrade instead — see
+        // `missing_tokenizer_degrades_for_load_only_policy`).
         let mut c = cfg();
         c.model.tokenizer_path = "/nonexistent.json".into();
+        c.model.policy = PolicyKind::CacheAwareZmq;
         let err = TokenizerRegistry::load_from_config(&c).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("tokenizer"));
     }

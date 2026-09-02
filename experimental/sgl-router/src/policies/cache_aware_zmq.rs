@@ -460,7 +460,7 @@ mod tests {
             query_blocks: 4,
         };
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body)).with_external_prefix(Some(&signal));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, w1.url);
@@ -503,7 +503,7 @@ mod tests {
         let w1 = worker("http://w1:30000", "tiny");
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000");
@@ -544,7 +544,7 @@ mod tests {
             worker("http://w1:30000", "tiny"),
         ];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let _ = policy.select(&workers, &ctx).expect("must pick");
 
@@ -596,7 +596,7 @@ mod tests {
             worker("http://w0:30000", "tiny"),
             worker("http://w1:30000", "tiny"),
         ];
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let _ = chosen_policy.select(&workers, &ctx).expect("must pick");
 
@@ -647,7 +647,7 @@ mod tests {
         let _g2 = w0.load_guard();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
 
@@ -693,7 +693,7 @@ mod tests {
             "bigram and unigram hashes must differ for this prefix"
         );
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
 
         // Bigram-aware router (oracle.is_bigram == true): query hashes match
         // the bigram tree -> overlap > 0 and it picks the matched worker w0.
@@ -1040,7 +1040,7 @@ mod tests {
         let _g = w0.load_guard();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000");
@@ -1079,7 +1079,7 @@ mod tests {
         }
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
         let ctx = SelectionContext::new(&model, Some(&body));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w1:30000", "imbalance must dominate");
@@ -1284,7 +1284,7 @@ mod tests {
         let w1 = worker("http://w1:30000", "tiny");
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
-        let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({ "prompt": text })).unwrap();
 
         // Before clear: w0 wins.
         let ctx = SelectionContext::new(&model, Some(&body));
