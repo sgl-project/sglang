@@ -1,0 +1,270 @@
+# Copyright 2023-2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Process-wide CUDA graph memory pool shared across the prefill and
+decode graph backends. The two phases never replay concurrently, so
+sharing one pool reserves only the larger phase's capture footprint.
+Serial capture passes also share one stream to reuse allocator scratch.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
+
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_resources, get_stream
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
+
+logger = logging.getLogger(__name__)
+_active_graph_pool_user: Optional[str] = None
+_borrow_stub: Optional[BumpArenaStub] = None
+_borrow_mem_pool: Optional[torch.cuda.MemPool] = None
+_borrow_disabled_reason: Optional[str] = None
+_borrow_static_runs: Optional[list[tuple[int, int]]] = None
+_borrow_extents_total = 0
+_largest_logged_graph_pool_borrow = 0
+
+_CAPTURE_STREAM_NAME = "cuda_graph_capture"
+
+
+def disable_graph_pool_borrow(reason: str) -> None:
+    """Disable borrowing when graph storage is managed outside the shared pool."""
+    global _borrow_disabled_reason
+    _borrow_disabled_reason = reason
+    _teardown_borrow_pool()
+    logger.info("Graph pool borrow disabled: %s", reason)
+
+
+def set_graph_pool_borrow_runs(runs: list[tuple[int, int]]) -> None:
+    """Use fixed graph-storage extents instead of snapshots of the shared pool.
+
+    This supports graph storage whose addresses are managed externally but
+    remain stable for the process lifetime. Registering an empty list disables
+    borrowing.
+    """
+    global _borrow_static_runs
+    _borrow_static_runs = sorted(runs, key=lambda run: run[1], reverse=True)[
+        : BumpArenaStub.MAX_EXTENTS
+    ]
+    logger.info(
+        "Graph pool borrow runs pinned: runs=%d free=%d",
+        len(_borrow_static_runs),
+        sum(nbytes for _, nbytes in _borrow_static_runs),
+    )
+
+
+def get_global_graph_memory_pool() -> Optional[Any]:
+    return get_resources().graph_memory_pool
+
+
+def set_global_graph_memory_pool(val: Any) -> None:
+    get_resources().graph_memory_pool = val
+
+
+def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
+    """Return the shared graph memory pool, creating it on first use so
+    later backends reuse the same handle."""
+    resources = get_resources()
+    if resources.graph_memory_pool is None:
+        resources.graph_memory_pool = device_module.graph_pool_handle()
+    return resources.graph_memory_pool
+
+
+def get_or_create_global_graph_capture_stream() -> Any:
+    """Return the shared graph capture stream, creating it on first use so every
+    capture pass reserves the pool's scratch once instead of per stream.
+
+    CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
+    """
+    return get_stream(_CAPTURE_STREAM_NAME)
+
+
+class GraphPoolPrecarve:
+    """Pre-carve the memory pool to reduce fragmentation."""
+
+    def __init__(self) -> None:
+        self.nbytes = 0
+        self.minted = False
+
+    @contextmanager
+    def measure(self) -> Iterator[None]:
+        """Wrap one eager warmup. the last one before ``mint`` sets the size."""
+        if self.minted or not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get():
+            yield
+            return
+        torch.cuda.synchronize()
+        # Shrink the cache first so the warmup's reserved growth is its own
+        # footprint. Reserved (not allocated) is the stat to use: allocated
+        # peak is the live-byte sum and undershoots by exactly the packing
+        # holes the carved span has to absorb.
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_stats()["reserved_bytes.all.current"]
+        yield
+        torch.cuda.synchronize()
+        self.nbytes = torch.cuda.memory_stats()["reserved_bytes.all.peak"] - base
+
+    def mint(self) -> None:
+        """Pre-allocate the space"""
+        if self.minted:
+            return
+        self.minted = True
+        if self.nbytes <= 0:
+            return
+        span = torch.empty(self.nbytes, dtype=torch.uint8, device="cuda")
+        del span
+        logger.info("Graph pool pre-carved: %.2f GB", self.nbytes / 2**30)
+
+
+def graph_pool_borrow_enabled() -> bool:
+    if (
+        _borrow_disabled_reason is not None
+        or not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+        or not is_cuda()
+    ):
+        return False
+    if _borrow_static_runs is not None:
+        return len(_borrow_static_runs) > 0
+    return get_global_graph_memory_pool() is not None
+
+
+@contextmanager
+def graph_pool_user_scope(user: str) -> Iterator[None]:
+    global _active_graph_pool_user
+    # Graph replay silently overwrites aliases of its allocator-free blocks.
+    if _active_graph_pool_user is not None:
+        raise RuntimeError(
+            f"graph pool already has live user {_active_graph_pool_user!r}; "
+            f"cannot use it for {user!r}"
+        )
+    _active_graph_pool_user = user
+    try:
+        yield
+    finally:
+        _active_graph_pool_user = None
+
+
+@contextmanager
+def graph_pool_replay_scope() -> Iterator[None]:
+    if not graph_pool_borrow_enabled():
+        yield
+        return
+    with graph_pool_user_scope("CUDA graph"):
+        yield
+
+
+@contextmanager
+def graph_pool_capture_scope() -> Iterator[None]:
+    if not graph_pool_borrow_enabled():
+        yield
+        return
+    with graph_pool_user_scope("CUDA graph"):
+        # Capture re-carves the pool's free space: the borrow extents go stale,
+        # so retire the borrow pool before capturing.
+        _teardown_borrow_pool()
+        yield
+
+
+def find_free_graph_pool_runs(pool_id: Any) -> list[tuple[int, int]]:
+    """Return contiguous inactive runs across all pool segments, largest first;
+    live and pending-free blocks break runs, so a run never overlaps live data.
+    """
+    runs: list[tuple[int, int]] = []
+    for segment in torch.cuda.memory_snapshot(pool_id, include_traces=False):
+        run_address = 0
+        run_bytes = 0
+        for block in segment["blocks"]:
+            if block["state"] == "inactive":
+                if run_bytes == 0:
+                    run_address = block["address"]
+                run_bytes += block["size"]
+                continue
+            if run_bytes:
+                runs.append((run_address, run_bytes))
+            run_bytes = 0
+        if run_bytes:
+            runs.append((run_address, run_bytes))
+    runs.sort(key=lambda run: run[1], reverse=True)
+    return runs
+
+
+def _teardown_borrow_pool() -> None:
+    """Retire the persistent borrow pool after draining deferred frees."""
+    global _borrow_mem_pool
+    if _borrow_mem_pool is None:
+        return
+    # Borrowed blocks that saw cross-stream use can remain in event limbo.
+    # Synchronize, then drive allocator event processing before dropping the pool.
+    torch.cuda.synchronize()
+    torch.empty(1, device="cuda")
+    _borrow_mem_pool = None
+
+
+@contextmanager
+def borrow_graph_pool(user: str) -> Iterator[None]:
+    """Route this thread's torch allocations onto the graph pool's free runs.
+
+    Tensors allocated inside must not survive the current step: the next graph
+    replay may overwrite their bytes. An allocation no run can hold raises the
+    allocator's normal OOM. This is a no-op while borrowing is disabled.
+    """
+    global _borrow_stub, _borrow_mem_pool, _borrow_extents_total
+    global _largest_logged_graph_pool_borrow
+    if not graph_pool_borrow_enabled():
+        yield
+        return
+    with graph_pool_user_scope(user):
+        if _borrow_mem_pool is not None:
+            # Return completed cross-stream frees to the cache. The allocator
+            # processes their events on a later allocation.
+            torch.empty(1, device="cuda")
+            if _borrow_stub.freed_bytes:
+                # Rebuild if the caching allocator released an arena segment.
+                # A high cursor alone means the cache owns reusable segments;
+                # rebuilding discards them and can turn the next large borrow
+                # into a fragmented cold-allocation OOM.
+                _teardown_borrow_pool()
+        if _borrow_mem_pool is None:
+            if _borrow_stub is None:
+                _borrow_stub = BumpArenaStub()
+                # Runs are sorted largest first, so first fit would carve every
+                # small allocation out of the run a probability matrix needs.
+                _borrow_stub.set_best_fit(True)
+            if _borrow_static_runs is not None:
+                runs = _borrow_static_runs
+            else:
+                runs = find_free_graph_pool_runs(get_global_graph_memory_pool())[
+                    : BumpArenaStub.MAX_EXTENTS
+                ]
+            _borrow_stub.set_extents(runs)
+            # Keep one caching layer across borrows so normal block reuse and
+            # stream-ordered deferred frees remain allocator-managed. Capture
+            # retires it because capture changes the underlying free extents.
+            _borrow_mem_pool = torch.cuda.MemPool(_borrow_stub.allocator)
+            _borrow_extents_total = sum(run_bytes for _, run_bytes in runs)
+            logger.info(
+                "Graph pool borrow extents: runs=%d free=%d",
+                len(runs),
+                _borrow_extents_total,
+            )
+        with torch.cuda.use_mem_pool(_borrow_mem_pool):
+            yield
+        consumed = _borrow_stub.cursor_bytes
+        if consumed > _largest_logged_graph_pool_borrow:
+            logger.info("Graph pool borrow: consumed=%d", consumed)
+            _largest_logged_graph_pool_borrow = consumed

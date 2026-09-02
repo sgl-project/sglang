@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import enum
 import random
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -28,15 +29,46 @@ class AttentionBackendEnum(enum.Enum):
     FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
+    TORCH_CUDNN_SDPA = enum.auto()
+    DYNAMIC_CUDNN_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_3 = enum.auto()
+    SPARGE_ATTN = enum.auto()
     VIDEO_SPARSE_ATTN = enum.auto()
+    SPARSE_VIDEO_GEN_2_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    AITER_SAGE = enum.auto()
+    SLA_ATTN = enum.auto()
+    SAGE_SLA_ATTN = enum.auto()
+    LASER_ATTN = enum.auto()
+    BLOCK_SPARSE_ATTN = enum.auto()
+    RAIN_FUSION_ATTN = enum.auto()
+    SOL_ATTN = enum.auto()
+    SUBBLOCK_SPARSE_ATTN = enum.auto()
+    CUBE_SPARSE_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
         return self.name.lower()
+
+    @property
+    def is_sparse(self) -> bool:
+        return self in {
+            AttentionBackendEnum.SLIDING_TILE_ATTN,
+            AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+            AttentionBackendEnum.VMOBA_ATTN,
+            AttentionBackendEnum.SLA_ATTN,
+            AttentionBackendEnum.SAGE_SLA_ATTN,
+            AttentionBackendEnum.SPARGE_ATTN,
+            AttentionBackendEnum.LASER_ATTN,
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
+            AttentionBackendEnum.SOL_ATTN,
+            AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        }
 
 
 class PlatformEnum(enum.Enum):
@@ -45,6 +77,9 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    NPU = enum.auto()
+    MUSA = enum.auto()
+    XPU = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -76,6 +111,7 @@ class Platform:
     _enum: PlatformEnum
     device_name: str
     device_type: str
+    device: torch.device | None = None  # Dummy attribute for compatibility
 
     # available dispatch keys:
     # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
@@ -90,6 +126,14 @@ class Platform:
     simple_compile_backend: str = "inductor"
 
     supported_quantization: list[str] = []
+
+    def get_compile_backend(self, mode: str | None = None) -> str:
+        """Return the backend used to compile diffusion modules."""
+        return self.simple_compile_backend
+
+    def get_compile_options(self, module: torch.nn.Module) -> dict[str, object] | None:
+        """Return backend-specific options for a diffusion module."""
+        return None
 
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
@@ -113,6 +157,13 @@ class Platform:
         if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 10
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_hopper(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability() == (9, 0)
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -147,7 +198,11 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
+
+    def is_device_type(self, device_type: str | None) -> bool:
+        """Return whether a device type belongs to this platform."""
+        return device_type == self.device_type
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
@@ -163,6 +218,36 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_hip(self) -> bool:
         return self.is_rocm()
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return True
+
+    @classmethod
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        return None
+
+    @classmethod
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        return None, None
+
+    @classmethod
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        return "auto"
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        raise NotImplementedError
+
+    @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        torch.get_device_module(device).set_device(device)
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -225,6 +310,10 @@ class Platform:
     def get_device(self, local_rank: int) -> torch.device:
         if self.is_cuda() or self.is_rocm():
             return torch.device("cuda", local_rank)
+        elif self.is_npu():
+            return torch.device("npu", local_rank)
+        elif self.is_xpu():
+            return torch.device("xpu", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
         elif self.is_mps():
@@ -236,10 +325,16 @@ class Platform:
     def get_torch_distributed_backend_str(self) -> str:
         if self.is_cuda_alike():
             return "nccl"
+        elif self.is_npu():
+            return "hccl"
         elif self.is_musa():
             return "mccl"
         elif self.is_mps():
             return "gloo"
+        elif self.is_cpu():
+            return "gloo"
+        elif self.is_xpu():
+            return "xccl"
         else:
             raise NotImplementedError(
                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"
@@ -274,7 +369,7 @@ class Platform:
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
+            torch.get_device_module().manual_seed_all(seed)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
@@ -311,7 +406,7 @@ class Platform:
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
@@ -332,6 +427,16 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
+        return True
+
+    @classmethod
+    def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
+        """Apply platform-specific optimizations to VAE after loading."""
+        return vae
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

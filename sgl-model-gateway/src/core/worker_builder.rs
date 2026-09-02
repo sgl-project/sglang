@@ -5,8 +5,8 @@ use super::{
     model_card::ModelCard,
     model_type::ModelType,
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
-        WorkerType,
+        parse_bootstrap_host_from_url, BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig,
+        RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -133,28 +133,7 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        let bootstrap_host = match url::Url::parse(&self.url) {
-            Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) if !self.url.contains("://") => {
-                match url::Url::parse(&format!("http://{}", self.url)) {
-                    Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-                    Err(_) => {
-                        tracing::warn!(
-                            "Failed to parse URL '{}', defaulting to localhost",
-                            self.url
-                        );
-                        "localhost".to_string()
-                    }
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Failed to parse URL '{}', defaulting to localhost",
-                    self.url
-                );
-                "localhost".to_string()
-            }
-        };
+        let bootstrap_host = parse_bootstrap_host_from_url(&self.url);
 
         let bootstrap_port = match self.worker_type {
             WorkerType::Prefill { bootstrap_port } => bootstrap_port,
@@ -193,6 +172,7 @@ impl BasicWorkerBuilder {
         BasicWorker {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
+            worker_routing_key_load: Arc::new(WorkerRoutingKeyLoad::new(&self.url)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             healthy: Arc::new(AtomicBool::new(healthy)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
@@ -396,6 +376,7 @@ mod tests {
             check_interval_secs: 60,
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -488,6 +469,7 @@ mod tests {
             check_interval_secs: 45,
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: false,
         };
 
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 3, 16)

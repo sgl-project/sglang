@@ -3,12 +3,10 @@
 use std::sync::Arc;
 
 use rand::Rng;
+use smg_grpc_client::sglang_proto::DisaggregatedParams;
 use tracing::debug;
 
-use crate::{
-    core::Worker, grpc_client::sglang_proto::DisaggregatedParams,
-    routers::grpc::proto_wrapper::ProtoGenerateRequest,
-};
+use crate::{core::Worker, routers::grpc::proto_wrapper::ProtoGenerateRequest};
 
 /// Inject PD bootstrap metadata into a gRPC request
 ///

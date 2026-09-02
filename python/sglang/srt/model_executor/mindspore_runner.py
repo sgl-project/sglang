@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
 """ms_runner launch MindSpore distributed modules."""
 
+import logging
 import multiprocessing as mp
 import os
 import sys
@@ -13,6 +14,9 @@ from mindspore._c_expression import GroupOptions
 from mindspore.communication import create_group
 
 from sglang.srt.distributed.parallel_state import _groups
+from sglang.srt.runtime_context import get_serving
+
+logger = logging.getLogger(__name__)
 
 
 class _Tmp:
@@ -92,10 +96,9 @@ def reuse_hccl_comm():
         hccl_comm_handle = device_group._get_backend(torch.device("npu")).get_hccl_comm(
             group().local_rank
         )
-        print(
+        logger.info(
             f"MindSpore reuse torch group: {device_group}, group_name: {group_name}, local rank: {group().local_rank},"
             f"hccl communicator handle: {hex(hccl_comm_handle)}",
-            flush=True,
         )
         # Create MS communication group by hccl comm handle to reuse Torch group.
         group_options = GroupOptions()
@@ -107,7 +110,7 @@ def init_ms_distributed(world_size, rank, local_rank, server_args, port):
     if server_args.dist_init_addr:
         dist_init_method = f"tcp://{server_args.dist_init_addr}"
     else:
-        dist_init_method = f"tcp://{server_args.host}:{port}"
+        dist_init_method = f"tcp://{get_serving().host}:{port}"
     set_ms_parallel_env(rank, local_rank, world_size, dist_init_method)
 
     ms.set_context(infer_boost="on", jit_level="O0")

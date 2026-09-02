@@ -25,7 +25,7 @@ To maximize Triton kernel efficiency, several strategies can be employed:
         triton.Config({'waves_per_eu': 4}, num_warps=16, num_stages=1),
     ], key=['BLOCK_N', 'NUM_TOKEN_BLKS'], use_cuda_graph=True)
 @triton.jit
-def _triton_kernel_funtion():
+def _triton_kernel_function():
     ...
 ```
 ## 2. Torch Tunable Operations

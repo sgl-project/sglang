@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import re
@@ -11,6 +10,11 @@ from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
     _GetInfoFunc,
+)
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+    safe_literal_eval,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,14 @@ def get_argument_type(
 ) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions.
 
+    Supports complex JSON Schema definitions including:
+    - Direct type field (including type arrays)
+    - anyOf/oneOf: parameter can be any of multiple types
+    - enum: parameter must be one of enum values
+    - allOf: parameter must satisfy all type definitions
+    - properties: inferred as object type
+    - items: inferred as array type
+
     Args:
         func_name: Name of the function/tool
         arg_key: Name of the argument
@@ -43,12 +55,12 @@ def get_argument_type(
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    properties = (tool.function.parameters or {}).get("properties", {})
-    if not isinstance(properties, dict):
-        properties = {}
+    properties = get_schema_properties(tool.function.parameters)
     if arg_key not in properties:
         return None
-    return properties[arg_key].get("type", None)
+
+    # Use new type inference function for complex JSON Schema support
+    return infer_type_from_json_schema(properties[arg_key])
 
 
 def _convert_to_number(value: str) -> Any:
@@ -105,9 +117,21 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError, KeyError):
         pass
 
+    # Strategy 2.5: string-typed values that are not valid JSON (S1/S2 failed) —
+    # strip the wrapping quotes and keep the raw bytes, backslashes included.
+    # Avoids ast.literal_eval so invalid escapes neither warn nor get reinterpreted.
+    if arg_type == "string":
+        if (
+            len(json_value) >= 2
+            and json_value[0] == json_value[-1]
+            and json_value[0] in {'"', "'"}
+        ):
+            return json_value[1:-1], True
+        return json_value, True
+
     # Strategy 3: ast.literal_eval
     try:
-        parsed_value = ast.literal_eval(json_value)
+        parsed_value = safe_literal_eval(json_value)
         return parsed_value, True
     except (ValueError, SyntaxError):
         pass
@@ -136,6 +160,10 @@ class Glm4MoeDetector(BaseFormatDetector):
 
     Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
     """
+
+    _STREAMING_PARTIAL_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
+    )
 
     def __init__(self):
         super().__init__()
@@ -216,21 +244,48 @@ class Glm4MoeDetector(BaseFormatDetector):
             tools: List of available tools
 
         Returns:
-            Type string: 'string', 'number', or 'object'
+            Type string: 'string', 'number', 'object', 'array', or 'boolean'
         """
         arg_type = get_argument_type(func_name, key, tools)
         if arg_type:
             return arg_type
 
-        # Auto-detect type from value (best effort)
-        first_chars = self._current_value.strip()[:10] if self._current_value else ""
-        if first_chars:
-            first_char = first_chars[0]
+        # Improved auto-detection type from value (best effort)
+        value_content = self._current_value.strip() if self._current_value else ""
+
+        if not value_content:
+            return "string"
+
+        # Try to parse as valid JSON first
+        try:
+            parsed = json.loads(value_content)
+            if isinstance(parsed, dict):
+                return "object"
+            elif isinstance(parsed, list):
+                return "array"
+            elif isinstance(parsed, bool):
+                return "boolean"
+            elif isinstance(parsed, (int, float)):
+                return "number"
+            # For string values, check if they look like numbers
+            elif isinstance(parsed, str):
+                if parsed.isdigit() or (
+                    parsed.startswith("-") and parsed[1:].isdigit()
+                ):
+                    return "number"
+                return "string"
+        except json.JSONDecodeError:
+            # Not valid JSON, try heuristic detection
+            first_char = value_content[0] if value_content else ""
+
             if first_char.isdigit() or first_char in ["-", "."]:
                 return "number"
             elif first_char in ["{", "["]:
                 return "object"
+            elif first_char in ['"', "'"]:
+                return "string"
 
+        # Default to string (safest fallback)
         return "string"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:
@@ -422,11 +477,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = re.search(
-                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
+            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
@@ -473,7 +524,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
+
+                # The name and final tool-call marker can arrive in the same
+                # parse call, so continue into argument/finalization handling.
+                if self.current_tool_name_sent:
                     # Process XML to JSON streaming
                     current_raw_length = len(func_args_raw)
 
@@ -514,7 +568,12 @@ class Glm4MoeDetector(BaseFormatDetector):
                                 )
                             )
                             self._last_arguments += empty_object
-                        elif not self._last_arguments.endswith("}"):
+                            self.streamed_args_for_tool[
+                                self.current_tool_id
+                            ] += empty_object
+                        else:
+                            # The streamed outer `{` is only closed here; a
+                            # trailing "}" may belong to a nested object value.
                             closing_brace = "}"
                             calls.append(
                                 ToolCallItem(
@@ -575,7 +634,6 @@ class Glm4MoeDetector(BaseFormatDetector):
         arguments = {}
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
-            arg_value = arg_value.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 

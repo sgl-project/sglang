@@ -1,21 +1,21 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=80, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=30, suite="stage-a-test-1")
-
 import unittest
 
 import torch
 from tqdm import tqdm
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import is_hip
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.utils import get_device, get_device_capability, is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
+
+register_cuda_ci(est_time=87, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -26,8 +26,8 @@ class TestFusedMOE(CustomTestCase):
     TOP_KS = [2, 6]
 
     @staticmethod
-    def create_random_cuda_tensor(shape, dtype, mean=0, std=0.01):
-        """Create a random CUDA tensor
+    def create_random_gpu_tensor(shape, dtype, mean=0, std=0.01):
+        """Create a random Torch(device) tensor
 
         Args:
             shape: Tensor shape
@@ -36,9 +36,9 @@ class TestFusedMOE(CustomTestCase):
             std: Standard deviation
 
         Returns:
-            torch.Tensor: Randomly initialized CUDA tensor
+            torch.Tensor: Randomly initialized Torch(device) tensor
         """
-        return torch.empty(shape, dtype=dtype, device="cuda").normal_(mean, std)
+        return torch.empty(shape, dtype=dtype, device=get_device()).normal_(mean, std)
 
     def get_tolerance(self, dtype):
         """Get tolerance values for different data types
@@ -67,6 +67,7 @@ class TestFusedMOE(CustomTestCase):
         w2_scale=None,
         a1_scale=None,
         a2_scale=None,
+        routed_scaling_factor=None,
     ):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
@@ -101,29 +102,34 @@ class TestFusedMOE(CustomTestCase):
                     a[mask] @ w1_compute[i].transpose(0, 1)
                 ) @ w2_compute[i].transpose(0, 1)
 
-        return (
+        result = (
             out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
         ).sum(dim=1)
+        if routed_scaling_factor is not None:
+            result = result * routed_scaling_factor
+        return result
 
-    def _test_case(self, m, n, k, e, topk, dtype, use_fp8_w8a8=False):
+    def _test_case(
+        self, m, n, k, e, topk, dtype, use_fp8_w8a8=False, routed_scaling_factor=None
+    ):
         rtol, atol = self.get_tolerance(dtype)
 
         if use_fp8_w8a8:
             # AssertionError: fp8e4nv data type is not supported on CUDA arch < 89
-            capability = torch.cuda.get_device_capability()
+            capability = get_device_capability()
             if not _is_hip and not (capability[0] >= 9 or capability == (8, 9)):
                 return
 
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
+            a = self.create_random_gpu_tensor((m, k), dtype)
+            w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
+            w2 = self.create_random_gpu_tensor((e, k, n), dtype)
             w1 = w1.to(torch.float8_e4m3fn)
             w2 = w2.to(torch.float8_e4m3fn)
-            score = self.create_random_cuda_tensor((m, e), dtype)
-            w1_scale = self.create_random_cuda_tensor(e, torch.float32)
-            w2_scale = self.create_random_cuda_tensor(e, torch.float32)
-            a1_scale = self.create_random_cuda_tensor(1, torch.float32)
-            a2_scale = self.create_random_cuda_tensor(1, torch.float32)
+            score = self.create_random_gpu_tensor((m, e), dtype)
+            w1_scale = self.create_random_gpu_tensor(e, torch.float32)
+            w2_scale = self.create_random_gpu_tensor(e, torch.float32)
+            a1_scale = self.create_random_gpu_tensor(1, torch.float32)
+            a2_scale = self.create_random_gpu_tensor(1, torch.float32)
 
             # Handle HIP case: normalize float8 weights so fused kernel doesn't break
             # on ROCm.
@@ -173,10 +179,10 @@ class TestFusedMOE(CustomTestCase):
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
         else:
-            a = self.create_random_cuda_tensor((m, k), dtype)
-            w1 = self.create_random_cuda_tensor((e, 2 * n, k), dtype)
-            w2 = self.create_random_cuda_tensor((e, k, n), dtype)
-            score = self.create_random_cuda_tensor((m, e), dtype)
+            a = self.create_random_gpu_tensor((m, k), dtype)
+            w1 = self.create_random_gpu_tensor((e, 2 * n, k), dtype)
+            w2 = self.create_random_gpu_tensor((e, k, n), dtype)
+            score = self.create_random_gpu_tensor((m, e), dtype)
 
             topk_output = select_experts(
                 hidden_states=a,
@@ -184,8 +190,15 @@ class TestFusedMOE(CustomTestCase):
                 topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
-            triton_output = fused_moe(a, w1, w2, topk_output)
-            torch_output = self.torch_naive_moe(a, w1, w2, score, topk)
+            moe_runner_config = MoeRunnerConfig(
+                routed_scaling_factor=routed_scaling_factor
+            )
+            triton_output = fused_moe(
+                a, w1, w2, topk_output, moe_runner_config=moe_runner_config
+            )
+            torch_output = self.torch_naive_moe(
+                a, w1, w2, score, topk, routed_scaling_factor=routed_scaling_factor
+            )
             torch.testing.assert_close(
                 triton_output, torch_output, rtol=rtol, atol=atol
             )
@@ -237,8 +250,27 @@ class TestFusedMOE(CustomTestCase):
                                                 dtype,
                                                 use_fp8_w8a8=use_fp8_w8a8,
                                             )
-                                            torch.cuda.empty_cache()
+                                            empty_gpu_cache()
                                         pbar.update(1)
+
+    def test_single_expert_routing(self):
+        # Cover the topk == 1 fast path (e.g. Llama-4-Scout num_experts_per_tok=1),
+        # where the second kernel writes directly into the output when
+        # routed_scaling_factor == 1.0 and the reduction is otherwise applied.
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        for routed_scaling_factor in [1.0, 1.5]:
+            for m in [1, 33]:
+                with self.subTest(m=m, routed_scaling_factor=routed_scaling_factor):
+                    self._test_case(
+                        m,
+                        n=128,
+                        k=128,
+                        e=8,
+                        topk=1,
+                        dtype=torch.bfloat16,
+                        routed_scaling_factor=routed_scaling_factor,
+                    )
+                    empty_gpu_cache()
 
 
 if __name__ == "__main__":

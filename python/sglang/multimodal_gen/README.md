@@ -9,14 +9,28 @@ SGLang diffusion features an end-to-end unified pipeline for accelerating diffus
 ## Key Features
 
 SGLang Diffusion has the following features:
-  - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux
-  - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
+  - Broad model support: Wan, FastWan, FLUX, Qwen-Image, LongCat-Image, Z-Image, Ideogram 4, Krea-2, Cosmos3, LTX-2/LTX-2.3/LTX-2.5, MiniMax-H3, LingBot Video MoE, LingBot World, SANA-Video/SANA-WM, JoyEcho, MOVA, GLM-Image, ERNIE-Image, Hunyuan3D, and more
+  - Fast inference speed: empowered by optimized `sgl-kernel` kernels, scheduler/runtime improvements, caching acceleration, and native diffusion hot-path optimizations
   - Ease of use: OpenAI-compatible api, CLI, and python sdk support
-  - Multi-platform support: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
+  - Multi-platform support:
+    - NVIDIA GPUs (H100, H200, A100, B200, 4090, 5090)
+    - AMD GPUs (MI300X, MI325X, MI355X)
+    - Intel XPUs
+    - Ascend NPU (A2, A3)
+    - Apple Silicon (M-series via MPS)
+    - Moore Threads GPUs (MTT S5000)
 
 ### AMD/ROCm Support
 
-SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [ROCm installation guide](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) for setup instructions.
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+
+### Moore Threads/MUSA Support
+
+SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use FlashAttention (FA3) when available; also supports Sage Attention when installed; otherwise falls back to the Torch SDPA backend. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+
+### Apple MPS Support
+
+SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, Triton kernels are replaced with PyTorch-native fallbacks on MPS. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ## Getting Started
 
@@ -24,8 +38,7 @@ SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we u
 uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
-For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md). ROCm/AMD users should follow the [ROCm quickstart](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) that includes the additional kernel builds and attention backend settings we validated on MI300X.
-
+For more installation methods (e.g. pypi, uv, docker, ROCm/AMD, MUSA/Moore Threads), check the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation).
 
 ## Inference
 
@@ -59,10 +72,27 @@ Or, more simply, with the CLI:
 
 ```bash
 sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-    --text-encoder-cpu-offload --pin-cpu-memory \
+    --component-residency text_encoder=component-offload --pin-cpu-memory \
     --prompt "A curious raccoon" \
     --save-output
 ```
+
+### Component residency
+
+Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
+loaded component:
+
+- `resident` keeps the complete component on the accelerator.
+- `component-offload` stores the complete component on CPU between uses.
+- `layerwise-offload` streams the component's declared layers from CPU.
+
+`COMPONENT` can be an exact `model_index.json` key or one of `all`, `dit`,
+`text_encoder`, `image_encoder`, and `vae`. Exact keys override groups, and
+groups override `all`. Existing options such as `--dit-cpu-offload`,
+`--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`,
+`--vae-cpu-offload`, and `--cpu-offload-components` remain supported. See the
+[CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli#component-residency)
+for precedence and compatibility details.
 
 ### LoRA support
 
@@ -77,11 +107,11 @@ sglang generate \
   --save-output
 ```
 
-For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
+For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
 
 ## Contributing
 
-All contributions are welcome. The contribution guide is available [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/contributing.md).
+All contributions are welcome. The contribution guide is available [here](https://docs.sglang.io/docs/sglang-diffusion/contributing).
 
 ## Acknowledgement
 

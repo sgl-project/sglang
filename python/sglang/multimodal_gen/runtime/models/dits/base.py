@@ -7,23 +7,52 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.multimodal_gen.configs.models import DiTConfig
+from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+
+# NOTE: SpectrumMixin lives in runtime.cache.spectrum
+from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
+
+# NOTE: TeaCacheContext and TeaCacheMixin have been moved to
+# sglang.multimodal_gen.runtime.cache.teacache
+# For backwards compatibility, re-export from the new location
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 # TODO
 class BaseDiT(nn.Module, ABC):
+    # These are runtime implementation settings, not checkpoint metadata.
+    # The backend set guides automatic selection; explicit backend requests are
+    # validated against platform and layer capabilities instead of this set.
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
+    # Methods that drive a forward pass without going through __call__. FSDP2
+    # only unshards around the wrapped module's own forward, so anything the
+    # shard conditions left in the root group stays sharded unless the entry
+    # point is registered; loaders read this and register each name.
+    _fsdp_forward_methods: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
-    # always supports torch_sdpa
-    _supported_attention_backends: set[AttentionBackendEnum] = (
-        DiTConfig()._supported_attention_backends
-    )
+    _supported_attention_backends: set[AttentionBackendEnum] = {
+        AttentionBackendEnum.SLIDING_TILE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SPARGE_ATTN,
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.AITER,
+        AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+        AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
+        AttentionBackendEnum.VMOBA_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+        AttentionBackendEnum.LASER_ATTN,
+        AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+        AttentionBackendEnum.RAIN_FUSION_ATTN,
+    }
 
     def __init_subclass__(cls) -> None:
         required_class_attrs = [
@@ -40,7 +69,10 @@ class BaseDiT(nn.Module, ABC):
 
     def __init__(self, config: DiTConfig, hf_config: dict[str, Any], **kwargs) -> None:
         super().__init__()
-        self.config = config
+        # `config.arch_config` contains static model metadata. Runtime
+        # capabilities remain class attributes on the model implementation.
+        self.config: DiTArchConfig = config.arch_config
+        self.prefix = config.prefix
         self.hf_config = hf_config
         if not self.supported_attention_backends:
             raise ValueError(
@@ -67,6 +99,16 @@ class BaseDiT(nn.Module, ABC):
                     f"Subclasses of BaseDiT must define '{attr}' instance variable"
                 )
 
+    def post_load_weights(self) -> None:
+        """Run model-specific post-load weight fixups after all parameters are materialized."""
+        return None
+
+    def prepare_lora_adapter(
+        self, adapter: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Apply model-specific LoRA transforms after names are normalized."""
+        return adapter
+
     @property
     def supported_attention_backends(self) -> set[AttentionBackendEnum]:
         return self._supported_attention_backends
@@ -77,11 +119,13 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(BaseDiT):
+class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
     """
-    An intermediate base class that adds TeaCache optimization functionality to DiT models.
-    TeaCache accelerates inference by selectively skipping redundant computation when consecutive
-    diffusion steps are similar enough.
+    Base class for DiT models that support inference-time cache accelerators.
+
+    Inherits ``SpectrumMixin`` (Chebyshev step skipping) and ``TeaCacheMixin``
+    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality.
+
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -93,42 +137,22 @@ class CachableDiT(BaseDiT):
     hidden_size: int
     num_attention_heads: int
     num_channels_latents: int
-    # always supports torch_sdpa
-    _supported_attention_backends: set[AttentionBackendEnum] = (
-        DiTConfig()._supported_attention_backends
-    )
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
+        self._init_spectrum_state()
+        self._init_teacache_state()
 
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients: list[float] = []
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:
+        """
+        Get quantization rules for Nunchaku quantization.
 
-        # NOTE(will): Only wan2.1 needs these, so we are hardcoding it here
-        if self.config.prefix == "wan":
-            self.use_ret_steps = self.config.cache_config.use_ret_steps
-            self.is_even = False
-            self.previous_residual_even: torch.Tensor | None = None
-            self.previous_residual_odd: torch.Tensor | None = None
-            self.accumulated_rel_l1_distance_even = 0
-            self.accumulated_rel_l1_distance_odd = 0
-            self.should_calc_even = True
-            self.should_calc_odd = True
-        else:
-            self.accumulated_rel_l1_distance = 0
-            self.previous_modulated_input = None
-            self.previous_resiual = None
-        self.previous_e0_even: torch.Tensor | None = None
-        self.previous_e0_odd: torch.Tensor | None = None
-
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        pass
-
-    def should_skip_forward_for_cached_states(self, **kwargs: dict[str, Any]) -> bool:
-        return False
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("maybe_retrieve_cached_states is not implemented")
+        Returns a dict mapping layer name patterns to quantization configs:
+        {
+            "skip": [list of patterns to skip quantization],
+            "svdq_w4a4": [list of patterns for SVDQ W4A4],
+            "awq_w4a16": [list of patterns for AWQ W4A16],
+        }
+        """
+        return {}

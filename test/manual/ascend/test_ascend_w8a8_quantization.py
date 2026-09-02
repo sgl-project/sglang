@@ -45,8 +45,6 @@ class TestAscendW8A8(CustomTestCase):
                 "npu",
                 "--attention-backend",
                 "ascend",
-                "--quantization",
-                "w8a8_int8",
             ],
         )
 

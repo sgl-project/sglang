@@ -38,7 +38,7 @@ def prefill_attention_wave(
     output_shape = (shape.total_seq_len, shape.num_query_heads, shape.head_size_kv)
     # Run the wave kernel.
     mfma_variant = (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16)
-    (prefill, hyperparams) = get_prefill_attention_kernel(
+    prefill, hyperparams = get_prefill_attention_kernel(
         shape,
         mfma_variant,
         q.shape,

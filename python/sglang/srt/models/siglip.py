@@ -2,7 +2,7 @@
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/siglip/modeling_siglip.py
 
 from functools import partial
-from typing import Optional, Type, Union
+from typing import Callable, Optional, Type, Union
 
 import torch
 import torch.nn as nn
@@ -10,23 +10,25 @@ from transformers import SiglipVisionConfig
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
 # Adapted from transformers.models.siglip.modeling_siglip.SiglipVisionTransformer
 class SiglipVisionEmbeddings(nn.Module):
 
-    def __init__(self, config: SiglipVisionConfig):
+    def __init__(self, config: SiglipVisionConfig, use_data_parallel: bool = False):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -37,7 +39,9 @@ class SiglipVisionEmbeddings(nn.Module):
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches
         self.position_embedding = VocabParallelEmbedding(
-            self.num_positions, self.embed_dim
+            self.num_positions,
+            self.embed_dim,
+            enable_tp=not use_data_parallel,
         )
         self.register_buffer(
             "position_ids",
@@ -50,7 +54,7 @@ class SiglipVisionEmbeddings(nn.Module):
         patch_embeds = self.patch_embedding(
             pixel_values.to(dtype=target_dtype)
         )  # shape = [*, width, grid, grid]
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2).contiguous()
         # interpolate_pos_encoding is never used in sglang
         embeddings = embeddings + self.position_embedding(self.position_ids)
 
@@ -63,16 +67,21 @@ class SiglipMLP(nn.Module):
     def __init__(
         self,
         config,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Callable[[], nn.Module] = QuickGELU,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        tp_size = 1 if use_data_parallel else get_parallel().tp_size
+        tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.act = act_layer()
         self.fc2 = RowParallelLinear(
@@ -80,6 +89,8 @@ class SiglipMLP(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("fc2", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -95,10 +106,13 @@ class SiglipEncoderLayer(nn.Module):
     def __init__(
         self,
         config: SiglipVisionConfig,
-        act_layer: Type[nn.Module] = QuickGELU,
+        act_layer: Callable[[], nn.Module] = QuickGELU,
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        flatten_batch: bool = True,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -110,13 +124,16 @@ class SiglipEncoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
-            flatten_batch=True,
+            flatten_batch=flatten_batch,
+            qkv_backend=qkv_backend,
+            use_data_parallel=use_data_parallel,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = SiglipMLP(
             config,
             act_layer=act_layer,
+            use_data_parallel=use_data_parallel,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
@@ -166,6 +183,10 @@ class SiglipEncoder(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -178,6 +199,10 @@ class SiglipEncoder(nn.Module):
                 SiglipEncoderLayer(
                     config=config,
                     norm_layer=norm_layer,
+                    qkv_backend=qkv_backend,
+                    act_layer=act_layer,
+                    flatten_batch=flatten_batch,
+                    use_data_parallel=use_data_parallel,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
                 )
@@ -214,16 +239,26 @@ class SiglipVisionTransformer(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
         self.config = config
         embed_dim = config.hidden_size
 
-        self.embeddings = SiglipVisionEmbeddings(config)
+        self.embeddings = SiglipVisionEmbeddings(
+            config, use_data_parallel=use_data_parallel
+        )
 
         self.encoder = SiglipEncoder(
             config=config,
+            qkv_backend=qkv_backend,
+            act_layer=act_layer,
+            flatten_batch=flatten_batch,
+            use_data_parallel=use_data_parallel,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
@@ -240,13 +275,15 @@ class SiglipVisionTransformer(nn.Module):
 
     @property
     def device(self) -> torch.device:
-        return self.encoder.layers[0].layer_norm1.weight.device
+        return self.embeddings.patch_embedding.weight.device
 
     def forward(
         self,
         pixel_values: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embeddings(pixel_values.to(self.device))
+        hidden_states = self.embeddings(pixel_values.to(self.device)).to(
+            self.post_layernorm.weight.dtype
+        )
 
         return_all_hidden_states = False
 
@@ -267,10 +304,20 @@ class SiglipVisionModel(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
+        act_layer: Callable[[], nn.Module] = QuickGELU,
+        flatten_batch: bool = True,
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         self.vision_model = SiglipVisionTransformer(
-            config, quant_config, prefix=add_prefix("vision_model", prefix)
+            config,
+            qkv_backend=qkv_backend,
+            act_layer=act_layer,
+            flatten_batch=flatten_batch,
+            use_data_parallel=use_data_parallel,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_model", prefix),
         )
 
     @property
