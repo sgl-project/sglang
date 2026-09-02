@@ -63,6 +63,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+          # This .git ships inside the image; without a reachable tag
+          # setuptools-scm stamps the build 0.0.0.
+          fetch-depth: 0
 
       - name: Compute Docker build metadata args
         run: |
@@ -184,6 +187,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+          # This .git ships inside the image; without a reachable tag
+          # setuptools-scm stamps the build 0.0.0.
+          fetch-depth: 0
 
       - name: Compute Docker build metadata args
         run: |
