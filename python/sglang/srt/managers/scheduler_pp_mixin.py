@@ -634,8 +634,11 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.full_untruncated_fill_ids = req.origin_input_ids
-                req.logprob_start_len = -1
+                # Walk the same match -> lock -> alloc lifecycle as a scheduled
+                # request so release_kv_cache can release it symmetrically.
+                req.init_next_round_input(self.tree_cache)
+                lock = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = lock.swa_uuid_for_lock
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
