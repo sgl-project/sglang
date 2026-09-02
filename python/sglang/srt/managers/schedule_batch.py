@@ -140,6 +140,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.watermark import WatermarkRequestConfig
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -910,6 +911,7 @@ class Req(ReqDllmMixin):
         origin_input_text: str,
         origin_input_ids: array[int],
         sampling_params: SamplingParams,
+        watermark: Optional[WatermarkRequestConfig] = None,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
         dllm_config: Optional[DllmConfig] = None,
@@ -1008,6 +1010,7 @@ class Req(ReqDllmMixin):
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        self.watermark = watermark
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
         self.return_hidden_states_mode = get_return_hidden_states_mode(
@@ -3285,6 +3288,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        if not self.enable_overlap:
+            self.sampling_info.refresh_watermark_contexts(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None

@@ -295,6 +295,7 @@ class Session:
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
+            watermark=req.watermark,
             lora_id=req.lora_id,
             session=self,
             custom_logit_processor=req.custom_logit_processor,

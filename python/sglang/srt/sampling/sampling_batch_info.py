@@ -12,10 +12,15 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_resources
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermark import (
+    WatermarkBatchInfo,
+    WatermarkRequestConfig,
+    build_watermark_batch_info,
+)
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -77,12 +82,15 @@ class SamplingBatchInfo:
     # Per-request flag for returning sparse sampling support metadata.
     return_sampling_masks: Optional[List[bool]] = None
     sampling_mask_max_top_k: int = 0
+    watermark_max_top_k: int = 0
 
     # Device
     device: str = "cuda"
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+
+    watermark: Optional[WatermarkBatchInfo] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -148,6 +156,14 @@ class SamplingBatchInfo:
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         sampling_mask_max_top_k = max(
             (r.sampling_params.top_k for r in reqs if r.return_sampling_mask),
+            default=0,
+        )
+        watermark_max_top_k = max(
+            (
+                r.sampling_params.top_k
+                for r in reqs
+                if isinstance(r.watermark, WatermarkRequestConfig)
+            ),
             default=0,
         )
 
@@ -216,26 +232,66 @@ class SamplingBatchInfo:
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
             sampling_mask_max_top_k=sampling_mask_max_top_k,
+            watermark_max_top_k=watermark_max_top_k,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
 
     # placeholder for override
     def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
-        pass
+        registry = get_resources().watermark_registry
+        if registry is None:
+            if any(
+                isinstance(request.watermark, WatermarkRequestConfig)
+                for request in batch.reqs
+            ):
+                raise RuntimeError("watermark registry is not initialized")
+            return
+        self.watermark = build_watermark_batch_info(
+            batch.reqs, registry, device=batch.device
+        )
 
     # placeholder for override
-    def adjusted_merge_batch(self, other: SamplingBatchInfo):
-        pass
+    def adjusted_merge_batch(
+        self,
+        other: SamplingBatchInfo,
+        *,
+        self_len: int,
+        other_len: int,
+    ):
+        if self.watermark is None:
+            if other.watermark is None:
+                return
+            disabled = WatermarkBatchInfo.disabled(
+                self_len,
+                context_width=other.watermark.contexts.shape[1],
+                device=other.watermark.contexts.device,
+            )
+            self.watermark = disabled.merge(other.watermark)
+            return
+        if other.watermark is None:
+            disabled = WatermarkBatchInfo.disabled(
+                other_len,
+                context_width=self.watermark.contexts.shape[1],
+                device=self.watermark.contexts.device,
+            )
+            self.watermark = self.watermark.merge(disabled)
+            return
+        self.watermark = self.watermark.merge(other.watermark)
 
     # placeholder for override
     def adjusted_filter_batch(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
     ):
-        pass
+        if self.watermark is not None:
+            self.watermark = self.watermark.filter(keep_indices_device)
 
     def __len__(self):
         return len(self.temperatures)
+
+    def refresh_watermark_contexts(self, requests) -> None:
+        if self.watermark is not None:
+            self.watermark = self.watermark.refresh_contexts(requests)
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
@@ -469,8 +525,15 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+        self.watermark_max_top_k = max(
+            self.watermark_max_top_k, other.watermark_max_top_k
+        )
 
-        self.adjusted_merge_batch(other)
+        self.adjusted_merge_batch(
+            other,
+            self_len=self_len,
+            other_len=other_len,
+        )
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later

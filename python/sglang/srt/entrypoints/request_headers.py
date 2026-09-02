@@ -6,6 +6,11 @@ This mechanism allows upstream callers to leave the body opaque
 
 from fastapi import HTTPException
 
+from sglang.srt.sampling.watermark import (
+    WatermarkRequestError,
+    parse_watermark_header,
+)
+
 # request header -> (target attribute, value type)
 _HEADER_OVERRIDES = {
     "x-override-rid": ("rid", str),
@@ -31,3 +36,14 @@ def apply_header_overrides(obj, headers) -> None:
             raise HTTPException(
                 status_code=400, detail=f"invalid {header} header {value!r}: {e}"
             ) from e
+
+
+def apply_watermark_request(obj, headers) -> None:
+    """Apply the request watermark selected by the watermark header."""
+    try:
+        obj.watermark = parse_watermark_header(headers.get("x-sglang-watermark"))
+    except WatermarkRequestError as error:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
