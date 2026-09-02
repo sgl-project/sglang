@@ -69,6 +69,17 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   const int tx = threadIdx.x;
 
   if (tx < RADIX + 1) s_histogram[tx] = 0;
+  // Ensure partially populated results remain valid if input changes in
+  // flight; index 0 is valid because length must exceed K.
+  if (tx < K) index[tx] = 0;
+  if (tx == 0) {
+    // Initialize selection state so a no-match threshold predicate below
+    // falls back to safe values instead of stale or uninitialized memory.
+    s_threshold_bin_id = 0;
+    s_num_input[0] = 0;
+    s_num_input[1] = 0;
+    s_counter = 0;
+  }
   __syncthreads();
 
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -110,7 +121,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < K)) index[pos] = idx;
       }
     }
     __syncthreads();
@@ -127,7 +138,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < K)) index[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
         if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
@@ -145,6 +156,11 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
   for (int round = 0; round < 4; ++round) {
     __shared__ int s_last_remain;
     const auto r_idx = round % 2;
+
+    if (tx == 0) {
+      s_last_remain = 0;
+      s_num_input[r_idx ^ 1] = 0;
+    }
 
     const auto _raw_num_input = s_num_input[r_idx];
     const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
@@ -167,7 +183,8 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          // Input changing mid-kernel can produce more than K candidates.
+          if (C10_LIKELY(pos < K)) index[pos] = idx;
         }
       }
       __syncthreads();
@@ -185,11 +202,12 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          // Bound the store against the shared index array.
+          if (C10_LIKELY(pos < K)) index[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
+            if (pos > 0 && pos <= K) {
               index[K - pos] = idx;
             }
           } else {
