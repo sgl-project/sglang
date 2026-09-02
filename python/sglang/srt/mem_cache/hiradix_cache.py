@@ -68,6 +68,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
+    get_parallel,
     get_serving,
 )
 
@@ -107,7 +108,6 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
-            from sglang.srt.runtime_context import get_parallel
 
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -151,7 +151,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -165,7 +164,6 @@ class HiRadixCache(RadixCache):
             attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
                 self,
                 params,
-                server_args,
                 extra_config=extra_config,
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
@@ -348,10 +346,8 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                from sglang.srt.runtime_context import get_server_args
 
                 storage_cls = resolve_collector_class(
-                    get_server_args(),
                     STAT_LOGGER_ROLE_STORAGE,
                     StorageMetricsCollector,
                 )
@@ -1765,6 +1761,11 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_storage_prefetch_miss(self, req_id: str) -> bool:
+        """Storage prefetch miss markers are not tracked on the dense path;
+        the scheduler's paced availability-check retry is inert here."""
+        return False
+
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
             return self._empty_match_result
@@ -1808,6 +1809,10 @@ class HiRadixCache(RadixCache):
         # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
         matched_prefix_tokens: Optional[List[int]] = None,
         router_hint: Optional[dict] = None,
+        # Cache mode write-through keeps the anchor on the request's own path,
+        # so the namespace is already carried by ``last_host_node.key``.
+        extra_key: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
