@@ -214,6 +214,7 @@ __global__ void moe_align_block_size_kernel(
 
   // Write prefix[0..num_experts - 1] and cumsum
   if (tid < num_experts) prefix[tid] = scan_buf[tid];
+  __syncthreads();
 #endif
 
   if (tid <= num_experts) {
