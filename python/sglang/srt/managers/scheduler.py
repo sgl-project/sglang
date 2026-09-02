@@ -304,6 +304,14 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+    set_global_indexer_capturer,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -1739,6 +1747,11 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        for capturer in (get_global_experts_capturer(), get_global_indexer_capturer()):
+            if capturer is not None:
+                capturer.destroy()
+        set_global_experts_capturer(None)
+        set_global_indexer_capturer(None)
 
         rank_consensus_checker.shutdown()
 

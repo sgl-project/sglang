@@ -8,10 +8,15 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     HostTensorAllocator,
+    _cuda_host_unregister,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
@@ -73,6 +78,15 @@ class BaseHostCache:
         self.topk_size = topk_size
         self.name = name
         self._log_allocation()
+
+    def destroy(self):
+        # Same reason as HostKVCache.destroy: a cudaHostRegister'd range left to
+        # SIGKILL reclaim can stall teardown for tens of seconds. Idempotent.
+        if self.buffer is None:
+            return
+        if _is_cuda or _is_hip:
+            _cuda_host_unregister(self.buffer)
+        self.buffer = None
 
     def get_buffer_size_bytes(self):
         return get_tensor_size_bytes(self.buffer)
@@ -137,6 +151,9 @@ class BaseTopkCapturer:
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
+
+    def destroy(self):
+        self.host_cache.destroy()
 
     def _get_local_slice(
         self,
