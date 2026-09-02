@@ -256,7 +256,7 @@ def test_cache_dit_preservation_only_makes_first_gate_out_of_place():
 
     with (
         patch(
-            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_scale_shift",
+            "sglang.multimodal_gen.runtime.models.dits.minimax_h3._modulate_rmsnorm_scale_shift",
             side_effect=lambda value, *_args, **_kwargs: value,
         ),
         patch(
