@@ -29,15 +29,20 @@ from sglang.srt.utils.common import (
     is_npu,
 )
 
+_HAS_FLASHINFER_LOGITS_SAMPLING = False
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
+        sampling_from_logits,
+        top_k_top_p_sampling_from_logits,
         top_k_top_p_sampling_from_probs,
     )
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
+    _HAS_FLASHINFER_LOGITS_SAMPLING = True
 
 if is_musa():
     from sgl_kernel import (
@@ -99,6 +104,11 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+        # Escape hatch for the fused sample-from-logits fast path (A/B testing
+        # and emergency fallback to the softmax + sample-from-probs pipeline).
+        self.disable_sampling_from_logits = (
+            envs.SGLANG_DISABLE_SAMPLING_FROM_LOGITS.get()
+        )
 
         self.output_logprob_processor = OutputLogprobProcessor()
 
@@ -234,30 +244,40 @@ class Sampler(nn.Module):
                         logits, dim=-1
                     )
 
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                if self._should_sample_from_scaled_logits(
+                    sampling_info, return_logprob, return_sampling_mask
+                ):
+                    # Fused fast path: flashinfer samplers normalize logits
+                    # internally, so the explicit full-vocab softmax pass (and
+                    # torch.multinomial for the filter-free case) is skipped.
+                    batch_next_token_ids = self._sample_from_scaled_logits(
+                        logits, sampling_info, simple_sampling_case
+                    )
+                else:
+                    # In-place op to save memory
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
 
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
-                )
-                if return_sampling_mask:
-                    sampling_mask_data = self._compute_sampling_mask_from_probs(
-                        probs, sampling_info
+                    batch_next_token_ids = self._sample_from_probs(
+                        probs, sampling_info, positions, simple_sampling_case
                     )
-                    self._attach_sampling_mask_to_output(
-                        logits_output,
-                        sampling_info,
-                        batch_next_token_ids,
-                        sampling_mask_data,
-                    )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
-                    )
-                del probs
+                    if return_sampling_mask:
+                        sampling_mask_data = self._compute_sampling_mask_from_probs(
+                            probs, sampling_info
+                        )
+                        self._attach_sampling_mask_to_output(
+                            logits_output,
+                            sampling_info,
+                            batch_next_token_ids,
+                            sampling_mask_data,
+                        )
+                    if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                        logprobs = (
+                            logprobs_via_logsoftmax_kernel
+                            if logprobs_via_logsoftmax_kernel is not None
+                            else torch.log(probs)
+                        )
+                    del probs
 
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
@@ -276,6 +296,51 @@ class Sampler(nn.Module):
 
         _trace_e2e_sampler("forward_returned")
         return batch_next_token_ids
+
+    def _should_sample_from_scaled_logits(
+        self,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        return_sampling_mask: bool,
+    ) -> bool:
+        """Whether sampling can consume temperature-scaled logits directly.
+
+        The fused flashinfer samplers apply the softmax internally, saving a
+        full-vocab read+write pass per step. This is only usable when nothing
+        downstream needs the materialized probs tensor and the RNG semantics
+        of the flashinfer kernels are acceptable:
+        - probs-derived logprobs are not requested,
+        - the RL sampling-mask capture is off,
+        - per-request seeds / deterministic mode are off (they use the
+          seed-hashed Gumbel path),
+        - min_p is off (no fused min_p-from-logits kernel).
+        """
+        return (
+            _HAS_FLASHINFER_LOGITS_SAMPLING
+            and not self.disable_sampling_from_logits
+            and get_exec().kernel.sampling_backend == "flashinfer"
+            and not self.enable_deterministic
+            and sampling_info.sampling_seed is None
+            and not return_logprob
+            and not return_sampling_mask
+            and not sampling_info.need_min_p_sampling
+        )
+
+    def _sample_from_scaled_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        simple_sampling_case: bool,
+    ) -> torch.Tensor:
+        """Sample directly from temperature-scaled logits via flashinfer."""
+        if simple_sampling_case:
+            return sampling_from_logits(logits.contiguous())
+        return top_k_top_p_sampling_from_logits(
+            logits.contiguous(),
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            filter_apply_order="joint",
+        )
 
     def _sample_from_probs(
         self,
