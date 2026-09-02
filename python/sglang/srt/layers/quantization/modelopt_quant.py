@@ -1643,14 +1643,35 @@ class HybridFp8NvFp4Config(Fp8Config):
         if isinstance(layer, FusedMoE):
             if not self.nvfp4_config.is_layer_excluded(prefix):
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
-            # Fall back to MXFP4 for MTP MoE layers
+            # Fall back to MXFP4 for MTP MoE layers. Mirror Fp8Config's runner
+            # dispatch: the trtllm-gen MXFP4 kernels ship sm100/sm103 cubins
+            # only, so on SM12x the b12x runner or the cutlass MXFP4 method
+            # must serve this layer (the draft worker selects its runner via
+            # --speculative-moe-runner-backend).
             if self.is_fp4_experts:
                 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+                fp8_method = Fp8MoEMethod(self)
+                backend = get_moe_runner_backend()
+                if backend.is_b12x():
+                    from sglang.srt.layers.quantization.mxfp4_b12x_moe import (
+                        Mxfp4B12xMoEMethod,
+                    )
+
+                    return Mxfp4B12xMoEMethod(fp8_method, prefix=prefix)
+                if (
+                    backend.is_flashinfer_mxfp4() or backend.is_flashinfer_cutlass()
+                ) and (get_platform().is_sm90 or get_platform().is_sm120):
+                    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+                        Mxfp4FlashinferCutlassMoEMethod,
+                    )
+
+                    return Mxfp4FlashinferCutlassMoEMethod(fp8_method, prefix=prefix)
                 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                     Mxfp4FlashinferTrtllmMoEMethod,
                 )
 
-                return Mxfp4FlashinferTrtllmMoEMethod(Fp8MoEMethod(self), prefix=prefix)
+                return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
         return super().get_quant_method(layer, prefix)
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
