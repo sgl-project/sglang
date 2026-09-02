@@ -2832,7 +2832,7 @@ class ServerArgs:
         str,
         Arg(
             help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake"],
+            choices=["mooncake", "mori"],
         ),
         NS("memory"),
     ] = "mooncake"
