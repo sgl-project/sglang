@@ -8,12 +8,12 @@ use super::shm::{ShmSegment, shm_name};
 
 /// One parked result: the buffers the drain-time Python adapter needs (the
 /// expanded `input_ids` travel separately, via `TmEvent::MmEncoded`). The qwen
-/// drain shape (`sglang_mm::qwen_vl::pack_drain`); generalizes to a
+/// shape (`sglang_mm::qwen_vl::pack_result`); generalizes to a
 /// named-tensor handoff once a family needs a different one.
 ///
 /// Constructed from outside the module only by tests; the worker parks every
 /// real entry itself.
-pub struct MmSidecarEntry {
+pub struct MmEncodedEntry {
     pub features: FeatureStore,
     pub grids: Vec<[u32; 3]>,
     pub hashes: Vec<u64>,
@@ -37,13 +37,13 @@ pub enum FeatureStore {
 /// strictly before `MmEncoded`, [`take`](Self::take) at the drain,
 /// [`purge`](Self::purge) for requests that die while parked.
 #[derive(Clone, Default)]
-pub struct Sidecar(Arc<Mutex<HashMap<String, MmSidecarEntry>>>);
+pub struct MmResultStore(Arc<Mutex<HashMap<String, MmEncodedEntry>>>);
 
-impl Sidecar {
-    pub fn park(&self, rid: String, entry: MmSidecarEntry) {
+impl MmResultStore {
+    pub fn park(&self, rid: String, entry: MmEncodedEntry) {
         self.0.lock().unwrap().insert(rid, entry);
     }
-    pub fn take(&self, rid: &str) -> Option<MmSidecarEntry> {
+    pub fn take(&self, rid: &str) -> Option<MmEncodedEntry> {
         self.0.lock().unwrap().remove(rid)
     }
     pub fn purge(&self, rid: &str) {

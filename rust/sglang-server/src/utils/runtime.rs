@@ -52,7 +52,7 @@ pub struct Runtime {
     pub tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>>,
     /// MM results parked between a worker's `MmEncoded` and the scheduler drain
     /// (`Server.take_mm_result`).
-    pub mm_sidecar: crate::multi_modality::sidecar::Sidecar,
+    pub mm_results: crate::multi_modality::result_store::MmResultStore,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -72,7 +72,7 @@ impl Runtime {
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::Context>) {
+    pub fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
@@ -165,7 +165,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
 
     // Shared: MM workers park, the Python drain pops.
-    let mm_sidecar: crate::multi_modality::sidecar::Sidecar = Default::default();
+    let mm_results: crate::multi_modality::result_store::MmResultStore = Default::default();
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
@@ -250,10 +250,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
         let limits = tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args);
-        let mm = tokenizer_manager::to_scheduler::Mm {
+        let mm = tokenizer_manager::to_scheduler::MmDispatch {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_worker_tx,
-            sidecar: mm_sidecar.clone(),
+            results: mm_results.clone(),
         };
         let mut parts = Some((tok_manager_rx, to_scheduler_tx)); // moved into the single worker
         let shutdown_rx = shutdown_rx.clone();
@@ -321,7 +321,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         to_mm_worker_rx: mm_worker_rx,
         from_mm_worker_tx: tok_manager_tx,
         tokenizer: text_tokenizer,
-        mm_sidecar,
+        mm_results,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })

@@ -55,7 +55,7 @@ class TestBuildRustMmOutput(CustomTestCase):
         features = np.arange(30, dtype=np.float32)
         output = RustMmProcessor.build_output(
             self.spec,
-            SimpleNamespace(  # the shape of Rust's MmEncodeResult
+            SimpleNamespace(  # the shape of Rust's MmEncodedResult
                 grids=self.GRIDS,
                 hashes=self.HASHES,
                 offsets=self.OFFSETS,
