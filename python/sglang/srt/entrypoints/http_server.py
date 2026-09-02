@@ -836,6 +836,7 @@ async def server_info():
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
+            "request_lifecycle": {"prefill_completed": True},
         }
     )
 
@@ -951,6 +952,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
+
+
+@app.get("/v1/request_lifecycle/{rid}/prefill_completed")
+async def wait_for_prefill_completed(rid: str):
+    """Wait for the engine's first output without consuming its response body."""
+    observed_at = await _global_state.tokenizer_manager.wait_for_prefill_completed(rid)
+    return orjson_response(
+        {
+            "request_id": rid,
+            "event": "prefill_completed",
+            "observed_at": observed_at,
+        }
+    )
 
 
 @app.api_route("/encode", methods=["POST", "PUT"])

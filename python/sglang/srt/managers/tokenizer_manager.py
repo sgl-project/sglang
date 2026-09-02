@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
@@ -176,6 +176,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_MAX_COMPLETED_REQUEST_LIFECYCLE_EVENTS = 8192
 
 logger = logging.getLogger(__name__)
 
@@ -588,6 +589,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.event_loop = None
         self.asyncio_tasks = set()
 
+        # Request lifecycle observers are intentionally independent from response
+        # delivery. A non-streaming caller only receives the terminal response, but
+        # an in-process sidecar can still observe that prefill completed when the
+        # first scheduler output reaches the tokenizer manager.
+        self._prefill_completed: OrderedDict[str, float] = OrderedDict()
+        self._prefill_completion_waiters: Dict[
+            str, set[asyncio.Future[float]]
+        ] = {}
+
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
@@ -598,6 +608,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+
+    def mark_prefill_completed(self, rid: str) -> float:
+        """Publish an idempotent request lifecycle event for ``rid``."""
+        if timestamp := self._prefill_completed.get(rid):
+            return timestamp
+
+        timestamp = real_time()
+        self._prefill_completed[rid] = timestamp
+        while (
+            len(self._prefill_completed) > _MAX_COMPLETED_REQUEST_LIFECYCLE_EVENTS
+        ):
+            self._prefill_completed.popitem(last=False)
+
+        for waiter in self._prefill_completion_waiters.pop(rid, set()):
+            if not waiter.done():
+                waiter.set_result(timestamp)
+        return timestamp
+
+    async def wait_for_prefill_completed(self, rid: str) -> float:
+        """Wait until the first scheduler output proves prefill has completed."""
+        if timestamp := self._prefill_completed.get(rid):
+            return timestamp
+
+        waiter = asyncio.get_running_loop().create_future()
+        waiters = self._prefill_completion_waiters.setdefault(rid, set())
+        waiters.add(waiter)
+        try:
+            return await waiter
+        finally:
+            waiters.discard(waiter)
+            if not waiters:
+                self._prefill_completion_waiters.pop(rid, None)
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -2439,6 +2481,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # This is the single write point for first_token_time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+                self.mark_prefill_completed(rid)
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
