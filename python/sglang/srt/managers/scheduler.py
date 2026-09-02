@@ -1426,6 +1426,11 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *8 headroom for MiniMax-M3; *2 for other models.
+            decode_poll_group = (
+                self.attn_tp_cpu_group
+                if self.enable_dp_attention
+                else self.tp_cpu_group
+            )
             buffer_multiplier = (
                 8 if is_minimax_sparse(self.model_config.hf_config) else 2
             )
@@ -1443,7 +1448,7 @@ class Scheduler(
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=decode_poll_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.ps.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -1461,7 +1466,7 @@ class Scheduler(
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
-                gloo_group=self.attn_tp_cpu_group,
+                gloo_group=decode_poll_group,
                 tp_rank=self.ps.tp_rank,
                 tp_size=self.ps.tp_size,
                 dp_size=get_parallel().dp_size,

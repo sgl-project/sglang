@@ -207,6 +207,7 @@ def poll_and_all_reduce(
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    collective_size: Optional[int] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -214,7 +215,40 @@ def poll_and_all_reduce(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if decode_reqs is not None and metadata_buffers is not None:
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(polls, gloo_group)
+    tensor = _build_fixed_poll_tensor(polls, collective_size)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=gloo_group)
+    return tensor[: len(polls)].tolist()
+
+
+def _build_fixed_poll_tensor(polls: List[int], collective_size: Optional[int]):
+    if collective_size is None:
+        return torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    if len(polls) > collective_size:
+        raise RuntimeError(
+            f"PD decode poll queue exceeded its collective capacity: "
+            f"{len(polls)} > {collective_size}"
+        )
+    tensor = torch.full(
+        (collective_size,),
+        int(KVPoll.Bootstrapping),
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    if polls:
+        tensor[: len(polls)] = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    return tensor
+
+
+def prepare_poll_tensor(
+    pollers,
+    collective_size: int,
+    decode_reqs=None,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+):
+    polls = _poll_with_failure_injection(pollers)
+    if decode_reqs is not None and metadata_buffers is not None:
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+    return polls, _build_fixed_poll_tensor(polls, collective_size)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -236,8 +270,25 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    collective_size: Optional[int] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    raw_polls, poll_tensor = prepare_poll_tensor_with_staging(
+        decode_reqs,
+        staging_handler,
+        metadata_buffers=metadata_buffers,
+        collective_size=collective_size,
+    )
+    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
+    return poll_tensor[: len(raw_polls)].tolist()
+
+
+def prepare_poll_tensor_with_staging(
+    decode_reqs,
+    staging_handler,
+    metadata_buffers: Optional[MetadataBuffers] = None,
+    collective_size: Optional[int] = None,
+):
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -263,7 +314,7 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
-    return _all_reduce_polls(raw_polls, gloo_group)
+    return raw_polls, _build_fixed_poll_tensor(raw_polls, collective_size)
 
 
 #########################

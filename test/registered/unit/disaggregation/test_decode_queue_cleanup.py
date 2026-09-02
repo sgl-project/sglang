@@ -3,11 +3,14 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -32,6 +35,137 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def _make_non_pp_poll_scheduler(self, *, poll_work=True, active=None):
+        def fixed_poll_tensor(state):
+            return torch.tensor([state, KVPoll.Bootstrapping], dtype=torch.uint8)
+
+        poll_group = MagicMock()
+        prealloc_req = MagicMock()
+        prealloc_queue = MagicMock(
+            pp_size=1,
+            queue=[prealloc_req] if poll_work else [],
+            pending_reqs=[],
+            retracted_queue=[],
+            gloo_group=poll_group,
+        )
+        prealloc_queue.resume_retracted_reqs.return_value = []
+        prealloc_queue.prepare_poll_tensor.return_value = (
+            [prealloc_req] if poll_work else [],
+            fixed_poll_tensor(
+                KVPoll.WaitingForInput if poll_work else KVPoll.Bootstrapping
+            ),
+        )
+        prealloc_queue.pop_preallocated.return_value = (["new-transfer"], [])
+
+        transfer_queue = MagicMock(queue=[MagicMock()] if poll_work else [])
+        transfer_queue.prepare_poll_tensor.return_value = (
+            int(poll_work),
+            fixed_poll_tensor(KVPoll.Success if poll_work else KVPoll.Bootstrapping),
+        )
+        transfer_queue.pop_transferred.return_value = ["ready"]
+
+        scheduler = SimpleNamespace(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            disagg_decode_prealloc_queue=prealloc_queue,
+            disagg_decode_transfer_queue=transfer_queue,
+            req_to_metadata_buffer_idx_allocator=SimpleNamespace(size=2),
+            waiting_queue=[],
+        )
+        if active is not None:
+            scheduler.decode_poll_collective_active = active
+            scheduler.polling_count = 0
+            scheduler.polling_interval = 1
+        return scheduler, prealloc_queue, transfer_queue, prealloc_req, poll_group
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_uses_one_fixed_poll_collective(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+        )
+        scheduler, prealloc_queue, transfer_queue, prealloc_req, poll_group = (
+            self._make_non_pp_poll_scheduler()
+        )
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        tensor = mock_all_reduce.call_args.args[0]
+        self.assertEqual(
+            tensor.tolist(),
+            [
+                1,
+                0,
+                KVPoll.WaitingForInput,
+                KVPoll.Bootstrapping,
+                KVPoll.Success,
+                KVPoll.Bootstrapping,
+            ],
+        )
+        self.assertIs(mock_all_reduce.call_args.kwargs["group"], poll_group)
+        transfer_queue.pop_transferred.assert_called_once_with(
+            precomputed_polls=[KVPoll.Success]
+        )
+        prealloc_queue.pop_preallocated.assert_called_once_with(
+            precomputed_polls=([prealloc_req], [KVPoll.WaitingForInput])
+        )
+        self.assertEqual(scheduler.waiting_queue, ["ready"])
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_retraction_participates_in_poll_collective(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+            disaggregation_decode_polling_interval=1,
+        )
+        scheduler, prealloc_queue, transfer_queue, _, poll_group = (
+            self._make_non_pp_poll_scheduler(poll_work=False, active=False)
+        )
+        prealloc_queue.scheduler = scheduler
+        prealloc_queue._check_if_req_exceed_kv_capacity.return_value = False
+        req = MagicMock()
+
+        DecodePreallocQueue.add(prealloc_queue, req, is_retracted=True)
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        self.assertTrue(scheduler.decode_poll_collective_active)
+        self.assertEqual(prealloc_queue.retracted_queue, [req])
+        tensor = mock_all_reduce.call_args.args[0]
+        self.assertEqual(
+            tensor.tolist(),
+            [0, 0] + [KVPoll.Bootstrapping] * 4,
+        )
+        self.assertIs(mock_all_reduce.call_args.kwargs["group"], poll_group)
+        prealloc_queue.prepare_poll_tensor.assert_not_called()
+        transfer_queue.prepare_poll_tensor.assert_not_called()
+        transfer_queue.pop_transferred.assert_not_called()
+        prealloc_queue.pop_preallocated.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.decode.get_disagg")
+    @patch("sglang.srt.disaggregation.decode.torch.distributed.all_reduce")
+    def test_non_pp_decode_deactivates_collective_after_global_idle(
+        self, mock_all_reduce, mock_get_disagg
+    ):
+        mock_get_disagg.return_value = SimpleNamespace(
+            disaggregation_decode_enable_offload_kvcache=False,
+        )
+        scheduler, _, _, _, _ = self._make_non_pp_poll_scheduler(
+            poll_work=False,
+            active=True,
+        )
+
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+        SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
+
+        mock_all_reduce.assert_called_once()
+        self.assertFalse(scheduler.decode_poll_collective_active)
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.

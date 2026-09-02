@@ -62,6 +62,8 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
     prepare_abort,
+    prepare_poll_tensor,
+    prepare_poll_tensor_with_staging,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -627,6 +629,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatch happens later, after preallocation and ``send_metadata`` (see
         ``pop_preallocated``).
         """
+        if self.pp_size <= 1:
+            # Requests are broadcast to all TP schedulers before they enter this
+            # queue. Activate the sticky poll epoch here, before local queue and
+            # retraction progress can diverge across ranks.
+            self.scheduler.decode_poll_collective_active = True
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -865,34 +872,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        precomputed_polls: Optional[Tuple[List[DecodeRequest], List[int]]] = None,
     ) -> None:
-        if not self.queue:
-            return
-
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if (
-            self.pp_size <= 1
-            and all(decode_req.waiting_for_input for decode_req in self.queue)
-            and not any(
-                decode_req.kv_receiver.conclude_state == KVPoll.Failed
-                for decode_req in self.queue
+        if precomputed_polls is not None:
+            poll_window, polls = precomputed_polls
+        elif self.pp_size <= 1:
+            collective_size = self.req_to_metadata_buffer_idx_allocator.size
+            poll_window = self.queue[:collective_size]
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in poll_window],
+                self.gloo_group,
+                collective_size=collective_size,
             )
-        ):
+        elif not self.queue:
             return
-
-        if self.pp_size > 1:
+        else:
             polls = poll_and_all_reduce_pp(
                 (decode_req.req.rid for decode_req in self.queue),
                 KVPoll.WaitingForInput,
                 pp_good_rids,
                 pp_bad_rids,
             )
-        else:
-            polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-            )
+            poll_window = self.queue
 
-        for decode_req, poll in zip(self.queue, polls):
+        for decode_req, poll in zip(poll_window, polls):
             if poll is None:
                 continue
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -925,6 +928,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
+
+    def prepare_poll_tensor(self):
+        self._resolve_pending_reqs()
+        collective_size = self.req_to_metadata_buffer_idx_allocator.size
+        poll_window = self.queue[:collective_size]
+        _, tensor = prepare_poll_tensor(
+            [decode_req.kv_receiver for decode_req in poll_window],
+            collective_size=collective_size,
+        )
+        return poll_window, tensor
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -1083,6 +1096,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        precomputed_polls: Optional[Tuple[List[DecodeRequest], List[int]]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         is_pp_mode = self.pp_size > 1
@@ -1091,8 +1105,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
-        self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
+        if precomputed_polls is None:
+            self._resolve_pending_reqs()
+        self._update_handshake_waiters(
+            rids_to_check,
+            pp_good_rids,
+            pp_bad_rids,
+            precomputed_polls=precomputed_polls,
+        )
         if is_pp_mode:
             rids_to_check = set(pp_good_rids) | set(pp_bad_rids)
 
@@ -2252,6 +2272,32 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             metadata_buffers=self.metadata_buffers,
         )
 
+    def prepare_poll_tensor(self):
+        if self.scheduler.enable_decode_hicache:
+            self._process_hicache_local_restores(self.queue)
+
+        collective_size = self.req_to_metadata_buffer_idx_allocator.size
+        if self.enable_staging:
+            polls, tensor = prepare_poll_tensor_with_staging(
+                self.queue,
+                self.staging_handler,
+                metadata_buffers=self.metadata_buffers,
+                collective_size=collective_size,
+            )
+        else:
+            pollers = (
+                [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
+                if self.scheduler.enable_decode_hicache
+                else [dr.kv_receiver for dr in self.queue]
+            )
+            polls, tensor = prepare_poll_tensor(
+                pollers,
+                decode_reqs=self.queue,
+                metadata_buffers=self.metadata_buffers,
+                collective_size=collective_size,
+            )
+        return len(polls), tensor
+
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -2263,11 +2309,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        if not self.queue:
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        precomputed_polls: Optional[List[int]] = None,
+    ) -> List[Req]:
+        if precomputed_polls is None and not self.queue:
             return []
 
-        if self.scheduler.enable_decode_hicache:
+        if precomputed_polls is None and self.scheduler.enable_decode_hicache:
             self._process_hicache_local_restores(
                 [
                     decode_req
@@ -2276,7 +2326,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ]
             )
 
-        if self.enable_staging:
+        if precomputed_polls is not None:
+            polls = precomputed_polls
+        elif self.enable_staging:
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
@@ -2699,9 +2751,24 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+        has_retracted_reqs = len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
+        is_pp_mode = self.disagg_decode_prealloc_queue.pp_size > 1
+        if has_retracted_reqs and is_pp_mode:
             # if there are still retracted requests, we do not allocate new requests
             return
+
+        if not is_pp_mode:
+            local_has_poll_work = bool(
+                has_retracted_reqs
+                or self.disagg_decode_prealloc_queue.queue
+                or self.disagg_decode_prealloc_queue.pending_reqs
+                or self.disagg_decode_transfer_queue.queue
+            )
+            if not hasattr(self, "decode_poll_collective_active"):
+                self.decode_poll_collective_active = False
+            self.decode_poll_collective_active |= local_has_poll_work
+            if not self.decode_poll_collective_active:
+                return
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -2710,11 +2777,67 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
+            if is_pp_mode:
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+                self.disagg_decode_transfer_queue.extend(req_conns)
+                transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+            else:
+                collective_size = self.req_to_metadata_buffer_idx_allocator.size
+                # Header is [can_poll, local_idle]. MIN gives a global retraction
+                # gate and deactivates the sticky collective only when every rank
+                # is idle; the remaining entries are the fixed poll payload.
+                if has_retracted_reqs:
+                    prealloc_window = []
+                    transfer_count = 0
+                    combined_tensor = torch.full(
+                        (2 * collective_size + 2,),
+                        int(KVPoll.Bootstrapping),
+                        dtype=torch.uint8,
+                        device="cpu",
+                    )
+                    combined_tensor[0] = 0
+                    combined_tensor[1] = 0
+                else:
+                    prealloc_window, prealloc_tensor = (
+                        self.disagg_decode_prealloc_queue.prepare_poll_tensor()
+                    )
+                    transfer_count, transfer_tensor = (
+                        self.disagg_decode_transfer_queue.prepare_poll_tensor()
+                    )
+                    combined_tensor = torch.cat(
+                        (
+                            torch.tensor(
+                                [1, int(not local_has_poll_work)],
+                                dtype=torch.uint8,
+                                device="cpu",
+                            ),
+                            prealloc_tensor,
+                            transfer_tensor,
+                        )
+                    )
+                torch.distributed.all_reduce(
+                    combined_tensor,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.disagg_decode_prealloc_queue.gloo_group,
+                )
+                if combined_tensor[1].item() == 1:
+                    self.decode_poll_collective_active = False
+                    self.polling_count = 0
+                    return
+                if combined_tensor[0].item() == 0:
+                    return
+                transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+                    precomputed_polls=combined_tensor[
+                        collective_size + 2 : collective_size + 2 + transfer_count
+                    ].tolist()
+                )
+                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                    precomputed_polls=(
+                        prealloc_window,
+                        combined_tensor[2 : len(prealloc_window) + 2].tolist(),
+                    )
+                )
+                self.disagg_decode_transfer_queue.extend(req_conns)
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
