@@ -150,7 +150,9 @@ Path("lingbot_video_moe.mp4").write_bytes(video.content)
 
 - `num_frames` must be `1` or `4n+1`; examples include 17 and 81.
 - Width and height must both be multiples of 16.
-- The native defaults are `guidance_scale=6.0`, `flow_shift=3.0`,
-  `num_inference_steps=40`, and `fps=16`.
+- SGLang's request defaults are `guidance_scale=6.0`, `flow_shift=3.0`,
+  `num_inference_steps=40`, and `fps=16`. The upstream reference scripts use
+  `guidance_scale=3` and `fps=24` instead; the checkpoint itself does not ship
+  either value, so match whichever reference you are comparing against.
 - Keep the prompt as serialized JSON. Raw free text is outside the
   checkpoint's expected caption format.

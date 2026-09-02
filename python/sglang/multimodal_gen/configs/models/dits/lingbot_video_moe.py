@@ -23,7 +23,6 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
     norm_eps: float = 1e-6
     rope_theta: float = 256.0
     axes_dims: tuple[int, ...] = (32, 48, 48)
-    axes_lens: tuple[int, ...] = (4096, 512, 512)
 
     qkv_bias: bool = False
     out_bias: bool = True
