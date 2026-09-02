@@ -695,8 +695,8 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
             modality="video",
             num_gpus=4,
             extras=[
-                "--attention-backend",
-                "video_sparse_attn_h3",
+                "--component-attention-backends",
+                "transformer=video_sparse_attn_h3",
                 "--attention-backend-config",
                 '{"VSA_sparsity": 0.9}',
                 "--enable-torch-compile",
