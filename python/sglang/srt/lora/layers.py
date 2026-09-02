@@ -461,6 +461,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             device="cpu",
             pin_memory=True,
         )
+        self._grouped_output_dim = None
+        self._grouped_output_offset = None
+        self._grouped_output_offset_cpu = None
 
     def set_lora_info(
         self,
@@ -481,6 +484,110 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             base_output=base_output,
         )
         return lora_output
+
+    def _get_grouped_output_offsets(
+        self, group_output_dim: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "_grouped_output_dim", None) != group_output_dim:
+            is_capturing = (
+                self.output_offset.is_cuda and torch.cuda.is_current_stream_capturing()
+            )
+            if is_capturing:
+                raise RuntimeError(
+                    "grouped LoRA output offsets must be initialized during "
+                    "CUDA-graph warmup"
+                )
+            self._grouped_output_dim = group_output_dim
+            self._grouped_output_offset = self.output_offset.new_tensor(
+                [0, group_output_dim]
+            )
+            self._grouped_output_offset_cpu = torch.tensor(
+                [0, group_output_dim],
+                dtype=self.output_offset_cpu.dtype,
+                device="cpu",
+                pin_memory=self.output_offset_cpu.is_pinned(),
+            )
+        return self._grouped_output_offset, self._grouped_output_offset_cpu
+
+    def apply_grouped_lora(
+        self, base_output: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply a flattened LoRA matrix as independent grouped projections.
+
+        DeepSeek-V4 ``wo_a`` stores ``G`` independent ``[R, D]`` matrices as
+        one column-parallel ``[G * R, D]`` weight. Route the flattened grouped
+        input through matching composite adapter/group B weights so
+        off-diagonal group products are never built.
+        """
+        if not self.lora_active:
+            return base_output
+        if x.ndim != 3 or base_output.ndim != 3:
+            raise RuntimeError(
+                "grouped LoRA expects x=[tokens,groups,input] and "
+                "base_output=[tokens,groups,output]"
+            )
+
+        num_tokens, num_groups, _ = x.shape
+        if base_output.shape[:2] != (num_tokens, num_groups):
+            raise RuntimeError(
+                "grouped LoRA base/input prefix mismatch: "
+                f"x={tuple(x.shape)}, base={tuple(base_output.shape)}"
+            )
+        group_output_dim = base_output.shape[-1]
+        if self.B_buffer.shape[-2] != num_groups * group_output_dim:
+            raise RuntimeError(
+                "grouped LoRA B/output mismatch: "
+                f"B={tuple(self.B_buffer.shape)}, groups={num_groups}, "
+                f"group_output={group_output_dim}"
+            )
+
+        batch_info = self.lora_backend.batch_info
+        if (
+            batch_info.expected_tokens is not None
+            and batch_info.expected_tokens != num_tokens
+        ):
+            raise RuntimeError(
+                "grouped LoRA batch/input token mismatch: "
+                f"metadata={batch_info.expected_tokens}, input={num_tokens}"
+            )
+
+        a_info, b_info = self.lora_backend.get_grouped_sgemm_batch_infos(
+            num_groups, num_tokens
+        )
+        flat_input = x.transpose(0, 1).contiguous().view(num_tokens * num_groups, -1)
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(
+            flat_input,
+            self.A_buffer,
+            pruned_batch_info=a_info,
+        )
+
+        num_adapters, _, lora_rank = self.B_buffer.shape
+        grouped_b = self.B_buffer.view(
+            num_adapters,
+            num_groups,
+            group_output_dim,
+            lora_rank,
+        ).reshape(num_adapters * num_groups, group_output_dim, lora_rank)
+        group_output_offset, group_output_offset_cpu = self._get_grouped_output_offsets(
+            group_output_dim
+        )
+        lora_output = self.lora_backend.run_lora_b_sgemm(
+            x=lora_a_output,
+            weights=grouped_b,
+            output_offset=group_output_offset,
+            output_offset_cpu=group_output_offset_cpu,
+            pruned_batch_info=b_info,
+        )
+        expected_shape = (num_tokens * num_groups, group_output_dim)
+        if tuple(lora_output.shape) != expected_shape:
+            raise RuntimeError(
+                "grouped LoRA kernel output mismatch: "
+                f"got {tuple(lora_output.shape)}, expected {expected_shape}"
+            )
+
+        return base_output + lora_output.view(
+            num_groups, num_tokens, group_output_dim
+        ).transpose(0, 1)
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear

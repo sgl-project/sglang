@@ -26,6 +26,7 @@ PREFILL_CUDA_GRAPH_LORA_SEGMENTS = 32
 class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
     supports_prefill_cuda_graph = True
+    supports_grouped_sgemm_batch_info = True
 
     def __init__(
         self,
@@ -70,6 +71,9 @@ class TritonLoRABackend(BaseLoRABackend):
             "sglang/srt/lora/layers.py forwards."
         )
         return self.sgemm_batch_info or self.batch_info
+
+    def _get_sgemm_batch_info(self) -> LoRABatchInfo:
+        return self._sgemm_info()
 
     def run_lora_a_sgemm(
         self,
@@ -273,6 +277,7 @@ class TritonLoRABackend(BaseLoRABackend):
         use_cuda_graph: bool,
         use_prefill_cuda_graph: bool = False,
     ):
+        self._reset_grouped_sgemm_batch_info()
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
             weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"

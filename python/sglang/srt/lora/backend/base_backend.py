@@ -1,3 +1,4 @@
+import dataclasses
 from typing import Optional, Tuple, Union
 
 import torch
@@ -26,6 +27,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     # Supporting backends implement init_prefill_cuda_graph_batch_info() and
     # honor use_prefill_cuda_graph in prepare_lora_batch().
     supports_prefill_cuda_graph: bool = False
+    # Supporting segmented-GEMM backends can apply grouped projections with
+    # group-major routing metadata supplied to both the A and B kernels.
+    supports_grouped_sgemm_batch_info: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
@@ -42,6 +46,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+        self._grouped_sgemm_batch_info_cache = {}
+        self._grouped_sgemm_capture_state = False
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -51,6 +57,118 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+        self._reset_grouped_sgemm_batch_info()
+
+    def _reset_grouped_sgemm_batch_info(self):
+        # prepare_lora_batch() calls this once per logical forward. During
+        # CUDA-graph capture, the first grouped layer records the metadata
+        # transforms and later layers reuse their outputs.
+        self._grouped_sgemm_batch_info_cache = {}
+        self._grouped_sgemm_capture_state = False
+
+    def _get_sgemm_batch_info(self) -> LoRABatchInfo:
+        assert self.batch_info is not None, "LoRA batch metadata is not prepared"
+        return self.batch_info
+
+    def get_grouped_sgemm_batch_infos(
+        self, num_groups: int, num_tokens: int
+    ) -> tuple[LoRABatchInfo, LoRABatchInfo]:
+        """Build group-major segmented-GEMM metadata for grouped projections.
+
+        The A pass reuses each token's adapter for every group. The B pass
+        routes to the composite ``adapter * num_groups + group`` weight. Whole
+        token segments are repeated per group, so the backend's original
+        maximum segment length remains unchanged.
+        """
+        if not self.supports_grouped_sgemm_batch_info:
+            raise RuntimeError(
+                f"LoRA backend {self.name!r} does not support grouped "
+                "segmented-GEMM metadata"
+            )
+        if num_groups <= 0 or num_tokens <= 0:
+            raise ValueError(
+                "grouped segmented-GEMM dimensions must be positive, got "
+                f"groups={num_groups}, tokens={num_tokens}"
+            )
+
+        source = self._get_sgemm_batch_info()
+        is_capturing = (
+            source.seg_indptr.is_cuda and torch.cuda.is_current_stream_capturing()
+        )
+        if getattr(self, "_grouped_sgemm_capture_state", False) != is_capturing:
+            # Full CUDA-graph capture invokes the model for eager warmup before
+            # recording it. Rebuild on the eager/capture transition so the
+            # metadata transforms themselves are captured exactly once.
+            self._grouped_sgemm_batch_info_cache = {}
+            self._grouped_sgemm_capture_state = is_capturing
+        key = (id(source), num_groups, num_tokens)
+        cache = getattr(self, "_grouped_sgemm_batch_info_cache", None)
+        if cache is None:
+            cache = self._grouped_sgemm_batch_info_cache = {}
+        if key in cache:
+            return cache[key]
+
+        # CUDA-graph descriptors use fixed-size padded buffers. Include every
+        # allocated slot so captured tensor shapes stay static; padded
+        # zero-length segments remain no-ops.
+        num_segments = (
+            source.weight_indices.shape[0]
+            if source.use_cuda_graph
+            else source.num_segments
+        )
+        if num_segments is None:
+            raise RuntimeError("grouped LoRA batch metadata has no segment count")
+
+        device = source.seg_indptr.device
+        index_dtype = source.weight_indices.dtype
+        group_ids = torch.arange(num_groups, dtype=index_dtype, device=device)
+        token_offsets = group_ids * num_tokens
+        source_starts = source.seg_indptr[:num_segments]
+        segment_starts = (
+            source_starts.unsqueeze(0) + token_offsets.unsqueeze(1)
+        ).reshape(-1)
+        segment_end = source.seg_indptr[:1] + num_tokens * num_groups
+        seg_indptr = torch.cat((segment_starts, segment_end))
+
+        permutation = None
+        if source.permutation is not None:
+            permutation = (
+                source.permutation[:num_tokens].unsqueeze(0)
+                + token_offsets.unsqueeze(1)
+            ).reshape(-1)
+        seg_lens = None
+        if source.seg_lens is not None:
+            seg_lens = source.seg_lens[:num_segments].repeat(num_groups)
+
+        common = {
+            "bs": source.bs * num_groups,
+            "num_segments": num_segments * num_groups,
+            "seg_indptr": seg_indptr,
+            "max_len": source.max_len,
+            "seg_lens": seg_lens,
+            "permutation": permutation,
+            "expected_tokens": num_tokens * num_groups,
+            "req_seg_indptr": None,
+            "req_weight_indices": None,
+            "moe_lora_info": None,
+        }
+        source_weight_indices = source.weight_indices[:num_segments]
+        a_info = dataclasses.replace(
+            source,
+            weight_indices=source_weight_indices.repeat(num_groups),
+            **common,
+        )
+        b_info = dataclasses.replace(
+            source,
+            weight_indices=(
+                source_weight_indices.unsqueeze(0) * num_groups + group_ids.unsqueeze(1)
+            ).reshape(-1),
+            lora_ranks=source.lora_ranks.repeat_interleave(num_groups),
+            scalings=source.scalings.repeat_interleave(num_groups),
+            **common,
+        )
+        cache[key] = (a_info, b_info)
+        return a_info, b_info
 
     def run_lora_a_embedding(
         self,

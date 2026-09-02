@@ -1712,6 +1712,8 @@ class MQALayer(MqaAttentionBase):
             )
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        wo_a_input = o
+        wo_a_base = getattr(self.wo_a, "base_layer", self.wo_a)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1738,13 +1740,13 @@ class MQALayer(MqaAttentionBase):
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                (wo_a_base.weight.view(G, R, D), wo_a_base.weight_scale_inv.data),
                 output,
                 recipe=recipe,
             )
             o = output
         else:
-            wo_a_weight = getattr(self.wo_a, "weight", None)
+            wo_a_weight = getattr(wo_a_base, "weight", None)
             if wo_a_weight is not None:
                 wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
                 o = _apply_wo_a_bf16_matmul(
@@ -1753,10 +1755,13 @@ class MQALayer(MqaAttentionBase):
             else:
                 o = _apply_gguf_grouped_wo_a(
                     o,
-                    self.wo_a.qweight,
-                    self.wo_a.qweight_type.weight_type,
+                    wo_a_base.qweight,
+                    wo_a_base.qweight_type.weight_type,
                     self.o_lora_rank,
                 )
+
+        if hasattr(self.wo_a, "apply_grouped_lora"):
+            o = self.wo_a.apply_grouped_lora(o, wo_a_input)
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
