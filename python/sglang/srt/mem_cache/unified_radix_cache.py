@@ -624,6 +624,15 @@ class UnifiedRadixCache(BasePrefixCache):
             available_size_targets=available_size_targets,
         )
 
+        return self._finish_eviction(tracker, start_time)
+
+    def _finish_eviction(
+        self,
+        tracker: dict[ComponentType, int],
+        start_time: float,
+    ) -> EvictResult:
+        """Finish write-back bookkeeping and build the public result."""
+
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"

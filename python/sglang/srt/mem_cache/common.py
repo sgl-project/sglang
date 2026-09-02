@@ -178,80 +178,25 @@ def evict_from_tree_cache(
 
     allocator = tree_cache.token_to_kv_pool_allocator
 
-    from sglang.srt.mem_cache.multi_ended_allocator import (
-        UnifiedSWATokenToKVPoolAllocator,
-    )
-
-    if (
-        isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
-        and allocator.supports_asymmetric_reservation
-    ):
-        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        if allocator.can_reserve(num_tokens, required_swa):
-            return
-
-        page_size = allocator.page_size
-        full_evictable = tree_cache.full_evictable_size() // page_size * page_size
-        swa_evictable = tree_cache.swa_evictable_size() // page_size * page_size
-        if not allocator.can_reserve(
-            num_tokens,
-            required_swa,
-            full_evictable_tokens=full_evictable,
-            swa_evictable_tokens=swa_evictable,
-        ):
-            return
-
-        def minimum_reclaim(max_tokens: int, fits) -> int:
-            lo, hi = 0, max_tokens // page_size
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if fits(mid * page_size):
-                    hi = mid
-                else:
-                    lo = mid + 1
-            return lo * page_size
-
-        full_reclaim = minimum_reclaim(
-            full_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                required_swa,
-                full_evictable_tokens=value,
-                swa_evictable_tokens=swa_evictable,
-            ),
-        )
-        swa_reclaim = minimum_reclaim(
-            swa_evictable,
-            lambda value: allocator.can_reserve(
-                num_tokens,
-                required_swa,
-                full_evictable_tokens=full_reclaim,
-                swa_evictable_tokens=value,
-            ),
-        )
-        evicted = tree_cache.evict_for_alloc(
-            EvictParams(
-                num_tokens=full_reclaim,
-                swa_num_tokens=swa_reclaim,
-            )
-        )
-        if not allocator.can_reserve(num_tokens, required_swa):
-            logger.warning(
-                "Unified SWA eviction did not satisfy the planned reservation: "
-                f"requested=({num_tokens}, {required_swa}), "
-                f"planned=({full_reclaim}, {swa_reclaim}), "
-                f"evicted=({evicted.num_tokens_evicted}, "
-                f"{evicted.swa_num_tokens_evicted})"
-            )
-    elif isinstance(allocator, SWATokenToKVPoolAllocator):
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
         required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
 
-        if full_available_size < num_tokens or swa_available_size < required_swa:
-            full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, required_swa - swa_available_size)
+        if (
+            isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+            and allocator.supports_asymmetric_reservation
+        ):
+            full_num_tokens, swa_num_tokens = allocator.allocation_shortfalls(
+                num_tokens, required_swa
+            )
+        else:
+            full_num_tokens = max(0, num_tokens - allocator.full_available_size())
+            swa_num_tokens = max(0, required_swa - allocator.swa_available_size())
+
+        if full_num_tokens or swa_num_tokens:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )

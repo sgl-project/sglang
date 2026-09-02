@@ -3518,6 +3518,33 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def current_swa_capacity(self) -> int:
         return self.swa_available_size() + self.swa_attn_allocator.allocated_count()
 
+    def allocation_shortfalls(
+        self, full_tokens: int | float, swa_tokens: int | float
+    ) -> tuple[int, int]:
+        """Return the shared-byte and SWA-slot shortfalls in token units.
+
+        SWA bytes are charged to the FULL budget so the shared gap is counted
+        once. SWA-only eviction backs the slot budget, not the byte budget.
+        """
+        if full_tokens < 0 or swa_tokens < 0:
+            raise ValueError("allocation sizes must be non-negative")
+
+        page_size = self.page_size
+        full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
+        swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
+        full_page_bytes = self.full_attn_allocator.entry_bytes_per_page
+        swa_page_bytes = self.swa_attn_allocator.entry_bytes_per_page
+        swa_full_pages = (
+            swa_pages * swa_page_bytes + full_page_bytes - 1
+        ) // full_page_bytes
+
+        joint_full_tokens = (full_pages + swa_full_pages) * page_size
+        aligned_swa_tokens = swa_pages * page_size
+        return (
+            max(0, joint_full_tokens - self.full_available_size()),
+            max(0, aligned_swa_tokens - self.swa_available_size()),
+        )
+
     def can_reserve(
         self,
         full_tokens: int | float,
@@ -3531,8 +3558,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Check pending FULL/SWA demand against the shared byte envelope.
 
         Scheduler admission keeps the historical one-token strict slack at an
-        empty-pool boundary. Actual allocation and eviction planning may consume
-        the exact physical capacity, so they leave ``require_token_slack`` off.
+        empty-pool boundary. For a live pool, shared bytes are backed only by
+        FULL eviction; SWA eviction backs its own slot shortfall.
         """
         if not self.supports_asymmetric_reservation:
             if (
@@ -3550,19 +3577,35 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ):
             return False
 
+        if empty_pool:
+            page_size = self.page_size
+            full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
+            swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
+            return self._fits_page_demand(
+                full_pages,
+                swa_pages,
+                compacted=True,
+                empty_pool=True,
+            )
+
+        full_shortfall, swa_shortfall = self.allocation_shortfalls(
+            full_tokens, swa_tokens
+        )
         page_size = self.page_size
-        full_pages = (math.ceil(full_tokens) + page_size - 1) // page_size
-        swa_pages = (math.ceil(swa_tokens) + page_size - 1) // page_size
-        compacted = empty_pool or not self.lazy_compaction
-        if not compacted:
-            compacted = self._compaction_allowed()
+        if (
+            full_shortfall > max(0, int(full_evictable_tokens)) // page_size * page_size
+            or swa_shortfall
+            > max(0, int(swa_evictable_tokens)) // page_size * page_size
+        ):
+            return False
+
+        compacted = not self.lazy_compaction or self._compaction_allowed()
         return self._fits_page_demand(
-            full_pages,
-            swa_pages,
-            full_reclaim_pages=max(0, int(full_evictable_tokens)) // page_size,
-            swa_reclaim_pages=max(0, int(swa_evictable_tokens)) // page_size,
+            (math.ceil(full_tokens) + page_size - 1) // page_size,
+            (math.ceil(swa_tokens) + page_size - 1) // page_size,
+            full_reclaim_pages=full_shortfall // page_size,
+            swa_reclaim_pages=swa_shortfall // page_size,
             compacted=compacted,
-            empty_pool=empty_pool,
         )
 
     def _compaction_allowed(self) -> bool:
@@ -3609,11 +3652,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             virtual_page_capacity,
             sa.num_pages - sa.min_page_index,
         )
-        if (
-            full_total_pages > full_page_capacity
-            or swa_total_pages > swa_page_capacity
-            or swa_total_pages > full_total_pages
-        ):
+        if full_total_pages > full_page_capacity or swa_total_pages > swa_page_capacity:
             return False
 
         if compacted:
