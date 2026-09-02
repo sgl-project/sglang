@@ -14,25 +14,24 @@ Covers:
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import (  # noqa: E402
+from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchStrOutput,
     GenerateReqInput,
 )
-from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import (
     ReqState,
     TokenizerManager,
 )
-from sglang.srt.observability.req_time_stats import (  # noqa: E402
+from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
 )
 from sglang.srt.runtime_context import get_context
@@ -639,6 +638,210 @@ class TestWaitOneResponseAfterStateFreed(CustomTestCase):
         out = asyncio.run(drive())
         self.assertEqual(out["meta_info"]["id"], rid)
         self.assertEqual(out["text"], "hello")
+
+
+class TestGenerateRequestCancellationCleanup(CustomTestCase):
+    """Cancellation must not orphan requests that reached the scheduler."""
+
+    def test_cancelled_request_after_dispatch_keeps_state_for_abort_echo(self):
+        tm = _make_tm_for_generate(self)
+        rid = "cancelled_after_dispatch"
+        obj = _make_generate_obj(rid, is_single=True)
+        obj.return_prompt_token_ids = False
+        tm._tokenize_one_request = AsyncMock(
+            return_value=MagicMock(input_ids=[1, 2, 3])
+        )
+        tm._send_one_request = Mock()
+
+        async def _cancelled_wait(*args, **kwargs):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._wait_one_response = _cancelled_wait
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        tm._send_one_request.assert_called_once()
+        self.assertIn(rid, tm.rid_to_state)
+
+    def test_cancelled_request_before_dispatch_discards_state(self):
+        tm = _make_tm_for_generate(self)
+        rid = "cancelled_before_dispatch"
+        obj = _make_generate_obj(rid, is_single=True)
+        tm._tokenize_one_request = AsyncMock(side_effect=asyncio.CancelledError())
+        tm._send_one_request = Mock()
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        tm._send_one_request.assert_not_called()
+        self.assertNotIn(rid, tm.rid_to_state)
+
+    def test_normal_stream_completion_does_not_dispatch_abort_or_metric(self):
+        tm = _make_tm_for_generate(self)
+        rid = "completed"
+        obj = GenerateReqInput(text="hello", rid=rid, sampling_params={})
+        tm._tokenize_one_request = AsyncMock(
+            return_value=MagicMock(input_ids=[1, 2, 3])
+        )
+        tm._send_one_request = Mock()
+
+        async def _completed_wait(*args, **kwargs):
+            yield {"text": "done"}
+            tm.rid_to_state.pop(rid)
+
+        tm._wait_one_response = _completed_wait
+        tm.enable_metrics = True
+        tm.metrics_collector = Mock()
+        tm._dispatch_to_scheduler = Mock()
+        serving = MagicMock(tokenizer_worker_num=1)
+
+        async def drive():
+            responses = [response async for response in tm.generate_request(obj)]
+            self.assertEqual(responses, [{"text": "done"}])
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.get_serving",
+                return_value=serving,
+            ), patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(),
+            ):
+                await tm.create_abort_task(obj)()
+
+        asyncio.run(drive())
+        tm._dispatch_to_scheduler.assert_not_called()
+        tm.metrics_collector.observe_one_aborted_request.assert_not_called()
+
+    def test_disconnect_abort_dispatches_for_pending_state(self):
+        tm = _make_tokenizer_manager(self)
+        rid = "disconnected"
+        obj = _make_generate_obj(rid, is_single=True)
+        tm.rid_to_state[rid] = _make_req_state(rid)
+        tm.enable_metrics = True
+        tm.metrics_collector = Mock()
+        tm._dispatch_to_scheduler = Mock()
+
+        async def drive():
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await tm.create_abort_task(obj)()
+
+        asyncio.run(drive())
+
+        tm._dispatch_to_scheduler.assert_called_once()
+        self.assertEqual(tm._dispatch_to_scheduler.call_args.args[0].rid, rid)
+        tm.metrics_collector.observe_one_aborted_request.assert_called_once_with(
+            tm.metrics_collector.labels
+        )
+
+    def test_cancelled_batch_after_partial_dispatch_keeps_state_and_aborts(self):
+        tm = _make_tm_for_generate(self)
+        rids = ["batch_dispatched", "batch_pending"]
+        obj = _make_generate_obj(rids, is_single=False)
+        tm._send_one_request = Mock()
+
+        async def _cancelled_batch(batch_obj, request, dispatched_rids):
+            tm._send_one_request(Mock())
+            dispatched_rids.add(rids[0])
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._handle_batch_request = _cancelled_batch
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        self.assertIn(rids[0], tm.rid_to_state)
+        self.assertNotIn(rids[1], tm.rid_to_state)
+
+        tm._dispatch_to_scheduler = Mock()
+        serving = MagicMock(tokenizer_worker_num=1)
+
+        async def abort():
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.get_serving",
+                return_value=serving,
+            ), patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+                new=AsyncMock(),
+            ):
+                await tm.create_abort_task(obj)()
+
+        asyncio.run(abort())
+        tm._dispatch_to_scheduler.assert_called_once()
+        self.assertEqual(tm._dispatch_to_scheduler.call_args.args[0].rid, rids[0])
+
+    def test_cancelled_batch_after_full_dispatch_keeps_all_states(self):
+        tm = _make_tm_for_generate(self)
+        rids = ["batch0", "batch1"]
+        obj = _make_generate_obj(rids, is_single=False)
+
+        async def _cancelled_batch(batch_obj, request, dispatched_rids):
+            dispatched_rids.update(rids)
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._handle_batch_request = _cancelled_batch
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        self.assertTrue(set(rids).issubset(tm.rid_to_state))
+
+    def test_cancelled_parallel_sampling_aborts_generated_scheduler_rids(self):
+        tm = _make_tm_for_generate(self)
+        obj = _make_generate_obj(["root"], is_single=False)
+        sample_rids = {"sample0", "sample1"}
+
+        async def _cancelled_parallel_batch(batch_obj, request, dispatched_rids):
+            for rid in sample_rids:
+                tm.rid_to_state[rid] = _make_req_state(rid)
+            dispatched_rids.update(sample_rids)
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        tm._handle_batch_request = _cancelled_parallel_batch
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(drive())
+
+        self.assertTrue(sample_rids.issubset(tm.rid_to_state))
+        tm.abort_request = Mock()
+
+        async def abort():
+            with patch(
+                "sglang.srt.managers.tokenizer_manager.asyncio.sleep", new=AsyncMock()
+            ):
+                await tm.create_abort_task(obj)()
+
+        asyncio.run(abort())
+        self.assertCountEqual(
+            [call.args for call in tm.abort_request.call_args_list],
+            [(rid,) for rid in sample_rids],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs == {"force": True}
+                for call in tm.abort_request.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":
