@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -156,6 +156,57 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
 
+def validate_deepseek_v4_layer_split(server_args: ServerArgs) -> None:
+    """Validate --enable-dsa-cache-layer-split for DeepSeek V4.
+
+    Shards the NPU KV/indexer cache layers across prefill CP ranks; only legal
+    on PD prefill workers (decode needs a full local cache).
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_dsa_cache_layer_split:
+        return
+
+    if cfg.disaggregation_mode != "prefill":
+        if cfg.disaggregation_mode == "decode":
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is not supported on decode "
+                "workers. This flag is a prefill-CP optimization; decode "
+                "receives the full cache through PD transfer."
+            )
+        raise ValueError(
+            "--enable-dsa-cache-layer-split is only supported on PD prefill "
+            "workers. Non-PD workers also run decode and require ordinary "
+            "local decode cache semantics."
+        )
+    if not cfg.enable_prefill_cp:
+        raise ValueError(
+            "--enable-dsa-cache-layer-split requires --enable-prefill-cp "
+            "(it shards cache layers across context-parallel ranks)."
+        )
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-dsa-cache-layer-split is not supported with pipeline "
+            "parallelism (pp_size > 1) yet."
+        )
+    # The ascend backend subclasses the mooncake transfer path that layer
+    # split builds on, so both are allowed; mori/nixl are not.
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "ascend"):
+        raise ValueError(
+            "--enable-dsa-cache-layer-split supports the mooncake and ascend "
+            "transfer backends, got "
+            f"--disaggregation-transfer-backend {cfg.disaggregation_transfer_backend!r}."
+        )
+    if not is_npu():
+        raise ValueError(
+            "--enable-dsa-cache-layer-split for DeepSeek V4 currently requires "
+            "the NPU (Ascend) backend."
+        )
+    logger.info(
+        "DeepSeek V4 DSA cache layer split enabled: sharding KV/indexer cache "
+        f"layers across attn_cp_size={cfg.tp_size // cfg.dp_size} CP ranks."
+    )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     cfg = resolving_view(server_args)
@@ -207,7 +258,8 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         assert (
             cfg.tp_size <= 8
         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-    if cfg.moe_a2a_backend not in ("none", "deepep", "megamoe"):
+    supported_a2a_backends = ("none", "deepep", "megamoe", "ascend_fuseep")
+    if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(
             f"DeepSeekV4 CP supports moe_a2a_backend in {supported_a2a_backends}, "
             f"got {cfg.moe_a2a_backend!r}."

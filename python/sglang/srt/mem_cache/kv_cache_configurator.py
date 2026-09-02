@@ -1294,12 +1294,26 @@ class KVCacheConfigurator:
         # follows the same fixed ring ownership as GPU. Do not replace the
         # configurator's C4-SWA/C128-request budgets with a paged allocator
         # estimate: Atlas A3 cache_mode=2 consumes explicit flat state_locs.
+        pool_kwargs = {}
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
             )
 
             pool_cls = DSV4NPUTokenToKVPool
+            # Prefill-CP layer split: shard the KV/indexer cache layers across
+            # CP ranks.
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            layer_shard_rank, layer_shard_size = get_glm_dsa_cp_layer_shard_info(self)
+            if layer_shard_rank is not None:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
+                    LayerSplitDSV4NPUTokenToKVPool,
+                )
+
+                pool_cls = LayerSplitDSV4NPUTokenToKVPool
+                pool_kwargs["layer_shard_rank"] = layer_shard_rank
+                pool_kwargs["layer_shard_size"] = layer_shard_size
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
@@ -1330,6 +1344,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            **pool_kwargs,
         )
         return token_to_kv_pool
 

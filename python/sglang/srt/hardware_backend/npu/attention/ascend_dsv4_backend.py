@@ -18,11 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-<<<<<<< HEAD
-=======
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
->>>>>>> 2fdfe9ff76 (dsv4(npu): support prefill context parallelism with interleave and zigzag (#23))
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel

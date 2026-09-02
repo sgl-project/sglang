@@ -15,6 +15,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,13 @@ class AscendKVManager(MooncakeKVManager):
         return (
             super()._requires_exact_state_index_match(st)
             or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
+    def _is_layer_split_kv_transfer(self) -> bool:
+        """Layer split registers only owned layers, so the positional
+        pp_size == 1 send path cannot be used."""
+        return self.disaggregation_mode == DisaggregationMode.PREFILL and (
+            get_parallel().config.enable_dsa_cache_layer_split
         )
 
     def init_engine(self):
@@ -80,6 +89,29 @@ class AscendKVManager(MooncakeKVManager):
 
             if state_type == AscendStateType.DSV4_C128:
                 dst = dst_kv_ptrs[c128_start:c128_end]
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            # NPU main KV layout [C4 KV, index K, index scale]; slice each dst
+            # section to the owned range (the trailing draft buffers pair
+            # positionally).
+            if state_type is None and self._is_layer_split_kv_transfer():
+                assert (
+                    end_layer is not None
+                ), "prefill_end_layer must be set for layer-split KV transfer"
+                owned_c4 = c4_end - c4_start
+                # Only the last CP rank ships the draft cache, so the src draft
+                # tail may be shorter than (or absent from) the dst tail.
+                n_draft_src = len(src_kv_ptrs) - 3 * owned_c4
+                n_draft_dst = len(dst_kv_ptrs) - 3 * c4_full
+                assert 0 <= n_draft_src <= n_draft_dst, (
+                    "Layer-split KV entry mismatch: src has "
+                    f"{len(src_kv_ptrs)} entries ({n_draft_src} draft), dst has "
+                    f"{len(dst_kv_ptrs)} ({n_draft_dst} draft)."
+                )
+                dst = []
+                for offset in (0, c4_full, 2 * c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                dst.extend(dst_kv_ptrs[3 * c4_full : 3 * c4_full + n_draft_src])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             # NPU main KV layout: [C4 KV, index K, index scale].
@@ -145,7 +177,7 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        if self.pp_size > 1 or self._is_layer_split_kv_transfer():
             if self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
