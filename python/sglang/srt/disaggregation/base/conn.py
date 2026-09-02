@@ -84,6 +84,10 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
+    # [scheme-1 scaffolding, default OFF] MLA replica sharding: when enabled, each
+    # prefill rank ships only 1/attn_tp of the pages (decode reconstructs via an
+    # intra-node all-gather). Set from SGLANG_MORI_SHARD_MLA_KV once Phase B lands.
+    mla_shard_enabled: bool = False
 
 
 class KVPoll:

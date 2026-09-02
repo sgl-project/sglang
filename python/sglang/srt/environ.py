@@ -586,6 +586,13 @@ class Envs:
     # Also the bound on outstanding (posted-but-not-completed) transfers, so it
     # is the primary throttle keeping the RDMA send queue from overflowing.
     SGLANG_MORI_TRANSFER_SHARDS = EnvInt(8)
+    # [scheme-1 scaffolding, default OFF] Eliminate MLA's TP-replicated KV transfer:
+    # each prefill rank ships only 1/tp of the pages, decode reconstructs the full
+    # latent via an intra-node all-gather (~4x measured raw-transfer speedup, more
+    # end-to-end from 8x-less per-NIC contention). NOT yet wired into the send path
+    # (Phase A = tested sharding filter only; Phase B decode aggregation TBD). Do NOT
+    # enable until Phase B lands — decode would receive only 1/tp of the KV.
+    SGLANG_MORI_SHARD_MLA_KV = EnvBool(False)
     # Poll cadence (ms) at which a transfer worker wakes to check the SLA while
     # waiting for completion; real completion still wakes it immediately.
     SGLANG_MORI_WAIT_POLL_MS = EnvInt(1000)

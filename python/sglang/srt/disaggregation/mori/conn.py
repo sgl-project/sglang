@@ -804,6 +804,37 @@ class MoriKVManager(CommonKVManager):
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
+    def _shard_kv_indices_for_mla(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        page_size: int,
+        shard_rank: int,
+        shard_size: int,
+    ) -> npt.NDArray[np.int32]:
+        """[scheme-1 Phase A, scaffolding — NOT yet wired into the send path]
+
+        MLA replicates the single latent KV head identically across all TP ranks, so
+        each prefill rank currently ships its full (identical) copy -> the same data
+        crosses the network `shard_size` times. This keeps only the pages this rank
+        owns (``(page_id) % shard_size == shard_rank``, pages kept whole), so the 8
+        NICs collectively ship 1x. Decode then reconstructs the full latent via an
+        intra-node all-gather (Phase B, TBD). Measured ~4x raw-transfer speedup.
+
+        Shard by PAGE (token block), NOT by latent dim, so each compressed layer's
+        per-page RDMA message stays intact. Unit-tested in
+        research/experiments/dsv4_ttft/shard_prototype.py (disjoint/complete/balanced).
+        """
+        if shard_size <= 1:
+            return kv_indices
+        if shard_rank < 0 or shard_rank >= shard_size:
+            logger.warning(
+                f"_shard_kv_indices_for_mla: shard_rank={shard_rank} out of "
+                f"range [0,{shard_size}); sending no pages"
+            )
+            return kv_indices[:0]
+        page_ids = kv_indices // page_size
+        return kv_indices[(page_ids % shard_size) == shard_rank]
+
     def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
         page_size = self.kv_args.page_size
 
