@@ -33,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     compute_position,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
 from sglang.srt.model_executor.runner_utils.pool import (
@@ -2203,6 +2204,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=(
+                torch.tensor(bs * block_size, dtype=torch.int32, device=device)
+                if enable_num_token_non_padded()
+                else None
+            ),
+            num_token_non_padded_cpu=bs * block_size,
         )
 
         if self.selector is not None:

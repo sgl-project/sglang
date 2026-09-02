@@ -215,6 +215,24 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             self.load_batch(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
+            # NPU skips the DFLASH verify pre-planning
+            # (DFlashVerifyInput.prepare_for_verify returns early for NPU),
+            # so load_batch may never have recorded the padded batch
+            # shapes. Compute them the same way load_batch does for the
+            # non-ragged path. Recompute on every batch: the verify batch
+            # size varies across requests (e.g. multi-concurrency), so a
+            # cached raw_num_token would slice a stale width and crash the
+            # input copy below.
+            raw_bs = forward_batch.batch_size
+            if self.require_mlp_tp_gather:
+                bs = self._pad_to_bucket(
+                    self._max_dp_batch_size(forward_batch), self.capture_bs
+                )
+            else:
+                bs = self._pad_to_bucket(raw_bs, self.capture_bs)
+            self.raw_bs = raw_bs
+            self.raw_num_token = raw_bs * self.captured_req_width
+            self.bs = bs
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -232,6 +250,52 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
                     forward_batch.mrope_positions
                 )
+
+            # The pre-planned path skipped init_forward_metadata_out_graph,
+            # so block_tables/seq_lens/swa_mask stayed at capture-time values
+            # during replay. Refresh them so attention reads correct KV pages.
+            from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+                build_replay_fb_view,
+            )
+
+            self.buffers.seq_lens[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.seq_lens_cpu[: self.raw_bs].copy_(
+                forward_batch.seq_lens_cpu[: self.raw_bs]
+            )
+            self.buffers.seq_lens_cpu[self.raw_bs : self.bs].fill_(
+                self.seq_len_fill_value
+            )
+            self.buffers.req_pool_indices[: self.raw_bs].copy_(
+                forward_batch.req_pool_indices[: self.raw_bs]
+            )
+            self.buffers.req_pool_indices[self.raw_bs : self.bs].fill_(0)
+            # The captured graph binds this static buffer for full-pool KV
+            # writes in save_kv_cache. Without this copy, replay writes the
+            # verify KV to stale capture-time slots while block_table points
+            # at the real (never-written) slots, and the error accumulates
+            # per verify iteration. Zero the padded tail to match the
+            # registry ZERO padding policy.
+            if forward_batch.out_cache_loc is not None:
+                _padded_num_token = self.bs * self.captured_req_width
+                _n = min(self.raw_num_token, forward_batch.out_cache_loc.shape[0])
+                self.buffers.out_cache_loc[:_n].copy_(forward_batch.out_cache_loc[:_n])
+                self.buffers.out_cache_loc[_n:_padded_num_token].zero_()
+            fb_view = build_replay_fb_view(
+                forward_batch=forward_batch,
+                buffers=self.buffers,
+                bs=self.bs,
+                raw_bs=self.raw_bs,
+                num_tokens=self.bs * self.captured_req_width,
+                seq_len_fill_value=self.seq_len_fill_value,
+                capture_forward_mode=self.capture_forward_mode,
+                is_encoder_decoder=self.is_encoder_decoder,
+            )
+            self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
         graph_key = self._make_graph_key(self.bs)
 
