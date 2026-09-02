@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import time
 from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -24,7 +23,6 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
-from sglang.srt.mem_cache.utils import hash_str_to_int64
 from sglang.srt.runtime_context import get_memory, get_model
 from sglang.srt.utils import freeze_gc, get_device_module
 
@@ -180,7 +178,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         _storage=None,
     ):
         self.page_size = params.page_size
-        self._tp_size = server_args.tp_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
         # Coalesce queued offload tasks up to this many pages; offload_nodes
@@ -362,8 +359,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.close()
             raise
 
-        self._cp_size = params.attn_cp_size
-        self._pp_size = params.pp_size
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -383,37 +378,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             "offload": 0,
             # offload / offload_batches is the coalescing actually achieved.
             "offload_batches": 0,
-            "extkv_reported": 0,
-            "extkv_revoked": 0,
-            "extkv_reconcile_failures": 0,
         }
-        backend_name = getattr(self.backend_mode, "name", str(self.backend_mode))
-        self._extkv_enabled = (
-            tp_rank == 0
-            and backend_name == "Distributed"
-            and _config_bool(os.getenv("UMBP_EXTKV_REPORT", "0"), "UMBP_EXTKV_REPORT")
-        )
-        self._extkv_batch_size = max(
-            1, int(os.getenv("UMBP_EXTKV_REPORT_BATCH", "512"))
-        )
-        self._extkv_flush_seconds = max(
-            0.01, float(os.getenv("UMBP_EXTKV_FLUSH_MS", "100")) / 1000.0
-        )
-        self._extkv_reconcile_seconds = max(
-            1.0, float(os.getenv("UMBP_EXTKV_RECONCILE_SECONDS", "60"))
-        )
-        self._extkv_lock = threading.Lock()
-        self._extkv_rpc_lock = threading.Lock()
-        self._extkv_pending: set[str] = set()
-        self._extkv_reported: set[str] = set()
-        self._extkv_required_keys: dict[str, tuple[str, ...]] = {}
-        self._extkv_stop = threading.Event()
-        self._extkv_thread: threading.Thread | None = None
-        self._extkv_tier_dram = None
-        if self._extkv_enabled:
-            import mori.umbp as _umbp_mod
-
-            self._extkv_tier_dram = _umbp_mod.UMBPTierType.DRAM
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
@@ -427,13 +392,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._closed = False
         self._load_thread.start()
         self._offload_thread.start()
-        if self._extkv_enabled:
-            self._extkv_thread = threading.Thread(
-                target=self._extkv_thread_func,
-                daemon=True,
-                name="umbp-extkv-reconcile",
-            )
-            self._extkv_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -915,187 +873,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for start in range(0, self.num_layers, self.layer_group)
         ]
 
-    def _extkv_page_hashes(self, expanded: list[PoolTransfer]) -> list[str]:
-        """Return the logical KV page hashes exactly once for an offload task."""
-        if not self._extkv_enabled:
-            return []
-        for transfer in expanded:
-            entry = self.pools[transfer.name]
-            if entry.indices_from_pool == PoolName.KV and transfer.keys:
-                return list(transfer.keys)
-        return []
-
-    def _extkv_keys_for_page(self, page_hash: str) -> tuple[str, ...]:
-        """Build every object key required to restore one logical block."""
-        required: list[str] = []
-        for pp_rank in range(self._pp_size):
-            for cp_rank in range(self._cp_size):
-                for tp_rank in range(self._tp_size):
-                    rank_suffix = f"tp{tp_rank}_cp{cp_rank}_pp{pp_rank}"
-                    for pool_name in self.pools:
-                        keys, _ = self.storage._get_hybrid_page_component_keys(
-                            [page_hash],
-                            PoolTransfer(name=pool_name),
-                            rank_suffix=rank_suffix,
-                        )
-                        required.extend(keys)
-        # Stable de-duplication protects against two logical entries resolving
-        # to the same physical object without changing the AND predicate.
-        return tuple(dict.fromkeys(required))
-
-    def _queue_extkv_pages(self, page_hashes: list[str]) -> None:
-        if not self._extkv_enabled or not page_hashes:
-            return
-        # Serialize state publication against reconcile/revoke. Otherwise a new
-        # offload can observe "reported", skip enqueueing, then lose the race to
-        # a concurrent reconcile that revokes and removes the same hash.
-        with self._extkv_rpc_lock:
-            with self._extkv_lock:
-                for page_hash in page_hashes:
-                    external_hash = str(hash_str_to_int64(page_hash))
-                    if external_hash not in self._extkv_required_keys:
-                        self._extkv_required_keys[external_hash] = (
-                            self._extkv_keys_for_page(page_hash)
-                        )
-                    if external_hash not in self._extkv_reported:
-                        self._extkv_pending.add(external_hash)
-                should_flush = len(self._extkv_pending) >= self._extkv_batch_size
-        if should_flush:
-            self._flush_extkv()
-
-    def _flush_extkv(self) -> None:
-        if not self._extkv_enabled:
-            return
-        with self._extkv_rpc_lock:
-            with self._extkv_lock:
-                hashes = list(self._extkv_pending)[: self._extkv_batch_size]
-            if not hashes:
-                return
-            try:
-                ok = self.storage.client.report_external_kv_blocks(
-                    hashes, self._extkv_tier_dram
-                )
-            except BaseException:
-                logger.exception("UMBP external-KV report RPC failed")
-                return
-            if not ok:
-                logger.warning(
-                    "UMBP external-KV report failed for %d hashes", len(hashes)
-                )
-                return
-            with self._extkv_lock:
-                self._extkv_pending.difference_update(hashes)
-                self._extkv_reported.update(hashes)
-            self._stats["extkv_reported"] += len(hashes)
-
-    def _reconcile_extkv_chunk(self, hashes: list[str]) -> None:
-        # Keep the exists -> revoke -> state-publication transaction serialized
-        # with report/queue, but only for one bounded RPC chunk. Holding this
-        # lock for the entire reconcile pass can stall the offload worker behind
-        # dozens of control-plane round trips.
-        with self._extkv_rpc_lock:
-            flattened: list[str] = []
-            spans: list[tuple[str, int, int]] = []
-            with self._extkv_lock:
-                for external_hash in hashes:
-                    keys = self._extkv_required_keys.get(external_hash, ())
-                    start = len(flattened)
-                    flattened.extend(keys)
-                    spans.append((external_hash, start, len(flattened)))
-            if not flattened:
-                return
-            try:
-                exists = list(self.storage.client.batch_exists(flattened))
-            except BaseException:
-                self._stats["extkv_reconcile_failures"] += 1
-                logger.exception("UMBP external-KV exists RPC failed")
-                return
-            if len(exists) != len(flattened):
-                self._stats["extkv_reconcile_failures"] += 1
-                logger.warning(
-                    "UMBP external-KV reconcile result mismatch: expected=%d actual=%d",
-                    len(flattened),
-                    len(exists),
-                )
-                return
-            dead = [
-                external_hash
-                for external_hash, start, end in spans
-                if start == end or not all(exists[start:end])
-            ]
-            if not dead:
-                return
-            try:
-                ok = self.storage.client.revoke_external_kv_blocks(
-                    dead, self._extkv_tier_dram
-                )
-            except BaseException:
-                self._stats["extkv_reconcile_failures"] += 1
-                logger.exception("UMBP external-KV revoke RPC failed")
-                return
-            if not ok:
-                self._stats["extkv_reconcile_failures"] += 1
-                logger.warning(
-                    "UMBP external-KV revoke failed for %d hashes", len(dead)
-                )
-                return
-            with self._extkv_lock:
-                self._extkv_reported.difference_update(dead)
-                for external_hash in dead:
-                    if external_hash not in self._extkv_pending:
-                        self._extkv_required_keys.pop(external_hash, None)
-            self._stats["extkv_revoked"] += len(dead)
-
-    def _reconcile_extkv(self) -> None:
-        if not self._extkv_enabled:
-            return
-        with self._extkv_lock:
-            reported = list(self._extkv_reported)
-            required = dict(self._extkv_required_keys)
-        chunk: list[str] = []
-        key_count = 0
-        for external_hash in reported:
-            count = len(required.get(external_hash, ()))
-            if chunk and key_count + count > RANGES_PER_CALL:
-                self._reconcile_extkv_chunk(chunk)
-                chunk = []
-                key_count = 0
-            chunk.append(external_hash)
-            key_count += count
-        if chunk:
-            self._reconcile_extkv_chunk(chunk)
-
-    def _clear_extkv(self) -> None:
-        if not self._extkv_enabled:
-            return
-        with self._extkv_rpc_lock:
-            try:
-                ok = self.storage.client.revoke_all_external_kv_blocks_at_tier(
-                    self._extkv_tier_dram
-                )
-            except BaseException:
-                ok = False
-                logger.exception("UMBP external-KV revoke-all RPC failed")
-            if not ok:
-                logger.warning("UMBP external-KV revoke-all failed during reset/close")
-            with self._extkv_lock:
-                self._extkv_pending.clear()
-                self._extkv_reported.clear()
-                self._extkv_required_keys.clear()
-
-    def _extkv_thread_func(self) -> None:
-        next_reconcile = time.monotonic() + self._extkv_reconcile_seconds
-        while not self._extkv_stop.wait(self._extkv_flush_seconds):
-            try:
-                self._flush_extkv()
-                now = time.monotonic()
-                if now >= next_reconcile:
-                    self._reconcile_extkv()
-                    next_reconcile = now + self._extkv_reconcile_seconds
-            except BaseException:
-                self._stats["extkv_reconcile_failures"] += 1
-                logger.exception("UMBP external-KV background task failed")
-
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
@@ -1145,14 +922,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
     def _offload_batch(self, tasks: list[_OffloadTask]) -> None:
         success = False
         try:
-            page_hashes = [
-                page_hash
-                for expanded, _ in tasks
-                for page_hash in self._extkv_page_hashes(expanded)
-            ]
             success = self._run_offload(tasks)
-            if success:
-                self._queue_extkv_pages(page_hashes)
         except BaseException:
             logger.exception("UMBP offload failed")
             success = False
@@ -1247,7 +1017,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending.clear()
         self._load_queue.join()
         self._offload_queue.join()
-        self._clear_extkv()
         while True:
             try:
                 self._offload_results.get_nowait()
@@ -1271,10 +1040,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             if thread.is_alive():
                 queue.put(None)
                 thread.join()
-        if self._extkv_thread is not None:
-            self._extkv_stop.set()
-            self._extkv_thread.join()
-            self._extkv_thread = None
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until
