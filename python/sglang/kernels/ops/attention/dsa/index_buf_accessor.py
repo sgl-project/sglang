@@ -467,7 +467,7 @@ def _get_k_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # buf[page_index, token_offset_in_page * index_head_dim : ...]
@@ -544,7 +544,7 @@ def _get_s_triton_kernel(
     token_offset_in_page = token_id % page_size
 
     # Load the page index from page_indices
-    page_index = tl.load(page_indices_ptr + page_idx)
+    page_index = tl.load(page_indices_ptr + page_idx).to(tl.int64)
 
     # Calculate source offset in buf
     # Scales are stored after K data: page_size * index_head_dim offset
@@ -677,7 +677,7 @@ def _get_k_and_s_triton_kernel(
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+    ).to(tl.int64)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.
