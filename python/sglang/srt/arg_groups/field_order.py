@@ -387,6 +387,7 @@ POSITIONAL_FIELD_ORDER = (
     "limit_mm_data_per_request",
     "enable_mm_global_cache",
     "image_processor_backend",
+    "mm_preprocessing_device",
     "mm_global_cache_backend",
     "disable_fast_image_processor",
     "mm_feature_transport",
