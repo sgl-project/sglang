@@ -257,7 +257,10 @@ def refresh_cutedsl_standard_scales_for_weight_update(
     w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
         resolve_cutedsl_standard_scales(layer)
     )
-    if layer.quant_config.use_per_token_activation:
+    if (
+        layer.quant_config.use_per_token_activation
+        and layer._cutedsl_wrapper.quant_mode == "w4a4"
+    ):
         used_input_scale = _make_per_token_global_scale(used_input_scale)
 
     new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
@@ -319,6 +322,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
+    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
         f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
@@ -360,12 +365,13 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             activation_type=_cutedsl_wrapper_activation_type(
                 layer.moe_runner_config.activation, ActivationType
             ),
+            quant_mode=quant_mode,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
             resolve_cutedsl_standard_scales(layer)
         )
-        if layer.quant_config.use_per_token_activation:
+        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
             used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
@@ -422,6 +428,9 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # v2 only: quantize hidden states with per-token dynamic activation scales.
     use_per_token_activation: bool = False
 
+    # v2 only: FlashInfer CuTe DSL activation/weight quantization mode.
+    quant_mode: str = "w4a4"
+
     # v1 only: SBO down-GEMM overlap args.
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
@@ -461,6 +470,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
             per_token_activation=True,
             backend="cute-dsl",
         )
+    elif quant_info.quant_mode == "w4a16":
+        x_fp4 = hidden_states
+        x_sf = None
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -470,11 +483,12 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         )
         per_token_scale = None
 
-    seq_len, hidden_size = hidden_states.shape
-    x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
-    x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-        seq_len, hidden_size // _FP4_SF_VEC_SIZE
-    )
+    if quant_info.quant_mode != "w4a16":
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
 
     output = quant_info.wrapper.run(
         x=x_fp4,
@@ -484,7 +498,9 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -496,10 +512,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
 @register_fused_func("flashinfer", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     """CuteDSL fused func for flashinfer alltoall dispatcher.
 
     Two cases depending on whether the dispatcher did FP4 quantization:
@@ -508,6 +524,10 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     """
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
@@ -535,6 +555,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
                 "so the runner can forward per_token_scale to FlashInfer."
             )
         # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+        per_token_scale = None
+    elif quant_info.quant_mode == "w4a16":
         x_fp4 = hidden_states
         per_token_scale = None
     else:
@@ -571,7 +594,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=quant_info.w13_weight_sf,
         w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=quant_info.a2_scale,
+        fc2_input_scale=(
+            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
+        ),
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
@@ -579,6 +604,9 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
+
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return StandardCombineInput(hidden_states=output)
 
     # Write into pre-allocated workspace buffer if available
     if dispatch_output.moe_output is not None:

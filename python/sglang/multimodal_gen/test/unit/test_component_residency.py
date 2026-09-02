@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -8,13 +9,20 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
     ResidencyState,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    ComponentResidencyError,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentOffloadStrategy,
     ResidentStrategy,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+    ImageEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def test_component_offload_releases_preferred_component_after_request():
@@ -171,6 +179,44 @@ def _manager_for_stage(stage, modules):
     return manager, server_args
 
 
+def _server_args_with_component_offload(component_name):
+    server_args = ServerArgs.__new__(ServerArgs)
+    server_args.component_residency = {component_name: "component-offload"}
+    return server_args
+
+
+def test_explicit_component_offload_requires_a_declared_request_use():
+    stage = _Stage()
+    pipeline = SimpleNamespace(
+        modules={"auxiliary": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args_with_component_offload("auxiliary")
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    with pytest.raises(
+        ComponentResidencyError,
+        match="'auxiliary'.*ComponentUse declaration",
+    ):
+        manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
+
+
+def test_declared_component_use_admits_explicit_component_offload():
+    stage = _Stage(ComponentUse("stage", "auxiliary"))
+    pipeline = SimpleNamespace(
+        modules={"auxiliary": torch.nn.Linear(2, 2)},
+        _stage_name_mapping={"stage": stage},
+        component_residency_strategies={},
+    )
+    server_args = _server_args_with_component_offload("auxiliary")
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+
+    manager.begin_request([stage], SimpleNamespace(is_warmup=False), server_args)
+
+
 def test_single_component_stage_is_prepared_at_stage_entry():
     module = torch.nn.Linear(2, 2)
     use = ComponentUse("stage", "text_encoder")
@@ -210,11 +256,46 @@ def test_realtime_text_encoder_use_starts_at_call_site():
     stage.text_encoders = [None]
     stage._registered_stage_name = None
 
-    uses = stage.component_uses(SimpleNamespace(), "RealtimeTextEncodingStage")
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}, pipeline_config=None),
+        "RealtimeTextEncodingStage",
+    )
 
     assert len(uses) == 1
     assert uses[0].component_name == "text_encoder"
     assert uses[0].start_at_stage_entry is False
+
+
+def test_image_encoder_use_has_exact_precision():
+    stage = ImageEncodingStage.__new__(ImageEncodingStage)
+    stage.image_encoder = object()
+    stage.text_encoder = None
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={"image_encoder": "fp16"}),
+        "ImageEncodingStage",
+    )
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("image_encoder", torch.float16)
+    ]
+
+
+def test_image_encoder_use_preserves_loaded_dtype_without_override():
+    stage = ImageEncodingStage.__new__(ImageEncodingStage)
+    stage.image_encoder = object()
+    stage.text_encoder = None
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(
+        SimpleNamespace(component_precisions={}),
+        "ImageEncodingStage",
+    )
+
+    assert [(use.component_name, use.target_dtype) for use in uses] == [
+        ("image_encoder", None)
+    ]
 
 
 def test_qwen_layered_uses_loaded_text_encoder(monkeypatch):

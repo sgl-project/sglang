@@ -4,6 +4,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
     get_serving,
     get_spec,
@@ -18,6 +19,10 @@ from sglang.srt.utils.common import (
     ceil_align,
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
+)
+from sglang.srt.utils.weight_versions import (
+    WeightVersionEvent,
+    truncate_weight_version_events,
 )
 
 # Copyright 2023-2024 SGLang Team
@@ -75,6 +80,14 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.beam_search.batch_tail import (
+    BeamTail,
+    append_beam_tail,
+    beam_retraction_order,
+    num_beam_member_rows,
+    strip_beam_tail,
+)
+from sglang.srt.beam_search.fork import free_member_rows
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
@@ -105,7 +118,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     retraction_backup,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -125,10 +138,8 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -498,6 +509,22 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
             )
             self.feature.acknowledge_consumption(consumer_count)
 
+    def release_transport_proxies(self, consumer_count: int = 1) -> None:
+        """Best-effort release of proxies left by an abandoned request."""
+        values = [self.feature, self.precomputed_embeddings]
+        values.extend(self.model_specific_data.values())
+        for value in values:
+            if not isinstance(value, CudaIpcTensorTransportProxy):
+                continue
+            count = self._resolve_transport_consumer_count(value, consumer_count)
+            try:
+                value.release_without_reconstruction(count)
+            except Exception:
+                logger.warning(
+                    "Failed to release an abandoned multimodal transport proxy",
+                    exc_info=True,
+                )
+
     @staticmethod
     def _resolve_transport_consumer_count(proxy, requested_count: int) -> int:
         """Clamp a group acknowledgement to the proxy's actual consumer set."""
@@ -632,7 +659,18 @@ class MultimodalInputs:
     def release_features(self):
         """Release feature tensors to free GPU memory."""
         for item in self.mm_items:
-            item.feature = None
+            try:
+                # A request can be rejected before a deferred GPU feature is
+                # reconstructed. Acknowledge that transport lease before the
+                # proxy is dropped so the tokenizer pool can reuse its slice.
+                item.acknowledge_deferred_cuda_ipc_feature()
+            except Exception:
+                logger.warning(
+                    "Failed to release an unused multimodal feature transport",
+                    exc_info=True,
+                )
+            finally:
+                item.feature = None
 
     @staticmethod
     def from_processor_output(obj: MultimodalProcessorOutput):
@@ -642,14 +680,19 @@ class MultimodalInputs:
 
         # try reconstructing from cuda-ipc
         reconstruct_device = None
-        for mm_item in mm_items:
-            if (
-                mm_item.has_cuda_ipc_proxy()
-                and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
-            ):
-                if reconstruct_device is None:
-                    reconstruct_device = torch.cuda.current_device()
-                mm_item.reconstruct(reconstruct_device)
+        try:
+            for mm_item in mm_items:
+                if (
+                    mm_item.has_cuda_ipc_proxy()
+                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
+                ):
+                    if reconstruct_device is None:
+                        reconstruct_device = torch.cuda.current_device()
+                    mm_item.reconstruct(reconstruct_device)
+        except BaseException:
+            for mm_item in mm_items:
+                mm_item.release_transport_proxies()
+            raise
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -804,13 +847,58 @@ class ReqLogprob:
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class ReqKvInfo:
-    kv_allocated_len: int
-    # The length of KV that have been removed in swa cache.
-    # SWA KV cache eviction behavior differs by cache type:
-    # - Radix cache: KV in range [cache_protected_len, swa_evicted_seqlen) is freed manually in
-    #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
-    # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
-    swa_evicted_seqlen: int
+    # Device KV a request holds outside the prefix cache. Always present on the Req;
+    # whether any KV is held is `holds_kv` (a row is registered).
+    # Match observations and scheduling state stay on the Req itself.
+    req_pool_idx: Optional[int] = None  # req_to_token row, the register for the slots
+
+    # The request's own KV is [cache_protected_len, kv_allocated_len).
+    cache_protected_len: int = 0  # Tree cache owns [0, here) (matched or inserted)
+    kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
+    kv_allocated_len: int = 0
+
+    # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
+    swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
+    swa_evicted_seqlen: int = 0  # SWA eviction cursor
+
+    # Host-side KV backup the request holds across a retraction (unified cache).
+    retraction_backup: Optional[RetractionBackup] = None
+
+    # Mamba state: an independent resource; whether it is held is `holds_mamba`.
+    mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+    mamba_next_track_idx: Optional[int] = None  # 0 or 1
+    mamba_last_track_idx: Optional[int] = None  # 0 or 1
+    # Seq len of the last cached mamba state
+    mamba_last_track_seqlen: Optional[int] = None
+    # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
+    mamba_cow_src_index: Optional[torch.Tensor] = None
+    # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
+    mamba_needs_clear: bool = False
+
+    def swa_dead_lo(self, page_size: int) -> int:
+        # Lowest SWA position this request may free itself: above the tree-owned
+        # prefix and above the eviction shield, page-aligned upward.
+        lo = max(self.cache_protected_len, self.swa_evict_floor)
+        if page_size > 1 and lo > self.cache_protected_len:
+            lo = ceil_align(lo, page_size)
+        return lo
+
+    @property
+    def holds_kv(self) -> bool:
+        return self.req_pool_idx is not None
+
+    @property
+    def holds_mamba(self) -> bool:
+        return self.mamba_pool_idx is not None
+
+    @property
+    def is_kv_released(self) -> bool:
+        return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
+
+    def mark_kv_released(self) -> None:
+        self.kv_allocated_len = 0
+        self.swa_evicted_seqlen = 0
 
 
 class Req(ReqDllmMixin):
@@ -892,16 +980,10 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
-        self.kv_committed_len = 0
-        self.kv: Optional[ReqKvInfo] = None
-        self.retraction_backup: Optional[RetractionBackup] = None
+        self.kv = ReqKvInfo()
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
-
-        # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
-        # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
-        self.swa_evict_floor: int = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -943,22 +1025,6 @@ class Req(ReqDllmMixin):
         self.lora_id = lora_id
         self.routing_key = routing_key
 
-        # Memory pool info
-        self.req_pool_idx: Optional[int] = None
-        self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
-        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
-        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
-        self.mamba_last_track_idx: Optional[int] = None  # 0 or 1
-        self.mamba_last_track_seqlen: Optional[int] = (
-            None  # seq len of the last cached mamba state
-        )
-        # the branching point seqlen to track mamba state. If set, given by prefix match,
-        # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
-        self.mamba_branching_seqlen: Optional[int] = None
-        # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
-        self.mamba_cow_src_index: Optional[torch.Tensor] = None
-        # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
-        self.mamba_needs_clear: bool = False
         # Lazy extra buffer: skip radix cache insert when prealloc failed at
         # boundary — the forward overwrites the only slot, corrupting the state.
         self.mamba_lazy_is_insert: bool = True
@@ -1011,6 +1077,10 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
+        # The branching point seqlen to track mamba state. If set, given by prefix
+        # match, it will be the tracked seqlen in the ping pong buffer for the
+        # right prefill pass.
+        self.mamba_branching_seqlen: Optional[int] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1018,6 +1088,11 @@ class Req(ReqDllmMixin):
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Storage prefetch retry state while queued
+        # (see Scheduler._retry_missed_storage_prefetches).
+        self.storage_prefetch_retry_pending = False
+        self.storage_prefetch_retry_wait_polls = 0
+        self.storage_prefetch_retry_attempts = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1025,8 +1100,6 @@ class Req(ReqDllmMixin):
         # per-component nodes this req skipped locking (e.g. mamba on the decode
         # hold, already COW'd), so their dec releases only what it took.
         self.skip_lock_node_ids: dict = {}
-        # The prefix length that is inserted into the tree cache
-        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -1037,6 +1110,8 @@ class Req(ReqDllmMixin):
         self.is_retracted = False
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
+
+        self.weight_version_events: List[WeightVersionEvent] = []
 
         # Incremental streamining
         self.send_token_offset: int = 0
@@ -1200,6 +1275,9 @@ class Req(ReqDllmMixin):
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # Beam search overlay: leader and internal members share one BeamGroup.
+        self.beam_group = None
+
         # Whether to return pooled hidden states (pre-head transformer output)
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
@@ -1214,6 +1292,12 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    @property
+    def is_beam_leader(self) -> bool:
+        """The user-visible row of a beam group; the group's other rows are
+        scheduler-internal and never streamed to the user."""
+        return self.beam_group is not None and self.beam_group.leader is self
 
     @property
     def is_prefill_only(self) -> bool:
@@ -1238,12 +1322,17 @@ class Req(ReqDllmMixin):
             or self.mamba_host_hit_length > 0
         )
 
+    def detach_kv(self) -> ReqKvInfo:
+        # Hand the KV record to a new holder; the req keeps a fresh empty one.
+        kv, self.kv = self.kv, ReqKvInfo()
+        return kv
+
     def effective_kv_committed_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
-            return min(self.kv_committed_len, len(self.origin_input_ids))
-        return self.kv_committed_len
+            return min(self.kv.kv_committed_len, len(self.origin_input_ids))
+        return self.kv.kv_committed_len
 
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
@@ -1395,9 +1484,9 @@ class Req(ReqDllmMixin):
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
-                self.cache_protected_len = match_result.cache_protected_len
+                self.kv.cache_protected_len = match_result.cache_protected_len
             else:
-                self.cache_protected_len = len(self.prefix_indices)
+                self.kv.cache_protected_len = len(self.prefix_indices)
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1680,7 +1769,7 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.indexer_topk = None
         self.last_node = None
-        self.cache_protected_len = 0
+        self.kv.cache_protected_len = 0
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
@@ -1695,17 +1784,17 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.inflight_middle_chunks = 0
-        self.mamba_pool_idx = None
-        self.mamba_ping_pong_track_buffer = None
-        self.mamba_next_track_idx = None
-        self.mamba_last_track_idx = None
-        self.mamba_last_track_seqlen = None
+        self.kv.mamba_pool_idx = None
+        self.kv.mamba_ping_pong_track_buffer = None
+        self.kv.mamba_next_track_idx = None
+        self.kv.mamba_last_track_idx = None
+        self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
-        self.mamba_cow_src_index = None
-        self.mamba_needs_clear = False
+        self.kv.mamba_cow_src_index = None
+        self.kv.mamba_needs_clear = False
         self.already_computed = 0
-        assert self.kv is None, "expect it is already released"
-        self.kv_committed_len = 0
+        assert not self.kv.holds_kv, "expect it is already released"
+        self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -1716,30 +1805,53 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.weight_version_events = truncate_weight_version_events(
+                self.weight_version_events, num_kept_tokens=self.send_token_offset
+            )
+
+    def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
+        if allocator.get_kvcache().cpu_copy_carries_mamba:
+            return None
+        if not isinstance(req_to_token_pool, HybridReqToTokenPool):
+            return None
+        return req_to_token_pool.mamba_pool
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            self.kv.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.retraction_backup = RetractionBackup(
+        mamba_pool = self._mamba_pool_needing_backup(
+            req_to_token_pool, token_to_kv_pool_allocator
+        )
+        self.kv.retraction_backup = RetractionBackup(
             cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
-                token_indices, mamba_indices=self.mamba_pool_idx
-            )
+                token_indices, mamba_indices=self.kv.mamba_pool_idx
+            ),
+            mamba_cpu=(
+                mamba_pool.get_cpu_copy(self.kv.mamba_pool_idx.unsqueeze(0))
+                if mamba_pool is not None and self.kv.holds_mamba
+                else None
+            ),
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
-        assert self.retraction_backup is not None
+        assert self.kv.retraction_backup is not None
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            self.kv.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
+        mamba_cpu = self.kv.retraction_backup.mamba_cpu
+        if mamba_cpu is not None and self.kv.holds_mamba:
+            req_to_token_pool.mamba_pool.load_cpu_copy(
+                mamba_cpu, self.kv.mamba_pool_idx.unsqueeze(0)
+            )
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.retraction_backup.cpu_tensors,
+            self.kv.retraction_backup.cpu_tensors,
             token_indices,
-            mamba_indices=self.mamba_pool_idx,
+            mamba_indices=self.kv.mamba_pool_idx,
         )
-        self.retraction_backup = None
+        self.kv.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -1812,9 +1924,18 @@ class Req(ReqDllmMixin):
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
-    def set_finish_with_abort(self, error_msg: str):
+    def set_finish_with_abort(
+        self,
+        error_msg: str,
+        status_code: int = HTTPStatus.BAD_REQUEST,
+        err_type: str = "BadRequestError",
+    ):
         if get_parallel().tp_rank == 0:
             logger.error(f"{error_msg}, {self.rid=}")
+        # Session requests share historical multimodal inputs with their prior
+        # request. The session owns and releases those features when it closes.
+        if self.multimodal_inputs is not None and self.session is None:
+            self.multimodal_inputs.release_features()
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = array(
@@ -1822,9 +1943,7 @@ class Req(ReqDllmMixin):
         )  # set it to one token to skip the long prefill
         self.return_logprob = False
         self.logprob_start_len = -1
-        self.to_finish = FINISH_ABORT(
-            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-        )
+        self.to_finish = FINISH_ABORT(error_msg, status_code, err_type)
 
     def update_reasoning_tokens(self, token_id, think_end_ids):
         if self._is_reasoning_over:
@@ -1870,7 +1989,7 @@ def mamba_lazy_spec_in_window(
     kv_committed_len lags device seq_lens by up to one verify under overlap;
     the 2x window absorbs it.
     """
-    seq_len = req.kv_committed_len
+    seq_len = req.kv.kv_committed_len
     window = 2 * max_draft_tokens
     return seq_len // mamba_track_interval != (seq_len + window) // mamba_track_interval
 
@@ -1892,7 +2011,11 @@ def set_mamba_track_indices_from_reqs(
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
         # Default to 0 (first ping-pong slot) to avoid TypeError.
         track_positions = [
-            req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
+            (
+                req.kv.mamba_next_track_idx
+                if req.kv.mamba_next_track_idx is not None
+                else 0
+            )
             for req in batch.reqs
         ]
     batch.mamba_track_buffer_indices = list(track_positions)
@@ -1914,7 +2037,6 @@ def release_req(
     *,
     req: Req,
     remaing_req_count: int,
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -1951,7 +2073,6 @@ def release_req(
 def retract_all(
     *,
     reqs: List[Req],
-    server_args: ServerArgs,
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
@@ -1962,7 +2083,6 @@ def retract_all(
         release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
-            server_args=server_args,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
@@ -2075,6 +2195,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
     mix_running_indices: Optional[torch.Tensor] = None
+    # CPU twin of mix_running_indices; lets the overlap tail resolve gather
+    # pinned mirrors without a device sync.
+    mix_running_indices_cpu: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
 
     # Token replacement embeddings and absolute positions (optional).
@@ -2102,8 +2225,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     # Per-batch snapshot of the logical ping-pong positions selected for this
-    # forward (normally req.mamba_next_track_idx; spec may override it). Result
-    # processing uses it to update req.mamba_last_track_idx, since both req-level
+    # forward (normally req.kv.mamba_next_track_idx; spec may override it). Result
+    # processing uses it to update req.kv.mamba_last_track_idx, since both req-level
     # indices may advance under overlap.
     mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
@@ -2132,8 +2255,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    can_run_dp_cuda_graph: bool = False
-    can_run_dp_breakable_cuda_graph: bool = False
+    can_run_decode_cuda_graph: bool = False
+    can_run_dp_prefill_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -2186,6 +2309,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
+
+    # Member rows riding one forward; None whenever reqs and rows are 1:1.
+    beam_tail: Optional[BeamTail] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -2442,12 +2568,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             req.extend_batch_idx += 1
 
-            # update req-level memory management fields
-            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
-            # allocation in alloc_for_extend above; they are currently a few
-            # steps apart and should become one owned-kv allocation step.
-            req.kv_committed_len = seq_len
-
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
@@ -2628,7 +2748,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         # Collect mamba init info for deferred ops on forward stream
-        if any(req.mamba_pool_idx is not None for req in reqs):
+        if any(req.kv.holds_mamba for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
 
         if self.model_config.is_encoder_decoder:
@@ -2644,25 +2764,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
-        chunk_size = mamba_cache_chunk_size()
-        # The donated depth has to be a radix node boundary. Read the tree's own
-        # page rather than re-deriving how DCP widens it; the kernel still
-        # snapshots on the chunk_size grid.
+        cache_chunk_size = mamba_cache_chunk_size()
+        state_chunk_size = getattr(
+            self.model_config.hf_text_config, "mamba_chunk_size", 64
+        )
+        # Donated depth must land on the actual DCP-widened radix page, while
+        # kernel snapshots stay on the cache chunk grid.
         checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
-            assert i % chunk_size == 0
+            # h is indexed relative to the extend start, so check that offset.
+            assert (i - len(req.prefix_indices)) % cache_chunk_size == 0, (
+                f"The force track calculation only handles last-position or "
+                f"unaligned seqlens, so it needs a chunk-aligned offset to "
+                f"start from. But i={i} prefix_len={len(req.prefix_indices)} "
+                f"chunk_size={cache_chunk_size} checkpoint_grid={checkpoint_grid}"
+            )
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with chunk_size-> retrieve from last_recurrent_state
+            # 1) aligned with cache_chunk_size-> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
             #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with chunk_size -> retrieve from h
+            # 2) unaligned with cache_chunk_size -> retrieve from h
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
         mask = req.extend_range.length >= checkpoint_grid
-        track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+        track_index = req.kv.mamba_ping_pong_track_buffer[
+            req.kv.mamba_next_track_idx
+        ].item()
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in
@@ -2681,13 +2811,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
-            # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
-            # retrieve the correct mamba state from h by _force_track_h()
+            # A coarser checkpoint grid may not be a model-state boundary, so
+            # force retrieval from the intermediate h state in that case.
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // state_chunk_size) * state_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
@@ -2697,11 +2825,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
-            req.mamba_last_track_idx = req.mamba_next_track_idx
+            req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
             if not mamba_extra_buffer_lazy_enabled():
-                req.mamba_next_track_idx = (
+                req.kv.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
+                        req.kv.mamba_next_track_idx
                     )
                 )
             if req.mamba_branching_seqlen is not None:
@@ -2709,7 +2837,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % chunk_size == 0
+                ) % cache_chunk_size == 0
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen
@@ -2720,7 +2848,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
-            req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
@@ -2734,14 +2862,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cow_dst_tensors = []
         clear_tensors = []
         for req in reqs:
-            if req.mamba_cow_src_index is not None:
-                cow_src_tensors.append(req.mamba_cow_src_index)
-                cow_dst_tensors.append(req.mamba_pool_idx.unsqueeze(0))
-                req.mamba_cow_src_index = None
-                req.mamba_needs_clear = False
-            elif req.mamba_needs_clear:
-                clear_tensors.append(req.mamba_pool_idx.unsqueeze(0))
-                req.mamba_needs_clear = False
+            if req.kv.mamba_cow_src_index is not None:
+                cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
+                req.kv.mamba_cow_src_index = None
+                req.kv.mamba_needs_clear = False
+            elif req.kv.mamba_needs_clear:
+                clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
+                req.kv.mamba_needs_clear = False
         self.mamba_cow_src_indices = (
             torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
@@ -2767,13 +2895,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
         self.mix_running_indices = running_batch.req_pool_indices
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        self.mix_running_indices_cpu = running_batch.req_pool_indices_cpu
+        if not self.spec_algorithm.is_none():
+            # Spec keeps no per-step out_cache_loc on the running batch; gather
+            # each tail's bonus slot at the committed length (rebound under overlap).
+            tail_base = torch.tensor(
+                [r.seqlen - 1 for r in running_batch.reqs],
+                dtype=torch.int64,
+                device=self.seq_lens.device,
+            )
+            running_out_cache_loc = self.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices.long(),
+                tail_base,
+            ].to(self.out_cache_loc.dtype)
+            # The spec relay is unresolved at schedule time, so merge_batch
+            # would null seq_lens_cpu; rebuild the tails from request state.
+            running_seq_lens_cpu = torch.tensor(
+                [int(r.seqlen) for r in running_batch.reqs], dtype=torch.int64
+            )
+            if self.seq_lens_cpu is None:
+                merged_seq_lens_cpu = running_seq_lens_cpu
+            else:
+                merged_seq_lens_cpu = torch.cat(
+                    [self.seq_lens_cpu, running_seq_lens_cpu]
+                )
+        else:
+            # Non-spec: the running batch carries prepared seq_lens_cpu
+            # (r.seqlen lags it under overlap); merge_batch concats it.
+            tail_base = None
+            running_out_cache_loc = running_batch.out_cache_loc
+            merged_seq_lens_cpu = None
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
         self.out_cache_loc = out_cache_loc
+        if merged_seq_lens_cpu is not None:
+            self.seq_lens_cpu = merged_seq_lens_cpu
+        if tail_base is not None:
+            # Spec seq_lens sit at the committed base (bonus token pending);
+            # this step commits it, so tails carry base + 1 or attention drops the row.
+            merged = self.seq_lens.clone()
+            merged[-running_bs:] = tail_base + 1
+            self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
+        # For overlap scheduler, the output_ids has one step delay;
+        # spec tail request state carries no delay in either mode.
+        if self.spec_algorithm.is_none():
+            delta = 0 if self.enable_overlap else -1
+        else:
+            delta = -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
         self.prefix_lens = self.prefix_lens + [
@@ -2788,6 +2958,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.is_prefill_only = False
 
+    def convert_decode_to_extend(self):
+        """View every decode request as a 1-token extend with its context as
+        prefix, making this a plain extend (prefill) batch. Called after the
+        DP mlp-sync when a peer rank runs extend, so this rank replays the
+        extend graphs; requires prepare_for_decode(); token count unchanged.
+        """
+        bs = self.batch_size()
+        self.forward_mode = ForwardMode.EXTEND
+        # Stale residue from this object's life as a prefill batch; the
+        # extend-merge path would exclude (silently drop) that req otherwise.
+        self.chunked_req = None
+        # Also stale residue; None keeps the prefill result path from
+        # re-reporting old prefill stats for what is decode work.
+        self.prefill_stats = None
+        for req in self.reqs:
+            req._refresh_fill_ids()
+            full_len = len(req.full_untruncated_fill_ids)
+            req.set_extend_range(full_len - 1, full_len)
+
+        # Same one-step output_ids delay handling as mix_with_running.
+        delta = 0 if self.enable_overlap else -1
+        self.prefix_lens = [
+            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
+        ]
+        self.extend_lens = [1] * bs
+        self.extend_num_tokens = bs
+        self.extend_logprob_start_lens = [0] * bs
+        self.decoding_reqs = self.reqs
+        self.is_prefill_only = False
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -2799,8 +2999,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
-            return new_pages * page_size
+            new_pages = sum(
+                1 for r in requests if r.kv.kv_committed_len % page_size == 0
+            )
+            return new_pages * page_size + num_beam_member_rows(requests)
 
         return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
@@ -2809,24 +3011,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + reserve - r.kv.kv_allocated_len)
+            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
             cur = r.kv.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
-        """Reclaim evictable tree-cache entries (shortfall only), then report
-        whether the next decode step fits in the KV pool."""
+        """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
+        the capacity gate (eviction + any per-step reservations of its own) —
+        the retract loop converges on this same check, so allocator-side
+        shortfalls retract gracefully instead of tripping fail-loud alloc
+        errors."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            num_tokens=num_tokens, tree_cache=self.tree_cache
+        )
 
-    def retract_decode(
-        self, server_args: ServerArgs
-    ) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
+        sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
@@ -2841,8 +3046,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
+            if req.beam_group is not None:
+                # Free member rows before release_req: they need the leader's kv
+                # info, which still carries the lockstep allocated length.
+                req.to_finish = FINISH_ABORT(
+                    "Beam search group aborted: KV cache pool is full. Beam "
+                    "groups cannot be retracted, so they are aborted instead "
+                    "of being requeued.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                free_member_rows(
+                    req.beam_group,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                )
+                # Aborting, so a host backup to resume from would be wasted.
+                self.release_req(idx, len(sorted_indices), offload_kv=False)
+                continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), server_args):
+            if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
                 # The retraction host pool could not hold the backup and the
@@ -2871,7 +3094,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args, offload_kv=False)
+            if last_req.beam_group is not None:
+                free_member_rows(
+                    last_req.beam_group,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                )
+            self.release_req(last_idx, 0, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2930,13 +3159,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         idx: int,
         remaing_req_count: int,
-        server_args: ServerArgs,
         offload_kv: bool = True,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
-            server_args=server_args,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -2975,12 +3202,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """
         pool = self.req_to_token_pool
         for i, req in enumerate(self.reqs):
-            buf = req.mamba_ping_pong_track_buffer
+            buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
             # Skip reqs not at a track boundary
             if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
                 continue
-            other_idx = 1 - req.mamba_next_track_idx
+            other_idx = 1 - req.kv.mamba_next_track_idx
             if buf[other_idx].item() != -1:
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
@@ -2993,7 +3220,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_slot = pool.mamba_allocator.alloc(1)
             if new_slot is not None:
                 pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                req.mamba_next_track_idx = other_idx
+                req.kv.mamba_next_track_idx = other_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3009,16 +3236,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         pool = self.req_to_token_pool
         track_positions: List[int] = []
         for req in self.reqs:
-            buf = req.mamba_ping_pong_track_buffer
+            buf = req.kv.mamba_ping_pong_track_buffer
             assert buf is not None
             if not mamba_lazy_spec_in_window(
                 req, mamba_track_interval, max_draft_tokens
             ):
                 # No crossing reachable: the scatter mask stays -1, the
                 # position is never written.
-                track_positions.append(req.mamba_next_track_idx)
+                track_positions.append(req.kv.mamba_next_track_idx)
                 continue
-            other_idx = 1 - req.mamba_next_track_idx
+            other_idx = 1 - req.kv.mamba_next_track_idx
             has_pending = buf[other_idx].item() != -1
             if not has_pending:
                 if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
@@ -3032,7 +3259,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     has_pending = True
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
-                other_idx if has_pending else req.mamba_next_track_idx
+                other_idx if has_pending else req.kv.mamba_next_track_idx
             )
         self.mamba_lazy_spec_track_positions_cpu = track_positions
 
@@ -3077,6 +3304,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_prepare_for_decode(self)
             return
 
+        # Beam member rows ride this decode batch: append them to the row
+        # tensors before allocation so alloc_for_decode covers them too.
+        strip_beam_tail(self)
+        append_beam_tail(self)
+
         if self.sampling_info.penalizer_orchestrator.is_required:
             self.cumulate_penalty_output_tokens()
 
@@ -3090,10 +3322,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
         # overlap forward.
@@ -3149,6 +3379,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -3231,6 +3462,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        strip_beam_tail(self)
+        strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -3320,8 +3553,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
-            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
+            can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
+            can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
@@ -3366,7 +3599,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # seqlen progress is monotonic per KV handle.
                     if (
                         req.decode_batch_idx >= 1
-                        and req.kv is not None
+                        and req.kv.holds_kv
                         and req.seqlen - 1 - sliding_window_size
                         >= req.kv.swa_evicted_seqlen + eviction_interval
                     ):

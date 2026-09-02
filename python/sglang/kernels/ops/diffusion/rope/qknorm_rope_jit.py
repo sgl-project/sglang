@@ -96,15 +96,13 @@ def _can_use_fused_qknorm_rope(
                 rotary_lanes,
             )
             return False
-    elif cache_has_full_width:
-        logger.warning("Full-width cos/sin caches are only supported for NeoX RoPE")
-        return False
     if pack_kv and cache_has_full_width:
         logger.warning("KV packing does not support full-width cos/sin caches")
         return False
-    if round_norm_before_rope and cache_dtype != dtype:
+    if round_norm_before_rope and cache_dtype not in (dtype, torch.float32):
         logger.warning(
-            "Exact fused QKNorm+RoPE requires cache dtype %s to match activation dtype %s",
+            "Exact fused QKNorm+RoPE requires cache dtype %s to match activation "
+            "dtype %s or use float32",
             cache_dtype,
             dtype,
         )

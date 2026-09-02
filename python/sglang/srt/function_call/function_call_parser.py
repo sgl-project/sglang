@@ -32,6 +32,7 @@ from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
+from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
@@ -43,6 +44,7 @@ from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import (
@@ -77,6 +79,7 @@ class FunctionCallParser:
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
         "lfm2": Lfm2Detector,
+        "ling3": Ling3Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
         "minicpm5": MiniCPM5Detector,
@@ -87,6 +90,7 @@ class FunctionCallParser:
         "qwen": Qwen25Detector,
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
+        "spark25": Spark25Detector,
         "step3": Step3Detector,
         "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,

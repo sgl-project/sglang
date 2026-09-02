@@ -14,9 +14,13 @@ through `get_parallel().override(...)`; the ones that are pure config /
 quantization are exercised directly.
 """
 
+import importlib.util
+import sys
 import unittest
 import unittest.mock
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+import pytest
 
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +31,25 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 def _quant(name: str):
     return SimpleNamespace(get_name=lambda: name)
+
+
+def _import_bailing_modules():
+    if importlib.util.find_spec("vllm") is not None:
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
+
+        return bailing_moe_v3, bailing_moe_nextn
+
+    # CPU CI omits vLLM; these fusion gates never execute the imported AWQ kernel.
+    vllm = ModuleType("vllm")
+    vllm.__path__ = []
+    custom_ops = ModuleType("vllm._custom_ops")
+    custom_ops.awq_dequantize = unittest.mock.Mock()
+    with unittest.mock.patch.dict(
+        sys.modules, {"vllm": vllm, "vllm._custom_ops": custom_ops}
+    ):
+        from sglang.srt.models import bailing_moe_nextn, bailing_moe_v3
+
+    return bailing_moe_v3, bailing_moe_nextn
 
 
 class _FusionGateCase(CustomTestCase):
@@ -226,6 +249,104 @@ class TestMiniMaxGates(_FusionGateCase):
             "No shared experts",
             self._reason(MiniMaxM3SparseForConditionalGeneration, wrapper),
         )
+
+
+class TestBailingMoeV3Gate(_FusionGateCase):
+    def _config(self):
+        return SimpleNamespace(
+            architectures=["BailingMoeV3ForCausalLM"],
+            num_shared_experts=1,
+            moe_intermediate_size=1024,
+        )
+
+    def _compressed_tensors(self, ignore):
+        return SimpleNamespace(
+            get_name=lambda: "compressed_tensors",
+            ignore=ignore,
+            packed_modules_mapping={},
+        )
+
+    def _reason_on_cuda(self, quant_config):
+        bailing_moe_v3, _ = _import_bailing_modules()
+
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            return self._reason(
+                bailing_moe_v3.BailingMoeV3ForCausalLM,
+                self._config(),
+                quant_config,
+            )
+
+    def test_compressed_tensors_mixed_expert_layout_cannot_fuse(self):
+        reason = self._reason_on_cuda(
+            self._compressed_tensors(
+                ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+            )
+        )
+        self.assertIn("different quant methods", reason)
+
+    def test_compressed_tensors_uniform_expert_layout_can_fuse(self):
+        self.assertIsNone(self._reason_on_cuda(self._compressed_tensors([])))
+
+    def test_nextn_uses_its_rewritten_architecture(self):
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+
+        config = self._config()
+        config.architectures = ["BailingMoeForCausalLMNextN"]
+        config.model_type = "bailing_hybrid"
+        config.use_kda = True
+        self._seed()
+        with (
+            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
+            unittest.mock.patch.object(
+                bailing_moe_v3.torch.cuda,
+                "get_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            reason = self._reason(
+                bailing_moe_nextn.BailingMoeForCausalLMNextN,
+                config,
+                self._compressed_tensors(
+                    ["re:.*(mlp|shared_experts)\\.(gate|up|gate_up|down|eh)_proj.*"]
+                ),
+            )
+
+        self.assertIn("different quant methods", reason)
+
+    def test_nextn_constructor_calls_v3_fusion_setup(self):
+        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+
+        config = SimpleNamespace(
+            architectures=["BailingMoeForCausalLMNextN"],
+            model_type="bailing_hybrid",
+            use_kda=True,
+            num_shared_experts=1,
+            vocab_size=32000,
+            hidden_size=4096,
+        )
+        self._seed(enable_dp_lm_head=False)
+        with (
+            get_parallel().override(tp_size=1, moe_ep_size=1),
+            unittest.mock.patch.object(
+                bailing_moe_v3,
+                "is_shared_experts_fusion_disabled",
+                return_value=False,
+            ),
+            unittest.mock.patch.object(bailing_moe_nextn, "BailingMoEModelNextN"),
+            unittest.mock.patch.object(bailing_moe_nextn, "ParallelLMHead"),
+            unittest.mock.patch.object(bailing_moe_nextn, "LogitsProcessor"),
+        ):
+            model = bailing_moe_nextn.BailingMoeForCausalLMNextN(config)
+
+        self.assertEqual(model.num_fused_shared_experts, 1)
 
 
 class TestQwen3_5Gate(_FusionGateCase):
@@ -518,6 +639,45 @@ class TestWrapperEntryClassGates(_FusionGateCase):
         )
 
 
+class TestA2ABackendGate(_FusionGateCase):
+    """`can_fuse_shared_expert` must refuse for every DeepEP-class backend it
+    is wired for. MoRI runs the same per-rank EP expert layout as DeepEP, so a
+    fused shared expert would occupy a global slot the layers never allocate —
+    the routed experts then read the wrong rows and accuracy collapses."""
+
+    def _config(self):
+        return SimpleNamespace(
+            model_type="qwen3_5_moe_text",
+            shared_expert_intermediate_size=1024,
+            moe_intermediate_size=1024,
+        )
+
+    def _use_backend(self, name: str):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.runtime_context import get_flags
+
+        moe = get_flags().moe
+        previous = moe.a2a_backend
+        moe.a2a_backend = MoeA2ABackend(name)
+        self.addCleanup(setattr, moe, "a2a_backend", previous)
+
+    def test_the_a2a_backends_refuse_fusion(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        for backend in ("deepep", "mori"):
+            with self.subTest(backend=backend):
+                self._use_backend(backend)
+                self.assertFalse(can_fuse_shared_expert(self._config(), None))
+
+    def test_a_plain_tp_deployment_still_fuses(self):
+        from sglang.srt.models.qwen2_moe import can_fuse_shared_expert
+
+        self._seed()
+        self._use_backend("none")
+        self.assertTrue(can_fuse_shared_expert(self._config(), None))
+
+
 class TestFamiliesWithoutAGate(_FusionGateCase):
     def test_qwen2_moe_style_families_follow_the_intent(self):
         """A family with no gate must not grow one by accident: the installer
@@ -530,4 +690,4 @@ class TestFamiliesWithoutAGate(_FusionGateCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

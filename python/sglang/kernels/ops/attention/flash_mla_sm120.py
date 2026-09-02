@@ -400,12 +400,16 @@ def _split_kv_pages_to_64(
     key = f"flash_mla_sm120_split:{dev}"
     buf = buffers.get(key)
     if buf is None or buf.shape[0] < num_dst_pages:
-        buf = torch.empty(
-            num_dst_pages,
-            _BYTES_PER_DST_PAGE_PADDED,
-            dtype=torch.uint8,
-            device=dev,
-        )
+        # The first allocation can happen under inference mode (autotune), but
+        # the buffer is written again during CUDA graph capture outside
+        # inference mode, where an inference tensor cannot be mutated.
+        with torch.inference_mode(False):
+            buf = torch.empty(
+                num_dst_pages,
+                _BYTES_PER_DST_PAGE_PADDED,
+                dtype=torch.uint8,
+                device=dev,
+            )
         buffers[key] = buf
     out = buf[:num_dst_pages]
 

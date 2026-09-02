@@ -91,7 +91,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
+from sglang.srt.layers.moe.utils import (
+    is_shared_experts_fusion_disabled,
+    uses_per_rank_fused_shared_slots,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale,
 )
@@ -153,7 +156,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -166,6 +175,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_gfx1250_supported,
     log_info_on_rank0,
     make_layers,
 )
@@ -294,9 +304,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
-    if _is_gfx95_supported:
+    if _is_gfx95_supported or _is_gfx1250_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
@@ -473,6 +484,31 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+def _apply_gguf_grouped_wo_a(
+    o: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_type: int,
+    o_lora_rank: int,
+    matmul_fn: Optional[Callable] = None,
+) -> torch.Tensor:
+    if matmul_fn is None:
+        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+        matmul_fn = fused_mul_mat_gguf
+
+    group_outputs = []
+    for group_id in range(o.shape[1]):
+        start = group_id * o_lora_rank
+        group_outputs.append(
+            matmul_fn(
+                o[:, group_id, :].contiguous(),
+                qweight[start : start + o_lora_rank],
+                qweight_type,
+            )
+        )
+    return torch.stack(group_outputs, dim=1)
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -501,6 +537,10 @@ def deepseek_v4_attention_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        output.zero_()
+        return
 
     query = query[:real_num_tokens]
     key_value = key_value[:real_num_tokens]
@@ -605,8 +645,11 @@ class MqaAttentionBase(nn.Module):
             else wo_b_reduce_results
         )
         if wo_a_keeps_quant_config is None:
+            keep_source_quant = (
+                quant_config is not None and quant_config.get_name() == "expert_pack"
+            )
             wo_a_quant_config: Optional[QuantizationConfig] = (
-                quant_config if fp8 else None
+                quant_config if fp8 or keep_source_quant else None
             )
         elif wo_a_keeps_quant_config:
             wo_a_quant_config = quant_config
@@ -817,13 +860,16 @@ class MQALayer(MqaAttentionBase):
             self.alt_streams = None
             self.alt_streams_indexer = None
 
-        from sglang.srt.utils import is_blackwell_supported
-
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
 
         self.compressor = None
         self.indexer = None
         if self.compress_ratio in (4, 128):
+            expert_pack_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                else None
+            )
             self.compressor = Compressor(
                 config,
                 layer_id=self.layer_id,
@@ -833,6 +879,7 @@ class MQALayer(MqaAttentionBase):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
+                quant_config=expert_pack_quant_config,
                 rotary_emb=self.rotary_emb,
             )
             if self.compress_ratio == 4:
@@ -1018,8 +1065,6 @@ class MQALayer(MqaAttentionBase):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -1030,6 +1075,7 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+        del qkv_a
 
         return q
 
@@ -1112,8 +1158,6 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
             q.record_stream(stream_q)
 
-        del qkv_a
-
         # Indexer + compressor: serial on current.
         if self.indexer is not None:
             self.indexer(
@@ -1133,6 +1177,7 @@ class MQALayer(MqaAttentionBase):
         # Join stream_kv + stream_q before downstream attention.
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_q)
+        del qkv_a
         return q
 
     def _forward_prepare_multi_stream_hip(
@@ -1180,7 +1225,7 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1297,7 +1342,7 @@ class MQALayer(MqaAttentionBase):
         )
 
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported:
+            if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
@@ -1690,10 +1735,19 @@ class MQALayer(MqaAttentionBase):
             )
             o = output
         else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = _apply_wo_a_bf16_matmul(
-                o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
-            )
+            wo_a_weight = getattr(self.wo_a, "weight", None)
+            if wo_a_weight is not None:
+                wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                o = _apply_wo_a_bf16_matmul(
+                    o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+                )
+            else:
+                o = _apply_gguf_grouped_wo_a(
+                    o,
+                    self.wo_a.qweight,
+                    self.wo_a.qweight_type.weight_type,
+                    self.o_lora_rank,
+                )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -1934,6 +1988,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+        from sglang.kernels.ops.layernorm.mhc import hc_combine
+
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
         # NCCL symmetric path: the Triton inplace MoE runner writes the expert
@@ -1943,7 +1999,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1).to(dtype)
+            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -2011,6 +2067,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
+            # Dispatch cascade: aiter HIP (gfx95) -> Triton (gfx95 small-batch
+            # <=64 tokens, or gfx1250 all sizes) -> TileLang -> None.
             input_norm_weight = (
                 self._input_layernorm_weight_bf16
                 if self._input_layernorm_weight_bf16 is not None
@@ -2036,11 +2094,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # The Triton fused post+pre returns the layer input WITHOUT
-                    # the input layernorm applied (norm_fused=False). Apply it
-                    # (fp8-quant on aiter gfx95) before attention, exactly as the
-                    # unfused hc_pre path below does; otherwise unnormalized
-                    # activations reach self_attn.
+                    # Triton fused post+pre (gfx95 small-batch or gfx1250) returns
+                    # norm_fused=False — the input layernorm is NOT folded.
+                    # gfx95 takes the fp8-quant path; gfx1250 takes plain layernorm.
                     if _use_aiter and _is_gfx95_supported:
                         x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                             hidden_states,
@@ -2053,10 +2109,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 else:
                     x_quant = None
             else:
-                # Fused dispatch declined: close the previous layer's deferred
-                # mHC post (prev_residual/prev_post/prev_comb) before opening this
-                # layer's pre. Skipping hc_post here would drop the previous-layer
-                # post state and corrupt all subsequent layers.
                 hidden_states = self.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
@@ -2138,9 +2190,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # The Triton fused post+pre skips the post-attention
-                    # layernorm (norm_fused=False); apply it before the MoE,
-                    # matching the unfused hc_pre path below.
                     hidden_states = self.post_attention_layernorm(hidden_states)
             else:
                 hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -2254,10 +2303,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "CP requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
-                    f"Got {moe_a2a_backend.value}."
+                assert (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_megamoe()
+                    or moe_a2a_backend.is_mori()
+                ), (
+                    "CP requires moe_a2a_backend in ('deepep', 'megamoe', 'mori'), "
+                    f"got {moe_a2a_backend.value!r}."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
@@ -2362,7 +2414,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         if not norm_fused:
-            if _use_aiter and _is_gfx95_supported:
+            if _use_aiter and (_is_gfx95_supported or _is_gfx1250_supported):
                 x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
                     hidden_states,
                     self.input_layernorm.weight,
@@ -2668,10 +2720,17 @@ class DeepseekV4Model(nn.Module):
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
+            embedding_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                else None
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 enable_tp=not is_dp_attention_enabled(),
+                quant_config=embedding_quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -3239,6 +3298,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "routed experts, so they cannot be fused into the quantized "
                 "routed-expert path."
             )
+        if get_parallel().moe_ep_size > 1 and not uses_per_rank_fused_shared_slots():
+            return (
+                "Expert parallelism keeps only a slice of the routed experts on "
+                "each rank, so the fused shared expert cannot be appended to the "
+                "routed weight tensor (only DeepEP/MegaMOE per-rank shared slots "
+                "support fusion under EP)."
+            )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
@@ -3367,10 +3433,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
-        if name == "embed.weight":
-            return "model.embed_tokens.weight"
-        if name == "head.weight":
-            return "lm_head.weight"
+        if name.startswith("embed."):
+            return "model.embed_tokens." + name.removeprefix("embed.")
+        if name.startswith("head."):
+            return "lm_head." + name.removeprefix("head.")
         if name == "norm.weight":
             return "model.norm.weight"
         if name.startswith("hc_head_"):
@@ -3508,8 +3574,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            weights = _dequant_fp8_wo_a_streaming(weights)
+        if not _FP8_WO_A_GEMM:
+            weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -3706,7 +3772,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 or name == "lm_head.weight"
                             ) and not self.pp_group.is_last_rank:
                                 continue
-                            elif COMPRESSOR_PART in name:
+                            elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
                                 assert is_kv != is_wgate
@@ -3743,6 +3809,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 or name.endswith(".wq_a.weight_scale_inv")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wq_a.qweight")
+                                or name.endswith(".wkv.qweight")
+                                or name.endswith(".wq_a.qweight_type")
+                                or name.endswith(".wkv.qweight_type")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
@@ -3757,8 +3827,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_weight
                                 )
                                 if len(bucket) == 2:
-                                    fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
+                                    fused_weight = _fuse_deepseek_v4_wqkv_a_pair(
+                                        param_name, bucket
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
@@ -3953,3 +4023,32 @@ def _dequant_fp8_wo_a(
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
+
+
+def _prepare_deepseek_v4_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Keep Expert Pack GGUF weights on the streaming load path."""
+
+    if quant_config is not None and quant_config.get_name() == "expert_pack":
+        logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+        return weights
+    return _dequant_fp8_wo_a_streaming(weights)
+
+
+def _fuse_deepseek_v4_wqkv_a_pair(
+    param_name: str, bucket: dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """Fuse Q/KV rows while preserving their common GGUF type scalar."""
+
+    q = bucket["q"]
+    kv = bucket["kv"]
+    if param_name.endswith(".qweight_type"):
+        if q.numel() != 1 or kv.numel() != 1 or q.item() != kv.item():
+            raise ValueError(
+                f"cannot fuse different GGUF qweight types for {param_name}: "
+                f"q={q.tolist()} kv={kv.tolist()}"
+            )
+        return q
+    return torch.cat([q, kv], dim=0)
