@@ -73,6 +73,49 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         self._pending_lora_a = None
         super().reset_batch_state()
 
+    def validate_lora_targets(
+        self,
+        base_model: torch.nn.Module,
+        target_modules: set[str],
+    ) -> None:
+        """Reject target layers that cannot honor UNO's token-row routing."""
+
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.utils import get_layer_id
+        from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
+
+        unsupported: list[str] = []
+        if "lm_head" in target_modules:
+            lm_head = getattr(base_model, "lm_head", None)
+            unsupported.append(f"lm_head ({type(lm_head).__name__})")
+        if "embed_tokens" in target_modules:
+            unsupported.append("embed_tokens (VocabParallelEmbedding)")
+
+        supported = (ColumnParallelLinear, RowParallelLinear)
+        target_moe = {"gate_up_proj", "down_proj"}.issubset(target_modules)
+        for module_name, module in base_model.named_modules():
+            parts = module_name.split(".")
+            named_target = bool(parts) and (
+                parts[-1] in target_modules or ".".join(parts[-2:]) in target_modules
+            )
+            special_moe_target = target_moe and isinstance(
+                module, (FusedMoE, InklingBatchDenseMLP)
+            )
+            if not (named_target or special_moe_target):
+                continue
+            if get_layer_id(module_name) is None:
+                continue
+            if not isinstance(module, supported):
+                unsupported.append(f"{module_name} ({type(module).__name__})")
+
+        if unsupported:
+            raise ValueError(
+                "UNO's LoRA backend supports only ColumnParallelLinear and "
+                "RowParallelLinear targets; unsupported target modules: "
+                + ", ".join(sorted(set(unsupported)))
+            )
+
     def prepare_lora_token_segments(
         self,
         *,

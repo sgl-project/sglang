@@ -1,4 +1,4 @@
-"""Startup validation for UNO tree dimensions."""
+"""Startup validation for UNO configuration."""
 
 import unittest
 from types import SimpleNamespace
@@ -12,11 +12,49 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestUnoTreeConfig(CustomTestCase):
+    def test_deterministic_inference_is_rejected_at_startup(self):
+        server_args = SimpleNamespace(
+            device="cuda",
+            speculative_draft_model_path=None,
+            uno_lora_path="/tmp/uno-lora",
+            enable_deterministic_inference=True,
+            enable_strict_thinking=False,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook.resolving_view",
+                side_effect=lambda args: args,
+            ),
+            self.assertRaisesRegex(ValueError, "enable-deterministic-inference"),
+        ):
+            _handle_uno(server_args)
+
+    def test_strict_thinking_is_rejected_at_startup(self):
+        server_args = SimpleNamespace(
+            device="cuda",
+            speculative_draft_model_path=None,
+            uno_lora_path="/tmp/uno-lora",
+            enable_deterministic_inference=False,
+            enable_strict_thinking=True,
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.speculative_hook.resolving_view",
+                side_effect=lambda args: args,
+            ),
+            self.assertRaisesRegex(ValueError, "enable-strict-thinking"),
+        ):
+            _handle_uno(server_args)
+
     def test_parent_list_overflow_is_rejected_at_startup(self):
         """An invalid tree must not survive startup and crash on first decode."""
 
         server_args = SimpleNamespace(
             device="cuda",
+            enable_deterministic_inference=False,
+            enable_strict_thinking=False,
             speculative_draft_model_path=None,
             uno_lora_path="/tmp/uno-lora",
             speculative_num_draft_tokens=8,

@@ -620,6 +620,10 @@ class LoRAManager:
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
+        self.lora_backend.validate_lora_targets(
+            base_model=self.base_model,
+            target_modules=self.target_modules,
+        )
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override

@@ -55,6 +55,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
 
+    def validate_lora_targets(
+        self,
+        base_model: torch.nn.Module,
+        target_modules: set[str],
+    ) -> None:
+        """Raise before wrapping when this backend cannot execute its targets."""
+        pass
+
     def run_lora_a_embedding(
         self,
         input_ids: torch.Tensor,

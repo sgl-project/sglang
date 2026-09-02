@@ -339,6 +339,16 @@ def _handle_uno(server_args: ServerArgs) -> None:
         )
     if cfg.uno_lora_path is None:
         raise ValueError("UNO requires --uno-lora-path.")
+    if cfg.enable_deterministic_inference:
+        raise ValueError(
+            "UNO does not support --enable-deterministic-inference because its "
+            "sampling path does not use per-request seeds."
+        )
+    if cfg.enable_strict_thinking:
+        raise ValueError(
+            "UNO does not support --enable-strict-thinking because it requires "
+            "grammar decoding."
+        )
 
     verify_width = cfg.speculative_num_draft_tokens
     if verify_width is None or int(verify_width) < 1:
