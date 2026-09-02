@@ -57,7 +57,6 @@ from sglang.srt.layers.moe.utils import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -338,15 +337,12 @@ class NemotronHMoE(nn.Module):
         shared_output: torch.Tensor | None,
     ) -> torch.Tensor:
         projection = self.fc2_latent_proj
-        if shared_output is not None and isinstance(projection, ReplicatedLinear):
-            quant_method = projection.quant_method
-            if isinstance(quant_method, UnquantizedLinearMethod):
-                return quant_method.apply_with_addend(
-                    projection,
-                    final_hidden_states,
-                    shared_output,
-                    projection.bias,
-                )
+        if shared_output is not None and type(projection) is ReplicatedLinear:
+            final_hidden_states, _ = projection(
+                final_hidden_states,
+                addend=shared_output,
+            )
+            return final_hidden_states
 
         final_hidden_states, _ = projection(final_hidden_states)
         if shared_output is not None:
