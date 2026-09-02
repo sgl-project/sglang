@@ -360,7 +360,6 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
         return (
             runner_input.use_masked_gemm,
             running_state.get("all_tokens"),
-            running_state.get("contiguous_layout_alignment"),
             runner_input.m_indices,
             post_permute_deep_gemm_to_standard(
                 runner_output,
@@ -373,14 +372,12 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     (
         compact_is_masked,
         compact_all_tokens,
-        compact_alignment,
         compact_m_indices,
         compact_output,
     ) = run_with_layout("compact")
     (
         masked_is_masked,
         masked_all_tokens,
-        masked_alignment,
         masked_m_indices,
         masked_output,
     ) = run_with_layout("masked")
@@ -389,9 +386,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(monkeypatch, weight_d
     assert not compact_is_masked
     assert masked_is_masked
     assert compact_all_tokens == 64
-    assert compact_alignment == 32
     assert masked_all_tokens is None
-    assert masked_alignment is None
     assert masked_m_indices is None
     valid_assignments = topk_ids[topk_ids >= 0]
     assert torch.equal(

@@ -88,7 +88,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         query = torch.zeros((4, 2, 3))
         key = torch.zeros_like(query)
         value = torch.zeros_like(query)
-        attn_sink = torch.zeros(2, dtype=torch.float32)
 
         op_names = {
             (False, False): "unified_attention_with_output",
@@ -152,7 +151,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                             value,
                             forward_batch,
                             key_value_num_tokens=3,
-                            attn_sink=attn_sink,
                         )
 
                     selected_name = op_names[(breakable, return_lse)]
@@ -165,7 +163,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                             {
                                 "use_mha_companion": True,
                                 "key_value_num_tokens": 3,
-                                "attn_sink": attn_sink,
                             }
                         ],
                     )

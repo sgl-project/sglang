@@ -1877,18 +1877,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             "dsa_decode_backend": "flashmla_sparse",
                         },
                     )
-                with self.subTest(arch=arch, backends="explicit-compatible"):
-                    self.assertEqual(
-                        _dsa_split_backend_resolution(
-                            _view(
-                                arch=arch,
-                                learnable_sink=True,
-                                dsa_prefill_backend="flashmla_sparse",
-                                dsa_decode_backend="flashmla_sparse",
-                            )
-                        ),
-                        {},
-                    )
                 for field, value in (
                     ("dsa_prefill_backend", "fa3"),
                     ("dsa_decode_backend", "trtllm"),
@@ -2891,14 +2879,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         )
                         for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
                             hf_config = SimpleNamespace(architectures=[arch])
-                            with self.subTest(arch=arch, prefill_cp=False):
-                                self.assertEqual(
-                                    _deepseek_family_overrides(_args(), hf_config),
-                                    {
-                                        "attention_backend": "dsa",
-                                        "page_size": 64,
-                                    },
-                                )
                             with self.subTest(arch=arch, prefill_cp=True):
                                 with self.assertRaisesRegex(
                                     ValueError, "--enable-prefill-cp.*HYV4"

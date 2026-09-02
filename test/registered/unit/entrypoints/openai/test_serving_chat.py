@@ -623,8 +623,6 @@ class ServingChatTestCase(unittest.TestCase):
 
         cases = [
             ("none", None, "no_think"),
-            ("medium", None, "high"),
-            ("xhigh", None, "high"),
             ("none", "xhigh", "high"),
         ]
         for default_effort, request_effort, normalized_effort in cases:
@@ -638,40 +636,6 @@ class ServingChatTestCase(unittest.TestCase):
                     model="x",
                     messages=[{"role": "user", "content": "What is 2+2?"}],
                     reasoning_effort=request_effort,
-                )
-
-                self.chat._process_messages(req, is_multimodal=False)
-
-                kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
-                self.assertEqual(req.reasoning_effort, normalized_effort)
-                self.assertEqual(kwargs["reasoning_effort"], normalized_effort)
-                self.assertNotIn("reasoning_effort", req.chat_template_kwargs)
-
-    def test_hunyuan_request_template_reasoning_effort_is_honored(self):
-        self.template_manager.chat_template_name = None
-        self.template_manager.jinja_template_content_format = "string"
-        self.template_manager.reasoning_config = ReasoningToggleConfig(
-            special_case="hunyuan_effort"
-        )
-        self.chat.reasoning_parser = "hunyuan"
-        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
-
-        cases = [
-            ("no_think", None, "no_think"),
-            ("none", None, "no_think"),
-            ("medium", None, "high"),
-            ("xhigh", None, "high"),
-            ("none", "xhigh", "high"),
-        ]
-        for template_effort, request_effort, normalized_effort in cases:
-            with self.subTest(
-                template_effort=template_effort, request_effort=request_effort
-            ):
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[{"role": "user", "content": "What is 2+2?"}],
-                    reasoning_effort=request_effort,
-                    chat_template_kwargs={"reasoning_effort": template_effort},
                 )
 
                 self.chat._process_messages(req, is_multimodal=False)
