@@ -529,7 +529,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
     def _next_channel_idx(self, text: str, start: int = 0) -> int:
         found = [
             idx
-            for token in (RESPONSE_OPEN, self.tool_start_token)
+            for token in (
+                RESPONSE_OPEN,
+                self.tool_start_token,
+                RESPONSE_CLOSE,
+                MESSAGE_CLOSE,
+            )
             if (idx := text.find(token, start)) != -1
         ]
         return min(found) if found else -1
@@ -616,7 +621,13 @@ class KimiK3Detector(BaseReasoningFormatDetector):
 
             if not self.stream_reasoning:
                 return StreamingParseResult()
-            markers = [self.think_end_token, self.tool_start_token, RESPONSE_OPEN]
+            markers = [
+                self.think_end_token,
+                self.tool_start_token,
+                RESPONSE_OPEN,
+                RESPONSE_CLOSE,
+                MESSAGE_CLOSE,
+            ]
             if not self.stripped_think_start:
                 markers.append(self.think_start_token)
             holdback = partial_suffix_len(buf, markers)

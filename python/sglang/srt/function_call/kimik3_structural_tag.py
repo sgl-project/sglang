@@ -24,6 +24,9 @@ from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
     CALL_OPEN,
+    MESSAGE_CLOSE,
+    RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     THINK_OPEN,
     TOOLS_CLOSE,
@@ -40,6 +43,8 @@ _JSON_TYPES = (
     "null",
 )
 _CLOSE_TOKEN = "<|close|>"
+_OPEN_TOKEN = "<|open|>"
+_END_OF_MSG_TOKEN = "<|end_of_msg|>"
 _ARGUMENT_CLOSE_SUFFIX = ARGUMENT_CLOSE.removeprefix(_CLOSE_TOKEN)
 _JSON_TO_XTML_TYPE = {
     "string": "string",
@@ -612,12 +617,21 @@ def get_kimik3_structural_tag(
     call_tags = [_tool_call_tag(tool) for tool in selected_tools]
     tools_tag = _tool_calls_tag(call_tags, parallel_tool_calls)
     if at_least_one:
+        # Resolve marker-looking prefixes through the response-close branch.
+        # Otherwise the model can repeat the still-legal <|close|> token while
+        # MESSAGE_CLOSE and EOS are masked by required tool choice.
         suffix: Format = SequenceFormat(
             elements=[
-                AnyTextFormat(
-                    excludes=[TOOLS_OPEN, THINK_OPEN, THINK_CLOSE, CALL_OPEN]
+                OptionalFormat(content=ConstStringFormat(value=RESPONSE_OPEN)),
+                TagFormat(
+                    begin="",
+                    content=AnyTextFormat(
+                        excludes=[_OPEN_TOKEN, _CLOSE_TOKEN, _END_OF_MSG_TOKEN]
+                    ),
+                    end=RESPONSE_CLOSE,
                 ),
                 tools_tag,
+                OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE)),
             ]
         )
     else:

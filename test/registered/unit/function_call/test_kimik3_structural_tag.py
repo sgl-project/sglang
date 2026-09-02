@@ -18,6 +18,8 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    RESPONSE_CLOSE,
+    RESPONSE_OPEN,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -197,10 +199,19 @@ def test_strict_schema_rejects_invalid_parameters(arguments):
 
 def test_required_allows_response_prefix_but_requires_tools():
     grammar = _grammar([_tool()], tool_choice="required")
-    response = "<|open|>response<|sep|>Checking." "<|close|>response<|sep|>"
+    response = f"{RESPONSE_OPEN}Checking.{RESPONSE_CLOSE}"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)
+    assert not _accepts(grammar, _tools_section(_valid_weather_call()))
+
+
+def test_required_close_token_commits_to_response_close():
+    structural_tag = get_kimik3_structural_tag([_tool()], tool_choice="required")
+    matcher = xgr.GrammarMatcher(_TOKEN_COMPILER.compile_structural_tag(structural_tag))
+
+    assert matcher.accept_token(_CLOSE_TOKEN_ID)
+    assert not matcher.accept_token(_CLOSE_TOKEN_ID)
 
 
 def test_auto_allows_plain_response_or_multiple_tool_calls():
@@ -832,11 +843,19 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     tool = _tool()
     wrapped_by_xgrammar = _grammar([tool], tool_choice="required", thinking_mode=True)
     post_reasoning_only = _grammar([tool], tool_choice="required", thinking_mode=False)
-    output = "reasoning" + THINK_CLOSE + _tools_section(_valid_weather_call())
+    output = (
+        "reasoning"
+        + THINK_CLOSE
+        + RESPONSE_CLOSE
+        + _tools_section(_valid_weather_call())
+    )
 
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
-    assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+    assert _accepts(
+        post_reasoning_only,
+        RESPONSE_CLOSE + _tools_section(_valid_weather_call()),
+    )
 
 
 if __name__ == "__main__":
