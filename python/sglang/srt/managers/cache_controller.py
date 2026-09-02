@@ -813,6 +813,9 @@ class HiCacheController:
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "write"), completion.finish_event
+        )
 
         self.ack_write_queue.append(
             HiCacheAck(
@@ -890,6 +893,11 @@ class HiCacheController:
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
         return (*self.move_indices(op.host_indices, op.device_indices), None)
 
+    def _move_load_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        return self._move_op_indices(op)
+
     def _l2_transfers(
         self,
         host_indices: torch.Tensor,
@@ -920,7 +928,7 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        host_indices, device_indices, pool_transfers = self._move_load_operation(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -938,6 +946,9 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
+        )
+        self.mem_pool_device_allocator.set_hicache_transfer_done_event(
+            (id(self), "load"), completion.finish_event
         )
 
         self.ack_load_queue.append(

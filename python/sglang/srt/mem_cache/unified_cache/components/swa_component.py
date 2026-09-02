@@ -934,12 +934,20 @@ class SWAComponent(TreeComponent):
             cd = node.component_data[ct]
             if cd.value is None:
                 return None
-            # cd.value already holds SWA-pool indices (translated at insert time).
-            # Host pool indexing wants int64.
+            allocator = self._unified_allocator()
+            if allocator is not None:
+                full_value = node.component_data[BASE_COMPONENT_TYPE].value
+                assert full_value is not None
+                assert len(full_value) == len(cd.value)
+                device_indices = allocator.translate_swa_kv_indices_for_transfer(
+                    full_value
+                )
+            else:
+                device_indices = cd.value.to(torch.int64)
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=cd.value.to(torch.int64),
+                    device_indices=device_indices,
                 )
             ]
 

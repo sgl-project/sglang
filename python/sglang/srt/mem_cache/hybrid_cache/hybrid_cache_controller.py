@@ -478,6 +478,17 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         return self.move_hybrid_indices(op)
 
+    def _move_load_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        # Resolve unified virtual ids only when the H2D transfer is submitted.
+        op.device_indices = (
+            self.mem_pool_device_allocator.translate_kv_indices_for_transfer(
+                op.device_indices
+            )
+        )
+        return self.move_hybrid_indices(op)
+
     def _move_write_operation(
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
@@ -976,7 +987,7 @@ class HybridCacheController(BaseHiCacheController):
         derived_transfers: list[PoolTransfer] = []
 
         def rollback_allocated() -> None:
-            for prev_pool, prev_free_fn, prev_indices in newly_allocated:
+            for prev_pool, prev_free_fn, prev_indices in reversed(newly_allocated):
                 prev_free_fn(prev_indices)
                 prev_pool.device_indices = None
 

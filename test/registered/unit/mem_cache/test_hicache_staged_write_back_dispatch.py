@@ -199,6 +199,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def _start_writing(controller):
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
             controller.l2_transfer_engine = L2TransferEngine("kernel")
+            controller.mem_pool_device_allocator = mock.Mock()
             controller.start_writing()
 
     def test_hybrid_load_forwards_merged_pool_transfers(self):
@@ -215,11 +216,12 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
         controller.layer_done_counter.update_producer.return_value = 0
-        controller._move_op_indices.side_effect = lambda op: (
+        controller._move_load_operation.side_effect = lambda op: (
             op.host_indices,
             op.device_indices,
             op.pool_transfers,
         )
+        controller.mem_pool_device_allocator = mock.Mock()
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller._l2_transfers.side_effect = lambda *args: (
             HybridCacheController._l2_transfers(controller, *args)
@@ -240,7 +242,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         self.assertEqual(HybridCacheController.start_loading(controller), 0)
 
-        merged_op = controller._move_op_indices.call_args.args[0]
+        merged_op = controller._move_load_operation.call_args.args[0]
         merged_transfer = merged_op.pool_transfers[0]
         self.assertEqual(merged_transfer.host_indices.tolist(), [0, 1, 0, 1])
         self.assertEqual(merged_transfer.keys, ["page-key", "page-key"])

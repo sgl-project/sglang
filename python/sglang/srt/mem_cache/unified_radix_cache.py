@@ -1404,8 +1404,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        transfer_device_value = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                device_value
+            )
+        )
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None
+            transfer_device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
         )
 
     def _track_write_through_node(

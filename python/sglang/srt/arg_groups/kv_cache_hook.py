@@ -288,13 +288,39 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "not translate speculative verify indices to the unified "
             "pool's kernel-facing space yet."
         )
-    assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
-        "--enable-unified-memory is not yet compatible with hierarchical / "
-        "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
-        "the unified-memory-pool init wires up no host pools, and its device mamba / "
-        "full-attention slots are VIRTUAL — the host-offload path does not "
-        "translate them to physical."
-    )
+    assert (
+        not cfg.enable_lmcache
+    ), "--enable-unified-memory is not yet compatible with --enable-lmcache."
+    if cfg.enable_hierarchical_cache:
+        model_config = model_config_of(server_args)
+        assert model_config.is_hybrid_swa and mambaish_config(model_config) is None, (
+            "--enable-unified-memory with hierarchical cache currently supports "
+            "hybrid-SWA models without recurrent state only."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "speculative decoding."
+        )
+        assert cfg.hicache_io_backend == "kernel", (
+            "--enable-unified-memory with hierarchical cache requires "
+            "--hicache-io-backend=kernel."
+        )
+        assert cfg.hicache_mem_layout == "page_first", (
+            "--enable-unified-memory with hierarchical cache requires "
+            "--hicache-mem-layout=page_first."
+        )
+        assert cfg.hicache_host_memory_mode == "cache", (
+            "--enable-unified-memory with hierarchical cache currently requires "
+            "--hicache-host-memory-mode=cache."
+        )
+        assert cfg.hicache_write_policy != "write_back", (
+            "--enable-unified-memory with hierarchical cache does not support "
+            "--hicache-write-policy=write_back yet."
+        )
+        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+            "--enable-unified-memory with hierarchical cache requires lazy "
+            "compaction so pending H2D physical reservations remain stable."
+        )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Only monolithic decode cuda-graph capture is wired; piecewise prefill

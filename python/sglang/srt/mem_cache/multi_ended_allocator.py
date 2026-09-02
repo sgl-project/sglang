@@ -30,6 +30,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Hashable,
     List,
     Optional,
     Sequence,
@@ -421,6 +422,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # Only the tensor reference is stored; `_flush` materializes the write-set
         # lazily, avoiding a launch-time sync.
         self._inflight_forward: Optional[Tuple[torch.cuda.Event, torch.Tensor]] = None
+        self._hicache_transfer_done_events: Dict[Hashable, torch.cuda.Event] = {}
+        # HiCache reserves SWA physical pages before the H2D is submitted. Keep
+        # those page ids stable until a completion event can take over.
+        self._pending_hicache_load_pages = 0
 
         # Per-call move cap on NON-urgent `_flush`: bounds work per `on_idle()` so a
         # large backlog doesn't block ZMQ IPC; the next flush picks up the rest.
@@ -527,9 +532,29 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.live_page_count = 0
         self._inflight_forward = None
         self._latest_forward_done_event = None
+        self._hicache_transfer_done_events.clear()
+        self._pending_hicache_load_pages = 0
 
     def clear_inverse_history(self) -> None:
         self._inverse_history.clear()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self._hicache_transfer_done_events[transfer_key] = event
+        if transfer_key == "load" or (
+            isinstance(transfer_key, tuple) and transfer_key[-1] == "load"
+        ):
+            if self._pending_hicache_load_pages > 0:
+                self._pending_hicache_load_pages = 0
+                self._capacity_epoch += 1
+
+    def _wait_hicache_transfers(self) -> None:
+        if not self._hicache_transfer_done_events:
+            return
+        current_stream = torch.cuda.current_stream()
+        events = tuple(self._hicache_transfer_done_events.values())
+        self._hicache_transfer_done_events.clear()
+        for event in events:
+            current_stream.wait_event(event)
 
     # -- size reporting --
 
@@ -740,6 +765,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         neighbor = self._growth_side_neighbor()
         if neighbor is None or not neighbor.lazy_compaction:
             return 0
+        if neighbor._pending_hicache_load_pages > 0:
+            return 0
         if neighbor.disagg_move_gate is not None and not neighbor.disagg_move_gate():
             # Not realizable: a PD transfer blocks the neighbour's compaction.
             # Crediting them admits work `_flush_peer_for_alloc` cannot satisfy,
@@ -949,6 +976,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
+            if self.lazy_compaction and self._free_phys_pages.numel() > 0:
+                self._wait_hicache_transfers()
 
             # FAST PATH: eager, or lazy with no current holes.
             if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
@@ -1148,6 +1177,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    def _expand_pages_to_tokens(self, pages: torch.Tensor) -> torch.Tensor:
+        if self.page_size == 1:
+            return pages
+        return (
+            pages[:, None] * self.page_size
+            + torch.arange(self.page_size, device=self.device)
+        ).reshape(-1)
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         """Allocate `need_size` virtual TOKEN ids (id-owner only). Returns
         token-granular, page-structured ids, or None on shortfall.
@@ -1181,13 +1218,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if phys_pages is None:
                 self.free_virtual_ids = torch.cat([v_pages, self.free_virtual_ids])
                 return None
-            if self.page_size == 1:
-                return v_pages  # v_pages already IS the token id list
-            # Expand page ids to token ids: (P, 1) * S + (S,) → (P, S) → (P*S,).
-            return (
-                v_pages[:, None] * self.page_size
-                + torch.arange(self.page_size, device=self.device)
-            ).reshape(-1)
+            return self._expand_pages_to_tokens(v_pages)
 
     def alloc_with_virtual(self, virtual_pages: torch.Tensor) -> None:
         """Take physical PAGES for caller-supplied virtual PAGE ids
@@ -1206,6 +1237,58 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the composite's byte-budget check should have caught this)"
             )
+
+    def alloc_physical(self, need_size: int) -> Optional[torch.Tensor]:
+        """Reserve physical token slots without assigning virtual page ids."""
+        if need_size <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        assert need_size % self.page_size == 0, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_physical: need_size="
+            f"{need_size} must be a multiple of page_size={self.page_size}"
+        )
+        if need_size > self.available_size() and not _relieve_for_alloc(
+            self, need_size
+        ):
+            return None
+        if self.lazy_compaction and self._free_phys_pages.numel() > 0:
+            self._wait_hicache_transfers()
+        physical_pages = self.take_physical_pages(need_size // self.page_size)
+        if physical_pages is None:
+            return None
+        if self.lazy_compaction:
+            self._pending_hicache_load_pages += int(physical_pages.shape[0])
+        return self._expand_pages_to_tokens(physical_pages)
+
+    def cancel_physical_reservation(self, free_index: torch.Tensor) -> None:
+        """Roll back a HiCache physical allocation before its H2D is submitted."""
+        self.free_physical(free_index)
+
+    def free_physical(self, free_index: torch.Tensor) -> None:
+        """Release physical token slots reserved by :meth:`alloc_physical`."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        physical_pages = torch.unique(
+            free_index.detach().to(torch.int64) // self.page_size
+        )
+        if self.lazy_compaction:
+            num_pages = int(physical_pages.shape[0])
+            assert num_pages <= self._pending_hicache_load_pages, (
+                f"MultiEndedAllocator({self.sub_pool_name!r}) released {num_pages} "
+                f"HiCache pages with only {self._pending_hicache_load_pages} pending"
+            )
+            self._pending_hicache_load_pages -= num_pages
+        self._wait_hicache_transfers()
+        if self.forward_stream is not None and not self.lazy_compaction:
+            torch.cuda.current_stream().wait_stream(self.forward_stream)
+        virtual_pages = self.physical_to_virtual[physical_pages]
+        bound_mask = virtual_pages >= 0
+        self.virtual_to_physical[virtual_pages[bound_mask]] = -1
+        self.physical_to_virtual[physical_pages] = -1
+        if self.lazy_compaction:
+            self._free_phys_pages = torch.cat([self._free_phys_pages, physical_pages])
+            self.live_page_count -= int(physical_pages.shape[0])
+            return
+        self._compact_pending(physical_pages)
 
     # -- paged alloc surface --
 
@@ -1365,6 +1448,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._free_lazy(free_index, pages=_pages)
                 return
             # --- EAGER path ---
+            self._wait_hicache_transfers()
             # Near-no-op in normal mode (sampling's CPU sync already drained
             # forward_stream); in overlap mode it serializes free+compaction with
             # the in-flight forward.
@@ -1884,6 +1968,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if self.disagg_move_gate is not None and not self.disagg_move_gate():
             # Holes stay in the free list; the next flush picks them up.
             return 0
+        if self._pending_hicache_load_pages > 0:
+            # The H2D has not been submitted, so no completion event exists yet.
+            return 0
+        self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
         with record_function("MultiEndedAlloc._flush"):
             self._drain_pending_reuse(urgent=urgent)
@@ -3479,7 +3567,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def _compaction_allowed(self) -> bool:
         return all(
-            allocator.disagg_move_gate is None or allocator.disagg_move_gate()
+            allocator._pending_hicache_load_pages == 0
+            and (allocator.disagg_move_gate is None or allocator.disagg_move_gate())
             for allocator in (self.full_attn_allocator, self.swa_attn_allocator)
         )
 
@@ -3628,8 +3717,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Translate virtual token ids to full-pool physical ids for PD."""
+        """Translate virtual token ids to raw full-pool physical token ids."""
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
+
+    def translate_swa_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Translate shared virtual ids to raw SWA physical token ids."""
+        return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:
         """Install the PD compaction gate on both physical sub-allocators."""
@@ -3947,15 +4042,25 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
-        """No-op stub for HiCache load-back compatibility. In shared mode there is
-        no mapping tensor (the swa v2p IS the mapping); HiCache for shared SWA is
-        out of scope.
-        """
-        return
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
+        full_pages = full_indices.to(torch.int64) // self.page_size
+        swa_pages = swa_indices.to(torch.int64) // self.page_size
+        self.swa_attn_allocator.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
-        # Paired with set_full_to_swa_mapping: shared mode has no mapping tensor.
-        return
+        if full_indices.numel() == 0:
+            return
+        full_pages = torch.unique(full_indices.to(torch.int64) // self.page_size)
+        swa = self.swa_attn_allocator
+        physical_pages = swa.virtual_to_physical[full_pages].clone()
+        swa.virtual_to_physical[full_pages] = -1
+        live = physical_pages > 0
+        physical_pages = physical_pages[live]
+        full_pages = full_pages[live]
+        still_owned = swa.physical_to_virtual[physical_pages] == full_pages
+        swa.physical_to_virtual[physical_pages[still_owned]] = -1
 
     # -- free-group --
 
@@ -4031,6 +4136,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_page_reps_group = None
 
     # -- Lazy compaction hooks --
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.swa_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
 
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""

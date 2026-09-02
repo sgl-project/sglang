@@ -326,6 +326,18 @@ def build_hybrid_swa_group(
             target_device_layer_num=swa_kv_pool.layer_num,
             draft_layer_num=len(mtp_swa_device_pools),
         )
+    from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+
+    uses_virtual_device_indices = isinstance(swa_attn_allocator, MultiEndedAllocator)
+    if swa_attn_allocator is None:
+        swa_device_alloc_fn = None
+        swa_device_free_fn = None
+    elif uses_virtual_device_indices:
+        swa_device_alloc_fn = swa_attn_allocator.alloc_physical
+        swa_device_free_fn = swa_attn_allocator.cancel_physical_reservation
+    else:
+        swa_device_alloc_fn = swa_attn_allocator.alloc
+        swa_device_free_fn = swa_attn_allocator.free
     return HostPoolGroup(
         [
             build_pool_entry(
@@ -345,12 +357,8 @@ def build_hybrid_swa_group(
                 transfer_layer_num=transfer_layer_num + len(mtp_swa_device_pools),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
-                device_alloc_fn=(
-                    swa_attn_allocator.alloc if swa_attn_allocator is not None else None
-                ),
-                device_free_fn=(
-                    swa_attn_allocator.free if swa_attn_allocator is not None else None
-                ),
+                device_alloc_fn=swa_device_alloc_fn,
+                device_free_fn=swa_device_free_fn,
                 packed_draft_device_pools=mtp_swa_device_pools,
             ),
         ]
