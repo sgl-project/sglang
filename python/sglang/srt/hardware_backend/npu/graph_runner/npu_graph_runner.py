@@ -133,6 +133,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            # TARGET_VERIFY must use a Python list: the v2 operator's
+            # actual_seq_kvlen is a Host-side IntArray, so graph.update can
+            # only rebind it when it was captured as a list.
             "TARGET_VERIFY": [],
         }
 
@@ -304,8 +307,18 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                # graph.update must carry the exact KV length that
+                # _apply_cuda_graph_metadata already computed into
+                # forward_metadata.seq_lens_cpu_list (it already includes
+                # the draft block for DFlash). Do NOT recompute and
+                # double-add here. The list already holds self.bs elements.
+                _attn = self._replay_attn_backend()
+                _meta_list = _attn.forward_metadata.seq_lens_cpu_list
+                if _meta_list is None:
+                    # Fallback: should not happen after the
+                    # init_forward_metadata_out_graph call above.
+                    _meta_list = self.buffers.seq_lens[: self.raw_bs].cpu().tolist()
+                seq_lens = list(_meta_list)
             else:
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
