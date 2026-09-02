@@ -3674,8 +3674,6 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         start_layer: Optional[int] = None,
-        layer_shard_rank: Optional[int] = None,
-        layer_shard_size: int = 1,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         # When provided (shared-KV-pool path), use this pool for the
@@ -3751,17 +3749,7 @@ class HybridLinearKVPool(KVCache):
             assert (
                 index_head_dim is not None and kv_cache_dim is not None
             ), "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
-            pool_kwargs = {}
-            DSAPoolCls = DSATokenToKVPool
-            if layer_shard_rank is not None and layer_shard_size > 1:
-                from sglang.srt.mem_cache.dsa_cache_layer_split import (
-                    LayerSplitDSATokenToKVPool,
-                )
-
-                DSAPoolCls = LayerSplitDSATokenToKVPool
-                pool_kwargs["layer_shard_rank"] = layer_shard_rank
-                pool_kwargs["layer_shard_size"] = layer_shard_size
-            self.full_kv_pool = DSAPoolCls(
+            self.full_kv_pool = DSATokenToKVPool(
                 size=size,
                 page_size=self.page_size,
                 kv_lora_rank=kv_lora_rank,
@@ -3777,7 +3765,6 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
-                **pool_kwargs,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -3854,28 +3841,6 @@ class HybridLinearKVPool(KVCache):
     @property
     def slots_per_page(self) -> int:
         return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
-
-    @property
-    def layer_shard_enabled(self) -> bool:
-        return bool(getattr(self.full_kv_pool, "layer_shard_enabled", False))
-
-    @property
-    def layer_shard_rank(self) -> Optional[int]:
-        return getattr(self.full_kv_pool, "layer_shard_rank", None)
-
-    @property
-    def layer_shard_size(self) -> int:
-        return getattr(self.full_kv_pool, "layer_shard_size", 1)
-
-    @property
-    def layer_shard_start(self) -> int:
-        return getattr(self.full_kv_pool, "layer_shard_start", self.start_layer)
-
-    def _is_layer_owned(self, layer_id: int) -> bool:
-        if not self.layer_shard_enabled:
-            return True
-        full_layer_id = self._transfer_full_attention_id(layer_id)
-        return self.full_kv_pool._is_layer_owned(full_layer_id)
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -4078,14 +4043,6 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
-
-    def prefetch_full_attention_kv_buffer(self, layer_id: int) -> None:
-        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
-            return
-        if layer_id not in self.full_attention_layer_id_mapping:
-            return
-        full_layer_id = self._transfer_full_attention_id(layer_id)
-        self.full_kv_pool.prefetch_kv_buffer(full_layer_id)
 
     def get_mla_kv_buffer(
         self,
@@ -4873,14 +4830,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_compress_tail_buf_infos(self):
         if not self.kpool_use_compress:
             return [], [], []
-        if self.layer_shard_enabled:
-            transfer_layer_ids = [
-                i
-                for i in range(self.layer_num)
-                if self._is_layer_owned(self.start_layer + i)
-            ]
-        else:
-            transfer_layer_ids = list(range(self.layer_num))
+        transfer_layer_ids = list(range(self.layer_num))
         # Keep zero-row indexShare entries in the pointer list so layer offsets
         # stay aligned across PD peers; item_len=0 makes transfer backends skip them.
         tail_buffers = [self._compress_tail_k[i] for i in transfer_layer_ids] + [
