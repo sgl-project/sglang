@@ -72,6 +72,10 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinker,
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
     UnifiedLRUList,
@@ -82,7 +86,11 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
 )
-from sglang.srt.runtime_context import get_memory, get_observability
+from sglang.srt.runtime_context import (
+    get_memory,
+    get_model,
+    get_observability,
+)
 from sglang.srt.session.streaming_session import StreamingSession
 from sglang.srt.utils.common import ceil_align
 
@@ -191,8 +199,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
+        self._tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
         self.tree_core = create_tree_core(
-            name=envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(),
+            name=self._tree_core_backend,
             params=params,
             components=self.components,
         )
@@ -234,6 +243,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
+        self.linker: Optional[UnifiedCacheLinkerWrapper] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -338,7 +348,13 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.work_list.append(send_work)
 
+    def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
+        """Attach an external KV store directly to the device pools."""
+        self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
+
     def reset(self) -> None:
+        if self.linker is not None:
+            self.linker.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -371,6 +387,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
+            # TODO(Jialin): Extend buffer-only state handoff to Mamba in a
+            # follow-up to #34798 and #35769.
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
             # Lifting the fence also needs the admission charge: a staged
@@ -432,7 +450,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
-                max_context_len=server_args.context_length or 0,
+                max_context_len=get_model().context_length or 0,
                 swa_window_pages=(
                     swa.full_window_pages
                     if swa is not None and self.tree_core.has_swa_host_pool
@@ -493,6 +511,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self.linker is not None:
+            self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -514,6 +534,8 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if self.linker is not None and params.req is not None:
+            result = self.linker.match(params.key, params.req, result)
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -820,17 +842,14 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
+            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_len_to_handle
+            req.kv.req_pool_idx, :kv_len_to_handle
         ]
 
         result = None
@@ -838,7 +857,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=req.kv.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -859,7 +878,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
-                tail_free_start = max(effective_cache_len, req.cache_protected_len)
+                tail_free_start = max(effective_cache_len, req.kv.cache_protected_len)
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
@@ -877,17 +896,16 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.insert(insert_params)
 
             # Free unaligned tail (+ deferred truncation tail)
-            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
-                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
-            self.token_to_kv_pool_allocator.free_segments(segments)
+                ranges.append((tail_free_start, len(kv_indices_full)))
+            self.free_kv_row(req.kv, ranges)
         else:
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.cache_protected_len :],
-                start_pos=req.cache_protected_len,
-            )
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
-        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        # Synthetic profiling requests may own KV without locking a tree node.
+        if req.last_node is not None:
+            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
@@ -914,18 +932,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(token_ids)
+                req.kv.req_pool_idx, : len(token_ids)
             ]
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len,
+            prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
         )
@@ -981,14 +999,14 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
         assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
         self._dec_req_lock(req)
@@ -1014,7 +1032,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             req.prefix_indices = new_indices
-        req.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
         # carry the skip set so this node's dec releases only what we locked
@@ -1055,6 +1073,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 action.old_node_id,
                 [action.new_node_id, action.new_child_node_id],
             )
+            if self.linker is not None:
+                self.linker.replace_pending_offload_node(
+                    action.ack_id,
+                    action.old_node_id,
+                    [action.new_node_id, action.new_child_node_id],
+                )
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
@@ -1063,7 +1087,10 @@ class UnifiedRadixCache(BasePrefixCache):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_full(indices)
         elif isinstance(action, BackupKV):
-            self._execute_and_commit_kv_backup(action)
+            if self.linker is not None:
+                self.linker.offload_nodes(action.node_ids)
+            else:
+                self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1156,7 +1183,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
         full_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :num_tokens
+            req.kv.req_pool_idx, :num_tokens
         ].to(torch.int64)
         full_indices = self._pad_retraction_indices(full_indices, self.page_size)
 
@@ -1167,7 +1194,7 @@ class UnifiedRadixCache(BasePrefixCache):
             window_start = max(0, num_tokens - self.sliding_window_size)
             window_start = window_start // self.page_size * self.page_size
             window_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, window_start:num_tokens
+                req.kv.req_pool_idx, window_start:num_tokens
             ].to(torch.int64)
             swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
             assert bool(
@@ -1312,9 +1339,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # FIFO ordering instead (BackupKV chains are parent-before-child
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
-                self.buffer_pipeline.enqueue_backup_intent(
-                    self.tree_core.node_by_id(node_id)
-                )
+                self.buffer_pipeline.enqueue_backup_intent(node_id)
             return 0
         written = 0
         for node_id in action.node_ids:
@@ -2079,6 +2104,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True)
     def release_aborted_request(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._storage_prefetch_missed_rids.discard(rid)
         if (
@@ -2719,6 +2746,8 @@ class UnifiedRadixCache(BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
+        if self.linker is not None and self.linker.has_hit(req.rid):
+            return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
 
         if (
@@ -2753,6 +2782,27 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None:
+            finish_counts = torch.tensor(
+                [
+                    self.linker.num_completed_loads(),
+                    self.linker.num_completed_offloads(),
+                ],
+                dtype=torch.int,
+                device="cpu",
+            )
+            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
+            load_count, offload_count = map(int, finish_counts.tolist())
+            self.linker.drain_loads(load_count)
+            local_successes = self.linker.take_completed_offloads(offload_count)
+            if local_successes:
+                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
+                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                self.linker.commit_completed_offloads(
+                    [bool(success) for success in successes.tolist()]
+                )
+            return
+
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
@@ -2813,6 +2863,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
+        if self.linker is not None:
+            return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
@@ -2866,7 +2918,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def swa_retain_floor(self, req) -> int | None:
         if not self.is_mamba_enabled or self._sliding_window_size is None:
             return None
-        checkpoint = req.mamba_last_track_seqlen
+        checkpoint = req.kv.mamba_last_track_seqlen
         if checkpoint is None:
             return None
         return checkpoint - self._sliding_window_size
@@ -3065,3 +3117,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)
+
+    def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
+        return self.tree_core.dfs_weight_order(node_handles)

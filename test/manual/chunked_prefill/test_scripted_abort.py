@@ -23,7 +23,7 @@ def _drain_until_released(t: ScriptedContext, *handles: ScriptedReqHandle):
         if all(
             h.kv_pages == 0
             and h.lock_refs == 0
-            and (h.req is None or h.req.req_pool_idx is None)
+            and (h.req is None or h.req.kv.req_pool_idx is None)
             for h in handles
         ):
             return
@@ -57,7 +57,7 @@ class TestAbortBasic(ScriptedTestCase):
             r.kv_pages == 0
         ), f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
         assert (
-            r.req is None or r.req.req_pool_idx is None
+            r.req is None or r.req.kv.req_pool_idx is None
         ), f"abort must release row; r.req={r.req} after abort"
         assert (
             r.lock_refs == 0
@@ -78,7 +78,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
 
     def test_abort_at_chunk_mid(self):
         self.server.execute_script(self._script_abort_at_chunk_mid)
@@ -124,7 +124,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
 
     def test_abort_at_admission_step(self):
@@ -137,7 +137,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
 
     def test_abort_then_start_same_step_new_rid(self):
         self.server.execute_script(self._script_abort_then_start_same_step_new_rid)
@@ -191,7 +191,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, *reqs)
         for r in reqs:
             assert r.kv_pages == 0
-            assert r.req is None or r.req.req_pool_idx is None
+            assert r.req is None or r.req.kv.req_pool_idx is None
 
     def test_abort_unknown_rid_noop(self):
         self.server.execute_script(self._script_abort_unknown_rid_noop)
@@ -264,7 +264,7 @@ class TestAbortBasic(ScriptedTestCase):
         t.abort(r)
         yield from _drain_until_released(t, r)
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
 
     def test_double_abort_idempotent(self):
@@ -351,7 +351,7 @@ class TestAbortBasic(ScriptedTestCase):
             f"aborted req revived and ran another chunk; "
             f"chunks_done went {chunks_after_abort} -> {r.chunks_done}"
         )
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
 
     def test_abort_mid_chunk_no_extra_radix_node(self):
         self.server.execute_script(self._script_abort_mid_chunk_no_extra_radix_node)
@@ -369,7 +369,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         chunks_after_release = r.chunks_done
         for _ in range(4):
             yield
@@ -406,7 +406,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from run_until_finished(r2)
         assert r2.finished, "resubmit under same rid must complete independently"
         assert r1.kv_pages == 0, "aborted r1 must release KV before resubmit"
-        assert r1.req is None or r1.req.req_pool_idx is None
+        assert r1.req is None or r1.req.kv.req_pool_idx is None
         assert r1.lock_refs == 0
 
     def test_abort_during_gap_inflight_middle_chunks_positive(self):
@@ -429,7 +429,7 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
 
         assert not r.is_chunking, "aborted gap req must not re-enter chunking"
         yield
@@ -511,7 +511,7 @@ class TestAbortBasic(ScriptedTestCase):
         assert r1.kv_pages == 0, (
             f"force_retract + abort same yield must release KV; got " f"{r1.kv_pages}"
         )
-        assert r1.req is None or r1.req.req_pool_idx is None, (
+        assert r1.req is None or r1.req.kv.req_pool_idx is None, (
             f"force_retract + abort same yield must release row; got " f"{r1.req}"
         )
         assert r1.lock_refs == 0, (
@@ -540,7 +540,7 @@ class TestAbortBasic(ScriptedTestCase):
 
         yield from run_until(r2, lambda h: h.is_chunking)
         assert r1.kv_pages == 0
-        assert r1.req is None or r1.req.req_pool_idx is None
+        assert r1.req is None or r1.req.kv.req_pool_idx is None
         assert r1.lock_refs == 0
         yield from run_until_finished(r2)
         assert r2.finished, "baton handoff must let r2 complete"
@@ -570,7 +570,7 @@ class TestAbortPP(ScriptedTestCase):
         yield from _drain_until_released(t, r)
 
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
         assert r.finished
 

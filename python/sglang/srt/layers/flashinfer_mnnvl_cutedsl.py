@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from sglang.srt.runtime_context import get_spec
+
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
@@ -149,7 +151,6 @@ class FlashInferMNNVLCuteDSLARFusion:
             ) = _import_kernel_backend()
             # Only fused finalize launches have a completed shared-expert handoff;
             # standalone AllReduce kernels retain the safe load ordering.
-            from sglang.srt.runtime_context import get_spec
 
             if get_spec().speculative_algorithm is None:
                 self.workspace_config = _with_early_finalize_shared_load(default_config)
