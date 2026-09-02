@@ -752,6 +752,7 @@ def build_hybrid_mamba_stack(
         mamba_host_size,
         allocator_type=_get_allocator_type(),
         layout=get_memory().hicache_mem_layout,
+        overflow_size=get_memory().mamba_overflow_size,
     )
     entries = [
         build_pool_entry(
@@ -853,6 +854,7 @@ def build_hybrid_mamba_swa_stack(
         mamba_host_size,
         allocator_type=get_memory().hicache_storage_backend,
         layout=get_memory().hicache_mem_layout,
+        overflow_size=get_memory().mamba_overflow_size,
     )
     entries = [
         build_pool_entry(
