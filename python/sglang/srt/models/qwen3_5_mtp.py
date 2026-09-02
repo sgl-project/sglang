@@ -323,6 +323,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # The last-stage MTP draft cannot share the target embedding on PP0.
+            # Load the checkpoint embedding into its retained local copy instead
+            # of leaving the torch.empty() allocation uninitialized.
+            if name in (
+                "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            ):
+                param_name = "model.embed_tokens.weight"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
