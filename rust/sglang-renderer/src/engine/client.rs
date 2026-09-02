@@ -571,15 +571,31 @@ fn normalize_engine_output(
         ))
     })?;
     let output_len = u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX);
+    let trimmed_stop_tokens = match output.finish_reason.as_ref() {
+        Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(_)))) => 1,
+        Some(GenerationFinishReason::Stop(Some(MatchedStop::Tokens(ids)))) => {
+            u64::try_from(ids.len()).unwrap_or(u64::MAX)
+        }
+        _ => 0,
+    };
+    let cumulative =
+        output_len == total || output_len.checked_add(trimmed_stop_tokens) == Some(total);
+    let incremental =
+        output_len == delta || output_len.checked_add(trimmed_stop_tokens) == Some(delta);
 
-    if output_len == total {
+    if cumulative {
         let prefix = usize::try_from(*emitted_tokens)
             .map_err(|_| internal("engine completion token count exceeds addressable memory"))?;
+        if prefix > output.token_ids.len() {
+            return Err(internal(format!(
+                "engine returned {output_len} cumulative output token IDs after {prefix} were already emitted"
+            )));
+        }
         output.token_ids.drain(..prefix);
         if let Some(extras) = output.extras.as_deref_mut() {
             trim_cumulative_output_extras(extras, prefix)?;
         }
-    } else if output_len != delta {
+    } else if !incremental {
         return Err(internal(format!(
             "engine returned {output_len} output token IDs after reporting {delta} new completion tokens"
         )));
@@ -1006,6 +1022,25 @@ mod tests {
         assert_eq!(extras.output_logprobs.len(), 1);
         assert_eq!(extras.output_logprobs[0].token.token_id, 8);
         assert_eq!(extras.output_logprobs[0].top.len(), 1);
+    }
+
+    #[test]
+    fn token_stops_may_be_trimmed_from_incremental_or_cumulative_frames() {
+        for token_ids in [vec![], vec![7]] {
+            let mut emitted_tokens = 1;
+            let mut output = GenerationOutput {
+                token_ids,
+                completion_tokens: 2,
+                finish_reason: Some(GenerationFinishReason::Stop(Some(MatchedStop::Token(9)))),
+                ..Default::default()
+            };
+
+            normalize_engine_output(&mut output, &mut emitted_tokens).unwrap();
+
+            assert!(output.token_ids.is_empty());
+            assert_eq!(output.completion_tokens, 1);
+            assert_eq!(emitted_tokens, 2);
+        }
     }
 
     #[test]

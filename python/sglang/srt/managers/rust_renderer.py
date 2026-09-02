@@ -107,6 +107,10 @@ def build_renderer_args(
 def validate_embedded_renderer(server_args, model_config) -> None:
     if server_args.skip_tokenizer_init:
         raise ValueError("SGLANG_RUST_RENDERER requires a tokenizer")
+    if server_args.preferred_sampling_params:
+        raise ValueError(
+            "SGLANG_RUST_RENDERER does not yet apply --preferred-sampling-params"
+        )
     if model_config.is_multimodal:
         raise ValueError(
             "SGLANG_RUST_RENDERER currently supports text-only models; "

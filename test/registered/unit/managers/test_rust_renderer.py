@@ -3,12 +3,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.rust_renderer import (
     RustRendererSidecar,
     build_renderer_args,
     connect_host,
     validate_embedded_renderer,
 )
+from sglang.srt.rust_server.server import RustServer
 from sglang.srt.utils.network import NetworkAddress
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -27,6 +29,7 @@ def server_args(**overrides):
         "reasoning_parser": "reasoner",
         "default_chat_template_kwargs": {"thinking": False},
         "sampling_defaults": "model",
+        "preferred_sampling_params": None,
         "stream_response_default_include_usage": True,
         "allow_auto_truncate": True,
         "enable_return_hidden_states": True,
@@ -69,6 +72,12 @@ def flag_values(args):
 
 
 class TestRustRendererSidecar(unittest.TestCase):
+    def test_disabled_renderer_does_not_initialize_sidecar(self):
+        with envs.SGLANG_RUST_RENDERER.override(False):
+            self.assertIsNone(
+                RustServer.initialize_renderer(mock.Mock(), "0.0.0.0:30000")
+            )
+
     def test_sidecar_owns_topology_and_process_lifecycle(self):
         process = mock.Mock(pid=123, exitcode=0)
         process.is_alive.return_value = False
@@ -204,6 +213,11 @@ class TestRustRendererSidecar(unittest.TestCase):
             (server_args(skip_tokenizer_init=True), text_model, "requires a tokenizer"),
             (server_args(ssl_certfile="cert"), text_model, "implement TLS"),
             (server_args(enable_http2=True), text_model, "implement HTTP/2"),
+            (
+                server_args(preferred_sampling_params={"temperature": 0.2}),
+                text_model,
+                "preferred-sampling-params",
+            ),
             (
                 server_args(hf_chat_template_name="tool_use"),
                 text_model,

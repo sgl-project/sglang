@@ -51,7 +51,7 @@ def _build_server_args(
     return ext.ServerArgs(
         model_path=get_model().model_path,
         served_model_name=get_serving().served_model_name,
-        tokenizer_path=get_serving().tokenizer_path,
+        tokenizer_path=scheduler.rust_server_tokenizer_path(),
         revision=get_model().revision,
         load_format=get_model().load_format,
         weight_version=get_serving().weight_version,
@@ -81,8 +81,6 @@ def _build_server_args(
                 **mc.get_default_sampling_params()
             ),
         ),
-        # `preferred_sampling_params` is deliberately absent: `launch`
-        # refuses to start when it is set, so the Rust server never needs it.
         preferred_sampling_params=(
             json.dumps(get_serving().preferred_sampling_params)
             if get_serving().preferred_sampling_params is not None

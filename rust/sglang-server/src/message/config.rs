@@ -126,8 +126,8 @@ pub struct ServerArgs {
     pub disaggregation_mode: DisaggregationMode,
     /// The resolved Python `ModelConfig`, attached at handoff time.
     pub model_config: ModelConfig,
-    /// Default sampling params advertised by `/get_model_info`, verbatim from
-    /// `server_args.preferred_sampling_params` (a JSON object or null).
+    /// Launch-time sampling defaults merged beneath per-request values and
+    /// advertised by `/get_model_info`.
     pub preferred_sampling_params: Option<PreferredSamplingParams>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
@@ -527,6 +527,10 @@ impl ServerArgs {
     pub fn validate(&self) -> Result<(), String> {
         if self.served_model_name.is_empty() {
             return Err("empty 'served_model_name' in server_args".into());
+        }
+        if let Some(preferred) = &self.preferred_sampling_params {
+            super::sampling::SamplingParamsInput::from_preferred(&preferred.0)
+                .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
     }

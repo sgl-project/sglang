@@ -196,7 +196,7 @@ async fn generate(
     State(state): State<Arc<AppState>>,
     body: Result<Json<GenerateBody>, JsonRejection>,
 ) -> Response {
-    let body = match body {
+    let mut body = match body {
         Ok(Json(body)) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary — as Python's does (FastAPI rejects before its
@@ -206,6 +206,15 @@ async fn generate(
         }
     };
     let stream = body.stream;
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = body.apply_preferred_sampling(&preferred.0)
+    {
+        return native_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error.to_string(),
+            stream,
+        );
+    }
     let incremental = body
         .incremental_streaming_output
         .unwrap_or(state.server_args.incremental_streaming_output);

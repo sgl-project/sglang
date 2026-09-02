@@ -1253,7 +1253,7 @@ class Scheduler(
                 self.profile_and_init_predictor()
             except Exception as e:
                 logger.warning(
-                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
@@ -2170,6 +2170,9 @@ class Scheduler(
         self.recv_from_tokenizer = rust_server
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
+
+    def rust_server_tokenizer_path(self) -> str:
+        return get_serving().tokenizer_path
 
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(

@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
 
-from sglang.srt import environ as envs
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -83,19 +83,6 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # `TokenizerManager` merges these under each request's own sampling params
-        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
-        # manager wholesale — so honouring the flag is not implemented here yet.
-        # Refuse rather than run: silently dropping it means generating with
-        # sampling the operator did not configure, and `/get_model_info` would go on
-        # advertising values no request ever receives.
-        if get_serving().preferred_sampling_params:
-            raise ValueError(
-                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
-                "(the Python TokenizerManager merges it into every request; the rust "
-                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
-                "drop --preferred-sampling-params and send those values per request."
-            )
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
