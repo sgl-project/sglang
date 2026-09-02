@@ -127,6 +127,20 @@ def test_session_slot_round_trip_preserves_mamba_state():
     assert next_req.kv.mamba_last_track_seqlen == 3
 
 
+def test_reusable_slot_requires_request_pool_ownership():
+    """An empty session record must not be treated as an owned request row."""
+    req_to_token_pool = _FakeReqToTokenPool(torch.empty((1, 1), dtype=torch.int32))
+    tree_cache = StreamingSession(
+        _FakeInnerCache(req_to_token_pool, _FakeAllocator(), page_size=1)
+    )
+
+    assert not tree_cache.has_reusable_streaming_session_slot("missing")
+    tree_cache.slots["empty"] = SessionSlot()
+    assert not tree_cache.has_reusable_streaming_session_slot("empty")
+    tree_cache.slots["live"] = SessionSlot(kv=ReqKvInfo(req_pool_idx=0))
+    assert tree_cache.has_reusable_streaming_session_slot("live")
+
+
 def test_preabort_detaches_session_and_preserves_slot():
     """Pre-aborted req (to_finish set before match_prefix) is detached from
     the session: session=None, abort_req() called. Slot stays intact."""
