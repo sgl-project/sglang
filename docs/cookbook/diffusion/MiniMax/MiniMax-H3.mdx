@@ -670,8 +670,8 @@ Requests use the same asynchronous video endpoint as the base model, with
 `task: "t2va"`, `conditions: []`, and a target such as
 `{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}`. The
 request default is `num_inference_steps: 5`: five points on the standard
-shift-12/shift-3 sigma grid, i.e. the four distilled DiT evaluations. Do not
-send the base 50-step schedule.
+shift-12/shift-3 sigma grid, i.e. the four distilled DiT evaluations. Any
+other step count is rejected.
 
 `video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
 Triton block-sparse kernel (SM90 / SM100 / SM103) over segment-pure prefix

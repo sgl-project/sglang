@@ -56,6 +56,9 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     assert params.num_inference_steps == 5
     assert params.guidance_scale == 1.0
 
+    with pytest.raises(ValueError, match="exactly five sigma grid points"):
+        FastH3SamplingParams(prompt="p", num_inference_steps=50)
+
     with pytest.raises(ValueError, match="distilled for t2va only"):
         FastH3SamplingParams(
             prompt="p",
@@ -117,4 +120,6 @@ def test_fasth3_gates_stay_bf16_under_runtime_quantization() -> None:
     assert not isinstance(attn.qkv_proj.quant_method, UnquantizedLinearMethod)
     assert isinstance(attn.to_gate_compress.quant_method, UnquantizedLinearMethod)
     assert attn.to_gate_compress.weight.dtype == torch.bfloat16
+    # A trained gate is required checkpoint content, never synthesized.
+    assert attn.to_gate_compress.weight.missing_param_init == "error"
     assert model.token_refiner.blocks[0].attn.to_gate_compress is None

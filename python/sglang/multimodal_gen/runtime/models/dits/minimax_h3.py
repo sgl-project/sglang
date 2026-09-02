@@ -806,7 +806,6 @@ class MiniMaxH3Attention(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.to_gate_compress",
             )
-            self.to_gate_compress.weight.missing_param_init = "zeros"
 
     def _set_attention_backend(self, backend) -> None:
         impl_cls = backend.get_impl_cls()
