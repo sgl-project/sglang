@@ -6,8 +6,10 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     DecLockRefParams,
     EvictParams,
     EvictResult,
@@ -15,7 +17,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    free_kv_row_segments,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -851,6 +856,31 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
+class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
+    """Minimal single-pool allocator: no SWA peer, so the whole range dies
+    together whatever the floor says."""
+
+    def __init__(self):
+        super().__init__(
+            size=16,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index)
+
+
 class TestFreeFullPartition(CustomTestCase):
     """`free_full` releases only the full side of a hybrid SWA allocator."""
 
@@ -892,6 +922,96 @@ class TestFreeFullPartition(CustomTestCase):
         self.allocator.free_group_end()
 
         self.assertEqual(self.allocator.full_available_size(), self.full_baseline)
+
+
+class _RowCache:
+    """Minimal PrefixCacheTrait host, so free_kv_row can be exercised without
+    standing up a whole tree."""
+
+    free_kv_row = BasePrefixCache.free_kv_row
+
+    def __init__(self, allocator, row):
+        self.req_to_token_pool = SimpleNamespace(req_to_token=row.unsqueeze(0))
+        self.token_to_kv_pool_allocator = allocator
+        self.page_size = allocator.page_size
+
+
+class TestFreeKvRow(CustomTestCase):
+    """A kv row is given back split at `swa_evicted_seqlen`: the full side
+    whole, the SWA side only from the floor up."""
+
+    def setUp(self):
+        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.full_baseline = self.allocator.full_available_size()
+        self.swa_baseline = self.allocator.swa_available_size()
+
+    def _sizes(self):
+        return (
+            self.allocator.full_available_size(),
+            self.allocator.swa_available_size(),
+        )
+
+    def test_floor_decides_how_much_of_the_swa_side_stays_out(self):
+        # (start_pos, num_slots, floor, rows whose SWA peers are already gone)
+        cases = [
+            (0, 4, 4, 4),
+            (8, 4, 8, 0),
+            (8, 4, 10, 2),
+            (8, 4, 4, 0),
+        ]
+        for start_pos, num_slots, floor, num_dead in cases:
+            with self.subTest(start_pos=start_pos, floor=floor):
+                indices = _swa_alloc(self.allocator, num_slots)
+                free_kv_row_segments(
+                    self.allocator, [(indices, start_pos)], swa_evicted_seqlen=floor
+                )
+                self.assertEqual(
+                    self._sizes(),
+                    (self.full_baseline, self.swa_baseline - num_dead),
+                )
+                # Give the held-back SWA peers back, so the next case starts clean.
+                if num_dead:
+                    self.allocator.free_swa(indices[:num_dead])
+                self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
+
+    def test_adjacent_below_floor_pieces_release_their_shared_page_once(self):
+        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        indices = _swa_alloc(allocator, 8)
+        after_alloc = allocator.full_available_size()
+
+        # Rows [0, 6) and [6, 8) both sit below the floor and share page 1.
+        free_kv_row_segments(
+            allocator,
+            [(indices[:6], 0), (indices[6:], 6)],
+            swa_evicted_seqlen=8,
+        )
+
+        self.assertEqual(allocator.full_available_size(), after_alloc + 8)
+
+    def test_free_kv_row_reads_the_record_row_and_its_floor(self):
+        indices = _swa_alloc(self.allocator, 8)
+        cache = _RowCache(self.allocator, indices)
+        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=3)
+
+        cache.free_kv_row(kv, [(1, 5)])
+
+        # Rows [1, 5) go back on the full side; of those, [1, 3) lost their SWA
+        # peers already, so 6 of the 8 SWA slots are still out.
+        self.assertEqual(self._sizes(), (self.full_baseline - 4, self.swa_baseline - 6))
+
+    def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
+        allocator = _SinglePoolAllocator()
+        cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
+        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=4)
+
+        cache.free_kv_row(kv, [(2, 6)])
+
+        self.assertEqual([t.tolist() for t in allocator.freed], [[2, 3], [4, 5]])
+
+        # release_session and _free_kv_aligned dropped their own emptiness
+        # guards, so an empty range has to stay a no-op here.
+        cache.free_kv_row(kv, [(6, 6)])
+        self.assertEqual(len(allocator.freed), 2)
 
 
 class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
