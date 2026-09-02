@@ -283,11 +283,17 @@ def handle_a2a_moe(server_args: Any):
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "deep_gemm",
+            "triton",
         ], (
             "FlashInfer MoE A2A is supported with flashinfer_cutlass, "
             "flashinfer_cutedsl, flashinfer_trtllm, "
-            "flashinfer_trtllm_routed, or deep_gemm."
+            "flashinfer_trtllm_routed, deep_gemm, or triton."
         )
+        if resolved_view(server_args).moe_runner_backend == "triton":
+            assert resolved_view(server_args).quantization is None, (
+                "FlashInfer MoE A2A with the Triton runner currently supports "
+                "only BF16/unquantized MoE layers."
+            )
 
     if a2a_backend == "mori":
         if cfg.deepep_mode == "auto":
