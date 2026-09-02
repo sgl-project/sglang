@@ -36,6 +36,7 @@ def _fake_layer(default=AttentionBackendEnum.FA) -> SimpleNamespace:
         _default_attn_backend=default,
         _attn_impl_by_backend={default: f"{default.name.lower()}_impl"},
         _supported_attention_backends=None,
+        _required_attention_backend=None,
         _attn_impl_ctor_kwargs={"num_heads": 2},
         attn_impl=f"{default.name.lower()}_impl",
         head_size=64,
@@ -222,6 +223,24 @@ class TestLayerPrepareApply(unittest.TestCase):
         layer_module.apply_attention_backend_override(layer, None)
         self.assertEqual(layer.attn_impl, "fa_impl")
         self.assertIs(layer.backend, AttentionBackendEnum.FA)
+
+    def test_required_backend_ignores_request_override(self):
+        layer = _fake_layer(default=AttentionBackendEnum.TORCH_SDPA)
+        layer._required_attention_backend = AttentionBackendEnum.TORCH_SDPA
+
+        layer_module.prepare_attention_backend_override(
+            layer, AttentionBackendEnum.SAGE_ATTN
+        )
+        layer_module.apply_attention_backend_override(
+            layer, AttentionBackendEnum.SAGE_ATTN
+        )
+
+        self.assertEqual(
+            layer._attn_impl_by_backend,
+            {AttentionBackendEnum.TORCH_SDPA: "torch_sdpa_impl"},
+        )
+        self.assertEqual(layer.attn_impl, "torch_sdpa_impl")
+        self.assertIs(layer.backend, AttentionBackendEnum.TORCH_SDPA)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionMetadata,
+    CubeSparseAttentionMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
@@ -333,6 +337,46 @@ def _resolve_denoise_model(
             model.eval()
         return model
     return model.to(device).eval()
+
+
+def _build_cube_attn_metadata(
+    server_args: ServerArgs,
+    *,
+    packed: dict[str, Any],
+    num_steps: int,
+    device: torch.device,
+) -> CubeSparseAttentionMetadata | None:
+    """Build cube sparse attention metadata when that backend is selected."""
+    transformer_backend = (server_args.component_attention_backends or {}).get(
+        "transformer", server_args.attention_backend
+    )
+    if str(transformer_backend).lower() != "cube_sparse_attn":
+        return None
+
+    config = server_args.attention_backend_config or {}
+    local_cube_size = config.get("local_cube_size")
+    topk_ratio_list = config.get("topk_ratio_list")
+    if not local_cube_size or not topk_ratio_list:
+        raise ValueError(
+            "cube_sparse_attn requires --attention-backend-config with "
+            "local_cube_size and topk_ratio_list"
+        )
+    metadata = CubeSparseAttentionMetadataBuilder().build(
+        packed=packed,
+        local_cube_size=local_cube_size,
+        topk_ratio_list=topk_ratio_list,
+        num_steps=num_steps,
+        device=device,
+    )
+    logger.info(
+        "cube sparse attention enabled: local_cube_size=%s "
+        "topk_ratio_list(len=%d, min=%.4f, max=%.4f)",
+        list(local_cube_size),
+        len(metadata.topk_ratio_list),
+        min(metadata.topk_ratio_list),
+        max(metadata.topk_ratio_list),
+    )
+    return metadata
 
 
 def _precompute_refined_prompt_embeds(
@@ -671,6 +715,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
         )
+        attn_metadata = _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=len(sigmas_video) - 1,
+            device=device,
+        )
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -716,7 +766,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(self._forward_dit, batch=batch),
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        attn_metadata=attn_metadata,
+                    ),
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -727,6 +781,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
+                    attn_metadata=attn_metadata,
                     on_step=on_step,
                     step_profiler=partial(
                         self._profile_denoising_step,
@@ -767,6 +822,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        attn_metadata: CubeSparseAttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -776,7 +832,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=None,
+            attn_metadata=attn_metadata,
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)

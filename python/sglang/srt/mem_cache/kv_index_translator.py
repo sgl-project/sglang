@@ -63,6 +63,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import get_parallel
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -122,6 +123,14 @@ class KVIndexTranslator:
             self._full_p2v_table = alloc.full_p2v_page_table
             self._full_page_multiplier = alloc.kernel_page_multiplier
             self._translate_full = alloc.translate_kv_loc_for_kernel
+            # The WRITE loc is the one id that arrives DCP-WIDENED: read indices
+            # are collapsed by the DCP index kernels, `out_cache_loc` still
+            # carries the owner rule in `loc % dcp_size`. Identity with the read
+            # translate when dcp_size == 1.
+            self._translate_write_full = alloc.translate_write_loc_for_kernel
+            # DCP read ids stay WIDENED to the consumer: selecting this rank's
+            # share changes the length, so only the production site can do it.
+            self.defer_read_translate = get_parallel().attn_dcp_size > 1
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
@@ -135,6 +144,8 @@ class KVIndexTranslator:
             self._full_p2v_table = None
             self._full_page_multiplier = 1
             self._translate_full = None
+            self._translate_write_full = None
+            self.defer_read_translate = False
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
             self._swa_write_loc_from_full = (
@@ -192,7 +203,7 @@ class KVIndexTranslator:
         captured graph bakes it) passes its own tables in ``into``;
         ``into=None`` allocates of width ``max_pages`` instead.
         """
-        if not self.is_translating:
+        if not self.is_translating or self.defer_read_translate:
             return KVIndexTable(
                 ids=self.req_to_token,
                 row_ids=req_pool_indices,
@@ -308,20 +319,22 @@ class KVIndexTranslator:
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
 
-    def assert_backends_carry_translator(self, backends) -> None:
-        """Boot guard: under the unified pool every backend a forward can reach
-        must carry THIS translator."""
-        if not self.is_translating:
-            return
+    def bind_and_verify_backends(self, backends) -> None:
+        """Boot: make every reachable backend carry THIS translator.
+
+        Model-layer producers read it off `get_attn_backend()`, so an unset
+        attribute is an unreachable hook, not "no translation needed".
+        """
         for backend in backends:
             if backend is None:
                 continue
+            if backend.kv_index_translator is None:
+                backend.kv_index_translator = self
+                continue
             assert backend.kv_index_translator is self, (
-                f"{type(backend).__name__} does not carry the runner's "
-                "KVIndexTranslator. A backend (or wrapper) reachable under "
-                "--enable-unified-memory must forward `kv_index_translator`, or "
-                "read-index producers silently skip the virtual->kernel-facing "
-                "translation."
+                f"{type(backend).__name__} carries a KVIndexTranslator that is "
+                "not this runner's. A wrapper must forward the inner backend's "
+                "copy, not build its own."
             )
 
     # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
@@ -338,7 +351,9 @@ class KVIndexTranslator:
         self._index_table_memo = None
         if not self.is_translating or forward_batch.out_cache_loc is None:
             return
-        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+        forward_batch.out_cache_loc = self._translate_write_full(
+            forward_batch.out_cache_loc
+        )
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]
@@ -362,6 +377,23 @@ class KVIndexTranslator:
         return (self._swa_v2p_table[virt_page] * swa_stride + offset).clamp_(min=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------
+
+    @property
+    def needs_read_translate(self) -> bool:
+        """Whether `translate_dcp_read_ids` is anything but the identity, so a
+        hot path can skip the call rather than round-trip a no-op copy."""
+        return self.is_translating or get_parallel().attn_dcp_size > 1
+
+    def translate_dcp_read_ids(self, widened_ids: torch.Tensor) -> torch.Tensor:
+        """Widened logical READ ids -> kernel-facing ids, for either pool.
+
+        The one hook every DCP read-index production site calls; on a static
+        pool `widened // dcp_size` IS the whole virtual->physical translation.
+        """
+        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size > 1:
+            widened_ids = widened_ids // dcp_size
+        return self.translate_full_attn_ids(widened_ids)
 
     def translate_full_attn_ids(
         self, kv_indices: torch.Tensor, *, out: Optional[torch.Tensor] = None
