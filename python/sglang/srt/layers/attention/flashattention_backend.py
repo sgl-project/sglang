@@ -495,6 +495,18 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
 
+        # Refill the SWA write-target buffer (bound as a metadata view in
+        # _bind_metadata_buffers) from the live out_cache_loc before replay.
+        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
+            n = out_cache_loc.shape[0]
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
+                )
+
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             seq_lens_cpu = seq_lens.cpu()
@@ -538,7 +550,6 @@ class FlashAttentionBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
-                in_capture=True,
             )
 
             if forward_mode.is_decode_or_idle() and spec_info is None:
@@ -2723,7 +2734,6 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
-        in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -2740,20 +2750,6 @@ class FlashAttentionBackend(AttentionBackend):
         device = seq_lens.device
         metadata = None
         metadata_expand = None
-
-        # Refill the SWA write-target buffer (bound as a metadata view in
-        # _bind_metadata_buffers) from the live out_cache_loc before replay.
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            n = out_cache_loc.shape[0]
-            self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            if in_capture and self.kv_index_translator.is_translating:
-                # A capture batch never went through `init_new`, so there is no
-                # rebound write loc; zeros are the page-0 sink.
-                self.cuda_graph_swa_out_cache_loc[:n].zero_()
-            else:
-                self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
-                )
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
