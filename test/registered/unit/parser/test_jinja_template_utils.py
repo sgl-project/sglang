@@ -349,41 +349,22 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(video_data[0], "http://example.com/v.mp4")
         self.assertEqual(result["content"][1], {"type": "video"})
 
-    def test_process_content_video_with_max_dynamic_patch(self):
-        """Test video_url with max_dynamic_patch stores a VideoData."""
+    def test_process_content_video_structured_fields_become_video_data(self):
+        """video_url with mdp/fps-style fields lands in VideoData.preprocess_kwargs."""
         msg_dict = {
             "role": "user",
             "content": [
                 {
                     "type": "video_url",
                     "video_url": {
-                        "url": "http://example.com/v.mp4",
+                        "url": "http://example.com/a.mp4",
                         "max_dynamic_patch": 4,
                     },
                 },
-            ],
-        }
-        image_data = []
-        video_data = []
-        audio_data = []
-        modalities = []
-        result = process_content_for_template_format(
-            msg_dict, "openai", image_data, video_data, audio_data, modalities
-        )
-        self.assertEqual(len(video_data), 1)
-        self.assertIsInstance(video_data[0], VideoData)
-        self.assertEqual(video_data[0].url, "http://example.com/v.mp4")
-        self.assertEqual(video_data[0].preprocess_kwargs, {"max_dynamic_patch": 4})
-
-    def test_process_content_video_with_preprocess_fields(self):
-        """fps-style fields on video_url land in VideoData.preprocess_kwargs."""
-        msg_dict = {
-            "role": "user",
-            "content": [
                 {
                     "type": "video_url",
                     "video_url": {
-                        "url": "http://example.com/v.mp4",
+                        "url": "http://example.com/b.mp4",
                         "fps": 1.5,
                         "max_frames": 16,
                     },
@@ -392,11 +373,14 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         }
         video_data = []
         process_content_for_template_format(msg_dict, "openai", [], video_data, [], [])
-        self.assertEqual(len(video_data), 1)
-        self.assertIsInstance(video_data[0], VideoData)
         self.assertEqual(
-            video_data[0].preprocess_kwargs, {"fps": 1.5, "max_frames": 16}
+            [(item.url, item.preprocess_kwargs) for item in video_data],
+            [
+                ("http://example.com/a.mp4", {"max_dynamic_patch": 4}),
+                ("http://example.com/b.mp4", {"fps": 1.5, "max_frames": 16}),
+            ],
         )
+        self.assertIsInstance(video_data[0], VideoData)
 
     def test_process_content_v32_encoding(self):
         """Test v32 encoding mode flattens text and ignores structured content parts."""
