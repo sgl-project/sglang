@@ -29,11 +29,11 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             VERSION="${{ github.event.inputs.version }}"
-            CHECK_TAG_EXISTS=true
+            IS_WORKFLOW_DISPATCH=true
           else
-            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            # Extract version from the tag that triggered this workflow (e.g., v0.5.7 -> 0.5.7)
             VERSION="${GITHUB_REF_NAME#v}"
-            CHECK_TAG_EXISTS=false
+            IS_WORKFLOW_DISPATCH=false
           fi
 
           # Validate version format
@@ -46,7 +46,7 @@ jobs:
             exit 1
           fi
 
-          if [ "$CHECK_TAG_EXISTS" = "true" ] && ! git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+          if [ "$IS_WORKFLOW_DISPATCH" = "true" ] && ! git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
             echo "::error::Version tag v${VERSION} does not exist"
             exit 1
           fi
