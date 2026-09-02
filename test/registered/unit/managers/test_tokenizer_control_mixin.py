@@ -19,6 +19,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 from sglang.srt.lora.lora_registry import LoRARegistry
 from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
@@ -27,10 +32,6 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -109,6 +110,8 @@ class TestMultiTokenizerRejectsDynamicLoRA(_LoRAControlTestBase):
         self.assertFalse(result.success)
         self.assertIn("--tokenizer-worker-num", result.error_message)
         self.assertIn("31084", result.error_message)
+        # Guard must describe both load and unload (same message for all 3 APIs).
+        self.assertRegex(result.error_message, r"load(/|ing).*(unload|unloading)")
         manager.update_lora_adapter_communicator.assert_not_awaited()
         self.assertEqual(manager.lora_registry.num_registered_loras, 0)
         self.assertEqual(manager.lora_ref_cache, {})
@@ -138,14 +141,29 @@ class TestMultiTokenizerRejectsDynamicLoRA(_LoRAControlTestBase):
 
 class TestSingleTokenizerUnchanged(_LoRAControlTestBase):
     def test_load_and_unload(self):
-        mgr = _FakeTokenizerManager(tokenizer_worker_num=1)
-        load = asyncio.run(mgr.load_lora_adapter(_load_req()))
-        self.assertTrue(load.success)
-        mgr.update_lora_adapter_communicator.assert_awaited()
+        # Use one event loop: asyncio.Lock must not be reused across asyncio.run().
+        async def _run():
+            mgr = _FakeTokenizerManager(tokenizer_worker_num=1)
+            load = await mgr.load_lora_adapter(_load_req())
+            self.assertTrue(load.success)
+            mgr.update_lora_adapter_communicator.assert_awaited()
+            self.assertEqual(mgr.lora_registry.num_registered_loras, 1)
+            self.assertIn("adapter_a", mgr.lora_ref_cache)
 
-        unload = asyncio.run(mgr.unload_lora_adapter(_unload_req()))
-        self.assertTrue(unload.success)
-        self.assertEqual(mgr.lora_registry.num_registered_loras, 0)
+            unload = await mgr.unload_lora_adapter(_unload_req())
+            self.assertTrue(unload.success)
+            self.assertEqual(mgr.lora_registry.num_registered_loras, 0)
+            return mgr
+
+        asyncio.run(_run())
+
+    def test_load_from_tensors(self):
+        mgr = _FakeTokenizerManager(tokenizer_worker_num=1)
+        load = asyncio.run(mgr.load_lora_adapter_from_tensors(_load_tensors_req()))
+        self.assertTrue(load.success)
+        mgr.update_lora_adapter_communicator.assert_awaited_once()
+        self.assertEqual(mgr.lora_registry.num_registered_loras, 1)
+        self.assertIn("adapter_a", mgr.lora_ref_cache)
 
 
 if __name__ == "__main__":
