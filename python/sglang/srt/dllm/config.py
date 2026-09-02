@@ -4,10 +4,10 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 
+
 def _require_positive_int(name: str, value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"dLLM {name} must be a positive integer, got {value!r}")
-
 
 
 def _validate_multi_block_prefill_backend(
