@@ -108,6 +108,18 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
 
   // stage 1: 8bit coarse histogram
   if (tx < RADIX + 1) s_histogram[tx] = 0;
+  // Ensure partially populated results remain valid if input changes in
+  // flight; any i < TopK is a valid index because length must exceed TopK.
+  for (int i = tx; i < TopK; i += BLOCK_SIZE)
+    index[i] = i;
+  if (tx == 0) {
+    // Initialize selection state so a no-match threshold predicate below
+    // falls back to safe values instead of stale or uninitialized memory.
+    s_threshold_bin_id = 0;
+    s_num_input[0] = 0;
+    s_num_input[1] = 0;
+    s_counter = 0;
+  }
   __syncthreads();
 
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -149,7 +161,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < TopK)) index[pos] = idx;
       }
     }
     __syncthreads();
@@ -166,7 +178,7 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       const auto bin = static_cast<int>(convert_to_uint8(raw_input));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
+        if (C10_LIKELY(pos < TopK)) index[pos] = idx;
       } else if (bin == threshold_bin) {
         const auto pos = ::atomicAdd(&s_num_input[0], 1);
         /// NOTE: (dark) fuse the histogram computation here
@@ -186,6 +198,11 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
   for (int round = 0; round < 4; ++round) {
     __shared__ int s_last_remain;
     const auto r_idx = round % 2;
+
+    if (tx == 0) {
+      s_last_remain = 0;
+      s_num_input[r_idx ^ 1] = 0;
+    }
 
     // clip here to prevent overflow
     const auto _raw_num_input = s_num_input[r_idx];
@@ -209,7 +226,8 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          // Input changing mid-kernel can produce more than TopK candidates.
+          if (C10_LIKELY(pos < TopK)) index[pos] = idx;
         }
       }
       __syncthreads();
@@ -227,11 +245,12 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
+          // The index array is global here and shared in transform kernels.
+          if (C10_LIKELY(pos < TopK)) index[pos] = idx;
         } else if (bin == threshold_bin) {
           if (round == 3) {
             const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
+            if (pos > 0 && pos <= TopK) {
               index[TopK - pos] = idx;
             }
           } else {
