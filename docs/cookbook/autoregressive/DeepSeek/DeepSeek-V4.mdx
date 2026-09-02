@@ -32,7 +32,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 **NVIDIA GPUs**
 
-A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). The one exception is **Flash Vision (Exp)**, whose support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)).
+A single image — `lmsysorg/sglang:latest` — covers the **datacenter GPUs** in this cookbook (B200 / B300 / GB200 / GB300 / H100 / H200 / RTX PRO 6000). The one exception is **Flash Vision (Exp)**, whose support has not shipped in a release yet: its cells use the preview image `lmsysorg/sglang:dev-dsv4-flash-vision` (the command panel picks it automatically — see the [Flash Vision notes](#vision-note)). **DGX Spark** is the other exception: its single Flash Official FP4 cell uses the DGX Spark–only preview image `lmsysorg/sglang:dev-v4f-2dgx` (the command panel picks it automatically — see the [DGX Spark notes](#spark-note)); do not use that image on any other hardware.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -214,6 +214,17 @@ For the original Flash and Pro checkpoints:
 - `balanced`: steps=1, draft-tokens=2 → gentler MTP, reduces throughput hit at higher batch.
 - `high-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP runs on the v2 speculative path.
+
+<a id="spark-note" />
+
+**DGX Spark (2x GB10, Flash Official FP4)**
+
+The **DGX Spark** row has a single recipe: **Flash Official (0731) · FP4 · Balanced · Multi-Nodes** — the 284B checkpoint does not fit one 128GB GB10, so it runs TP=2 across two DGX Sparks connected over ConnectX-7 (RoCE). Every other DGX Spark combination is greyed out on purpose.
+
+- **Docker image** — the cell uses `lmsysorg/sglang:dev-v4f-2dgx`, a preview build made **only for DGX Spark**: it bakes in the SM12x `b12x` MoE (W4A8) and compressed-MLA attention kernels ([#34878](https://github.com/sgl-project/sglang/pull/34878), [#35899](https://github.com/sgl-project/sglang/pull/35899), [#34018](https://github.com/sgl-project/sglang/pull/34018)) plus the CuTeDSL and NCCL pins the GB10 pair needs. Do not use it on other hardware, and use the panel's Docker mode — the bare Python command needs the `b12x` kernel package this image ships.
+- **Run the same command on both Sparks** with `--node-rank 0` / `--node-rank 1` and `--dist-init-addr` pointing at node 0 over the ConnectX-7 link. The `docker run` flags the panel emits (`--network host --ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`) are what let NCCL use RDMA; without them NCCL silently falls back to TCP and decode slows by roughly 40%.
+- **Env knobs** in the cell are part of the recipe: `SGLANG_SM120_FLASHMLA_BACKEND=b12x` selects the b12x attention path, `SGLANG_B12X_MAX_TOKENS` must equal `--chunked-prefill-size`, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids unified-memory fragmentation OOMs on GB10.
+- **Text only** — the image predates Flash Vision support, and the b12x kernels do not yet cover image prefill on SM12x; there is no DGX Spark cell for the Flash Vision variant.
 
 <a id="vision-note" />
 
