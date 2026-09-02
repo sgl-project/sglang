@@ -112,6 +112,19 @@ class TestTopologyAwarePlacement(unittest.TestCase):
                 algorithm=EplbAlgorithm.topology_aware,
             )
 
+    def test_topology_swaps_without_worsening_load_balance(self):
+        # The load-balanced seed assigns [0, 1] to rank 0 and [2, 3] to rank
+        # 1. The traffic is reversed, so two swaps should make the placement
+        # local while keeping both ranks at the same total load.
+        counts = torch.zeros((1, 2, 4), dtype=torch.int64)
+        counts[0, 0, 2:] = 10
+        counts[0, 1, :2] = 10
+        costs = torch.tensor([[0.0, 5.0], [5.0, 0.0]])
+
+        physical_to_logical, _, _ = rebalance_experts_topology_aware(counts, costs)
+
+        self.assertEqual(physical_to_logical[0].tolist(), [2, 3, 0, 1])
+
     def test_rejects_replication_until_supported(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
         costs = torch.zeros((2, 2), dtype=torch.float32)

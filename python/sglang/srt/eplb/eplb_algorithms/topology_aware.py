@@ -20,9 +20,11 @@ many tokens each source rank sent to each expert.  This module deliberately
 keeps that distinction explicit by accepting a ``[layers, source_ranks,
 experts]`` tensor.
 
-This first version handles the no-replication case.  It is a small, pure
-PyTorch planner that is useful for validating the placement contract before
-the runtime recorder and CLI are wired up.
+This first version handles the no-replication case.  It seeds the placement
+with a load-balanced assignment and then applies communication-improving
+pairwise swaps without increasing the baseline's maximum rank load.  The
+implementation is deliberately small and pure PyTorch so it can run during a
+rebalance without an external optimizer.
 """
 
 from __future__ import annotations
@@ -109,6 +111,124 @@ def _assignment_to_maps(
     return physical_to_logical, logical_to_physical, expert_count
 
 
+def _load_balanced_seed(total_load: torch.Tensor, num_ranks: int) -> torch.Tensor:
+    """Build the same kind of load-first, equal-capacity seed as EPLB."""
+    num_experts = total_load.numel()
+    experts_per_rank = num_experts // num_ranks
+    order = sorted(
+        range(num_experts), key=lambda expert: (-float(total_load[expert]), expert)
+    )
+    assignment = torch.empty(num_experts, dtype=torch.int64)
+    rank_load = [0.0] * num_ranks
+    rank_items = [0] * num_ranks
+    for expert in order:
+        eligible = [
+            rank for rank in range(num_ranks) if rank_items[rank] < experts_per_rank
+        ]
+        destination_rank = min(eligible, key=lambda rank: (rank_load[rank], rank))
+        assignment[expert] = destination_rank
+        rank_items[destination_rank] += 1
+        rank_load[destination_rank] += float(total_load[expert])
+    return assignment
+
+
+def _improve_topology(
+    assignment: torch.Tensor,
+    total_load: torch.Tensor,
+    communication_cost: torch.Tensor,
+    num_ranks: int,
+) -> torch.Tensor:
+    """Apply deterministic improving swaps within the seed's load envelope."""
+    rank_load = [0.0] * num_ranks
+    for expert, rank in enumerate(assignment.tolist()):
+        rank_load[rank] += float(total_load[expert])
+    rank_load = torch.tensor(rank_load, dtype=torch.float64)
+    max_seed_load = rank_load.max().item()
+
+    num_experts = assignment.numel()
+    expert_ids = torch.arange(num_experts, dtype=torch.int64)
+    first_rank = assignment[:, None].expand(num_experts, num_experts)
+    second_rank = assignment[None, :].expand(num_experts, num_experts)
+    pair_mask = torch.triu(
+        torch.ones((num_experts, num_experts), dtype=torch.bool), diagonal=1
+    )
+    pair_mask &= first_rank != second_rank
+
+    # The rank loads of all non-swapped ranks are already within the seed's
+    # envelope.  Therefore a proposed swap is feasible exactly when its two
+    # changed ranks stay below that envelope; this avoids an O(num_ranks)
+    # max-reduction for every pair.
+    new_first_load = (
+        rank_load[first_rank]
+        - total_load[:, None]
+        + total_load[None, :]
+    )
+    new_second_load = (
+        rank_load[second_rank]
+        - total_load[None, :]
+        + total_load[:, None]
+    )
+    pair_mask &= new_first_load <= max_seed_load + 1e-12
+    pair_mask &= new_second_load <= max_seed_load + 1e-12
+
+    first_ids = expert_ids[:, None]
+    second_ids = expert_ids[None, :]
+    delta = (
+        communication_cost[first_ids, second_rank]
+        + communication_cost[second_ids, first_rank]
+        - communication_cost[first_ids, first_rank]
+        - communication_cost[second_ids, second_rank]
+    )
+
+    # Rebalancing runs in the serving process.  A bounded number of swaps keeps
+    # the planner predictable for large expert counts while still allowing a
+    # full pass over the ranks on the usual 8-way EP setup.
+    for _ in range(max(1, num_ranks)):
+        feasible_delta = delta.masked_fill(~pair_mask, float("inf"))
+        feasible_delta = feasible_delta.masked_fill(feasible_delta >= -1e-12, float("inf"))
+        best_flat = int(feasible_delta.argmin())
+        if not torch.isfinite(feasible_delta.flatten()[best_flat]):
+            return assignment
+
+        first = best_flat // num_experts
+        second = best_flat % num_experts
+        first_rank_id = int(assignment[first])
+        second_rank_id = int(assignment[second])
+        assignment[first] = second_rank_id
+        assignment[second] = first_rank_id
+        rank_load[first_rank_id] = new_first_load[first, second]
+        rank_load[second_rank_id] = new_second_load[first, second]
+
+        # Keep the pair tensors synchronized with the changed assignment for
+        # the next bounded iteration.
+        first_rank = assignment[:, None].expand(num_experts, num_experts)
+        second_rank = assignment[None, :].expand(num_experts, num_experts)
+        new_first_load = (
+            rank_load[first_rank]
+            - total_load[:, None]
+            + total_load[None, :]
+        )
+        new_second_load = (
+            rank_load[second_rank]
+            - total_load[None, :]
+            + total_load[:, None]
+        )
+        pair_mask = torch.triu(
+            torch.ones((num_experts, num_experts), dtype=torch.bool), diagonal=1
+        )
+        pair_mask &= first_rank != second_rank
+        pair_mask &= new_first_load <= max_seed_load + 1e-12
+        pair_mask &= new_second_load <= max_seed_load + 1e-12
+        delta = (
+            communication_cost[first_ids, second_rank]
+            + communication_cost[second_ids, first_rank]
+            - communication_cost[first_ids, first_rank]
+            - communication_cost[second_ids, second_rank]
+        )
+
+    return assignment
+
+
 def rebalance_experts_topology_aware(
     tokens_per_source_expert: torch.Tensor,
     rank_cost_matrix: torch.Tensor,
@@ -121,9 +241,10 @@ def rebalance_experts_topology_aware(
     ``tokens_per_source_expert[layer, source, expert]`` is the number of
     routed tokens originating at ``source`` for ``expert``.  Each logical
     expert is assigned to exactly one destination rank, and every rank gets
-    the same number of experts.  Experts are considered in descending total
-    load; each one is assigned to the currently cheapest rank with remaining
-    capacity.  Ties are resolved by rank id, making the result deterministic.
+    the same number of experts.  A load-balanced seed is improved with
+    communication-reducing swaps that keep the seed's maximum rank load as an
+    upper bound.  Ties are resolved by expert and rank id, making the result
+    deterministic.
 
     The return value follows ``rebalance_experts``: physical-to-logical map,
     logical-to-physical map, and the per-expert replica count.
@@ -142,24 +263,13 @@ def rebalance_experts_topology_aware(
     assignment = torch.empty(
         (num_layers, num_logical_experts), dtype=torch.int64, device="cpu"
     )
-    experts_per_rank = num_physical_experts // num_ranks
-
     for layer in range(num_layers):
         total_load = counts[layer].sum(dim=0)
         communication_cost = counts[layer].transpose(0, 1).matmul(costs)
-        order = sorted(
-            range(num_logical_experts),
-            key=lambda expert: (-float(total_load[expert]), expert),
+        assignment[layer] = _load_balanced_seed(total_load, num_ranks)
+        assignment[layer] = _improve_topology(
+            assignment[layer], total_load, communication_cost, num_ranks
         )
-        remaining = [experts_per_rank] * num_ranks
-        for expert in order:
-            eligible = [rank for rank in range(num_ranks) if remaining[rank] > 0]
-            destination_rank = min(
-                eligible,
-                key=lambda rank: (float(communication_cost[expert, rank]), rank),
-            )
-            assignment[layer, expert] = destination_rank
-            remaining[destination_rank] -= 1
 
     return _assignment_to_maps(assignment, num_ranks)
 
