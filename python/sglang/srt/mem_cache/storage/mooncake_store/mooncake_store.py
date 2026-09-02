@@ -799,6 +799,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             PoolName.DRAFT_INDEXER,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
             PoolName.DEEPSEEK_V4_C128,
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,

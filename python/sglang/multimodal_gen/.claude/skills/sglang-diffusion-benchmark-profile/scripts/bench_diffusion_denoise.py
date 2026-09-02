@@ -16,8 +16,9 @@ Usage:
     # Opt in to a compile control (presets are eager by default)
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --torch-compile
 
-    # Check Eager/BCG at lossless/high on one GPU set; high+BCG is invalid when
-    # request-scoped DiT fusions mount only after lossless graph capture.
+    # Check Eager/BCG at every request quality on one GPU set; extra-high/high
+    # + BCG are invalid when request-scoped DiT fusions mount only after the
+    # lossless graph capture.
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model sana-video --quality-bcg-matrix --model-cache-root /task/model-caches --cleanup-model-cache
 
     # Clean an isolated model cache even if the run fails or is interrupted
@@ -80,14 +81,14 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
-BENCHMARK_QUALITY_LEVELS = ("lossless", "high")
+BENCHMARK_QUALITY_LEVELS = ("lossless", "extra-high", "high")
 BCG_CAPTURE_SIGNAL = "[diffusion bcg] captured"
 BCG_INVALID_SIGNALS = (
     "[diffusion bcg] capture failed",
     "[diffusion bcg] disabled",
     "[diffusion bcg] serving signature missed",
     "no graph will be captured",
-    "quality='high' cannot be used with breakable cuda graphs",
+    "cannot be used with breakable cuda graphs",
 )
 BCG_LATE_QUALITY_FUSION_SIGNAL = "quality fusion mounted after BCG capture"
 QUALITY_BCG_ABBA_MATRIX = (
@@ -95,6 +96,10 @@ QUALITY_BCG_ABBA_MATRIX = (
     ("bcg-lossless-a", "lossless", True),
     ("bcg-lossless-b", "lossless", True),
     ("eager-lossless-b", "lossless", False),
+    ("eager-extra-high-a", "extra-high", False),
+    ("bcg-extra-high-a", "extra-high", True),
+    ("bcg-extra-high-b", "extra-high", True),
+    ("eager-extra-high-b", "extra-high", False),
     ("eager-high-a", "high", False),
     ("bcg-high-a", "high", True),
     ("bcg-high-b", "high", True),
@@ -419,6 +424,33 @@ MODELS = {
             "fps",
             "num-inference-steps",
         },
+    },
+    # H3 rejects a 1-step warmup request, hence --warmup-steps=2.
+    "fasth3-t2va-vsa": {
+        "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "prompt": (
+            "A curious raccoon peers through a vibrant field of yellow "
+            "sunflowers, its eyes wide with interest."
+        ),
+        "seed": 1000,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 10.0,
+            },
+            "num_inference_steps": 5,
+        },
+        "extra_args": [
+            "--num-gpus=4",
+            "--attention-backend=video_sparse_attn_h3",
+            '--attention-backend-config={"VSA_sparsity": 0.9}',
+            "--enable-torch-compile=false",
+            "--warmup-steps=2",
+        ],
+        "force_eager": True,
     },
     # Source-tracked extras from current registry / GPU test coverage.
     "longcat-image": {
@@ -1838,11 +1870,11 @@ def _run_benchmark_once_impl(
             if BCG_CAPTURE_SIGNAL in lower_line:
                 bcg_capture_detected = True
             if (
-                quality == "high"
+                quality in {"extra-high", "high"}
                 and breakable_cuda_graph
                 and bcg_capture_detected
                 and "mounted " in lower_line
-                and "for quality=high" in lower_line
+                and f"for quality={quality}" in lower_line
             ):
                 bcg_invalid_signals.add(BCG_LATE_QUALITY_FUSION_SIGNAL)
             bcg_invalid_signals.update(
@@ -2256,7 +2288,8 @@ def main():
         "--quality-bcg-matrix",
         action="store_true",
         help=(
-            "Run lossless/high Eager-vs-BCG as two ABBA pairs on one GPU set "
+            "Run lossless/extra-high/high Eager-vs-BCG as three ABBA pairs "
+            "on one GPU set "
             "and one task-owned model cache."
         ),
     )
