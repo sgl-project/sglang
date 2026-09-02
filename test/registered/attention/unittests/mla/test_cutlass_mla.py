@@ -1,18 +1,13 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     run_mla_attention_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 # Cutlass MLA requires exactly Blackwell SM 10.0. The sgl-kernel
 # `cutlass_mla_decode` checks `sm_version == 100` (major*10+minor), so

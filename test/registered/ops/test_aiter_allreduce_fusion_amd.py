@@ -389,7 +389,6 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         tp_size=8,
     ):
         """Run the gate with the aiter branch isolated (flashinfer forced off)."""
-        server_args = types.SimpleNamespace(enable_aiter_allreduce_fusion=aiter_enabled)
         a2a_backend = types.SimpleNamespace(is_none=lambda: a2a_is_none)
 
         with ExitStack() as stack:
@@ -410,17 +409,25 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 )
             )
             stack.enter_context(mock.patch.object(comm, "_use_aiter", use_aiter))
+            # moe_ep_size/moe_tp_size of 1 keep the hybrid EP+TP guard inactive
+            # so the aiter branch is what decides.
             stack.enter_context(
                 mock.patch.object(
                     comm,
                     "get_parallel",
-                    lambda: types.SimpleNamespace(tp_size=tp_world_size),
+                    lambda: types.SimpleNamespace(
+                        tp_size=tp_world_size, moe_ep_size=1, moe_tp_size=1
+                    ),
                 )
             )
+            # the gate reads get_exec().comm.enable_aiter_allreduce_fusion
+            from sglang.srt.runtime_context import get_context, get_flags
+
             stack.enter_context(
-                mock.patch.object(comm, "get_server_args", lambda: server_args)
+                get_context().override_server_args(
+                    enable_aiter_allreduce_fusion=aiter_enabled
+                )
             )
-            from sglang.srt.runtime_context import get_flags
 
             stack.enter_context(get_flags().dp.override(enabled=dp_attention))
             stack.enter_context(

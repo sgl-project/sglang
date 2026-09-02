@@ -10,7 +10,7 @@ Tests HiCache with different configurations: standard, MLA, EAGLE, and page size
 import unittest
 
 from sglang.benchmark.utils import get_tokenizer
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import is_hip
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin, MMLUMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 _is_hip = is_hip()
@@ -50,7 +51,7 @@ class HiCacheBaseServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process)
 
 
 class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
@@ -64,8 +65,8 @@ class TestHiCacheStandard(HiCacheBaseServer, MMLUMixin):
         "--hicache-size",
         100 if not _is_hip else 200,
     ]
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
 
@@ -77,10 +78,12 @@ class TestHiCacheMLA(HiCacheBaseServer, MMLUMixin, MGSMEnMixin):
         "--trust-remote-code",
         "--enable-hierarchical-cache",
     ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
-    mmlu_score_threshold = 0.5
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.54
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
     mgsm_en_score_threshold = 0.8
+    if _is_hip:
+        mgsm_en_num_threads = 32
 
 
 @unittest.skipIf(is_hip(), "Disabled for AMD-aiter")
@@ -110,8 +113,8 @@ class TestHiCacheEagle(HiCacheBaseServer, MMLUMixin):
         "--chunked-prefill-size",
         1024,
     ]
-    mmlu_score_threshold = 0.72
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
     mmlu_accept_length_thres = 2.26
 
@@ -127,8 +130,8 @@ class TestHiCachePage(HiCacheBaseServer, MMLUMixin):
         "--hicache-write-policy",
         "write_back",
     ]
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
 

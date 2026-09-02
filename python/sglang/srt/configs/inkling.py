@@ -8,6 +8,10 @@ from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 
 
 class InklingModelConfig(PretrainedConfig):
@@ -209,7 +213,6 @@ class InklingModelConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Optional[InklingConvCacheParams]:
-        from sglang.srt.runtime_context import get_parallel
 
         try:
             tp_size = get_parallel().attn_tp_size
@@ -224,9 +227,8 @@ class InklingModelConfig(PretrainedConfig):
             self.swa_num_key_value_heads, self.swa_head_dim
         )
         stream_dim = self.hidden_size
-        from sglang.srt.runtime_context import get_server_args
 
-        if get_server_args().enable_scattered_sconv:
+        if get_exec().comm.enable_scattered_sconv:
             # Scattered sconv: the attn/mlp output sconvs run on the [T, H/P]
             # hidden shard, so their conv-state caches shard with them.
             assert (

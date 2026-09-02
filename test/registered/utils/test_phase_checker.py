@@ -166,19 +166,20 @@ class TestUpdateAssertEnabled(CustomTestCase):
             text=True,
             timeout=180,
         )
-        # Accept both exit-0 (RuntimeError caught) and SIGABRT (-6, the kernel's
-        # device_assert killed the process directly before sync could raise).
-        # Either way, the kernel-side check fired — which is what we're verifying.
-        # The presence of the SimplePhaseChecker FAIL line in stdout confirms it.
+        # The FAIL line is the evidence that the kernel-side check fired. How the
+        # process then dies is not: the CUDA coredump handler may abort it, and sync
+        # otherwise raises cudaErrorAssert or a generic cudaErrorLaunchFailure
+        # depending on whether generation ran. Only exit 1 means it never fired.
         self.assertIn(
             "SimplePhaseChecker FAIL",
             result.stdout,
+            f"returncode {result.returncode}; "
             f"stdout: {result.stdout}\nstderr: {result.stderr}",
         )
-        self.assertIn(
+        self.assertNotEqual(
             result.returncode,
-            (0, -6),
-            f"unexpected returncode {result.returncode}; "
+            1,
+            "the mismatch did not fire device_assert; "
             f"stdout: {result.stdout}\nstderr: {result.stderr}",
         )
 

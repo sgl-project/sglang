@@ -19,6 +19,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import publish
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -51,6 +52,8 @@ class TestForwardSplitPrefill(CustomTestCase):
         )
 
         cls.port_args = PortArgs.init_new(cls.server_args)
+
+        publish(cls.server_args, role="scheduler")
 
         # Load model and tokenizer
         cls.model_config = ModelConfig.from_server_args(cls.server_args)

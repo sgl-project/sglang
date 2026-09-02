@@ -18,11 +18,10 @@ from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _fake_forward_batch(is_decode: bool):
@@ -61,6 +60,39 @@ class TestDispatchMLASubtype(CustomTestCase):
                 _fake_attn("aiter"), _fake_forward_batch(is_decode=False)
             )
         self.assertEqual(method, AttnForwardMethod.MLA)
+
+
+class TestResolveRocmForwardMethod(CustomTestCase):
+    """The generic MHA/MLA methods must never reach the CUDA forward paths on
+    ROCm: those were stripped of their AMD branches when the AITER kernels moved
+    into forward_mha_rocm.py / forward_mla_rocm.py."""
+
+    def test_hip_routes_shared_methods_to_rocm(self):
+        with mock.patch.object(abh, "_is_hip", True):
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA),
+                AttnForwardMethod.MHA_ROCM,
+            )
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MHA_ONE_SHOT),
+                AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+            )
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MLA),
+                AttnForwardMethod.MLA_ROCM,
+            )
+
+    def test_hip_leaves_platform_specific_methods_alone(self):
+        with mock.patch.object(abh, "_is_hip", True):
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(AttnForwardMethod.MLA_FUSED_ROPE_ROCM),
+                AttnForwardMethod.MLA_FUSED_ROPE_ROCM,
+            )
+
+    def test_non_hip_is_identity(self):
+        with mock.patch.object(abh, "_is_hip", False):
+            for method in AttnForwardMethod:
+                self.assertEqual(abh.resolve_rocm_forward_method(method), method)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -35,6 +36,14 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._scheduler_logger.setLevel(cls._old_level)
+
+    def setUp(self):
+        # The scheduler scales the budget by the live DCP size
+        # (`get_parallel().attn_dcp_size`), so the double states a topology
+        # rather than publishing a config it does not otherwise need.
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
 
     def _new_scheduler(
         self,

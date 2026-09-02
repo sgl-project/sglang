@@ -74,7 +74,7 @@ class LlamaForSequenceClassification(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        return LlamaForCausalLM.load_weights(self, weights)
+        return LlamaForCausalLM._legacy_load_weights(self, weights)
 
 
 class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassification):

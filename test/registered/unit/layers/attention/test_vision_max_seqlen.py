@@ -1,9 +1,11 @@
 import sys
 
+import pytest
 import torch
 from torch import nn
 
 from sglang.srt.layers.attention import vision
+from sglang.srt.models import kimi_k25
 from sglang.srt.models.kimi_k25 import MoonViT3dEncoder, MoonViTEncoderLayer
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -166,6 +168,7 @@ def test_kimi_moonvit_precomputes_sequence_lengths_once():
     encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
     nn.Module.__init__(encoder)
     encoder.rope_2d = CapturingRope()
+    encoder.use_fused_rope = False
     encoder.blocks = nn.ModuleList([CapturingBlock()])
     encoder.final_layernorm = nn.Identity()
 
@@ -177,6 +180,59 @@ def test_kimi_moonvit_precomputes_sequence_lengths_once():
     assert torch.equal(recorded["sequence_lengths"], torch.tensor([3, 4]))
     assert torch.equal(recorded["cu_seqlens"], torch.tensor([0, 3, 7]))
     assert recorded["max_seqlen"] == 4
+
+
+def test_kimi_moonvit_prepares_cuda_rope_inputs_once():
+    recorded = {}
+
+    class CapturingRope:
+        def get_freqs_cis(self, grid_thws, device):
+            real = torch.arange(14, dtype=torch.float32, device=device).view(7, 2)
+            return torch.complex(real, real + 1)
+
+    class CapturingBlock(nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            rope_freqs_cis,
+            **kwargs,
+        ):
+            recorded["rope_freqs_cis"] = rope_freqs_cis
+            return hidden_states
+
+    encoder = MoonViT3dEncoder.__new__(MoonViT3dEncoder)
+    nn.Module.__init__(encoder)
+    encoder.rope_2d = CapturingRope()
+    encoder.use_fused_rope = True
+    encoder.blocks = nn.ModuleList([CapturingBlock()])
+    encoder.final_layernorm = nn.Identity()
+
+    # The fused path is gated on the q/k dtype; fp32 stays on the portable one.
+    hidden_states = torch.ones(7, 4, dtype=torch.bfloat16)
+    encoder(hidden_states, torch.tensor([[1, 1, 7]], dtype=torch.int32))
+
+    cos_sin_cache, positions = recorded["rope_freqs_cis"]
+    assert cos_sin_cache.shape == (7, 4)
+    assert torch.equal(cos_sin_cache[:, :2] + 1, cos_sin_cache[:, 2:])
+    assert torch.equal(positions, torch.arange(7))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_kimi_moonvit_fused_rope_matches_portable_path():
+    torch.manual_seed(0)
+    q = torch.randn(256, 4, 72, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    angles = torch.randn(256, 36, device="cuda", dtype=torch.float32)
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+
+    q_ref, k_ref = kimi_k25.apply_rope(q.clone(), k.clone(), freqs_cis)
+    prepared_rope = kimi_k25.prepare_fused_qk_complex_rope_inplace(freqs_cis)
+    q_fused, k_fused = kimi_k25.apply_rope(q.clone(), k.clone(), prepared_rope)
+
+    torch.testing.assert_close(q_fused, q_ref, rtol=0.01, atol=0.01)
+    torch.testing.assert_close(k_fused, k_ref, rtol=0.01, atol=0.01)
 
 
 if __name__ == "__main__":

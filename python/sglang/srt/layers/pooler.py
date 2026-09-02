@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
@@ -48,7 +49,7 @@ def pool_hidden_states(
     hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> torch.Tensor:
-    """Pool hidden_states by PoolingType (LAST/CLS).
+    """Pool hidden_states by PoolingType (LAST/CLS/MEAN).
 
     Raw pooling only — no normalize, no dim truncation.
     Returns shape (batch_size, hidden_size).
@@ -61,6 +62,14 @@ def pool_hidden_states(
         first_token_flat_indices = torch.zeros_like(prompt_lens)
         first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
         return hidden_states[first_token_flat_indices]
+    elif pooling_type == PoolingType.MEAN:
+        prompt_lens = forward_batch.extend_seq_lens
+        end_indices = torch.cumsum(prompt_lens, dim=0) - 1
+        cumulative_hidden_states = torch.cumsum(hidden_states, dim=0)
+        sums = cumulative_hidden_states[end_indices]
+        preceding_sums = torch.zeros_like(sums)
+        preceding_sums[1:] = cumulative_hidden_states[end_indices[:-1]]
+        return (sums - preceding_sums) / prompt_lens.unsqueeze(-1)
     else:
         raise ValueError(f"Unsupported pooling type: {pooling_type}")
 
@@ -163,7 +172,7 @@ class Pooler(nn.Module):
     2. Normalizes output if specified.
     3. Returns structured results as `PoolerOutput`.
     Attributes:
-        pooling_type: The type of pooling to use (LAST, AVERAGE, MAX).
+        pooling_type: The type of pooling to use (LAST, CLS, MEAN).
         normalize: Whether to normalize the pooled data.
     """
 

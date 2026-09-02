@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -22,6 +23,8 @@ AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
 
 def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:
     batch = ScheduleBatch(reqs=overrides.pop("reqs"))
+    # init_new always sets a SpeculativeAlgorithm enum, never None.
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE
     for field in dataclasses.fields(ScheduleBatch):
         name = field.name
         if name in overrides or name in AUTO_FILL_EXCLUDED_FIELDS:
@@ -69,6 +72,10 @@ class _FakeReq:
 
     def _refresh_fill_ids(self):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
 
     def set_extend_range(self, start, end):
         self.extend_range = Range(start, end)

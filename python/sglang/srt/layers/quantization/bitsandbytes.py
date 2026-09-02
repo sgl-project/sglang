@@ -26,6 +26,21 @@ if TYPE_CHECKING:
     )
 
 
+def require_bitsandbytes() -> None:
+    try:
+        import bitsandbytes
+
+        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
+            raise ImportError(
+                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
+            )
+    except ImportError as err:
+        raise ImportError(
+            "Please install bitsandbytes>=0.46.1 via "
+            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
+        ) from err
+
+
 class BitsAndBytesConfig(QuantizationConfig):
     """Config class for BitsAndBytes Quantization.
 
@@ -184,21 +199,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: BitsAndBytesConfig):
-        try:
-            import bitsandbytes
-
-            if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.46.1."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.46.1 via "
-                "`pip install bitsandbytes>=0.46.1` to use "
-                "bitsandbytes quantizer."
-            ) from err
-
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(

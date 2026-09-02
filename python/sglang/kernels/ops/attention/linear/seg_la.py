@@ -221,11 +221,14 @@ def seg_la_p_kernel(
     q_lengths,
     s_scales,
     decay_scales,
+    track_lens,
+    track_state_indices,
     HEAD_DIM: tl.constexpr,
     K_SPLIT_DIM: tl.constexpr,
     V_SPLIT_DIM: tl.constexpr,
     BLOCK: tl.constexpr,
     EVEN: tl.constexpr,
+    TRACK_STATE: tl.constexpr,
 ):
     bid = tl.program_id(0)
     hid = tl.program_id(1)
@@ -241,6 +244,11 @@ def seg_la_p_kernel(
     q_offset = tl.load(q_offsets + bid)
     s_offset = tl.load(s_offsets + bid)
     decay_scale = -tl.load(decay_scales + hid)
+    track_len = 0
+    track_state_offset = -1
+    if TRACK_STATE:
+        track_len = tl.load(track_lens + bid)
+        track_state_offset = tl.load(track_state_indices + bid)
 
     offs_b = tl.arange(0, BLOCK)
     offs_k = tl.arange(0, K_SPLIT_DIM)
@@ -288,6 +296,15 @@ def seg_la_p_kernel(
         + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
     )
     state = tl.load(s_ptrs, mask=s_scale > 0).to(tl.float32)
+    if TRACK_STATE:
+        track_s_ptrs = (
+            S
+            + track_state_offset * stride_s
+            + hid * HEAD_DIM * HEAD_DIM
+            + kid * HEAD_DIM * K_SPLIT_DIM
+            + vid * V_SPLIT_DIM
+            + (offs_k[:, None] * HEAD_DIM + offs_v[None, :])
+        )
 
     for n in range(0, q_length, BLOCK):
         n = tl.multiple_of(n, BLOCK)
@@ -330,6 +347,15 @@ def seg_la_p_kernel(
         o = tl.dot(q, state) * block_decay * softmax_scale + o
 
         state = state * block_decay + tl.dot(k, v)
+        if TRACK_STATE:
+            should_track = (
+                (track_state_offset >= 0) & (track_len > 0) & (n + b == track_len)
+            )
+            tl.store(
+                track_s_ptrs,
+                state.to(S.dtype.element_ty),
+                mask=should_track,
+            )
 
         if EVEN:
             tl.store(out_ptrs + n * H * HEAD_DIM, o.to(Out.dtype.element_ty))
@@ -663,6 +689,8 @@ def seg_la_fwd(
     meta,
     caches=None,
     cache_indices=None,
+    track_lens=None,
+    track_state_indices=None,
     softmax_scale=None,
     decouple=False,
 ):
@@ -779,11 +807,18 @@ def seg_la_fwd(
                 meta.q_lengths,
                 meta.s_scales,
                 decay_scales,
+                track_lens if track_lens is not None else meta.q_lengths,
+                (
+                    track_state_indices
+                    if track_state_indices is not None
+                    else meta.s_offsets
+                ),
                 HEAD_DIM=HEAD_DIM,
                 K_SPLIT_DIM=K_SPLIT_DIM,
                 V_SPLIT_DIM=V_SPLIT_DIM,
                 BLOCK=BLOCK,
                 EVEN=EVEN,
+                TRACK_STATE=track_lens is not None and track_state_indices is not None,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )

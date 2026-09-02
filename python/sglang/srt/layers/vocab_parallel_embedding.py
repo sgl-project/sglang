@@ -224,6 +224,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         prefix: full name of the layer in the state dict
     """  # noqa: E501
 
+    # Attached by quant methods for a quantized ParallelLMHead; see
+    # LinearBase.scheme.
+    scheme = None
+
     def __init__(
         self,
         num_embeddings: int,

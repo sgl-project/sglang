@@ -9,7 +9,6 @@ import unittest
 import requests
 from transformers import AutoProcessor, AutoTokenizer
 
-from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -19,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    build_vlm_image_prompt,
     download_image_with_retry,
     popen_launch_server,
 )
@@ -91,9 +91,13 @@ class TestSkipTokenizerInit(CustomTestCase):
                 self.assertEqual(item["meta_info"]["prompt_tokens"], len(input_ids))
 
                 if return_logprob:
-                    num_input_logprobs = len(input_ids) - request["logprob_start_len"]
-                    if num_input_logprobs > len(input_ids):
-                        num_input_logprobs -= len(input_ids)
+                    # -1 resolves to the prompt end, so no input logprob is returned.
+                    if request["logprob_start_len"] == -1:
+                        num_input_logprobs = 0
+                    else:
+                        num_input_logprobs = (
+                            len(input_ids) - request["logprob_start_len"]
+                        )
                     self.assertEqual(
                         len(item["meta_info"]["input_token_logprobs"]),
                         num_input_logprobs,
@@ -150,7 +154,6 @@ class TestSkipTokenizerInit(CustomTestCase):
 
         response_stream_json = []
         for line in response_stream.iter_lines():
-            print(line)
             if line.startswith(b"data: ") and line[6:] != b"[DONE]":
                 response_stream_json.append(json.loads(line[6:]))
         out_stream_ids = []
@@ -230,8 +233,7 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
         cls.eos_token_id = [cls.tokenizer.eos_token_id]
 
     def get_input_ids(self, _prompt_text) -> list[int]:
-        chat_template = get_chat_template_by_model_path(self.model)
-        text = f"{chat_template.image_token}What is in this picture?"
+        text = build_vlm_image_prompt(self.processor, "What is in this picture?")
         inputs = self.processor(
             text=[text],
             images=[self.image],

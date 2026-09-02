@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=108, stage="base-b", runner_config="1-gpu-small")
 
-set_global_server_args_for_scheduler(object.__new__(ServerArgs))
+set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):

@@ -1,13 +1,15 @@
 """Inference-only GraniteMoe model."""
 
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 import torch
 from torch import nn
 from transformers import GraniteConfig
 
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -25,8 +27,31 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models import mixtral
+from sglang.srt.models.granite import build_attention_sinks, granite_layer_attn_params
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+
+SHARED_MOE_MODEL_TYPES = frozenset({"granitemoeshared", "granitemoe_swa"})
+
+
+def granitemoe_split_expert_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Split the packed expert tensors into per-expert w1/w2/w3."""
+    for name, weight in weights:
+        if name.endswith(".experts.gate_up_proj"):
+            for e in range(weight.size(0)):
+                expert = name.replace(".experts.gate_up_proj", f".experts.{e}")
+                w1, w3 = weight[e].chunk(2, dim=0)
+                yield f"{expert}.w1.weight", w1
+                yield f"{expert}.w3.weight", w3
+        elif name.endswith(".experts.down_proj"):
+            for e in range(weight.size(0)):
+                expert = name.replace(".experts.down_proj", f".experts.{e}")
+                yield f"{expert}.w2.weight", weight[e]
+        else:
+            yield name, weight
 
 
 class GraniteMoeMoE(nn.Module):
@@ -89,16 +114,56 @@ class GraniteMoeMoE(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
+class GraniteMoeSharedMLP(nn.Module):
+
+    def __init__(
+        self,
+        config: GraniteConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.input_size = config.hidden_size
+        self.hidden_size = config.shared_intermediate_size
+        self.input_linear = MergedColumnParallelLinear(
+            input_size=self.input_size,
+            output_sizes=[self.hidden_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("input_linear", prefix),
+        )
+        self.output_linear = RowParallelLinear(
+            self.hidden_size,
+            self.input_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("output_linear", prefix),
+        )
+        if config.hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {config.hidden_act}. "
+                "Only silu is supported for now."
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.input_linear(hidden_states)
+        x = self.act_fn(gate_up)
+        x, _ = self.output_linear(x)
+        return x
+
+
 class GraniteMoeAttention(nn.Module):
 
     def __init__(
         self,
+        config: GraniteConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
         max_position: int = 4096 * 32,
         layer_id: int = 0,
-        rope_theta: float = 10000,
         quant_config: Optional[QuantizationConfig] = None,
         attention_multiplier: Optional[float] = None,
         prefix: str = "",
@@ -127,7 +192,9 @@ class GraniteMoeAttention(nn.Module):
             if attention_multiplier is not None
             else self.head_dim**-1
         )
-        self.rope_theta = rope_theta
+        sliding_window_size, self.rope_theta, has_sink = granite_layer_attn_params(
+            config, layer_id
+        )
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -145,13 +212,18 @@ class GraniteMoeAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=int(self.rope_theta),
-            is_neox_style=True,
+        self.rotary_emb = (
+            get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position,
+                base=int(self.rope_theta),
+                is_neox_style=True,
+            )
+            if self.rope_theta
+            else None
         )
+        self.sinks = build_attention_sinks(self.num_heads) if has_sink else None
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -160,6 +232,7 @@ class GraniteMoeAttention(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            sliding_window_size=sliding_window_size,
         )
 
     def forward(
@@ -170,8 +243,12 @@ class GraniteMoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
+        if self.sinks is None:
+            attn_output = self.attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch, sinks=self.sinks)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -187,13 +264,12 @@ class GraniteMoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
         self.self_attn = GraniteMoeAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -207,6 +283,18 @@ class GraniteMoeDecoderLayer(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.block_sparse_moe",
+        )
+        shared_intermediate_size = (
+            config.shared_intermediate_size
+            if config.model_type in SHARED_MOE_MODEL_TYPES
+            else 0
+        )
+        self.shared_mlp = (
+            None
+            if shared_intermediate_size == 0
+            else GraniteMoeSharedMLP(
+                config, quant_config=quant_config, prefix=f"{prefix}.shared_mlp"
+            )
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -233,7 +321,12 @@ class GraniteMoeDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states * self.residual_multiplier
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.block_sparse_moe(hidden_states)
+        if self.shared_mlp is None:
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            # Routed experts consume `hidden_states`, so compute shared first
+            shared_output = self.shared_mlp(hidden_states)
+            hidden_states = self.block_sparse_moe(hidden_states) + shared_output
         hidden_states = residual + hidden_states * self.residual_multiplier
 
         return hidden_states
@@ -297,6 +390,16 @@ class GraniteMoeModel(nn.Module):
 
 class GraniteMoeForCausalLM(nn.Module):
 
+    # Legacy and current HF expert / router names with otherwise shared layout
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={
+            ".block_sparse_moe.input_linear.weight": ".block_sparse_moe.experts.gate_up_proj",
+            ".block_sparse_moe.output_linear.weight": ".block_sparse_moe.experts.down_proj",
+            ".block_sparse_moe.router.layer.weight": ".block_sparse_moe.gate.weight",
+            ".block_sparse_moe.router.weight": ".block_sparse_moe.gate.weight",
+        }
+    )
+
     def __init__(
         self,
         config: GraniteConfig,
@@ -346,42 +449,22 @@ class GraniteMoeForCausalLM(nn.Module):
             return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        new_weights = {}
-        for n, p in weights:
-            if n.endswith(".block_sparse_moe.input_linear.weight"):
-                for e in range(p.size(0)):
-                    w1_name = n.replace(
-                        ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w1.weight",
-                    )
-                    w3_name = n.replace(
-                        ".block_sparse_moe.input_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w3.weight",
-                    )
-                    w1_param, w3_param = p[e].chunk(2, dim=0)
-                    assert w1_name not in new_weights
-                    assert w3_name not in new_weights
-                    new_weights[w1_name] = w1_param
-                    new_weights[w3_name] = w3_param
-            elif n.endswith(".block_sparse_moe.output_linear.weight"):
-                for e in range(p.size(0)):
-                    w2_name = n.replace(
-                        ".block_sparse_moe.output_linear.weight",
-                        f".block_sparse_moe.experts.{e}.w2.weight",
-                    )
-                    w2_param = p[e]
-                    assert w2_name not in new_weights
-                    new_weights[w2_name] = w2_param
-            elif n.endswith(".block_sparse_moe.router.layer.weight"):
-                gate_name = n.replace(
-                    ".block_sparse_moe.router.layer.weight",
-                    ".block_sparse_moe.gate.weight",
-                )
-                assert gate_name not in new_weights
-                new_weights[gate_name] = p
-            else:
-                new_weights[n] = p
-        mixtral.MixtralForCausalLM.load_weights(self, new_weights.items())
+        weights = granitemoe_split_expert_weights(
+            self.hf_to_sglang_mapper.apply(weights)
+        )
+        mixtral.MixtralForCausalLM.load_weights(self, weights)
 
 
-EntryClass = [GraniteMoeForCausalLM]
+class GraniteMoeSharedForCausalLM(GraniteMoeForCausalLM):
+    pass
+
+
+class GraniteMoeSWAForCausalLM(GraniteMoeForCausalLM):
+    pass
+
+
+EntryClass = [
+    GraniteMoeForCausalLM,
+    GraniteMoeSharedForCausalLM,
+    GraniteMoeSWAForCausalLM,
+]

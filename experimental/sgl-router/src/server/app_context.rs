@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
@@ -12,7 +13,6 @@ use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug)]
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -30,6 +30,8 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
 
@@ -82,6 +84,8 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -127,6 +131,8 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }

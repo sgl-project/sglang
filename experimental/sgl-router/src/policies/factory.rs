@@ -65,7 +65,7 @@ pub fn build_policy(
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
-            let cache_cfg = model.cache_aware.unwrap_or_default();
+            let cache_cfg = model.cache_aware.clone().unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
                 cache_cfg,
                 tree,

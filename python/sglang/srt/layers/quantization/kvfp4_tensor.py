@@ -17,6 +17,8 @@ from enum import Enum
 
 import torch
 
+from sglang.srt.runtime_context import get_platform
+
 
 class FP4KVCacheRecipe(Enum):
     MXFP4 = 1  # KVFP4: block-wise scaling
@@ -175,14 +177,9 @@ class NVFP4KVQuantizeUtil:
                 block_scales: shape [B, M, N/16], dtype float8_e4m3fn
                 global_scale: passthrough
         """
-        from sglang.srt.utils import (
-            is_sm90_supported,
-            is_sm100_supported,
-            is_sm120_supported,
-        )
 
         assert (
-            is_sm100_supported() or is_sm120_supported() or is_sm90_supported()
+            get_platform().is_sm100 or get_platform().is_sm120 or get_platform().is_sm90
         ), "NVFP4 KV cache quantize requires SM100/SM120 or SM90 fallback GPU"
 
         b, m, n = tensor.shape
@@ -202,7 +199,7 @@ class NVFP4KVQuantizeUtil:
                 "NVFP4 global scale tensor must already be on the KV tensor device."
             )
 
-        if is_sm100_supported() or is_sm120_supported():
+        if get_platform().is_sm100 or get_platform().is_sm120:
             from flashinfer import nvfp4_kv_quantize
 
             # nvfp4_kv_quantize takes global_scale directly (not inverted)
@@ -249,11 +246,6 @@ class NVFP4KVQuantizeUtil:
         Returns:
             Dequantized tensor of shape [B, M, N]
         """
-        from sglang.srt.utils import (
-            is_sm90_supported,
-            is_sm100_supported,
-            is_sm120_supported,
-        )
 
         b, m, n_half = quant_tensor.shape
 
@@ -271,7 +263,7 @@ class NVFP4KVQuantizeUtil:
                 "NVFP4 global scale tensor must already be on the KV tensor device."
             )
 
-        if is_sm100_supported() or is_sm120_supported():
+        if get_platform().is_sm100 or get_platform().is_sm120:
             from flashinfer import nvfp4_kv_dequantize
 
             quant_2d = quant_tensor.view(torch.uint8).reshape(b * m, n_half)
@@ -282,7 +274,7 @@ class NVFP4KVQuantizeUtil:
             return output_2d.reshape(b, m, -1)
         else:
             assert (
-                is_sm90_supported()
+                get_platform().is_sm90
             ), "NVFP4 KV cache dequantize requires SM100/SM120 or SM90 fallback GPU"
             # Pure PyTorch fallback for SM90
             n = n_half * 2

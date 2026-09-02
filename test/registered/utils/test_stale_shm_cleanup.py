@@ -44,13 +44,13 @@ class TestCleanupStaleShm(unittest.TestCase):
     def _make_segment(self, name: str) -> str:
         shm = shared_memory.SharedMemory(create=True, size=4096, name=name)
         shm.close()
-        self.addCleanup(self._unlink_quiet, name)
+        self.addCleanup(self._unlink_quiet, f"/dev/shm/{name}")
         return name
 
     @staticmethod
-    def _unlink_quiet(name: str):
+    def _unlink_quiet(path: str):
         try:
-            shared_memory.SharedMemory(name=name).unlink()
+            os.unlink(path)
         except FileNotFoundError:
             pass
 
@@ -120,6 +120,33 @@ class TestCleanupStaleShm(unittest.TestCase):
             cleanup_stale_shm()
 
         self.assertFalse(os.path.exists(f"/dev/shm/{stale}"))
+
+    def _make_raw_file(self, name: str) -> str:
+        """Orphan families are plain files, not shared_memory segments."""
+        path = f"/dev/shm/{name}"
+        with open(path, "wb") as f:
+            f.write(b"\0" * 4096)
+        self.addCleanup(self._unlink_quiet, path)
+        return path
+
+    @unittest.skipUnless(
+        os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1"),
+        "sweeps orphan families unconditionally; only safe on a CI runner",
+    )
+    def test_orphan_family_sweep(self):
+        stale = [
+            self._make_raw_file("sglang_loads_test_deadbeef.shm"),
+            self._make_raw_file("cuda.shm.0.deadbeef.1"),
+            self._make_raw_file("nccl-testonly"),
+            self._make_raw_file("sem.loky-0-testonly"),
+        ]
+        unknown = self._make_raw_file("unknown_family_file")
+
+        cleanup_stale_shm()
+
+        for path in stale:
+            self.assertFalse(os.path.exists(path), path)
+        self.assertTrue(os.path.exists(unknown))
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -9,6 +8,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,28 +16,33 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestComputeLaunchCapacities(CustomTestCase):
-    @staticmethod
-    def _make_server_args(*, max_bs: int) -> SimpleNamespace:
-        return SimpleNamespace(
-            cuda_graph_config=CudaGraphConfig(
-                decode=PhaseConfig(backend=Backend.FULL, max_bs=max_bs)
-            ),
-            speculative_num_draft_tokens=0,
-            chunked_prefill_size=None,
-            max_prefill_tokens=128,
-        )
-
-    @staticmethod
     def _from_args(
+        self,
         *,
         max_bs: int,
         max_seq_len: int,
         max_total_num_tokens: int | None = None,
+        speculative_num_draft_tokens: int | None = 0,
     ) -> CanaryLaunchCapacities:
+        """`from_args` reads the published configuration, so publish one.
+
+        Handing it a stand-in object stopped meaning anything when the reads
+        moved to the config bags: the parameter was ignored and the values
+        under test came from whatever the process had published.
+        """
         if max_total_num_tokens is None:
             max_total_num_tokens = max_bs * max_seq_len
+        override = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL, max_bs=max_bs)
+            ),
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            chunked_prefill_size=None,
+            max_prefill_tokens=128,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         return CanaryLaunchCapacities.from_args(
-            server_args=TestComputeLaunchCapacities._make_server_args(max_bs=max_bs),
             req_to_token_pool_size=max_bs,
             max_seq_len_per_req=max_seq_len,
             pool_slot_count=max_total_num_tokens,
@@ -60,14 +65,11 @@ class TestComputeLaunchCapacities(CustomTestCase):
 
     def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
         """per_forward_write_entry_capacity is floored by max_prefill_tokens when batch * tokens_per_req is smaller."""
-        server_args = self._make_server_args(max_bs=2)
-        server_args.speculative_num_draft_tokens = None
-
-        capacities = CanaryLaunchCapacities.from_args(
-            server_args=server_args,
-            req_to_token_pool_size=2,
-            max_seq_len_per_req=32,
-            pool_slot_count=64,
+        capacities = self._from_args(
+            max_bs=2,
+            max_seq_len=32,
+            max_total_num_tokens=64,
+            speculative_num_draft_tokens=None,
         )
 
         self.assertEqual(capacities.per_forward_write_entry_capacity, 128)
@@ -84,12 +86,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
     def test_from_args_rejects_empty_pool_capacity(self) -> None:
         """Verify derived launch capacities reject invalid pool sizing."""
         with self.assertRaisesRegex(ValueError, "pool_slot_count"):
-            CanaryLaunchCapacities.from_args(
-                server_args=self._make_server_args(max_bs=1),
-                req_to_token_pool_size=1,
-                max_seq_len_per_req=1,
-                pool_slot_count=0,
-            )
+            self._from_args(max_bs=1, max_seq_len=1, max_total_num_tokens=0)
 
 
 if __name__ == "__main__":

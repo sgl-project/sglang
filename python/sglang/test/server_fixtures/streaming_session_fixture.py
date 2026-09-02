@@ -21,7 +21,6 @@ import aiohttp
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -29,6 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 LOGPROB_PROMPTS = [
@@ -50,6 +50,15 @@ LEAK_FILLER = (
     "A wizard's job is to vex chumps quickly in fog. "
     "We promptly judged antique ivory buckles for the next prize. "
 ) * 20
+
+SWA_MODEL = "openai/gpt-oss-20b"
+
+# Common gpt-oss-20b launch args. Matches TestSessionLatency/TestSWARadixCacheKL.
+SWA_COMMON_ARGS = [
+    "--mem-fraction-static",
+    "0.70",
+    "--cuda-graph-backend-prefill=disabled",
+]
 
 ABORT_REPRO_CONTEXT_LEN = 512
 ABORT_REPRO_PAGE_SIZE = 256
@@ -432,4 +441,4 @@ class StreamingSessionServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        terminate_and_kill_process_tree(cls.process, wait_timeout=60)

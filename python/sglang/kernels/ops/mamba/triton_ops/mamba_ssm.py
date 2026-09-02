@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from packaging import version
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 
 PAD_SLOT_ID = -1
 

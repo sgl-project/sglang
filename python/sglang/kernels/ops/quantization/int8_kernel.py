@@ -14,15 +14,7 @@ from sglang.srt.utils import get_device_name, is_cuda, is_hip
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda:
-    # Temporary
-    try:
-        from sgl_kernel import sgl_per_token_group_quant_8bit
-
-        enable_sgl_per_token_group_quant_8bit = True
-    except ImportError:
-        from sgl_kernel import sgl_per_token_group_quant_int8
-
-        enable_sgl_per_token_group_quant_8bit = False
+    from sglang.kernels.ops.quantization import per_token_group_quant
 
 logger = logging.getLogger(__name__)
 
@@ -204,34 +196,18 @@ def sglang_per_token_group_quant_int8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
-    enable_v2: Optional[bool] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
+    assert dtype == torch.int8
+    # per_token_group_quant bakes the int8 constants in ([-128, 127], eps 1e-10).
+    assert (
+        eps == 1e-10
+    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
 
-    iinfo = torch.iinfo(dtype)
-    int8_max = iinfo.max
-    int8_min = iinfo.min
-
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = torch.empty(
-        x.shape[:-1] + (x.shape[-1] // group_size,),
-        device=x.device,
-        dtype=torch.float32,
-    )
-
-    # Temporary
-    if enable_sgl_per_token_group_quant_8bit:
-        sgl_per_token_group_quant_8bit(
-            x, x_q, x_s, group_size, eps, int8_min, int8_max, enable_v2=enable_v2
-        )
-    else:
-        assert not enable_v2
-        sgl_per_token_group_quant_int8(x, x_q, x_s, group_size, eps, int8_min, int8_max)
-
-    return x_q, x_s
+    return per_token_group_quant(x, group_size=group_size, out_dtype=dtype)
 
 
 @triton.jit

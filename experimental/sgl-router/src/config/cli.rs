@@ -12,9 +12,13 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    DiscoveryBackend, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig,
 };
+
+const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
+const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
 ///
@@ -69,6 +73,18 @@ pub struct Cli {
     /// Multiplicative load spread gating the absolute balance check.
     #[arg(long)]
     pub balance_rel_threshold: Option<f32>,
+    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
+    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
+    #[arg(long)]
+    pub kv_indexer_endpoint: Option<String>,
+    /// KV Indexer query timeout in milliseconds. Requires
+    /// `--kv-indexer-endpoint`; defaults to 100.
+    #[arg(long)]
+    pub kv_indexer_query_timeout_ms: Option<u64>,
+    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
+    /// `--kv-indexer-endpoint`; defaults to 32.
+    #[arg(long)]
+    pub kv_indexer_query_max_inflight: Option<usize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -157,14 +173,35 @@ impl Cli {
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
             || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
+            || self.balance_rel_threshold.is_some()
+            || self.kv_indexer_endpoint.is_some()
+            || self.kv_indexer_query_timeout_ms.is_some()
+            || self.kv_indexer_query_max_inflight.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
-                "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
-                 require --policy cache_aware_zmq"
+                "cache-aware tuning flags require --policy cache_aware_zmq"
             ));
         }
-
+        if self.kv_indexer_query_timeout_ms == Some(0) {
+            return Err(anyhow!(
+                "--kv-indexer-query-timeout-ms must be greater than zero"
+            ));
+        }
+        if self.kv_indexer_query_timeout_ms.is_some() && self.kv_indexer_endpoint.is_none() {
+            return Err(anyhow!(
+                "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
+            ));
+        }
+        if self.kv_indexer_query_max_inflight == Some(0) {
+            return Err(anyhow!(
+                "--kv-indexer-query-max-inflight must be greater than zero"
+            ));
+        }
+        if self.kv_indexer_query_max_inflight.is_some() && self.kv_indexer_endpoint.is_none() {
+            return Err(anyhow!(
+                "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
+            ));
+        }
         let tuned_sticky = self.routing_key_header.is_some()
             || self.sticky_fallback_policy.is_some()
             || self.sticky_idle_secs.is_some()
@@ -234,6 +271,12 @@ impl Cli {
         // Only build a CacheAwareConfig when the operator tuned at least
         // one knob; otherwise leave it None so the policy uses its own
         // defaults. Unset knobs fall back to the per-field defaults.
+        let kv_indexer_query_timeout_ms = self
+            .kv_indexer_query_timeout_ms
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
+        let kv_indexer_query_max_inflight = self
+            .kv_indexer_query_max_inflight
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
@@ -244,6 +287,11 @@ impl Cli {
                 balance_rel_threshold: self
                     .balance_rel_threshold
                     .unwrap_or(d.balance_rel_threshold),
+                kv_indexer_endpoint: self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
+                    url,
+                    query_timeout_ms: kv_indexer_query_timeout_ms,
+                    query_max_inflight: kv_indexer_query_max_inflight,
+                }),
             })
         } else {
             None
@@ -742,6 +790,109 @@ mod tests {
         assert_eq!(ca.cache_threshold, 0.7);
         // Untouched knobs fall back to defaults.
         assert_eq!(ca.balance_abs_threshold, 32);
+    }
+
+    #[test]
+    fn kv_indexer_reuses_cache_aware_policy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-indexer-query-timeout-ms",
+            "75",
+            "--kv-indexer-query-max-inflight",
+            "17",
+        ]))
+        .unwrap();
+        let cache = c.model.cache_aware.expect("cache-aware config");
+        let indexer = cache.kv_indexer_endpoint.expect("Indexer config");
+        assert_eq!(indexer.url, "http://indexer:50051");
+        assert_eq!(indexer.query_timeout_ms, 75);
+        assert_eq!(indexer.query_max_inflight, 17);
+    }
+
+    #[test]
+    fn kv_indexer_uses_safe_query_defaults() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap();
+        let indexer = c
+            .model
+            .cache_aware
+            .expect("cache-aware config")
+            .kv_indexer_endpoint
+            .expect("Indexer config");
+        assert_eq!(indexer.query_timeout_ms, 100);
+        assert_eq!(indexer.query_max_inflight, 32);
+    }
+
+    #[test]
+    fn kv_indexer_requires_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("require --policy cache_aware_zmq"));
+    }
+
+    #[test]
+    fn kv_indexer_timeout_requires_endpoint() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-query-timeout-ms",
+            "75",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --kv-indexer-endpoint"));
+    }
+
+    #[test]
+    fn kv_indexer_max_inflight_requires_endpoint() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-query-max-inflight",
+            "17",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires --kv-indexer-endpoint"));
+    }
+
+    #[test]
+    fn kv_indexer_max_inflight_must_be_positive() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--kv-indexer-endpoint",
+            "http://indexer:50051",
+            "--kv-indexer-query-max-inflight",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be greater than zero"));
     }
 
     #[test]

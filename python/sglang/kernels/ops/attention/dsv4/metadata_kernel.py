@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["bs", "c128_cur_max_seq_len"])
+@triton.jit(do_not_specialize=["bs", "num_write_tokens", "c128_cur_max_seq_len"])
 def _init_compressed_attn_metadata_kernel(
     seq_lens_ptr,
     positions_ptr,
@@ -21,6 +21,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_seq_lens_clamp1_ptr,
     c128_page_indices_ptr,
     bs,
+    num_write_tokens,
     max_pages,
     c128_cur_max_seq_len,
     c128_page_size: tl.constexpr,
@@ -33,7 +34,8 @@ def _init_compressed_attn_metadata_kernel(
 
     seq_len = tl.load(seq_lens_ptr + batch_id)
     position = tl.load(positions_ptr + batch_id)
-    raw_out_loc = tl.load(raw_out_loc_ptr + batch_id)
+    is_write_token = batch_id < num_write_tokens
+    raw_out_loc = tl.load(raw_out_loc_ptr + batch_id, mask=is_write_token, other=0)
 
     c4_should_compress = (seq_len % 4) == 0
     c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
@@ -41,7 +43,7 @@ def _init_compressed_attn_metadata_kernel(
     c4_seq_lens_raw = seq_len // 4
     c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
 
-    tl.store(c4_out_loc_ptr + batch_id, c4_out_loc)
+    tl.store(c4_out_loc_ptr + batch_id, c4_out_loc, mask=is_write_token)
     tl.store(c4_positions_ptr + batch_id, c4_positions)
     tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
     tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
@@ -52,7 +54,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_seq_lens_raw = seq_len // 128
     c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
 
-    tl.store(c128_out_loc_ptr + batch_id, c128_out_loc)
+    tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
     tl.store(c128_positions_ptr + batch_id, c128_positions)
     tl.store(c128_seq_lens_raw_ptr + batch_id, c128_seq_lens_raw)
     tl.store(c128_seq_lens_clamp1_ptr + batch_id, c128_seq_lens_clamp1)
@@ -104,14 +106,21 @@ def _init_compressed_attn_metadata_triton(
     Optional[torch.Tensor],
 ]:
     bs = seq_lens.shape[0]
+    # CP-v2 may add padding rows to the attention metadata, but those rows have
+    # no cache-write locations. Keep the write buffers unpadded and mask those
+    # rows in the kernel.
+    num_write_tokens = raw_out_loc.shape[0]
+    assert (
+        num_write_tokens <= bs
+    ), f"raw_out_loc has {num_write_tokens} rows, expected at most {bs} metadata rows"
     device = seq_lens.device
 
-    c4_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
+    c4_out_loc = torch.empty(num_write_tokens, dtype=torch.int64, device=device)
     c4_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c4_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
-    c128_out_loc = torch.empty(bs, dtype=torch.int64, device=device)
+    c128_out_loc = torch.empty(num_write_tokens, dtype=torch.int64, device=device)
     c128_positions = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_raw = torch.empty(bs, dtype=torch.int32, device=device)
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
@@ -159,6 +168,7 @@ def _init_compressed_attn_metadata_triton(
             else torch.empty(0, dtype=torch.int32, device=device)
         ),
         bs,
+        num_write_tokens,
         max_pages,
         c128_cur_max_seq_len,
         c128_page_size,

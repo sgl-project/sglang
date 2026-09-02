@@ -18,6 +18,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_spec,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
@@ -59,13 +63,12 @@ def install_canary(
         allocator if isinstance(allocator, SWATokenToKVPoolAllocator) else None
     )
     launch_capacities = CanaryLaunchCapacities.from_args(
-        server_args=model_runner.server_args,
         req_to_token_pool_size=model_runner.req_to_token_pool.size,
         max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],
         pool_slot_count=model_runner.max_total_num_tokens,
     )
     swa_window_size = model_runner.sliding_window_size or 0
-    speculative_num_steps = int(server_args.speculative_num_steps or 1)
+    speculative_num_steps = int(get_spec().speculative_num_steps or 1)
     manager = CanaryManager(
         config=config,
         perturb_config=perturb_config,
@@ -88,7 +91,7 @@ def install_canary(
         "install_canary: disaggregation_mode=%s config=%s perturb_config=%s "
         "launch_capacities=%s n_buffer_groups=%d buffer_group_kinds=%s "
         "swa_window_size=%d speculative_num_steps=%d",
-        server_args.disaggregation_mode,
+        get_disagg().disaggregation_mode,
         config,
         perturb_config,
         launch_capacities,

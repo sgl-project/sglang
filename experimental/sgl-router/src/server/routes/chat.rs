@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -16,6 +17,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use sgl_kv_indexer::PrefixIndex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -167,6 +169,34 @@ pub async fn chat_completions(
     let request_tokens = request_value
         .as_ref()
         .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
+    let external_prefix = match (
+        ctx.prefix_index.as_ref(),
+        request_tokens.as_ref(),
+        ctx.block_size_oracle.get(),
+    ) {
+        (Some(index), Some(tokens), Some(block_size)) => {
+            let hashes = if ctx.block_size_oracle.is_bigram() {
+                compute_block_hashes_bigram(&tokens.ids, block_size as usize)
+            } else {
+                compute_block_hashes(&tokens.ids, block_size as usize)
+            };
+            let query_blocks = hashes.len();
+            let outcome = if hashes.is_empty() {
+                sgl_kv_indexer::PrefixOutcome::Empty
+            } else {
+                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+            };
+            Some(ExternalPrefixSignal {
+                outcome,
+                query_blocks,
+            })
+        }
+        (Some(_), _, _) => Some(ExternalPrefixSignal {
+            outcome: sgl_kv_indexer::PrefixOutcome::Empty,
+            query_blocks: 0,
+        }),
+        _ => None,
+    };
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -181,7 +211,8 @@ pub async fn chat_completions(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
+        .with_external_prefix(external_prefix.as_ref());
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -620,6 +651,42 @@ pub async fn chat_completions(
     }
 }
 
+fn resolve_prefix_query(
+    result: Result<sgl_kv_indexer::PrefixOutcome, sgl_kv_indexer::PrefixIndexError>,
+    model: &str,
+) -> Result<sgl_kv_indexer::PrefixOutcome, ApiError> {
+    use sgl_kv_indexer::PrefixIndexError;
+    match result {
+        Ok(outcome) => Ok(outcome),
+        // The prefix hit only improves worker choice, so an indexer that is
+        // shedding, slow, or down costs cache affinity — not availability.
+        Err(
+            error @ (PrefixIndexError::Overloaded
+            | PrefixIndexError::Timeout
+            | PrefixIndexError::Unreachable),
+        ) => {
+            tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A prompt too long to fit one gRPC message is still a prompt a worker
+        // can serve, so it costs cache affinity like the cases above. Logged
+        // separately because the remedy is operational — raise the indexer's
+        // message limit — rather than waiting for the indexer to recover.
+        Err(error @ PrefixIndexError::QueryTooLarge) => {
+            tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
+            Ok(sgl_kv_indexer::PrefixOutcome::Empty)
+        }
+        // A rejection means the router and the indexer disagree on the request
+        // contract; degrading would hide that from every request.
+        Err(error) => {
+            tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
+            Err(ApiError::PolicySelectionFailed {
+                model: model.to_string(),
+            })
+        }
+    }
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
@@ -910,6 +977,38 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unavailable indexer must never fail a request that min-load routing
+    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
+    /// the query's message limit loses cache affinity, not availability.
+    #[test]
+    fn unavailable_indexer_degrades_to_empty_prefix_signal() {
+        for error in [
+            sgl_kv_indexer::PrefixIndexError::Overloaded,
+            sgl_kv_indexer::PrefixIndexError::Timeout,
+            sgl_kv_indexer::PrefixIndexError::Unreachable,
+            sgl_kv_indexer::PrefixIndexError::QueryTooLarge,
+        ] {
+            assert_eq!(
+                resolve_prefix_query(Err(error.clone()), "tiny").unwrap(),
+                sgl_kv_indexer::PrefixOutcome::Empty,
+                "{error} should degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_indexer_query_still_fails_selection() {
+        assert!(matches!(
+            resolve_prefix_query(
+                Err(sgl_kv_indexer::PrefixIndexError::Rejected(
+                    sgl_kv_indexer::RpcCode::InvalidArgument
+                )),
+                "tiny"
+            ),
+            Err(ApiError::PolicySelectionFailed { .. })
+        ));
+    }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
     /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64

@@ -23,13 +23,20 @@ class KernelRegistry:
     def register(self, spec: KernelSpec) -> KernelSpec:
         """Register ``spec``.
 
-        Re-registering the same ``(op, backend)`` pair replaces the previous
-        entry so that module reloads during tests stay idempotent.
+        Re-registering an identical spec is idempotent so that module reloads
+        during tests remain safe. A different spec for the same ``(op,
+        backend)`` pair is rejected because silently replacing it makes the
+        selected implementation depend on import order.
         """
         existing = self._by_op[spec.op]
-        for i, other in enumerate(existing):
+        for other in existing:
             if other.backend == spec.backend:
-                existing[i] = spec
+                if other != spec:
+                    raise ValueError(
+                        f"Conflicting kernel registration for op {spec.op!r}, "
+                        f"backend {spec.backend.value!r}: "
+                        f"{other.target!r} != {spec.target!r}"
+                    )
                 return spec
         existing.append(spec)
         return spec

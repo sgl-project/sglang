@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.utils.network import get_zmq_socket
@@ -56,8 +57,8 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     """Run the engine until the server warmup request has been received and
     fully processed, so scripts never observe foreign warmup traffic."""
     scheduler = ctx.scheduler
-    server_args = scheduler.server_args
-    if server_args.skip_server_warmup:
+    cfg = resolving_view(scheduler.server_args)
+    if cfg.skip_server_warmup:
         logger.info("scripted_runtime: skip_server_warmup set, not driving warmup")
         return
 
@@ -67,7 +68,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
     # is_fully_idle() can transiently report idle while a PP microbatch result
     # is still in flight, so require it to hold for two full microbatch
     # rotations after the warmup request was observed on the recv socket.
-    quiesce_iters = 2 * (server_args.pp_size + server_args.pp_async_batch_depth)
+    quiesce_iters = 2 * (cfg.pp_size + cfg.pp_async_batch_depth)
     proxy = ctx._tokenizer_recv_proxy
     deadline = start_time + WARMUP_DRIVE_TIMEOUT_S
 

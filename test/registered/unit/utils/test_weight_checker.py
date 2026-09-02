@@ -111,7 +111,7 @@ class _TinyModel(nn.Module):
         self.w = nn.Parameter(torch.randn(4, 4), requires_grad=False)
         self.b = nn.Parameter(torch.zeros(4), requires_grad=False)
         self.register_buffer("running_mean", torch.zeros(4))
-        # Buffer names that match weight_checker's hard-coded skip patterns.
+        # Buffer names used to exercise weight checker's hard-coded filters.
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
@@ -250,13 +250,6 @@ class TestPostprocessTensors(CustomTestCase):
         _assert_entries_close(
             _build_check_entries({"model.rotary_emb.inv_freq": t}, set()),
             [("model.rotary_emb.inv_freq", False, RawComparable(t))],
-        )
-
-    def test_skips_weight_fp32_substring(self):
-        t = torch.randn(4)
-        _assert_entries_close(
-            _build_check_entries({"model.layers.0.mlp.gate._weight_fp32": t}, set()),
-            [("model.layers.0.mlp.gate._weight_fp32", False, RawComparable(t))],
         )
 
     def test_substring_match_not_endswith(self):
@@ -545,10 +538,12 @@ class TestResetTensors(_WeightCheckerTestBase):
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_freqs_cis, before)
 
-    def test_skips_weight_fp32(self):
+    def test_poisons_weight_fp32_cache(self):
         before = self.model.gate_proj_weight_fp32_cache.clone()
+        before_ptr = self.model.gate_proj_weight_fp32_cache.data_ptr()
         self.checker._reset_tensors()
-        torch.testing.assert_close(self.model.gate_proj_weight_fp32_cache, before)
+        self.assertEqual(self.model.gate_proj_weight_fp32_cache.data_ptr(), before_ptr)
+        self.assertFalse(torch.equal(self.model.gate_proj_weight_fp32_cache, before))
 
 
 class TestCompare(_WeightCheckerTestBase):
@@ -645,11 +640,6 @@ class TestIsNonPersistentBufferName(CustomTestCase):
     def test_matches_freqs_cis_substring(self):
         self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.freqs_cis"))
 
-    def test_matches_weight_fp32_substring(self):
-        self.assertTrue(
-            _is_non_persistent_buffer_name("model.layers.0.mlp.gate._weight_fp32")
-        )
-
     def test_does_not_match_normal_param_names(self):
         self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
         self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
@@ -723,10 +713,10 @@ class TestComputeChecksum(_ChecksumTestBase):
         self.assertIn("w", names)
         self.assertIn("b", names)
         self.assertIn("running_mean", names)
+        self.assertIn("gate_proj_weight_fp32_cache", names)
         # Non-persistent buffer patterns are filtered out.
         self.assertNotIn("rotary_emb_cos_sin_cache", names)
         self.assertNotIn("rotary_emb_freqs_cis", names)
-        self.assertNotIn("gate_proj_weight_fp32_cache", names)
 
     def test_hashes_are_hex_strings(self):
         out = self.checker._compute_checksum()

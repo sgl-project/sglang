@@ -27,7 +27,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_server_args
 
 
 class ViTNpuGraphRunner(ViTCudaGraphRunner):
@@ -70,17 +69,19 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
         graph = torch_npu.npu.NPUGraph()
         vit = self.vit
 
-        override_backend = get_server_args().mm_attention_backend
+        backend = self._attn_backend
         with torch_npu.npu.graph(graph, pool=ViTNpuGraphRunner._graph_memory_pool):
             y = None
             deepstack_outs: List[torch.Tensor] = []
             deepstack_capture_idx = 0
 
             for layer_num, blk in enumerate(vit.blocks):
-                if override_backend == "ascend_attn":
+                if backend == "ascend_attn":
                     cu_seq_lens = self.cu_seq_lens[graph_key]
                 else:
-                    raise RuntimeError("Not supported ViT attention backend")
+                    raise RuntimeError(
+                        f"ViT NPU graph does not support attention backend: {backend}"
+                    )
 
                 if layer_num == 0:
                     y = blk(

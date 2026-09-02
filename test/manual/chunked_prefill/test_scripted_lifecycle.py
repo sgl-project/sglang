@@ -18,7 +18,7 @@ def _drain_until_released(t, *handles):
         if all(
             h.kv_pages == 0
             and h.lock_refs == 0
-            and (h.req is None or h.req.req_pool_idx is None)
+            and (h.req is None or h.req.kv.req_pool_idx is None)
             for h in handles
         ):
             return
@@ -223,7 +223,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r)
         assert r.finished
-        assert r.req.req_pool_idx is None
+        assert r.req.kv.req_pool_idx is None
         assert r.kv_pages == 0
         assert r.lock_refs == 0
 
@@ -235,7 +235,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         r1 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
         yield from run_until_finished(r1)
         yield from _drain_until_released(t, r1)
-        assert r1.req.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
+        assert r1.req.kv.req_pool_idx is None and r1.kv_pages == 0 and r1.lock_refs == 0
         r1_output_len = len(r1.req.output_ids)
 
         r2 = t.start_req(prompt_len=16, max_new_tokens=2, ignore_eos=True)
@@ -243,7 +243,7 @@ class TestLifecycleBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r2)
         assert r1.finished and r2.finished
         assert r1_output_len == 2 and len(r2.req.output_ids) == 2
-        assert r2.req.req_pool_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
+        assert r2.req.kv.req_pool_idx is None and r2.kv_pages == 0 and r2.lock_refs == 0
 
     def test_five_seq_clean(self):
         self.server.execute_script(self._script_five_seq_clean)
@@ -256,7 +256,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None
+            assert r.req.kv.req_pool_idx is None
             assert r.kv_pages == 0
             assert r.lock_refs == 0
             reqs.append(r)
@@ -300,7 +300,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert (
+                r.req.kv.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            )
             if prompt == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done == 8
             else:
@@ -319,7 +321,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            assert r.req is None or r.req.req_pool_idx is None
+            assert r.req is None or r.req.kv.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (
@@ -341,7 +343,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             assert r.finished
             assert len(r.req.output_ids) == 1
             yield from _drain_until_released(t, r)
-            assert r.req is None or r.req.req_pool_idx is None
+            assert r.req is None or r.req.kv.req_pool_idx is None
             assert r.kv_pages == 0 and r.lock_refs == 0
             if L > DEFAULT_CHUNK_SIZE:
                 assert (
@@ -360,7 +362,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert (
+                r.req.kv.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            )
             for _ in range(20):
                 yield
 
@@ -377,7 +381,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert (
+                r.req.kv.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            )
             if L == VERY_LONG_PROMPT_LEN:
                 assert r.chunks_done == 8
             else:
@@ -394,7 +400,9 @@ class TestLifecycleBasic(ScriptedTestCase):
             yield from run_until_finished(r)
             assert r.finished
             assert len(r.req.output_ids) == 2
-            assert r.req.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            assert (
+                r.req.kv.req_pool_idx is None and r.kv_pages == 0 and r.lock_refs == 0
+            )
         for _ in range(5):
             yield
         t.flush_cache()
@@ -432,7 +440,7 @@ class TestLifecycleBasic(ScriptedTestCase):
             )
         assert r.finished or _error_message(r) is not None
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         assert r.lock_refs == 0
 
 

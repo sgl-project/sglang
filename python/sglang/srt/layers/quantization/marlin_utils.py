@@ -46,7 +46,7 @@ except ImportError:
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ def check_moe_marlin_supports_layer(
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
     if layer.moe_runner_config.is_gated:
-        supports_activation = layer.moe_runner_config.activation == "silu"
+        supports_activation = layer.moe_runner_config.activation in {"silu", "situ"}
     else:
         supports_activation = layer.moe_runner_config.activation in {
             "silu",

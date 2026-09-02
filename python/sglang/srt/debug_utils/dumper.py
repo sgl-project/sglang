@@ -23,6 +23,11 @@ import torch.distributed as dist
 import zmq
 
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_server_args,
+    get_serving,
+)
 
 # -------------------------------------- config base ------------------------------------------
 
@@ -1721,8 +1726,6 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         info = {}
 
-        from sglang.srt.runtime_context import get_parallel
-
         try:
             parallel = get_parallel()
             info["tp_rank"] = parallel.tp_rank
@@ -1734,8 +1737,8 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["moe_tp_rank"] = parallel.moe_tp_rank
             info["moe_tp_size"] = parallel.moe_tp_size
             info["moe_dp_rank"] = parallel.moe_dp_rank
-            info["moe_dp_size"] = parallel.moe_dp_size
-        except (AttributeError, AssertionError):
+            info["moe_dp_size"] = self._dp_attn.get_moe_cp_size()
+        except (AttributeError, AssertionError, ValueError):
             info["distributed_error"] = True
 
         try:
@@ -1747,7 +1750,7 @@ class _SGLangPlugin(_FrameworkPlugin):
             info["attn_dp_size"] = self._dp_attn.get_attention_dp_size()
             info["attn_cp_rank"] = parallel.attn_cp_rank
             info["attn_cp_size"] = parallel.attn_cp_size
-        except (AttributeError, AssertionError):
+        except (AttributeError, AssertionError, ValueError):
             info["dp_attention_error"] = True
 
         return info
@@ -1792,13 +1795,12 @@ class _SGLangPlugin(_FrameworkPlugin):
             return None
 
         try:
-            from sglang.srt.runtime_context import get_server_args
 
             args = get_server_args()
             if args is None:
                 return None
 
-            return args.tokenizer_path
+            return get_serving().tokenizer_path
         except Exception:
             return None
 

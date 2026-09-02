@@ -6,9 +6,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import FailReason
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary import consts
+from sglang.kernels.ops.kv_canary.consts import FailReason
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.runner import violation_reporter as violation_reporter_module
 from sglang.srt.kv_canary.runner.violation_reporter import (

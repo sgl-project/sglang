@@ -173,7 +173,7 @@ class TestMultiReqBasic(ScriptedTestCase):
         for _ in range(5):
             yield
         assert r.kv_pages == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
 
     def test_rid_reuse_after_finish(self):
         self.server.execute_script(self._script_rid_reuse_after_finish)

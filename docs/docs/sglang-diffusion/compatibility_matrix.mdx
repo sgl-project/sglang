@@ -1,0 +1,24 @@
+---
+title: "Supported Models"
+description: "Browse model families and public checkpoints supported by SGLang Diffusion."
+---
+
+import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
+
+Use a listed checkpoint as `--model-path` with `sglang generate` or
+`sglang serve`. This registry-backed list contains known public entry points;
+family detection may also support compatible local directories. Open the linked
+Cookbook recipe for launch commands, optimizations, adapters, and model-specific
+notes.
+
+<Tabs>
+  <Tab title="Image and 3D">
+    <DiffusionModelCatalog category="image" />
+  </Tab>
+  <Tab title="Video and audio">
+    <DiffusionModelCatalog category="video" />
+  </Tab>
+  <Tab title="World and action">
+    <DiffusionModelCatalog category="world" />
+  </Tab>
+</Tabs>
