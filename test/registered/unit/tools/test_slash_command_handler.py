@@ -1,8 +1,10 @@
-"""Tests for cross-directory slash-command test groups."""
+"""Tests for declarative slash-command test groups."""
 
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -30,7 +32,38 @@ def _load_handler():
     return module
 
 
-class TestNamedTestGroups(CustomTestCase):
+class TestConfiguredTestGroups(CustomTestCase):
+    def test_additional_group_requires_only_manifest_data(self):
+        handler = _load_handler()
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(_REPO_ROOT)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                manifest = Path(temp_dir) / "groups.json"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "mixed": [
+                                "registered/rust/test_run_rust_tests.py",
+                                "registered/core/test_srt_endpoint.py",
+                            ]
+                        }
+                    )
+                )
+                with patch.object(handler, "TEST_GROUPS_FILE_PATH", str(manifest)):
+                    specs, error = handler.resolve_test_group_specs("mixed")
+
+            self.assertIsNone(error)
+            self.assertEqual(
+                specs,
+                [
+                    "registered/rust/test_run_rust_tests.py",
+                    "registered/core/test_srt_endpoint.py",
+                ],
+            )
+        finally:
+            os.chdir(previous_cwd)
+
     def test_rust_server_group(self):
         handler = _load_handler()
         previous_cwd = os.getcwd()

@@ -27,6 +27,7 @@ _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 
@@ -501,18 +502,14 @@ MULTIMODAL_PATH_TO_RUNNER = {
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
 
-NAMED_TEST_GROUPS = {
-    "rust-server": (
-        "registered/rust/test_run_rust_tests.py",
-        "registered/core/test_srt_endpoint.py",
-        "registered/vlm/test_rust_native_mm_e2e.py",
-        "registered/vlm/test_rust_native_mm_mmmu.py",
-    ),
-}
+
+def _load_test_groups():
+    with open(TEST_GROUPS_FILE_PATH, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _known_test_groups():
-    groups = set(NAMED_TEST_GROUPS)
+    groups = set(_load_test_groups())
     for group_dir in glob.glob("test/registered/*"):
         if os.path.isdir(group_dir):
             groups.add(os.path.basename(group_dir))
@@ -538,8 +535,13 @@ def resolve_test_group_specs(group_name):
     ):
         return [], f"Invalid test group `{group_name}`."
 
-    if group_name in NAMED_TEST_GROUPS:
-        test_specs = list(NAMED_TEST_GROUPS[group_name])
+    test_groups = _load_test_groups()
+    if group_name in test_groups:
+        test_specs = test_groups[group_name]
+        if not isinstance(test_specs, list) or not all(
+            isinstance(test_spec, str) for test_spec in test_specs
+        ):
+            return [], f"Invalid definition for test group `{group_name}`."
         missing = [
             test_spec
             for test_spec in test_specs
