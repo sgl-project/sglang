@@ -1,3 +1,5 @@
+import inspect
+
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -9,6 +11,26 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _supported_init_kwargs(scheduler_cls, config: dict) -> dict:
+    """Drop scheduler_config keys the constructor can't accept.
+
+    Some checkpoints (e.g. distilled fixed-step schedulers) carry keys in
+    ``scheduler_config.json`` that are consumed downstream, not by the
+    scheduler ``__init__``. Constructors taking ``**kwargs`` accept anything
+    and are left untouched; otherwise unknown non-private keys would raise
+    ``TypeError``, so they are dropped (private ``_``-keys are handled by
+    ``register_to_config``).
+    """
+    params = inspect.signature(scheduler_cls.__init__).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return config
+    dropped = [k for k in config if k not in params and not k.startswith("_")]
+    if dropped:
+        logger.debug("Ignoring unsupported scheduler config keys: %s", dropped)
+        return {k: v for k, v in config.items() if k not in dropped}
+    return config
 
 
 class SchedulerLoader(ComponentLoader):
@@ -41,7 +63,7 @@ class SchedulerLoader(ComponentLoader):
 
         scheduler_cls, _ = ModelRegistry.resolve_model_cls(class_name)
 
-        scheduler = scheduler_cls(**config)
+        scheduler = scheduler_cls(**_supported_init_kwargs(scheduler_cls, config))
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
 

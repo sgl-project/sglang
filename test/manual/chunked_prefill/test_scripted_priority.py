@@ -168,13 +168,13 @@ class TestPriorityBasic(ScriptedTestCase):
             if (
                 r.kv_pages == 0
                 and r.lock_refs == 0
-                and (r.req is None or r.req.req_pool_idx is None)
+                and (r.req is None or r.req.kv.req_pool_idx is None)
             ):
                 break
             yield
         assert r.kv_pages == 0
         assert r.lock_refs == 0
-        assert r.req is None or r.req.req_pool_idx is None
+        assert r.req is None or r.req.kv.req_pool_idx is None
         t.continue_generation()
         yield
         assert r.kv_pages == 0 and r.lock_refs == 0

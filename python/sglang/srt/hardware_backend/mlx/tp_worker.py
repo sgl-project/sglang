@@ -78,10 +78,13 @@ class MlxTpModelWorker(TpModelWorker):
 
     def _init_model_runner(self):
         """Create MLX runner first (auto-sizes pool), then stub with matching size."""
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
             MlxModelRunnerStub,
         )
+
+        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
         init_kwargs = dict(
@@ -90,6 +93,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=get_memory().disable_radix_cache,
             mem_fraction_static=get_schedule().mem_fraction_static,
             quantization=get_model().quantization,
+            revision=get_model().revision,
             enable_sampling=get_device().mlx_enable_sampling,
             sampling_rng_seed=get_device().random_seed,
             deterministic_seeding=(
@@ -168,7 +172,7 @@ class MlxTpModelWorker(TpModelWorker):
             self._mlx_runner.store_auxiliary_state_for_request(req.rid)
             # Prefer the just-snapshotted live auxiliary state for the final
             # insert. Any older tracked slot is released during component cleanup.
-            req.mamba_last_track_seqlen = None
+            req.kv.mamba_last_track_seqlen = None
 
     def _route_extend_request(self, rid: str, decoding_rids: set[str]) -> str:
         """Classify a request within an extend / mixed batch.
@@ -498,7 +502,7 @@ class MlxTpModelWorker(TpModelWorker):
                         full_token_ids=full_token_ids,
                         prefix_slot_ids=prefix_slot_ids,
                         new_slot_ids=req_new_slots,
-                        req_pool_idx=req.req_pool_idx,
+                        req_pool_idx=req.kv.req_pool_idx,
                         req=req,
                         needs_logits=self._chunk_needs_logits(req),
                         logit_edit_row=edit_rows[req.rid] if edit_rows else None,

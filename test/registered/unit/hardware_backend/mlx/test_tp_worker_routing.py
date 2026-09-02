@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
@@ -169,7 +170,7 @@ class _FakeReq:
         self.rid = rid
         self.prefix_indices = torch.empty(0, dtype=torch.long)
         self.fill_ids = [0]
-        self.req_pool_idx = req_pool_idx
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         # Mirrors Req's chunk-finality contract read by
         # MlxTpModelWorker._chunk_needs_logits: extend_range=None means
         # "not truncated" (final chunk / plain prefill).
@@ -219,6 +220,20 @@ class TestMlxExtendRouting(CustomTestCase):
         # already run it for real by the time either path is reached.
         worker._mlx_pool_initialized = True
         return worker
+
+    def test_startup_weight_overlap_is_rejected_before_mlx_model_load(self):
+        from sglang.srt.hardware_backend.mlx.model_runner_stub import (
+            MlxModelRunnerStub,
+        )
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+
+        worker = MlxTpModelWorker.__new__(MlxTpModelWorker)
+        worker.server_args = SimpleNamespace(is_startup_weight_load_overlap=True)
+
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            MlxModelRunnerStub.validate_startup_weight_load_mode(worker.server_args)
+        with self.assertRaisesRegex(ValueError, "CUDA only"):
+            worker._init_model_runner()
 
     # ---------- the shared decision helper ----------
     # The helper takes no seq_len: length cannot distinguish a 1-token

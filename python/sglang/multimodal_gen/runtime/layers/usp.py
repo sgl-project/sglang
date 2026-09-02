@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,19 +9,12 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.kernels.ops.diffusion.triton.ulysses_qkv import (
-    pack_qkv_destination_major,
-)
-from sglang.kernels.ops.diffusion.usp_relayout import usp_merge_heads
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends import (
-    flash_attn as _fa_backend,
 )
 from sglang.srt.utils.common import torch_release
 
@@ -44,7 +38,7 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-_A2A_STAGING_BUFFERS: dict[tuple, torch.Tensor] = {}
+_A2A_STAGING_BUFFERS: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
 
 
 def _a2a_staging_buffer(
@@ -53,8 +47,10 @@ def _a2a_staging_buffer(
     """Reusable staging buffer for a Ulysses collective.
 
     A buffer of a given role is fully consumed (in stream order) before the
-    next collective with the same role overwrites it, so caching by
-    (role, shape, dtype) is exact and removes per-block allocator churn.
+    next collective with the same role overwrites it. Keep one grow-only
+    backing allocation per (role, dtype, device), then return an exact-shape
+    view into that allocation. This removes per-block allocator churn without
+    retaining one CUDA tensor for every request shape seen by the worker.
     Bypassed under autograd and CUDA graph capture: a buffer first allocated
     while capturing would live in the graph's private memory pool and must
     not be shared with eager replays.
@@ -66,12 +62,22 @@ def _a2a_staging_buffer(
         or torch.cuda.is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-    key = (role, tuple(shape), dtype, device.index)
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    key = (role, dtype, device_index)
+    required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
-    if buffer is None:
-        buffer = torch.empty(shape, dtype=dtype, device=device)
+    if buffer is None or buffer.numel() < required_numel:
+        # The previous same-role collective is fully consumed by contract, so
+        # drop its cache reference before allocating a larger backing buffer.
+        # Any outstanding tensor view still keeps the old storage alive.
+        _A2A_STAGING_BUFFERS.pop(key, None)
+        del buffer
+        buffer = torch.empty(required_numel, dtype=dtype, device=device)
         _A2A_STAGING_BUFFERS[key] = buffer
-    return buffer
+    return buffer[:required_numel].view(shape)
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
@@ -172,6 +178,11 @@ def _ipc_input_a2a_qkv(q, k, v):
     """The three input A2As of one attention as a single IPC exchange;
     None when unavailable."""
     if get_ulysses_parallel_world_size() != 2:
+        return None
+    # One staging slot is sized from `q` and reused for all three, so unequal
+    # k/v lengths would copy mismatched extents into it. The general exchange
+    # guards the same way and handles them.
+    if q.shape != k.shape or q.shape != v.shape:
         return None
     group = _ipc_ready_group()
     if group is None:
@@ -819,7 +830,7 @@ def _ring_attention_varlen(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    softmax_scale: float,
+    attn_impl: "AttentionImpl",
     real_seq_len: int,
     ring_ws: int,
 ) -> torch.Tensor:
@@ -858,7 +869,6 @@ def _ring_attention_varlen(
     kv_bufs = [kv0, torch.empty_like(kv0)]
     cur = 0
 
-    q_cu = torch.tensor([0, ring_chunk_len], dtype=torch.int32, device=q.device)
     out_acc: torch.Tensor | None = None
     lse_acc: torch.Tensor | None = None
     pending_ops = None
@@ -889,27 +899,11 @@ def _ring_attention_varlen(
             max(real_seq_len - src_rank * ring_chunk_len, 0), ring_chunk_len
         )
         if remote_used > 0:
-            k_cu = torch.tensor([0, remote_used], dtype=torch.int32, device=q.device)
-            result = flash_attn_varlen_func(
+            step_out, step_lse = attn_impl.forward_ring_kv_chunk(
                 q,
                 kv_bufs[cur][0, :remote_used],
                 kv_bufs[cur][1, :remote_used],
-                cu_seqlens_q=q_cu,
-                cu_seqlens_k=k_cu,
-                max_seqlen_q=ring_chunk_len,
-                max_seqlen_k=remote_used,
-                softmax_scale=softmax_scale,
-                causal=False,
-                ver=_fa_backend.fa_ver,
-                return_softmax_lse=True,
             )
-            if not isinstance(result, tuple):
-                raise RuntimeError(
-                    "flash_attn_varlen_func did not return softmax_lse; ring "
-                    "parallelism requires a backend that supports "
-                    "return_softmax_lse=True."
-                )
-            step_out, step_lse, *_ = result
             out_acc, lse_acc = _ring_merge_attention(
                 out_acc, lse_acc, step_out, step_lse
             )

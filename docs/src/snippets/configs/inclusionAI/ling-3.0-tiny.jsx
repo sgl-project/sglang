@@ -10,6 +10,7 @@ export const config = {
   quantizations: [
     { id: "bf16", label: "BF16" },
     { id: "fp8", label: "FP8" },
+    { id: "int4", label: "INT4" },
   ],
   strategies: [
     { id: "high-throughput", label: "High-Throughput" },
@@ -21,6 +22,7 @@ export const config = {
   modelNames: {
     "default|bf16": "inclusionAI/Ling-3.0-tiny",
     "default|fp8": "inclusionAI/Ling-3.0-tiny-fp8",
+    "default|int4": "inclusionAI/Ling-3.0-tiny-int4",
   },
 
   placeholders: {
@@ -51,13 +53,16 @@ export const config = {
   --model {{MODEL_NAME}} \\
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} \\
+  --random-range-ratio 1 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
   --flush-cache`,
     accuracy: {
       gsm8k_pct: `# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
-  --num-threads 32`,
+  --num-threads 32 \\
+  --temperature 1.0 --top-p 0.95 \\
+  --thinking`,
     },
   },
 
@@ -180,6 +185,60 @@ sgl-eval run gsm8k \\
     },
     {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h20-3e", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h800", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b200", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "int4", strategy: "high-throughput", nodes: "single" },
       verified: false,
       flags: [
         "--model-path {{MODEL_NAME}}",

@@ -47,6 +47,10 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelInfo {
     pub model_path: Option<String>,
+    /// The identity the worker currently serves under. A weight update moves
+    /// this (and `model_path`) on the worker's manager, so it is answered here
+    /// rather than by `/server_info`, which reports the launch record.
+    pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
     pub is_generation: Option<bool>,
     pub model_type: Option<String>,
@@ -277,18 +281,50 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
 
-                // Fetch from /server_info for server-related metadata
-                if let Ok(server_info) =
-                    get_server_info(&config.url, config.api_key.as_deref()).await
-                {
-                    if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
-                        labels.insert("model_path".to_string(), model_path);
+                // /server_info reports the launch configuration; /model_info
+                // reports the model the worker is serving now. Both are read
+                // here, and a failure of one does not lose the other.
+                let server_info = get_server_info(&config.url, config.api_key.as_deref())
+                    .await
+                    .ok();
+                let model_info = get_model_info(&config.url, config.api_key.as_deref())
+                    .await
+                    .ok();
+
+                // Identity comes from /model_info, which a weight update moves;
+                // /server_info answers the launch record and is the fallback for
+                // workers that predate the fields there.
+                let present = |value: Option<&String>| value.filter(|s| !s.is_empty()).cloned();
+                let identity = [
+                    (
+                        "model_path",
+                        present(model_info.as_ref().and_then(|m| m.model_path.as_ref())).or_else(
+                            || present(server_info.as_ref().and_then(|s| s.model_path.as_ref())),
+                        ),
+                    ),
+                    (
+                        "served_model_name",
+                        present(
+                            model_info
+                                .as_ref()
+                                .and_then(|m| m.served_model_name.as_ref()),
+                        )
+                        .or_else(|| {
+                            present(
+                                server_info
+                                    .as_ref()
+                                    .and_then(|s| s.served_model_name.as_ref()),
+                            )
+                        }),
+                    ),
+                ];
+                for (key, value) in identity {
+                    if let Some(value) = value {
+                        labels.insert(key.to_string(), value);
                     }
-                    if let Some(served_model_name) =
-                        server_info.served_model_name.filter(|s| !s.is_empty())
-                    {
-                        labels.insert("served_model_name".to_string(), served_model_name);
-                    }
+                }
+
+                if let Some(server_info) = server_info {
                     if let Some(tp_size) = server_info.tp_size {
                         labels.insert("tp_size".to_string(), tp_size.to_string());
                     }
@@ -303,9 +339,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     }
                 }
 
-                // Fetch from /model_info for model-related metadata
-                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
-                {
+                if let Some(model_info) = model_info {
                     if let Some(tokenizer_path) =
                         model_info.tokenizer_path.filter(|s| !s.is_empty())
                     {
