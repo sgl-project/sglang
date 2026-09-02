@@ -596,6 +596,14 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
+        # HiCache's L2 kernels address these views as
+        # `k_data_ptrs[layer] + row * token_stride_size`. That holds here: each
+        # view is contiguous in the ROW space with row stride
+        # head_num * head_dim, which is exactly the `token_stride_size` the
+        # host pool computes and the `prod(shape[1:]) * itemsize` this fills in.
+        # The base builds them at the end of its `_create_buffers`, which this
+        # override replaces.
+        self._init_data_ptrs_and_strides()
 
     def _clear_buffers(self):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
@@ -1338,6 +1346,11 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+    # Size any HiCache host pool against the STATIC token cap, not the
+    # sub-pool's `size` (a kernel-facing row count) nor the composite's `size`
+    # (the dynamic whole-buffer view, which would ask for a host pool covering
+    # the entire buffer instead of the configured limit).
+    token_to_kv_pool.full_kv_pool.host_capacity_tokens = max_total_num_tokens
 
     # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
     mamba_slot_allocator = UnifiedMambaSlotAllocator(
@@ -1345,9 +1358,17 @@ def init_unified_mamba_pools(
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
     )
-    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
+    # `_mamba_translate` feeds the retraction CPU-copy path (see
+    # HybridLinearKVPool); HiCache reaches the same v2p through the pool's
+    # `host_transfer_translate` below, which the L2 engine applies per transfer.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
+    # HiCache addresses the state pool by PHYSICAL slot (it is a pure physical
+    # store), while the controller holds virtual slot ids; `L2TransferEngine`
+    # applies this just before each transfer.
+    req_to_token_pool.mamba_pool.host_transfer_translate = (
+        mamba_slot_allocator.translate
+    )
     # No full-KV translate hook is wired: both MLA doors now receive
     # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
     # translated at their production sites.
