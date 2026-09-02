@@ -383,6 +383,7 @@ struct Router {
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
+    source_label_header: Option<String>,
     pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
@@ -636,6 +637,7 @@ impl Router {
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
+            .maybe_source_label_header(self.source_label_header.clone())
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
@@ -761,6 +763,7 @@ impl Router {
         pool_max_idle_per_host = 500,
         tcp_keepalive_secs = 30,
         enable_wasm = false,
+        source_label_header = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -853,6 +856,7 @@ impl Router {
         pool_max_idle_per_host: usize,
         tcp_keepalive_secs: u64,
         enable_wasm: bool,
+        source_label_header: Option<String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -959,6 +963,7 @@ impl Router {
             pool_max_idle_per_host,
             tcp_keepalive_secs,
             enable_wasm,
+            source_label_header,
         })
     }
 
