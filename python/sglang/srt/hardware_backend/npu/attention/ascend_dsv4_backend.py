@@ -19,12 +19,10 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -491,7 +489,9 @@ class CompressorAscendBackendMixin:
 
         # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
         compressor_op = (
-            torch.ops.custom.compressor if _is_npu_arch35() else torch.ops.npu.compressor
+            torch.ops.custom.compressor
+            if _is_npu_arch35()
+            else torch.ops.npu.compressor
         )
         cmp_kv = compressor_op(
             x,
@@ -1850,7 +1850,7 @@ class DeepseekV4AscendAttnBackend(
 
         if _is_npu_arch35():
             ctx.fm.dsv4_cycle_state_block_table.copy_(
-                ctx.forward_batch.req_pool_indices
+                ctx.forward_batch.req_pool_indices[: ctx.bs]
             )
 
         self._refresh_graph_seq_metadata(ctx)
@@ -1999,6 +1999,7 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         metadata_op, _ = _sparse_attn_ops()
+        fm = self.forward_metadata
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,

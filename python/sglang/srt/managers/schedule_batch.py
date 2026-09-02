@@ -3039,9 +3039,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if reserve is None:
                 next_len = current_len + 1
             else:
-                num_new_tokens = max(
-                    0, req.kv_committed_len + reserve - current_len
-                )
+                num_new_tokens = max(0, req.kv.kv_committed_len + reserve - current_len)
                 next_len = current_len + num_new_tokens
             prefix_lens.append(current_len)
             seq_lens.append(next_len)
@@ -3061,9 +3059,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         allocator = self.token_to_kv_pool_allocator
         if hasattr(allocator, "ensure_c128_capacity"):
             c128_num_pages = self._c128_pages_required_next_decode(selected_indices)
-            c128_ok = allocator.ensure_c128_capacity(
-                self.tree_cache, c128_num_pages
-            )
+            c128_ok = allocator.ensure_c128_capacity(self.tree_cache, c128_num_pages)
             full_swa_ok = allocator.full_swa_available_size() >= num_tokens
             return full_swa_ok and c128_ok
         return allocator.available_size() >= num_tokens
