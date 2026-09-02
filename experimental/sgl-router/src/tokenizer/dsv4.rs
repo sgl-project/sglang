@@ -1908,7 +1908,7 @@ mod tests {
         // and thinking still defaults from effort != "none".
         assert!(resolve_render_opts(&json!({"reasoning_effort": "medium"})).thinking);
         // a present-null effort falls to the (false) env default for thinking…
-        assert!(!resolve_render_opts(&json!({"reasoning_effort": null})).thinking);
+        assert!(!resolve_render_opts(&json!({ "reasoning_effort": null })).thinking);
         // …while an explicit null THINKING key wins over the effort default
         // (setdefault semantics: key presence, not truthiness).
         assert!(

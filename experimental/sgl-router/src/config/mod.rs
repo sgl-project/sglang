@@ -78,6 +78,22 @@ impl Config {
                 ));
             }
         }
+        if self.load_monitor.enabled {
+            let lm = &self.load_monitor;
+            if lm.report_interval_ms == 0 {
+                return Err(anyhow!("load_monitor.report_interval_ms must be > 0"));
+            }
+            if lm.stale_after_ms <= lm.report_interval_ms {
+                return Err(anyhow!(
+                    "load_monitor.stale_after_ms ({}) must exceed report_interval_ms ({}) or idle workers flap between fresh and stale",
+                    lm.stale_after_ms,
+                    lm.report_interval_ms
+                ));
+            }
+            if lm.request_timeout_ms == 0 {
+                return Err(anyhow!("load_monitor.request_timeout_ms must be > 0"));
+            }
+        }
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
@@ -154,6 +170,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                decode_policy: None,
                 sticky: None,
                 max_output_tokens: None,
                 sampling_overrides: Default::default(),
@@ -163,6 +180,7 @@ mod tests {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             }),
             proxy: ProxyConfig::default(),
+            load_monitor: LoadMonitorConfig::default(),
             active_load: ActiveLoadConfig::default(),
             admission: AdmissionConfig::default(),
             retry: RetryConfig::default(),

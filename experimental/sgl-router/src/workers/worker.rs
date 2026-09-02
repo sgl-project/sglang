@@ -290,6 +290,8 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// PD transfer group (see [`crate::discovery::WorkerSpec::transfer_group`]).
+    transfer_group: Option<String>,
 }
 
 impl Worker {
@@ -324,7 +326,14 @@ impl Worker {
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            transfer_group: spec.transfer_group,
         }
+    }
+
+    /// PD transfer group, or `None` for ungrouped workers. Prefill and
+    /// decode workers pair only within the same group.
+    pub fn transfer_group(&self) -> Option<&str> {
+        self.transfer_group.as_deref()
     }
 
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
@@ -413,6 +422,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("protocol", &self.protocol())
+            .field("transfer_group", &self.transfer_group)
             .field("active_load", &self.active_load())
             .finish()
     }
@@ -431,6 +441,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         });
         assert_eq!(w.active_load(), 0);
         let g = w.load_guard();
@@ -451,6 +462,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         });
         let cap = 2;
         let g1 = w.try_load_guard(cap);
@@ -481,6 +493,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         }));
         let cap = 8;
         let n_threads = 64;
@@ -517,6 +530,7 @@ mod tests {
                 mode: m,
                 model_ids: vec![],
                 bootstrap_port: None,
+                transfer_group: None,
             });
             assert_eq!(w.mode(), m);
         }
@@ -530,6 +544,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: None,
+            transfer_group: None,
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -546,6 +561,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![],
             bootstrap_port: None,
+            transfer_group: None,
         });
         // Always-safe default until the manager resolves /server_info.
         assert_eq!(w.protocol(), WireProtocol::Http1);
@@ -564,6 +580,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -576,6 +593,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![],
             bootstrap_port: None,
+            transfer_group: None,
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -588,6 +606,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -600,6 +619,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -616,6 +636,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }
@@ -627,6 +648,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         })
     }
 

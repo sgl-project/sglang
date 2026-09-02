@@ -58,6 +58,16 @@ pub struct WorkerSpec {
     pub model_ids: Vec<ModelId>,
     #[serde(default)]
     pub bootstrap_port: Option<u16>,
+    /// PD transfer group this worker belongs to (AIgate's
+    /// `transfer-group` concept). A decode worker can only receive KV
+    /// from a prefill worker in the SAME group, so the router picks the
+    /// prefill across groups and then the decode inside the chosen
+    /// prefill's group. Read from the EndpointSlice label named by
+    /// `--transfer-group-label` in k8s discovery; `None` (ungrouped)
+    /// for static URLs and unlabelled slices. Ungrouped workers only
+    /// pair with each other.
+    #[serde(default)]
+    pub transfer_group: Option<String>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -97,6 +107,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: None,
+            transfer_group: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
@@ -111,6 +122,7 @@ mod tests {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"bootstrap_port\":8997"));
@@ -152,6 +164,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m1".into())],
             bootstrap_port: None,
+            transfer_group: None,
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

@@ -110,6 +110,7 @@ fn build_ctx(worker_url: &str, cache_sim_url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -119,6 +120,7 @@ fn build_ctx(worker_url: &str, cache_sim_url: &str) -> Arc<AppContext> {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -132,6 +134,7 @@ fn build_ctx(worker_url: &str, cache_sim_url: &str) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        transfer_group: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());

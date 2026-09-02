@@ -216,6 +216,32 @@ pub enum ApiError {
     #[error("worker circuit breaker open: {worker}")]
     BreakerOpen { worker: String },
 
+    /// PD mode: the prefill leg answered with a non-2xx status. The router
+    /// cancels the paired decode leg and fails fast (502) instead of letting
+    /// the client wait for the engine-side `bootstrap_room` timeout.
+    #[error("prefill worker {worker} rejected the request with status {status}")]
+    PrefillUpstreamRejected { worker: String, status: StatusCode },
+
+    /// PD mode: the prefill leg failed before producing a response
+    /// (unreachable, timeout, breaker open, mid-body drop). Same fail-fast
+    /// treatment as [`Self::PrefillUpstreamRejected`]; `cause` is the
+    /// rendered inner error, logged server-side only.
+    #[error("prefill worker {worker} failed: {cause}")]
+    PrefillUpstreamFailed { worker: String, cause: String },
+
+    /// PD mode: no transfer group currently has BOTH a routable prefill
+    /// worker and a routable decode worker, so no prefill→decode pair can
+    /// be formed (each pool may be non-empty on its own).
+    #[error("no transfer group with both prefill and decode workers for model {model}")]
+    NoCompatiblePdGroup { model: String },
+
+    /// Load Monitor is enabled and every candidate in the `role` pool for
+    /// `model` has a missing, stale, or unreachable load report. Mirrors
+    /// the freshness gate: a worker whose load the router cannot see is
+    /// not routable, even if its circuit breaker is closed.
+    #[error("no fresh load report for any {role} worker of model {model}")]
+    NoFreshWorkerLoad { model: String, role: &'static str },
+
     /// The worker URL emitted by discovery failed to parse.  Always a
     /// config / discovery-backend bug, not a transient infra issue — but
     /// from the client's perspective the worker is unreachable, so 503.
@@ -262,6 +288,10 @@ impl ApiError {
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
             ApiError::ServiceOverloaded { .. } => ErrorClass::NoTarget,
+            ApiError::PrefillUpstreamRejected { .. } => ErrorClass::Upstream,
+            ApiError::PrefillUpstreamFailed { .. } => ErrorClass::Upstream,
+            ApiError::NoFreshWorkerLoad { .. } => ErrorClass::NoTarget,
+            ApiError::NoCompatiblePdGroup { .. } => ErrorClass::NoTarget,
             ApiError::Internal(_) => ErrorClass::Internal,
         }
     }
@@ -290,6 +320,10 @@ impl ApiError {
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
             ApiError::ServiceOverloaded { .. } => "service_overloaded",
+            ApiError::PrefillUpstreamRejected { .. } => "prefill_upstream_rejected",
+            ApiError::PrefillUpstreamFailed { .. } => "prefill_upstream_failed",
+            ApiError::NoFreshWorkerLoad { .. } => "no_fresh_worker_load",
+            ApiError::NoCompatiblePdGroup { .. } => "no_compatible_pd_group",
             ApiError::Internal(_) => "internal_error",
         }
     }
@@ -354,8 +388,12 @@ impl ApiError {
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
-            | ApiError::ServiceOverloaded { .. } => Stage::Queue,
-            ApiError::UpstreamUnreachable { .. }
+            | ApiError::ServiceOverloaded { .. }
+            | ApiError::NoFreshWorkerLoad { .. }
+            | ApiError::NoCompatiblePdGroup { .. } => Stage::Queue,
+            ApiError::PrefillUpstreamRejected { .. }
+            | ApiError::PrefillUpstreamFailed { .. }
+            | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamStatus { .. }
             | ApiError::UpstreamTimeout { .. }
             | ApiError::UpstreamSocketTimeout { .. }
@@ -434,6 +472,12 @@ impl ApiError {
             | ApiError::StaleRequestExpired { .. }
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::ServiceOverloaded { .. }
+            // PD legs are paired on a bootstrap_room; re-dispatching only one
+            // side is meaningless, so a prefill failure is terminal here.
+            | ApiError::PrefillUpstreamRejected { .. }
+            | ApiError::PrefillUpstreamFailed { .. }
+            | ApiError::NoFreshWorkerLoad { .. }
+            | ApiError::NoCompatiblePdGroup { .. }
             | ApiError::Internal(_) => false,
         }
     }
@@ -447,7 +491,12 @@ impl ApiError {
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
             ApiError::UpstreamStatus { status, .. } => Some(*status),
-            ApiError::BadRequest(_)
+            // 502 synthesized over a prefill worker that DID respond (5xx).
+            ApiError::PrefillUpstreamRejected { status, .. } => Some(*status),
+            ApiError::PrefillUpstreamFailed { .. }
+            | ApiError::NoFreshWorkerLoad { .. }
+            | ApiError::NoCompatiblePdGroup { .. }
+            | ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::UpstreamUnreachable { .. }
             | ApiError::UpstreamTimeout { .. }
@@ -573,6 +622,42 @@ impl IntoResponse for ApiError {
             ApiError::BreakerOpen { worker } => {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
+            }
+            ApiError::PrefillUpstreamRejected { worker, status } => {
+                tracing::warn!(
+                    upstream = %worker,
+                    upstream_status = %status,
+                    reason = "prefill_upstream_rejected",
+                    "prefill worker rejected the request; paired decode cancelled",
+                );
+                format!("prefill worker returned HTTP {}", status.as_u16())
+            }
+            ApiError::PrefillUpstreamFailed { worker, cause } => {
+                tracing::warn!(
+                    upstream = %worker,
+                    error = %cause,
+                    reason = "prefill_upstream_failed",
+                    "prefill worker failed; paired decode cancelled",
+                );
+                "prefill worker unavailable".to_string()
+            }
+            ApiError::NoCompatiblePdGroup { model } => {
+                tracing::warn!(
+                    model = %model,
+                    reason = "no_compatible_pd_group",
+                    "service unavailable",
+                );
+                "no transfer group has both a prefill and a decode worker for the requested model"
+                    .to_string()
+            }
+            ApiError::NoFreshWorkerLoad { model, role } => {
+                tracing::warn!(
+                    model = %model,
+                    role = %role,
+                    reason = "no_fresh_worker_load",
+                    "service unavailable",
+                );
+                format!("no {role} worker with a fresh load report for the requested model")
             }
             ApiError::WorkerMisconfigured { worker, source } => {
                 tracing::error!(

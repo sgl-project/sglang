@@ -57,6 +57,7 @@ fn build_ctx(url: String, flags: &[&str]) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        transfer_group: None,
     });
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());

@@ -50,6 +50,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -59,6 +60,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -72,6 +74,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());

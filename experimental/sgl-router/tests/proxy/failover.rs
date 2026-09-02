@@ -44,6 +44,7 @@ async fn failover_when_one_worker_dies() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -53,6 +54,7 @@ async fn failover_when_one_worker_dies() {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig::default(),
@@ -188,6 +190,7 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -197,6 +200,7 @@ async fn retry_recovers_request_that_lands_on_a_dead_worker() {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         // Admission disabled → no per-worker cap, so the load gate is a no-op
         // and the single retry always proceeds to a different worker.
@@ -337,6 +341,7 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -346,6 +351,7 @@ async fn retry_skipped_when_the_only_other_worker_is_full() {
             urls: vec![w_dead.url.clone(), w_live.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         // Cap = 1 gives "full" a concrete meaning for the load gate.
         admission: AdmissionConfig::Enabled {
@@ -504,6 +510,7 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -513,6 +520,7 @@ async fn retry_recovers_streaming_request_that_lands_on_a_dead_worker() {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig {
@@ -650,6 +658,7 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -659,6 +668,7 @@ async fn retry_is_bounded_to_one_when_every_worker_is_dead() {
             urls: vec![w1.url.clone(), w2.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         // Admission disabled → the retry load gate always admits, so the only
         // thing bounding attempts is the at-most-one-retry flag.
@@ -803,6 +813,7 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -812,6 +823,7 @@ async fn engine_error_status_is_forwarded_verbatim_and_never_retried() {
             urls: vec![w1.url.clone(), w2.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig {
@@ -921,6 +933,7 @@ async fn retry_skipped_when_only_alternative_is_itl_hot() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -930,6 +943,7 @@ async fn retry_skipped_when_only_alternative_is_itl_hot() {
             urls: vec![w_dead.url.clone(), w_hot.url.clone()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig {
@@ -1073,6 +1087,7 @@ fn retry_gate_cfg(urls: Vec<String>, attempt_deadline_ms: Option<u64>) -> Config
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -1080,6 +1095,7 @@ fn retry_gate_cfg(urls: Vec<String>, attempt_deadline_ms: Option<u64>) -> Config
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig { urls }),
         proxy: ProxyConfig::default(),
+        load_monitor: LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: AdmissionConfig::default(),
         retry: RetryConfig {

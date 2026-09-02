@@ -48,6 +48,7 @@ fn config(forward_input_ids: bool) -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -57,6 +58,7 @@ fn config(forward_input_ids: bool) -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -76,6 +78,7 @@ fn build_ctx(url: String, forward_input_ids: bool) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        transfer_group: None,
     });
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());

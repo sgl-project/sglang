@@ -2432,7 +2432,7 @@ mod tests {
         assert_eq!(opts.thinking_effort, RequestedEffort::Invalid);
 
         // Explicit null means "absent" -> the default still applies.
-        let opts = resolve_render_opts(&json!({"thinking_effort": null}));
+        let opts = resolve_render_opts(&json!({ "thinking_effort": null }));
         assert_eq!(
             opts.thinking_effort,
             RequestedEffort::Valid(ThinkingEffort::Max)

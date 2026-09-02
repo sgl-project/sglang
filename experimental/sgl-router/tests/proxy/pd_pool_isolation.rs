@@ -51,6 +51,7 @@ fn config() -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -60,6 +61,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -105,6 +107,7 @@ async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
         mode: WorkerMode::Decode,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        transfer_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -158,6 +161,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -165,6 +169,7 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -242,14 +247,16 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             url: prefill_a.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("p2".into()),
             url: prefill_b.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -257,6 +264,7 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -264,6 +272,7 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -314,6 +323,7 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        transfer_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -339,7 +349,8 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         url: prefill.url.clone(),
         mode: WorkerMode::Prefill,
         model_ids: vec![ModelId("tiny".into())],
-        bootstrap_port: None,
+        bootstrap_port: Some(8997),
+        transfer_group: None,
     }]);
     let app = build_router(ctx);
 
@@ -367,7 +378,8 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             url: prefill.url.clone(),
             mode: WorkerMode::Prefill,
             model_ids: vec![ModelId("tiny".into())],
-            bootstrap_port: None,
+            bootstrap_port: Some(8997),
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -375,6 +387,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -382,6 +395,7 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             mode: WorkerMode::Decode,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         },
     ]);
     let app = build_router(ctx);
@@ -420,6 +434,7 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        transfer_group: None,
     }]);
     let app = build_router(ctx);
 

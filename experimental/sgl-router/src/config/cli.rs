@@ -15,10 +15,11 @@ use crate::config::{
     default_proxy_request_timeout_secs, default_shutdown_drain_secs,
     default_stale_request_timeout_secs, default_stream_idle_timeout_secs,
     default_stream_send_stall_secs, default_stream_total_timeout_secs, default_tokenizer_shards,
-    resolve_mode, ActiveLoadConfig, AdmissionConfig, CacheAwareConfig, CircuitBreakerConfig,
-    Config, ConflictPolicy, DiscoveryBackend, K8sDiscoveryConfig, LoadGate, LogFormat, ModelConfig,
-    ObservabilityConfig, ParamSpec, PolicyKind, ProxyConfig, RetryConfig, SamplingField,
-    SamplingOverrides, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    default_transfer_group_label, resolve_mode, ActiveLoadConfig, AdmissionConfig,
+    CacheAwareConfig, CircuitBreakerConfig, Config, ConflictPolicy, DiscoveryBackend,
+    K8sDiscoveryConfig, LoadGate, LoadMonitorConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    ParamSpec, PolicyKind, ProxyConfig, RetryConfig, SamplingField, SamplingOverrides,
+    ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -154,9 +155,35 @@ pub struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub disable_input_ids_offload: bool,
-    /// Routing policy.
+    /// Routing policy (plain-mode workers, or the PREFILL pool in PD mode).
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
+    /// PD mode: routing policy for the DECODE pool. When omitted, decode
+    /// workers are picked by same-host affinity to the chosen prefill worker
+    /// (min-load fallback). Ignored for plain-mode deployments.
+    #[arg(long, value_enum)]
+    pub decode_policy: Option<PolicyKind>,
+
+    // ---- load monitor (pull mode) ----
+    /// Enable the Load Monitor: poll every worker's `GET /v1/loads`
+    /// (immediately, per routed request with coalescing, and on a periodic
+    /// fallback) and route only to workers with a fresh report. Load-aware
+    /// policies (`power_of_two`, `load_based`) then score by the
+    /// engine-reported `running + waiting` request count plus locally
+    /// dispatched-but-unreported requests.
+    #[arg(long)]
+    pub load_monitor: bool,
+    /// Load Monitor periodic fallback pull interval in milliseconds.
+    /// Defaults to 1000.
+    #[arg(long)]
+    pub load_monitor_interval_ms: Option<u64>,
+    /// Load Monitor report age (milliseconds) after which a worker is
+    /// `stale` and unroutable. Defaults to 3000; must exceed the interval.
+    #[arg(long)]
+    pub load_monitor_stale_after_ms: Option<u64>,
+    /// Load Monitor per-pull HTTP timeout in milliseconds. Defaults to 1000.
+    #[arg(long)]
+    pub load_monitor_request_timeout_ms: Option<u64>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -312,6 +339,12 @@ pub struct Cli {
     /// PD-mode decode label selector terms. Requires `--prefill-selector`.
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
+    /// EndpointSlice label whose value names a PD transfer group. Decode
+    /// workers only pair with prefill workers of the same group; slices
+    /// without the label are ungrouped and pair with each other. Defaults
+    /// to `sglang.ai/transfer-group`.
+    #[arg(long)]
+    pub transfer_group_label: Option<String>,
 
     // ---- proxy / active-load ----
     /// Per-request upstream timeout in seconds.
@@ -727,6 +760,7 @@ impl Cli {
                 max_output_tokens: self.max_output_tokens,
                 sampling_overrides,
                 forward_input_ids: !self.disable_input_ids_offload,
+                decode_policy: self.decode_policy,
             },
             discovery,
             proxy: ProxyConfig {
@@ -734,6 +768,19 @@ impl Cli {
                 stream_idle_timeout_secs: self.stream_idle_timeout_secs,
                 stream_send_stall_secs: self.stream_send_stall_secs,
                 stream_total_timeout_secs: self.stream_total_timeout_secs,
+            },
+            load_monitor: {
+                let d = LoadMonitorConfig::default();
+                LoadMonitorConfig {
+                    enabled: self.load_monitor,
+                    report_interval_ms: self
+                        .load_monitor_interval_ms
+                        .unwrap_or(d.report_interval_ms),
+                    stale_after_ms: self.load_monitor_stale_after_ms.unwrap_or(d.stale_after_ms),
+                    request_timeout_ms: self
+                        .load_monitor_request_timeout_ms
+                        .unwrap_or(d.request_timeout_ms),
+                }
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -784,10 +831,11 @@ impl Cli {
                     || !self.selector.is_empty()
                     || !self.prefill_selector.is_empty()
                     || !self.decode_selector.is_empty()
+                    || self.transfer_group_label.is_some()
                 {
                     return Err(anyhow!(
                         "--service-discovery-namespace / --selector / --prefill-selector / \
-                         --decode-selector require --service-discovery"
+                         --decode-selector / --transfer-group-label require --service-discovery"
                     ));
                 }
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -808,6 +856,11 @@ impl Cli {
                     namespace: self.service_discovery_namespace.clone().unwrap_or_default(),
                     mode,
                     peer_selector: self.kv_peer_selector.clone(),
+                    transfer_group_label: self
+                        .transfer_group_label
+                        .clone()
+                        .filter(|l| !l.trim().is_empty())
+                        .unwrap_or_else(default_transfer_group_label),
                 })
             }
         };
@@ -1155,6 +1208,68 @@ mod tests {
         "--tokenizer-path",
         "/tmp/qwen.json",
     ];
+
+    #[test]
+    fn load_monitor_flags_resolve_into_config() {
+        let cfg = into_config(&[
+            "--model-id",
+            "m",
+            "--tokenizer-path",
+            "/tmp/t.json",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--load-monitor",
+            "--load-monitor-interval-ms",
+            "500",
+            "--load-monitor-stale-after-ms",
+            "2000",
+            "--decode-policy",
+            "load_based",
+        ])
+        .unwrap();
+        assert!(cfg.load_monitor.enabled);
+        assert_eq!(cfg.load_monitor.report_interval_ms, 500);
+        assert_eq!(cfg.load_monitor.stale_after_ms, 2000);
+        assert_eq!(cfg.load_monitor.request_timeout_ms, 1000);
+        assert_eq!(cfg.model.decode_policy, Some(PolicyKind::LoadBased));
+    }
+
+    #[test]
+    fn load_monitor_defaults_off() {
+        let cfg = into_config(&[
+            "--model-id",
+            "m",
+            "--tokenizer-path",
+            "/tmp/t.json",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+        ])
+        .unwrap();
+        assert!(!cfg.load_monitor.enabled);
+        assert_eq!(cfg.load_monitor.report_interval_ms, 1000);
+        assert_eq!(cfg.load_monitor.stale_after_ms, 3000);
+        assert_eq!(cfg.model.decode_policy, None);
+    }
+
+    #[test]
+    fn load_monitor_rejects_stale_not_exceeding_interval() {
+        let err = into_config(&[
+            "--model-id",
+            "m",
+            "--tokenizer-path",
+            "/tmp/t.json",
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--load-monitor",
+            "--load-monitor-interval-ms",
+            "3000",
+            "--load-monitor-stale-after-ms",
+            "3000",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("stale_after"), "got: {err}");
+    }
 
     fn with_model(extra: &[&str]) -> Vec<String> {
         MODEL_ARGS

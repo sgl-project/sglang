@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::load_monitor::LoadMonitor;
 
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::itl::ItlTable;
@@ -60,6 +61,10 @@ pub struct AppContext {
     /// `/readyz` reads it to decide whether peer bootstrap has settled, and
     /// `/internal/kv_snapshot` reads it to serve sibling replicas.
     kv_index: OnceLock<Arc<KvEventIndex>>,
+    /// Pull-mode Load Monitor. `Some` only when `--load-monitor` is set;
+    /// the chat handler then gates candidates on report freshness and
+    /// load-aware policies score by engine-reported load.
+    pub load_monitor: Option<Arc<LoadMonitor>>,
     ready: AtomicBool,
 }
 
@@ -172,6 +177,7 @@ impl AppContext {
             cache_sim_tee,
             s3_export_sink,
             kv_index: OnceLock::new(),
+            load_monitor: None,
             ready: AtomicBool::new(false),
         }
     }
@@ -238,6 +244,7 @@ impl AppContext {
                     policy: crate::config::PolicyKind::RoundRobin,
                     circuit_breaker: None,
                     cache_aware: None,
+                    decode_policy: None,
                     sticky: None,
                     max_output_tokens: None,
                     sampling_overrides: Default::default(),
@@ -249,6 +256,7 @@ impl AppContext {
                     },
                 ),
                 proxy: crate::config::ProxyConfig::default(),
+                load_monitor: crate::config::LoadMonitorConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
                 admission: crate::config::AdmissionConfig::default(),
                 retry: crate::config::RetryConfig::default(),
@@ -270,6 +278,7 @@ impl AppContext {
             // reports true and the readiness gate is inert unless a test
             // attaches one.
             kv_index: OnceLock::new(),
+            load_monitor: None,
             ready: AtomicBool::new(false),
         }
     }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::discovery::WorkerMode;
 use crate::server::app_context::AppContext;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -32,11 +33,35 @@ pub async fn healthz() -> StatusCode {
 /// Condition 3 latches once satisfied (see `BootstrapTracker::settled`): a
 /// later scale-up must never drag an already-serving replica back to 503.
 pub async fn readyz(State(ctx): State<Arc<AppContext>>) -> StatusCode {
-    if ctx.is_ready() && !ctx.registry.is_empty() && ctx.kv_bootstrap_settled() {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+    if !ctx.is_ready() || ctx.registry.is_empty() || !ctx.kv_bootstrap_settled() {
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
+    // PD-aware readiness: a PD deployment can only serve when it has at
+    // least one ROUTABLE prefill worker (mode Prefill with a bootstrap
+    // port) AND at least one decode worker. Reporting Ready with an empty
+    // pool would let the Service send traffic to a pod that 503s every
+    // request (`no_prefill_workers_available` / `no_decode_workers_available`).
+    let all = ctx.registry.all();
+    let pd = all
+        .iter()
+        .any(|w| matches!(w.mode(), WorkerMode::Prefill | WorkerMode::Decode));
+    if pd {
+        // Pairing is per transfer group, so readiness needs at least one
+        // group that is COMPLETE: a routable prefill and a decode worker
+        // with the same group (ungrouped counts as its own group).
+        let complete_group = all
+            .iter()
+            .filter(|p| p.mode() == WorkerMode::Prefill && p.bootstrap_port().is_some())
+            .any(|p| {
+                all.iter().any(|d| {
+                    d.mode() == WorkerMode::Decode && d.transfer_group() == p.transfer_group()
+                })
+            });
+        if !complete_group {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    }
+    StatusCode::OK
 }
 
 #[cfg(test)]
@@ -224,6 +249,7 @@ mod tests {
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("test".into())],
                     bootstrap_port: None,
+                    transfer_group: None,
                 })
                 .expect("test worker accepted");
         }

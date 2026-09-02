@@ -4,6 +4,7 @@
 use crate::config::Config;
 use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::load_monitor::LoadMonitor;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::itl::ItlTable;
 use crate::policies::kv_events::KvEventIndex;
@@ -167,12 +168,65 @@ pub async fn run_with_introspector(
 // without clarity.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_introspector_and_reconcile(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    itl: Option<Arc<ItlTable>>,
+    introspector: Arc<WorkerIntrospector>,
+    reconcile_interval: Duration,
+) {
+    run_loop(
+        rx,
+        registry,
+        cfg,
+        kv_index,
+        active_load,
+        itl,
+        None,
+        introspector,
+        reconcile_interval,
+    )
+    .await
+}
+
+/// Production entry point with every optional sidecar, including the
+/// pull-mode [`LoadMonitor`]: newly registered workers are `track`ed (the
+/// monitor starts polling `/v1/loads`) and removed workers are `untrack`ed
+/// once no other registered worker shares their URL.
+pub async fn run_with_options(
+    rx: mpsc::Receiver<DiscoveryEvent>,
+    registry: Arc<WorkerRegistry>,
+    cfg: Option<Arc<Config>>,
+    kv_index: Option<Arc<KvEventIndex>>,
+    active_load: Option<Arc<ActiveLoadRegistry>>,
+    itl: Option<Arc<ItlTable>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
+) {
+    run_loop(
+        rx,
+        registry,
+        cfg,
+        kv_index,
+        active_load,
+        itl,
+        load_monitor,
+        Arc::new(WorkerIntrospector::default()),
+        RECONCILE_INTERVAL,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
     mut rx: mpsc::Receiver<DiscoveryEvent>,
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
     itl: Option<Arc<ItlTable>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
     introspector: Arc<WorkerIntrospector>,
     reconcile_interval: Duration,
 ) {
@@ -214,6 +268,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &kv_index,
                     &active_load,
                     &itl,
+                    &load_monitor,
                     &introspector,
                     &mut pending,
                 )
@@ -225,6 +280,7 @@ pub async fn run_with_introspector_and_reconcile(
                     &registry,
                     &cfg,
                     &kv_index,
+                    &load_monitor,
                     &introspector,
                     &mut pending,
                 );
@@ -257,6 +313,7 @@ async fn handle_discovery_event(
     kv_index: &Option<Arc<KvEventIndex>>,
     active_load: &Option<Arc<ActiveLoadRegistry>>,
     itl: &Option<Arc<ItlTable>>,
+    load_monitor: &Option<Arc<LoadMonitor>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
@@ -274,9 +331,18 @@ async fn handle_discovery_event(
             let registry_t = registry.clone();
             let cfg_t = cfg.clone();
             let kv_index_t = kv_index.clone();
+            let load_monitor_t = load_monitor.clone();
             let introspector_t = introspector.clone();
             let handle = tokio::spawn(async move {
-                register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+                register_one(
+                    spec,
+                    registry_t,
+                    cfg_t,
+                    kv_index_t,
+                    load_monitor_t,
+                    introspector_t,
+                )
+                .await;
             });
             pending.insert(id, handle);
         }
@@ -295,6 +361,13 @@ async fn handle_discovery_event(
             // stays available for the ITL prune after this match.
             let worker_url = registry.get(&id).map(|w| w.url.clone());
             registry.remove(&id);
+            // Stop polling the URL unless another registered worker still
+            // shares it (k8s ids are per-endpoint; static ids are per-URL).
+            if let (Some(lm), Some(url)) = (load_monitor, worker_url.as_deref()) {
+                if !registry.all().iter().any(|w| w.url == url) {
+                    lm.untrack(url);
+                }
+            }
             match (kv_index, worker_url.as_deref()) {
                 (Some(idx), Some(url)) => {
                     idx.remove_worker(url).await;
@@ -350,6 +423,39 @@ async fn handle_discovery_event(
                 Some(w) => {
                     tracing::info!("discovery: ~worker {id} mode→{mode:?}");
                     w.set_mode(mode);
+                    // `bootstrap_port` is immutable on `Worker`, so a flip
+                    // INTO Prefill on a worker that never disclosed a port
+                    // would leave a portless (unroutable) prefill worker.
+                    // Re-run registration so `/server_info` can supply the
+                    // port; the upsert replaces the entry (resetting its
+                    // counters + breaker — acceptable for this rare event).
+                    if mode == WorkerMode::Prefill && w.bootstrap_port().is_none() {
+                        let spec = WorkerSpec {
+                            id: id.clone(),
+                            url: w.url.clone(),
+                            mode,
+                            model_ids: w.model_ids.clone(),
+                            bootstrap_port: None,
+                            transfer_group: w.transfer_group().map(str::to_string),
+                        };
+                        let registry_t = registry.clone();
+                        let cfg_t = cfg.clone();
+                        let kv_index_t = kv_index.clone();
+                        let load_monitor_t = load_monitor.clone();
+                        let introspector_t = introspector.clone();
+                        let handle = tokio::spawn(async move {
+                            register_one(
+                                spec,
+                                registry_t,
+                                cfg_t,
+                                kv_index_t,
+                                load_monitor_t,
+                                introspector_t,
+                            )
+                            .await;
+                        });
+                        pending.insert(id, handle);
+                    }
                 }
                 None => {
                     tracing::warn!(
@@ -395,11 +501,14 @@ fn reconcile_unresolved_workers(
     registry: &Arc<WorkerRegistry>,
     cfg: &Option<Arc<Config>>,
     kv_index: &Option<Arc<KvEventIndex>>,
+    load_monitor: &Option<Arc<LoadMonitor>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, JoinHandle<()>>,
 ) {
     for worker in registry.all() {
-        if !worker.model_ids.is_empty() {
+        let portless_prefill =
+            worker.mode() == WorkerMode::Prefill && worker.bootstrap_port().is_none();
+        if !worker.model_ids.is_empty() && !portless_prefill {
             continue;
         }
         let id = worker.id.clone();
@@ -412,12 +521,20 @@ fn reconcile_unresolved_workers(
         // `register_one` re-resolves them from `/server_info`; current
         // mode + bootstrap_port as the seed (`register_one` re-applies
         // any `/server_info` override).
+        // A portless prefill worker keeps its resolved `model_ids` so the
+        // upsert does not drop it from its model pool while we wait for
+        // the port to appear.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker.url.clone(),
             mode: worker.mode(),
-            model_ids: Vec::new(),
+            model_ids: if portless_prefill {
+                worker.model_ids.clone()
+            } else {
+                Vec::new()
+            },
             bootstrap_port: worker.bootstrap_port(),
+            transfer_group: worker.transfer_group().map(str::to_string),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for a worker
@@ -432,9 +549,18 @@ fn reconcile_unresolved_workers(
         let registry_t = registry.clone();
         let cfg_t = cfg.clone();
         let kv_index_t = kv_index.clone();
+        let load_monitor_t = load_monitor.clone();
         let introspector_t = introspector.clone();
         let handle = tokio::spawn(async move {
-            register_one(spec, registry_t, cfg_t, kv_index_t, introspector_t).await;
+            register_one(
+                spec,
+                registry_t,
+                cfg_t,
+                kv_index_t,
+                load_monitor_t,
+                introspector_t,
+            )
+            .await;
         });
         pending.insert(id, handle);
     }
@@ -450,6 +576,7 @@ async fn register_one(
     registry: Arc<WorkerRegistry>,
     cfg: Option<Arc<Config>>,
     kv_index: Option<Arc<KvEventIndex>>,
+    load_monitor: Option<Arc<LoadMonitor>>,
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
@@ -505,6 +632,15 @@ async fn register_one(
         ),
         WireProtocol::Http1 => {}
     }
+    if spec.mode == WorkerMode::Prefill && spec.bootstrap_port.is_none() {
+        // Registered but not routable (see `PdPoolResolver::resolve`).
+        // The reconcile pass keeps re-introspecting until `/server_info`
+        // reports `disaggregation_bootstrap_port`.
+        tracing::warn!(
+            worker_url = %worker_url,
+            "prefill worker registered without a bootstrap_port; excluded from routing until /server_info reports one",
+        );
+    }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
     let worker_id = spec.id.clone();
     if let Err(e) = registry.add_with_cb(spec, cb) {
@@ -530,6 +666,11 @@ async fn register_one(
     // protocol on the post-insert entry.
     if let Some(w) = registry.get(&worker_id) {
         w.set_protocol(protocol);
+    }
+    if let Some(lm) = &load_monitor {
+        // Start polling `/v1/loads` right away so the worker becomes
+        // routable (fresh) as soon as its first report lands.
+        lm.track(&worker_url);
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -572,6 +713,7 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                decode_policy: None,
                 sticky: None,
                 max_output_tokens: None,
                 sampling_overrides: Default::default(),
@@ -581,6 +723,7 @@ mod tests {
                 urls: vec!["http://test:30000".into()],
             }),
             proxy: ProxyConfig::default(),
+            load_monitor: crate::config::LoadMonitorConfig::default(),
             active_load: ActiveLoadConfig::default(),
             admission: crate::config::AdmissionConfig::default(),
             retry: crate::config::RetryConfig::default(),
@@ -596,6 +739,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -707,6 +851,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -752,6 +897,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -802,6 +948,7 @@ mod tests {
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
+                transfer_group: None,
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -873,6 +1020,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -976,6 +1124,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -1058,6 +1207,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         let added = timeout(Duration::from_secs(2), async {
@@ -1139,6 +1289,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1243,6 +1394,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1332,6 +1484,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         }))
         .await
         .unwrap();
@@ -1457,6 +1610,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         }))
         .await
         .unwrap();
@@ -1585,6 +1739,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         }))
         .await
         .unwrap();
@@ -1657,6 +1812,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: Vec::new(),
             bootstrap_port: None,
+            transfer_group: None,
         }))
         .await
         .unwrap();

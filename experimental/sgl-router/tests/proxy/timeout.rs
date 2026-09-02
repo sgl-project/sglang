@@ -45,6 +45,7 @@ fn config(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -54,6 +55,7 @@ fn config(_worker_url: &str) -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -74,6 +76,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
+        transfer_group: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());

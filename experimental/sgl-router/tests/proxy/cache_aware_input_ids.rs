@@ -59,6 +59,7 @@ fn config() -> Config {
             policy: PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: Some(CacheAwareConfig::default()),
+            decode_policy: None,
             sticky: None,
             max_output_tokens: None,
             sampling_overrides: Default::default(),
@@ -68,6 +69,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -88,6 +90,7 @@ fn build_ctx(url: String) -> Arc<AppContext> {
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId(MODEL.into())],
         bootstrap_port: None,
+        transfer_group: None,
     });
     // Use the real loaded tokenizers (not the empty-registry test default) so
     // the cache-aware policy can tokenize at ingress.

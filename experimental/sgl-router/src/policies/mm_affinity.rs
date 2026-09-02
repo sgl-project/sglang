@@ -473,6 +473,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
+            transfer_group: None,
         }))
     }
 

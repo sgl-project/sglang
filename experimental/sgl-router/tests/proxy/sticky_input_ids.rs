@@ -64,6 +64,7 @@ fn config() -> Config {
             cache_aware: None,
             // Push eviction far out so the background sweeper never fires
             // mid-test; round-robin fallback for the initial pin of a key.
+            decode_policy: None,
             sticky: Some(StickyConfig {
                 header_name: HEADER.to_string(),
                 fallback_policy: PolicyKind::RoundRobin,
@@ -78,6 +79,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+        load_monitor: sgl_router::config::LoadMonitorConfig::default(),
         active_load: ActiveLoadConfig::default(),
         admission: sgl_router::config::AdmissionConfig::default(),
         retry: sgl_router::config::RetryConfig::default(),
@@ -103,6 +105,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId(MODEL.into())],
             bootstrap_port: None,
+            transfer_group: None,
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the

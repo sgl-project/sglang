@@ -26,8 +26,16 @@ impl LoadBasedPolicy {
 }
 
 impl Policy for LoadBasedPolicy {
-    fn select(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        Self::pick_min_load(workers)
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        if ctx.load_monitor().is_none() {
+            return Self::pick_min_load(workers);
+        }
+        // Load Monitor on: score by engine-reported load (+ local
+        // pre-deduction) instead of the router-local counter.
+        workers
+            .iter()
+            .min_by_key(|w| ctx.worker_load(w))
+            .map(Arc::clone)
     }
 }
 
@@ -43,6 +51,7 @@ mod tests {
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
+            transfer_group: None,
         }))
     }
 

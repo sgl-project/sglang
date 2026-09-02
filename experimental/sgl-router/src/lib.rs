@@ -12,6 +12,7 @@ pub mod config;
 pub mod diag;
 pub mod discovery;
 pub mod health;
+pub mod load_monitor;
 pub mod policies;
 pub mod proxy;
 pub mod server;
