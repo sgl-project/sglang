@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
+    from sglang.srt.sampling.watermark import load_watermark_config
 
     cfg = resolving_view(server_args)
+
+    load_watermark_config(cfg.watermark_config)
 
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":

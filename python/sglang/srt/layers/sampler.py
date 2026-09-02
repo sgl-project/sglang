@@ -19,6 +19,11 @@ from sglang.srt.layers.logprob_processor import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.sampling.watermark import (
+    WatermarkBatchInfo,
+    deterministic_key_a_mask,
+    select_textseal_tokens,
+)
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -289,6 +294,46 @@ class Sampler(nn.Module):
         Used for standard sampling with flashinfer/pytorch backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
+        if sampling_info.watermark is not None:
+            if sampling_info.watermark.all_enabled:
+                return sample_textseal_from_probs(
+                    probs,
+                    sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    sampling_info.watermark,
+                    positions,
+                    sampling_info.watermark_max_top_k,
+                )
+            ordinary_token_ids = self._sample_from_probs_ordinary(
+                probs, sampling_info, positions, simple_sampling_case
+            )
+            enabled_indices = torch.nonzero(
+                sampling_info.watermark.enabled, as_tuple=True
+            )[0]
+            watermark_token_ids = sample_textseal_from_probs(
+                probs[enabled_indices],
+                sampling_info.top_ks[enabled_indices],
+                sampling_info.top_ps[enabled_indices],
+                sampling_info.min_ps[enabled_indices],
+                sampling_info.watermark.filter(enabled_indices),
+                positions[enabled_indices],
+                sampling_info.watermark_max_top_k,
+            )
+            return ordinary_token_ids.index_copy(
+                0, enabled_indices, watermark_token_ids
+            )
+        return self._sample_from_probs_ordinary(
+            probs, sampling_info, positions, simple_sampling_case
+        )
+
+    def _sample_from_probs_ordinary(
+        self,
+        probs: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+        simple_sampling_case: bool,
+    ) -> torch.Tensor:
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
@@ -640,6 +685,65 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def build_effective_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+) -> torch.Tensor:
+    probs_sort, probs_idx = _build_effective_probs_sorted(probs, top_ks, top_ps, min_ps)
+    return torch.zeros_like(probs).scatter(1, probs_idx, probs_sort)
+
+
+def _build_effective_probs_sorted(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    max_top_k: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if max_top_k is not None and max_top_k < probs.shape[-1]:
+        probs_sort, probs_idx = torch.topk(
+            probs, k=max_top_k, dim=-1, largest=True, sorted=True
+        )
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    positions = torch.arange(probs_sort.shape[-1], device=probs.device).view(1, -1)
+    keep = positions < top_ks.view(-1, 1)
+    keep &= (probs_sum - probs_sort) <= top_ps.view(-1, 1)
+    keep &= probs_sort >= probs_sort[:, :1] * min_ps.view(-1, 1)
+    probs_sort = torch.where(keep, probs_sort, 0.0)
+    probs_sort = probs_sort / probs_sort.sum(dim=-1, keepdim=True)
+    return probs_sort, probs_idx
+
+
+def sample_textseal_from_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    watermark: WatermarkBatchInfo,
+    positions: torch.Tensor,
+    max_top_k: int,
+) -> torch.Tensor:
+    effective_probs, token_ids = _build_effective_probs_sorted(
+        probs, top_ks, top_ps, min_ps, max_top_k
+    )
+    use_key_a = deterministic_key_a_mask(
+        watermark.nonces, positions, watermark.mixing_probabilities
+    )
+    return select_textseal_tokens(
+        effective_probs,
+        watermark.contexts,
+        watermark.key_a,
+        watermark.key_b,
+        use_key_a,
+        token_ids=token_ids,
+        ngrams=watermark.ngrams,
+    )
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(

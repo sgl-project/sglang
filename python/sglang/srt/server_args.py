@@ -1322,6 +1322,11 @@ class ServerArgs:
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
         NS("serving"),
     ] = None
+    watermark_config: A[
+        Optional[str],
+        "Path to the server-side watermark configuration JSON file.",
+        NS("serving"),
+    ] = None
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",

@@ -143,6 +143,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.watermark import (
+    WatermarkRequestError,
+    load_watermark_config,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -414,6 +418,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Parse args
         self.server_args = server_args
         assert_published(server_args, role="tokenizer")
+        self.init_watermark_registry()
         self.startup_time: Optional[Dict[str, Any]] = None
         self.elastic_worker_count = get_parallel().dp_size
         self.elastic_pending_ep_size = None
@@ -464,6 +469,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+
+    def init_watermark_registry(self):
+        self.watermark_registry = load_watermark_config(get_serving().watermark_config)
 
     def init_model_config(self):
         server_args = self.server_args
@@ -776,6 +784,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        self._validate_watermark_requests(obj)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -834,6 +843,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
             raise
+
+    def _validate_watermark_requests(self, obj) -> None:
+        if not isinstance(obj, GenerateReqInput):
+            return
+        requests = (
+            [obj] if obj.is_single else [obj[index] for index in range(obj.batch_size)]
+        )
+        for request in requests:
+            request_config = request.watermark
+            if request_config is None:
+                continue
+            self.watermark_registry.resolve_request(request_config)
+            self._validate_watermark_mode(request)
+
+    def _validate_watermark_mode(self, request: GenerateReqInput) -> None:
+        sampling_params = request.sampling_params
+        unsupported_reason = None
+        if not self.is_generation:
+            unsupported_reason = "watermark requires a generation model"
+        elif not get_device().device.startswith("cuda"):
+            unsupported_reason = "watermark currently requires a CUDA device"
+        elif request.contains_mm_input():
+            unsupported_reason = "watermark does not support multimodal input"
+        elif self.disaggregation_mode != DisaggregationMode.NULL:
+            unsupported_reason = "watermark does not support disaggregated execution"
+        elif get_parallel().tp_size != 1:
+            unsupported_reason = "watermark currently requires tensor parallel size 1"
+        elif get_spec().speculative_algorithm:
+            unsupported_reason = "watermark does not support speculative decoding"
+        elif get_exec().dllm.dllm_algorithm is not None:
+            unsupported_reason = "watermark does not support diffusion language models"
+        elif sampling_params.get("beam_width", 1) > 1:
+            unsupported_reason = "watermark does not support beam search"
+        elif sampling_params.get("temperature", 1.0) == 0:
+            unsupported_reason = "watermark does not support greedy sampling"
+        elif sampling_params.get("top_k") == 1:
+            unsupported_reason = "watermark does not support single-token support"
+        elif get_exec().kernel.sampling_backend not in ("flashinfer", "pytorch"):
+            unsupported_reason = "watermark requires the flashinfer or pytorch sampler"
+        elif not get_exec().graph.disable_cuda_graph:
+            unsupported_reason = (
+                "watermark currently requires CUDA graphs to be disabled"
+            )
+
+        if unsupported_reason is not None:
+            raise WatermarkRequestError(
+                "watermark_unsupported_mode", unsupported_reason
+            )
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1381,6 +1438,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
                 sampling_params=sampling_params,
+                watermark=obj.watermark,
                 return_logprob=obj.return_logprob,
                 logprob_start_len=obj.logprob_start_len,
                 top_logprobs_num=obj.top_logprobs_num,
