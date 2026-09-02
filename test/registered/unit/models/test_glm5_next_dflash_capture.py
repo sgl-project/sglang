@@ -72,9 +72,7 @@ def test_glm5_next_initializes_vision_only_with_vision_config(
         "sglang.srt.models.glm5_next.LogitsProcessor",
         lambda *_args, **_kwargs: nn.Identity(),
     )
-    monkeypatch.setattr(
-        "sglang.srt.models.glm5_next.PPMissingLayer", nn.Identity
-    )
+    monkeypatch.setattr("sglang.srt.models.glm5_next.PPMissingLayer", nn.Identity)
     monkeypatch.setattr("sglang.srt.models.glm5_next.get_pp_group", lambda: pp_group)
     monkeypatch.setattr("sglang.srt.models.glm5_next.get_parallel", lambda: parallel)
     monkeypatch.setattr("sglang.srt.models.glm5_next.get_mm", lambda: mm)
@@ -177,18 +175,14 @@ def test_glm5_next_pp_embed_and_head_follow_stage_ownership():
     embed = nn.Parameter(torch.randn(4, 3))
     head = nn.Parameter(torch.randn(4, 3))
 
-    first = Glm5NextForConditionalGeneration.__new__(
-        Glm5NextForConditionalGeneration
-    )
+    first = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
     nn.Module.__init__(first)
     first.model = nn.Module()
     first.model.embed_tokens = nn.Embedding(4, 3)
     first.lm_head = nn.Identity()
     first.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=False)
 
-    last = Glm5NextForConditionalGeneration.__new__(
-        Glm5NextForConditionalGeneration
-    )
+    last = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
     nn.Module.__init__(last)
     last.model = nn.Module()
     last.model.embed_tokens = nn.Identity()
@@ -202,6 +196,79 @@ def test_glm5_next_pp_embed_and_head_follow_stage_ownership():
     assert first_head is None
     assert last_embed is None
     assert last_head is last.lm_head.weight
+
+
+@pytest.mark.parametrize("first_k_dense_replace", [2, 4])
+def test_glm5_next_tbo_stays_within_later_pp_stage(monkeypatch, first_k_dense_replace):
+    class GuardedLayers(list):
+        def __getitem__(self, index):
+            if isinstance(index, int) and index < 0:
+                raise AssertionError("TBO scatter mode crossed the PP stage boundary")
+            return super().__getitem__(index)
+
+    model = Glm5NextModel.__new__(Glm5NextModel)
+    nn.Module.__init__(model)
+    model.start_layer = 4
+    model.end_layer = 7
+    model.first_k_dense_replace = first_k_dense_replace
+    model.dflash_capture = False
+    model.dsa_enable_prefill_cp = False
+    model.mla_enable_prefill_cp = False
+    model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    missing_layer = object()
+    model.layers = GuardedLayers(
+        [missing_layer] * model.start_layer
+        + [nn.Identity() for _ in range(model.end_layer - model.start_layer)]
+    )
+    model.layers_to_capture = []
+    model.enable_a2a_moe = False
+    model.next_full_attention_layer_id = {}
+
+    stage_entry_scatter_mode = object()
+    tbo_calls = []
+
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.BumpAllocator", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.dsa_use_prefill_cp",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.mla_use_prefill_cp",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.ScatterMode.model_input_output",
+        lambda: stage_entry_scatter_mode,
+    )
+
+    def capture_tbo(**kwargs):
+        tbo_calls.append(kwargs)
+        return kwargs["hidden_states"], kwargs["residual"]
+
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next.model_forward_maybe_tbo", capture_tbo
+    )
+
+    hidden_states = torch.randn(2, 4)
+    residual = torch.randn(2, 4)
+    result = model.forward(
+        input_ids=torch.empty(0, dtype=torch.int64),
+        positions=torch.arange(2),
+        forward_batch=SimpleNamespace(can_run_tbo=True),
+        pp_proxy_tensors={
+            "hidden_states": hidden_states,
+            "residual": residual,
+        },
+    )
+
+    assert len(tbo_calls) == 1
+    assert tbo_calls[0]["layers"] == model.layers[model.start_layer : model.end_layer]
+    assert all(layer is not missing_layer for layer in tbo_calls[0]["layers"])
+    assert tbo_calls[0]["input_data_scatter_mode"] is stage_entry_scatter_mode
+    assert result["hidden_states"] is hidden_states
+    assert result["residual"] is residual
 
 
 def test_glm5_nextn_loader_loads_checkpoint_embedding(monkeypatch):

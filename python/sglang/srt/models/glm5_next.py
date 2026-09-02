@@ -39,6 +39,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -1131,8 +1132,8 @@ class Glm5NextModel(nn.Module):
                 and self.first_k_dense_replace < normal_end_layer
             ):
                 normal_end_layer = self.first_k_dense_replace
-            elif self.first_k_dense_replace < normal_start_layer:
-                normal_end_layer = normal_start_layer = 0
+            elif self.first_k_dense_replace <= normal_start_layer:
+                normal_end_layer = normal_start_layer
         aux_hidden_states = []
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
@@ -1174,9 +1175,13 @@ class Glm5NextModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
+                input_data_scatter_mode=(
+                    ScatterMode.model_input_output()
+                    if normal_end_layer == self.start_layer
+                    else self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode
+                ),
                 zero_allocator=zero_allocator,
             )
 
@@ -1658,10 +1663,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # stage, so retain and load the draft's own embedding copy.
                 # The lm_head remains shared from the last target stage.
                 is_draft_embedding = name == "model.embed_tokens.weight"
-                if (
-                    not name.startswith(nextn_layer_prefix)
-                    and not is_draft_embedding
-                ):
+                if not name.startswith(nextn_layer_prefix) and not is_draft_embedding:
                     continue
 
                 if "shared_head.head" in name:
