@@ -535,6 +535,18 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_empty_non_last_chunk_sends_standalone_notification(self):
+        room = 24
+        mgr = self._make_manager(room)
+        mgr.agent.send_notif = MagicMock()
+        mgr.send_kvcache = MagicMock()
+        chunk = self._make_chunk(room, [], is_last_chunk=False)
+
+        self._run_worker_once(mgr, chunk)
+
+        mgr.agent.send_notif.assert_called_once_with("agent", b"24_kv_0_0_0")
+        mgr.send_kvcache.assert_not_called()
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
         room = 23
         mgr = self._make_manager(room)

@@ -16,11 +16,13 @@ class TestRegisterToBootstrap(CustomTestCase):
     """Tests for CommonKVManager.register_to_bootstrap retry/backoff behavior."""
 
     def setUp(self):
-        # register_to_bootstrap reads get_parallel().load_balance_method /
-        # .enable_dsa_cache_layer_split and get_serving().port from the
-        # published config.
+        # register_to_bootstrap reads get_parallel().load_balance_method,
+        # .enable_dsa_cache_layer_split, and .enable_kv_cache_sharding plus
+        # get_serving().port from the published config.
         override = get_context().override_server_args(
-            load_balance_method="follow_bootstrap_room", port=30000
+            load_balance_method="follow_bootstrap_room",
+            port=30000,
+            enable_kv_cache_sharding=True,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -177,12 +179,14 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
         ]
         for field in required_fields:
             self.assertIn(field, payload)
+        self.assertIs(payload["enable_kv_cache_sharding"], True)
         self.assertEqual(payload["prefill_http_port"], 30000)
 
     @patch("sglang.srt.disaggregation.common.conn.time")

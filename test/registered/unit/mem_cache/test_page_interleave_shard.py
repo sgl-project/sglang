@@ -30,6 +30,8 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
+6. The value-derived P/D ownership send filter
+   ``filter_kv_indices_for_shard_rank``.
 """
 
 import unittest
@@ -37,8 +39,10 @@ import unittest.mock
 from array import array
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
+from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
     page_interleave_shard_size,
@@ -1127,6 +1131,58 @@ class TestWritePlan(CustomTestCase):
         owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
         self.assertEqual(owned_idx.numel(), 0)
         self.assertEqual(local_rows.numel(), 0)
+
+
+class TestShardSendFilter(CustomTestCase):
+    """Value-derived P/D ownership partition: owner = logical page % N, wire
+    value = logical page // N — independent of positions, so it stays
+    correct under any placement policy."""
+
+    def test_partition_and_positional_pairing(self):
+        mgr = SimpleNamespace(kv_shard_rank=0, kv_shard_size=N)
+        # A base-2 rotated chain: owners are NOT position-congruent.
+        logical_pages = np.array(_chain_pages(base=2, n_pages=9), dtype=np.int64)
+        sl = slice(0, 9)
+        got = {}
+        for r in range(N):
+            mgr.kv_shard_rank = r
+            wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, sl)
+            got[r] = (wire, pos)
+            # Ownership by VALUE (l % N == r), wire id = owner's local page.
+            np.testing.assert_array_equal(logical_pages[pos] % N, r)
+            np.testing.assert_array_equal(wire, logical_pages[pos] // N)
+        # Disjoint cover of all positions.
+        all_pos = np.sort(np.concatenate([got[r][1] for r in range(N)]))
+        np.testing.assert_array_equal(all_pos, np.arange(9))
+
+    def test_wire_value_is_the_owner_local_page(self):
+        """The wire byte contract: l // N == loc // (N * ps) — the owner-local
+        page id, so the decode side needs no change."""
+        mgr = SimpleNamespace(kv_shard_rank=1, kv_shard_size=N)
+        logical_pages = np.array(_chain_pages(base=0, n_pages=8), dtype=np.int64)
+        locs = logical_pages * PS  # page-head loc of each entry
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, slice(0, 8))
+        np.testing.assert_array_equal(wire, locs[pos] // (N * PS))
+
+    def test_mid_request_chunk_positions_canonical(self):
+        mgr = SimpleNamespace(kv_shard_rank=2, kv_shard_size=N)
+        logical_pages = np.array(
+            _chain_pages(base=1, n_pages=32)[20:32], dtype=np.int64
+        )
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, logical_pages, slice(20, 32))
+        # Positions are canonical (chunk-global), values from this chunk.
+        self.assertTrue(((pos >= 20) & (pos < 32)).all())
+        np.testing.assert_array_equal(logical_pages[pos - 20] % N, 2)
+        np.testing.assert_array_equal(wire, logical_pages[pos - 20] // N)
+
+    def test_rank_owning_nothing_in_chunk(self):
+        """A short chunk can leave a rank with zero pages; the filter must
+        return empty arrays, not error."""
+        mgr = SimpleNamespace(kv_shard_rank=3, kv_shard_size=N)
+        pages = np.array(_chain_pages(base=0, n_pages=2), dtype=np.int64)  # owners 0,1
+        wire, pos = filter_kv_indices_for_shard_rank(mgr, pages, slice(0, 2))
+        self.assertEqual(len(wire), 0)
+        self.assertEqual(len(pos), 0)
 
 
 if __name__ == "__main__":
