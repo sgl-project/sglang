@@ -3701,7 +3701,6 @@ class Scheduler(
         for req in self.waiting_queue:
             candidate_reuses_slot = self._waiting_req_reuses_streaming_session_slot(req)
             running_bs = len(running_batch.reqs)
-            parallel_capacity = get_parallel().pp_max_micro_batch_size - running_bs
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
@@ -3780,8 +3779,7 @@ class Scheduler(
             if added and not owns_slot:
                 fresh_slots_used += 1
             if not added and candidate_reuses_slot:
-                # Mirror the empty-batch HiCache NO_TOKEN rule below: that state
-                # is retryable and must not permanently latch row admission full.
+                # A transiently blocked retained turn must not latch admission full.
                 reusable_retryable |= res != AddReqResult.NO_TOKEN or (
                     self.enable_hierarchical_cache
                     and len(adder.can_run_list) == 0
@@ -3804,8 +3802,10 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if not added:
+                req_was_added = (
+                    len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                )
+                if not req_was_added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
