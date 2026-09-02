@@ -43,7 +43,6 @@ class TestDeepSeekOCR(CustomTestCase):
             "--attention-backend",
             "intel_xpu",
         ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "1"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

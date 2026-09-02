@@ -18,7 +18,14 @@ from typing import Any
 import torch
 from torch.distributed import TCPStore
 
+try:
+    from torch.distributed import all_gather_single as _all_gather_single
+except ImportError:
+    from torch.distributed import all_gather_into_tensor as _all_gather_single
+
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+all_gather_single = _all_gather_single
 
 logger = init_logger(__name__)
 

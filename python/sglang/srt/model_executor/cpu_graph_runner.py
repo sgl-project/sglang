@@ -39,7 +39,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -127,14 +133,13 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # torch compile speeds up decoding by reducing python overhead on CPU
-    server_args = model_runner.server_args
     # Reuse cuda_graph_config[decode].bs here.
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert (
-        max(capture_bs) <= server_args.torch_compile_max_bs
-    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
+        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
+    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -177,6 +182,9 @@ def register_fake_ops(tp_size: int):
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "multimodal_rotary_embedding_cpu",
+        "apply_multidimensional_rope_cpu",
+        "fused_sigmoid_mul_cpu",
     ]
     for op in none_return_ops:
 
@@ -200,6 +208,31 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
+    def _(q, k, q_weight, k_weight, eps, head_dim):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_with_gate_cpu")
+    def _(q_gate, k, q_weight, k_weight, eps, head_dim, num_head):
+        seq_len = q_gate.shape[0]
+        num_head_kv = k.shape[1] // head_dim
+        q_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        k_out = k.new_empty((seq_len * num_head_kv, head_dim))
+        gate_out = q_gate.new_empty((seq_len * num_head, head_dim))
+        return q_out, k_out, gate_out
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
@@ -248,26 +281,12 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 2:
-            return query, key
-        else:
+        if query.ndim == 3:
             return torch.empty_like(query), torch.empty_like(key)
+        return query, key
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
-        return query, key
-
-    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
         return query, key
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
@@ -385,7 +404,7 @@ def register_fake_ops(tp_size: int):
         return topk_weights, topk_ids
 
     @register_cpu_compile_fake("topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
+    def _(hidden_states, gating_output, topk, renormalize, correction_bias=None):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
         return (
@@ -399,6 +418,7 @@ def register_fake_ops(tp_size: int):
         gating_output,
         topk,
         renormalize,
+        correction_bias=None,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
@@ -567,7 +587,7 @@ class CPUGraphRunner:
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
@@ -578,29 +598,27 @@ class CPUGraphRunner:
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
-        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+        self.require_gathered_buffer = require_gathered_buffer()
+        self.require_mlp_tp_gather = require_mlp_tp_gather()
+        self.require_mlp_sync = require_mlp_sync()
+        self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
-        self.tp_size = model_runner.server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
-        assert (
-            not self.model_runner.server_args.enable_lora
-        ), "CPUGraphRunner does not support LoRA yet."
+        assert not get_lora().enable_lora, "CPUGraphRunner does not support LoRA yet."
         assert (
             not self.enable_two_batch_overlap
         ), "CPUGraphRunner does not support two batch overlap yet."
@@ -991,7 +1009,7 @@ class CPUGraphRunner:
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
                     spec_steps=get_spec().speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    topk=get_spec().speculative_eagle_topk,
                     draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,

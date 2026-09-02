@@ -9,11 +9,13 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,36 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+def ranks_per_host() -> int:
+    """Number of ranks of this job running on the same machine as this one.
+
+    Derived as world_size // nnodes: the launcher slices ranks uniformly
+    across nodes (resolution asserts divisibility), so no hostname collective
+    is needed — a collective here would have to be issued the same number of
+    times on every rank, and ranks build different numbers of host pools.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 1
+    try:
+        world_group = get_world_group()
+    except AssertionError:
+        return 1
+    if world_group.world_size == 1:
+        return 1
+    return max(world_group.world_size // get_parallel().nnodes, 1)
+
+
+def host_memory_budget_bytes() -> int:
+    """Host RAM this rank may claim for a HiCache pool.
+
+    psutil reports the whole machine, so co-located ranks each see the same free
+    memory; without the split every rank sizes its pool against all of it and
+    the host is oversubscribed by the number of ranks it holds.
+    """
+    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return free // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -139,9 +171,8 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -340,21 +371,18 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
         Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
         """
         if self.dcp_size == 1:
             return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
-            "HiCache DCP translation expects runs of whole widened pages "
-            f"(every residue class equally represented); got {indices.numel()} "
-            f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
+        assert indices.numel() % self.dcp_size == 0, (
+            "HiCache DCP translation expects runs of whole widened pages; got "
+            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
-        return owned
+        return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:

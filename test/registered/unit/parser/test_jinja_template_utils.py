@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
@@ -137,6 +137,31 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         ]
         self.assertEqual(result["content"], expected_content)
         self.assertEqual(result["role"], "user")
+
+    def test_process_content_preserves_image_content_hash(self):
+        content_hash = "sha256:" + "ab" * 32
+        image_data = []
+        result = process_content_for_template_format(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "http://example.com/image.jpg",
+                            "content_hash": content_hash,
+                        },
+                    }
+                ],
+            },
+            "openai",
+            image_data,
+            [],
+            [],
+            [],
+        )
+        self.assertEqual(result["content"], [{"type": "image"}])
+        self.assertEqual(image_data[0].content_hash, content_hash)
 
     def test_process_content_string_format(self):
         """Test content processing for string format."""
