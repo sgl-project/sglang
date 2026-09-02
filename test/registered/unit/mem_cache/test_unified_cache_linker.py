@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -296,8 +296,23 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.reset()
 
 
+class _TreeCoreBackendTestMixin:
+    tree_core_backend = "python"
+
+    def setUp(self):
+        previous = shared_cache_suite._TREE_CORE_TEST_BACKEND
+        self.addCleanup(
+            setattr,
+            shared_cache_suite,
+            "_TREE_CORE_TEST_BACKEND",
+            previous,
+        )
+        shared_cache_suite._TREE_CORE_TEST_BACKEND = self.tree_core_backend
+        super().setUp()
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerBackends(_InsertWalkSuite):
+class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
     def test_full_offload_load_round_trip_and_dedup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
@@ -582,7 +597,9 @@ class TestUnifiedCacheLinkerBackends(_InsertWalkSuite):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerTreeCoreBackends(shared_cache_suite._InsertWalkSuite):
+class TestUnifiedCacheLinkerTreeCorePythonBackend(
+    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite
+):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 
     def test_builds_opaque_external_offload_transfers(self):
@@ -717,6 +734,16 @@ class TestUnifiedCacheLinkerTreeCoreBackends(shared_cache_suite._InsertWalkSuite
         core.finish_external_linker_offload([node_id], node_id, success=False)
         self.assertIsNone(core.get_write_through_pending_id(node_id))
         self.assertTrue(core.is_external_cache_stored(node_id))
+
+
+class TestUnifiedCacheLinkerRustBackend(TestUnifiedCacheLinkerPythonBackend):
+    tree_core_backend = "rust"
+
+
+class TestUnifiedCacheLinkerTreeCoreRustBackend(
+    TestUnifiedCacheLinkerTreeCorePythonBackend
+):
+    tree_core_backend = "rust"
 
 
 def test_restorable_prefix_intersects_sparse_rank_results():
