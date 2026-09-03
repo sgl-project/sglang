@@ -6,6 +6,7 @@ use crate::config::{
 };
 use crate::discovery::ModelId;
 use crate::policies::{
+    cache_aware::CacheAwarePolicy,
     cache_aware_zmq::CacheAwareZmqPolicy,
     engine_load::EngineLoadTable,
     kv_events::{BlockSizeOracle, HashTree},
@@ -15,8 +16,9 @@ use crate::policies::{
     round_robin::RoundRobinPolicy,
     scoring::{
         admission::Overloaded, prefix_cache, prefix_cache::PrefixCachePolicy, FusedScorePolicy,
-        Pipeline,
+        Pipeline, ScorePolicy,
     },
+    session_aware::SessionAwarePolicy,
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
@@ -102,8 +104,15 @@ fn build_kind(
                 Arc::clone(engine_load),
             ))
         }
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            model.affinity.clone().unwrap_or_default(),
+        )),
         PolicyKind::Sticky => build_sticky(model),
         PolicyKind::FusedScore => build_fused(model, &tree, &block_size_oracle)?,
+        PolicyKind::ScorePolicy => build_score_policy(model, &tree, &block_size_oracle)?,
     })
 }
 
@@ -173,6 +182,17 @@ fn build_fused(
     Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
 
+/// Builds the top-level `score_policy`.
+fn build_score_policy(
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    oracle: &Arc<BlockSizeOracle>,
+) -> Result<Arc<dyn Policy>> {
+    Ok(Arc::new(ScorePolicy::new(build_fused(
+        model, tree, oracle,
+    )?)))
+}
+
 /// Builds a policy with test defaults.
 #[cfg(test)]
 pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
@@ -188,6 +208,12 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
             BlockSizeOracle::new(),
             EngineLoadTable::new(),
         )),
+        PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
+        PolicyKind::CacheAware => Arc::new(CacheAwarePolicy::new(
+            crate::config::AffinityConfig::default(),
+        )),
         PolicyKind::Sticky => {
             let s = crate::config::StickyConfig::default();
             Arc::new(StickyPolicy::new(
@@ -196,7 +222,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
-        PolicyKind::FusedScore => {
+        PolicyKind::FusedScore | PolicyKind::ScorePolicy => {
             return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
         }
     })
@@ -342,6 +368,7 @@ mod tests {
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
+                affinity: None,
                 fused: None,
                 eligibility: None,
             },
@@ -361,11 +388,14 @@ mod tests {
             PolicyKind::PowerOfTwo,
             PolicyKind::LoadBased,
             PolicyKind::CacheAwareZmq,
+            PolicyKind::SessionAware,
+            PolicyKind::CacheAware,
             PolicyKind::Sticky,
         ] {
             assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
         }
         assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
+        assert!(build_policy_kind_only(PolicyKind::ScorePolicy).is_err());
     }
 
     #[test]
@@ -393,6 +423,50 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at least one --fuse term"));
+    }
+
+    /// `score_policy` uses its own top-level factory branch.
+    #[test]
+    fn score_policy_builds_via_its_own_factory_branch() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
+        cfg.model.fused = Some(vec![crate::config::FusedTerm {
+            kind: ScoreTermKind::PrefixCache,
+            weight: Some(2.0),
+        }]);
+
+        let registry = build_registry_with_defaults(&cfg).expect("score policy builds");
+        let policy = registry
+            .get(&ModelId("modelA".into()))
+            .expect("configured model has a policy");
+        assert!(
+            policy.can_fuse(),
+            "the score policy exposes score semantics"
+        );
+        assert!(
+            policy.uses_shared_prefill_admission(),
+            "top-level score_policy participates in the shared hard admission layer"
+        );
+    }
+
+    #[test]
+    fn score_policy_with_filter_builds_one_outer_pipeline() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::ScorePolicy);
+        cfg.model.fused = Some(vec![crate::config::FusedTerm {
+            kind: ScoreTermKind::LoadBased,
+            weight: Some(1.0),
+        }]);
+        cfg.model.eligibility = Some(EligibilityConfig {
+            filters: vec![FilterKind::Overloaded],
+            max_in_flight: Some(2),
+            min_prefix_share: None,
+        });
+
+        let registry = build_registry_with_defaults(&cfg)
+            .expect("a score policy keeps eligibility outside its scoring terms");
+        let policy = registry
+            .get(&ModelId("modelA".into()))
+            .expect("configured model has a policy");
+        assert!(policy.uses_shared_prefill_admission());
     }
 
     #[test]

@@ -7,7 +7,7 @@ pub mod admission;
 pub mod argmax;
 pub mod prefix_cache;
 
-use crate::policies::{Policy, SelectionContext};
+use crate::policies::{Policy, PrefillProposal, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use argmax::{Selector, ARGMAX};
 use std::sync::Arc;
@@ -185,12 +185,103 @@ impl Pipeline {
     fn views(&self) -> impl Iterator<Item = &dyn EligibilityFilter> {
         (self.filters.iter()).map(|p| p.as_filter().expect("checked by Pipeline::new"))
     }
+
+    /// Apply eligibility without rewriting an existing Session assignment.
+    fn propose_prefill_filtered(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        let eligible = admit(self.views(), workers, ctx)?;
+        if self.inner.is_bucket_affinity_policy() && ctx.affinity_lookup_enabled() {
+            let probe_ctx = (*ctx).clone().without_affinity_assignment();
+            if let Some(
+                proposal @ PrefillProposal::Pair(SelectionProposal {
+                    kind: crate::policies::ProposalKind::SessionAffinity,
+                    ..
+                }),
+            ) = self.inner.propose_prefill(workers, &probe_ctx)
+            {
+                return Some(proposal.with_eligible_workers(eligible));
+            }
+        }
+        self.inner
+            .propose_prefill(&eligible, ctx)
+            .map(|proposal| proposal.with_eligible_workers(eligible))
+    }
 }
 
 impl Policy for Pipeline {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        let eligible = admit(self.views(), workers, ctx)?;
-        self.inner.select(&eligible, ctx)
+        let (proposal_kind, selected) = match self.propose_prefill_filtered(workers, ctx)? {
+            PrefillProposal::Pair(proposal) => {
+                let eligible = proposal.eligible_workers.as_deref().unwrap_or(workers);
+                if eligible
+                    .iter()
+                    .any(|worker| worker.id == proposal.primary.id)
+                {
+                    (proposal.kind, proposal.primary)
+                } else {
+                    let selected = proposal
+                        .backup
+                        .filter(|backup| eligible.iter().any(|worker| worker.id == backup.id))
+                        .or_else(|| eligible.first().cloned())?;
+                    (proposal.kind, selected)
+                }
+            }
+            PrefillProposal::CacheCandidates(proposal) => {
+                let selected = proposal.candidates.into_iter().next()?.worker;
+                (crate::policies::ProposalKind::CacheAffinity, selected)
+            }
+        };
+        self.inner
+            .commit_prefill_selection(ctx, proposal_kind, &selected);
+        Some(selected)
+    }
+
+    /// Preserves the inner policy's complete proposal.
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        match self.propose_prefill_filtered(workers, ctx)? {
+            PrefillProposal::Pair(proposal) => Some(proposal),
+            PrefillProposal::CacheCandidates(proposal) => {
+                let candidate = proposal.candidates.into_iter().next()?;
+                Some(
+                    SelectionProposal::primary(candidate.worker)
+                        .with_kind(crate::policies::ProposalKind::CacheAffinity),
+                )
+            }
+        }
+    }
+
+    fn propose_prefill(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        self.propose_prefill_filtered(workers, ctx)
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        self.inner.uses_shared_prefill_admission()
+    }
+
+    fn commit_prefill_selection(
+        &self,
+        ctx: &SelectionContext<'_>,
+        proposal_kind: crate::policies::ProposalKind,
+        selected: &Arc<Worker>,
+    ) {
+        self.inner
+            .commit_prefill_selection(ctx, proposal_kind, selected);
+    }
+
+    /// Preserves the inner policy's Bucket-affinity semantics.
+    fn is_bucket_affinity_policy(&self) -> bool {
+        self.inner.is_bucket_affinity_policy()
     }
 
     fn needs_request_tokens(&self) -> bool {
@@ -199,6 +290,54 @@ impl Policy for Pipeline {
 
     fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
         self.inner.attach_metrics(metrics);
+    }
+}
+
+/// Top-level score policy that enters shared Prefill admission.
+#[derive(Debug)]
+pub struct ScorePolicy {
+    inner: Arc<dyn Policy>,
+}
+
+impl ScorePolicy {
+    pub fn new(inner: Arc<dyn Policy>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Policy for ScorePolicy {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        self.inner.select(workers, ctx)
+    }
+
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        self.inner
+            .propose(workers, ctx)
+            .map(|proposal| proposal.with_kind(crate::policies::ProposalKind::Score))
+    }
+
+    fn uses_shared_prefill_admission(&self) -> bool {
+        true
+    }
+
+    fn needs_request_tokens(&self) -> bool {
+        self.inner.needs_request_tokens()
+    }
+
+    fn attach_metrics(&self, metrics: Arc<crate::server::metrics::MetricsRegistry>) {
+        self.inner.attach_metrics(metrics);
+    }
+
+    fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
+        self.inner.as_scoring()
+    }
+
+    fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
+        self.inner.as_filter()
     }
 }
 
@@ -230,8 +369,15 @@ pub(crate) fn refs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AffinityConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::admission::{resolve_prefill, CandidateRange};
+    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     fn worker(id: &str) -> Arc<Worker> {
         Arc::new(Worker::new(WorkerSpec {
@@ -245,6 +391,27 @@ mod tests {
 
     fn fleet() -> Vec<Arc<Worker>> {
         vec![worker("a"), worker("b"), worker("c")]
+    }
+
+    fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
+        EngineLoadSnapshot::from_workers(
+            1,
+            entries
+                .iter()
+                .map(|(worker, running, waiting, used, capacity)| {
+                    (
+                        worker.url.clone(),
+                        EngineWorkerLoad {
+                            num_running_reqs: *running,
+                            num_waiting_reqs: *waiting,
+                            num_tokens: *used,
+                            max_total_num_tokens: *capacity,
+                            captured_at: Instant::now(),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+        )
     }
 
     fn urls(ws: &[Arc<Worker>]) -> Vec<String> {
@@ -431,6 +598,138 @@ mod tests {
         assert_eq!(open.select(&ws, &ctx).unwrap().url, ws[2].url);
     }
 
+    #[test]
+    fn pipeline_preserves_the_inner_step_one_proposal_and_admission_opt_in() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b", "c"], OnEmpty::Abstain))],
+            Arc::new(PowerOfTwoChoicesPolicy::new()),
+        )
+        .expect("valid filter and inner policy");
+
+        let proposal = pipeline
+            .propose(&ws, &ctx)
+            .expect("eligible P2 must retain a pair");
+
+        assert!(
+            proposal.backup.is_some(),
+            "Pipeline must not collapse P2 to one primary"
+        );
+        assert!(pipeline.uses_shared_prefill_admission());
+
+        let session_pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b", "c"], OnEmpty::Abstain))],
+            Arc::new(SessionAwarePolicy::new(AffinityConfig::default())),
+        )
+        .expect("valid filter and inner session policy");
+        assert!(
+            session_pipeline.is_bucket_affinity_policy(),
+            "Pipeline must forward the inner Session affinity range capability"
+        );
+    }
+
+    #[test]
+    fn shared_admission_fallback_cannot_reintroduce_a_filtered_worker() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b"], OnEmpty::Abstain))],
+            Arc::new(PowerOfTwoChoicesPolicy::new()),
+        )
+        .expect("valid filter and inner policy");
+        let proposal = pipeline
+            .propose(&ws, &ctx)
+            .expect("the two eligible workers produce a P2 proposal");
+        let snapshot = snapshot(&[
+            (&ws[0], 0, 0, 4_090, 4_096),
+            (&ws[1], 0, 0, 4_090, 4_096),
+            (&ws[2], 0, 0, 0, 4_096),
+        ]);
+
+        assert!(
+            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot).is_none(),
+            "hard admission may refuse the filtered domain, but must never route to rejected c"
+        );
+    }
+
+    #[test]
+    fn eligibility_escape_does_not_rewrite_an_existing_session_assignment() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-a"));
+        let session = Arc::new(SessionAwarePolicy::new(AffinityConfig::default()));
+
+        let initial = session
+            .propose(&ws[2..], &ctx)
+            .expect("one-worker domain establishes c");
+        assert_eq!(initial.primary.id, ws[2].id);
+        session.commit_prefill_selection(&ctx, initial.kind, &initial.primary);
+
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b"], OnEmpty::Abstain))],
+            session.clone(),
+        )
+        .expect("valid filter and session policy");
+        let PrefillProposal::Pair(proposal) = pipeline
+            .propose_prefill(&ws, &ctx)
+            .expect("filtered session proposal")
+        else {
+            panic!("Session-Aware must retain pair semantics");
+        };
+        assert_eq!(
+            proposal.kind,
+            crate::policies::ProposalKind::SessionAffinity
+        );
+        assert_eq!(proposal.primary.id, ws[2].id);
+
+        let snapshot = EngineLoadSnapshot::default();
+        let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
+            .expect("an eligible escape worker exists");
+        assert_ne!(decision.selected.id, ws[2].id);
+        assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
+
+        let after = session
+            .propose(&ws, &ctx)
+            .expect("the original assignment remains readable");
+        assert_eq!(after.kind, crate::policies::ProposalKind::SessionAffinity);
+        assert_eq!(after.primary.id, ws[2].id);
+    }
+
+    #[test]
+    fn new_session_assignment_is_created_inside_the_eligible_set() {
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_session_id(Some("session-new"));
+        let session = Arc::new(SessionAwarePolicy::new(AffinityConfig::default()));
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a", "b"], OnEmpty::Abstain))],
+            session.clone(),
+        )
+        .expect("valid filter and session policy");
+
+        let PrefillProposal::Pair(proposal) = pipeline
+            .propose_prefill(&ws, &ctx)
+            .expect("eligible workers establish the session")
+        else {
+            panic!("Session-Aware must retain pair semantics");
+        };
+        assert!(matches!(proposal.primary.id.0.as_str(), "a" | "b"));
+        pipeline.commit_prefill_selection(&ctx, proposal.kind, &proposal.primary);
+
+        let mapped = session
+            .propose(&ws, &ctx)
+            .expect("the assignment is stored by the inner policy");
+        assert_eq!(mapped.kind, crate::policies::ProposalKind::SessionAffinity);
+        assert_eq!(mapped.primary.id, proposal.primary.id);
+    }
+
+    /// Order is priority: the LOWER-priority filter yields, and what the
+    /// higher-priority one narrowed to is kept. Asserted on the surviving set
+    /// rather than on the winner, because with three workers a wrong rule can
+    /// still land on the right one by luck.
     #[test]
     fn a_conflict_yields_the_later_filter_and_keeps_the_earlier_narrowing() {
         let ws = fleet();
