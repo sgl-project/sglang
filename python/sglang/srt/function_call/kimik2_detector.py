@@ -333,9 +333,9 @@ class KimiK2Detector(BaseFormatDetector):
                     )
                     if argument_diff:
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
 
                 if end_idx == -1:
                     # Args still streaming.
