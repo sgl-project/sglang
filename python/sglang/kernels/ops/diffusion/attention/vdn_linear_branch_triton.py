@@ -105,7 +105,17 @@ def vdn_temporal_conv_act(
     w = w.contiguous()
     out = torch.empty_like(x)
     _tconv_act_kernel[(triton.cdiv(T, _BLOCK_T), S_, heads)](
-        x, w, out, T, S_, C_, BLOCK_T=_BLOCK_T, D_=head_dim, L2=l2norm, num_warps=4, num_stages=2
+        x,
+        w,
+        out,
+        T,
+        S_,
+        C_,
+        BLOCK_T=_BLOCK_T,
+        D_=head_dim,
+        L2=l2norm,
+        num_warps=4,
+        num_stages=2,
     )
     return out.view(T * S_, heads, head_dim)
 
@@ -160,8 +170,16 @@ def vdn_silu_l2norm(tokens: torch.Tensor, l2norm: bool) -> torch.Tensor:
     if N == 0:
         return out
     _silu_l2norm_kernel[(triton.cdiv(N, _BLOCK_ROWS), H)](
-        tokens, out, N, tokens.stride(0), tokens.stride(1), H,
-        BLOCK_N=_BLOCK_ROWS, D_=D, L2=l2norm, num_warps=4,
+        tokens,
+        out,
+        N,
+        tokens.stride(0),
+        tokens.stride(1),
+        H,
+        BLOCK_N=_BLOCK_ROWS,
+        D_=D,
+        L2=l2norm,
+        num_warps=4,
     )
     return out
 
@@ -216,7 +234,9 @@ def vdn_frame_stats_prep(
     """key/value [F*S, H, d] bf16 contiguous, beta [F*S, H] bf16 ->
     (k16 [F,H,S,d] bf16, k32 fp32, k32*beta fp32, v*beta bf16), all contiguous."""
     if not key.is_cuda:
-        raise ValueError("vdn_frame_stats_prep is a Triton kernel; inputs must be on CUDA")
+        raise ValueError(
+            "vdn_frame_stats_prep is a Triton kernel; inputs must be on CUDA"
+        )
     rows, H, D = key.shape
     _check_head_dim(D)
     if rows != num_frames * tokens_per_frame:
@@ -229,9 +249,21 @@ def vdn_frame_stats_prep(
     k32 = torch.empty(shape, dtype=torch.float32, device=key.device)
     kb32 = torch.empty(shape, dtype=torch.float32, device=key.device)
     vb = torch.empty(shape, dtype=value.dtype, device=key.device)
-    _frame_stats_prep_kernel[(triton.cdiv(tokens_per_frame, _BLOCK_ROWS), num_frames, H)](
-        key, value, beta, k16, k32, kb32, vb, tokens_per_frame, H,
-        BLOCK_S=_BLOCK_ROWS, D_=D, num_warps=4,
+    _frame_stats_prep_kernel[
+        (triton.cdiv(tokens_per_frame, _BLOCK_ROWS), num_frames, H)
+    ](
+        key,
+        value,
+        beta,
+        k16,
+        k32,
+        kb32,
+        vb,
+        tokens_per_frame,
+        H,
+        BLOCK_S=_BLOCK_ROWS,
+        D_=D,
+        num_warps=4,
     )
     return k16, k32, kb32, vb
 
@@ -279,15 +311,25 @@ def vdn_linear_epilogue(
     """readout [F, H, S, d] bf16 contiguous, norm_weight [d], gate [F*S, H, d]
     -> [F*S, H*d] bf16."""
     if not readout.is_cuda:
-        raise ValueError("vdn_linear_epilogue is a Triton kernel; readout must be on CUDA")
+        raise ValueError(
+            "vdn_linear_epilogue is a Triton kernel; readout must be on CUDA"
+        )
     F, H, S_, D = readout.shape
     _check_head_dim(D)
     readout = readout.contiguous()
     gate = gate.reshape(F * S_, H, D).to(readout.dtype).contiguous()
     out = torch.empty((F * S_, H * D), dtype=readout.dtype, device=readout.device)
     _linear_epilogue_kernel[(triton.cdiv(S_, _BLOCK_ROWS), F, H)](
-        readout, norm_weight.contiguous(), gate, out, S_, H, float(eps),
-        BLOCK_S=_BLOCK_ROWS, D_=D, num_warps=4,
+        readout,
+        norm_weight.contiguous(),
+        gate,
+        out,
+        S_,
+        H,
+        float(eps),
+        BLOCK_S=_BLOCK_ROWS,
+        D_=D,
+        num_warps=4,
     )
     return out
 

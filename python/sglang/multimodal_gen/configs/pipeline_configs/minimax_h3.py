@@ -365,7 +365,7 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                     f"the transformer (got {selected_backend}); a dense backend "
                     "would skip the linear branch and the softmax gates and "
                     "produce the wrong model, not a slower one. Pass "
-                    '--attention-backend-config \'{"vdn_h3_dense_smoke": true}\' '
+                    "--attention-backend-config '{\"vdn_h3_dense_smoke\": true}' "
                     "only for the base-H3+LoRA equivalence smoke."
                 )
         if int(server_args.ring_degree or 1) > 1:

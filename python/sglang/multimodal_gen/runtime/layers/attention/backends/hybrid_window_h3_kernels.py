@@ -16,8 +16,6 @@ the paper workload.
 
 from __future__ import annotations
 
-import math
-
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (

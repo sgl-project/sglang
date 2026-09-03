@@ -874,7 +874,9 @@ def _minimax_h3_hybrid_attention_core_impl(
         head_range = None
         if ulysses_active:
             local_heads = q.shape[1]
-            head_range = slice(ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads)
+            head_range = slice(
+                ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads
+            )
         readout = branch(
             q_raw=q[video_start:video_end],
             k_raw=k[video_start:video_end],
@@ -1348,7 +1350,6 @@ class MiniMaxH3Attention(nn.Module):
         out, _ = self.out_proj(out)
         return out
 
-
     def _forward_hybrid(
         self,
         x: torch.Tensor,
@@ -1392,7 +1393,9 @@ class MiniMaxH3Attention(nn.Module):
             max_seqlen=max_seqlen,
             ulysses_active=ulysses_active,
         )
-        out, _ = self.out_proj(softmax_out.reshape(total, self.num_heads * self.head_dim))
+        out, _ = self.out_proj(
+            softmax_out.reshape(total, self.num_heads * self.head_dim)
+        )
         if linear_out is not None:
             assert self.to_out_linear is not None
             far, _ = self.to_out_linear(linear_out)

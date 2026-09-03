@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 from sglang.multimodal_gen.configs.pipeline_configs import (
     Cosmos3Config,
     FastH3PipelineConfig,
-    VDNH3PipelineConfig,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -40,6 +39,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
     MiniMaxH3PipelineConfig,
+    VDNH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,

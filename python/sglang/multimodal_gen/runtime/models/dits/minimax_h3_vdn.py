@@ -35,15 +35,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
-    MiniMaxH3DiTArchConfig,
-    VDNHybridAttentionArchConfig,
-)
 from sglang.kernels.ops.diffusion import (
     vdn_frame_stats_prep,
     vdn_linear_epilogue,
     vdn_silu_l2norm,
     vdn_temporal_conv_act,
+)
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MiniMaxH3DiTArchConfig,
+    VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
@@ -224,8 +224,12 @@ class VDNFrameAlpha(nn.Module):
     def __init__(self, hidden_size: int, local_heads: int, head_dim: int) -> None:
         super().__init__()
         self.local_heads, self.head_dim = local_heads, head_dim
-        self.down = _Linear(hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False)
-        self.up = _Linear(head_dim, local_heads * head_dim, bias=False, dtype=_BF16, shard_output=True)
+        self.down = _Linear(
+            hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False
+        )
+        self.up = _Linear(
+            head_dim, local_heads * head_dim, bias=False, dtype=_BF16, shard_output=True
+        )
         # fp32 islands: the scan multiplies alpha across ~100 frames, so a bf16
         # gate compounds into tens of percent of retention error.
         self.A_log = _make_param((local_heads,), dtype=_FP32, shard_dim=0)
@@ -264,8 +268,12 @@ class VDNOutputGate(nn.Module):
     def __init__(self, hidden_size: int, local_heads: int, head_dim: int) -> None:
         super().__init__()
         self.local_heads, self.head_dim = local_heads, head_dim
-        self.down = _Linear(hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False)
-        self.up = _Linear(head_dim, local_heads * head_dim, bias=True, dtype=_BF16, shard_output=True)
+        self.down = _Linear(
+            hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False
+        )
+        self.up = _Linear(
+            head_dim, local_heads * head_dim, bias=True, dtype=_BF16, shard_output=True
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.up(self.down(x))).view(
@@ -278,7 +286,9 @@ class VDNSoftmaxGate(nn.Module):
 
     def __init__(self, hidden_size: int, local_heads: int) -> None:
         super().__init__()
-        self.up = _Linear(hidden_size, local_heads, bias=True, dtype=_BF16, shard_output=True)
+        self.up = _Linear(
+            hidden_size, local_heads, bias=True, dtype=_BF16, shard_output=True
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.up(x))
@@ -298,7 +308,11 @@ class VDNShortConv(nn.Module):
                 self,
                 f"{name}_sp",
                 nn.ParameterDict(
-                    {"weight": _make_param((channels, 1, k, k), dtype=_BF16, shard_dim=0)}
+                    {
+                        "weight": _make_param(
+                            (channels, 1, k, k), dtype=_BF16, shard_dim=0
+                        )
+                    }
                 ),
             )
             setattr(
@@ -328,7 +342,9 @@ class VDNShortConv(nn.Module):
             rows = slice(heads.start * head_dim, heads.stop * head_dim)
             w_sp, w_tm = w_sp[rows], w_tm[rows]
         # [F*S, H, d] read as channels_last [F, C, gh, gw]: cuDNN NHWC depthwise
-        volume = tokens.reshape(num_frames, grid_h, grid_w, channels).permute(0, 3, 1, 2)
+        volume = tokens.reshape(num_frames, grid_h, grid_w, channels).permute(
+            0, 3, 1, 2
+        )
         volume = F.conv2d(volume, w_sp, padding=SHORT_CONV_KERNEL // 2, groups=channels)
         x = volume.permute(0, 2, 3, 1).reshape(num_frames, grid_h * grid_w, channels)
         return x, w_tm.squeeze(1).to(x.dtype)
@@ -413,7 +429,8 @@ def frame_statistics(
     beta: torch.Tensor,
     *,
     a_fp32: bool,
-    prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """kf, vf [F, H, S, d]; beta [F, H, S] -> A [F, H, dk, dk] fp32 (symmetric),
     B [F, H, dv, dk] fp32.
@@ -551,7 +568,9 @@ def gather_linear_state(
         # skipped: from virtual -1 that is [0..t], from virtual F it is [t..F-1]
         bridge_before = (last_before + 1).clamp(min=0)
         bridge_after = first_after.clamp(max=num_frames)
-        alpha_from_before = torch.exp(log_prefix[frames + 1] - log_prefix[bridge_before])
+        alpha_from_before = torch.exp(
+            log_prefix[frames + 1] - log_prefix[bridge_before]
+        )
         alpha_from_after = torch.exp(log_prefix[bridge_after] - log_prefix[frames])
         # alpha is per KEY channel: broadcast over dv, not dk
         state_before = state_before * alpha_from_before.unsqueeze(2)
@@ -561,9 +580,9 @@ def gather_linear_state(
     if text_state is not None:
         out = state_before + state_after
     else:
-        out = state_before * has_before.view(-1, 1, 1, 1) + state_after * has_after.view(
+        out = state_before * has_before.view(
             -1, 1, 1, 1
-        )
+        ) + state_after * has_after.view(-1, 1, 1, 1)
     return out.to(out_dtype)
 
 
@@ -571,10 +590,15 @@ def linear_epilogue(
     readout: torch.Tensor, norm_weight: torch.Tensor, gate: torch.Tensor, eps: float
 ) -> torch.Tensor:
     """readout [F, H, S, dv] -> RMSNorm over dv -> * gate [F*S, H, dv] -> [F*S, H*dv]."""
-    ms = torch.linalg.vector_norm(readout, dim=-1, keepdim=True, dtype=_FP32).pow(2) / (
-        readout.shape[-1]
+    ms = (
+        torch.linalg.vector_norm(readout, dim=-1, keepdim=True, dtype=_FP32).pow(2)
+        / (readout.shape[-1])
     )
-    normed = readout * torch.rsqrt(ms + eps).to(readout.dtype) * norm_weight.to(readout.dtype)
+    normed = (
+        readout
+        * torch.rsqrt(ms + eps).to(readout.dtype)
+        * norm_weight.to(readout.dtype)
+    )
     frames, heads, per_frame, dim = normed.shape
     rows = frames * per_frame
     return normed.permute(0, 2, 1, 3).reshape(rows, heads * dim) * gate.reshape(
@@ -614,7 +638,9 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             VDNShortConv(channels, hybrid.short_conv) if hybrid.short_conv else None
         )
         self.alpha = VDNFrameAlpha(hidden, local_heads, self.head_dim)
-        self.beta_proj = _Linear(hidden, local_heads, bias=False, dtype=_BF16, shard_output=True)
+        self.beta_proj = _Linear(
+            hidden, local_heads, bias=False, dtype=_BF16, shard_output=True
+        )
         self.output_gate = VDNOutputGate(hidden, local_heads, self.head_dim)
         self.norm = VDNRMSNorm(self.head_dim)
 
@@ -641,8 +667,12 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         because the old state is zero), scaled by TEXT_STATE_SCALE."""
         length = text_k_raw.shape[0]
         heads, head_dim = text_k_raw.shape[1], self.head_dim
-        key = linear_features(text_k_raw, proj="k", conv=None, num_frames=None, frame_size=None)
-        value = linear_features(text_v_raw, proj="v", conv=None, num_frames=None, frame_size=None)
+        key = linear_features(
+            text_k_raw, proj="k", conv=None, num_frames=None, frame_size=None
+        )
+        value = linear_features(
+            text_v_raw, proj="v", conv=None, num_frames=None, frame_size=None
+        )
         key = key.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
         value = value.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
         beta = text_beta.view(1, length, heads).permute(0, 2, 1)
@@ -698,18 +728,36 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         n_heads = q_raw.shape[1]
         if not skip_ends:
             return self._readout(
-                q_raw, k_raw, v_raw, beta, gate, frame_mean, num_frames, per_frame,
-                bounds, layout.frame_size, text_state, heads,
+                q_raw,
+                k_raw,
+                v_raw,
+                beta,
+                gate,
+                frame_mean,
+                num_frames,
+                per_frame,
+                bounds,
+                layout.frame_size,
+                text_state,
+                heads,
             )
         out = q_raw.new_empty(num_frames * per_frame, n_heads * self.head_dim)
         if num_frames <= 2:
             return out.zero_()
         inner = slice(per_frame, (num_frames - 1) * per_frame)
         readout = self._readout(
-            q_raw[inner], k_raw[inner], v_raw[inner], beta[inner], gate[inner],
-            frame_mean[1:-1], num_frames - 2, per_frame,
+            q_raw[inner],
+            k_raw[inner],
+            v_raw[inner],
+            beta[inner],
+            gate[inner],
+            frame_mean[1:-1],
+            num_frames - 2,
+            per_frame,
             [(lo - 1, hi - 1) for lo, hi in bounds[1 : num_frames - 1]],
-            layout.frame_size, text_state, heads,
+            layout.frame_size,
+            text_state,
+            heads,
         )
         out[:per_frame].zero_()
         out[(num_frames - 1) * per_frame :].zero_()
@@ -735,9 +783,30 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         shape = (num_frames, per_frame, n_heads, head_dim)
         conv = self.short_conv
         # 1. features (q frame-major for the bmm readout)
-        query = linear_features(q_raw, proj="q", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
-        key = linear_features(k_raw, proj="k", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
-        value = linear_features(v_raw, proj="v", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
+        query = linear_features(
+            q_raw,
+            proj="q",
+            conv=conv,
+            num_frames=num_frames,
+            frame_size=frame_size,
+            heads=heads,
+        )
+        key = linear_features(
+            k_raw,
+            proj="k",
+            conv=conv,
+            num_frames=num_frames,
+            frame_size=frame_size,
+            heads=heads,
+        )
+        value = linear_features(
+            v_raw,
+            proj="v",
+            conv=conv,
+            num_frames=num_frames,
+            frame_size=frame_size,
+            heads=heads,
+        )
         query_by_frame = query.view(shape).permute(0, 2, 1, 3)
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
@@ -750,8 +819,11 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             else None
         )
         A, B = frame_statistics(
-            key_by_frame, value_by_frame, beta_by_frame,
-            a_fp32=self.hybrid.a_fp32, prepared=prepared,
+            key_by_frame,
+            value_by_frame,
+            beta_by_frame,
+            a_fp32=self.hybrid.a_fp32,
+            prepared=prepared,
         )
         del prepared
         alpha = self.alpha(frame_mean, heads=heads)
@@ -763,8 +835,13 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         del transitions, injections
         # 4. boundary gather
         linear_state = gather_linear_state(
-            prefix, suffix, alpha, bounds,
-            bridge=self.hybrid.bridge, text_state=text_state, out_dtype=q_raw.dtype,
+            prefix,
+            suffix,
+            alpha,
+            bounds,
+            bridge=self.hybrid.bridge,
+            text_state=text_state,
+            out_dtype=q_raw.dtype,
         )
         del prefix, suffix
         # 5. readout

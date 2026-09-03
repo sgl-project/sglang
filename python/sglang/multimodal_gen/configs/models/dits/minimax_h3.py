@@ -72,7 +72,9 @@ class VDNHybridAttentionArchConfig:
             raise ValueError("hybrid_attention.linear_head_dim must be positive")
 
     @classmethod
-    def from_transform_config(cls, config: dict[str, Any]) -> "VDNHybridAttentionArchConfig":
+    def from_transform_config(
+        cls, config: dict[str, Any]
+    ) -> "VDNHybridAttentionArchConfig":
         """Build from VDN's nested v2 transform config."""
         soft = dict(config.get("softmax_attention", {}))
         lin = dict(config.get("linear_attention", {}))
@@ -111,7 +113,8 @@ class VDNHybridAttentionArchConfig:
         """True when every frame's window already spans the whole clip, i.e.
         the softmax branch IS dense attention and the linear branch is off."""
         return all(
-            lo <= 0 and hi >= num_frames - 1 for lo, hi in self.window_bounds(num_frames)
+            lo <= 0 and hi >= num_frames - 1
+            for lo, hi in self.window_bounds(num_frames)
         )
 
 

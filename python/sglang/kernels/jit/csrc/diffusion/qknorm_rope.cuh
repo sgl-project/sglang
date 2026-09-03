@@ -308,10 +308,11 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
                                : pointer::offset(k_ptr, token_id * k_stride_bytes, head_id * head_stride_bytes);
     void* output = const_cast<void*>(input);
     if constexpr (kOutOfPlace) {
-      output = load_q ? pointer::offset(
-                            params.q_out_ptr, token_id * params.q_out_stride_bytes, head_id * params.out_head_stride_bytes)
-                      : pointer::offset(
-                            params.k_out_ptr, token_id * params.k_out_stride_bytes, head_id * params.out_head_stride_bytes);
+      output =
+          load_q ? pointer::offset(
+                       params.q_out_ptr, token_id * params.q_out_stride_bytes, head_id * params.out_head_stride_bytes)
+                 : pointer::offset(
+                       params.k_out_ptr, token_id * params.k_out_stride_bytes, head_id * params.out_head_stride_bytes);
     }
     if constexpr (kPackKV) {
       if (!load_q) {
@@ -651,8 +652,7 @@ struct QKNormRopeOutOfPlaceKernel {
     params.num_tokens = num_tokens;
     params.eps = eps;
     params.q_out_ptr = q_out.data_ptr();
-    params.k_out_ptr =
-        pointer::offset(k_out.data_ptr(), -static_cast<int64_t>(num_qo_heads) * out_head_stride_bytes);
+    params.k_out_ptr = pointer::offset(k_out.data_ptr(), -static_cast<int64_t>(num_qo_heads) * out_head_stride_bytes);
     params.q_out_stride_bytes = static_cast<int64_t>(Dqo.unwrap() * sizeof(DType));
     params.k_out_stride_bytes = static_cast<int64_t>(Dko.unwrap() * sizeof(DType));
     params.out_head_stride_bytes = out_head_stride_bytes;

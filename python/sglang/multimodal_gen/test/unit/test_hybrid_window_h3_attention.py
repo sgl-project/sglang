@@ -161,9 +161,7 @@ def test_mask_reference_partition_is_exact() -> None:
         expected_softmax = {f for f in range(lo, hi + 1)} | {0, NUM_FRAMES - 1}
         # inner frames 1..F-2 minus the window: the branch's complement
         # (prefix[lo-1] and suffix[hi+1] over the rebased frames)
-        expected_linear = {
-            f for f in range(1, NUM_FRAMES - 1) if f < lo or f > hi
-        }
+        expected_linear = {f for f in range(1, NUM_FRAMES - 1) if f < lo or f > hi}
         kept = {f for f in range(NUM_FRAMES) if frame_kept[f]}
         assert kept == expected_softmax
         assert kept.isdisjoint(expected_linear)
@@ -251,7 +249,9 @@ def test_metadata_layout_mismatch_is_rejected() -> None:
     meta = HybridWindowAttentionH3MetadataBuilder().build(
         layout=layout, hybrid=_hybrid(), device=device
     )
-    cu = torch.tensor([0, layout.used - 48, layout.seq_len], dtype=torch.int32, device=device)
+    cu = torch.tensor(
+        [0, layout.used - 48, layout.seq_len], dtype=torch.int32, device=device
+    )
     with pytest.raises(ValueError, match="diverged"):
         _impl().forward_varlen(
             q,

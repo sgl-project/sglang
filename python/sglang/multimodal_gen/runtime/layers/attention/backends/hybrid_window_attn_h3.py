@@ -70,15 +70,15 @@ class HybridWindowAttentionH3Backend(AttentionBackend):
         return AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
 
     @staticmethod
-    def get_impl_cls() -> type["HybridWindowAttentionH3Impl"]:
+    def get_impl_cls() -> type[HybridWindowAttentionH3Impl]:
         return HybridWindowAttentionH3Impl
 
     @staticmethod
-    def get_metadata_cls() -> type["HybridWindowAttentionH3Metadata"]:
+    def get_metadata_cls() -> type[HybridWindowAttentionH3Metadata]:
         return HybridWindowAttentionH3Metadata
 
     @staticmethod
-    def get_builder_cls() -> type["HybridWindowAttentionH3MetadataBuilder"]:
+    def get_builder_cls() -> type[HybridWindowAttentionH3MetadataBuilder]:
         return HybridWindowAttentionH3MetadataBuilder
 
 
@@ -192,7 +192,9 @@ class _DecomposedPlan:
             lo, hi = bounds[frames[0]]
             kv_frames = sorted(set(range(lo, hi + 1)) | dense_cols)
             qi = cat_ranges(merge([layout.frame_rows(f) for f in frames]))
-            ki = cat_ranges(merge(global_ranges + [layout.frame_rows(f) for f in kv_frames]))
+            ki = cat_ranges(
+                merge(global_ranges + [layout.frame_rows(f) for f in kv_frames])
+            )
             q_idx.append(qi)
             kv_idx.append(ki)
             q_lens.append(int(qi.numel()))
@@ -213,11 +215,11 @@ class _DecomposedPlan:
             self.win_q = torch.cat(q_idx)
             self.kv_gather = torch.cat(kv_idx)
             zero = torch.zeros(1, dtype=torch.long)
-            self.cu_q = (
-                torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(device, torch.int32)
+            self.cu_q = torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
+                device, torch.int32
             )
-            self.cu_k = (
-                torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(device, torch.int32)
+            self.cu_k = torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
+                device, torch.int32
             )
             self.max_q, self.max_k = max(q_lens), max(k_lens)
             self.gathered_rows = int(self.kv_gather.numel())
