@@ -158,7 +158,18 @@ class TestDecodeAttention(CustomTestCase):
         return output
 
     def _test_grouped_decode_attention_once(
-        self, B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn, dtype, device
+        self,
+        B,
+        H_Q,
+        H_KV,
+        D,
+        D_V,
+        sliding_window,
+        sink,
+        is_cross_attn,
+        dtype,
+        device,
+        kvcache_dtype=torch.bfloat16,
     ):
         # This represents the number of tokens already in the sequence
         seq_len = 1024
@@ -176,14 +187,32 @@ class TestDecodeAttention(CustomTestCase):
         # k_buffer and v_buffer represent all previous tokens
         k_buffer = torch.randn(total_tokens, H_KV, D, dtype=dtype, device=device)
         v_buffer = torch.randn(total_tokens, H_KV, D_V, dtype=dtype, device=device)
+        k_scale = 1.0
+        v_scale = 1.0
+        if kvcache_dtype == torch.float8_e4m3fn:
+            k_scale = 0.5
+            v_scale = 0.25
+            k_buffer_fp8 = (k_buffer / k_scale).to(torch.float8_e4m3fn)
+            v_buffer_fp8 = (v_buffer / v_scale).to(torch.float8_e4m3fn)
+            k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
+            v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
 
         key = torch.randn(B, H_KV, D, dtype=dtype)
         value = torch.randn(B, H_KV, D_V, dtype=dtype)
         loc = torch.randint(0, 10, (B,)).to(torch.int64)
 
         # set kv cache
-        k_buffer[loc] = key
-        v_buffer[loc] = value
+        if not is_cross_attn:
+            if kvcache_dtype == torch.float8_e4m3fn:
+                k_buffer[loc] = (
+                    (key / k_scale).to(torch.float8_e4m3fn).float() * k_scale
+                ).to(dtype)
+                v_buffer[loc] = (
+                    (value / v_scale).to(torch.float8_e4m3fn).float() * v_scale
+                ).to(dtype)
+            else:
+                k_buffer[loc] = key
+                v_buffer[loc] = value
 
         # o will have the same shape as q
         o = torch.zeros(B, H_Q, D_V, dtype=dtype, device=device)
@@ -212,8 +241,10 @@ class TestDecodeAttention(CustomTestCase):
         value = value.transpose(0, 1).contiguous().transpose(0, 1)
         torch.ops.sgl_kernel.decode_attention_cpu(
             q,
-            k_buffer,
-            v_buffer,
+            (k_buffer if kvcache_dtype != torch.float8_e4m3fn else k_buffer_fp8),
+            (v_buffer if kvcache_dtype != torch.float8_e4m3fn else v_buffer_fp8),
+            k_scale,
+            v_scale,
             o,
             key if not is_cross_attn else None,
             value if not is_cross_attn else None,
@@ -304,6 +335,27 @@ class TestDecodeAttention(CustomTestCase):
                 self._test_grouped_decode_attention_once(
                     B, H_Q, H_KV, D, D_V, None, False, True, dtype=dtype, device=device
                 )
+
+        fp8_configs = [
+            (2, 32, 8, 33, 55, None, False, False),
+            (1, 16, 1, 576, 512, None, False, False),
+            (2, 16, 16, 64, 64, 10, True, False),
+            (2, 16, 1, 64, 64, None, False, True),
+        ]
+        for B, H_Q, H_KV, D, D_V, sliding_window, sink, is_cross_attn in fp8_configs:
+            self._test_grouped_decode_attention_once(
+                B,
+                H_Q,
+                H_KV,
+                D,
+                D_V,
+                sliding_window,
+                sink,
+                is_cross_attn,
+                dtype=torch.bfloat16,
+                device=device,
+                kvcache_dtype=torch.float8_e4m3fn,
+            )
 
     def test_grouped_decode_attention(self):
         self._test_grouped_decode_attention("cpu")

@@ -559,7 +559,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
-
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
         draft_backend = fallback_backend

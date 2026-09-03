@@ -81,7 +81,6 @@ def flash_attn_non_varlen_ref(
 
 
 class TestFlashAttn(CustomTestCase):
-
     @parametrize(
         batch=[4],
         max_seqlen_q=[35, 96],

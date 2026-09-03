@@ -97,6 +97,7 @@ class _MockTemplateManager:
         self.chat_template_name = None  # None for embeddings usually
         self.jinja_template_content_format = "openai"
         self.completion_template_name = None
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingEmbeddingTestCase(unittest.TestCase):

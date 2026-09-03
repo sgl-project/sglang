@@ -53,7 +53,6 @@ def _make_batch(reqs):
 
 # BatchedPenalizerOrchestrator
 class TestBatchedPenalizerOrchestrator(CustomTestCase):
-
     def test_init_detects_required_penalizers(self):
         """Test that orchestrator marks is_required=True when any request has nonzero penalty."""
         reqs = [_make_req(freq=1.0)]
@@ -143,7 +142,6 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
 
 # BatchedFrequencyPenalizer
 class TestBatchedFrequencyPenalizer(CustomTestCase):
-
     def _setup(self, freq_values):
         reqs = [_make_req(freq=f) for f in freq_values]
         batch = _make_batch(reqs)
@@ -225,7 +223,6 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
 
 # BatchedPresencePenalizer
 class TestBatchedPresencePenalizer(CustomTestCase):
-
     def _setup(self, presence_values):
         reqs = [_make_req(presence=p) for p in presence_values]
         batch = _make_batch(reqs)
@@ -275,7 +272,6 @@ class TestBatchedPresencePenalizer(CustomTestCase):
 
 # BatchedMinNewTokensPenalizer
 class TestBatchedMinNewTokensPenalizer(CustomTestCase):
-
     def _setup(self, configs):
         """configs: list of (min_tokens, stop_ids, eos_id)."""
         reqs = [_make_req(min_tokens=c[0], stop_ids=c[1], eos_id=c[2]) for c in configs]
@@ -388,7 +384,6 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
 
 # _BatchedPenalizer base class edge cases
 class TestBatchedPenalizerBase(CustomTestCase):
-
     def test_filter_when_not_prepared_is_noop(self):
         """Test that filter on an unprepared penalizer does not crash."""
         reqs = [_make_req()]
@@ -452,7 +447,6 @@ class TestBatchedPenalizerBase(CustomTestCase):
 
 # Orchestrator with multiple penalizer types
 class TestOrchestratorMultiplePenalizers(CustomTestCase):
-
     def test_all_three_penalizers(self):
         """Test orchestrator managing frequency, presence, and min_new_tokens together."""
         reqs = [_make_req(freq=1.0, presence=0.5, min_tokens=2, eos_id=2)]
