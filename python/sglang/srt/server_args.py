@@ -2067,7 +2067,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        NS("spec"),
+    ] = None
+    uno_lora_path: A[
+        Optional[str],
+        "Path to the UNO draft LoRA checkpoint.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
