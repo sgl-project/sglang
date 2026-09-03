@@ -118,6 +118,24 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             fb.input_embeds, torch.tensor([[1.0, 1.0, 1.0, 1.0], [0, 0, 0, 0]])
         )
 
+    def test_chunked_prefill_trims_reserved_cache_locations_before_padding(self):
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.tensor([11, 12]),
+            req_pool_indices=torch.tensor([5]),
+            seq_lens=torch.tensor([2]),
+            out_cache_loc=torch.tensor([20, 21, 22]),
+            seq_lens_sum=2,
+            positions=torch.tensor([0, 1]),
+            seq_lens_cpu=torch.tensor([2]),
+            lora_ids=[None],
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=4, bs=1)
+
+        torch.testing.assert_close(fb.out_cache_loc, torch.tensor([20, 21, 0, 0]))
+
     def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
         fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])
         self.assertEqual(DecodeCudaGraphRunner._max_dp_batch_size(fb), 11)
