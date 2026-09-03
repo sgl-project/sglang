@@ -1,0 +1,6 @@
+{"conversations":[{"from":"human","value":"Reply with the single word amber."},{"from":"assistant","value":"amber"}]}
+{"conversations":[{"from":"human","value":"List the first three prime numbers."},{"from":"assistant","value":"2, 3, 5"}]}
+{"conversations":[{"from":"human","value":"Rewrite this in uppercase: synthetic clouds drift."},{"from":"assistant","value":"SYNTHETIC CLOUDS DRIFT."}]}
+{"conversations":[{"from":"human","value":"A fictional box has two blue tokens and three green tokens. How many tokens are there?"},{"from":"assistant","value":"There are five tokens."}]}
+{"conversations":[{"from":"human","value":"Translate the synthetic phrase hello benchmark into Chinese."},{"from":"assistant","value":"你好，基准测试。"}]}
+{"conversations":[{"from":"human","value":"Count from one to five using comma-separated English words."},{"from":"assistant","value":"one, two, three, four, five"}]}
