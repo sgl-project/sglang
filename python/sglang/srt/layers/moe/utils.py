@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
-
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
@@ -168,7 +167,6 @@ class _MoeRunnerBackendPredicates:
 
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
-
     AUTO = "auto"
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
@@ -241,7 +239,6 @@ class DeepEPv2Fp8ScaleFormat(NamedTuple):
 
 
 class DeepEPMode(Enum):
-
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
@@ -486,7 +483,6 @@ def is_shared_experts_fusion_disabled() -> bool:
         )
     moe = get_flags().moe
     if moe.disable_shared_experts_fusion is None:
-
         return get_exec().moe.disable_shared_experts_fusion
     return moe.disable_shared_experts_fusion
 

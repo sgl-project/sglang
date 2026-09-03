@@ -20,7 +20,6 @@ fused_gdn_gating = fused_gdn_gating_npu
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
-
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = torch.Size(

@@ -449,8 +449,9 @@ import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
 @register_model_override_predicate(
-    lambda arch: "Step3p5ForCausalLM" in arch
-    or "Step3p7ForConditionalGeneration" in arch
+    lambda arch: (
+        "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
+    )
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
@@ -1261,9 +1262,9 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
         or view.prefill_attention_backend == "cutedsl_mla"
     ):
         return {}
-    assert (
-        view.prefill_attention_backend != "cutedsl_mla"
-    ), "CuteDSL MLA only supports decoding for now"
+    assert view.prefill_attention_backend != "cutedsl_mla", (
+        "CuteDSL MLA only supports decoding for now"
+    )
     if not get_platform().is_sm100:
         raise ValueError(
             "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -1435,12 +1436,12 @@ def _dp_lm_head_validation(view: Any) -> dict:
     dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
     values through the view."""
     if view.enable_dp_lm_head:
-        assert (
-            view.enable_dp_attention
-        ), "Please enable dp attention when setting enable_dp_lm_head. "
+        assert view.enable_dp_attention, (
+            "Please enable dp attention when setting enable_dp_lm_head. "
+        )
     if view.enable_tp_lm_head_all_to_all:
         assert view.enable_dp_attention, (
-            "Please enable dp attention when setting " "enable_tp_lm_head_all_to_all."
+            "Please enable dp attention when setting enable_tp_lm_head_all_to_all."
         )
         assert not view.enable_dp_lm_head, (
             "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
@@ -1500,7 +1501,7 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:
             logger.warning(
-                "mxfp8 quantization supports only %s backends. " "Overriding %r.",
+                "mxfp8 quantization supports only %s backends. Overriding %r.",
                 ", ".join(allowed),
                 moe_runner_backend,
             )
@@ -1845,7 +1846,6 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
     from sglang.srt.arg_groups.overrides import model_config_of
 
     if not hasattr(server_args, "_mamba_cache_chunk_size"):
-
         try:
             from sglang.kernels.ops.attention.fla.chunk_delta_h import (
                 CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -1857,9 +1857,9 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
         hf_config = model_config_of(server_args).hf_config
         chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
         page_size = resolved_view(server_args).page_size
-        assert (
-            max(chunk_size, page_size) % min(chunk_size, page_size) == 0
-        ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+        assert max(chunk_size, page_size) % min(chunk_size, page_size) == 0, (
+            f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
+        )
         if not getattr(server_args, "_resolution_finished", False):
             return max(chunk_size, page_size)
         server_args._mamba_cache_chunk_size = max(chunk_size, page_size)
