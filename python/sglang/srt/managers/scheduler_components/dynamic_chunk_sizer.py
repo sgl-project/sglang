@@ -185,8 +185,7 @@ class DynamicChunkSizer:
             current_seq_len = req.extend_range.end
 
             if is_dp_attention_enabled():
-                # For profiling, we only have one request on PP0
-                # Set global_num_tokens to indicate this rank has tokens, others have 0
+                # Profiling runs one request on this rank; other DP ranks report 0.
                 dp_size = get_attention_dp_size()
                 global_num_tokens = [0] * dp_size
                 dp_rank = get_attention_dp_rank()
@@ -266,12 +265,8 @@ class DynamicChunkSizer:
 
 
 class ChunkSizePredictor:
-    """
-    Predictor for dynamic chunk size based on quadratic latency model.
-
-    Models latency as: f(l) = a*l^2 + b*l + c
-    Predicts next chunk size x such that: f(L+x) - f(L) = target_latency
-    """
+    """Quadratic latency model f(l) = a*l^2 + b*l + c; predicts the chunk x with
+    f(L + x) - f(L) = target_latency."""
 
     def __init__(self):
         self.quadratic_coeff_a = 0.0
@@ -361,19 +356,8 @@ class ChunkSizePredictor:
         context_len: int,
         max_chunk_size: Optional[int] = None,
     ) -> Optional[int]:
-        """
-        Predict next chunk size x such that f(history_len + x) - f(history_len) = target_latency.
-
-        Args:
-            history_len: Current sequence length (L)
-            base_chunk_size: Base chunk size
-            page_size: Page size for alignment
-            context_len: Maximum context length
-            max_chunk_size: Maximum allowed chunk size (optional)
-
-        Returns:
-            Predicted chunk size, or None if prediction fails
-        """
+        """Chunk size x with f(L + x) - f(L) = target_latency for L = history_len,
+        or None when the model cannot say."""
         if not self.is_ready or self.target_latency is None:
             return None
 
@@ -381,10 +365,7 @@ class ChunkSizePredictor:
         if self.quadratic_coeff_a <= 0:
             return None
 
-        # Solve f(L+x) - f(L) = T
-        # where f(L) = a*L^2 + b*L + c
-        # This expands to: ax^2 + (2aL+b)x - T = 0
-        # A = a, B = 2aL + b, C = -T
+        # f(L+x) - f(L) = T expands to a*x^2 + (2aL + b)*x - T = 0.
         A = self.quadratic_coeff_a
         B = 2 * self.quadratic_coeff_a * history_len + self.linear_coeff_b
         C = -self.target_latency
