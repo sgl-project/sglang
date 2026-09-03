@@ -2306,6 +2306,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "inkling":
             request.skip_special_tokens = False
+        elif self.reasoning_parser == "gigachat35":
+            request.skip_special_tokens = False
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
 
