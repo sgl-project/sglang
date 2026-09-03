@@ -65,39 +65,62 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_k = kwargs.get("replayssm_k")
         replayssm_g = kwargs.get("replayssm_g")
         replayssm_write_pos = kwargs.get("replayssm_write_pos")
+        replayssm_cache_base = kwargs.get("replayssm_cache_base")
         replayssm_force_flush = kwargs.get("replayssm_force_flush")
-        if (
-            lower_bound is None
-            and replayssm_d is not None
-            and replayssm_k is not None
-            and replayssm_g is not None
-            and replayssm_write_pos is not None
+        replay_fields = (
+            replayssm_d,
+            replayssm_k,
+            replayssm_g,
+            replayssm_write_pos,
+        )
+        if any(value is not None for value in replay_fields) and not all(
+            value is not None for value in replay_fields
         ):
-            if lower_bound is not None:
-                raise NotImplementedError(
-                    "KDA safe gate (lower_bound) is not implemented in the "
-                    "ReplaySSM decode kernel; disable --enable-linear-replayssm."
-                )
-            K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
-            fused_recurrent_linear_replayssm_decode(
-                mixed_qkv=mixed_qkv,
-                a=a.reshape(B, num_v_heads, K).contiguous(),
-                b=b.reshape(B, num_v_heads).contiguous(),
-                A_log=A_log.reshape(-1),
-                dt_bias=dt_bias.reshape(num_v_heads, K).contiguous(),
-                scale=scale,
-                initial_state=ssm_states,
-                d_cache=replayssm_d,
-                k_cache=replayssm_k,
-                g_cache=replayssm_g,
-                out=out,
-                ssm_state_indices=cache_indices,
-                write_pos=replayssm_write_pos,
-                force_flush=replayssm_force_flush,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=True,
+            raise RuntimeError(
+                "KDA ReplaySSM received partial ring metadata; refusing to "
+                "decode from a potentially stale checkpoint."
             )
-            return out.transpose(0, 1)
+        if all(value is not None for value in replay_fields):
+            K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
+            use_predecay = lower_bound is not None and replayssm_cache_base is not None
+            if lower_bound is not None and not use_predecay:
+                raise RuntimeError(
+                    "Bounded KDA ReplaySSM ring metadata is missing cache_base; "
+                    "native fallback would discard pending replay history."
+                )
+            else:
+                fused_recurrent_linear_replayssm_decode(
+                    mixed_qkv=mixed_qkv,
+                    a=a.reshape(B, num_v_heads, K).contiguous(),
+                    b=b.reshape(B, num_v_heads).contiguous(),
+                    A_log=A_log.reshape(-1),
+                    dt_bias=dt_bias.reshape(num_v_heads, K).contiguous(),
+                    scale=scale,
+                    initial_state=ssm_states,
+                    d_cache=replayssm_d,
+                    k_cache=replayssm_k,
+                    g_cache=replayssm_g,
+                    out=out,
+                    ssm_state_indices=cache_indices,
+                    write_pos=replayssm_write_pos,
+                    force_flush=replayssm_force_flush,
+                    lower_bound=lower_bound,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=True,
+                    block_v=16 if B == 1 else (32 if use_predecay else None),
+                    num_warps=2 if B == 1 and use_predecay else 1,
+                    num_stages=2 if use_predecay else 3,
+                    nk=1 if use_predecay else 2,
+                    cache_base=replayssm_cache_base,
+                    circular_replay=use_predecay,
+                    prefix_gate_cache=use_predecay,
+                    predecayed_k_cache=use_predecay,
+                )
+                return out.transpose(0, 1)
+        elif replayssm_cache_base is not None:
+            raise RuntimeError(
+                "KDA ReplaySSM received cache_base without a complete replay ring."
+            )
 
         # a may come in as [B, HV, K] (or [B, 1, HV*K]); b may come in as
         # [B, 1, HV]. Flatten both to the 2D shapes the kernel expects.
