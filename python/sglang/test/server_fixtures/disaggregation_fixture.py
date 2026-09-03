@@ -93,11 +93,13 @@ class PDDisaggregationServerBase(CustomTestCase):
 
         # config transfer backend and rdma devices
         cls._mc_gid_index_set = False
+        cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
             ib_devices = get_rdma_devices_args()
             cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
             cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
+            cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -226,6 +228,8 @@ class PDDisaggregationServerBase(CustomTestCase):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
+        if getattr(cls, "_ucx_net_devices_set", False):
+            os.environ.pop("UCX_NET_DEVICES", None)
         # The LB holds no device state, and popen_with_error_check only stays
         # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
         if cls.process_lb:
@@ -500,4 +504,28 @@ def _maybe_set_roce_gid_index(ib_devices) -> bool:
         return False
     os.environ["MC_GID_INDEX"] = str(gid_index)
     logger.warning("RoCE fabric detected; set MC_GID_INDEX=%d for mooncake", gid_index)
+    return True
+
+
+def _maybe_set_ucx_net_devices(ib_devices) -> bool:
+    """Pin UCX to the test's RDMA devices; return True if this call set it.
+
+    The NIXL backend does not consume --disaggregation-ib-device, so UCX falls
+    back to opening every RDMA device on the host. On runners with many NICs
+    (e.g. 8 IB ports plus a RoCE bond) that full-device init can stall for
+    minutes inside the driver, which surfaces as a hung create_backend. Scoping
+    UCX_NET_DEVICES to the two devices the fixture already selected keeps NIXL
+    on the same NICs as mooncake. A user-provided UCX_NET_DEVICES is left as is.
+    """
+    if not ib_devices or os.environ.get("UCX_NET_DEVICES"):
+        return False
+    if ib_devices.lstrip().startswith("{"):
+        # Per-GPU JSON mapping; UCX_NET_DEVICES cannot express it.
+        return False
+    devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
+    if not devices:
+        return False
+    net_devices = ",".join(f"{d}:1" for d in devices)
+    os.environ["UCX_NET_DEVICES"] = net_devices
+    logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True
