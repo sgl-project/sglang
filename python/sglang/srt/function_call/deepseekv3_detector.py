@@ -69,21 +69,26 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=[])
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
-        try:
-            for match_result in match_result_list:
-                # Get function name
+        # Isolate per-call parsing: a single malformed tool call (a non-matching
+        # detail regex, so `.group()` raises, or invalid JSON arguments) must not
+        # discard the valid calls parsed before it and leak the raw markup back as
+        # normal text. Skip the bad call and keep the good ones.
+        for match_result in match_result_list:
+            try:
                 func_detail = re.search(self.func_detail_regex, match_result, re.DOTALL)
+                if func_detail is None:
+                    continue
                 func_name = func_detail.group(2)
-                func_args = func_detail.group(3)
-                func_args = json.loads(func_args)
-                # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
-                calls.extend(self.parse_base_json(match_result, tools))
-            return StreamingParseResult(normal_text=normal_text, calls=calls)
-        except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
-            # return the normal text if parsing fails
-            return StreamingParseResult(normal_text=text)
+                func_args = json.loads(func_detail.group(3))
+                calls.extend(
+                    self.parse_base_json(
+                        {"name": func_name, "parameters": func_args}, tools
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Error parsing DeepSeek tool call: {e}")
+                continue
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
