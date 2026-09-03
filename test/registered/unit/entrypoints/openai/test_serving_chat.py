@@ -1204,6 +1204,127 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
 
+    def test_kimi_k3_routes_video_through_one_structural_media_placeholder(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 8]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video_url",
+                            "video_url": {"url": "https://example.com/video.mp4"},
+                        },
+                        {"type": "text", "text": "Describe it."},
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(call.kwargs["image_prompts"], ["<|media_pad|>"])
+        self.assertEqual(call.args[0][0]["content"][0]["type"], "image_url")
+        self.assertIsNone(result.image_data)
+        self.assertEqual(result.video_data, ["https://example.com/video.mp4"])
+        self.assertEqual(result.modalities, ["video"])
+
+    def test_kimi_k3_keeps_only_latest_two_videos_in_same_turn(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 99, 8]
+        videos = [
+            "https://example.com/video-1.mp4",
+            "https://example.com/video-2.mp4",
+            "https://example.com/video-3.mp4",
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        *[
+                            {"type": "video_url", "video_url": {"url": url}}
+                            for url in videos
+                        ],
+                        {"type": "text", "text": "Compare them."},
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertEqual(result.video_data, videos[-2:])
+        self.assertEqual(result.modalities, ["video", "video"])
+        rendered = self.tm.tokenizer.apply_chat_template.call_args.args[0][0]
+        self.assertEqual(
+            [part["image_url"]["url"] for part in rendered["content"][:-1]],
+            videos[-2:],
+        )
+        self.assertEqual(len(request.messages[0].content), 4)
+
+    def test_kimi_k3_keeps_only_latest_two_videos_across_turns(self):
+        self.template_manager.chat_template_name = None
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 99, 99, 8]
+        videos = [
+            "https://example.com/video-1.mp4",
+            "https://example.com/video-2.mp4",
+            "https://example.com/video-3.mp4",
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": videos[0]}},
+                        {"type": "text", "text": "First."},
+                    ],
+                },
+                {"role": "assistant", "content": "First answer."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": videos[1]}},
+                        {"type": "text", "text": "Second."},
+                    ],
+                },
+                {"role": "assistant", "content": "Second answer."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video_url", "video_url": {"url": videos[2]}},
+                        {"type": "text", "text": "Third."},
+                    ],
+                },
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        self.assertEqual(result.video_data, videos[-2:])
+        self.assertEqual(result.modalities, ["video", "video"])
+        self.assertEqual(
+            [
+                part["image_url"]["url"]
+                for message in self.tm.tokenizer.apply_chat_template.call_args.args[0]
+                for part in (message.get("content") or [])
+                if part.get("type") == "image_url"
+            ],
+            videos[-2:],
+        )
+        self.assertEqual(request.messages[0].content[0].video_url.url, videos[0])
+
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

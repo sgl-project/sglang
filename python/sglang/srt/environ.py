@@ -1598,6 +1598,47 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Hard cap on sampled frames for a Kimi-K3 request's video_url content, as
+    # a safety net independent of the checkpoint's own sample_fps /
+    # max_num_frames_each_video preprocessor config: summed across every
+    # video in the request (NOT checked per-video -- two videos each under
+    # the cap can still add up over it, which is exactly the shape of a real
+    # incident this was missed on the first pass), a request that would
+    # sample more than this many frames total is rejected with 503 (Service
+    # Unavailable) before any GPU preprocessing, instead of risking an OOM
+    # deep in the model forward pass on an oversized prefill batch. 503 (not
+    # 400) so a router/gateway sees this as "this backend can't take it
+    # right now" and can retry elsewhere, rather than a client-side error.
+    # Set to 0 (or any value <= 0) to disable the cap.
+    SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES = EnvInt(256)
+    # Cap on how many Kimi-K3 video requests run GPU preprocessing
+    # (bicubic resize -> patchify -> concat) at the same time. Each video's
+    # own preprocessing is bounded by SGLANG_K3_VIDEO_MAX_SAMPLED_FRAMES, but
+    # nothing else in this deployment currently bounds how many of those
+    # per-request peaks can land on the GPU simultaneously (the general
+    # mm_processor_worker_num pool was not active for the request that hit
+    # this in production -- see the incident notes). Excess requests queue
+    # for a slot rather than being rejected; this only throttles concurrency,
+    # it doesn't drop requests. Set to 0 (or any value <= 0) to disable
+    # (unbounded concurrency).
+    SGLANG_K3_VIDEO_MAX_CONCURRENT_PREPROCESS = EnvInt(2)
+    # When true, log Kimi-K3 video GPU-preprocessing slot acquire/release
+    # events (current in-flight count) at INFO level, on top of the
+    # always-on per-request duration/frame-count/token-count logs. Off by
+    # default because slot events fire far more often than one line per
+    # video; turn on to confirm the concurrency cap above is actually taking
+    # effect under real traffic.
+    SGLANG_K3_VIDEO_DEBUG_LOG = EnvBool(False)
+    # Override individual keys of the checkpoint-provided video media_proc_cfg
+    # (sample_fps / max_num_frames_each_video / in_patch_limit_video) without
+    # locating or editing the checkpoint's own trust_remote_code processor
+    # file -- media_proc_cfg ships entirely from that checkpoint-side code,
+    # not from sglang or any file sglang controls, so there is normally no
+    # way to tune it short of finding and editing that file. Unset (None)
+    # leaves the checkpoint's own value alone; each is applied independently.
+    SGLANG_K3_VIDEO_SAMPLE_FPS = EnvFloat(None)
+    SGLANG_K3_VIDEO_MAX_NUM_FRAMES = EnvInt(None)
+    SGLANG_K3_VIDEO_IN_PATCH_LIMIT = EnvInt(None)
 
     # ===================================================================
     # Symmetric memory

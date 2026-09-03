@@ -176,6 +176,50 @@ def _resize_bicubic_if_needed(
     )
 
 
+_RESIZE_CHUNK_BYTES_CAP = 1 << 30
+_RESIZE_FREE_MEMORY_FRACTION = 0.25
+
+
+def _resize_chunk_size(source_batch: torch.Tensor, scratch_bytes_per_image: int) -> int:
+    """Frames per bicubic launch, bounded by free VRAM.
+
+    Preprocessing runs after the weights and the KV pool are allocated, so a
+    long video's frames cannot all be cast to float at once: the uint8 -> float
+    copy alone is 4x the source batch. Budget against measured free memory
+    rather than total capacity.
+    """
+    free_bytes, _ = torch.cuda.mem_get_info(source_batch.device)
+    budget = min(
+        _RESIZE_CHUNK_BYTES_CAP, int(free_bytes * _RESIZE_FREE_MEMORY_FRACTION)
+    )
+    return max(1, budget // max(1, scratch_bytes_per_image))
+
+
+def _resize_bicubic_chunked(
+    source_batch: torch.Tensor, target_height: int, target_width: int
+) -> torch.Tensor:
+    """``_resize_bicubic_if_needed`` over batch slices that fit in free memory."""
+    batch_size = source_batch.shape[0]
+    if batch_size <= 1:
+        return _resize_bicubic_if_needed(source_batch, target_height, target_width)
+
+    channels = source_batch.shape[-3]
+    per_image_floats = source_batch[0].numel() + channels * target_height * target_width
+    chunk = _resize_chunk_size(source_batch, per_image_floats * 4)
+    if chunk >= batch_size:
+        return _resize_bicubic_if_needed(source_batch, target_height, target_width)
+
+    return torch.cat(
+        [
+            _resize_bicubic_if_needed(
+                source_batch[start : start + chunk], target_height, target_width
+            )
+            for start in range(0, batch_size, chunk)
+        ],
+        dim=0,
+    )
+
+
 def _grid_thw_from_resize_config(config: dict, patch_size: int) -> tuple[int, int, int]:
     height = config["new_height"] + config["pad_height"]
     width = config["new_width"] + config["pad_width"]
@@ -244,7 +288,7 @@ def _resize_images_by_source_shape(
             continue
 
         source_batch = torch.cat([image.unsqueeze(0) for _, image in images], dim=0)
-        resized_batch = _resize_bicubic_if_needed(
+        resized_batch = _resize_bicubic_chunked(
             source_batch, target_height, target_width
         )
         for local_index, (index, _) in enumerate(images):

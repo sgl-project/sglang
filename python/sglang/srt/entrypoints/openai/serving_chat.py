@@ -104,6 +104,40 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 
+_KIMI_K3_MAX_VIDEO_INPUTS = 2
+
+
+def _truncate_kimi_k3_videos(messages: List[Dict[str, Any]]) -> None:
+    """Keep only the latest two K3 video parts across the whole request.
+
+    K3 receives the complete conversation on every chat request, so the
+    ordering here naturally covers both same-turn and multi-turn inputs.
+    Removing old parts before encoding keeps the rendered placeholders and
+    the extracted ``video_data`` list aligned.
+    """
+    video_count = sum(
+        1
+        for message in messages
+        for part in (message.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "video_url"
+    )
+    to_drop = max(0, video_count - _KIMI_K3_MAX_VIDEO_INPUTS)
+    if not to_drop:
+        return
+
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        kept = []
+        for part in content:
+            is_video = isinstance(part, dict) and part.get("type") == "video_url"
+            if is_video and to_drop:
+                to_drop -= 1
+                continue
+            kept.append(part)
+        message["content"] = kept
+
 
 def normalize_tool_content(role: str, content):
     """Normalize tool message content from OpenAI array format to plain string.
@@ -429,7 +463,8 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[List[Dict[str, Any]], int, Optional[str]]:
-        image_count = 0
+        _truncate_kimi_k3_videos(messages)
+        media_count = 0
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -452,7 +487,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        media_count += 1
+                    elif part_type == "video_url":
+                        video = part.get("video_url") or {}
+                        if isinstance(video, str):
+                            video = {"url": video}
+                        # K3's chat encoder only recognizes image parts. Emit one
+                        # structural media placeholder here; the multimodal
+                        # processor expands it into timestamped video chunks.
+                        parts.append({"type": "image_url", "image_url": video})
+                        media_count += 1
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -496,7 +540,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, media_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -548,15 +592,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             return prompt_ids
         if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            if media_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * media_count
 
             if (
                 request.reasoning_effort in ("low", "high", "max")
@@ -1295,6 +1339,8 @@ class OpenAIServingChat(OpenAIServingBase):
             normalize_assistant_tool_call_arguments(
                 message, strict=self.chat_encoding_spec != "kimi_k3"
             )
+        if self.chat_encoding_spec == "kimi_k3":
+            _truncate_kimi_k3_videos(messages)
 
         prompt_ids = self._encode_messages(
             copy.deepcopy(messages),
@@ -1305,8 +1351,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if prompt_ids is not None:
             if self.chat_encoding_spec in ("inkling", "kimi_k3"):
-                for message in request.messages:
-                    msg_dict = message.model_dump()
+                for msg_dict in messages:
                     if msg_dict.get("content") is None:
                         msg_dict["content"] = ""
                     process_content_for_template_format(

@@ -585,6 +585,7 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    modalities: Optional[Literal["video"]] = "video"
 
 
 class ChatCompletionMessageContentInputAudio(BaseModel):
