@@ -2043,8 +2043,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         policy, source = resolve_step_policy(checkpoint_quant_config)
         if policy is None:
             logger.info(
-                "Step mixed precision off (%s); running W8A8 on every "
-                "denoising step.",
+                "Step mixed precision off (%s); running W8A8 on every denoising step.",
                 source,
             )
             return
