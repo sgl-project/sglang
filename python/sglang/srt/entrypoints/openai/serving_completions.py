@@ -308,9 +308,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_top_logprobs = content["meta_info"].get(
                             "output_top_logprobs", []
                         )
-                        if (
-                            not self.tokenizer_manager.server_args.incremental_streaming_output
-                        ):
+                        if not self.tokenizer_manager.server_args.incremental_streaming_output:
                             output_token_logprobs = output_token_logprobs[
                                 n_prev_token:total_output_logprobs
                             ]
@@ -329,9 +327,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 chunk_prompt_token_ids = None
                 if request.return_token_ids:
                     output_ids = content["output_ids"]
-                    if (
-                        not self.tokenizer_manager.server_args.incremental_streaming_output
-                    ):
+                    if not self.tokenizer_manager.server_args.incremental_streaming_output:
                         n_prev_token_id = n_prev_token_ids.get(index, 0)
                         chunk_token_ids = output_ids[n_prev_token_id:]
                         n_prev_token_ids[index] = len(output_ids)
