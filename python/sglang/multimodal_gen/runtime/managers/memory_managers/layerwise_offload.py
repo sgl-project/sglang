@@ -1636,7 +1636,11 @@ class LayerwiseOffloadManager:
                 weight_metadata=self._weight_metadata,
                 device=self.device,
                 pin_slots=current_platform.is_cuda(),
-                direct_copy=host_copies_are_redundant(),
+                # Measured on a GB10: a copy_ straight from file-backed pages ran
+                # at 0.67 GiB/s (the driver stages pageable sources page by
+                # page) and the process's anonymous memory grew past 100 GiB;
+                # the pinned slots stay even on a shared pool.
+                direct_copy=False,
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,
