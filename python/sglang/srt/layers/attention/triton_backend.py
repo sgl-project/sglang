@@ -684,7 +684,9 @@ class TritonAttnBackend(AttentionBackend):
             out_cache_loc_full_physical = self._fill_cuda_graph_write_locs(
                 forward_batch, bs
             )
-            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(
+                forward_batch, in_capture=True
+            )
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs,
                 forward_mode,
@@ -705,7 +707,7 @@ class TritonAttnBackend(AttentionBackend):
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
 
     def _fill_cuda_graph_swa_out_cache_loc(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> Optional[torch.Tensor]:
         """Refill the SWA write-target buffer from the batch's derived
         sliding-window write loc, returning the [:n] view (None for non-SWA /
@@ -719,12 +721,14 @@ class TritonAttnBackend(AttentionBackend):
             or out_cache_loc.shape[0] > self.cuda_graph_swa_out_cache_loc.shape[0]
         ):
             return None
-        swa_write_loc = self.kv_index_translator.sliding_window_write_loc_for(
-            out_cache_loc
-        )
         n = out_cache_loc.shape[0]
         self.cuda_graph_swa_out_cache_loc[n:].zero_()
-        self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_write_loc)
+        if in_capture:
+            self.cuda_graph_swa_out_cache_loc[:n].zero_()
+        else:
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self.kv_index_translator.sliding_window_write_loc_for(out_cache_loc)
+            )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
     def _fill_cuda_graph_write_locs(
