@@ -128,17 +128,15 @@ packed layout end to end — there is no dequantization to BF16 — so GPT-OSS-2
 loads in roughly 13 GB rather than the ~42 GB a BF16 upcast would need, which is
 what lets it fit on a single 24 GB card.
 
-This path is opt-in via the `sgl-kernel-xpu` backend:
+The `mxfp4` method is registered automatically on `--device xpu`, which already
+requires `sgl-kernel-xpu` — no extra flag is needed:
 
 ```bash
-SGLANG_USE_SGL_XPU=1 sglang serve  \
+sglang serve                        \
     --model-path openai/gpt-oss-20b \
     --device xpu                    \
     --attention-backend intel_xpu
 ```
-
-Without `SGLANG_USE_SGL_XPU=1` the `mxfp4` method is not registered on XPU and
-startup stops with `Unknown quantization method: mxfp4`.
 
 **Tested models:**
 
