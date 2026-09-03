@@ -16,9 +16,11 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
     MAX_STOP_REGEX_LEN,
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
@@ -107,6 +109,28 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
+        self._make(
+            custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
+        ).verify(self.VOCAB_SIZE)
+
+        invalid_values = [
+            [],
+            [-1],
+            [True],
+            [self.VOCAB_SIZE],
+            "17",
+            list(range(MAX_REQUEST_REASONING_END_TOKEN_IDS + 1)),
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request reasoning end token IDs"),
+            ):
+                self._make(
+                    custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
+                ).verify(self.VOCAB_SIZE)
 
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""

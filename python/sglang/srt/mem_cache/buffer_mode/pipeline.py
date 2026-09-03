@@ -222,8 +222,6 @@ class BufferModePipeline:
         # Metadata-only pending-write backlog cap; beyond it new intents
         # are dropped at admission (re-trigger on a later hit).
         self.write_backlog_cap = write_backlog_cap
-        # Anchor-lock knobs; the cap keeps queued holds from pinning the pool.
-        self.anchor_lock_enabled = envs.SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK.get()
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
@@ -239,8 +237,7 @@ class BufferModePipeline:
             ),
         )
         logger.info(
-            "BufferModePipeline anchor_lock_enabled=%s cap_tokens=%d",
-            self.anchor_lock_enabled,
+            "BufferModePipeline anchor_lock_cap_tokens=%d",
             self.anchor_lock_cap_tokens,
         )
         self.reset()
@@ -278,10 +275,13 @@ class BufferModePipeline:
         self._anchor_lock_cap_skips = 0
 
     def is_idle(self) -> bool:
-        """No queued writes, staged prefetches, or storage writes in flight
-        (all of which hold host staging or would re-trigger IO)."""
+        """No queued or in-flight operation holds host staging or can restart I/O."""
         return not (
-            self.pending_write_queue or self.staged_prefetches or self.ongoing_backup
+            self.pending_write_queue
+            or self.staged_prefetches
+            or self.ongoing_write_through
+            or self.ongoing_backup
+            or self.ongoing_buffer_load_back
         )
 
     # ---- backup pipeline (device -> staging -> storage) ----
@@ -690,8 +690,6 @@ class BufferModePipeline:
         O(prefix path)). Returns "locked", "no_anchor" (nothing to pin),
         "cap_skip" (over cap; launches unlocked), or "anchor_lost" (splice
         base gone — the caller cancels the storage IO)."""
-        if not self.anchor_lock_enabled:
-            return "no_anchor"
         if req_id in self.anchor_locks:
             return "locked"
         prefix_ctx = self._prefetch_prefix_ctx.get(req_id)

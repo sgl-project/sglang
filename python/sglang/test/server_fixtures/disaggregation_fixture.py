@@ -378,7 +378,7 @@ def get_rdma_devices_args():
         if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
             warnings.warn(
                 f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group+3}"
+                f"{base_rdma_group}-{base_rdma_group + 3}"
             )
 
     # 3. Generate RDMA device names

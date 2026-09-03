@@ -29,7 +29,6 @@ register_amd_ci(est_time=60, suite="stage-a-test-1-gpu-small-amd")
 
 
 class TestWaveAttention(unittest.TestCase):
-
     def _set_all_seeds(self, seed):
         """Set all random seeds for reproducibility."""
         random.seed(seed)
