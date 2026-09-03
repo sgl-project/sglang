@@ -3,6 +3,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+_MIN_DIRECT_ACCUMULATION_LORAS = 4
+
 
 def sgemm_lora_a_embedding_graph_fwd(
     inputs: torch.Tensor,
@@ -85,6 +87,12 @@ def sgemm_lora_b_graph_fwd(
             total_seq_len, total_output_dim, dtype=inputs.dtype, device=inputs.device
         )
 
+    # With fewer slots, CUDA Graph replay removes enough launch overhead that
+    # the beta-enabled GEMM can be slower than the existing mm + add sequence.
+    use_direct_accumulation = (
+        num_loras >= _MIN_DIRECT_ACCUMULATION_LORAS and not torch.is_grad_enabled()
+    )
+
     num_slices = len(slice_offsets) - 1
     max_rank = input_dim // num_slices
 
@@ -110,8 +118,14 @@ def sgemm_lora_b_graph_fwd(
             w_slice = weights[
                 lora_idx, slice_start_output:slice_end_output
             ]  # (slice_dim, max_rank)
-            output[..., slice_start_output:slice_end_output].add_(
-                torch.mm(x_slice, w_slice.t())
-            )
+            output_slice = output[..., slice_start_output:slice_end_output]
+            if (
+                use_direct_accumulation
+                and output_slice.dtype == x_slice.dtype
+                and x_slice.dtype == w_slice.dtype
+            ):
+                output_slice.addmm_(x_slice, w_slice.t())
+            else:
+                output_slice.add_(torch.mm(x_slice, w_slice.t()))
 
     return output
