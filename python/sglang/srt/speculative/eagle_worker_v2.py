@@ -133,9 +133,39 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
-# Embedding weight names across checkpoint layouts (GLM/DeepSeek-V3 style
-# vs DeepSeek-V4 style).
-_EMBED_TENSOR_NAMES = ("model.embed_tokens.weight", "embed.weight")
+# Checkpoint spellings of the input embedding across the model families the
+# PP+spec gate admits (GLM/DeepSeek NextN, Bailing MTP, Mistral-style drafts).
+_EMBED_TENSOR_NAMES = (
+    "model.embed_tokens.weight",
+    "embed.weight",
+    "model.word_embeddings.weight",
+    "tok_embeddings.weight",
+)
+
+
+def _find_draft_input_embedding(model) -> "torch.nn.Module":
+    """The draft's input embedding, found by type rather than attribute path.
+
+    Draft models hang it under different names (embed_tokens, word_embeddings,
+    embed, tok_embeddings), but it is always the one VocabParallelEmbedding
+    that is not the ParallelLMHead."""
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    found = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, VocabParallelEmbedding)
+        and not isinstance(module, ParallelLMHead)
+    ]
+    if len(found) != 1:
+        raise ValueError(
+            "PP+spec needs exactly one input embedding on the draft model, "
+            f"found {[name for name, _ in found]!r}"
+        )
+    return found[0][1]
 
 
 def _load_checkpoint_tensor(
@@ -348,7 +378,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # draft's embedding must be loaded from the checkpoint directly
             # — otherwise it stays randomly initialized and accept_length
             # collapses to ~1.
-            embed = self.draft_runner.model.model.embed_tokens.weight
+            embed = _find_draft_input_embedding(self.draft_runner.model).weight
             if get_model().load_format != "dummy":
                 target_runner = self.target_worker.model_runner
                 loaded_embed = _load_checkpoint_tensor(
