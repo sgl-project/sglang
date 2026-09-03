@@ -156,6 +156,13 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
+def _aiter_situ_uses_gu_interleaved_weights() -> bool:
+    """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
+    a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
+    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
+    return a8w4 or not a4w4
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
@@ -951,12 +958,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .view(-1, n)
                     )
 
-            k3_situ_a8w4 = (
-                os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-                and getattr(layer.moe_runner_config, "activation", None) == "situ"
-            )
-            use_aiter_gu_interleave = k3_situ_a8w4 or (
-                envs.SGLANG_USE_AITER_MOE_GU_ITLV.get() and gate_up_interleaved
+            # AITER selects the activation dtype at runtime. A8W4 takes precedence
+            # and, together with A16W4, uses the preshuffled GU-interleaved layout.
+            # A4W4 uses the generic separated layout instead; feeding it the
+            # A16/A8 layout makes real-checkpoint MoE outputs nearly orthogonal.
+            k3_situ = getattr(layer.moe_runner_config, "activation", None) == "situ"
+            use_aiter_gu_interleave = (
+                k3_situ and _aiter_situ_uses_gu_interleaved_weights()
+            ) or (
+                not k3_situ
+                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                and gate_up_interleaved
             )
             if use_aiter_gu_interleave:
                 layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
@@ -1733,9 +1745,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             expanded_idx_to_permuted_idx=expanded_idx,
                             top_k=packed_topk.shape[1],
                         )
-                    else:
-                        result = result[0]
-                    return StandardCombineInput(hidden_states=result)
+                        return StandardCombineInput(hidden_states=result)
+                    # The finalized kernel writes to its explicit output
+                    # argument. Do not propagate the FFI return tensor: some
+                    # SiTU runner versions return a distinct wrapper/allocation
+                    # even though symm_output contains the published result.
+                    # Returning the destination makes the pointer contract
+                    # explicit for K3's zero-copy latent buffer.
+                    return StandardCombineInput(hidden_states=symm_output)
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
