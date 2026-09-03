@@ -675,7 +675,7 @@ def resolve_test_file(file_part):
             full_path = (
                 file_part
                 if file_part.startswith("python/")
-                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix) :]}"
             )
             if not os.path.isfile(full_path):
                 return None, False, f"File not found: `{full_path}`"
@@ -1207,9 +1207,8 @@ def handle_rerun_test(
     ):
         return False
 
-    if (
-        refresh_precision_baseline
-        and not _check_precision_baseline_refresh_permissions(gh_repo, pr, comment)
+    if refresh_precision_baseline and not _check_precision_baseline_refresh_permissions(
+        gh_repo, pr, comment
     ):
         return False
 

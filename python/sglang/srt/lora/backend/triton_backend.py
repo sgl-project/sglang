@@ -287,9 +287,9 @@ class TritonLoRABackend(BaseLoRABackend):
         bs = forward_batch.batch_size
 
         if use_cuda_graph:
-            assert (
-                self.cuda_graph_batch_info is not None
-            ), "CUDA Graph batch info is not initialized."
+            assert self.cuda_graph_batch_info is not None, (
+                "CUDA Graph batch info is not initialized."
+            )
             batch_info = self.cuda_graph_batch_info
             if forward_batch.forward_mode.is_target_verify():
                 # seg_lens were pre-filled at the captured per-request width
