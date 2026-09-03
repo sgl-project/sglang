@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -140,10 +139,11 @@ def _commit_disagg_handoff(
             None,
             None,
             None,
-            torch.zeros(1, dtype=torch.long),
+            torch.tensor([1], dtype=torch.long),
         )
     )
-    req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    req.bootstrap_host = "127.0.0.1"
+    req.bootstrap_room = 1
     if replayed_boundary:
         req.pd_rebootstrap_forced_output_id = token_id
     decode_req = DecodeRequest(

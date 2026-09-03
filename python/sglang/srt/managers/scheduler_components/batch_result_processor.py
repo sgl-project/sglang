@@ -1211,21 +1211,21 @@ class SchedulerBatchResultProcessor:
     ):
         if not req.require_reasoning:
             return
-        request_think_end_ids = get_request_reasoning_end_token_ids(
-            req.sampling_params.custom_params,
-            allowed_sequences=getattr(
-                self.model_config,
-                "request_selectable_think_end_id_sequences",
-                None,
-            ),
-        )
-        think_end_ids = (
-            request_think_end_ids
-            if request_think_end_ids is not None
-            else self.model_config.think_end_ids
-        )
-        if think_end_ids:
-            req.update_reasoning_tokens(next_token_id, think_end_ids)
+        think_end_ids = self.model_config.think_end_ids
+        if req._think_end_matcher is None:
+            request_think_end_ids = get_request_reasoning_end_token_ids(
+                req.sampling_params.custom_params,
+                allowed_sequences=getattr(
+                    self.model_config,
+                    "request_selectable_think_end_id_sequences",
+                    None,
+                ),
+            )
+            if request_think_end_ids is not None:
+                think_end_ids = request_think_end_ids
+            if not think_end_ids:
+                return
+        req.update_reasoning_tokens(next_token_id, think_end_ids)
 
     def _mamba_prefix_cache_update(
         self,
