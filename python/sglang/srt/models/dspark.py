@@ -484,6 +484,8 @@ _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 class DSparkDraftMixin:
 
+    supports_pre_gather_target_hidden_projection = True
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self._fused_kv_write_cache = None
@@ -737,8 +739,13 @@ class DSparkDraftMixin:
         cache_loc: torch.Tensor,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
     ) -> None:
-        ctx_hidden = self.project_target_hidden(target_hidden)
+        ctx_hidden = (
+            target_hidden
+            if target_hidden_is_projected
+            else self.project_target_hidden(target_hidden)
+        )
 
         bundle = self._fused_kv_write_bundle(pool)
         if bundle is not None:
