@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.models.deepseek_v2 import MoEGate, _is_glm_moe_dsa
+from sglang.srt.configs.model_config import is_glm_moe_dsa
+from sglang.srt.models.deepseek_v2 import MoEGate
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -81,25 +82,25 @@ class TestIsGlmMoeDsaHelper(CustomTestCase):
     """The arch-gate predicate used at both fix sites."""
 
     def test_matches_main_and_nextn(self):
-        self.assertTrue(_is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_MAIN_ARCH])))
+        self.assertTrue(is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_MAIN_ARCH])))
         self.assertTrue(
-            _is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH]))
+            is_glm_moe_dsa(SimpleNamespace(architectures=[GLM_NEXTN_ARCH]))
         )
 
     def test_matches_when_present_among_others(self):
         self.assertTrue(
-            _is_glm_moe_dsa(SimpleNamespace(architectures=["Foo", GLM_MAIN_ARCH]))
+            is_glm_moe_dsa(SimpleNamespace(architectures=["Foo", GLM_MAIN_ARCH]))
         )
 
     def test_rejects_non_glm(self):
-        self.assertFalse(_is_glm_moe_dsa(SimpleNamespace(architectures=[NON_GLM_ARCH])))
+        self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=[NON_GLM_ARCH])))
 
     def test_returns_false_for_none_or_empty_architectures(self):
         # A config with architectures=None or [] must return False, never
         # mis-gating a non-GLM model (matches the direct-access idiom in
         # configs/model_config.py, which reads config.architectures unguarded).
-        self.assertFalse(_is_glm_moe_dsa(SimpleNamespace(architectures=None)))
-        self.assertFalse(_is_glm_moe_dsa(SimpleNamespace(architectures=[])))
+        self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=None)))
+        self.assertFalse(is_glm_moe_dsa(SimpleNamespace(architectures=[])))
 
 
 class TestCorrectionBiasBf16Collapse(CustomTestCase):

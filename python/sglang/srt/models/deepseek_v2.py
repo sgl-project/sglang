@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_n_heads,
     get_dsa_index_topk,
     is_deepseek_dsa,
+    is_glm_moe_dsa,
 )
 from sglang.srt.distributed import (
     divide,
@@ -465,13 +466,6 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
-def _is_glm_moe_dsa(config) -> bool:
-    """True for GLM-5.2 GlmMoeDsa models -- the ``"GlmMoeDsa"`` substring matches
-    both the main arch ``GlmMoeDsaForCausalLM`` and the NextN draft head
-    ``GlmMoeDsaForCausalLMNextN`` (rewritten in ``configs/model_config.py``)."""
-    return any("GlmMoeDsa" in arch for arch in (config.architectures or []))
-
-
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -495,7 +489,7 @@ class MoEGate(nn.Module):
             correction_bias_dtype = torch.float32
             # GLM-5.2's bias sits at an offset where its spread is only a few bf16 ULPs
             # wide, so bf16 collapses it and reorders top-k routing. HF stores it fp32.
-            if quant_config is not None and not _is_glm_moe_dsa(config):
+            if quant_config is not None and not is_glm_moe_dsa(config):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
