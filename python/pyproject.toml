@@ -158,6 +158,10 @@ fastokens = [
   "fastokens>=0.1.1,<0.2.0",
 ]
 
+gigatoken = [
+  "gigatoken>=0.10.0,<0.11.0",
+]
+
 test = [
   "accelerate",
   "addict",
@@ -187,6 +191,7 @@ test = [
   # and the mmlu thresholds of run_eval's other callers before changing it.
   "sgl-eval==0.1.0",
   "sglang[fastokens]",
+  "sglang[gigatoken]",
   "tabulate",
 ]
 
