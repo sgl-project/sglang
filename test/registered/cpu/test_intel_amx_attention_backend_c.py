@@ -18,7 +18,6 @@ register_cpu_ci(est_time=477, suite="base-b-tp-test-cpu")
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",

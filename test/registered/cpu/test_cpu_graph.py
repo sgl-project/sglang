@@ -25,7 +25,6 @@ register_cpu_ci(est_time=315, suite="base-b-tp-test-cpu")
 
 
 class TestCPUGraph(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",

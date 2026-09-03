@@ -123,12 +123,7 @@ class TestMMMUEvalUtils(CustomTestCase):
         self,
     ):
         response = (
-            "The options are:\n"
-            "(A) red\n"
-            "(B) blue\n"
-            "(C) green\n"
-            "(D) yellow\n"
-            "Answer: B"
+            "The options are:\n(A) red\n(B) blue\n(C) green\n(D) yellow\nAnswer: B"
         )
 
         pred_ans = self.eval_utils.parse_multi_choice_response(
