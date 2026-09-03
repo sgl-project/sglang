@@ -38,6 +38,7 @@ from torch import nn
 
 from sglang.kernels.ops.diffusion import (
     vdn_frame_stats_prep,
+    vdn_gather_linear_state,
     vdn_linear_epilogue,
     vdn_silu_l2norm,
     vdn_temporal_conv_act,
@@ -590,6 +591,21 @@ def gather_linear_state(
         has_after,
         frames,
     ) = _gather_indices(tuple(bounds), num_frames, str(prefix.device))
+    if prefix.is_cuda and _use_fused_kernels():
+        return vdn_gather_linear_state(
+            prefix,
+            suffix,
+            alpha,
+            text_state,
+            before_idx=before_idx,
+            after_idx=after_idx,
+            has_before=has_before,
+            has_after=has_after,
+            bridge_before=(last_before + 1).clamp(min=0),
+            bridge_after=first_after.clamp(max=num_frames),
+            bridge=bridge == "alpha",
+            out_dtype=out_dtype,
+        )
 
     state_before = prefix[before_idx]
     state_after = suffix[after_idx]

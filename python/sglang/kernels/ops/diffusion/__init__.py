@@ -356,6 +356,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "VDN-H3 linear branch: frame-statistics GEMM operands in one pass.",
     ),
     (
+        "diffusion.vdn_gather_linear_state",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_gather_linear_state",
+        _CUDA,
+        "VDN-H3 linear branch: alpha-bridged boundary gather in one pass.",
+    ),
+    (
         "diffusion.vdn_linear_epilogue",
         KernelBackend.TRITON,
         "attention.vdn_linear_branch_triton:vdn_linear_epilogue",
@@ -555,6 +562,7 @@ _EXPORTS: dict[str, str] = {
     "_attn_fwd": "attention.sparse_linear_attn_triton",
     "get_block_map": "attention.sparse_linear_attn_triton",
     "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
+    "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
     "vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
     "vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",

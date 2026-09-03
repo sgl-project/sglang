@@ -660,6 +660,33 @@ def test_fused_branch_kernels_match_eager_chain() -> None:
 
 
 @requires_cuda
+def test_fused_gather_matches_eager_gather() -> None:
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
+
+    g = torch.Generator(device="cpu").manual_seed(5)
+    F_, H_, D_ = 9, 2, 32
+    hybrid = VDNHybridAttentionArchConfig(chunk=3, radius=1, anchor_frames="none")
+    bounds = hybrid.window_bounds(F_)
+    prefix = torch.randn(F_, H_, D_, D_, generator=g).cuda()
+    suffix = torch.randn(F_, H_, D_, D_, generator=g).cuda()
+    alpha = (torch.rand(F_, H_, D_, generator=g) * 0.5 + 0.5).cuda()
+    text = torch.randn(H_, D_, D_, generator=g).cuda()
+    for ts in (None, text):
+        for bridge in ("alpha", "none"):
+            vdn.set_fused_kernels_enabled(False)
+            try:
+                ref = gather_linear_state(
+                    prefix, suffix, alpha, bounds, bridge=bridge, text_state=ts, out_dtype=torch.float32
+                )
+            finally:
+                vdn.set_fused_kernels_enabled(True)
+            got = gather_linear_state(
+                prefix, suffix, alpha, bounds, bridge=bridge, text_state=ts, out_dtype=torch.float32
+            )
+            assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5), (bridge, ts is None)
+
+
+@requires_cuda
 def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
     from sglang.kernels.ops.diffusion import (
         can_use_fused_inplace_qknorm_rope,

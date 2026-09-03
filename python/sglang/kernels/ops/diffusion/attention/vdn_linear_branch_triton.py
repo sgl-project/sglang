@@ -334,8 +334,115 @@ def vdn_linear_epilogue(
     return out
 
 
+# --------------------------------------------------------------------------
+# boundary gather: prefix[lo-1] * prod alpha + suffix[hi+1] * prod alpha
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _gather_state_kernel(
+    PREFIX,
+    SUFFIX,
+    LOGP,  # [F+1, H, dk] fp32 exclusive log-alpha prefix sums
+    TEXT,  # [H, dv, dk] fp32 (or PREFIX when HAS_TEXT is False)
+    BEFORE,  # [F] int32 prefix row to read (clamped)
+    AFTER,  # [F] int32 suffix row to read (clamped)
+    HASB,  # [F] int32 0/1
+    HASA,  # [F] int32 0/1
+    BRIDGEB,  # [F] int32 log-prefix row for the before side
+    BRIDGEA,  # [F] int32 log-prefix row for the after side
+    OUT,
+    H,
+    DV,
+    HAS_TEXT: tl.constexpr,
+    BRIDGE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    DK: tl.constexpr,
+):
+    f = tl.program_id(0)
+    h = tl.program_id(1)
+    pid_v = tl.program_id(2)
+    rows = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+    cols = tl.arange(0, DK)
+    valid = rows < DV
+    fb = tl.load(BEFORE + f)
+    fa = tl.load(AFTER + f)
+    has_b = tl.load(HASB + f)
+    has_a = tl.load(HASA + f)
+    plane = (rows[:, None] * DK + cols[None, :])
+    off_b = ((fb * H + h) * DV) * DK + plane
+    off_a = ((fa * H + h) * DV) * DK + plane
+    sb = tl.load(PREFIX + off_b, mask=valid[:, None], other=0.0)
+    sa = tl.load(SUFFIX + off_a, mask=valid[:, None], other=0.0)
+    if HAS_TEXT:
+        ts = tl.load(TEXT + (h * DV) * DK + plane, mask=valid[:, None], other=0.0)
+        sb = tl.where(has_b != 0, sb, ts)
+        sa = tl.where(has_a != 0, sa, ts)
+    else:
+        sb = tl.where(has_b != 0, sb, 0.0)
+        sa = tl.where(has_a != 0, sa, 0.0)
+    if BRIDGE:
+        bb = tl.load(BRIDGEB + f)
+        ba = tl.load(BRIDGEA + f)
+        lp_t1 = tl.load(LOGP + ((f + 1) * H + h) * DK + cols)
+        lp_t = tl.load(LOGP + (f * H + h) * DK + cols)
+        lp_bb = tl.load(LOGP + (bb * H + h) * DK + cols)
+        lp_ba = tl.load(LOGP + (ba * H + h) * DK + cols)
+        sb = sb * tl.exp(lp_t1 - lp_bb)[None, :]
+        sa = sa * tl.exp(lp_ba - lp_t)[None, :]
+    out = sb + sa
+    tl.store(
+        OUT + ((f * H + h) * DV) * DK + plane,
+        out.to(OUT.dtype.element_ty),
+        mask=valid[:, None],
+    )
+
+
+def vdn_gather_linear_state(
+    prefix: torch.Tensor,
+    suffix: torch.Tensor,
+    alpha: torch.Tensor,
+    text_state: torch.Tensor | None,
+    *,
+    before_idx: torch.Tensor,
+    after_idx: torch.Tensor,
+    has_before: torch.Tensor,
+    has_after: torch.Tensor,
+    bridge_before: torch.Tensor,
+    bridge_after: torch.Tensor,
+    bridge: bool,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """The boundary gather of the linear branch as one kernel over the
+    [F, H, dv, dk] fp32 state banks (eager: ~7 passes over ~350 MB)."""
+    if not prefix.is_cuda:
+        raise ValueError("vdn_gather_linear_state is a Triton kernel; inputs must be on CUDA")
+    F, H, DV, DK = prefix.shape
+    _check_head_dim(DK)
+    prefix = prefix.contiguous()
+    suffix = suffix.contiguous()
+    if bridge:
+        log_alpha = torch.log(alpha.float().clamp_min(1e-12))
+        logp = torch.cat([torch.zeros_like(log_alpha[:1]), log_alpha.cumsum(0)]).contiguous()
+    else:
+        logp = prefix  # unused
+    text = text_state.float().contiguous() if text_state is not None else prefix
+    out = torch.empty(prefix.shape, dtype=out_dtype, device=prefix.device)
+    i32 = lambda t: t.to(torch.int32).contiguous()  # noqa: E731
+    _gather_state_kernel[(F, H, triton.cdiv(DV, _BLOCK_ROWS))](
+        prefix, suffix, logp, text,
+        i32(before_idx), i32(after_idx), i32(has_before), i32(has_after),
+        i32(bridge_before), i32(bridge_after),
+        out, H, DV,
+        HAS_TEXT=text_state is not None, BRIDGE=bridge, BLOCK_V=_BLOCK_ROWS, DK=DK,
+        num_warps=4,
+    )
+    return out
+
+
 __all__ = [
     "vdn_frame_stats_prep",
+    "vdn_gather_linear_state",
     "vdn_linear_epilogue",
     "vdn_silu_l2norm",
     "vdn_temporal_conv_act",
