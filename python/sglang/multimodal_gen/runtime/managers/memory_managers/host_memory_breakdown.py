@@ -76,6 +76,33 @@ def _anon_vmas(min_bytes: int = 128 * 1024**2) -> list[tuple[int, int, int, str]
     return sorted(out, key=lambda item: -item[2])
 
 
+def _file_mapping_cow(top: int = 3) -> tuple[int, list[tuple[str, int]]]:
+    """Anonymous bytes inside file mappings: pages a write copied out of the file.
+
+    A private writable mapping (safetensors' from_file) stays "file-backed" by
+    pointer, but every page written to it becomes anonymous memory that no
+    longer drops under pressure. Returns (total, [(path, bytes)] for the largest).
+    """
+    per_path: dict[str, int] = {}
+    try:
+        path = ""
+        with open("/proc/self/smaps") as handle:
+            for line in handle:
+                if line[0] in "0123456789abcdef" and "-" in line.split()[0]:
+                    fields = line.split()
+                    path = fields[5] if len(fields) >= 6 else ""
+                    if path.startswith("[") or path.startswith("/dev/"):
+                        path = ""
+                elif path and line.startswith("Anonymous:"):
+                    anon = int(line.split()[1]) * 1024
+                    if anon:
+                        per_path[path] = per_path.get(path, 0) + anon
+    except OSError:
+        return 0, []
+    ranked = sorted(per_path.items(), key=lambda item: -item[1])
+    return sum(per_path.values()), ranked[:top]
+
+
 def _mallinfo() -> dict[str, float]:
     try:
         import ctypes
@@ -220,6 +247,15 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
             f"{kind}={value:.2f}GiB" for kind, value in sorted(table[owner].items())
         )
         lines.append(f"  {owner}: {kinds}")
+    cow_total, cow_top = _file_mapping_cow()
+    if cow_total:
+        lines.append(
+            f"  copy-on-write pages in file mappings: {cow_total / GIB:.2f}GiB; "
+            + ", ".join(
+                f"{'/'.join(path.rsplit('/', 3)[-3:])}={size / GIB:.2f}GiB"
+                for path, size in cow_top
+            )
+        )
     device = torch.get_device_module()
     if hasattr(device, "memory_allocated"):
         lines.append(
