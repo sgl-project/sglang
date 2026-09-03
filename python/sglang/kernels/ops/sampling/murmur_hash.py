@@ -108,6 +108,12 @@ def murmur_hash32(seed, positions, col_indices):
     assert len(seed.shape) == 1 and len(col_indices.shape) == 1, (
         f"Inputs must be 1D tensors {seed.shape=} {col_indices.shape=}"
     )
+    device = seed.device
+    if device.type == "cpu":
+        return torch.ops.sgl_kernel.murmur_hash32_cpu.default(
+            seed, positions, col_indices
+        )
+
     n = seed.shape[0]
     m = col_indices.shape[0]
     hashed = torch.empty((n, m), dtype=torch.uint32, device=device)
