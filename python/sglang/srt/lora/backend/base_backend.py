@@ -394,9 +394,9 @@ def _compute_moe_lora_info(
     max_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if token_lora_mapping is not None:
-        assert (
-            num_tokens <= token_lora_mapping.shape[0]
-        ), "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        assert num_tokens <= token_lora_mapping.shape[0], (
+            "num_tokens must be less than or equal to the shape of token_lora_mapping"
+        )
         token_lora_mapping = token_lora_mapping[:num_tokens]
     else:
         token_lora_mapping = torch.empty(
@@ -404,9 +404,9 @@ def _compute_moe_lora_info(
         )
 
     if adapter_enabled is not None:
-        assert (
-            len(lora_ranks) <= adapter_enabled.shape[0]
-        ), "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        assert len(lora_ranks) <= adapter_enabled.shape[0], (
+            "lora_ranks must be less than or equal to the shape of adapter_enabled"
+        )
     else:
         adapter_enabled = torch.empty(
             len(lora_ranks), dtype=torch.int32, device=lora_ranks.device

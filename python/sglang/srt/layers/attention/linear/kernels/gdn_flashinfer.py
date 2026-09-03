@@ -109,7 +109,12 @@ def _get_flashinfer_gdn_kernels():
 
     Returns (available, prefill_fn, mtp_fn, decode_fn, mtp_bf16_fn).
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_mtp_bf16
+    global \
+        _flashinfer_gdn_available, \
+        _flashinfer_chunk_gated_delta_rule, \
+        _flashinfer_gated_delta_rule_mtp, \
+        _flashinfer_gated_delta_rule_decode, \
+        _flashinfer_gated_delta_rule_mtp_bf16
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
