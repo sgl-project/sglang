@@ -571,3 +571,19 @@ def test_single_iteration_probe_counts_repeated_stage_layers_per_iteration():
     )
     assert uses["transformer"] == {"blocks": (19, 19, 19)}
     assert uses["text_encoder"] == {"layers": (1, 1)}
+
+
+def test_mapped_populator_populates_each_layer_once_per_request():
+    populator = layerwise_offload._MappedPopulator(workers=2)
+    try:
+        tensor = torch.zeros(1 << 16, dtype=torch.uint8)
+        assert populator.submit(3, [tensor]) is True
+        assert populator.submit(3, [tensor]) is False
+        assert populator.wait(3) is True
+        assert populator.wait(4) is False
+        assert populator.submit(5, []) is False
+        populator.reset()
+        assert populator.submit(3, [tensor]) is True
+        assert populator.wait(3) is True
+    finally:
+        populator.close()

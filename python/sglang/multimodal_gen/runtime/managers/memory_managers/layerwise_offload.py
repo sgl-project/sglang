@@ -352,6 +352,9 @@ _MADV_PAGEOUT = 21  # Linux 5.4+: reclaim the pages now
 
 
 _MADV_POPULATE_READ = 22  # Linux 5.14+: fault the range in, in one sequential pass
+# Streamed layers faulted in concurrently on a cold pass. One sequential
+# stream gets ~1 GiB/s from a GB10's NVMe; six over different layers, ~3 GiB/s.
+MAPPED_POPULATE_AHEAD = 6
 
 
 def populate_mapped_source(tensors) -> int:
@@ -437,6 +440,73 @@ def _shared_pool_hosting(
     }
 
 
+class _MappedPopulator:
+    """Fault upcoming mapped layers in from several threads at once.
+
+    On the pass that may find pages cold, the manager hands the next few
+    streamed layers to this pool so the drive stays saturated while the
+    courier stages and the model computes the current one. A layer is
+    populated once per request; ``reset`` starts the next request over.
+    """
+
+    def __init__(self, workers: int = MAPPED_POPULATE_AHEAD) -> None:
+        self._tasks: queue.Queue[Optional[tuple[int, list]]] = queue.Queue()
+        self._lock = threading.Condition()
+        self._pending: Set[int] = set()
+        self._done: Set[int] = set()
+        self._threads = [
+            threading.Thread(target=self._run, name=f"mapped-populate-{i}", daemon=True)
+            for i in range(max(1, workers))
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, layer_idx: int, tensors) -> bool:
+        tensors = list(tensors)
+        if not tensors:
+            return False
+        with self._lock:
+            if layer_idx in self._pending or layer_idx in self._done:
+                return False
+            self._pending.add(layer_idx)
+        self._tasks.put((layer_idx, tensors))
+        return True
+
+    def wait(self, layer_idx: int) -> bool:
+        """Block until a submitted layer is populated; False if it never was."""
+        with self._lock:
+            if layer_idx not in self._pending and layer_idx not in self._done:
+                return False
+            while layer_idx in self._pending:
+                self._lock.wait()
+            return layer_idx in self._done
+
+    def reset(self) -> None:
+        with self._lock:
+            self._done.clear()
+
+    def close(self) -> None:
+        for _ in self._threads:
+            self._tasks.put(None)
+        for thread in self._threads:
+            thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            layer_idx, tensors = task
+            try:
+                populate_mapped_source(tensors)
+            except Exception:  # advisory only; the courier reads the pages anyway
+                pass
+            with self._lock:
+                self._pending.discard(layer_idx)
+                self._done.add(layer_idx)
+                self._lock.notify_all()
+
+
 class MappedLayerCourier:
     """Ships a mapped layer's weights to the device off the compute thread.
 
@@ -465,8 +535,12 @@ class MappedLayerCourier:
         pin_slots: bool,
         cold_source: Optional[Callable[[int], bool]] = None,
         populate_source: Optional[Callable[[int], bool]] = None,
+        await_populated: Optional[Callable[[int], bool]] = None,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
+        # Blocks until a populator thread has faulted the layer in; True if one
+        # did, so the courier does not fault the same range a second time.
+        self._await_populated = await_populated
         self._weight_metadata = weight_metadata
         self._device = device
         # Whether a layer's file pages may go cold once its copy is staged:
@@ -560,7 +634,10 @@ class MappedLayerCourier:
         tensors: Dict[str, torch.Tensor] = {}
         offset = 0
         if self._populate_source is not None and self._populate_source(layer_idx):
-            populate_mapped_source(self._mapped_cpu_weights[layer_idx].values())
+            if not (
+                self._await_populated is not None and self._await_populated(layer_idx)
+            ):
+                populate_mapped_source(self._mapped_cpu_weights[layer_idx].values())
         with torch.inference_mode(False), torch.no_grad():
             staged = []
             for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
@@ -666,6 +743,7 @@ class LayerwiseOffloadManager:
         # True from a request's start until its last layer has run once: the
         # pass in which a mapped layer's pages may not be in the page cache.
         self._first_pass = True
+        self._mapped_populator: Optional[_MappedPopulator] = None
         # True once _initialize builds the CPU buffers; unlike `enabled` it
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
@@ -1252,6 +1330,25 @@ class LayerwiseOffloadManager:
             for tensor in weights.values():
                 _advise_mapped_source_cold(tensor)
 
+    def _ensure_mapped_populator(self) -> Optional[_MappedPopulator]:
+        if self._mapped_populator is None and _libc is not None:
+            self._mapped_populator = _MappedPopulator()
+        return self._mapped_populator
+
+    def _await_mapped_populated(self, layer_idx: int) -> bool:
+        populator = self._mapped_populator
+        return populator is not None and populator.wait(layer_idx)
+
+    def _populate_ahead(self, layer_idx: int) -> None:
+        """On a cold pass, fault the next streamed layers in from parallel threads."""
+        populator = self._ensure_mapped_populator()
+        if populator is None:
+            return
+        for ahead in self._next_streamed(after=layer_idx, count=MAPPED_POPULATE_AHEAD):
+            if ahead in self._gpu_layers or ahead in self._courier_inflight:
+                continue
+            populator.submit(ahead, self._mapped_cpu_weights.get(ahead, {}).values())
+
     def _mapped_source_may_be_cold(self, layer_idx: int) -> bool:
         """Whether this copy is the first read of the layer in this request."""
         return self._first_pass or self._materializing_all
@@ -1340,17 +1437,11 @@ class LayerwiseOffloadManager:
                     advise_willneed(self._mapped_cpu_weights[layer_idx].values())
                     if self._first_pass:
                         # On the pass that may find pages cold, keep the drive
-                        # busy two layers ahead: with one layer in flight the
-                        # disk idles while that layer is staged and computed,
-                        # and a 1 GiB/s drive delivered a third of that.
-                        for ahead in self._next_streamed(after=layer_idx, count=2):
-                            if (
-                                ahead not in self._gpu_layers
-                                and ahead not in self._courier_inflight
-                            ):
-                                advise_willneed(
-                                    self._mapped_cpu_weights.get(ahead, {}).values()
-                                )
+                        # saturated several layers ahead from parallel threads:
+                        # one sequential stream idles the NVMe at ~1 GiB/s
+                        # while a layer is staged and computed; six streams
+                        # over different layers measured ~3 GiB/s on a GB10.
+                        self._populate_ahead(layer_idx)
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
@@ -1445,6 +1536,7 @@ class LayerwiseOffloadManager:
                 pin_slots=current_platform.is_cuda(),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
+                await_populated=self._await_mapped_populated,
             )
             logger.info(
                 "Layerwise offload: %s ships mapped layers through a courier "
@@ -1528,6 +1620,8 @@ class LayerwiseOffloadManager:
     def release_all(self) -> None:
         """Release every layer, including the resident ones: this ends the
         denoise stage that the resident set is scoped to."""
+        if self._mapped_populator is not None:
+            self._mapped_populator.reset()
         if not self.enabled or self.device is None:
             return
         if self.copy_stream is not None:
@@ -1582,6 +1676,9 @@ class LayerwiseOffloadManager:
         if self._mapped_courier is not None:
             self._mapped_courier.close()
             self._mapped_courier = None
+        if self._mapped_populator is not None:
+            self._mapped_populator.close()
+            self._mapped_populator = None
         if self._courier_inflight:
             raise RuntimeError(
                 "cannot release host stores with mapped copies in flight"
