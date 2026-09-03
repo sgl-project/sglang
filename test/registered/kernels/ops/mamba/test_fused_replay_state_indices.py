@@ -49,11 +49,15 @@ def _reference_chain(
     out_buf: torch.Tensor,
     valid_bs: int,
     total_bs: int,
+    v2p: torch.Tensor = None,
 ) -> None:
     """Replicates the _replay_metadata reference ops, in order, in place."""
     req_pool_indices[valid_bs:total_bs] = 0
     mamba_indices = mapping[req_pool_indices[:total_bs]]
-    # static pool: _translate_mamba_indices is the identity
+    if v2p is not None:
+        # Unified pool: virtual->physical slot translate, and it runs BEFORE
+        # the padding sentinel -- captured kernels read physical ids.
+        mamba_indices = v2p[mamba_indices].to(torch.int32)
     mamba_indices[valid_bs:] = -1
     out_buf[: len(mamba_indices)].copy_(mamba_indices)
 
@@ -138,6 +142,80 @@ class TestFusedReplayStateIndices(CustomTestCase):
                 (buf[total_bs:] == expected).all(),
                 f"{name} guard tail clobbered ({case}): {buf[total_bs:].tolist()}",
             )
+
+    def _run_v2p_case(self, total_bs: int, num_padding: int, seed: int) -> None:
+        """Same equivalence, with the unified pool's virtual slot ids.
+
+        The mapping yields VIRTUAL slots there and the kernel folds the v2p
+        gather in, which is what lets the unified pool take this path at all
+        instead of ~7 launches of the reference chain.
+        """
+        device = torch.device("cuda")
+        gen = torch.Generator(device="cpu").manual_seed(seed + 1000)
+        valid_bs = total_bs - num_padding
+
+        req_pool = torch.randint(
+            0, _REQ_POOL_SIZE, (total_bs + _GUARD,), generator=gen, dtype=torch.int64
+        )
+        req_pool[total_bs:] = _GUARD_SENTINEL
+        mapping = torch.randint(
+            0, _MAMBA_POOL_SIZE, (_REQ_POOL_SIZE,), generator=gen, dtype=torch.int32
+        )
+        # Scrambled table with a tombstone, so a skipped gather cannot pass.
+        v2p = torch.randperm(_MAMBA_POOL_SIZE + 1, generator=gen).to(torch.int64)
+        v2p[7] = -1
+        out = torch.full((total_bs + _GUARD,), _OUT_POISON, dtype=torch.int32)
+
+        req_ref, req_fused = req_pool.clone().to(device), req_pool.clone().to(device)
+        out_ref, out_fused = out.clone().to(device), out.clone().to(device)
+        mapping_d, v2p_d = mapping.to(device), v2p.to(device)
+
+        _reference_chain(
+            req_pool_indices=req_ref,
+            mapping=mapping_d,
+            out_buf=out_ref,
+            valid_bs=valid_bs,
+            total_bs=total_bs,
+            v2p=v2p_d,
+        )
+        returned = fused_replay_state_indices(
+            req_pool_indices=req_fused,
+            mamba_index_mapping=mapping_d,
+            out_state_indices=out_fused,
+            valid_bs=valid_bs,
+            total_bs=total_bs,
+            v2p=v2p_d,
+        )
+        case = f"v2p {total_bs=} {num_padding=} {seed=}"
+        self.assertTrue(
+            torch.equal(out_ref[:total_bs], out_fused[:total_bs]),
+            f"state indices mismatch ({case}):\n"
+            f"  ref   {out_ref[:total_bs].tolist()}\n"
+            f"  fused {out_fused[:total_bs].tolist()}",
+        )
+        self.assertTrue(torch.equal(returned, out_fused[:total_bs]), case)
+        self.assertTrue(
+            torch.equal(req_pool_ref_tail := req_ref[total_bs:], req_fused[total_bs:]),
+            f"guard tail diverged ({case}): {req_pool_ref_tail.tolist()}",
+        )
+        self.assertTrue(
+            (out_fused[total_bs:] == _OUT_POISON).all(),
+            f"out guard tail clobbered ({case})",
+        )
+
+    def test_v2p_matrix(self):
+        for total_bs in (1, 7, 32, 33):
+            paddings = sorted(
+                {0, 1, total_bs // 2, total_bs - 1} & set(range(total_bs))
+            )
+            for num_padding in paddings:
+                for seed in (0, 1):
+                    with self.subTest(
+                        total_bs=total_bs, num_padding=num_padding, seed=seed
+                    ):
+                        self._run_v2p_case(
+                            total_bs=total_bs, num_padding=num_padding, seed=seed
+                        )
 
     def test_matrix(self):
         # Non-power-of-two sizes (7, 33) exercise the BS_UPPER in_range mask;
