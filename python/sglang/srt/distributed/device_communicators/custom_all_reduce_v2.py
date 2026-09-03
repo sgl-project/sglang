@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -242,7 +243,7 @@ class CustomAllReduceV2:
         # start zeroed; the pull buffer need not, but it rides along in the
         # one-shot memset.
         slabs[self.rank].zero_()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         dist.barrier(group=self.group)
 
         def slice_all(shape: List[int], offset: int) -> List[torch.Tensor]:
@@ -453,7 +454,7 @@ class CustomAllReduceV2:
         rows = torch.tensor(peer_ptrs, dtype=torch.uint64, device=self.device)
         self.graph_params[self._graph_counter : self._graph_counter + count].copy_(rows)
         # the rows must be visible before any (PDL-chained) graph replay
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self._graph_counter += count
         self._graph_inputs.clear()
 

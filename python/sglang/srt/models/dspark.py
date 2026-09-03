@@ -16,6 +16,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -859,7 +860,7 @@ class DSparkDraftModel(DSparkDraftMixin, DFlashDraftModel):
         for layer in self.layers:
             layer.mlp = None
             layer.self_attn.o_proj = None
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
 
 class Qwen3DSparkModel(DSparkDraftModel):

@@ -29,6 +29,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     get_bool_env_var,
     get_num_new_pages,
@@ -141,7 +142,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             try:
                 _warmup = torch.arange(1024, dtype=torch.int64, device=device)
                 _ = torch.unique(_warmup // page_size)
-                torch.cuda.synchronize()
+                current_platform.synchronize()
             except Exception:
                 pass
         self.clear()

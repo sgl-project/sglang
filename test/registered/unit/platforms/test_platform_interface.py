@@ -5,6 +5,7 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import inspect
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -165,6 +166,32 @@ class TestDeviceMixin(CustomTestCase):
         mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
         self.assertFalse(mixin.is_pin_memory_available())
         self.assertFalse(mixin.is_pin_memory_available(device="cpu"))
+
+    def test_device_op_defaults_are_no_ops(self):
+        """empty_cache/synchronize default to no-ops, so an OOT platform that
+        implements neither still works instead of raising."""
+        mixin = _make_device_mixin(PlatformEnum.OOT, "custom", "custom")
+        self.assertIsNone(mixin.empty_cache())
+        self.assertIsNone(mixin.synchronize())
+        self.assertIsNone(mixin.synchronize(0))
+
+    def test_synchronize_accepts_a_device_argument(self):
+        """Every in-tree platform must accept synchronize(device): call sites
+        such as the vision CUDA graph runners pass a concrete device."""
+        for platform_cls in (
+            SRTPlatform,
+            CpuSRTPlatform,
+            CudaSRTPlatform,
+            RocmSRTPlatform,
+            XpuSRTPlatform,
+        ):
+            with self.subTest(platform=platform_cls.__name__):
+                sig = inspect.signature(platform_cls.synchronize)
+                # Bind without calling: no device is touched, but a signature
+                # that rejects the argument fails here.
+                sig.bind(MagicMock(), torch.device("cpu", 0))
+                sig.bind(MagicMock(), 0)
+                sig.bind(MagicMock())
 
     @patch("platform.machine")
     def test_get_cpu_architecture(self, mock_machine):
@@ -341,6 +368,24 @@ class TestCpuDeviceMixin(CustomTestCase):
         base.set_device(torch.device("cpu"))
         after = torch.empty(0).device
         self.assertEqual(before, after)
+
+    def test_device_ops_forward_to_torch_cpu(self):
+        """CPU empty_cache/synchronize are safe to call for real — call sites in
+        core no longer guard on the device type before reaching them."""
+        base = CpuSRTPlatform()
+        base.empty_cache()
+        base.synchronize()
+        base.synchronize(torch.device("cpu"))
+
+    @patch("torch.cuda.synchronize")
+    def test_cuda_synchronize_forwards_device(self, mock_sync):
+        base = CudaSRTPlatform()
+        base.synchronize(torch.device("cuda", 1))
+        mock_sync.assert_called_once_with(torch.device("cuda", 1))
+        mock_sync.reset_mock()
+        # No device → still one call, with the "current device" sentinel.
+        base.synchronize()
+        mock_sync.assert_called_once_with(None)
 
     @patch("platform.machine", return_value="aarch64")
     def test_cpu_arch_property_resolves_and_caches(self, mock_machine):

@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     shard_like,
     tail_attn_meta,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _fake_sp(monkeypatch, sp_size, sp_rank=0):
@@ -127,7 +128,7 @@ def test_tail_meta_is_cuda_graph_capturable():
     with torch.cuda.graph(graph):
         captured = tail_attn_meta(shard, 2, device, image_seq_len=100)
     graph.replay()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.equal(captured["cu_seqlens_tail"], eager["cu_seqlens_tail"])
 
 

@@ -14,6 +14,7 @@ from sglang.srt.compilation.compile_phase import (
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec
 
 logger = logging.getLogger(__name__)
@@ -218,7 +219,7 @@ class PyMscclppCommunicator:
             if best_config:
                 self.best_configs[size] = best_config
 
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         for algo, _, _ in algos_config:
             algo.reset()
 

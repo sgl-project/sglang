@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
@@ -791,7 +792,7 @@ class LogitsProcessor(nn.Module):
 
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("pre_lm_head_sync_enter")
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             _trace_e2e_logits("pre_lm_head_sync_returned")
 
         _trace_e2e_logits("lm_head_enter", hidden_shape=tuple(hidden_states.shape))
@@ -799,7 +800,7 @@ class LogitsProcessor(nn.Module):
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
-            torch.cuda.synchronize()
+            current_platform.synchronize()
             _trace_e2e_logits("post_lm_head_sync_returned")
 
         if self.logit_scale is not None:

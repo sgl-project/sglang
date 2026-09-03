@@ -37,6 +37,8 @@ from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
 from flashinfer.comm.workspace_base import AllReduceFusionWorkspace
 from torch.distributed import ProcessGroup
 
+from sglang.srt.platforms import current_platform
+
 from .mnnvl_cutedsl import DEFAULT_CONFIG, MNNVLCuteDSLConfig, ProtocolKind
 from .mnnvl_cutedsl.config import StaticProfile
 from .mnnvl_cutedsl.kernel_bt import BTAllReduceTuning, BTFinalizeTuning
@@ -216,7 +218,7 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
                 )
             self._protocols[protocol] = instance
 
-        torch.cuda.synchronize(device)
+        current_platform.synchronize(device)
         dist.barrier(group=group)
 
     @staticmethod

@@ -166,7 +166,7 @@ def _worker() -> int:
     IPC_A2A.budget_ns = 5 * 1000 * 1000
     if rank == 0:
         IPC_A2A.signal_and_wait()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     dist.barrier()
     if IPC_A2A.timed_out.item() == 0:
         failures.append(f"rank{rank} never saw the timeout flag")

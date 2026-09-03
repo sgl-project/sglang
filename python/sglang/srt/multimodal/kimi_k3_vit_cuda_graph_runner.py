@@ -14,6 +14,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.models.kimi_k3_vl import (
@@ -119,7 +120,7 @@ class KimiK3ViTCudaGraphRunner:
                 grid_thw_list=grid_thw_list,
                 forward_metadata=metadata,
             )
-        torch.cuda.synchronize(pixel_values.device)
+        current_platform.synchronize(pixel_values.device)
         entry = _CapturedVisionGraph(
             graph=graph,
             input_buffer=input_buffer,

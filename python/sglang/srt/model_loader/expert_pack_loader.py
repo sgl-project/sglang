@@ -41,6 +41,7 @@ from sglang.srt.model_loader.loader import (
     device_loading_context,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
@@ -297,9 +298,9 @@ class ExpertPackModelLoader(BaseModelLoader):
                 device=target_device,
             )
             _clamped_swiglu(activation_input, activation_input, hf_config.swiglu_limit)
-            torch.cuda.synchronize(target_device)
+            current_platform.synchronize(target_device)
             del activation_input
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
             logger.info(
                 "Expert-pack CUDA extension and clamped SwiGLU prewarmed in %.3fs",
                 time.monotonic() - prewarm_started,

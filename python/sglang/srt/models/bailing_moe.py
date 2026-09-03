@@ -77,6 +77,7 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
@@ -841,8 +842,8 @@ class BailingMoEForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.word_embeddings.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @torch.no_grad()
     def forward(

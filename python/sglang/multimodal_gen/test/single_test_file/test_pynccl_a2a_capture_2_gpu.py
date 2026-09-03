@@ -60,7 +60,7 @@ def _worker() -> int:
     got = torch.empty_like(x)
     with comm.change_state(enable=True):
         comm.all_to_all_single(got, x)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     if not torch.equal(reference(x), got):
         failures.append("eager result differs from dist.all_to_all_single")
 
@@ -69,18 +69,18 @@ def _worker() -> int:
     static_out = torch.empty_like(static_in)
     with comm.change_state(enable=True):
         comm.all_to_all_single(static_out, static_in)  # NCCL wants a warm path
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, capture_error_mode="thread_local"):
             comm.all_to_all_single(static_out, static_in)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     for i, seed in enumerate((33, 44, 55)):
         fresh = make(seed)
         static_in.copy_(fresh)
         expected = reference(fresh)
         graph.replay()
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         if not torch.equal(expected, static_out):
             failures.append(f"replay {i} (seed {seed}) diverged")
 
@@ -104,7 +104,7 @@ def _worker() -> int:
     got_out = torch.empty_like(ref_out)
     with comm.change_state(enable=True):
         comm.all_to_all_single(got_out, rows, out_splits, in_splits)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     if not torch.equal(ref_out, got_out):
         failures.append("uneven dim-0 split diverged from dist.all_to_all_single")
 

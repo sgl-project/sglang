@@ -6,6 +6,7 @@ import os
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 
 _HEADS = 12
@@ -162,5 +163,5 @@ def warmup(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
     )
-    torch.cuda.synchronize(device)
+    current_platform.synchronize(device)
     _WARMED.add(key)

@@ -26,6 +26,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -414,4 +415,4 @@ def maybe_flashinfer_autotune_extend(
     finally:
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()

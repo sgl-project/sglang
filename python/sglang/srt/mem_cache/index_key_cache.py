@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -116,7 +117,7 @@ class IndexKeyCache:
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
@@ -130,12 +131,12 @@ class IndexKeyCache:
                     "cpu", non_blocking=True
                 )
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
@@ -147,7 +148,7 @@ class IndexKeyCache:
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
                 self.buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
     def _item_len(self, layer_idx: int) -> int:
         # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.

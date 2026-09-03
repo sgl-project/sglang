@@ -10,6 +10,8 @@ from sgl_kernel import (
     fp8_blockwise_scaled_grouped_mm,
 )
 
+from sglang.srt.platforms import current_platform
+
 random.seed(28)
 
 
@@ -152,7 +154,7 @@ def bench_es(
     # warmup
     for _ in range(num_warmup):
         run_cutlass()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # run
     start_event = torch.cuda.Event(enable_timing=True)
@@ -162,7 +164,7 @@ def bench_es(
         run_cutlass()
     end_event.record()
     end_event.synchronize()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, expert_offsets[-1]
@@ -276,7 +278,7 @@ def bench_sgl(
     # warmup
     for _ in range(num_warmup):
         run_cutlass()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
 
     # run
     start_event = torch.cuda.Event(enable_timing=True)
@@ -286,7 +288,7 @@ def bench_sgl(
         run_cutlass()
     end_event.record()
     end_event.synchronize()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, expert_offsets[-1]

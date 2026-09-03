@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
+from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 from sglang.srt.utils import add_prefix
 
@@ -210,7 +211,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         del head
         self.target_embed_weight = embed
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def get_attention_sliding_window_size(self) -> int:
         # Gemma 4 config treats the bound as inclusive; SGLang attention metadata

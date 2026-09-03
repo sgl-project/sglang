@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
 from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.platforms import current_platform
 
 DEVICE = "cuda"
 FP8 = torch.float8_e4m3fn
@@ -210,7 +211,7 @@ def test_msa_fp8_decode_capture_replay_bitexact():
     with torch.cuda.graph(g):
         o_graph = run()
     g.replay()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     assert torch.equal(o_graph, o_eager), "fp8 MSA decode capture/replay not bit-exact"
 
 

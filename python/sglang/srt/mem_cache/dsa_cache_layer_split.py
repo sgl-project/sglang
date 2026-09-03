@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
     maybe_detect_oob,
     unwrap_write_loc,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -157,7 +158,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
 
     def cpu_copy(self, indices):
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
@@ -171,12 +172,12 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                     "cpu", non_blocking=True
                 )
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
@@ -188,7 +189,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
                 idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
                 self.buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        current_platform.synchronize()
 
 
 class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
@@ -552,8 +553,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
-
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -572,8 +571,6 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
-        from sglang.srt.utils import current_platform
-
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

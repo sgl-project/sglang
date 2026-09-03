@@ -51,8 +51,8 @@ class XpuDeviceMixin(DeviceMixin):
     def empty_cache(self) -> None:
         torch.xpu.empty_cache()
 
-    def synchronize(self) -> None:
-        torch.xpu.synchronize()
+    def synchronize(self, device: "torch.device | int | None" = None) -> None:
+        torch.xpu.synchronize(device)
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         # TODO: simple return of torch.xpu.mem_get_info

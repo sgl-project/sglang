@@ -35,6 +35,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -111,7 +112,7 @@ def init(
     )
     symm = _SymmetricMemory.rendezvous(region)
     region.zero_()
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.distributed.barrier(group=group)
     # keep the peer buffer tensors alive alongside the region
     peer_bufs = [symm.get_buffer(r, [nbytes], torch.uint8) for r in range(world_size)]
@@ -131,7 +132,7 @@ def init(
     uc_bases = torch.tensor(ptrs, dtype=torch.int64, device="cpu")
     gather = torch.zeros(int(mod.gather_words()), dtype=torch.int32, device=device)
     epochs = torch.zeros(int(mod.num_fams()), dtype=torch.int32, device=device)
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     _STATE = _State(
         world_size=world_size,
         rank=rank,

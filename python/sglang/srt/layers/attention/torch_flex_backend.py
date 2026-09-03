@@ -8,6 +8,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -31,7 +32,7 @@ class TorchFlexAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         # TODO: find a more elegant way to save memory
         # Currently maintain the same memory as torch_native_backend
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         # Provide two block_mask Lists per seq_idx for lower latency, later will support per layer level mask generation
         self.extend_block_masks = []

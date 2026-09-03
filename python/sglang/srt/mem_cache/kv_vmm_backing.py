@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.cuda_vmm_utils import (
     BumpArenaStub,
     VmmReservation,
@@ -110,7 +111,7 @@ class KvVmmArena:
             return
         self._closed = True
         try:
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         except Exception as e:  # pragma: no cover
             logger.warning("KvVmmArena.close synchronize failed: %s", e)
         self._allocation.close()

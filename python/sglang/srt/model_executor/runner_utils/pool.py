@@ -26,6 +26,7 @@ from typing import Any, Iterator, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_resources, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
@@ -107,16 +108,16 @@ class GraphPoolPrecarve:
         if self.minted or not envs.SGLANG_ENABLE_GRAPH_POOL_PRECARVE.get():
             yield
             return
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         # Shrink the cache first so the warmup's reserved growth is its own
         # footprint. Reserved (not allocated) is the stat to use: allocated
         # peak is the live-byte sum and undershoots by exactly the packing
         # holes the carved span has to absorb.
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_stats()["reserved_bytes.all.current"]
         yield
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         self.nbytes = torch.cuda.memory_stats()["reserved_bytes.all.peak"] - base
 
     def mint(self) -> None:
@@ -210,7 +211,7 @@ def _teardown_borrow_pool() -> None:
         return
     # Borrowed blocks that saw cross-stream use can remain in event limbo.
     # Synchronize, then drive allocator event processing before dropping the pool.
-    torch.cuda.synchronize()
+    current_platform.synchronize()
     torch.empty(1, device="cuda")
     _borrow_mem_pool = None
 

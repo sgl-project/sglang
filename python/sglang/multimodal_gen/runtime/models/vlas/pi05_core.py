@@ -35,7 +35,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.vla.prefix_cache import VLADensePrefixCache
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
@@ -587,7 +590,7 @@ class PiGemmaModel(nn.Module):
             and device is not None
             and device.type == "cuda"
         ):
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def forward(
         self,
@@ -1387,7 +1390,7 @@ class Pi05CoreModel(nn.Module):
             return
         self._move_prefix_image_encoder_to_device(torch.device("cpu"))
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     def _prepare_prefix_language_layers_for_forward(self) -> None:
         if (
@@ -1407,7 +1410,7 @@ class Pi05CoreModel(nn.Module):
             return
         self._move_prefix_language_layers_to_device(torch.device("cpu"))
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            current_platform.empty_cache()
 
     @torch.no_grad()
     def encode_prefix(

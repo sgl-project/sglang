@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
 
@@ -365,12 +366,12 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
             shuffle_weight(layer.w13_weight.data, (16, 16)),
             requires_grad=False,
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
         layer.w2_weight = torch.nn.Parameter(
             shuffle_weight(layer.w2_weight.data, (16, 16)),
             requires_grad=False,
         )
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
         # INT4-FP8 : offset INT4 w13_int4_scale to single w13_fp8_scale
         # Fp8 moe kernel needs single fp8 w13_fp8_scale for w13 per expert.

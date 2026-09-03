@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -254,7 +255,7 @@ def _compile_deep_gemm_one_type_all(
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
         del executor
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
     finally:
         # Restore symmetric memory context
         restore_symmetric_memory_context(saved_context)

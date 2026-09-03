@@ -143,7 +143,7 @@ class SGLDiffusionProfiler:
         if torch.cuda.is_available() or (
             hasattr(torch, "musa") and torch.musa.is_available()
         ):
-            torch.cuda.synchronize()
+            current_platform.synchronize()
         if current_platform.is_npu():
             torch.npu.synchronize()
             export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
