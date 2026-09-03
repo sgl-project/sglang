@@ -136,15 +136,15 @@ jobs:
           echo "Source code path: ${sglang_source_path}"
 
           test_case="${{ inputs.test_case }}"
-          if [ ! -f "${sglang_source_path}/${test_case}" ]; then
-            echo "The testcase does not exit: ${sglang_source_path}/${test_case}"
-            exit 1
-          fi
+          # Pre-check: support both single-case and batch (space-separated) modes.
+          for tc in ${test_case}; do
+            if [ ! -f "${sglang_source_path}/${tc}" ]; then
+              echo "The testcase does not exist: ${sglang_source_path}/${tc}"
+              exit 1
+            fi
+          done
 
           # prepare for output data
-          tc_name=${test_case##*/}
-          tc_name=${tc_name%.*}
-
           # Provided automatically by the GitHub server.
           # run_id is the unique identifier for the workflow run,
           # attempt represents the re‑run attempt count of the job.
@@ -161,7 +161,19 @@ jobs:
           # Print persistence‑directory‑prefix variables
           echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
 
-          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
+          # For batch (multiple space-separated cases) use the matrix config name as
+          # the final dir segment; for single-case keep the legacy per-case filename dir.
+          case "${test_case}" in
+            *" "*)
+              tc_dir_name="${{ inputs.test_config_name }}"
+              ;;
+            *)
+              tc_dir_name=${test_case##*/}
+              tc_dir_name=${tc_dir_name%.*}
+              ;;
+          esac
+
+          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_dir_name}
           mkdir -p ${sglang_test_results_output_path}
           echo "Metrics file path: ${sglang_test_results_output_path}"
 
@@ -183,7 +195,7 @@ jobs:
             --image ${{ inputs.image }} \
             --sglang-source-relative-path ${sglang_source_relative_path} \
             --metrics-data-file ${sglang_test_results_output_path} \
-            --test-case ${test_case} \
+            --test-case \"${test_case}\" \
             --kube-name-space ${NAMESPACE} \
             --kube-job-type ${kube_job_type} \
             --kube-job-name-prefix ${KUBE_JOB_NAME} \

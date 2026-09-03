@@ -1,10 +1,19 @@
-test_case=$1
-
-sglang_source_path=/root/sglang
-if [ ! -f "${sglang_source_path}/${test_case}" ];then
-  echo "The test case file is not exist: $test_case"
+# Accept one or more test_case paths (space separated). Loop over them so a single
+# Pod allocation can run a batch of cases that share the same resource profile.
+TEST_CASES=("$@")
+if [ ${#TEST_CASES[@]} -eq 0 ];then
+  echo "No test case provided. Usage: run_npu_testcase.sh <case1.py> [case2.py ...]"
   exit 0
 fi
+
+sglang_source_path=/root/sglang
+# Validate all cases exist up front so we fail fast before allocating NPU time.
+for tc in "${TEST_CASES[@]}";do
+  if [ ! -f "${sglang_source_path}/${tc}" ];then
+    echo "The test case file is not exist: $tc"
+    exit 0
+  fi
+done
 
 echo "NPU info:"
 npu-smi info
@@ -110,44 +119,121 @@ fi
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
 . /usr/local/Ascend/nnal/atb/set_env.sh
+# Adapt DeepSeek-V4-Flash test cases with additional environment variables.
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
 
-echo "Running test case ${test_case}"
-tc_name=${test_case##*/}
-tc_name=${tc_name%.*}
+echo "Running ${#TEST_CASES[@]} test case(s): ${TEST_CASES[*]}"
+OVERALL_SUCCESS=true
+case_index=0
+total_cases=${#TEST_CASES[@]}
+# run_label is injected as RUN_LABEL (derived from the metrics output path) and
+# replaces the old date-based prefix so logs can be grouped per workflow run.
 run_label="${RUN_LABEL:-unknown}"
-log_path="/root/sglang/debug/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
-if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-    # In CI, persist logs under /root/.cache/tests/logs so they can be collected
-    log_path="/root/.cache/tests/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
-fi
-rm -rf "${log_path}"
-mkdir -p "${log_path}"
-echo "Log path: ${log_path}"
 
-if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
-    echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
-    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
-    sleep 14400
-else
-    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
-fi
-echo "Finished test case ${test_case}"
-
-if [ -n "${METRICS_DATA_FILE}" ]; then
-    mkdir -p "${METRICS_DATA_FILE}"
-    # Archive the test log into the output directory for result collection
-    cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
-    echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
-fi
-
-source_plog_path="/root/ascend/log/debug/plog"
-if [ -d "$source_plog_path" ];then
-    echo "Plog files found. Begin to backup them."
-    target_plog_path="/root/sglang/debug/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
+for test_case in "${TEST_CASES[@]}";do
+    case_index=$((case_index+1))
+    tc_name=${test_case##*/}
+    tc_name=${tc_name%.*}
+    log_path="/root/sglang/debug/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
     if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-        target_plog_path="/root/.cache/tests/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
+        # In CI, persist logs under /root/.cache/tests/logs so they can be collected
+        log_path="/root/.cache/tests/logs/log/${run_label}/${tc_name}/${HOSTNAME}"
     fi
-    rm -rf "${target_plog_path}"
-    mkdir -p "${target_plog_path}"
-    cp ${source_plog_path}/* "${target_plog_path}"
+    rm -rf "${log_path}"
+    mkdir -p "${log_path}"
+    echo "===== [$(date)] Case ${case_index}/${total_cases}: ${tc_name} (log: ${log_path}) ====="
+
+    if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
+        echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
+        ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
+        sleep 14400
+    else
+        # Use process substitution so bash only waits for the python process.
+        # A plain `python | tee` pipeline hangs forever when a grandchild
+        # (e.g. the smg router spawned via Popen without stdout redirection)
+        # inherits and holds the pipe write end after python exits.
+        set +e
+        ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" > >(tee -a "${log_path}/${tc_name}.log") 2>&1
+        case_exit=$?
+        set -e
+        if [ "${case_exit}" != "0" ];then
+            OVERALL_SUCCESS=false
+            echo "===== [$(date)] Case ${tc_name} FAILED (exit ${case_exit}) ====="
+        else
+            echo "===== [$(date)] Case ${tc_name} OK ====="
+        fi
+    fi
+    echo "Finished test case ${test_case}"
+
+    # per-case metrics: each case writes into its own subdirectory so concurrent
+    # cases in the same batch do not overwrite each other's test_output.log.
+    if [ -n "${METRICS_DATA_FILE}" ]; then
+        case_metrics_dir="${METRICS_DATA_FILE}/${tc_name}"
+        mkdir -p "${case_metrics_dir}"
+        cp "${log_path}/${tc_name}.log" "${case_metrics_dir}/test_output.log"
+        echo "Metrics log saved to ${case_metrics_dir}/test_output.log"
+    fi
+
+    # per-case plog backup into its own tc_name subdir.
+    source_plog_path="/root/ascend/log/debug/plog"
+    if [ -d "$source_plog_path" ];then
+        echo "Plog files found. Begin to backup them for ${tc_name}."
+        target_plog_path="/root/sglang/debug/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
+        if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
+            target_plog_path="/root/.cache/tests/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
+        fi
+        rm -rf "${target_plog_path}"
+        mkdir -p "${target_plog_path}"
+        cp ${source_plog_path}/* "${target_plog_path}" || true
+        # Clear plog buffer so the next case starts fresh.
+        rm -f ${source_plog_path}/* 2>/dev/null || true
+    fi
+
+    # Inter-case cleanup: kill lingering sglang/python test processes and wait
+    # for NPU memory + ports to be released before launching the next case.
+    # Skip after the last case (Volcano Job teardown will reclaim everything).
+    if [ "${case_index}" -lt "${total_cases}" ];then
+        echo "===== Cleaning up sglang processes before next case ====="
+        pkill -9 -f "sglang" 2>/dev/null || true
+        pkill -9 -f "python.*launch_server" 2>/dev/null || true
+        pkill -9 -f "python.*test_npu" 2>/dev/null || true
+        sleep 10
+
+        # Wait for NPU memory to be released (max 120s).
+        wait_npu_idle=0
+        while [ $wait_npu_idle -lt 120 ]; do
+            # npu-smi lists one summary block per card; "0NPU" markers indicate idle.
+            # If no line shows real usage, consider NPU idle.
+            npu_busy=$(npu-smi info 2>/dev/null | grep -E "^\|" | grep -v "0NPU" | grep -v "^$" | wc -l)
+            if [ "${npu_busy}" -le 0 ];then
+                echo "NPU memory all released."
+                break
+            fi
+            echo "Waiting NPU memory release... (${wait_npu_idle}s, busy cards: ${npu_busy})"
+            sleep 5
+            wait_npu_idle=$((wait_npu_idle + 5))
+        done
+        if [ $wait_npu_idle -ge 120 ];then
+            echo "WARNING: NPU memory not fully released after 120s, proceeding anyway."
+        fi
+
+        # Wait for common sglang ports to be released (max 30s per port).
+        for port in 6677 8000 8995; do
+            for i in $(seq 1 30); do
+                if ! ss -tln 2>/dev/null | grep -q ":${port} "; then
+                    break
+                fi
+                sleep 1
+            done
+        done
+    fi
+done
+
+if [ "$OVERALL_SUCCESS" = "true" ];then
+    echo "All ${total_cases} case(s) OK."
+    exit 0
+else
+    echo "Some case(s) failed in batch."
+    exit 1
 fi
