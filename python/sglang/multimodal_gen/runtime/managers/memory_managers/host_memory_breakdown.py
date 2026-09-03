@@ -119,4 +119,22 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
             f"  device: allocated={device.memory_allocated() / GIB:.2f}GiB "
             f"reserved={device.memory_reserved() / GIB:.2f}GiB"
         )
+    snapshot = getattr(device, "memory_snapshot", None)
+    if callable(snapshot):
+        try:
+            segments = snapshot()
+        except Exception:
+            segments = []
+        big = sorted(
+            (
+                (int(segment.get("address", 0)), int(segment.get("total_size", 0)))
+                for segment in segments
+                if int(segment.get("total_size", 0)) >= 256 * 1024**2
+            ),
+            key=lambda item: -item[1],
+        )[:12]
+        lines.append(
+            "  device segments >= 256 MiB: "
+            + ", ".join(f"{address:#x}:{size / GIB:.2f}GiB" for address, size in big)
+        )
     logger.info("\n".join(lines))

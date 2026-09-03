@@ -9,6 +9,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
@@ -455,6 +456,7 @@ class _MappedPopulator:
         self._lock = threading.Condition()
         self._pending: Set[int] = set()
         self._done: Set[int] = set()
+        self.stats = {"populate_s": 0.0, "bytes": 0, "layers": 0}
         self._threads = [
             threading.Thread(target=self._run, name=f"mapped-populate-{i}", daemon=True)
             for i in range(max(1, workers))
@@ -498,10 +500,17 @@ class _MappedPopulator:
             if task is None:
                 return
             layer_idx, tensors = task
+            started = time.perf_counter()
             try:
                 populate_mapped_source(tensors)
             except Exception:  # advisory only; the courier reads the pages anyway
                 pass
+            with self._lock:
+                self.stats["populate_s"] += time.perf_counter() - started
+                self.stats["bytes"] += sum(
+                    t.numel() * t.element_size() for t in tensors
+                )
+                self.stats["layers"] += 1
             with self._lock:
                 self._pending.discard(layer_idx)
                 self._done.add(layer_idx)
@@ -537,8 +546,22 @@ class MappedLayerCourier:
         cold_source: Optional[Callable[[int], bool]] = None,
         populate_source: Optional[Callable[[int], bool]] = None,
         await_populated: Optional[Callable[[int], bool]] = None,
+        direct_copy: bool = False,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
+        # On a shared host/device pool the device reads host pages directly, so
+        # a layer goes mapping -> device in one copy and the pinned staging
+        # slots (2.7 GiB on the H3 encoder + VAE) are not allocated at all.
+        self._direct_copy = direct_copy
+        self.stats = {
+            "layers": 0,
+            "bytes": 0,
+            "slot_sync_s": 0.0,
+            "populate_wait_s": 0.0,
+            "populate_s": 0.0,
+            "memcpy_s": 0.0,
+            "h2d_issue_s": 0.0,
+        }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
         self._await_populated = await_populated
@@ -560,10 +583,14 @@ class MappedLayerCourier:
         )
         if slot_bytes <= 0:
             raise ValueError("no mapped weights to ship")
-        self._slots = [
-            torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin_slots)
-            for _ in range(self._NUM_SLOTS)
-        ]
+        self._slots = (
+            []
+            if direct_copy
+            else [
+                torch.empty(slot_bytes, dtype=torch.uint8, pin_memory=pin_slots)
+                for _ in range(self._NUM_SLOTS)
+            ]
+        )
         self._slot_events: List[Optional[Any]] = [None] * self._NUM_SLOTS
         self._stream = torch.get_device_module().Stream()
         self._tasks: queue.Queue[Optional[int]] = queue.Queue()
@@ -627,44 +654,76 @@ class MappedLayerCourier:
                 return
 
     def _ship(self, layer_idx: int, slot_turn: int):
-        slot = self._slots[slot_turn]
-        previous = self._slot_events[slot_turn]
-        if previous is not None:
-            # the previous transfer through this slot must land before reuse
-            previous.synchronize()
+        stats = self.stats
         tensors: Dict[str, torch.Tensor] = {}
-        offset = 0
+        if not self._direct_copy:
+            slot = self._slots[slot_turn]
+            previous = self._slot_events[slot_turn]
+            if previous is not None:
+                # the previous transfer through this slot must land before reuse
+                started = time.perf_counter()
+                previous.synchronize()
+                stats["slot_sync_s"] += time.perf_counter() - started
         if self._populate_source is not None and self._populate_source(layer_idx):
-            if not (
-                self._await_populated is not None and self._await_populated(layer_idx)
-            ):
+            started = time.perf_counter()
+            if self._await_populated is not None and self._await_populated(layer_idx):
+                stats["populate_wait_s"] += time.perf_counter() - started
+            else:
                 populate_mapped_source(self._mapped_cpu_weights[layer_idx].values())
+                stats["populate_s"] += time.perf_counter() - started
+        layer_bytes = 0
         with torch.inference_mode(False), torch.no_grad():
-            staged = []
-            for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
-                width = cpu_tensor.element_size()
-                if offset % width:
-                    offset += width - (offset % width)
-                start = offset // width
-                window = slot.view(cpu_tensor.dtype)[
-                    start : start + cpu_tensor.numel()
-                ].view(cpu_tensor.shape)
-                window.copy_(cpu_tensor)
-                if self._cold_source is not None and self._cold_source(layer_idx):
-                    _advise_mapped_source_cold(cpu_tensor, reclaim=True)
-                offset += cpu_tensor.numel() * width
-                staged.append((name, window))
             event = torch.get_device_module().Event()
-            with torch.get_device_module().stream(self._stream):
-                for name, window in staged:
-                    meta = self._weight_metadata[layer_idx][name]
-                    gpu_tensor = torch.empty(
-                        meta["shape"], dtype=meta["dtype"], device=self._device
-                    )
-                    gpu_tensor.copy_(window, non_blocking=True)
-                    tensors[name] = gpu_tensor
-                event.record(self._stream)
-        self._slot_events[slot_turn] = event
+            if self._direct_copy:
+                started = time.perf_counter()
+                with torch.get_device_module().stream(self._stream):
+                    for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
+                        meta = self._weight_metadata[layer_idx][name]
+                        gpu_tensor = torch.empty(
+                            meta["shape"], dtype=meta["dtype"], device=self._device
+                        )
+                        gpu_tensor.copy_(cpu_tensor, non_blocking=True)
+                        layer_bytes += cpu_tensor.numel() * cpu_tensor.element_size()
+                        if self._cold_source is not None and self._cold_source(
+                            layer_idx
+                        ):
+                            _advise_mapped_source_cold(cpu_tensor, reclaim=True)
+                        tensors[name] = gpu_tensor
+                    event.record(self._stream)
+                stats["h2d_issue_s"] += time.perf_counter() - started
+            else:
+                offset = 0
+                staged = []
+                started = time.perf_counter()
+                for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
+                    width = cpu_tensor.element_size()
+                    if offset % width:
+                        offset += width - (offset % width)
+                    start = offset // width
+                    window = slot.view(cpu_tensor.dtype)[
+                        start : start + cpu_tensor.numel()
+                    ].view(cpu_tensor.shape)
+                    window.copy_(cpu_tensor)
+                    if self._cold_source is not None and self._cold_source(layer_idx):
+                        _advise_mapped_source_cold(cpu_tensor, reclaim=True)
+                    offset += cpu_tensor.numel() * width
+                    layer_bytes += cpu_tensor.numel() * width
+                    staged.append((name, window))
+                stats["memcpy_s"] += time.perf_counter() - started
+                started = time.perf_counter()
+                with torch.get_device_module().stream(self._stream):
+                    for name, window in staged:
+                        meta = self._weight_metadata[layer_idx][name]
+                        gpu_tensor = torch.empty(
+                            meta["shape"], dtype=meta["dtype"], device=self._device
+                        )
+                        gpu_tensor.copy_(window, non_blocking=True)
+                        tensors[name] = gpu_tensor
+                    event.record(self._stream)
+                stats["h2d_issue_s"] += time.perf_counter() - started
+                self._slot_events[slot_turn] = event
+        stats["layers"] += 1
+        stats["bytes"] += layer_bytes
         return event, tensors
 
 
@@ -745,6 +804,7 @@ class LayerwiseOffloadManager:
         # pass in which a mapped layer's pages may not be in the page cache.
         self._first_pass = True
         self._mapped_populator: Optional[_MappedPopulator] = None
+        self._debug_collect_wait_s = 0.0
         # True once _initialize builds the CPU buffers; unlike `enabled` it
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
@@ -1350,6 +1410,47 @@ class LayerwiseOffloadManager:
                 continue
             populator.submit(ahead, self._mapped_cpu_weights.get(ahead, {}).values())
 
+    def _log_debug_timing(self) -> None:
+        """Debug: where this stage's layer traffic spent its time."""
+        if not envs.SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING:
+            return
+        courier = self._mapped_courier
+        populator = self._mapped_populator
+        if courier is None or not courier.stats["layers"]:
+            self._debug_collect_wait_s = 0.0
+            return
+        cs = courier.stats
+        ps = (
+            populator.stats
+            if populator is not None
+            else {"populate_s": 0.0, "bytes": 0, "layers": 0}
+        )
+        logger.info(
+            "Layerwise timing %s: layers=%d bytes=%.2fGiB direct=%s | courier: slot_sync=%.2fs "
+            "populate_wait=%.2fs populate=%.2fs memcpy=%.2fs h2d_issue=%.2fs | populator: "
+            "layers=%d bytes=%.2fGiB busy=%.2fs | compute thread collect wait=%.2fs",
+            self.layers_attr_str,
+            cs["layers"],
+            cs["bytes"] / (1024**3),
+            courier._direct_copy,
+            cs["slot_sync_s"],
+            cs["populate_wait_s"],
+            cs["populate_s"],
+            cs["memcpy_s"],
+            cs["h2d_issue_s"],
+            ps["layers"],
+            ps["bytes"] / (1024**3),
+            ps["populate_s"],
+            self._debug_collect_wait_s,
+        )
+        for key in cs:
+            cs[key] = 0.0 if isinstance(cs[key], float) else 0
+        if populator is not None:
+            with populator._lock:
+                for key in ps:
+                    ps[key] = 0.0 if isinstance(ps[key], float) else 0
+        self._debug_collect_wait_s = 0.0
+
     def _mapped_source_may_be_cold(self, layer_idx: int) -> bool:
         """Whether this copy is the first read of the layer in this request."""
         return self._first_pass or self._materializing_all
@@ -1535,6 +1636,7 @@ class LayerwiseOffloadManager:
                 weight_metadata=self._weight_metadata,
                 device=self.device,
                 pin_slots=current_platform.is_cuda(),
+                direct_copy=host_copies_are_redundant(),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,
@@ -1559,6 +1661,7 @@ class LayerwiseOffloadManager:
     def _collect_mapped_layer(self, layer_idx: int) -> None:
         """Bind a shipped layer's tensors on the compute thread."""
         courier = self._mapped_courier
+        started = time.perf_counter()
         try:
             event, tensors = courier.collect(layer_idx)
         except BaseException as exc:
@@ -1574,6 +1677,7 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        self._debug_collect_wait_s += time.perf_counter() - started
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
                 target = self.get_target_with_name(name)
@@ -1621,6 +1725,7 @@ class LayerwiseOffloadManager:
     def release_all(self) -> None:
         """Release every layer, including the resident ones: this ends the
         denoise stage that the resident set is scoped to."""
+        self._log_debug_timing()
         if self._mapped_populator is not None:
             self._mapped_populator.reset()
         if not self.enabled or self.device is None:

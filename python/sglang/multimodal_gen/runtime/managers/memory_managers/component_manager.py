@@ -722,6 +722,13 @@ class ComponentResidencyManager:
             )
             self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
         self._track_warmup_memory = False
+        if (
+            current_platform.device_shares_host_memory()
+            and torch.get_device_module().is_available()
+        ):
+            # One pool: every byte the caching allocator keeps reserved between
+            # requests is page cache the next request's streamed encoder cannot use.
+            torch.get_device_module().empty_cache()
 
     def _begin_warmup_phase(
         self,
