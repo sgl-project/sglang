@@ -18,9 +18,9 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
-    AckTarget,
     AbortAck,
     AbortNotification,
+    AckTarget,
     CommonKVManager,
     CommonKVReceiver,
     CommonKVSender,

@@ -53,11 +53,16 @@ def _install_mori_stubs() -> None:
 
 _install_mori_stubs()
 
+from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
+    DeferredAbortNotificationScenarios,
+)
+
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
-    AckTarget,
     AbortNotification,
+    AckTarget,
 )
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
@@ -67,11 +72,6 @@ from sglang.srt.disaggregation.mori.conn import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-from test_deferred_decode_kv_release import (
-    ABORT_GENERATION,
-    DeferredAbortNotificationScenarios,
-)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
