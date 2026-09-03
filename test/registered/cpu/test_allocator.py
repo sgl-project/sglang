@@ -11,6 +11,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
+torch.manual_seed(1234)
+
 
 def _ceil_div(a, b):
     """Integer ceiling division. Works for both Python ints and torch Tensors."""

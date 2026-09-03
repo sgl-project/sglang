@@ -32,8 +32,10 @@ def fp8_paged_mqa_logits_torch(
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
 
-    assert head_dim == 128, "TODO"
-    assert block_size == 64, "TODO"
+    assert head_dim == 128, f"reference only implements head_dim=128, got {head_dim}"
+    assert block_size == 64, (
+        f"reference only implements block_size=64, got {block_size}"
+    )
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
