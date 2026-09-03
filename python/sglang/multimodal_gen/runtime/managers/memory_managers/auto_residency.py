@@ -2227,7 +2227,6 @@ def _unconfigured_layerwise_targets(
                     current_pinned_layers=empty_pins,
                     uses_per_streamed_layer=uses_per_request,
                     layer_uses=layer_uses,
-                    mapped_stream_cost_multiplier=mapped_stream_cost_multiplier,
                 )
                 if allow_host_pin_reallocation
                 else [empty_pins]

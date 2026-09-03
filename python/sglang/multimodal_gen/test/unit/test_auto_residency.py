@@ -1529,7 +1529,7 @@ class TestPlanAutoResidency:
                 node_rank=0,
                 host_pin_budget=lambda: None,
             ),
-            _auto_residency_budget_bytes=lambda: 30 * GIB_BYTES,
+            _auto_residency_budget_bytes=lambda **_kwargs: 30 * GIB_BYTES,
             _collect_auto_residency_targets=collect_targets,
             _auto_residency_modules=lambda: modules,
         )
@@ -1609,7 +1609,7 @@ class TestPlanAutoResidency:
                 node_rank=0,
                 host_pin_budget=lambda: None,
             ),
-            _auto_residency_budget_bytes=lambda: 80 * GIB_BYTES,
+            _auto_residency_budget_bytes=lambda **_kwargs: 80 * GIB_BYTES,
             _collect_auto_residency_targets=lambda _workload, **_kwargs: [
                 transformer,
                 vae,
