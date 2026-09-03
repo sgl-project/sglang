@@ -451,6 +451,44 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
 
+    def test_host_load_back_waits_until_chunk_admission_can_commit(self):
+        """A waiting request must not allocate H2D restore slots when the
+        current chunk budget cannot admit even one page.
+
+        Repeating this admission attempt used to launch the same layerwise
+        restore once per scheduler pass. The next prefix rematch overwrote the
+        request-owned slot list, leaking every rejected attempt.
+        """
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=64,
+            rem_input_tokens=16_384,
+            rem_chunk_tokens=0,
+        )
+        req = self.create_mock_req("host-hit-waiter", 0, max_new_tokens=1)
+        req.prefix_indices = []
+        req.full_untruncated_fill_ids = list(range(28_864))
+        req.host_hit_length = 576
+        req.last_node = MagicMock()
+        req.best_match_node = req.last_node
+        req.sampling_params.ignore_eos = False
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            MagicMock(),
+            req.last_node,
+        )
+
+        for _ in range(2):
+            result = adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+            self.assertEqual(result, AddReqResult.OTHER)
+
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+
     def _build_hybrid_swa_chunked_req(
         self,
         *,

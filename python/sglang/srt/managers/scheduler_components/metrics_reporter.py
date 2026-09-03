@@ -608,12 +608,24 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+        total_prefill_tokens = (
+            prefill_stats.log_hit_tokens + prefill_stats.log_input_tokens
+        )
+        actual_hit_rate = (
+            prefill_stats.log_hit_tokens / total_prefill_tokens
+            if total_prefill_tokens > 0
+            else 0.0
+        )
 
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"#cached-device: {prefill_stats.log_device_hit_tokens}, "
+            f"#cached-host: {prefill_stats.log_host_hit_tokens}, "
+            f"#cached-storage: {prefill_stats.log_storage_hit_tokens}, "
+            f"actual-hit-rate: {actual_hit_rate:.6f}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
