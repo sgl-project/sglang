@@ -71,7 +71,6 @@ class TestExtendAttention(CustomTestCase):
 
         start_q, start_kv = 0, 0
         for seq_idx in range(seq_lens.shape[0]):
-
             extend_seq_len_q = extend_seq_lens[seq_idx]
             prefill_seq_len_q = extend_prefix_lens[seq_idx]
 
