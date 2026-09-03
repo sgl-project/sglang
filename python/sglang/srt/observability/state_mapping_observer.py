@@ -67,6 +67,52 @@ def _enum_name(value: Any) -> Optional[str]:
     return str(getattr(value, "name", value))
 
 
+def _enum_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+def _bounded_int_list(value: Any, *, limit: int = 512) -> Optional[list[int]]:
+    if value is None:
+        return []
+    value = list(value)
+    if len(value) > limit:
+        return None
+    return [int(item) for item in value]
+
+
+def _bounded_optional_int_list(
+    value: Any, *, limit: int = 512
+) -> Optional[list[Optional[int]]]:
+    if value is None:
+        return []
+    value = list(value)
+    if len(value) > limit:
+        return None
+    return [None if item is None else int(item) for item in value]
+
+
+def _bounded_conv_groups(
+    value: Any, *, outer_limit: int = 512, inner_limit: int = 8
+) -> Optional[list[Optional[list[int]]]]:
+    if value is None:
+        return []
+    value = list(value)
+    if len(value) > outer_limit:
+        return None
+    result = []
+    for group in value:
+        if group is None:
+            result.append(None)
+            continue
+        group = list(group)
+        if len(group) > inner_limit:
+            return None
+        result.append([int(item) for item in group])
+    return result
+
+
 def _input_ids_digest(req: Any) -> dict[str, Any]:
     token_ids = [int(token_id) for token_id in req.origin_input_ids]
     canonical = json.dumps(token_ids, separators=(",", ":")).encode()
@@ -97,9 +143,7 @@ def _pool_details(pool: Any) -> dict[str, Any]:
     }
 
 
-def _dsa_tail_state_indices(
-    pool: Any, req_pool_idx: int, seq_len: int
-) -> list[int]:
+def _dsa_tail_state_indices(pool: Any, req_pool_idx: int, seq_len: int) -> list[int]:
     """Metadata-only mirror of the PD transfer's DSA-tail addressing."""
     full_pool = getattr(pool, "full_kv_pool", pool)
     if not getattr(full_pool, "kpool_use_compress", False):
@@ -168,6 +212,72 @@ def _draft_runners(scheduler: Any) -> list[Any]:
     return []
 
 
+def _transfer_manager(scheduler: Any) -> Any:
+    mode = _enum_name(getattr(scheduler, "disaggregation_mode", None))
+    queue_name = {
+        "PREFILL": "disagg_prefill_bootstrap_queue",
+        "DECODE": "disagg_decode_prealloc_queue",
+    }.get(mode)
+    queue = getattr(scheduler, queue_name, None) if queue_name else None
+    return getattr(queue, "kv_manager", None)
+
+
+def _transfer_contract(scheduler: Any) -> dict[str, Any]:
+    """Return the registered PD transfer schema without buffer addresses."""
+    manager = _transfer_manager(scheduler)
+    kv_args = getattr(manager, "kv_args", None)
+    if kv_args is None:
+        return {"present": False}
+
+    state_types = list(getattr(kv_args, "state_types", []) or [])
+    state_ptrs = list(getattr(kv_args, "state_data_ptrs", []) or [])
+    state_item_lens = list(getattr(kv_args, "state_item_lens", []) or [])
+    state_dims = list(getattr(kv_args, "state_dim_per_tensor", []) or [])
+    state_outer_counts = list(getattr(kv_args, "state_slice_outer_counts", []) or [])
+    state_conv_groups = list(getattr(kv_args, "state_conv_shard_groups", []) or [])
+    state_layer_ids = list(getattr(kv_args, "state_layer_ids", []) or [])
+
+    components = []
+    for index, state_type in enumerate(state_types):
+        ptrs = state_ptrs[index] if index < len(state_ptrs) else []
+        components.append(
+            {
+                "type": _enum_value(state_type),
+                "entry_count": len(ptrs),
+                "item_lens": _bounded_int_list(
+                    state_item_lens[index] if index < len(state_item_lens) else []
+                ),
+                "dim_per_tensor": _bounded_optional_int_list(
+                    state_dims[index] if index < len(state_dims) else []
+                ),
+                "slice_outer_counts": _bounded_int_list(
+                    state_outer_counts[index] if index < len(state_outer_counts) else []
+                ),
+                "conv_shard_groups": _bounded_conv_groups(
+                    state_conv_groups[index] if index < len(state_conv_groups) else []
+                ),
+                "layer_ids": _bounded_int_list(
+                    state_layer_ids[index] if index < len(state_layer_ids) else []
+                ),
+            }
+        )
+
+    kv_ptrs = list(getattr(kv_args, "kv_data_ptrs", []) or [])
+    return {
+        "present": True,
+        "backend": _enum_value(getattr(scheduler, "transfer_backend", None)),
+        "manager_class": _class_name(manager),
+        "engine_rank": int(getattr(kv_args, "engine_rank")),
+        "pp_rank": int(getattr(kv_args, "pp_rank")),
+        "system_dp_rank": int(getattr(kv_args, "system_dp_rank")),
+        "page_size": int(getattr(kv_args, "page_size")),
+        "kv_cache_dtype": str(getattr(kv_args, "kv_cache_dtype_str")),
+        "kv_entry_count": len(kv_ptrs),
+        "kv_layer_ids": _bounded_int_list(getattr(kv_args, "kv_layer_ids", [])),
+        "state_components": components,
+    }
+
+
 def _token_slots(req_pool: Any, req_pool_idx: Optional[int], kv: Any) -> dict[str, Any]:
     if req_pool is None or req_pool_idx is None:
         return {"positions": [], "slot_ids": []}
@@ -194,7 +304,7 @@ class StateMappingObserver:
     scheduler: Any
 
     @classmethod
-    def from_scheduler(cls, scheduler: Any) -> Optional["StateMappingObserver"]:
+    def from_scheduler(cls, scheduler: Any) -> Optional[StateMappingObserver]:
         output_dir = envs.SGLANG_STATE_OBSERVER_DIR.get()
         rid_prefix = envs.SGLANG_STATE_OBSERVER_RID_PREFIX.get()
         if not output_dir or not rid_prefix:
@@ -240,7 +350,7 @@ class StateMappingObserver:
             getattr(scheduler, "disaggregation_mode", None)
         )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": {
                 "phase": phase,
                 "timestamp_ns": time.time_ns(),
@@ -259,7 +369,9 @@ class StateMappingObserver:
                 "rid": str(req.rid),
                 "input_ids": _input_ids_digest(req),
                 "sequence_length": int(req.seqlen),
-                "req_pool_idx": None if kv.req_pool_idx is None else int(kv.req_pool_idx),
+                "req_pool_idx": (
+                    None if kv.req_pool_idx is None else int(kv.req_pool_idx)
+                ),
                 "kv_committed_len": int(kv.kv_committed_len),
                 "kv_allocated_len": int(kv.kv_allocated_len),
                 "cache_protected_len": int(kv.cache_protected_len),
@@ -273,29 +385,43 @@ class StateMappingObserver:
             "draft": {
                 "present_on_rank": bool(draft_runners),
                 "runners": [_runner_details(runner) for runner in draft_runners],
-                "shares_target_req_pool": all(
-                    getattr(runner, "req_to_token_pool", None) is req_pool
-                    for runner in draft_runners
-                ) if draft_runners else None,
+                "shares_target_req_pool": (
+                    all(
+                        getattr(runner, "req_to_token_pool", None) is req_pool
+                        for runner in draft_runners
+                    )
+                    if draft_runners
+                    else None
+                ),
             },
+            "transfer": _transfer_contract(scheduler),
             "dsa": {
                 **_pool_details(target_pool),
                 "tail_state_indices": [int(item) for item in dsa_tail],
             },
             "mamba": {
-                "layer_ids": sorted(int(layer) for layer in getattr(req_pool, "mamba_map", {})),
+                "layer_ids": sorted(
+                    int(layer) for layer in getattr(req_pool, "mamba_map", {})
+                ),
                 "layer_mapping": {
                     str(layer): int(local)
                     for layer, local in getattr(req_pool, "mamba_map", {}).items()
                 },
                 "pool_idx": _small_ints(kv.mamba_pool_idx, limit=1),
                 "mapping_value": _small_ints(
-                    getattr(req_pool, "req_index_to_mamba_index_mapping", None)[int(kv.req_pool_idx)]
-                    if kv.req_pool_idx is not None and hasattr(req_pool, "req_index_to_mamba_index_mapping")
-                    else None,
+                    (
+                        getattr(req_pool, "req_index_to_mamba_index_mapping", None)[
+                            int(kv.req_pool_idx)
+                        ]
+                        if kv.req_pool_idx is not None
+                        and hasattr(req_pool, "req_index_to_mamba_index_mapping")
+                        else None
+                    ),
                     limit=1,
                 ),
-                "ping_pong_slots": _small_ints(kv.mamba_ping_pong_track_buffer, limit=2),
+                "ping_pong_slots": _small_ints(
+                    kv.mamba_ping_pong_track_buffer, limit=2
+                ),
                 "next_track_idx": kv.mamba_next_track_idx,
                 "last_track_idx": kv.mamba_last_track_idx,
                 "last_track_seqlen": kv.mamba_last_track_seqlen,

@@ -11,6 +11,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+try:
+    from sglang.test.ci.ci_register import register_cpu_ci
+except ModuleNotFoundError:
+
+    def register_cpu_ci(*args, **kwargs):
+        pass
+
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
 
 class _EnvField:
     def __init__(self, name):
@@ -45,6 +55,20 @@ class _Mode(Enum):
 
 class _Algorithm(Enum):
     EAGLE = auto()
+
+
+class _DisaggregationMode(Enum):
+    DECODE = "decode"
+
+
+class _TransferBackend(Enum):
+    NIXL = "nixl"
+
+
+class _StateType(Enum):
+    MAMBA = "mamba"
+    DSA = "dsa"
+    DSA_TAIL = "dsa_tail"
 
 
 @dataclass(frozen=True)
@@ -147,6 +171,22 @@ def _make_scheduler():
     target_pool = FakeHybridPool()
     target_runner = FakeRunner(0, 24, req_pool, target_pool)
     draft_runner = FakeRunner(24, 25, req_pool, FakeHybridPool())
+    kv_args = SimpleNamespace(
+        engine_rank=3,
+        pp_rank=1,
+        system_dp_rank=0,
+        page_size=64,
+        kv_cache_dtype_str="bfloat16",
+        kv_data_ptrs=[0xDEADBEEF, 0xFEEDFACE],
+        kv_layer_ids=[23, 45],
+        state_types=[_StateType.MAMBA, _StateType.DSA, _StateType.DSA_TAIL],
+        state_data_ptrs=[[0xBAD, 0xBAD], [0xBAD], [0xBAD]],
+        state_item_lens=[[128, 128], [256], [512]],
+        state_dim_per_tensor=[[64, 64], [], []],
+        state_slice_outer_counts=[[1, 1], [], []],
+        state_conv_shard_groups=[[None, [32, 32, 64]], [], []],
+        state_layer_ids=[[1, 2], [], []],
+    )
     return SimpleNamespace(
         ps=FakeParallelState(),
         world_group=SimpleNamespace(rank=11, local_rank=3),
@@ -154,7 +194,11 @@ def _make_scheduler():
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: target_pool),
         tp_worker=SimpleNamespace(model_runner=target_runner),
         model_worker=FakeSpecWorker([draft_runner]),
-        disaggregation_mode=SimpleNamespace(name="DECODE"),
+        disaggregation_mode=_DisaggregationMode.DECODE,
+        transfer_backend=_TransferBackend.NIXL,
+        disagg_decode_prealloc_queue=SimpleNamespace(
+            kv_manager=SimpleNamespace(kv_args=kv_args)
+        ),
     )
 
 
@@ -170,9 +214,7 @@ def _make_batch(rid="glm53-state-proof-001"):
         mamba_last_track_idx=0,
         mamba_last_track_seqlen=6,
     )
-    req = SimpleNamespace(
-        rid=rid, origin_input_ids=[41, 42, 43, 44], seqlen=7, kv=kv
-    )
+    req = SimpleNamespace(rid=rid, origin_input_ids=[41, 42, 43, 44], seqlen=7, kv=kv)
     spec = SimpleNamespace(
         topk_p=FakeTensor([123456.0] * 4, [1, 4]),
         topk_index=FakeTensor([123456] * 4, [1, 4]),
@@ -250,21 +292,44 @@ class TestStateMappingObserver(unittest.TestCase):
             with open(os.path.join(tmpdir, files[0]), encoding="utf-8") as stream:
                 raw = stream.read()
             rows = [json.loads(line) for line in raw.splitlines()]
-            self.assertEqual([row["event"]["phase"] for row in rows], ["pre_forward", "post_forward"])
+            self.assertEqual(
+                [row["event"]["phase"] for row in rows], ["pre_forward", "post_forward"]
+            )
             row = rows[1]
+            self.assertEqual(row["schema_version"], 2)
             self.assertEqual(row["request"]["rid"], "glm53-state-proof-001")
             self.assertEqual(row["request"]["req_pool_idx"], 3)
-            self.assertEqual(row["request"]["token_slots"], {"positions": [0, 4, 6], "slot_ids": [101, 105, 107]})
+            self.assertEqual(
+                row["request"]["token_slots"],
+                {"positions": [0, 4, 6], "slot_ids": [101, 105, 107]},
+            )
             self.assertEqual(row["target"]["layers"], [0, 24])
             self.assertEqual(row["draft"]["runners"][0]["layers"], [24, 25])
             self.assertTrue(row["draft"]["shares_target_req_pool"])
+            self.assertEqual(row["transfer"]["backend"], "nixl")
+            self.assertEqual(row["transfer"]["engine_rank"], 3)
+            self.assertEqual(row["transfer"]["pp_rank"], 1)
+            self.assertEqual(row["transfer"]["kv_entry_count"], 2)
+            self.assertEqual(row["transfer"]["kv_layer_ids"], [23, 45])
+            self.assertEqual(
+                [item["type"] for item in row["transfer"]["state_components"]],
+                ["mamba", "dsa", "dsa_tail"],
+            )
+            self.assertEqual(
+                row["transfer"]["state_components"][0]["layer_ids"],
+                [1, 2],
+            )
             self.assertEqual(row["dsa"]["tail_state_indices"], [3, 4, 2, 0, 1, 6])
             self.assertEqual(row["mamba"]["layer_mapping"], {"1": 0, "2": 1})
             self.assertEqual(row["mamba"]["pool_idx"], [9])
             self.assertEqual(row["mamba"]["ping_pong_slots"], [9, 10])
-            self.assertEqual(row["speculative"]["next_draft_input_shapes"]["hidden_states"], [1, 16])
+            self.assertEqual(
+                row["speculative"]["next_draft_input_shapes"]["hidden_states"], [1, 16]
+            )
             self.assertEqual(row["context"]["pod_uid"], "pod-uid")
             self.assertNotIn("123456", raw)
+            self.assertNotIn("DEADBEEF", raw)
+            self.assertNotIn("FEEDFACE", raw)
             self.assertNotIn("0x", raw)
 
 
