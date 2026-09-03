@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import (
-    _can_use_fused_suffix_attention_merge,
+from sglang.kernels.ops.attention.suffix_attention_merge import (
+    can_use_fused_suffix_attention_merge,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,7 +37,7 @@ class TestSuffixAttentionMergeDispatch(CustomTestCase):
             extra_kwargs={},
         )
         arguments.update(overrides)
-        return _can_use_fused_suffix_attention_merge(**arguments)
+        return can_use_fused_suffix_attention_merge(**arguments)
 
     def test_standard_attention_is_eligible(self):
         self.assertTrue(self._eligible())

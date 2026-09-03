@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.metadata import (
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.suffix_attention_merge import (
+    can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
@@ -60,26 +61,6 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().enable_dp_attention)
-
-
-def _can_use_fused_suffix_attention_merge(
-    *,
-    layer,
-    q: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    extra_kwargs: dict,
-) -> bool:
-    """Whether attention can use the specialized suffix merge."""
-    return bool(
-        q.dtype in (torch.float16, torch.bfloat16)
-        and key_cache.dtype == q.dtype
-        and value_cache.dtype == q.dtype
-        and layer.head_dim == layer.v_head_dim
-        and not layer.is_cross_attention
-        and not layer.logit_cap
-        and not extra_kwargs
-    )
 
 
 @dataclass
@@ -1605,7 +1586,7 @@ class FlashAttentionBackend(AttentionBackend):
             if (
                 use_cascade_attn
                 and forward_batch.spec_algorithm.is_uno()
-                and _can_use_fused_suffix_attention_merge(
+                and can_use_fused_suffix_attention_merge(
                     layer=layer,
                     q=q,
                     key_cache=key_cache,
