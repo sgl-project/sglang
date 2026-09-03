@@ -77,7 +77,7 @@ class LLaDAImageRMSNorm(SGLangRMSNorm):
     """RMSNorm with a synthesized unit weight for affine-free checkpoints."""
 
     def __init__(self, hidden_size: int, eps: float):
-        super().__init__(hidden_size, eps=eps)
+        super().__init__(hidden_size, eps=eps, cast_x_before_out_mul=True)
         self.weight.missing_param_init = "ones"
 
 
