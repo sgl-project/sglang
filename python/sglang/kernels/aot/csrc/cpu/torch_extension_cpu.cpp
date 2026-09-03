@@ -58,6 +58,10 @@ at::Tensor fused_add_layernorm_cpu(
     const std::optional<at::Tensor>& bias,
     double eps);
 
+// fused_qk_norm (per-head, in place)
+void fused_qk_norm_cpu(
+    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
+
 // fused_qk_rmsnorm
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
@@ -610,6 +614,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def("fused_qk_norm_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps) -> ()");
+  m.impl("fused_qk_norm_cpu", torch::kCPU, &fused_qk_norm_cpu);
   m.def(
       "fused_qk_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps) -> "
       "(Tensor, Tensor)");
