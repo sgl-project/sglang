@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVTransferMetric,
     StateType,
 )
+from sglang.srt.disaggregation.decode_kv_broadcast import KV_BROADCAST_SRC_RANK
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
@@ -203,6 +204,21 @@ class CommonKVManager(BaseKVManager):
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
         )
+
+        # Decode-side MLA KV broadcast (resolved in DecodePreallocQueue): only
+        # attn TP rank 0 pulls KV from prefill, then relays it to its peers
+        # over NVLink (DecodeKVBroadcaster).
+        self.enable_decode_kv_broadcast = args.enable_decode_kv_broadcast
+        self.pull_kv_from_prefill = (
+            not self.enable_decode_kv_broadcast
+            or self.attn_tp_rank == KV_BROADCAST_SRC_RANK
+        )
+        if self.enable_decode_kv_broadcast:
+            logger.info(
+                f"Decode KV broadcast: attn_tp_rank={self.attn_tp_rank}/"
+                f"{self.attn_tp_size}, pull_kv_from_prefill="
+                f"{self.pull_kv_from_prefill}"
+            )
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
