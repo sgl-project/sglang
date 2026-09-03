@@ -146,6 +146,15 @@ def _has_toggle_default_assignment(
 
 REASONING_MODE_RULES = (
     DetectionRule(
+        name="k2_v3_reasoning_effort",
+        value=ReasoningToggleConfig(special_case="always"),
+        predicate=lambda ctx: (
+            ctx.has_text("<ifm|think>")
+            and ctx.has_text("<ifm|think_fast>")
+            and ctx.has_text("reasoning_effort")
+        ),
+    ),
+    DetectionRule(
         name="gpt_oss_channel_markers",
         value=ReasoningToggleConfig(special_case="always"),
         predicate=lambda ctx: ctx.has_text("<|channel|>"),
@@ -286,6 +295,14 @@ def _is_gpt_oss(ctx):
 
 def _is_kimi_k2(ctx):
     return ctx.has_vocab("<|tool_calls_section_begin|>")
+
+
+def _is_k2_v3(ctx):
+    return (
+        ctx.has_text("<ifm|think>")
+        and ctx.has_text("<ifm|tool_calls>")
+        and ctx.has_text("<ifm|tool_call>")
+    )
 
 
 def _is_nemotron_3(ctx):
@@ -443,6 +460,7 @@ def _is_deepseek_r1_think_tags(ctx):
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="kimi", value="kimi", predicate=_is_kimi),
@@ -477,6 +495,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
