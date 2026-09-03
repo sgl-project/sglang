@@ -241,3 +241,16 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
             + ", ".join(f"{address:#x}:{size / GIB:.2f}GiB" for address, size in big)
         )
     logger.info("\n".join(lines))
+
+
+def log_anon_vmas(label: str) -> None:
+    """Debug: the process's large anonymous mappings right now, for a timeline of
+    where they appear during startup."""
+    rollup = _smaps_rollup()
+    lines = [
+        f"Anonymous memory timeline ({label}): "
+        + " ".join(f"{k}={v:.2f}GiB" for k, v in sorted(rollup.items()))
+    ]
+    for start, end, anon, flags in _anon_vmas()[:8]:
+        lines.append(f"  anon vma {start:#x}-{end:#x}: {anon / GIB:.2f}GiB [{flags}]")
+    logger.info("\n".join(lines))

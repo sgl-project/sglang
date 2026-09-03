@@ -2914,6 +2914,12 @@ class LayerwiseOffloadableModuleMixin:
         policies = ", ".join(sorted({manager.residency_policy for manager in managers}))
         total_layers = sum(manager.num_layers for manager in managers)
         resident_layers = sum(manager.resident_layers for manager in managers)
+        if envs.SGLANG_DIFFUSION_DEBUG_HOST_MEMORY:
+            from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_breakdown import (
+                log_anon_vmas,
+            )
+
+            log_anon_vmas(f"layerwise offload ready for {component_name}")
         logger.info(
             "Layerwise offload ready for %s in %.2fs: groups=%d, layers=%d, "
             "prefetch/group=%s, resident=%d/%d, policy=%s",

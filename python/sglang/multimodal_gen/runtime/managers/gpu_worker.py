@@ -1786,6 +1786,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self, *, workload: DefaultWorkload
     ) -> RankResidencyReport:
         """Build exact weight lower bounds before the first serving forward."""
+        if envs.SGLANG_DIFFUSION_DEBUG_HOST_MEMORY:
+            from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_breakdown import (
+                log_anon_vmas,
+            )
+
+            log_anon_vmas("before the pre-warmup plan (model loaded)")
         if self.pipeline is None:
             return RankResidencyReport(
                 rank=self.rank,
