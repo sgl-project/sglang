@@ -457,10 +457,13 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         self.assertIsNotNone(v)
-        with mock.patch.object(
-            torch, "unique", side_effect=AssertionError("unique = host sync")
-        ), mock.patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+        with (
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+            ),
         ):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)

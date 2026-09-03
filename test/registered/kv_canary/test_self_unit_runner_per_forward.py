@@ -28,21 +28,25 @@ class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
         """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
-        with patch.object(
-            kernel_launcher_module,
-            "launch_canary_plan_kernels",
-            lambda **kwargs: calls.append("plan"),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: calls.append(
-                ("verify", kwargs["context"].kernel_kind.name)
+        with (
+            patch.object(
+                kernel_launcher_module,
+                "launch_canary_plan_kernels",
+                lambda **kwargs: calls.append("plan"),
             ),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: calls.append(
-                ("write", kwargs["context"].kernel_kind.name)
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: calls.append(
+                    ("verify", kwargs["context"].kernel_kind.name)
+                ),
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: calls.append(
+                    ("write", kwargs["context"].kernel_kind.name)
+                ),
             ),
         ):
             manager = make_manager(device=self.device)

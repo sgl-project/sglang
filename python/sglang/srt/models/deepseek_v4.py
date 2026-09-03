@@ -596,9 +596,9 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert (
-        output[:real_num_tokens].numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    assert output[:real_num_tokens].numel() == ret.numel(), (
+        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    )
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
@@ -610,7 +610,6 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 
 class MqaAttentionBase(nn.Module):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -740,9 +739,9 @@ class MqaAttentionBase(nn.Module):
         if fp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+            assert hasattr(self.wo_a, "weight_scale_inv"), (
+                "FP8 quant_config must create weight_scale_inv"
+            )
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
@@ -3910,9 +3909,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = _clone_if_runai_streamed_tensor(
                                     loaded_weight
                                 )
@@ -4027,9 +4026,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert (
-        weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8_e4m3fn, got {weight.dtype}"
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn, got {weight.dtype}"
+    )
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,

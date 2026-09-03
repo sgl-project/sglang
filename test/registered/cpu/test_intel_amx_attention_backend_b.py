@@ -18,7 +18,6 @@ register_cpu_ci(est_time=47, suite="base-b-test-cpu")
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
         min_throughput=150,
