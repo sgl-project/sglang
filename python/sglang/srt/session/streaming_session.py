@@ -595,6 +595,10 @@ class StreamingSession(BasePrefixCache):
     def init_metrics_collector(self):
         return self.inner.init_metrics_collector()
 
+    def release_host_resources(self) -> None:
+        """Forward graceful host-pool teardown to the wrapped cache."""
+        self.inner.release_host_resources()
+
     def sanity_check(self):
         # Skip inner sanity check when sessions hold tree locks, because
         # the check asserts all nodes are unlocked during idle.

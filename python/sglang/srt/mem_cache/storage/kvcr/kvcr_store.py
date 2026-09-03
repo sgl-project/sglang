@@ -1217,9 +1217,9 @@ class KVCRStore(HiCacheStorage):
         The core's own ``close()`` makes the same trade one level down: when its
         progress loop does not go quiescent it keeps the backend resources and
         raises, precisely so nothing unmaps memory a native transfer still
-        references. We hold the reference in that case for the same reason, and
-        report rather than propagate -- ``close()`` is a teardown path, and the
-        rule for this backend is that it never raises at a HiCache seam.
+        references. We retain the reference and propagate that refusal. The
+        owner must not clear the backend or destroy its registered host pools
+        unless this method returns successfully.
         """
         self._pump_stop.set()
         pump = self._pump_thread
@@ -1233,19 +1233,23 @@ class KVCRStore(HiCacheStorage):
                     "live poll.",
                     _PUMP_JOIN_TIMEOUT_S,
                 )
-                return
+                raise RuntimeError(
+                    "KVCR source pump did not stop; KVCR core remains open"
+                )
             self._pump_thread = None
         if self._kvcr is not None:
             try:
                 self._kvcr.close()
-            except BaseException:
-                # Core-side close is idempotent, so keeping the reference costs
-                # nothing and leaves a later attempt possible.
+            except BaseException as error:
+                # Keep the core reachable so process reclaim, rather than an
+                # unsafe framework unmap, owns the remaining native resources.
                 logger.exception(
                     "KVCRStore: KVCR core did not close cleanly; keeping the "
                     "core so its still-registered memory is not unmapped."
                 )
-                return
+                raise RuntimeError(
+                    "KVCR core did not close; registered memory remains owned"
+                ) from error
             self._kvcr = None
 
     # ------------------------------------------------------------------

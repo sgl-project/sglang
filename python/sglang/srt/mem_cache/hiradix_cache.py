@@ -187,6 +187,10 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config=extra_config,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
+        # Dynamic group creation is a default-world collective.  Precreate the
+        # reusable data-path groups while every scheduler rank is still in tree
+        # initialization, even when no storage backend is attached at startup.
+        self.cache_controller.initialize_storage_data_sync_groups()
         self._apply_storage_runtime_config(
             storage_backend=get_memory().hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,

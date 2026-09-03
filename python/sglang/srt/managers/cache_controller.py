@@ -54,6 +54,10 @@ _RATE_LIMIT_LOG_INTERVAL_S = 30.0
 device_module = get_device_module()
 
 
+class StorageLifecycleConsensusError(RuntimeError):
+    """The storage lifecycle collective failed; this worker must terminate."""
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -340,6 +344,16 @@ class HiCacheController:
         self.pp_group = pp_group
         self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.storage_data_sync_groups_initialized = False
+        self.storage_lifecycle_sync_groups: List[torch.distributed.ProcessGroup] = []
+        # Custom group creation uses a default-world collective.  Build these
+        # lifecycle-only groups while every scheduler rank is still starting,
+        # never lazily from an admin request after DP replicas can diverge.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            self.storage_lifecycle_sync_groups = (
+                self._create_lifecycle_sync_groups()
+            )
+        self.storage_lifecycle_groups_initialized = True
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -355,6 +369,7 @@ class HiCacheController:
         self.enable_storage = False
         self.storage_backend = None
         self.storage_backend_type = None
+        self.storage_lifecycle_failed = False
         self.enable_storage_metrics = enable_storage_metrics
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
@@ -402,6 +417,7 @@ class HiCacheController:
         # so init/runtime share the same lifecycle semantics and code paths.
         if storage_backend is not None:
             try:
+                self.initialize_storage_data_sync_groups()
                 self.attach_storage_backend(
                     storage_backend=storage_backend,
                     prefetch_threshold=prefetch_threshold,
@@ -448,6 +464,17 @@ class HiCacheController:
             )
         return groups
 
+    def _create_lifecycle_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+        """Create lifecycle-only copies of this DP replica's sync topology.
+
+        Attention-DP replicas are independently scheduled, so a world-wide
+        lifecycle group would deadlock when one replica is busy and another is
+        idle.  The CP -> TP -> PP groups built by ``_create_sync_groups`` form
+        exactly one model-parallel replica and a sequential MIN propagates
+        across that connected component.
+        """
+        return self._create_sync_groups()
+
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
     ) -> None:
@@ -465,6 +492,134 @@ class HiCacheController:
     ) -> None:
         for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _storage_detach_consensus(self, local_success: bool) -> bool:
+        """Agree across this DP replica's model-parallel ranks.
+
+        Dedicated CP, TP, and PP groups exclude independently scheduled
+        attention-DP replicas.  MIN reductions in that fixed order spread a
+        failure through the replica's connected model-parallel component.
+
+        A collective fault cannot be downgraded to a local refusal: another
+        rank may have observed success and committed. Propagate a distinguished
+        fatal error so the scheduler process terminates instead of serving in a
+        potentially divergent state.
+        """
+        groups = self.storage_lifecycle_sync_groups
+        if not groups:
+            return local_success
+        agreed = torch.tensor([int(local_success)], dtype=torch.int32, device="cpu")
+        try:
+            self._all_reduce(agreed, torch.distributed.ReduceOp.MIN, groups)
+        except Exception as error:
+            logger.exception("Storage detach consensus failed.")
+            self._mark_storage_lifecycle_failed()
+            raise StorageLifecycleConsensusError(
+                "Storage lifecycle consensus failed; worker termination is required"
+            ) from error
+        return bool(agreed.item())
+
+    def _disable_storage_data_path(self) -> None:
+        """Stop new storage work while retaining teardown-owned resources."""
+        self.enable_storage = False
+        self.page_get_func = self._generic_page_get
+        self.page_set_func = self._generic_page_set
+
+    def _mark_storage_lifecycle_failed(self) -> None:
+        """Make retained storage state unusable until coordinated cleanup."""
+        self.storage_lifecycle_failed = True
+        # A failed lifecycle may leave a storage thread alive.  Keep every
+        # worker loop asked to stop until process reclaim; reset must not make
+        # retained backend memory reachable again.
+        self.storage_stop_event.set()
+        self._disable_storage_data_path()
+
+    def _ensure_storage_lifecycle_sync_groups(self) -> None:
+        """Require the commit channel established during controller startup."""
+        if self.storage_lifecycle_groups_initialized:
+            return
+        self._mark_storage_lifecycle_failed()
+        raise StorageLifecycleConsensusError(
+            "Storage lifecycle groups were not initialized at worker startup; "
+            "worker termination is required"
+        )
+
+    def prepare_storage_lifecycle(self, local_ready: bool) -> bool:
+        """Vote readiness before any rank may enter or leave lifecycle work."""
+        self._ensure_storage_lifecycle_sync_groups()
+        return self._storage_detach_consensus(local_ready)
+
+    def _storage_lifecycle_vote(
+        self, local_success: bool, coordinated_lifecycle: bool
+    ) -> bool:
+        if not coordinated_lifecycle:
+            return local_success
+        return self._storage_detach_consensus(local_success)
+
+    def initialize_storage_data_sync_groups(self) -> None:
+        """Create data-path groups while every distributed rank is in startup.
+
+        ``create_custom_parallel_group`` uses a default-world collective even
+        when the resulting group covers only one DP replica.  Runtime attach
+        therefore cannot create these groups after replicas have independent
+        queue state.  ``StorageAttachment`` calls this once while the tree is
+        being initialized; startup-attached backends call it before attaching.
+        """
+        if self.storage_data_sync_groups_initialized:
+            return
+        if self.prefetch_hits_sync_groups or self.prefetch_completion_sync_groups:
+            self._mark_storage_lifecycle_failed()
+            raise StorageLifecycleConsensusError(
+                "Storage data sync groups are only partially initialized; "
+                "worker termination is required"
+            )
+        try:
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
+        except Exception as error:
+            self._mark_storage_lifecycle_failed()
+            raise StorageLifecycleConsensusError(
+                "Storage data sync group creation failed; worker termination "
+                "is required"
+            ) from error
+        self.storage_data_sync_groups_initialized = True
+
+    def _ensure_storage_data_sync_groups(self) -> None:
+        if self.storage_data_sync_groups_initialized:
+            return
+        self._mark_storage_lifecycle_failed()
+        raise StorageLifecycleConsensusError(
+            "Storage data sync groups were not initialized at worker startup; "
+            "worker termination is required"
+        )
+
+    def finalize_storage_attach(self, local_success: bool) -> bool:
+        """Commit tree publication, or stop and retain the attached backend.
+
+        Publication happens above the controller after backend workers have
+        started.  If any rank cannot publish its tree state, every rank stops
+        admitting storage work and retains the backend and process groups until
+        worker restart rather than attempting a rank-divergent close rollback.
+        """
+        if self._storage_detach_consensus(local_success):
+            return True
+
+        self._mark_storage_lifecycle_failed()
+        stop_error = None
+        try:
+            self._stop_storage_threads()
+        except Exception as error:
+            logger.exception(
+                "Storage attach publication rollback could not stop threads."
+            )
+            stop_error = error
+
+        if not self._storage_detach_consensus(stop_error is None):
+            raise RuntimeError(
+                "Storage tree publication failed and storage threads did not "
+                "stop on every rank; worker restart is required"
+            ) from stop_error
+        return False
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -564,49 +719,87 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list["PoolEntry"]] = None,
+        coordinated_lifecycle: bool = False,
     ):
         """Attach (enable) storage backend at runtime.
 
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
-        if self.enable_storage:
-            raise RuntimeError("Storage backend already attached.")
+        # Every rank must establish the commit channel before doing anything
+        # fallible locally.  Otherwise one rank can return while its peers enter
+        # group creation or a lifecycle reduction and wait forever.
+        if coordinated_lifecycle:
+            self._ensure_storage_lifecycle_sync_groups()
 
-        # Defensive: a previous partial detach may have flipped `enable_storage` but
-        # left background threads alive. Attaching on top of them is unsafe.
+        preparation_error = None
         try:
+            if self.enable_storage:
+                raise RuntimeError("Storage backend already attached.")
+            if self.storage_lifecycle_failed or self.storage_backend is not None:
+                raise RuntimeError(
+                    "Cannot attach storage backend: a previous storage lifecycle "
+                    "failed or still owns registered memory; worker restart is required."
+                )
+
+            # Defensive: a previous partial detach may have flipped
+            # `enable_storage` but left background threads alive. Attaching on
+            # top of them is unsafe.
             self._stop_storage_threads()
-        except Exception as e:
+
+            self.storage_backend_type = storage_backend
+            from sglang.srt.mem_cache.utils import get_hash_str
+
+            self.get_hash_str = get_hash_str
+            self.storage_config = self._generate_storage_config(
+                model_name, storage_backend_extra_config
+            )
+            # for MLA models, only one rank needs to backup the KV cache
+            self.backup_skip = (
+                self.storage_config.is_mla_model
+                # todo: load balancing
+                and self.storage_config.tp_rank != 0
+            )
+        except Exception as error:
+            logger.exception("Storage backend preparation failed on this rank.")
+            preparation_error = error
+
+        if not self._storage_lifecycle_vote(
+            preparation_error is None, coordinated_lifecycle
+        ):
+            self._mark_storage_lifecycle_failed()
+            where = "this rank" if preparation_error is not None else "a peer rank"
             raise RuntimeError(
-                "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
-            ) from e
+                f"Storage backend preparation failed on {where}; lifecycle "
+                "resources are retained and worker restart is required"
+            ) from preparation_error
 
-        # Rollback-safe init: if creation fails, keep controller state consistent
-        # for future attach attempts.
-        self.storage_backend_type = storage_backend
-        from sglang.srt.mem_cache.utils import get_hash_str
-
-        self.get_hash_str = get_hash_str
-        self.storage_config = self._generate_storage_config(
-            model_name, storage_backend_extra_config
-        )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        )
-
-        # Use storage backend factory for dynamic backend creation
-        from sglang.srt.mem_cache.storage import StorageBackendFactory
-
+        registration_error = None
         try:
+            # Import inside the voted phase: an optional-backend import may fail
+            # on one rank and must not let its peers wait in the next consensus.
+            from sglang.srt.mem_cache.storage import StorageBackendFactory
+
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.storage_host_pool
             )
             self._register_storage_backend_pools(host_pools)
+        except Exception as error:
+            logger.exception("Storage backend registration failed on this rank.")
+            registration_error = error
 
+        if not self._storage_lifecycle_vote(
+            registration_error is None, coordinated_lifecycle
+        ):
+            self._mark_storage_lifecycle_failed()
+            where = "this rank" if registration_error is not None else "a peer rank"
+            raise RuntimeError(
+                f"Storage backend registration failed on {where}; registered "
+                "memory is retained and worker restart is required"
+            ) from registration_error
+
+        activation_error = None
+        try:
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
@@ -624,10 +817,10 @@ class HiCacheController:
             self.prefetch_tokens_occupied = 0
             self._last_rate_limit_log_s = 0.0
 
-            # Use dedicated gloo groups so storage prefetch sync is isolated
-            # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            # These dedicated Gloo groups were created during startup.  Creating
+            # them here would require independently scheduled DP replicas to
+            # enter a default-world collective together.
+            self._ensure_storage_data_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -646,60 +839,75 @@ class HiCacheController:
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
-        except Exception:
-            # Best-effort cleanup for partial init.
-            try:
-                self._stop_storage_threads()
-            except Exception:
-                pass
-            self._destroy_sync_groups(self.prefetch_hits_sync_groups)
-            self._destroy_sync_groups(self.prefetch_completion_sync_groups)
-            self.prefetch_hits_sync_groups = []
-            self.prefetch_completion_sync_groups = []
-            try:
-                if (
-                    hasattr(self, "storage_backend")
-                    and self.storage_backend is not None
-                ):
-                    if hasattr(self.storage_backend, "close"):
-                        self.storage_backend.close()
-            except Exception:
-                pass
-            self.storage_backend = None
-            self.storage_backend_type = None
-            self.enable_storage = False
-            self.page_get_func = self._generic_page_get
-            self.page_set_func = self._generic_page_set
-            raise
+        except Exception as error:
+            logger.exception("Storage backend activation failed on this rank.")
+            activation_error = error
 
-    def detach_storage_backend(self):
+        if self._storage_lifecycle_vote(
+            activation_error is None, coordinated_lifecycle
+        ):
+            return
+
+        # At least one rank failed after registration. Successful ranks may
+        # already have live storage workers; disable admission everywhere, stop
+        # them, and retain every backend/group rather than attempting a
+        # rank-divergent close rollback.
+        self._mark_storage_lifecycle_failed()
+        stop_error = None
+        try:
+            self._stop_storage_threads()
+        except Exception as error:
+            logger.exception("Attach rollback could not stop storage threads.")
+            stop_error = error
+
+        stopped_everywhere = self._storage_lifecycle_vote(
+            stop_error is None, coordinated_lifecycle
+        )
+        if not stopped_everywhere:
+            raise RuntimeError(
+                "Storage backend activation failed and storage threads did not "
+                "stop on every rank; worker restart is required"
+            ) from (stop_error or activation_error)
+
+        where = "this rank" if activation_error is not None else "a peer rank"
+        raise RuntimeError(
+            f"Storage backend activation failed on {where}; registered memory "
+            "is retained and worker restart is required"
+        ) from activation_error
+
+    def detach_storage_backend(self, coordinated_lifecycle: bool = False):
         """Detach (disable) storage backend at runtime.
 
-        Requirement: no in-flight requests. This will stop storage threads and release
-        the backend instance (best-effort close).
+        Requirement: no in-flight requests. Model-parallel ranks agree after
+        stopping storage threads and again after closing their backend. No rank
+        clears shared lifecycle state unless every rank reached both boundaries.
         """
         # Idempotent cleanup: even if `enable_storage` is already False,
         # we may still have leftover resources (threads/backend/process group) from a
         # previous partial detach. We attempt cleanup whenever possible.
+        stop_error = None
         try:
             self._stop_storage_threads()
         except Exception as e:
-            # Do not proceed tearing down backend/process group if threads are not
-            # fully stopped; otherwise still-alive threads may touch released state.
-            # Caller can retry detach.
             logger.exception("Stop storage threads failed: %s", e)
-            # IMPORTANT: Do not silently succeed. Upper layers rely on exceptions here
-            # to avoid flipping `enable_storage` flags while threads are still alive.
-            raise RuntimeError("Stop storage threads failed; detach aborted.") from e
+            stop_error = e
 
-        # Best-effort destroy process groups created for storage ops.
-        self._destroy_sync_groups(
-            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
-        )
-        self.prefetch_hits_sync_groups = []
-        self.prefetch_completion_sync_groups = []
+        if not self._storage_lifecycle_vote(
+            stop_error is None, coordinated_lifecycle
+        ):
+            # Some ranks may have stopped their threads while another did not.
+            # Disable new storage work everywhere and retain every backend/group;
+            # resuming or reattaching would otherwise diverge the model ranks.
+            self._mark_storage_lifecycle_failed()
+            raise RuntimeError(
+                "Storage threads did not stop on this or a peer rank; storage "
+                "is disabled and worker restart is required"
+            ) from stop_error
 
-        # Best-effort close (some backends rely on GC/destructor).
+        # A successful backend close is the ownership boundary: only then may
+        # detach discard the backend reference and the resources it registered.
+        # Keep the backend and groups on every rank if any rank refuses.
+        close_error = None
         try:
             if (
                 hasattr(self, "storage_backend")
@@ -707,14 +915,27 @@ class HiCacheController:
                 and hasattr(self.storage_backend, "close")
             ):
                 self.storage_backend.close()
-        except Exception:
-            logger.exception("Failed to close storage backend cleanly.")
+        except Exception as e:
+            logger.exception("Failed to close storage backend on this rank.")
+            close_error = e
 
+        if not self._storage_lifecycle_vote(
+            close_error is None, coordinated_lifecycle
+        ):
+            self._mark_storage_lifecycle_failed()
+            where = "this rank" if close_error is not None else "a peer rank"
+            raise RuntimeError(
+                f"Storage backend close failed on {where}; storage is disabled "
+                "and worker restart is required"
+            ) from close_error
+
+        # Storage threads are stopped and the backend is quiescent.  The
+        # startup-created data and lifecycle groups remain for a future attach;
+        # recreating them dynamically would require a default-world collective.
         self.storage_backend = None
         self.storage_backend_type = None
-        self.enable_storage = False
-        self.page_get_func = self._generic_page_get
-        self.page_set_func = self._generic_page_set
+        self.storage_lifecycle_failed = False
+        self._disable_storage_data_path()
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -788,6 +1009,13 @@ class HiCacheController:
         )
 
     def reset(self):
+        if self.storage_lifecycle_failed:
+            self.storage_stop_event.set()
+            raise RuntimeError(
+                "Cannot reset HiCache after a storage lifecycle failure; "
+                "worker restart is required."
+            )
+
         self.storage_stop_event.set()
 
         self.write_queue.clear()

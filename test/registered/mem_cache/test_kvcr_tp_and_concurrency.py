@@ -1596,12 +1596,27 @@ class CloseTest(unittest.TestCase):
         store, core = self._store_with_pump(wedged.wait)
         self.addCleanup(wedged.set)
 
-        with mock.patch.object(kvcr_store, "_PUMP_JOIN_TIMEOUT_S", 0.05):
+        with (
+            mock.patch.object(kvcr_store, "_PUMP_JOIN_TIMEOUT_S", 0.05),
+            self.assertRaisesRegex(RuntimeError, "source pump did not stop"),
+        ):
             store.close()
 
         self.assertFalse(core.closed)
         # And the store still holds the core, so nothing later mistakes it for
         # an already-released handle.
+        self.assertIs(store._kvcr, core)
+
+    def test_a_core_close_failure_is_propagated_and_retains_the_core(self):
+        store = _store(0, 1)
+        core = mock.Mock()
+        core.close.side_effect = RuntimeError("native operations still active")
+        store._kvcr = core
+
+        with self.assertRaisesRegex(RuntimeError, "KVCR core did not close"):
+            store.close()
+
+        core.close.assert_called_once_with()
         self.assertIs(store._kvcr, core)
 
 

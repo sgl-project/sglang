@@ -152,6 +152,7 @@ class HybridCacheController(BaseHiCacheController):
 
         self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
+            self.initialize_storage_data_sync_groups()
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
                 prefetch_threshold=prefetch_threshold,
@@ -180,6 +181,7 @@ class HybridCacheController(BaseHiCacheController):
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
+        coordinated_lifecycle: bool = False,
     ):
         super().attach_storage_backend(
             storage_backend=storage_backend,
@@ -187,6 +189,7 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             host_pools=host_pools,
+            coordinated_lifecycle=coordinated_lifecycle,
         )
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:

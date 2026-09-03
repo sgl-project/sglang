@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -10,6 +10,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
+)
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AttachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqInput,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 
@@ -64,6 +68,47 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_hicache_lifecycle_request_is_forwarded_before_pp_consensus(self):
+        for request in (
+            AttachHiCacheStorageReqInput(hicache_storage_backend="kvcr"),
+            DetachHiCacheStorageReqInput(),
+        ):
+            with self.subTest(request=type(request).__name__):
+                events = []
+                scheduler = SchedulerPPMixin()
+                scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+                pending_send = object()
+                scheduler.send_req_work = pending_send
+                requests = [request]
+                scheduler.request_receiver = SimpleNamespace(
+                    recv_requests=Mock(
+                        side_effect=lambda: events.append("recv") or requests
+                    )
+                )
+                scheduler._pp_commit_comm_work = Mock(
+                    side_effect=lambda _work: events.append("commit-old-send")
+                )
+                scheduler._pp_send_pyobj_to_next_stage = Mock(
+                    side_effect=lambda *_args, **_kwargs: (
+                        events.append("sync-send") or []
+                    )
+                )
+                scheduler.process_input_requests = Mock(
+                    side_effect=lambda _reqs: events.append("process")
+                )
+
+                received, forwarded = scheduler._pp_recv_process_input_requests()
+
+                self.assertIs(received, requests)
+                self.assertTrue(forwarded)
+                self.assertEqual(
+                    events, ["recv", "commit-old-send", "sync-send", "process"]
+                )
+                scheduler._pp_commit_comm_work.assert_called_once_with(pending_send)
+                scheduler._pp_send_pyobj_to_next_stage.assert_called_once_with(
+                    requests, async_send=False
+                )
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []

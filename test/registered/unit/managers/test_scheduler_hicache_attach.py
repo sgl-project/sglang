@@ -8,12 +8,14 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     DetachHiCacheStorageReqInput,
 )
+from sglang.srt.managers.cache_controller import StorageLifecycleConsensusError
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,8 +38,9 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler.enable_hicache_storage = False
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(
-            attach_storage_backend=lambda **kwargs: (True, "attached"),
-            detach_storage_backend=lambda: (True, "detached"),
+            supports_coordinated_storage_lifecycle=True,
+            attach_storage_backend=Mock(return_value=(True, "attached")),
+            detach_storage_backend=Mock(return_value=(True, "detached")),
         )
         return scheduler
 
@@ -75,6 +78,85 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         # meant to differ here.
         self.assertEqual(
             resolution_result(self.server_args, "hicache_storage_backend"), "file"
+        )
+
+    def test_detach_refusal_still_disables_a_stopped_tree_data_path(self):
+        scheduler = self._scheduler(hicache_storage_backend="kvcr")
+        scheduler.enable_hicache_storage = True
+        scheduler.tree_cache.enable_storage = False
+        scheduler.tree_cache.detach_storage_backend = lambda **_kwargs: (
+            False,
+            "KVCR close failed; worker restart required",
+        )
+
+        out = scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+
+        self.assertFalse(out.success)
+        self.assertFalse(scheduler.enable_hicache_storage)
+        self.assertIsNone(get_memory().hicache_storage_backend)
+
+    def test_detach_consensus_failure_is_fatal_to_the_scheduler(self):
+        scheduler = self._scheduler(hicache_storage_backend="kvcr")
+        scheduler.enable_hicache_storage = True
+
+        def fail_consensus(**_kwargs):
+            raise StorageLifecycleConsensusError("gloo failed")
+
+        scheduler.tree_cache.detach_storage_backend = fail_consensus
+
+        with self.assertRaisesRegex(StorageLifecycleConsensusError, "gloo failed"):
+            scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+
+    def test_attach_busy_state_is_voted_inside_the_storage_lifecycle(self):
+        scheduler = self._scheduler(hicache_storage_backend=None)
+        scheduler.is_fully_idle = lambda: False
+        scheduler.waiting_queue = [object()]
+        scheduler.running_batch = SimpleNamespace(reqs=[])
+        scheduler.tree_cache.attach_storage_backend.return_value = (
+            False,
+            "scheduler is not idle on this or a peer rank",
+        )
+
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(hicache_storage_backend="file")
+        )
+
+        self.assertFalse(out.success)
+        self.assertEqual(
+            scheduler.tree_cache.attach_storage_backend.call_args.kwargs["local_ready"],
+            False,
+        )
+
+    def test_detach_busy_state_is_voted_inside_the_storage_lifecycle(self):
+        scheduler = self._scheduler(hicache_storage_backend="file")
+        scheduler.enable_hicache_storage = True
+        scheduler.is_fully_idle = lambda: False
+        scheduler.waiting_queue = [object()]
+        scheduler.running_batch = SimpleNamespace(reqs=[])
+        scheduler.tree_cache.detach_storage_backend.return_value = (
+            False,
+            "scheduler is not idle on this or a peer rank",
+        )
+
+        out = scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+
+        self.assertFalse(out.success)
+        scheduler.tree_cache.detach_storage_backend.assert_called_once_with(
+            local_ready=False
+        )
+
+    def test_legacy_tree_keeps_the_original_attach_signature(self):
+        scheduler = self._scheduler(hicache_storage_backend=None)
+        scheduler.tree_cache.supports_coordinated_storage_lifecycle = False
+
+        out = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(hicache_storage_backend="file")
+        )
+
+        self.assertTrue(out.success)
+        self.assertNotIn(
+            "local_ready",
+            scheduler.tree_cache.attach_storage_backend.call_args.kwargs,
         )
 
 

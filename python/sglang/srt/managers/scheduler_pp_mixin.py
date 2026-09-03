@@ -25,6 +25,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqInput,
+)
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -71,6 +75,41 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_preforward_hicache_lifecycle_requests(
+        self: Scheduler, recv_reqs: list
+    ) -> bool:
+        """Forward attach/detach before a PP-spanning lifecycle collective.
+
+        PP0 normally handles a request before forwarding it.  HiCache lifecycle
+        handlers may enter a PP consensus, so that ordering would wait on a
+        downstream stage that has not received the request yet.  A synchronous
+        pre-forward makes the request cascade to the last stage first.
+        """
+        has_lifecycle_request = any(
+            isinstance(
+                req,
+                (AttachHiCacheStorageReqInput, DetachHiCacheStorageReqInput),
+            )
+            for req in recv_reqs
+        )
+        if self.pp_group.is_last_rank or not has_lifecycle_request:
+            return False
+
+        self._pp_commit_comm_work(self.send_req_work)
+        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+            recv_reqs, async_send=False
+        )
+        return True
+
+    def _pp_recv_process_input_requests(self: Scheduler) -> tuple[list, bool]:
+        """Receive, pre-forward lifecycle commands, then handle the batch."""
+        recv_reqs = self.request_receiver.recv_requests()
+        lifecycle_preforwarded = self._pp_preforward_hicache_lifecycle_requests(
+            recv_reqs
+        )
+        self.process_input_requests(recv_reqs)
+        return recv_reqs, lifecycle_preforwarded
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -105,9 +144,10 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.request_receiver.recv_requests()
-                    self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                    recv_reqs, lifecycle_preforwarded = (
+                        self._pp_recv_process_input_requests()
+                    )
+                if not self.pp_group.is_last_rank and not lifecycle_preforwarded:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -245,8 +285,9 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                recv_reqs, lifecycle_preforwarded = (
+                    self._pp_recv_process_input_requests()
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -337,9 +378,12 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    if lifecycle_preforwarded:
+                        self.send_req_work = []
+                    else:
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs, async_send=True
+                        )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
                     )
@@ -399,8 +443,9 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
-                self.process_input_requests(recv_reqs)
+                recv_reqs, lifecycle_preforwarded = (
+                    self._pp_recv_process_input_requests()
+                )
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -523,9 +568,12 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    if lifecycle_preforwarded:
+                        self.send_req_work = []
+                    else:
+                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                            recv_reqs, async_send=True
+                        )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )

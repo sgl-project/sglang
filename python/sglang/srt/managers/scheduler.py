@@ -110,6 +110,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.cache_controller import StorageLifecycleConsensusError
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -4644,7 +4645,15 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        local_ready = self.is_fully_idle()
+        coordinated_lifecycle = bool(
+            getattr(
+                self.tree_cache,
+                "supports_coordinated_storage_lifecycle",
+                False,
+            )
+        )
+        if not coordinated_lifecycle and not local_ready:
             return AttachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -4661,13 +4670,18 @@ class Scheduler(
             )
 
         try:
-            ok, msg = self.tree_cache.attach_storage_backend(
+            attach_kwargs = dict(
                 storage_backend=recv_req.hicache_storage_backend,
                 storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
                 served_model_name=get_serving().served_model_name,
                 hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
                 hicache_write_policy=recv_req.hicache_write_policy,
             )
+            if coordinated_lifecycle:
+                attach_kwargs["local_ready"] = local_ready
+            ok, msg = self.tree_cache.attach_storage_backend(**attach_kwargs)
+        except StorageLifecycleConsensusError:
+            raise
         except Exception as e:
             logger.exception("Attach HiCache storage backend failed with exception.")
             return AttachHiCacheStorageReqOutput(success=False, message=str(e))
@@ -4700,7 +4714,15 @@ class Scheduler(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        if not self.is_fully_idle():
+        local_ready = self.is_fully_idle()
+        coordinated_lifecycle = bool(
+            getattr(
+                self.tree_cache,
+                "supports_coordinated_storage_lifecycle",
+                False,
+            )
+        )
+        if not coordinated_lifecycle and not local_ready:
             return DetachHiCacheStorageReqOutput(
                 success=False,
                 message=(
@@ -4718,13 +4740,18 @@ class Scheduler(
 
         # Idempotent detach: even if scheduler thinks storage is disabled, we still
         # attempt best-effort cleanup in tree_cache (it may have leftover state).
+        storage_was_enabled = self.enable_hicache_storage
         try:
-            ok, msg = self.tree_cache.detach_storage_backend()
+            detach_kwargs = {"local_ready": local_ready} if coordinated_lifecycle else {}
+            ok, msg = self.tree_cache.detach_storage_backend(**detach_kwargs)
+        except StorageLifecycleConsensusError:
+            raise
         except Exception as e:
             logger.exception("Detach HiCache storage backend failed with exception.")
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
-        if ok or (not self.enable_hicache_storage):
+        tree_storage_disabled = not getattr(self.tree_cache, "enable_storage", True)
+        if ok or (not storage_was_enabled) or tree_storage_disabled:
             # Treat "already disabled / nothing to do" as success for idempotence.
             self.enable_hicache_storage = False
             get_context().override(
@@ -4732,6 +4759,13 @@ class Scheduler(
                 hicache_storage_backend=None,
                 hicache_storage_backend_extra_config=None,
             )
+            if not ok and storage_was_enabled:
+                logger.error(
+                    "HiCache storage data path is disabled, but backend teardown "
+                    "did not complete: %s",
+                    msg,
+                )
+                return DetachHiCacheStorageReqOutput(success=False, message=msg)
             logger.info("Detached HiCache storage backend.")
             return DetachHiCacheStorageReqOutput(
                 success=True, message=msg or "HiCache storage backend is detached."

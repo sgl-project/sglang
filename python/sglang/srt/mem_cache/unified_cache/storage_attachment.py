@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.managers.cache_controller import StorageLifecycleConsensusError
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -39,6 +40,14 @@ class StorageAttachment:
 
     def __init__(self, cache: UnifiedRadixCache):
         self._cache = cache
+        # Custom group creation is a default-world collective.  Do it while all
+        # scheduler ranks are still constructing the tree, before DP replicas
+        # acquire independent request/idle state.
+        controller = getattr(cache, "cache_controller", None)
+        if controller is not None and hasattr(
+            controller, "initialize_storage_data_sync_groups"
+        ):
+            controller.initialize_storage_data_sync_groups()
 
     # ---- Lifecycle entry points ----
 
@@ -49,6 +58,7 @@ class StorageAttachment:
         served_model_name: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
+        local_ready: bool = True,
     ) -> tuple[bool, str]:
         """Enable the storage backend at runtime.
 
@@ -73,6 +83,20 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
+        try:
+            lifecycle_ready = controller.prepare_storage_lifecycle(local_ready)
+        except StorageLifecycleConsensusError:
+            raise
+        except Exception as e:
+            logger.exception("Failed to coordinate storage attach readiness.")
+            return False, f"Failed to coordinate storage attach readiness: {e}"
+        if not lifecycle_ready:
+            return (
+                False,
+                "Reject attach: scheduler is not idle on this or a peer "
+                "model-parallel rank.",
+            )
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:
@@ -90,13 +114,11 @@ class StorageAttachment:
                 "policies updated.",
             )
 
-        # Apply policies before the controller attach, so the storage threads
-        # observe the new values as soon as they start.
-        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
-
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
+        parsed_config = None
+        parse_error = None
         try:
-            (
+            parsed_config = (
                 extra_config,
                 prefetch_threshold,
                 prefetch_timeout_base,
@@ -105,13 +127,43 @@ class StorageAttachment:
             ) = HybridCacheController.parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
-        except Exception as e:
-            logger.exception(f"Failed to parse storage_backend_extra_config_json: {e}")
+        except Exception as error:
+            logger.exception(
+                "Failed to parse storage_backend_extra_config_json: %s", error
+            )
+            parse_error = error
+
+        try:
+            parse_agreed = controller.prepare_storage_lifecycle(parse_error is None)
+        except StorageLifecycleConsensusError:
+            raise
+        except Exception as error:
+            logger.exception("Failed to coordinate storage config parsing.")
             return (
                 False,
-                f"Failed to parse storage_backend_extra_config_json "
-                f"'{storage_backend_extra_config_json}': {e}",
+                f"Failed to coordinate storage config parsing: {error}",
             )
+        if not parse_agreed:
+            where = "this rank" if parse_error is not None else "a peer rank"
+            detail = f": {parse_error}" if parse_error is not None else ""
+            return (
+                False,
+                f"Failed to parse storage_backend_extra_config_json on "
+                f"{where}{detail}; backend was not attached.",
+            )
+
+        assert parsed_config is not None
+        (
+            extra_config,
+            prefetch_threshold,
+            prefetch_timeout_base,
+            prefetch_timeout_per_ki_token,
+            hicache_storage_pass_prefix_keys,
+        ) = parsed_config
+
+        # Apply policies before the controller attach, so the storage threads
+        # observe the new values as soon as they start.
+        self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
 
         try:
             controller.attach_storage_backend(
@@ -120,26 +172,62 @@ class StorageAttachment:
                 model_name=served_model_name,
                 storage_backend_extra_config=extra_config,
                 host_pools=controller.mem_pool_host.entries,
+                coordinated_lifecycle=True,
             )
+        except StorageLifecycleConsensusError:
+            raise
         except Exception as e:
             logger.exception(
                 f"Failed to attach storage backend '{storage_backend}': {e}"
             )
             return False, f"Failed to attach storage backend '{storage_backend}': {e}"
 
-        self.apply_runtime_config(
-            storage_backend=storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
-            hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
-            enable_storage=True,
-            enable_storage_metrics=cache._enable_metrics_flag,
-            extra_metric_labels=cache.extra_metric_labels,
-        )
+        publication_error = None
+        try:
+            self.apply_runtime_config(
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                prefetch_timeout_base=prefetch_timeout_base,
+                prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+                hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+                enable_storage=True,
+                enable_storage_metrics=cache._enable_metrics_flag,
+                extra_metric_labels=cache.extra_metric_labels,
+            )
+        except Exception as error:
+            logger.exception("Failed to publish attached storage state to the tree.")
+            publication_error = error
+
+        try:
+            publication_agreed = controller.finalize_storage_attach(
+                publication_error is None
+            )
+        except StorageLifecycleConsensusError:
+            cache.enable_storage = False
+            cache.enable_storage_metrics = False
+            raise
+        except Exception as error:
+            cache.enable_storage = False
+            cache.enable_storage_metrics = False
+            logger.exception("Failed to coordinate storage tree publication.")
+            return False, f"Failed to coordinate storage tree publication: {error}"
+
+        if not publication_agreed:
+            cache.enable_storage = False
+            cache.enable_storage_metrics = False
+            where = "this rank" if publication_error is not None else "a peer rank"
+            return (
+                False,
+                f"Storage tree publication failed on {where}; backend memory is "
+                "retained and worker restart is required.",
+            )
         return True, "Attached HiCache storage backend successfully."
 
-    def detach(self) -> tuple[bool, str]:
+    def detach(
+        self,
+        local_ready: bool = True,
+        coordinated_lifecycle: bool = True,
+    ) -> tuple[bool, str]:
         """Disable the storage backend at runtime.
 
         The caller must ensure there are no running or queued requests. Ordering
@@ -159,17 +247,65 @@ class StorageAttachment:
         if controller is None:
             return False, "HiCache storage backend is not initialized."
 
+        if coordinated_lifecycle:
+            try:
+                lifecycle_ready = controller.prepare_storage_lifecycle(local_ready)
+            except StorageLifecycleConsensusError:
+                raise
+            except Exception as e:
+                logger.exception("Failed to coordinate storage detach readiness.")
+                return False, f"Failed to coordinate storage detach readiness: {e}"
+            if not lifecycle_ready:
+                return (
+                    False,
+                    "Reject detach: scheduler is not idle on this or a peer "
+                    "model-parallel rank.",
+                )
+
+        drain_error = None
         try:
             cache.drain_storage_control_queues_local()
+        except Exception as error:
+            logger.exception("Failed to drain storage queues before detach.")
+            drain_error = error
+
+        try:
+            drain_agreed = (
+                controller.prepare_storage_lifecycle(drain_error is None)
+                if coordinated_lifecycle
+                else drain_error is None
+            )
+        except StorageLifecycleConsensusError:
+            raise
+        except Exception as e:
+            logger.exception("Failed to coordinate storage detach preparation.")
+            return False, f"Failed to coordinate storage detach preparation: {e}"
+        if not drain_agreed:
+            where = "this rank" if drain_error is not None else "a peer rank"
+            detail = f": {drain_error}" if drain_error is not None else ""
+            return (
+                False,
+                f"Storage detach preparation failed on {where}{detail}; "
+                "backend remains attached.",
+            )
+
+        try:
             # Idempotent: ask the controller to clean up even when `enable_storage`
             # is already False, since that may be leftover state from an earlier
             # partial detach.
-            controller.detach_storage_backend()
+            controller.detach_storage_backend(
+                coordinated_lifecycle=coordinated_lifecycle
+            )
+        except StorageLifecycleConsensusError:
+            raise
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
-            # Never crash the server for an admin operation. The controller raises
-            # while its threads are still alive, so leave `ongoing_*` untouched --
-            # a retry must still be able to match their acks.
+            # A coordinated teardown refusal disables the controller data path
+            # while retaining native resources. Publish that disabled state to
+            # the tree too, so requests cannot enqueue onto stopped threads.
+            if not controller.enable_storage:
+                cache.enable_storage = False
+                cache.enable_storage_metrics = False
             return False, f"Failed to detach HiCache storage backend: {e}"
 
         try:
@@ -189,10 +325,55 @@ class StorageAttachment:
         via CLI args or via the admin API is detached on exit.
         """
         try:
-            if self._cache.enable_storage:
-                self.detach()
+            controller = getattr(self._cache, "cache_controller", None)
+            backend = getattr(controller, "storage_backend", None)
+            lifecycle_failed = bool(
+                getattr(controller, "storage_lifecycle_failed", False)
+            )
+            if self._cache.enable_storage or backend is not None or lifecycle_failed:
+                # Peers may already be gone on atexit.  Only local quiescence is
+                # required because this process will not serve another request.
+                self.detach(coordinated_lifecycle=False)
+        except StorageLifecycleConsensusError:
+            raise
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
+
+    def release_host_resources(self) -> None:
+        """Detach storage before releasing host memory registered into it.
+
+        Unlike :meth:`shutdown`, this graceful-release boundary is strict. A
+        backend that refuses to close may still own native operations against
+        the linker's host pools, so those pools must remain mapped until process
+        reclaim rather than be destroyed underneath it.
+        """
+        cache = self._cache
+        controller = getattr(cache, "cache_controller", None)
+        backend = (
+            getattr(controller, "storage_backend", None)
+            if controller is not None
+            else None
+        )
+        lifecycle_failed = bool(
+            getattr(controller, "storage_lifecycle_failed", False)
+            if controller is not None
+            else False
+        )
+        if cache.enable_storage or backend is not None or lifecycle_failed:
+            # Scheduler ``finally`` paths cannot assume peer ranks are alive.
+            # A local close is sufficient to prove this rank's host mappings
+            # are no longer reachable by native operations.
+            detached, message = self.detach(coordinated_lifecycle=False)
+            if not detached:
+                raise RuntimeError(
+                    "Cannot release HiCache host pools before storage detaches: "
+                    f"{message}"
+                )
+
+        if cache.linker is not None:
+            cache.linker.close()
+        if cache.host_pool_group is not None:
+            cache.host_pool_group.destroy()
 
     def clear(self) -> bool:
         """Drop everything the backend has stored, keeping it attached."""
@@ -280,7 +461,6 @@ class StorageAttachment:
 
         existing_collector = cache.storage_metrics_collector
         if existing_collector is None:
-
             storage_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,

@@ -155,6 +155,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    supports_coordinated_storage_lifecycle = True
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -511,6 +513,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        if self._storage_attachment is not None:
+            self._storage_attachment.release_host_resources()
+            return
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -2521,6 +2526,7 @@ class UnifiedRadixCache(BasePrefixCache):
         served_model_name: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = None,
         hicache_write_policy: Optional[str] = None,
+        local_ready: bool = True,
     ) -> tuple[bool, str]:
         """Attach (enable) the HiCache storage backend at runtime."""
         if self._storage_attachment is None:
@@ -2535,13 +2541,14 @@ class UnifiedRadixCache(BasePrefixCache):
             served_model_name=served_model_name,
             hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
             hicache_write_policy=hicache_write_policy,
+            local_ready=local_ready,
         )
 
-    def detach_storage_backend(self) -> tuple[bool, str]:
+    def detach_storage_backend(self, local_ready: bool = True) -> tuple[bool, str]:
         """Detach (disable) the HiCache storage backend at runtime."""
         if self._storage_attachment is None:
             return False, "HiCache storage backend is not initialized."
-        return self._storage_attachment.detach()
+        return self._storage_attachment.detach(local_ready=local_ready)
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
