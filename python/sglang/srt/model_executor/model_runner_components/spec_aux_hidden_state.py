@@ -112,17 +112,29 @@ def _resolve_eagle_aux_hidden_state(
         )
 
     if spec_algorithm.is_eagle3():
-        config.eagle_use_aux_hidden_state = True
-        try:
-            eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
-            config.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
+        eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
+        draft_architectures = set(
+            getattr(draft_model_config.hf_config, "architectures", None) or []
+        )
+        is_glm5_native_nextn = (
+            "Glm5NextForConditionalGenerationNextN" in draft_architectures
+            or getattr(draft_model_config.hf_config, "model_type", None) == "glm5_next"
+        ) and eagle_config is None
+
+        # GLM-5.3's native MTP head consumes the final H-wide target state. It
+        # has no EAGLE3 aux-state projection; applying EAGLE3's generic fallback
+        # would incorrectly concatenate three target states into a 3H tensor.
+        config.eagle_use_aux_hidden_state = not is_glm5_native_nextn
+        if eagle_config is not None:
+            getter = (
+                eagle_config.get
+                if isinstance(eagle_config, dict)
+                else lambda key, default=None: getattr(eagle_config, key, default)
             )
-            config.eagle_aux_hidden_state_layer_ids = eagle_config[
-                "eagle_aux_hidden_state_layer_ids"
-            ]
-        except Exception:
-            config.eagle_aux_hidden_state_layer_ids = None
+            config.eagle_use_aux_hidden_state = getter("use_aux_hidden_state", True)
+            config.eagle_aux_hidden_state_layer_ids = getter(
+                "eagle_aux_hidden_state_layer_ids", None
+            )
 
 
 def _resolve_dflash_aux_hidden_state(
