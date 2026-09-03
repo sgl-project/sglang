@@ -51,9 +51,9 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
     VEC = _VEC
     NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
-    assert (
-        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
-    ), f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
+        f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    )
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -543,9 +543,9 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
     VEC = _VEC
     NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
-    assert (
-        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
-    ), f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
+        f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    )
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])

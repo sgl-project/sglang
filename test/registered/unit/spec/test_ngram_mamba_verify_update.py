@@ -123,15 +123,19 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             dtype=torch.int32,
         )
 
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.srt.speculative.spec_utils.get_spec",
-            return_value=MagicMock(speculative_eagle_topk=2),
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=256,
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.get_spec",
+                return_value=MagicMock(speculative_eagle_topk=2),
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -200,15 +204,19 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             dtype=torch.int32,
         )
 
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=256,
-        ), patch(
-            "sglang.srt.speculative.spec_utils.get_spec",
-            return_value=MagicMock(speculative_eagle_topk=2),
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.get_spec",
+                return_value=MagicMock(speculative_eagle_topk=2),
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -467,25 +475,29 @@ class TestMambaTrackSkipAdaptiveBound(CustomTestCase):
                 torch.tensor([-1], dtype=torch.int32),
             )
         )
-        with patch(
-            "sglang.srt.speculative.spec_utils.mambaish_config",
-            return_value={"some": "config"},
-        ), patch(
-            "sglang.srt.speculative.spec_utils.get_spec",
-            return_value=MagicMock(speculative_eagle_topk=1),
-        ), patch(
-            "sglang.srt.speculative.spec_utils.mamba_track_grid",
-            return_value=interval,
-        ), patch(
-            "sglang.srt.speculative.spec_utils.max_speculative_num_draft_tokens",
-            return_value=max_draft,
-        ), patch(
-            "sglang.srt.speculative.spec_utils._is_cuda", True
-        ), patch(
-            "sglang.srt.speculative.spec_utils._is_hip", False
-        ), patch(
-            "sglang.kernels.ops.speculative.eagle.nextn_mamba_commit_prologue_func",
-            prologue,
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.get_spec",
+                return_value=MagicMock(speculative_eagle_topk=1),
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=interval,
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.max_speculative_num_draft_tokens",
+                return_value=max_draft,
+            ),
+            patch("sglang.srt.speculative.spec_utils._is_cuda", True),
+            patch("sglang.srt.speculative.spec_utils._is_hip", False),
+            patch(
+                "sglang.kernels.ops.speculative.eagle.nextn_mamba_commit_prologue_func",
+                prologue,
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,

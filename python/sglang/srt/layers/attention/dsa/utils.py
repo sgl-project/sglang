@@ -326,9 +326,9 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
 
     if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -402,9 +402,9 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_parallel().attn_cp_size
-        assert (
-            input_.shape[0] % cp_size == 0
-        ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        assert input_.shape[0] % cp_size == 0, (
+            f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
+        )
         return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(

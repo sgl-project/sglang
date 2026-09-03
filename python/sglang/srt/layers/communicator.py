@@ -492,9 +492,9 @@ def tp_reduce_scatter(
     ``LayerCommunicator`` instance."""
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
-    assert (
-        hidden_states.shape[0] % context.tp_size == 0
-    ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    assert hidden_states.shape[0] % context.tp_size == 0, (
+        f"Expected total tokens {hidden_states.shape[0]} % tp_size {context.tp_size} to be 0"
+    )
     local_tokens = hidden_states.shape[0] // context.tp_size
     output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
     get_tp_group().reduce_scatter_tensor(output, hidden_states)

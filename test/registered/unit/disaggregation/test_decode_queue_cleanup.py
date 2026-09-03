@@ -367,8 +367,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         tail = decode_req(8)
         queue.pending_reqs.append(tail)
         with patch(
-            "sglang.srt.disaggregation.decode."
-            "CommonKVReceiver.query_prefill_dp_ranks",
+            "sglang.srt.disaggregation.decode.CommonKVReceiver.query_prefill_dp_ranks",
             return_value={"8": 2},
         ) as query:
             queue._resolve_pending_reqs()
