@@ -98,7 +98,12 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+    # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
+    # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
+    # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
+    elif x.shape[-1] != hidden_size or (
+        _is_sm107_supported() and x.dtype != torch.float32
+    ):
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
@@ -300,7 +305,6 @@ def quant_dequant_mxfp4(
 
 
 class Mxfp4Config(QuantizationConfig):
-
     def __init__(
         self,
         ignored_layers: Optional[list[str]] = None,
@@ -322,7 +326,6 @@ class Mxfp4Config(QuantizationConfig):
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
-
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
@@ -381,7 +384,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-
     def __init__(
         self,
         prefix: str,
@@ -1007,7 +1009,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_kernels:
-
             from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
@@ -1623,13 +1624,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             is_standard = TopKOutputChecker.format_is_standard(topk_output)
             # The situ path accepts precomputed (standard) routing; the
             # public path below is logits-only.
-            assert is_standard or TopKOutputChecker.format_is_bypassed(
-                topk_output
-            ), f"unsupported topk format: {topk_output.format}"
+            assert is_standard or TopKOutputChecker.format_is_bypassed(topk_output), (
+                f"unsupported topk format: {topk_output.format}"
+            )
             if is_standard:
-                assert (
-                    self.moe_runner_config.activation == "situ"
-                ), "standard topk output only wired for the situ path"
+                assert self.moe_runner_config.activation == "situ", (
+                    "standard topk output only wired for the situ path"
+                )
                 top_k = topk_output.topk_ids.shape[1]
                 router_logits = None
             else:
@@ -1823,9 +1824,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 TritonKernelsQuantInfo,
             )
 
-            assert (
-                layer.moe_ep_size == 1
-            ), "Expert parallel is not supported when using triton kernels"
+            assert layer.moe_ep_size == 1, (
+                "Expert parallel is not supported when using triton kernels"
+            )
             quant_info = TritonKernelsQuantInfo(
                 w13_weight=(
                     self.w13_weight_triton_tensor
