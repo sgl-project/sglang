@@ -139,8 +139,11 @@ class TestCaptureOneWithProfiling(CustomTestCase):
             rf_names.append(name)
             return contextlib.nullcontext()
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"), mock.patch(
-            "torch.profiler.record_function", side_effect=_fake_record_function
+        with (
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+            mock.patch(
+                "torch.profiler.record_function", side_effect=_fake_record_function
+            ),
         ):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 

@@ -553,9 +553,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not get_bool_env_var("SGLANG_PIECEWISE_NO_CAPTURED_METADATA")
         )
         if _wants_captured_metadata:
-            self.use_captured_attn_metadata = (
-                model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
-            )
+            self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
         self.attn_metadata_buffers: Optional[Dict[int, object]] = (
@@ -635,9 +633,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
         if not forward_batch.return_logprob:
             return forward_batch.batch_size
-        assert (
-            self._uses_eager_prefill_tail()
-        ), "Prefill return_logprob requires an eager logits tail."
+        assert self._uses_eager_prefill_tail(), (
+            "Prefill return_logprob requires an eager logits tail."
+        )
 
         global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
         if global_num_tokens is not None:
