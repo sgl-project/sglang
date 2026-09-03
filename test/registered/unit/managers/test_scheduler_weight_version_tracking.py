@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -103,6 +105,9 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
 
 def _runner(result=(True, "ok")):
     runner = Mock()
+    runner.weight_updater.receive_weights_from_distributed.return_value = [
+        ("model.layers.0.weight", torch.ones(1))
+    ]
     for method in (
         "update_weights_from_disk",
         "update_weights_from_tensor",
@@ -145,7 +150,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             tp_worker=SimpleNamespace(
                 model_runner=target,
                 weight_update_runners=lambda: [("target", target)],
-                deserialize_own_rank=lambda payloads: [],
+                deserialize_own_rank=lambda payloads: [
+                    ("model.layers.0.weight", torch.ones(1))
+                ],
             ),
             draft_worker=(
                 None
@@ -171,7 +178,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
     def test_successful_update_records_the_version(self):
         """A refit that reports success advances the scheduler-side version."""
-        output = self._manager(_runner()).update_weights_from_disk(_request())
+        output = self._manager(_runner(), session=False).update_weights_from_disk(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
@@ -196,9 +205,12 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        output = self._manager(_runner()).update_weights_from_distributed(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
@@ -212,14 +224,19 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
     def test_successful_tensor_update_records_the_version(self):
         """The tensor refit records the version once the load reports success."""
-        output = self._manager(_runner()).update_weights_from_tensor(_request())
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_successful_ipc_update_records_the_version(self):
         """The checkpoint-engine IPC refit records the version like every other path."""
-        output = self._manager(_runner()).update_weights_from_ipc(_request())
+        output = self._manager(_runner(), session=False).update_weights_from_ipc(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])

@@ -144,7 +144,7 @@ class TestLruSkipsNonReloadable(CustomTestCase):
             registry = LoRARegistry()
             # Registration order = LRU order; the wire-loaded ref is oldest.
             await registry.register(
-                LoRARef(lora_name="wire", lora_path="__distributed__", reloadable=False)
+                LoRARef(lora_name="wire", lora_path="__stream__", reloadable=False)
             )
             await registry.register(LoRARef(lora_name="disk", lora_path="/d"))
             self.assertEqual(await registry.lru_lora_name(), "disk")
@@ -155,10 +155,10 @@ class TestLruSkipsNonReloadable(CustomTestCase):
         async def run():
             registry = LoRARegistry()
             await registry.register(
-                LoRARef(lora_name="w1", lora_path="__tensor__", reloadable=False)
+                LoRARef(lora_name="w1", lora_path="__stream__", reloadable=False)
             )
             await registry.register(
-                LoRARef(lora_name="w2", lora_path="__distributed__", reloadable=False)
+                LoRARef(lora_name="w2", lora_path="__stream__", reloadable=False)
             )
             self.assertIsNone(await registry.lru_lora_name())
             self.assertIsNone(await registry.lru_lora_name(exclude_pinned=True))
