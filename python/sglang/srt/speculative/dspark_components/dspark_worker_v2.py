@@ -125,7 +125,6 @@ def _configure_target_hidden_projection(
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,

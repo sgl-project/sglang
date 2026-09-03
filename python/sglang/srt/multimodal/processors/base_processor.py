@@ -1754,9 +1754,9 @@ class BaseMultimodalProcessor(ABC):
                 and not raw_audios
                 and not raw_videos
             ):
-                assert isinstance(
-                    base_output.input_ids, list
-                ), f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                assert isinstance(base_output.input_ids, list), (
+                    f"expected list[int] input_ids, got {type(base_output.input_ids)}"
+                )
                 try:
                     counts = self.resolve_image_token_counts(raw_images)
                     image_placeholder_token_id = mm_tokens.image_token_id

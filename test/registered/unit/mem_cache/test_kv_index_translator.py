@@ -182,7 +182,6 @@ def _alloc_and_fill(allocator, ps, lens):
 
 
 class TestReadTableBuild(unittest.TestCase):
-
     def test_read_table_matches_reference_across_multipliers(self):
         """The load-bearing formula pin: full AND swa read tables equal
         the independent per-element derivation, across page sizes and both
