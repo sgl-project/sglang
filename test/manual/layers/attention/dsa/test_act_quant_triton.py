@@ -9,8 +9,8 @@ from typing import Tuple
 import pytest
 import torch
 
-from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant as act_quant_triton
+from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant as act_quant_triton
 
 
 def benchmark_kernel(

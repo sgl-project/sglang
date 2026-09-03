@@ -27,7 +27,7 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -35,7 +35,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=300, suite="base-b-test-1-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cpu_ci(est_time=123, suite="base-c-test-cpu")
 
 
 def _data_uri():
@@ -53,9 +54,7 @@ def _build_drift_prompt(model, image_token):
     token), followed by one image placeholder. drift_delta is how many extra
     tokens the non-canonical form carries vs. the canonical re-tokenization.
     """
-    tok = AutoProcessor.from_pretrained(
-        model, trust_remote_code=True, use_fast=True
-    ).tokenizer
+    tok = AutoProcessor.from_pretrained(model, trust_remote_code=True).tokenizer
 
     def enc(text):
         return tok.encode(text, add_special_tokens=False)

@@ -15,11 +15,18 @@
 """BailingHybrid model configuration"""
 
 import enum
+from typing import Union
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    KimiLinearCacheParams,
+    KimiLinearStateShape,
+    Mamba2CacheParams,
+    Mamba2StateShape,
+)
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -30,7 +37,6 @@ class HybridLayerType(enum.Enum):
 
 
 class BailingHybridConfig(PretrainedConfig):
-
     model_type = "bailing_hybrid"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -81,6 +87,14 @@ class BailingHybridConfig(PretrainedConfig):
         v_head_dim=128,
         qk_nope_head_dim=128,
         rope_interleave=True,
+        # KDA (Ling-V3) linear-attention variant. Absent from a V2.5 /
+        # lightning checkpoint, which keeps the Mamba2 branch below.
+        short_conv_kernel_size=None,
+        no_kda_lora=False,
+        kda_safe_gate=False,
+        kda_lower_bound=None,
+        # NoPE MLA: the rope half of the query/key is dropped entirely.
+        use_mla_nope=False,
         **kwargs,
     ):
         self.num_hidden_layers = num_hidden_layers
@@ -109,7 +123,6 @@ class BailingHybridConfig(PretrainedConfig):
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.routed_scaling_factor = routed_scaling_factor
 
-        # MoE configs
         self.num_experts = num_experts
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
@@ -119,12 +132,10 @@ class BailingHybridConfig(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.output_router_logits = output_router_logits
 
-        # Linear configs
         self.layer_group_size = layer_group_size
         self.group_norm_size = group_norm_size
         self.linear_silu = linear_silu
         self.num_linear_key_value_heads = num_attention_heads
-        # mla
         self.kv_lora_rank = kv_lora_rank
         self.q_lora_rank = q_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -132,6 +143,14 @@ class BailingHybridConfig(PretrainedConfig):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.rope_interleave = rope_interleave
+        self.short_conv_kernel_size = short_conv_kernel_size
+        # KDA is what distinguishes Ling-V3 from the V2.5 / lightning
+        # checkpoints; only the former carries a short conv.
+        self.use_kda = short_conv_kernel_size is not None
+        self.no_kda_lora = no_kda_lora
+        self.kda_safe_gate = kda_safe_gate
+        self.kda_lower_bound = kda_lower_bound if kda_safe_gate else None
+        self.use_mla_nope = use_mla_nope
         self.for_nextn_model = False
         super().__init__(
             pad_token_id=pad_token_id,
@@ -147,11 +166,22 @@ class BailingHybridConfig(PretrainedConfig):
 
         layer_type_list = []
 
-        for l in range(self.num_hidden_layers):
-            if (l + 1) % self.layer_group_size == 0:
-                layer_type_list.append(HybridLayerType.full_attention.value)
-            else:
-                layer_type_list.append(HybridLayerType.linear_attention.value)
+        if isinstance(self.layer_group_size, int):
+            for l in range(self.num_hidden_layers):
+                if (l + 1) % self.layer_group_size == 0:
+                    layer_type_list.append(HybridLayerType.full_attention.value)
+                else:
+                    layer_type_list.append(HybridLayerType.linear_attention.value)
+        else:
+            # Per-layer schedule: 1 marks a linear-attention layer.
+            assert len(self.layer_group_size) == self.num_hidden_layers, (
+                "When layer_group_size is a list, its length must be equal to num_hidden_layers"
+            )
+            for l in range(self.num_hidden_layers):
+                if self.layer_group_size[l] == 1:
+                    layer_type_list.append(HybridLayerType.linear_attention.value)
+                else:
+                    layer_type_list.append(HybridLayerType.full_attention.value)
 
         return layer_type_list
 
@@ -172,11 +202,20 @@ class BailingHybridConfig(PretrainedConfig):
         ]
 
     @property
-    def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+    def mamba2_cache_params(self) -> Union[KimiLinearCacheParams, Mamba2CacheParams]:
+
+        if self.use_kda:
+            shape = KimiLinearStateShape.create(
+                tp_world_size=get_parallel().attn_tp_size,
+                num_heads=self.num_attention_heads,
+                head_dim=self.head_dim,
+                conv_kernel_size=self.short_conv_kernel_size,
+            )
+
+            return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=0,
             n_groups=0,
             num_heads=self.num_linear_key_value_heads,

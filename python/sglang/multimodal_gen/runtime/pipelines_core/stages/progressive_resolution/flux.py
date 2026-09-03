@@ -30,6 +30,10 @@ logger = init_logger(__name__)
 FLUX_SPECTRUM_A: float = 203.615097
 FLUX_SPECTRUM_BETA: float = 1.915461
 
+# Module-level aliases for test discoverability and external reuse.
+_flux_unpack = unpack_2x2_latent
+_flux_pack = pack_2x2_latent
+
 
 class FluxProgressiveDenoisingStage(ProgressiveDenoisingStage):
     """FLUX-specific progressive denoising stage.

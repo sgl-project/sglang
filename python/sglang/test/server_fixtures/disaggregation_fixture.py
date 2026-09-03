@@ -7,6 +7,8 @@ import warnings
 from typing import ClassVar, Optional
 from urllib.parse import urlparse
 
+import requests
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -17,16 +19,41 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
 
 
+def configure_nixl_pd_backend(test_cls):
+    test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+    # NIXL backend/network selection is driven by NIXL environment variables
+    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
+    # Mooncake-specific --disaggregation-ib-device argument.
+    test_cls.rdma_devices = []
+
+
+def assert_process_healthy(test_case, name, process, url, health_path="/health"):
+    test_case.assertIsNotNone(process, f"{name} process was not started")
+    test_case.assertIsNone(
+        process.poll(),
+        f"{name} exited unexpectedly with code {process.returncode}",
+    )
+    try:
+        response = requests.get(f"{url}{health_path}", timeout=10)
+    except requests.RequestException as e:
+        test_case.fail(f"Failed to connect to {name} health endpoint: {e}")
+    test_case.assertEqual(response.status_code, 200, response.text)
+
+
 class PDDisaggregationServerBase(CustomTestCase):
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
+    prefill_tp_size: ClassVar[int] = 1
+    decode_tp_size: ClassVar[int] = 1
+    decode_base_gpu_id: ClassVar[int] = 1
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -42,12 +69,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
         cls.bootstrap_port = f"{int(base_port) + 500}"
+        # Pin distinct nccl (torch.distributed rendezvous) ports below the
+        # ephemeral range; otherwise both sides derive them from get_free_port()
+        # and can race onto the same port, failing at init_process_group with
+        # EADDRINUSE.
+        cls.prefill_nccl_port = f"{int(base_port) + 300}"
+        cls.decode_nccl_port = f"{int(base_port) + 400}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.base_url = cls.lb_url
         print(
-            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} "
+            f"{cls.bootstrap_port=} {cls.prefill_nccl_port=} {cls.decode_nccl_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
         if cls.capture_per_side_logs:
@@ -58,9 +92,12 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._fail_fast_stop = None
 
         # config transfer backend and rdma devices
+        cls._mc_gid_index_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            cls.rdma_devices = ["--disaggregation-ib-device", get_rdma_devices_args()]
+            ib_devices = get_rdma_devices_args()
+            cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
+            cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -87,8 +124,10 @@ class PDDisaggregationServerBase(CustomTestCase):
             "prefill",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
             "--tp",
-            "1",
+            str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -112,10 +151,12 @@ class PDDisaggregationServerBase(CustomTestCase):
             "decode",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
             "--tp",
-            "1",
+            str(cls.decode_tp_size),
             "--base-gpu-id",
-            "1",
+            str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -183,10 +224,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         if cls._fail_fast_stop is not None:
             cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+        if getattr(cls, "_mc_gid_index_set", False):
+            os.environ.pop("MC_GID_INDEX", None)
+        # The LB holds no device state, and popen_with_error_check only stays
+        # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
+        if cls.process_lb:
+            try:
+                kill_process_tree(cls.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"Error killing process {cls.process_lb.pid}: {e}")
+        for process in [cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
@@ -328,7 +378,7 @@ def get_rdma_devices_args():
         if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
             warnings.warn(
                 f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group+3}"
+                f"{base_rdma_group}-{base_rdma_group + 3}"
             )
 
     # 3. Generate RDMA device names
@@ -371,3 +421,83 @@ def get_rdma_devices_args():
 
     # Deduplicate while preserving order
     return ",".join(dict.fromkeys(rdma_devices))
+
+
+_IB_SYSFS = "/sys/class/infiniband"
+
+
+def _roce_v2_gid_index(device: str):
+    """Return a RoCEv2 GID index for a device, preferring a global (routable)
+    GID over a link-local (fe80::) one, or None if the device has no RoCEv2 GID.
+    """
+    port = os.path.join(_IB_SYSFS, device, "ports", "1")
+    types_dir = os.path.join(port, "gid_attrs", "types")
+    try:
+        indices = sorted(int(x) for x in os.listdir(types_dir) if x.isdigit())
+    except OSError:
+        return None
+    fallback = None
+    for i in indices:
+        try:
+            with open(os.path.join(types_dir, str(i))) as f:
+                if f.read().strip() != "RoCE v2":
+                    continue
+        except OSError:
+            continue
+        if fallback is None:
+            fallback = i
+        try:
+            with open(os.path.join(port, "gids", str(i))) as f:
+                gid = f.read().strip()
+        except OSError:
+            gid = ""
+        # Prefer a global GID; link-local (fe80::) entries don't route between
+        # NICs on some fabrics.
+        if gid and not gid.lower().startswith("fe80"):
+            return i
+    return fallback
+
+
+def _detect_roce_gid_index(devices):
+    """Return a single RoCEv2 GID index shared by all `devices`, or None.
+
+    None when any device is InfiniBand (mooncake selects the GID automatically
+    there), when a device has no RoCEv2 GID, or when devices disagree on the
+    index — MC_GID_INDEX is a single global value, so a divergent set can't be
+    satisfied and is left to mooncake's own selection.
+    """
+    picked = None
+    for device in [d.strip() for d in devices if d.strip()]:
+        try:
+            with open(os.path.join(_IB_SYSFS, device, "ports", "1", "link_layer")) as f:
+                if f.read().strip() != "Ethernet":
+                    return None
+        except OSError:
+            return None
+        idx = _roce_v2_gid_index(device)
+        if idx is None:
+            return None
+        if picked is None:
+            picked = idx
+        elif picked != idx:
+            return None
+    return picked
+
+
+def _maybe_set_roce_gid_index(ib_devices) -> bool:
+    """Export MC_GID_INDEX for a RoCE fabric; return True if this call set it.
+
+    On RoCE-only hosts mooncake's automatic GID selection can come up empty
+    ("GID is NULL, please check your GID index by specifying MC_GID_INDEX"),
+    leaving the KV-transfer RDMA endpoint with no GID so every prefill->decode
+    transfer fails and PD accuracy collapses to 0. InfiniBand hosts don't need
+    this (auto GID works), and a user-provided MC_GID_INDEX is left untouched.
+    """
+    if not ib_devices or os.environ.get("MC_GID_INDEX"):
+        return False
+    gid_index = _detect_roce_gid_index(ib_devices.split(","))
+    if gid_index is None:
+        return False
+    os.environ["MC_GID_INDEX"] = str(gid_index)
+    logger.warning("RoCE fabric detected; set MC_GID_INDEX=%d for mooncake", gid_index)
+    return True

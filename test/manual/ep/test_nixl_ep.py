@@ -1,7 +1,10 @@
 import os
+import subprocess
 import time
 import unittest
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -101,12 +104,34 @@ class TestNixlEPElasticEP(_EPTestBase):
 
 
 class TestNixlMoeMooncakeElasticEP(_EPTestBase):
-    server_args = [*NIXL_COMMON, *DP_ATTN, *ELASTIC_MOONCAKE]
+    server_args = [
+        *NIXL_COMMON,
+        *DP_ATTN,
+        *ELASTIC_MOONCAKE,
+        "--moe-dense-tp-size",
+        "1",
+        "--enable-dp-lm-head",
+    ]
 
-    pkill_process_1 = "sglang::scheduler_DP1_TP8_EP8"
+    pkill_process_1 = "sglang::scheduler_DP1_TP1_EP1"
 
     def test_gsm8k_fault_1(self):
-        os.system(f"pkill -f {self.pkill_process_1}")
+        subprocess.run(
+            ["pkill", "-f", f"^{self.pkill_process_1}$"],
+            check=True,
+        )
+        # Bootstrap one forward on a survivor so the controller learns the
+        # post-fault active-rank mask before dispatching concurrent requests.
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "Hello",
+                "sampling_params": {"max_new_tokens": 1},
+                "routed_dp_rank": 0,
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
         metrics = self._run_gsm8k()
         self.assertGreater(metrics["score"], 0.60)
 

@@ -4,7 +4,7 @@ Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: extra-b-test-deepep-4-gpu-b200 (label-gated, 4x B200)
+Registry: extra-b-test-4-gpu-b200 (label-gated, 4x B200)
 """
 
 import unittest
@@ -13,6 +13,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -20,7 +21,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="deepep-4-gpu-b200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -33,12 +34,11 @@ _W4A8_MEGAMOE_ENV = {
 
 _W4A4_MEGAMOE_ENV = {
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "4096",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": "1",
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": "1",
 }
 
 
 class TestDSV4FlashFP4B200W4A8MegaMoE(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -46,6 +46,8 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(
     """Balanced recipe: TP=4, DP=4, MegaMoE."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 100
 
     @classmethod
     def setUpClass(cls):
@@ -83,6 +85,7 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(
 
 
 class TestDSV4FlashFP4B200W4A4MegaMoE(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -90,6 +93,8 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
     """Balanced recipe: TP=4, DP=4, MegaMoE."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 2.8
+    bs_1_speed_thres = 100
 
     @classmethod
     def setUpClass(cls):
@@ -108,6 +113,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "megamoe",
+                "--enable-w4a4-mxfp4-megamoe",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",

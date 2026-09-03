@@ -8,7 +8,7 @@ from typing import Any
 
 import torch.nn as nn
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -52,7 +52,6 @@ class CustomOp(nn.Module):
     def forward_tpu(self, *args, **kwargs) -> Any:
         # By default, we assume that TPU ops are compatible with the
         # PyTorch-native implementation.
-        # NOTE(woosuk): This is a placeholder for future extensions.
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs) -> Any:
@@ -66,11 +65,6 @@ class CustomOp(nn.Module):
 
     def forward_npu(self, *args, **kwargs) -> Any:
         # By default, we assume that NPU ops are compatible with the
-        # PyTorch-native implementation.
-        return self.forward_native(*args, **kwargs)
-
-    def forward_xpu(self, *args, **kwargs) -> Any:
-        # By default, we assume that XPU ops are compatible with the
         # PyTorch-native implementation.
         return self.forward_native(*args, **kwargs)
 

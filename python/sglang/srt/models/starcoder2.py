@@ -29,7 +29,7 @@ import torch
 from torch import nn
 from transformers import Starcoder2Config
 
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -47,11 +47,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
 class Starcoder2Attention(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -63,7 +63,7 @@ class Starcoder2Attention(nn.Module):
         self.config = config
 
         self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -133,7 +133,6 @@ class Starcoder2Attention(nn.Module):
 
 
 class Starcoder2MLP(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -168,7 +167,6 @@ class Starcoder2MLP(nn.Module):
 
 
 class Starcoder2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -218,7 +216,6 @@ class Starcoder2DecoderLayer(nn.Module):
 
 
 class Starcoder2Model(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,
@@ -275,7 +272,6 @@ class Starcoder2Model(nn.Module):
 
 
 class Starcoder2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: Starcoder2Config,

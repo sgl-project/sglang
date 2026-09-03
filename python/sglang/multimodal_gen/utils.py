@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     SortedHelpFormatter,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import (
+    PRECISION_TO_TYPE as PRECISION_TO_TYPE,
+)
 
 logger = init_logger(__name__)
 
@@ -51,14 +54,6 @@ def expand_path_fields(obj) -> None:
                 {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
             )
 
-
-# TODO(will): used to convert server_args.precision to torch.dtype. Find a
-# cleaner way to do this.
-PRECISION_TO_TYPE = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 STR_BACKEND_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_BACKEND"
 STR_ATTN_CONFIG_ENV_VAR: str = "SGLANG_DIFFUSION_ATTENTION_CONFIG"
@@ -140,7 +135,6 @@ def current_stream() -> torch.cuda.Stream | None:
 
 
 class StoreBoolean(argparse.Action):
-
     def __init__(self, option_strings, dest, default=False, required=False, help=None):
         super().__init__(
             option_strings=option_strings,
@@ -162,7 +156,7 @@ class StoreBoolean(argparse.Action):
                 setattr(namespace, self.dest, False)
             else:
                 raise ValueError(
-                    f"Invalid boolean value: {values}. " "Expected 'true' or 'false'."
+                    f"Invalid boolean value: {values}. Expected 'true' or 'false'."
                 )
         else:
             setattr(namespace, self.dest, bool(values))
@@ -300,8 +294,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         if args[0] == "serve":
             if index == 1:
                 raise ValueError(
-                    "No model_tag specified! Please check your command-line"
-                    " arguments."
+                    "No model_tag specified! Please check your command-line arguments."
                 )
             command = args_before_config[0]
             model_tag = args_before_config[1]
@@ -489,7 +482,7 @@ def update_environment_variables(envs: dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -514,7 +507,7 @@ def run_method(
             func = getattr(obj, method)
         except AttributeError:
             raise NotImplementedError(
-                f"Method {method!r} is not" " implemented."
+                f"Method {method!r} is not implemented."
             ) from None
     else:
         func = partial(method, obj)  # type: ignore
@@ -527,21 +520,24 @@ def shallow_asdict(obj) -> dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 
-# TODO: validate that this is fine
 def kill_itself_when_parent_died() -> None:
-    # if sys.platform == "linux":
-    # sigkill this process when parent worker manager dies
-    PR_SET_PDEATHSIG = 1
-    import platform
+    if sys.platform != "linux":
+        return
 
-    if platform.system() == "Linux":
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    # elif platform.system() == "Darwin":
-    #     libc = ctypes.CDLL("libc.dylib")
-    #     logger.warning("kill_itself_when_parent_died is only supported in linux.")
-    else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+    # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
+    PR_SET_PDEATHSIG = 1
+    # Capture parent before arming PDEATHSIG: if the parent already died in the
+    # fork->prctl window, PDEATHSIG won't fire, so detect the reparent explicitly.
+    parent_pid = os.getppid()
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    # getppid() changing means we were reparented (parent gone). Comparing to the
+    # captured pid instead of "== 1" avoids self-killing when PID 1 is the real
+    # parent (e.g. running as a container's init process).
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def get_exception_traceback() -> str:
@@ -551,7 +547,6 @@ def get_exception_traceback() -> str:
 
 
 class TypeBasedDispatcher:
-
     def __init__(self, mapping: list[tuple[type, Callable]]):
         self._mapping = mapping
 
@@ -628,9 +623,9 @@ def dict_to_3d_list(
     """
     # Case 1: no data, but fixed shape requested
     if mask_strategy is None:
-        assert (
-            t_max is not None and l_max is not None and h_max is not None
-        ), "If mask_strategy is None, you must provide t_max, l_max, and h_max"
+        assert t_max is not None and l_max is not None and h_max is not None, (
+            "If mask_strategy is None, you must provide t_max, l_max, and h_max"
+        )
         return [
             [[None for _ in range(h_max)] for _ in range(l_max)] for _ in range(t_max)
         ]

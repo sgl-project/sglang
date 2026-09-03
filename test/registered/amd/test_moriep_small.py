@@ -72,7 +72,7 @@ common_args = [
     "32768",
     "--attention-backend",
     "aiter",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "32",
 ]
 
@@ -103,7 +103,6 @@ mtp_args = [
 
 
 class TestPureDP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -148,7 +147,6 @@ class TestPureDP(CustomTestCase):
 
 
 class TestMTP(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -199,7 +197,6 @@ class TestMTP(CustomTestCase):
 
 
 class TestNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -247,7 +244,6 @@ class TestNormal(CustomTestCase):
 
 
 class TestLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -297,7 +293,6 @@ class TestLowLatency(CustomTestCase):
 
 
 class TestTBOwithNormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -346,7 +341,6 @@ class TestTBOwithNormal(CustomTestCase):
 
 
 class TestTBOwithLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -397,7 +391,6 @@ class TestTBOwithLowLatency(CustomTestCase):
 
 
 class TestMTPwithTBONormal(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -457,7 +450,6 @@ class TestMTPwithTBONormal(CustomTestCase):
 
 
 class TestMTPwithTBOLowLatency(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
@@ -469,6 +461,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
                 "--deepep-mode",
                 "low_latency",
                 "--enable-two-batch-overlap",
+                "--disable-overlap-schedule",
             ]
         )
 
@@ -476,7 +469,6 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
-        env["SGLANG_ENABLE_SPEC_V2"] = "false"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
@@ -534,6 +526,7 @@ class TestEPLBMoriStat(CustomTestCase):
                 "normal",
                 "--expert-distribution-recorder-mode",
                 "stat",
+                "--disable-overlap-schedule",
             ]
         )
 
@@ -541,7 +534,6 @@ class TestEPLBMoriStat(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "128"
-        env["SGLANG_ENABLE_SPEC_V2"] = "false"
         env["SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE"] = "32"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine

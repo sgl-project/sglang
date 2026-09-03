@@ -6,7 +6,6 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
-    validate_adaptive_initial_steps,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
@@ -199,6 +198,30 @@ class TestAdaptiveStepSlot(unittest.TestCase):
         self.assertEqual(params.current_steps, 1)
         self.assertEqual(params.ema_accept_len, 0.375)
 
+    def test_zero_step_mixed_slot_drops_probes_and_rechecks(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [0, 3],
+                "ema_alpha": 1.0,
+                "warmup_batches": 0,
+                "update_interval": 1,
+                "down_hysteresis": 0.0,
+            },
+        )
+
+        self.assertTrue(params.update([0, 0]))
+        self.assertEqual(params.current_steps, 0)
+        self.assertEqual(params.ema_accept_len, 0.0)
+
+        self.assertTrue(params.update([3, 3]))
+        self.assertEqual(params.current_steps, 3)
+        self.assertEqual(params.ema_accept_len, 0.0)
+
+        self.assertTrue(params.update([0, 0]))
+        self.assertEqual(params.current_steps, 0)
+        self.assertEqual(params.ema_accept_len, 0.0)
+
     def test_ceiling_coeff_caps_steps(self):
         params = self._make_params_from_config(
             7,
@@ -224,10 +247,11 @@ class TestAdaptiveStepSlot(unittest.TestCase):
 class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
-        self.assertEqual(params._bs_list, [1, 8, 32])
+        self.assertEqual(params._bs_list, [1, 8, 32, 64])
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
-        self.assertEqual(params._slots[8].candidate_steps, [1, 3])
-        self.assertEqual(params._slots[32].candidate_steps, [1])
+        self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
+        self.assertEqual(params._slots[32].candidate_steps, [0, 1])
+        self.assertEqual(params._slots[64].candidate_steps, [0])
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -288,13 +312,6 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
             with self.assertRaises(ValueError):
                 AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
 
-    def test_zero_steps_raises(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"candidate_steps": [0]}}, f)
-            f.flush()
-            with self.assertRaises(ValueError):
-                AdaptiveSpeculativeParams(initial_steps=3, cfg_path=f.name)
-
     def test_global_hysteresis_inherited(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
@@ -334,20 +351,20 @@ class TestBatchSizeRouting(unittest.TestCase):
         # A batch maps to the largest slot BS <= batch (floor), capped at the top slot.
         self.assertEqual(params._route(1).candidate_steps, [1, 3, 7])
         self.assertEqual(params._route(7).candidate_steps, [1, 3, 7])
-        self.assertEqual(params._route(8).candidate_steps, [1, 3])
-        self.assertEqual(params._route(31).candidate_steps, [1, 3])
-        self.assertEqual(params._route(32).candidate_steps, [1])
-        self.assertEqual(params._route(1000).candidate_steps, [1])
+        self.assertEqual(params._route(8).candidate_steps, [0, 1, 3])
+        self.assertEqual(params._route(31).candidate_steps, [0, 1, 3])
+        self.assertEqual(params._route(32).candidate_steps, [0, 1])
+        self.assertEqual(params._route(1000).candidate_steps, [0])
 
     def test_cuda_graph_bs_pads_batch_up_before_routing(self):
         params = self._params()
         params.set_cuda_graph_bs([4, 8, 16, 32])
         # bs=5 pads up to the captured graph BS 8 -> slot bs=8.
-        self.assertEqual(params._route(5).candidate_steps, [1, 3])
+        self.assertEqual(params._route(5).candidate_steps, [0, 1, 3])
         # bs=17 pads up to 32 -> slot bs=32.
-        self.assertEqual(params._route(17).candidate_steps, [1])
+        self.assertEqual(params._route(17).candidate_steps, [0, 1])
         # A batch larger than every captured BS keeps its own value -> top slot.
-        self.assertEqual(params._route(100).candidate_steps, [1])
+        self.assertEqual(params._route(100).candidate_steps, [0])
 
     def test_cuda_graph_bs_for_step_prunes_unreachable_graphs(self):
         params = self._params()
@@ -401,26 +418,6 @@ class TestResolveCandidateSteps(unittest.TestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
-
-
-class TestValidateAdaptiveInitialSteps(unittest.TestCase):
-    def test_accepts_value_from_any_slot(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump(
-                {
-                    "1": {"candidate_steps": [1, 5]},
-                    "8": {"candidate_steps": [1, 3, 7]},
-                },
-                f,
-            )
-            f.flush()
-            # Membership in any slot is enough: 5 lives in the smallest slot,
-            # 7 only in a larger slot -- both accepted.
-            validate_adaptive_initial_steps(5, cfg_path=f.name)
-            validate_adaptive_initial_steps(7, cfg_path=f.name)
-            # 9 is in no slot -> rejected.
-            with self.assertRaises(ValueError):
-                validate_adaptive_initial_steps(9, cfg_path=f.name)
 
 
 if __name__ == "__main__":

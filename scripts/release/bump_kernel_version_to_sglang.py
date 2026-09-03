@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bump sglang-kernel version in SGLang files to match the version in sgl-kernel/pyproject.toml.
+Bump SGLang's kernel dependencies to match the AOT source pyproject.
 Updates:
   - python/pyproject.toml
   - python/sglang/srt/entrypoints/engine.py
@@ -18,8 +18,8 @@ except ImportError:
 
 
 def get_kernel_version_from_source() -> str:
-    """Extract version from sgl-kernel/pyproject.toml"""
-    pyproject_path = Path("sgl-kernel/pyproject.toml")
+    """Extract the version from the AOT source pyproject."""
+    pyproject_path = Path("python/sglang/kernels/aot/pyproject.toml")
 
     if not pyproject_path.exists():
         print(f"Error: {pyproject_path} not found")
@@ -30,7 +30,9 @@ def get_kernel_version_from_source() -> str:
 
     version = data.get("project", {}).get("version")
     if not version:
-        print("Error: Could not find version in sgl-kernel/pyproject.toml")
+        print(
+            "Error: Could not find version in python/sglang/kernels/aot/pyproject.toml"
+        )
         sys.exit(1)
 
     return version

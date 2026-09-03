@@ -1,7 +1,9 @@
-"""Cross-framework comparison benchmark for diffusion serving.
+"""Diffusion serving benchmark for SGLang-Diffusion nightly CI.
 
-Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+Launches an SGLang-Diffusion server for each test case, sends a single
+request, measures end-to-end latency, and writes comparison-results.json.
+The runner still supports extra frameworks via --frameworks, but the nightly
+config tracks SGLang-Diffusion only.
 
 Usage:
     # Full run (requires GPU)
@@ -84,6 +86,10 @@ def _build_sglang_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
         cmd += ["--num-gpus", str(case["num_gpus"])]
     if fw_cfg.get("serve_args", "").strip():
         cmd += fw_cfg["serve_args"].strip().split()
+    # No explicit --warmup-resolutions: server-based warmup now defaults to the
+    # model's sampling-default resolution (see warmup_request_builder), which
+    # already matches these single-resolution cases — the default warmup is
+    # sufficient, so we don't pin a resolution here.
     return cmd
 
 
@@ -356,6 +362,16 @@ def _build_sglang_payload(case: dict) -> dict:
     ):
         if key in case:
             payload[key] = case[key]
+
+    # Model-specific request fields outside the common schema -- MiniMax-H3
+    # derives its shape from `target` and rejects an explicit num_frames, so a
+    # case needs to both add keys and drop common ones. A null value removes
+    # the key rather than sending null.
+    for key, value in (case.get("sglang_request_extra") or {}).items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
     return payload
 
 
@@ -399,14 +415,16 @@ def send_image_request_sglang(
     if "data" not in data or len(data["data"]) == 0:
         raise RuntimeError(f"Image request returned no data: {data}")
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Image generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Image generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Image generated in {client_latency:.2f}s")
     return client_latency
 
@@ -450,14 +468,16 @@ def send_video_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Video generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Video generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Video generated in {client_latency:.2f}s")
     return client_latency
 
@@ -536,14 +556,16 @@ def send_image_conditioned_request_sglang(
 
     client_latency = time.time() - start
 
+    # Report client-side e2e latency to match vllm-omni / lightx2v (fair
+    # cross-framework comparison); server-side perf_dump is diagnostic only.
     if perf_dump_path:
         server_latency = _read_perf_dump(perf_dump_path)
         if server_latency is not None:
             print(
-                f"  Generated in {server_latency:.2f}s (server-side), "
-                f"client={client_latency:.2f}s"
+                f"  Generated in {client_latency:.2f}s (client e2e; "
+                f"server-side {server_latency:.2f}s, diagnostic)"
             )
-            return server_latency
+            return client_latency
     print(f"  Generated in {client_latency:.2f}s (sglang, image-conditioned)")
     return client_latency
 
@@ -789,18 +811,17 @@ def run_single(
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
 
-        # Warmup requests (not measured, no perf dump)
-        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
-        # torch.compile compilation; these external warmups just stabilize triton
-        # kernel specializations across requests.
-        WARMUP_STEPS = 3
-        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
-        for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
-            try:
-                send_request(base_url, warmup_case, framework, config)
-            except Exception as e:
-                raise RuntimeError(f"Warmup request {wi} failed: {e}") from e
+        # No client-side warmup: each framework relies on its own server-side
+        # warmup before traffic. sglang's serve_args pass --warmup-mode server,
+        # which primes kernels with a synthetic request at startup, before the
+        # health check passes. This goes through the internal
+        # warmup path that bypasses sampling-param preset validation (e.g.
+        # Ideogram-4's preset-locked num_inference_steps), so no per-case warmup
+        # special-casing is needed here.
+        # NOTE: vllm-omni / lightx2v configure no server-side warmup; if
+        # cross-framework comparison is restored, they must add their own warmup
+        # to stay on equal footing — otherwise their measured request pays the
+        # full cold-start.
 
         # Measured request — pass perf_dump_path for SGLang server-side timing
         if perf_dump_path and os.path.exists(perf_dump_path):
@@ -834,9 +855,9 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     if dry_run:
         print(f"  [DRY-RUN] Would install: bash {INSTALL_SCRIPT} {fw_name}")
         return True
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Installing framework: {fw_name}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     ret = subprocess.run(
         ["bash", str(INSTALL_SCRIPT), fw_name],
         timeout=600,
@@ -845,6 +866,20 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
         print(f"  WARNING: {fw_name} installation failed (exit {ret.returncode})")
         return False
     return True
+
+
+def _get_checkout_commit_sha() -> str:
+    fallback = os.environ.get("GITHUB_SHA", "unknown")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.strip() or fallback
 
 
 def run_comparison(
@@ -861,7 +896,7 @@ def run_comparison(
     Each non-sglang framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+    commit_sha = _get_checkout_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
 
     log_dir = Path("comparison-logs")
@@ -908,9 +943,9 @@ def run_comparison(
             installed_fws.add(fw_name)
 
         for case, fw_cfg in pairs:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Case: {case['id']} | Model: {case['model']} | Framework: {fw_name}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             if dry_run:
                 cmd = build_server_cmd(fw_name, case, fw_cfg, port)
@@ -947,9 +982,9 @@ def run_comparison(
     print(f"\nResults written to {output}")
 
     # Print summary table
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for r in results:
         lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")
@@ -964,7 +999,7 @@ def run_comparison(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cross-framework diffusion serving comparison benchmark"
+        description="SGLang-Diffusion serving benchmark (nightly CI)"
     )
     parser.add_argument(
         "--config",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
@@ -16,19 +18,18 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
-    from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.kernels.ops.quantization.gptq_marlin import gptq_marlin_gemm
+    from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 
 ScalarType, scalar_types = get_scalar_types()
+logger = logging.getLogger(__name__)
 
 
 def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     if not (marlin_scales >= 0).all():
         # NVFP4 ModelOpt scales are expected to be non-negative. Keep this as
         # a warning so unusual checkpoints can still load for diagnosis.
-        import logging
-
-        logging.getLogger(__name__).warning_once(
+        logger.warning_once(
             "NVFP4 Marlin assumes non-negative scales, but negative scales "
             "were found. Accuracy may be degraded."
         )
@@ -90,11 +91,18 @@ def apply_fp4_marlin_linear(
 
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
+    # Recover the physical Marlin tile dimensions from the repacked weight.
+    # They can exceed the logical TP shard dimensions when preparation padded a
+    # misaligned shard (e.g. N=928 -> 960 for TP=4).
+    padded_size_k = weight.size(0) * 16
+    padded_size_n = weight.size(1) * 8 // 16
+    if padded_size_k != size_k:
+        reshaped_x = torch.nn.functional.pad(reshaped_x, (0, padded_size_k - size_k))
 
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0),
-        n=size_n,
-        k=size_k,
+        n=padded_size_n,
+        k=padded_size_k,
         device=input.device,
         dtype=input.dtype,
     )
@@ -111,8 +119,8 @@ def apply_fp4_marlin_linear(
         workspace=workspace,
         b_q_type=scalar_types.float4_e2m1f,
         size_m=reshaped_x.size(0),
-        size_n=size_n,
-        size_k=size_k,
+        size_n=padded_size_n,
+        size_k=padded_size_k,
         is_k_full=True,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
@@ -121,6 +129,10 @@ def apply_fp4_marlin_linear(
     if bias is not None:
         output.add_(bias)
 
+    # A narrowed N dimension has the padded row stride, so materialize it
+    # before reshaping. This is only needed for a TP shard that was padded.
+    if padded_size_n != size_n:
+        output = output[:, :size_n].contiguous()
     return output.reshape(out_shape)
 
 
@@ -138,10 +150,29 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     assert layer.weight.shape == (part_size_n, part_size_k // 2)
 
-    if part_size_n % 64 != 0:
-        raise ValueError(
-            f"NVFP4 Marlin requires output_size_per_partition to be a multiple of 64, "
-            f"got {part_size_n}."
+    # Marlin accepts either N%64/K%128 or N%128/K%64. Select the smaller
+    # padded shape, matching vLLM's marlin_padded_nk helper.
+    padded_size_n, padded_size_k = min(
+        (
+            ((part_size_n + 63) // 64 * 64, (part_size_k + 127) // 128 * 128),
+            ((part_size_n + 127) // 128 * 128, (part_size_k + 63) // 64 * 64),
+        ),
+        key=lambda nk: (nk[0] * nk[1], nk[0] + nk[1]),
+    )
+
+    if (padded_size_n, padded_size_k) != (part_size_n, part_size_k):
+        pad_rows = padded_size_n - part_size_n
+        pad_cols = (padded_size_k - part_size_k) // 2
+        scale_pad_cols = (padded_size_k - part_size_k) // 16
+        layer.weight = torch.nn.Parameter(
+            torch.nn.functional.pad(layer.weight, (0, pad_cols, 0, pad_rows)),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.nn.functional.pad(
+                layer.weight_scale, (0, scale_pad_cols, 0, pad_rows)
+            ),
+            requires_grad=False,
         )
 
     device = layer.weight.device
@@ -152,8 +183,8 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     marlin_qweight = gptq_marlin_repack(
         b_q_weight=qweight,
         perm=perm,
-        size_k=part_size_k,
-        size_n=part_size_n,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
         num_bits=4,
     )
     layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
@@ -161,8 +192,8 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     weight_scale = layer.weight_scale.T.contiguous().to(param_dtype)
     weight_scale = marlin_permute_scales(
         s=weight_scale,
-        size_k=part_size_k,
-        size_n=part_size_n,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
         group_size=16,
     )
     weight_scale = nvfp4_marlin_process_scales(weight_scale)
@@ -176,7 +207,8 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
-        bias = marlin_permute_bias(layer.bias)
+        bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
+        bias = marlin_permute_bias(bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
 
@@ -225,6 +257,45 @@ def _get_optional_param(layer: torch.nn.Module, *names: str) -> torch.Tensor | N
     return None
 
 
+def deinterleave_moe_mxfp4_w13_for_marlin(layer: torch.nn.Module) -> None:
+    """Convert GPT-OSS interleaved w13 rows to Marlin's contiguous halves.
+
+    GPT-OSS stores gate/up rows as [gate0, up0, gate1, up1, ...]. The Marlin
+    fused activation consumes [all_gate_rows, all_up_rows].
+    """
+
+    w13 = layer.w13_weight.data
+    w13_scale = _get_optional_param(layer, "w13_weight_scale", "w13_weight_scale_inv")
+    w13_bias = _get_optional_param(layer, "w13_weight_bias", "w13_bias")
+
+    if w13.shape[1] % 2 != 0:
+        raise ValueError(f"Expected even w13 row dimension, got {w13.shape}.")
+
+    e, n, k = w13.shape
+    layer.w13_weight.data = (
+        w13.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+    )
+
+    if w13_scale is not None:
+        scale = w13_scale.data
+        if scale.shape[1] != n:
+            raise ValueError(
+                f"Expected w13 scale row dimension {n}, got {scale.shape}."
+            )
+        w13_scale.data = (
+            scale.view(e, n // 2, 2, scale.shape[-1])
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, scale.shape[-1])
+        )
+
+    if w13_bias is not None:
+        bias = w13_bias.data
+        if bias.shape[1] != n:
+            raise ValueError(f"Expected w13 bias row dimension {n}, got {bias.shape}.")
+        w13_bias.data = bias.view(e, n // 2, 2).permute(0, 2, 1).contiguous().view(e, n)
+
+
 def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     group_size = 32
     w13 = layer.w13_weight.data
@@ -245,6 +316,15 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     num_experts = w13.shape[0]
     intermediate_size = w13.shape[1] // 2
     hidden_size = w13.shape[2] * 2
+    if hidden_size % 128 == 0:
+        padded_intermediate_size = ((intermediate_size + 63) // 64) * 64
+    else:
+        if hidden_size % 64 != 0:
+            raise ValueError(
+                f"MXFP4 Marlin requires hidden_size to be divisible by 64, "
+                f"got {hidden_size}."
+            )
+        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
     param_dtype = getattr(
         layer,
         "orig_dtype",
@@ -255,11 +335,37 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
+    def _pad_w13(x: torch.Tensor) -> torch.Tensor:
+        if padded_intermediate_size == intermediate_size:
+            return x
+        x = x.view(num_experts, 2, intermediate_size, x.shape[-1])
+        x = torch.nn.functional.pad(
+            x, (0, 0, 0, padded_intermediate_size - intermediate_size)
+        )
+        return x.reshape(num_experts, 2 * padded_intermediate_size, -1)
+
+    def _pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
+        if padded_intermediate_size == intermediate_size:
+            return x
+        return torch.nn.functional.pad(
+            x, (0, (padded_intermediate_size - intermediate_size) // packing)
+        )
+
+    w13 = _pad_w13(w13)
+    w2 = _pad_w2(w2, packing=2)
+    w13_scale_data = _pad_w13(_normalize_scale_tensor(w13_scale_data, param_dtype))
+    w2_scale_data = _pad_w2(
+        _normalize_scale_tensor(w2_scale_data, param_dtype),
+        packing=group_size,
+    )
+    if w13_bias_data is not None:
+        w13_bias_data = _pad_w13(w13_bias_data.unsqueeze(-1)).squeeze(-1)
+
     def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
-            size_n, size_k = intermediate_size * 2, hidden_size
+            size_n, size_k = padded_intermediate_size * 2, hidden_size
         else:
-            size_n, size_k = hidden_size, intermediate_size
+            size_n, size_k = hidden_size, padded_intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
         tensor_list = []
@@ -276,12 +382,10 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         return torch.stack(tensor_list)
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
-        scales = _normalize_scale_tensor(scales, param_dtype)
-
         if is_w13:
-            size_n, size_k = intermediate_size * 2, hidden_size
+            size_n, size_k = padded_intermediate_size * 2, hidden_size
         else:
-            size_n, size_k = hidden_size, intermediate_size
+            size_n, size_k = hidden_size, padded_intermediate_size
 
         tensor_list = []
         for i in range(num_experts):
@@ -326,6 +430,11 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         layer.w2_weight_bias = torch.nn.Parameter(
             _permute_bias(w2_bias_data), requires_grad=False
         )
+
+    # Marlin uses the repacked scales; release the loader-format parameters.
+    for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        if hasattr(layer, stale):
+            delattr(layer, stale)
 
 
 def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:

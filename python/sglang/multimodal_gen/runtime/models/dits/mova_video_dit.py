@@ -14,6 +14,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 
@@ -32,6 +33,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb_complex,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -80,25 +84,6 @@ def precompute_freqs_cis(
     freqs = torch.outer(pos, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
-
-
-def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
-def rope_apply_head_dim(x, freqs, head_dim):
-    x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    # print(f"{x_out.shape = }, {freqs.shape = }")
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
 
 
 class SelfAttention(nn.Module):
@@ -153,13 +138,14 @@ class SelfAttention(nn.Module):
             softmax_scale=None,
         )
 
-    def forward(self, x, freqs):
+    def forward(self, x, freqs, attn_mask_meta=None):
         """
         Forward pass for self-attention.
 
         Args:
             x: Input tensor [B, S_local, D] - already sharded by SP when SP > 1
             freqs: RoPE frequencies [S_local, 1, head_dim] - should match x's sequence length
+            attn_mask_meta: sp_shard tail-pad meta; excludes SP padding from attention
 
         Returns:
             Output tensor [B, S_local, D]
@@ -180,18 +166,20 @@ class SelfAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
 
+        b, s, _ = q.shape
+        q = q.view(b, s, self.num_heads_per_rank, self.head_dim)
+        k = k.view(b, s, self.num_heads_per_rank, self.head_dim)
+        v = v.view(b, s, self.num_heads_per_rank, self.head_dim)
+
         # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
+        q = _apply_rotary_emb_complex(q, freqs)
+        k = _apply_rotary_emb_complex(k, freqs)
 
         # USPAttention expects [B, S_local, H, D] format
-        q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-        k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-        v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
-
-        # USPAttention handles SP communication internally
-        out = self.attn(q, k, v)
-        out = rearrange(out, "b s n d -> b s (n d)")
+        # USPAttention handles SP communication internally; the tail meta keeps
+        # SP padding out of the softmax.
+        out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
+        out = out.reshape(b, s, -1)
 
         out, _ = self.o(out)
         return out
@@ -248,6 +236,7 @@ class CrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
+            is_cross_attention=True,
         )
 
     def forward(self, x: torch.Tensor, y: torch.Tensor):
@@ -326,7 +315,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, attn_mask_meta=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -347,7 +336,9 @@ class DiTBlock(nn.Module):
         # - layernorm(x) * (1 + scale_msa) + shift_msa
         input_x = self.norm1(x, shift_msa, scale_msa)
         # 2. torch.compile may fuse mlp_residual and self_attn_norm
-        x = self.mlp_residual(self.self_attn(input_x, freqs), gate_msa, x)
+        x = self.mlp_residual(
+            self.self_attn(input_x, freqs, attn_mask_meta=attn_mask_meta), gate_msa, x
+        )
         norm_x = self.self_attn_norm(x)
         # 3. Cross-attention, fuse:
         # - x = x + 1 * cross_output
@@ -422,9 +413,8 @@ class Conv3dLocalIsland(nn.Conv3d):
 
 
 class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = MOVAVideoConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVAVideoConfig()._compile_conditions
-    _supported_attention_backends = MOVAVideoConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_block]
+    _compile_conditions = [is_block]
     param_names_mapping = MOVAVideoConfig().param_names_mapping
     reverse_param_names_mapping = MOVAVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVAVideoConfig().lora_param_names_mapping

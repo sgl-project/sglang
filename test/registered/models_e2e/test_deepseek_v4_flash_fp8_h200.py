@@ -5,7 +5,7 @@ with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: extra-b-test-deepep-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
+Registry: extra-b-test-8-gpu-h200 (label-gated, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -14,6 +14,7 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=280, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=560, stage="extra-b", runner_config="8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -29,6 +30,7 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 
 
 class TestDSV4FlashFP8H200(
+    SpecDecodingMixin,
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
     CustomTestCase,
@@ -36,6 +38,8 @@ class TestDSV4FlashFP8H200(
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 140
 
     @classmethod
     def setUpClass(cls):
@@ -62,7 +66,7 @@ class TestDSV4FlashFP8H200(
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "128",
@@ -74,6 +78,74 @@ class TestDSV4FlashFP8H200(
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
+class TestDSV4FlashFP8H200MegaMoE(
+    SpecDecodingMixin,
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """SM90 FP8 MegaMoE recipe: same 4-GPU split (TP=4) + EAGLE spec decoding
+    as the recipe above, but routes MoE through the SM90 all-FP8 MegaMoE path
+    (DeepEP a2a + DeepGEMM ``deep_gemm`` runner + the ``SGLANG_OPT_*`` flags).
+    """
+
+    gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 140
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL_FP8)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--moe-runner-backend",
+                "deep_gemm",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--chunked-prefill-size",
+                "8192",
+                "--cuda-graph-max-bs-decode",
+                "128",
+                "--max-running-requests",
+                "128",
+                "--watchdog-timeout",
+                "900",
+            ],
+            env={
+                "SGLANG_DSV4_FP4_EXPERTS": "0",
+                # INVARIANT: this per-rank cap MUST equal
+                # chunked_prefill_size / dp_size (= 8192 / 4 = 2048), the per-rank
+                # prefill bound under --enable-dp-attention. If you change
+                # --chunked-prefill-size or --dp above, update this to match —
+                # otherwise MegaMoE falls back whenever a prefill chunk exceeds it.
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "2048",
             },
         )
 

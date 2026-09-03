@@ -4,9 +4,13 @@ should use that classmethod API; do not import from this module directly.
 
 from __future__ import annotations
 
+import logging
+import warnings
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
+
+from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -16,6 +20,8 @@ if TYPE_CHECKING:
 
 WorkerFactory = Callable[["ServerArgs"], Type]
 ServerArgsValidator = Callable[["ServerArgs"], None]
+
+logger = logging.getLogger(__name__)
 
 
 class CustomSpecAlgo:
@@ -28,8 +34,12 @@ class CustomSpecAlgo:
     branches like ``if spec_algorithm.is_eagle():`` in scheduler /
     model_runner). Pass the subclass via ``spec_class=...`` at registration.
 
-    Defaults: all ``is_*()`` return ``False`` except ``is_speculative``;
-    ``supports_spec_v2`` follows ``supports_overlap``.
+    Defaults: all ``is_*()`` return ``False`` except ``is_speculative``.
+
+    ``supports_overlap=False`` is deprecated: the spec V1 worker path has been
+    removed, so such algorithms run on the V2 scheduler schema with overlap
+    disabled (synchronous). Migrate plugin workers to the V2 schema and
+    overlap scheduling.
     """
 
     def __init__(
@@ -60,6 +70,9 @@ class CustomSpecAlgo:
     def is_eagle(self) -> bool:
         return False
 
+    def supports_mixed_chunk(self) -> bool:
+        return False
+
     def is_eagle3(self) -> bool:
         return False
 
@@ -67,6 +80,15 @@ class CustomSpecAlgo:
         return False
 
     def is_dflash(self) -> bool:
+        return False
+
+    def is_uno(self) -> bool:
+        return False
+
+    def is_dspark(self) -> bool:
+        return False
+
+    def is_dflash_family(self) -> bool:
         return False
 
     def is_standalone(self) -> bool:
@@ -78,17 +100,55 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def supports_spec_v2(self) -> bool:
-        return self.supports_overlap
+    def supports_ragged_verify(self) -> bool:
+        return False
 
-    def create_worker(self, server_args: "ServerArgs") -> Type:
-        if not server_args.disable_overlap_schedule and not self.supports_overlap:
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        return False
+
+    def has_draft_kv(self) -> bool:
+        # Conservative default: the larger KV reserve.
+        return True
+
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        pass
+
+    def resolve_max_speculative_num_draft_tokens(
+        self, server_args: ServerArgs
+    ) -> Optional[int]:
+        """Return the largest draft-token width this algorithm may use.
+
+        The default covers static algorithms and adaptive algorithms whose
+        runtime states never exceed their startup width. Overrides must not
+        return less than ``server_args.speculative_num_draft_tokens``.
+        """
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        return resolving_view(server_args).speculative_num_draft_tokens
+
+    def create_worker(self, server_args: ServerArgs) -> Type:
+
+        cfg = resolving_view(server_args)
+        if not cfg.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"Speculative algorithm {self.name} does not support overlap scheduling."
             )
+        if not self.supports_overlap:
+            # Reached only when overlap is disabled, so the algorithm really
+            # does run synchronously on the V2 schema below.
+            logger.warning(
+                "Speculative algorithm %s is registered with "
+                "supports_overlap=False, which is deprecated: the spec V1 "
+                "worker path has been removed, and the algorithm now runs on "
+                "the V2 scheduler schema with overlap disabled (synchronous). "
+                "Migrate the plugin worker to support overlap scheduling.",
+                self.name,
+            )
         return self.factory(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         # FIXME: Remove this after the forward mode refactor. Target verify is
@@ -98,13 +158,31 @@ class CustomSpecAlgo:
         # Here, we expose this interface to allow the other use cases.
         return num_draft_tokens
 
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # Deprecated alias; remove together with the FIXME above.
+        warnings.warn(
+            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
+            "get_num_tokens_per_req_for_target_verify instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
+        """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        The speculative config comes from ``runtime_context.get_spec()``, which
+        follows a runtime override where the startup record does not.
+        """
         return None
 
 

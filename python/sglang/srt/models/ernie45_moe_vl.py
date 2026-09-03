@@ -24,7 +24,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -42,8 +41,11 @@ from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,7 @@ class Ernie4_5_VLMoeAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -158,7 +160,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.moe_num_shared_experts = getattr(config, "moe_num_shared_experts", 0)
         self.hidden_size = config.hidden_size
 
@@ -225,7 +227,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             layer_id >= vision_moe_layer_start_index
             and layer_id <= vision_moe_layer_end_index
         ):
-
             self.vision_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[1],
@@ -281,7 +282,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = get_is_capture_mode()
 
         if visual_token_mask is not None and not capturing:
             all_visual = visual_token_mask.all()
@@ -368,8 +369,7 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta, rope_scaling = get_rope_config(config)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)

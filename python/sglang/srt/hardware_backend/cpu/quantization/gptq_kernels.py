@@ -19,7 +19,7 @@ __all__ = ["GPTQIntelAMXLinearKernel", "GPTQIntelAMXMoEKernel"]
 
 
 class GPTQIntelAMXLinearKernel:
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -46,7 +46,7 @@ class GPTQIntelAMXLinearKernel:
 
 
 class GPTQIntelAMXMoEKernel:
-    def __init__(self, quant_config: "GPTQConfig"):
+    def __init__(self, quant_config: GPTQConfig):
         self.quant_config = quant_config
         self.moe_runner_config: Optional[MoeRunnerConfig] = None
 
@@ -66,13 +66,13 @@ class GPTQIntelAMXMoEKernel:
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: "StandardDispatchOutput",
+        dispatch_output: StandardDispatchOutput,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

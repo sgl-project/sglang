@@ -11,20 +11,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The baseclass of a backend for grammar-guided constrained decoding."""
+"""The base class of a backend for grammar-guided constrained decoding."""
 
+import json
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_resources,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+GRAMMAR_BACKEND_REGISTRY = {}
 
 
 @dataclass
@@ -39,8 +48,14 @@ class GrammarStats:
     num_timeout: int = 0
 
 
-class BaseGrammarObject:
+class GrammarRow(NamedTuple):
+    """Grammar and destination row for a batched vocab-mask fill."""
 
+    row: int
+    grammar: "BaseGrammarObject"
+
+
+class BaseGrammarObject:
     def __init__(self):
         self._finished = False
         self.grammar_stats = None
@@ -67,6 +82,19 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError()
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Fill listed rows, leaving unlisted rows untouched."""
+        for entry in entries:
+            entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
+
+    @staticmethod
+    def reset_vocab_mask(vocab_mask: torch.Tensor) -> None:
+        """Restore a reusable mask to the backend's unconstrained state."""
         raise NotImplementedError()
 
     @staticmethod
@@ -117,6 +145,48 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
+class GrammarMask(NamedTuple):
+    """A filled vocab_mask plus the backend that applies it.
+
+    The grammar is any one of the batch's -- a handle, not per-request state.
+    """
+
+    grammar: BaseGrammarObject
+    vocab_mask: torch.Tensor
+
+    def apply(self, logits: torch.Tensor) -> None:
+        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
+
+
+def _grammar_key_contains_nul(key_type: str, key_string: str) -> bool:
+    """A NUL in a spec segfaults xgrammar's regex converter, which a JSON schema
+    also reaches through `pattern` (possibly escaped). Drop once the upstream fix
+    https://github.com/mlc-ai/xgrammar/pull/850 is in our pinned version.
+    """
+    if "\x00" in key_string:
+        return True
+    if key_type not in ("json", "structural_tag"):
+        return False
+    try:
+        decoded = json.loads(key_string)
+    except ValueError:
+        # Malformed JSON: the backend's own parse reports it as a normal error.
+        return False
+
+    stack = [decoded]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, str):
+            if "\x00" in node:
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.keys())
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
 class InvalidGrammarObject(BaseGrammarObject):
     """Represents a grammar that failed to compile, carrying the original error message."""
 
@@ -134,6 +204,16 @@ class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+
+    def initialize_vocab_mask_buffer(
+        self,
+        name: str,
+        vocab_size: int,
+        max_rows: int,
+        device,
+    ) -> Optional[torch.Tensor]:
+        """Initialize a reusable mask buffer when supported by the backend."""
+        return None
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
@@ -180,6 +260,11 @@ class BaseGrammarBackend:
     ) -> BaseGrammarObject:
         s = time.perf_counter()
         key_type, key_string = key
+        if _grammar_key_contains_nul(key_type, key_string):
+            logger.error(f"Rejecting {key_type} grammar containing a NUL byte")
+            return InvalidGrammarObject(
+                f"Invalid {key_type}: NUL bytes (\\u0000) are not allowed"
+            )
         if key_type == "json":
             grammar = self.dispatch_json(key_string)
         elif key_type == "regex":
@@ -213,7 +298,49 @@ class BaseGrammarBackend:
         self.cache.clear()
 
 
-GRAMMAR_BACKEND_REGISTRY = {}
+def register_vocab_mask_buffer(
+    name: str, vocab_mask: torch.Tensor, max_rows: int
+) -> torch.Tensor:
+    """Register a fixed-capacity mask buffer, preserving an equivalent one."""
+    if max_rows <= 0:
+        raise ValueError(f"Grammar mask max_rows must be positive, got {max_rows}")
+    if vocab_mask.ndim == 0 or vocab_mask.shape[0] != max_rows:
+        raise ValueError(
+            f"Grammar mask buffer {name!r} must have {max_rows} rows, "
+            f"got shape {tuple(vocab_mask.shape)}"
+        )
+
+    buffers = get_resources().buffers
+    existing = buffers.get(name)
+    if existing is not None:
+        if (
+            existing.shape != vocab_mask.shape
+            or existing.dtype != vocab_mask.dtype
+            or existing.device != vocab_mask.device
+        ):
+            raise RuntimeError(
+                f"Grammar mask buffer {name!r} was already initialized as "
+                f"{tuple(existing.shape)}, {existing.dtype}, {existing.device}; "
+                f"new buffer is {tuple(vocab_mask.shape)}, {vocab_mask.dtype}, "
+                f"{vocab_mask.device}"
+            )
+        return existing
+
+    buffers[name] = vocab_mask
+    return vocab_mask
+
+
+def get_vocab_mask_buffer(name: str, rows: int) -> Optional[torch.Tensor]:
+    """Return the active rows of a registered mask buffer, if available."""
+    vocab_mask = get_resources().buffers.get(name)
+    if vocab_mask is None:
+        return None
+    if rows > vocab_mask.shape[0]:
+        raise ValueError(
+            f"Grammar batch needs {rows} mask rows, exceeding initialized "
+            f"capacity {vocab_mask.shape[0]} for {name!r}"
+        )
+    return vocab_mask[:rows]
 
 
 def register_grammar_backend(name, init_func):
@@ -225,9 +352,9 @@ def create_grammar_backend(
     tokenizer,
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
-    think_end_id: Optional[int] = None,
+    think_end_ids: Optional[List[int]] = None,
 ) -> Optional[BaseGrammarBackend]:
-    name = server_args.grammar_backend
+    name = get_exec().kernel.grammar_backend
 
     # Custom grammar backend has the highest priority
     if name in GRAMMAR_BACKEND_REGISTRY:
@@ -241,7 +368,7 @@ def create_grammar_backend(
 
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
-            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import (
@@ -257,10 +384,10 @@ def create_grammar_backend(
                 tokenizer,
                 vocab_size=vocab_size,
                 model_eos_token_ids=eos_list,
-                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+                any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
             )
         except TokenizerNotSupportedError as e:
-            if server_args.enable_strict_thinking:
+            if get_serving().enable_strict_thinking:
                 raise ValueError(
                     f"--enable-strict-thinking requires a grammar backend with "
                     f"token filtering support, but XGrammar failed to initialize: "
@@ -272,18 +399,20 @@ def create_grammar_backend(
                 "Falling back to grammar_backend='none'. "
                 "Structured outputs (JSON schema, regex, EBNF) will not be available."
             )
-            server_args.grammar_backend = "none"
+            get_context().override("grammar.import_fallback", grammar_backend="none")
             return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 
         grammar_backend = GuidanceBackend(
             tokenizer=tokenizer,
-            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
-            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+            whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
+            n_vocab=vocab_size,
+            eos_token_ids=eos_token_ids,
         )
     elif name == "none":
-        if server_args.enable_strict_thinking:
+        if get_serving().enable_strict_thinking:
             raise ValueError(
                 "--enable-strict-thinking requires a grammar backend that supports "
                 "token filtering, but grammar_backend='none' was specified. Use "
@@ -294,20 +423,22 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and think_end_id is not None:
+    if get_serving().reasoning_parser and think_end_ids:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
         reasoning_parser = ReasoningParser(
-            model_type=server_args.reasoning_parser, stream_reasoning=False
+            model_type=get_serving().reasoning_parser,
+            stream_reasoning=False,
+            tokenizer=tokenizer,
         )
 
         grammar_backend = ReasonerGrammarBackend(
             grammar_backend,
             reasoning_parser,
             tokenizer,
-            enable_strict_thinking=server_args.enable_strict_thinking,
+            enable_strict_thinking=get_serving().enable_strict_thinking,
         )
 
     return grammar_backend

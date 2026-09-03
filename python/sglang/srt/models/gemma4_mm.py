@@ -59,12 +59,19 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    load_tied_lm_head,
+    pp_filter_load_weight,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -241,9 +248,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # while logits run on the last rank, so we can't reuse the embedding
         # module directly.  For PP=1 keep the original tying; for PP>1
         # materialize a real ParallelLMHead on the last rank and route the
-        # checkpoint embedding into it during load_weights.
+        # checkpoint embedding into it during load_weights.  CPU with AMX does
+        # the same: the packed head weights cannot alias the embedding table.
         text_tie = getattr(text_config, "tie_word_embeddings", True)
-        if self.pp_group.world_size == 1 and text_tie:
+        self.lm_head_is_tied = (
+            self.pp_group.world_size == 1
+            and text_tie
+            and not (_is_cpu and _is_cpu_amx_available)
+        )
+        if self.lm_head_is_tied:
             self.lm_head = self.language_model.embed_tokens
         elif self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -301,6 +314,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+
     def prepare_attn_masks(
         self,
         forward_batch: ForwardBatch,
@@ -327,7 +348,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         bidirectional_attn_masks_list = []
         bidirectional_attn_mask_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
+            forward_batch.batch_size + 1, dtype=torch.int64, device=input_ids.device
         )
 
         split_images = []
@@ -608,9 +629,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
+            # Use torch.where instead of boolean indexing for NPU graph compatibility
+            ple_ids = torch.where(
+                input_ids == self.config.image_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.video_token_id, pad_id, ple_ids
+            )
+            ple_ids = torch.where(
+                input_ids == self.config.audio_token_id, pad_id, ple_ids
+            )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.
@@ -653,13 +681,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        # PP=1 keeps the original tied-weight behavior of using embed_tokens
-        # directly; under PP we route through the dedicated lm_head module.
         head = (
-            self.language_model.embed_tokens
-            if self.pp_group.world_size == 1
-            and getattr(self.config.text_config, "tie_word_embeddings", True)
-            else self.lm_head
+            self.language_model.embed_tokens if self.lm_head_is_tied else self.lm_head
         )
         return self.logits_processor(
             input_ids,
@@ -1001,6 +1024,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        if (
+                            text_tie
+                            and not self.lm_head_is_tied
+                            and name == "language_model.embed_tokens.weight"
+                        ):
+                            load_tied_lm_head(
+                                loaded_weight,
+                                params_dict=params_dict,
+                                loaded_params=loaded_params,
+                            )
                         loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
@@ -1080,7 +1113,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "--pp-size 1 if you need this API."
             )
         embed = self.language_model.embed_tokens.weight
-        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        # a materialized lm_head is loaded from this very tensor, so it is exact
         return embed, embed
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):

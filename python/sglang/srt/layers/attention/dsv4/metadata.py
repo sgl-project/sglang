@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+
+_IS_SM120 = is_sm120_supported()
 
 if TYPE_CHECKING:
     pass
@@ -50,6 +52,8 @@ Some other notes:
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
+_SM120_INDEXER_M_CHUNK = 4096
+
 
 def copy_metadata(
     *,
@@ -85,14 +89,26 @@ def copy_metadata(
 
     provided_fields = check_eq_fields + copy_fields + assign_fields
     provided_fields_unique = set(provided_fields)
-    assert len(provided_fields) == len(
-        provided_fields_unique
-    ), f"{provided_fields=} has dup"
+    assert len(provided_fields) == len(provided_fields_unique), (
+        f"{provided_fields=} has dup"
+    )
     all_fields = {f.name for f in fields(src)}
     provided_fields = set(provided_fields)
-    assert (
-        provided_fields == all_fields
-    ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
+    assert provided_fields == all_fields, (
+        f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
+    )
+
+
+@dataclass
+class NonPagedIndexerPlan:
+    page_table: torch.Tensor
+    gather_seq_lens: torch.Tensor
+    ks: torch.Tensor
+    ke: torch.Tensor
+    seq_len_sum: int
+    max_seq_len: int
+    max_seqlen_k: int
+    query_rows: int
 
 
 @dataclass
@@ -100,41 +116,61 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    use_topk_v2: bool
+    force_deep_gemm_metadata: bool = False
+    use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
+    nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
+        init=False, repr=False, default=None
+    )
 
     def __post_init__(self):
         if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ):
+            is_hip() or is_xpu() or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        ) and not self.force_deep_gemm_metadata:
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
 
-            use_jit_indexer = (
+            use_jit_indexer = not self.force_deep_gemm_metadata and (
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                 or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
             )
             if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+                from sglang.kernels.ops.attention.dsv4 import (
+                    get_paged_mqa_logits_metadata,
+                )
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+            if _IS_SM120 and _c4.shape[0] > _SM120_INDEXER_M_CHUNK:
+                # Chunk metadata is identical for every layer in the forward
+                # pass; compute the per-chunk list once here instead of per
+                # layer in the indexer.
+                self.deep_gemm_metadata = [
+                    get_paged_mqa_logits_metadata(
+                        _c4[_s : _s + _SM120_INDEXER_M_CHUNK],
+                        self.c4_page_size,
+                        deep_gemm.get_num_sms(),
+                    )
+                    for _s in range(0, _c4.shape[0], _SM120_INDEXER_M_CHUNK)
+                ]
+            else:
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
 
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
-        from sglang.jit_kernel.dsv4 import plan_topk_v2
+        if self.use_topk_v2:
+            from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))
@@ -153,21 +189,27 @@ class PagedIndexerMetadata:
     def max_c4_seq_len(self) -> int:
         return self.page_table.shape[1] * self.c4_page_size
 
-    def copy_(self, other: "PagedIndexerMetadata"):
+    def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
-            assign_fields = ["deep_gemm_metadata"]
+            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-            assign_fields = []
+            assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size"],
+            check_eq_fields=[
+                "page_size",
+                "force_deep_gemm_metadata",
+                "use_prefill_cuda_graph",
+                "use_topk_v2",
+            ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )
+        self.nonpaged_plan = None
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

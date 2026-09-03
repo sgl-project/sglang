@@ -14,11 +14,10 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=477, suite="base-b-tp-test-cpu")
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",

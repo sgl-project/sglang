@@ -3,7 +3,7 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock
@@ -36,6 +36,7 @@ def _make_req(freq=0.0, presence=0.0, min_tokens=0, stop_ids=None, eos_id=2):
     req.sampling_params.presence_penalty = presence
     req.sampling_params.min_new_tokens = min_tokens
     req.sampling_params.stop_token_ids = stop_ids
+    req.eos_token_ids = None
     req.tokenizer.additional_stop_token_ids = None
     req.tokenizer.eos_token_id = eos_id
     return req
@@ -52,7 +53,6 @@ def _make_batch(reqs):
 
 # BatchedPenalizerOrchestrator
 class TestBatchedPenalizerOrchestrator(CustomTestCase):
-
     def test_init_detects_required_penalizers(self):
         """Test that orchestrator marks is_required=True when any request has nonzero penalty."""
         reqs = [_make_req(freq=1.0)]
@@ -142,7 +142,6 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
 
 # BatchedFrequencyPenalizer
 class TestBatchedFrequencyPenalizer(CustomTestCase):
-
     def _setup(self, freq_values):
         reqs = [_make_req(freq=f) for f in freq_values]
         batch = _make_batch(reqs)
@@ -224,7 +223,6 @@ class TestBatchedFrequencyPenalizer(CustomTestCase):
 
 # BatchedPresencePenalizer
 class TestBatchedPresencePenalizer(CustomTestCase):
-
     def _setup(self, presence_values):
         reqs = [_make_req(presence=p) for p in presence_values]
         batch = _make_batch(reqs)
@@ -274,7 +272,6 @@ class TestBatchedPresencePenalizer(CustomTestCase):
 
 # BatchedMinNewTokensPenalizer
 class TestBatchedMinNewTokensPenalizer(CustomTestCase):
-
     def _setup(self, configs):
         """configs: list of (min_tokens, stop_ids, eos_id)."""
         reqs = [_make_req(min_tokens=c[0], stop_ids=c[1], eos_id=c[2]) for c in configs]
@@ -347,6 +344,20 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         # Non-stop tokens should be fine
         self.assertEqual(logits[0, 0].item(), 0.0)
 
+    def test_blocks_model_eos_without_tokenizer_eos(self):
+        """Model-config EOS remains blocked when tokenizer EOS metadata is missing."""
+        req = _make_req(min_tokens=3, eos_id=None)
+        req.eos_token_ids = {6}
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertTrue(torch.isneginf(logits[0, 6]))
+
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])
@@ -373,7 +384,6 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
 
 # _BatchedPenalizer base class edge cases
 class TestBatchedPenalizerBase(CustomTestCase):
-
     def test_filter_when_not_prepared_is_noop(self):
         """Test that filter on an unprepared penalizer does not crash."""
         reqs = [_make_req()]
@@ -437,7 +447,6 @@ class TestBatchedPenalizerBase(CustomTestCase):
 
 # Orchestrator with multiple penalizer types
 class TestOrchestratorMultiplePenalizers(CustomTestCase):
-
     def test_all_three_penalizers(self):
         """Test orchestrator managing frequency, presence, and min_new_tokens together."""
         reqs = [_make_req(freq=1.0, presence=0.5, min_tokens=2, eos_id=2)]

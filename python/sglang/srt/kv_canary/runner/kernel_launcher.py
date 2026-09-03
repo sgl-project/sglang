@@ -4,15 +4,15 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import (
+from sglang.kernels.ops.kv_canary.consts import (
     RealKvHashMode,
 )
-from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
-from sglang.jit_kernel.kv_canary.verify import (
+from sglang.kernels.ops.kv_canary.plan import launch_canary_plan_kernels
+from sglang.kernels.ops.kv_canary.verify import (
     CanaryLaunchTag,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
@@ -64,7 +64,7 @@ def launch_endpoints_per_forward(
     tag_filter: Callable[[CanaryLaunchTag], bool],
     verify_plan: VerifyPlan,
     write_plan: WritePlan,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     expected_inputs: ExpectedInputs,
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,

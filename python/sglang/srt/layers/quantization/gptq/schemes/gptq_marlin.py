@@ -27,7 +27,7 @@ __all__ = ["GPTQMarlinLinearScheme"]
 
 
 class GPTQMarlinLinearScheme(GPTQLinearSchemeBase):
-    def __init__(self, quant_config: "GPTQMarlinConfig"):
+    def __init__(self, quant_config: GPTQMarlinConfig):
         self.quant_config = quant_config
         self.kernel = self._init_kernel(quant_config)
 
@@ -36,7 +36,7 @@ class GPTQMarlinLinearScheme(GPTQLinearSchemeBase):
             group_size=self.quant_config.group_size,
         )
 
-    def _init_kernel(self, quant_config: "GPTQMarlinConfig"):
+    def _init_kernel(self, quant_config: GPTQMarlinConfig):
         from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
             GPTQMarlinLinearKernel,
         )

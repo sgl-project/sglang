@@ -22,20 +22,24 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
+    process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_spec_tokens_details_from_ret,
     should_include_usage,
+    spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
@@ -124,12 +128,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
-            extra_key=self._compute_extra_key(request),
+            session_id=request.session_id,
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
         )
 
         return adapted_request, request
@@ -164,9 +172,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
+            json_schema = request.response_format.json_schema
+            schema = getattr(json_schema, "schema_", None)
+            if schema is None:
+                raise ValueError(
+                    "schema_ is required for json_schema response format request."
+                )
+            sampling_params["json_schema"] = convert_json_schema_to_str(schema)
         elif request.response_format and request.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif (
@@ -218,6 +230,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_offsets = {}
         n_prev_tokens = {}
+        n_prev_token_ids = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -227,6 +240,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        spec_tokens_details = {}
 
         stream_started = False
         try:
@@ -254,6 +268,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if request.return_spec_tokens_details:
+                    spec_tokens_details[index] = spec_tokens_details_from_meta_info(
+                        content["meta_info"]
+                    )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
@@ -290,9 +308,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_top_logprobs = content["meta_info"].get(
                             "output_top_logprobs", []
                         )
-                        if (
-                            not self.tokenizer_manager.server_args.incremental_streaming_output
-                        ):
+                        if not self.tokenizer_manager.server_args.incremental_streaming_output:
                             output_token_logprobs = output_token_logprobs[
                                 n_prev_token:total_output_logprobs
                             ]
@@ -307,8 +323,24 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
+                chunk_token_ids = None
+                chunk_prompt_token_ids = None
+                if request.return_token_ids:
+                    output_ids = content["output_ids"]
+                    if not self.tokenizer_manager.server_args.incremental_streaming_output:
+                        n_prev_token_id = n_prev_token_ids.get(index, 0)
+                        chunk_token_ids = output_ids[n_prev_token_id:]
+                        n_prev_token_ids[index] = len(output_ids)
+                    else:
+                        chunk_token_ids = output_ids
+                    if is_first_chunk:
+                        chunk_prompt_token_ids = content.get("prompt_token_ids")
+
                 # Generate delta
-                delta = text[offset:]
+                if self.tokenizer_manager.server_args.incremental_streaming_output:
+                    delta = text
+                else:
+                    delta = text[offset:]
                 stream_offsets[index] = len(content["text"])
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
@@ -341,6 +373,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
+                    token_ids=chunk_token_ids,
+                    prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -364,10 +398,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
+                        response_hidden_states = process_hidden_states_for_response(
+                            choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -377,7 +409,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                 CompletionResponseStreamChoice(
                                     index=index,
                                     text="",
-                                    hidden_states=last_token_hidden_states,
+                                    hidden_states=response_hidden_states,
                                     finish_reason=None,
                                 )
                             ],
@@ -391,15 +423,36 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     (v for v in routed_experts.values() if v is not None), None
                 )
 
-            sglext_details = None
+            sglext_cached_tokens_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
                 first_details = next(
                     (v for v in cached_tokens_details.values() if v is not None), None
                 )
                 if first_details is not None:
-                    sglext_details = cached_tokens_details_from_dict(first_details)
+                    sglext_cached_tokens_details = cached_tokens_details_from_dict(
+                        first_details
+                    )
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_spec_tokens_details = None
+            if request.return_spec_tokens_details and spec_tokens_details:
+                spec_details = [
+                    spec_tokens_details[index]
+                    for index in sorted(spec_tokens_details)
+                    if spec_tokens_details[index] is not None
+                ]
+                if spec_details:
+                    sglext_spec_tokens_details = (
+                        spec_details if request.n > 1 else spec_details[0]
+                    )
+
+            if any(
+                obj is not None
+                for obj in [
+                    sglext_routed,
+                    sglext_cached_tokens_details,
+                    sglext_spec_tokens_details,
+                ]
+            ):
                 sglext_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,
@@ -408,7 +461,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     model=request.model,
                     sglext=SglExt(
                         routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
+                        cached_tokens_details=sglext_cached_tokens_details,
+                        spec_tokens_details=sglext_spec_tokens_details,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -489,11 +543,24 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_details = [
+            detail
+            for detail in (
+                process_spec_tokens_details_from_ret(item, request) for item in ret
+            )
+            if detail is not None
+        ]
+        spec_tokens_details = (
+            spec_details
+            if request.n > 1
+            else (spec_details[0] if spec_details else None)
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                spec_tokens_details=spec_tokens_details,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -541,6 +608,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                token_ids=(
+                    ret_item["output_ids"] if request.return_token_ids else None
+                ),
+                prompt_token_ids=(
+                    ret_item.get("prompt_token_ids")
+                    if request.return_token_ids
+                    else None
+                ),
             )
             choices.append(choice_data)
 
@@ -556,7 +631,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             created=created,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
             sglext=response_sglext,
         )
 

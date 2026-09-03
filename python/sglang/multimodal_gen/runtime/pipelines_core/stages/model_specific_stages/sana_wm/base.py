@@ -838,9 +838,11 @@ class SanaWMDenoisingStage(DenoisingStage):
         scheduler = getattr(
             batch, "scheduler", None
         ) or get_or_create_request_scheduler(batch, self.scheduler)
+        self._move_scheduler_tensors_to_device(scheduler, device)
         timesteps = batch.timesteps
         if timesteps is None:
             raise ValueError("SANA-WM denoising requires prepared timesteps.")
+        timesteps = timesteps.to(device=device)
 
         latents = batch.latents.to(device=device, dtype=target_dtype)
         init_latents = latents.clone()
@@ -962,7 +964,7 @@ class SanaWMDenoisingStage(DenoisingStage):
             assert transformer is not None
             self.transformer = transformer
 
-            for step_idx, t in enumerate(self.progress_bar(timesteps)):
+            for step_idx, t in enumerate(self.progress_bar(timesteps, batch=batch)):
                 if cfg_parallel:
                     latent_model_input = latents
                 else:
@@ -1039,6 +1041,17 @@ class SanaWMDenoisingStage(DenoisingStage):
         )
         batch.latents = server_args.pipeline_config.post_denoising_loop(latents, batch)
         return batch
+
+    @staticmethod
+    def _move_scheduler_tensors_to_device(scheduler: object, device) -> None:
+        for name in ("sigmas", "timesteps"):
+            for attr_name in (name, f"_{name}"):
+                value = getattr(scheduler, attr_name, None)
+                if isinstance(value, torch.Tensor):
+                    try:
+                        setattr(scheduler, attr_name, value.to(device=device))
+                    except AttributeError:
+                        pass
 
 
 class SanaWMBeforeDenoisingStage(PipelineStage):

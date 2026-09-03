@@ -4,7 +4,8 @@ Per-request accounting state (`decode_batch_idx` / `extend_batch_idx` iter
 clocks, `kv_committed_len` / `kv_allocated_len` KV watermarks,
 `spec_verify_ct`, and the `maybe_evict_swa()` call) must only be advanced by
 the reviewed owner sites in _OWNER_SITES; spec-v2 draft workers must not
-repeat any of them (the scheduler-driven mixin / resolve path already does).
+repeat any of them (the scheduler-driven free function / resolve path already
+does).
 A clock that runs fast fires SWA eviction in the overlap race window and
 releases the SWA prefix lock early; neither shows up in e2e CI or the idle
 leak checker, hence this AST-level guard.
@@ -39,7 +40,15 @@ _EVICT_METHOD = "maybe_evict_swa"
 # attribute (`= 0` resets exempt) or "evict" for a `maybe_evict_swa()` call.
 # Any added/removed/recounted site fails until reviewed here.
 _SB = "managers/schedule_batch.py"
-_MIXIN = ("speculative/eagle_info_v2.py", "EagleDraftInputV2Mixin.prepare_for_decode")
+_EAGLE_DECODE = ("speculative/eagle_utils.py", "eagle_prepare_for_decode")
+_DFLASH_DECODE = (
+    "speculative/dflash_info_v2.py",
+    "DFlashDraftInputV2.prepare_for_decode",
+)
+_UNO_DECODE = (
+    "speculative/uno_info.py",
+    "UnoDraftInput.prepare_for_decode",
+)
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
@@ -48,48 +57,75 @@ _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
     (_SB, "ScheduleBatch.prepare_for_decode", "decode_batch_idx"): 1,
-    (_SB, "ScheduleBatch.prepare_for_decode", "kv_committed_len"): 1,
-    (_SB, "ScheduleBatch.prepare_for_decode", "kv_allocated_len"): 1,
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
-    (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
-    (_SB, "ScheduleBatch.prepare_for_extend", "kv_allocated_len"): 1,
-    ("mem_cache/common.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/common.py", "alloc_for_decode", "evict"): 1,
-    # spec v2: pre-claim in the scheduler-driven mixin, settle in resolve
-    (*_MIXIN, "decode_batch_idx"): 1,
-    (*_MIXIN, "evict"): 1,
-    (*_MIXIN, "kv_committed_len"): 1,
-    (*_MIXIN, "kv_allocated_len"): 1,
-    (*_RESOLVE, "kv_committed_len"): 2,
+    # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
+    ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
+    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode", "evict"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode", "kv_allocated_len"): 1,
+    ("mem_cache/allocation.py", "alloc_for_decode", "kv_committed_len"): 1,
+    # spec v2: no pre-claim; resolve commits the full accepted run uniformly.
+    # kv_allocated_len for spec v2 draft decode (eagle + dflash) is settled
+    # inside the owned-kv alloc_for_spec_decode function (op42).
+    (*_EAGLE_DECODE, "decode_batch_idx"): 1,
+    (*_EAGLE_DECODE, "evict"): 1,
+    # DFlash uses its stateful scheduler-side preparation instead of
+    # eagle_prepare_for_decode. spec_prepare_for_decode dispatches to exactly
+    # one of these two owners for each speculative decode iteration.
+    (*_DFLASH_DECODE, "decode_batch_idx"): 1,
+    (*_DFLASH_DECODE, "evict"): 1,
+    (*_UNO_DECODE, "decode_batch_idx"): 1,
+    (*_UNO_DECODE, "evict"): 1,
+    (
+        "mem_cache/allocation.py",
+        "alloc_for_spec_decode",
+        "kv_allocated_len",
+    ): 1,
+    (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
-    # spec v1: each verify path owns its own settlement
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_committed_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "kv_allocated_len"): 1,
-    ("speculative/eagle_info.py", "EagleVerifyInput.verify", "spec_verify_ct"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_committed_len"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "kv_allocated_len"): 1,
-    ("speculative/dflash_info.py", "DFlashVerifyInput.verify", "spec_verify_ct"): 1,
-    # disaggregation decode prealloc
+    # Mixed-chunk spec tails: the mixed prefill step commits the pending
+    # bonus token, advancing the watermark by exactly that one token.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_prefill",
+        "kv_committed_len",
+    ): 1,
+    # disaggregation decode prealloc: kv_allocated_len is settled inside the
+    # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
         "disaggregation/decode.py",
         "DecodePreallocQueue._pre_alloc",
         "kv_committed_len",
     ): 1,
+    ("disaggregation/decode.py", "alloc_for_decode_prealloc", "kv_allocated_len"): 1,
     (
         "disaggregation/decode.py",
-        "DecodePreallocQueue._pre_alloc",
+        "alloc_for_decode_prealloc_hisparse",
         "kv_allocated_len",
     ): 1,
-    # streaming session slot save/restore and tail trimming
-    (_SS, "SessionSlot.save_from_req", "kv_committed_len"): 1,
-    (_SS, "SessionSlot.save_from_req", "kv_allocated_len"): 1,
-    (_SS, "SessionSlot.restore_to_req", "kv_committed_len"): 1,
-    (_SS, "SessionSlot.restore_to_req", "kv_allocated_len"): 1,
-    (_SS, "StreamingSession._free_tail", "kv_committed_len"): 2,
-    (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 2,
+    # Beam member rows alias the leader's decode region, so releasing them
+    # rewinds the leader's watermarks to keep its own per-Req release from
+    # freeing that region twice.
+    (
+        "beam_search/fork.py",
+        "free_member_rows",
+        "kv_committed_len",
+    ): 1,
+    (
+        "beam_search/fork.py",
+        "free_member_rows",
+        "kv_allocated_len",
+    ): 1,
+    # streaming session tail trimming
+    (_SS, "StreamingSession._free_tail", "kv_committed_len"): 1,
+    (_SS, "StreamingSession._free_tail", "kv_allocated_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_committed_len"): 1,
     (_SS, "StreamingSession._trim_overshoot", "kv_allocated_len"): 1,
-    (_SS, "StreamingSession.try_cache_finished_req", "kv_allocated_len"): 1,
+    # Inherit the authoritative finished length (not the lagging req clock).
+    (_SS, "StreamingSession.try_cache_finished_req", "kv_committed_len"): 1,
+    # NPU page-boundary clamp on the shared req/slot clock.
+    (_SS, "StreamingSession.try_match_prefix", "kv_committed_len"): 1,
 }
 
 
@@ -154,7 +190,7 @@ def _scan_srt():
 
 
 def _draft_worker_classes():
-    """All transitive BaseDraftWorker subclasses under speculative/."""
+    """All transitive EagleDraftWorkerBase subclasses under speculative/."""
     by_name = {}
     for path in sorted(_SPECULATIVE_DIR.glob("*.py")):
         rel = path.relative_to(_SRT_DIR).as_posix()
@@ -166,7 +202,7 @@ def _draft_worker_classes():
                 }
                 by_name[node.name] = (rel, node, bases)
 
-    workers = {"BaseDraftWorker"}
+    workers = {"EagleDraftWorkerBase"}
     changed = True
     while changed:
         changed = False
@@ -177,7 +213,7 @@ def _draft_worker_classes():
     return [
         (rel, node)
         for name, (rel, node, _) in sorted(by_name.items())
-        if name in workers and name != "BaseDraftWorker"
+        if name in workers and name != "EagleDraftWorkerBase"
     ]
 
 
@@ -229,7 +265,7 @@ class TestDecodeBookkeepingOwnership(CustomTestCase):
             + "\n  ".join(map(str, sorted(violations)))
             + "\nUnder spec v2 the iter-clock ticks, `maybe_evict_swa`, and "
             "KV watermark settlement are owned by the scheduler-driven "
-            "mixin / resolve path. Remove these from the worker.",
+            "free function / resolve path. Remove these from the worker.",
         )
 
 

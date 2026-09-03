@@ -5,14 +5,14 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag, VerifyPlan
+from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.runner import kernel_launcher as kernel_launcher_module
 from sglang.srt.kv_canary.state import ViolationLog
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
@@ -21,27 +21,32 @@ from sglang.test.kv_canary.runner_test_base import (
 )
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
 
 
 class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
         """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
-        with patch.object(
-            kernel_launcher_module,
-            "launch_canary_plan_kernels",
-            lambda **kwargs: calls.append("plan"),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: calls.append(
-                ("verify", kwargs["context"].kernel_kind.name)
+        with (
+            patch.object(
+                kernel_launcher_module,
+                "launch_canary_plan_kernels",
+                lambda **kwargs: calls.append("plan"),
             ),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: calls.append(
-                ("write", kwargs["context"].kernel_kind.name)
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: calls.append(
+                    ("verify", kwargs["context"].kernel_kind.name)
+                ),
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: calls.append(
+                    ("write", kwargs["context"].kernel_kind.name)
+                ),
             ),
         ):
             manager = make_manager(device=self.device)

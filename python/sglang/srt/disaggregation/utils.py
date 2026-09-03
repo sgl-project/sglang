@@ -1,19 +1,31 @@
 from __future__ import annotations
 
-import os
 import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_npu
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -24,12 +36,66 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.server_args import ServerArgs
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        DSV4NPUTokenToKVPool,
+    )
 
 #########################
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+_IS_HIP = is_hip()
+
+
+def poll_and_all_reduce_pp(
+    rids: Iterable[str],
+    ready_poll: int,
+    pp_good_rids: Optional[List[str]] = None,
+    pp_bad_rids: Optional[List[str]] = None,
+) -> List[Optional[int]]:
+    """Map authoritative PP consensus to poll states without polling again."""
+    if pp_good_rids is None or pp_bad_rids is None:
+        raise ValueError("PP consensus is required")
+
+    good_rids = set(pp_good_rids)
+    bad_rids = set(pp_bad_rids)
+    return [
+        KVPoll.Failed if rid in bad_rids else ready_poll if rid in good_rids else None
+        for rid in rids
+    ]
+
+
+def get_dsa_seed_metadata_dim(hf_config) -> int:
+    """Return the model-defined PD seed width, independent of local spec mode."""
+    if not getattr(hf_config, "index_share_for_mtp_iteration", False):
+        return 0
+    return get_dsa_index_topk(hf_config)
+
+
+def is_dsv4_c128_online_enabled() -> bool:
+    """Return whether DSV4 C128 uses request-scoped online state."""
+    return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
+def get_dsv4_c128_state_indices(
+    req_pool_idx: int,
+    seq_len: int,
+    *,
+    online: bool,
+    ring_size: int,
+) -> np.ndarray:
+    """Return the PD transfer row/page indices for DSV4 C128 state."""
+    if seq_len == 0 or seq_len % 128 == 0:
+        return np.empty((0,), dtype=np.int32)
+    if online:
+        return np.array([int(req_pool_idx)], dtype=np.int32)
+
+    assert ring_size % 128 == 0, f"C128 ring_size must be 128-aligned, got {ring_size}"
+    pages_per_req = ring_size // 128
+    page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
+    return np.array([page], dtype=np.int32)
 
 
 class DisaggregationMode(Enum):
@@ -46,21 +112,57 @@ class DisaggregationMode(Enum):
         return "unified"
 
 
+def unified_memory_disagg_move_gate(scheduler):
+    """Compaction move gate for a PD node running the unified memory pool.
+
+    Returns a predicate that is True only when no transfer can be in flight, so
+    compaction never relocates a page the RDMA engine is reading or writing.
+    Safe to read this state from here: every mover runs on the scheduler thread.
+
+    A page is exposed from the moment its address reaches the peer until the
+    transfer concludes, and for part of that lifetime the request is in NEITHER
+    end's queue -- so queue emptiness alone is not enough:
+
+    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
+      chunks may still be draining, and the request only reaches the inflight
+      queue later, in the result path.
+    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
+      allocating for the next, whose allocation can urgently flush the peer
+      sub-allocator; the batch reaches the transfer queue only after the loop.
+    """
+    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+
+        def prefill_gate() -> bool:
+            return not (
+                scheduler.disagg_prefill_inflight_queue
+                or scheduler.disagg_prefill_pending_chunk_rids
+            )
+
+        return prefill_gate
+
+    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+
+        def decode_gate() -> bool:
+            return not (
+                scheduler.disagg_decode_transfer_queue.queue
+                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+            )
+
+        return decode_gate
+
+    raise ValueError(
+        "unified_memory_disagg_move_gate: scheduler is not a PD node "
+        f"(mode={scheduler.disaggregation_mode})"
+    )
+
+
 #########################
 # Synchronization
 #########################
 
 
-def _get_failure_prob() -> float:
-    try:
-        return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
-    except Exception:
-        # fallback to legacy env var
-        return float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", "0"))
-
-
 def _poll_with_failure_injection(pollers) -> List[int]:
-    if (failure_prob := _get_failure_prob()) > 0:
+    if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
@@ -68,14 +170,14 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
-def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
+def _is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
-        and server_args.disaggregation_transfer_backend == "fake"
+        and get_disagg().disaggregation_transfer_backend == "fake"
     )
 
 
-def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> None:
+def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
@@ -84,7 +186,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
             decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req, server_args):
+            if _is_fake_transfer(decode_req.req):
                 continue
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
@@ -93,26 +195,26 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
+    """MIN-reduce poll states so no rank commits ahead of its peers."""
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
-    server_args: Optional[ServerArgs] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
-    if (
-        decode_reqs is not None
-        and metadata_buffers is not None
-        and server_args is not None
-    ):
-        _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    if decode_reqs is not None and metadata_buffers is not None:
+        _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
+    return _all_reduce_polls(polls, gloo_group)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -126,13 +228,7 @@ def poll_and_all_reduce_attn_cp_tp_group(
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
-    return tensor_to_reduce.tolist()
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def poll_and_all_reduce_with_staging(
@@ -140,7 +236,6 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
-    server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -153,17 +248,22 @@ def poll_and_all_reduce_with_staging(
     receivers = [dr.kv_receiver for dr in decode_reqs]
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
+        if decode_req.kv_receiver.require_staging and staging_handler.is_failed(
+            decode_req
+        ):
+            # Staging completion timed out; KVPoll.Failed == 0 propagates
+            # through the MIN all_reduce.
+            raw_polls[i] = int(KVPoll.Failed)
+            continue
         if raw_polls[i] == int(KVPoll.Success):
             if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
                 decode_req
             ):
                 raw_polls[i] = int(KVPoll.Transferring)
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
-    if metadata_buffers is not None and server_args is not None:
-        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    if metadata_buffers is not None:
+        _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
+    return _all_reduce_polls(raw_polls, gloo_group)
 
 
 #########################
@@ -201,9 +301,17 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
+        max_sampling_mask_tokens: Optional[int] = None,
         custom_mem_pool: torch.cuda.MemPool = None,
+        output_dsa_topk_indices_dim: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        if max_sampling_mask_tokens is None:
+            max_sampling_mask_tokens = (
+                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
+            )
+        self.enable_sampling_mask = max_sampling_mask_tokens > 0
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -241,6 +349,19 @@ class MetadataBuffers:
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
+            self.output_token_sampling_mask_len = None
+            self.output_token_sampling_mask_idx = None
+            self.output_token_sampling_logprobs = None
+            if self.enable_sampling_mask:
+                self.output_token_sampling_mask_len = torch.zeros(
+                    (size, 16), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_mask_idx = torch.zeros(
+                    (size, max_sampling_mask_tokens), dtype=torch.int32, device=device
+                )
+                self.output_token_sampling_logprobs = torch.zeros(
+                    (size, 16), dtype=torch.float32, device=device
+                )
             # For PD + spec decode
             self.output_topk_p = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
@@ -251,51 +372,60 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            if self.output_dsa_topk_indices_dim > 0:
+                self.output_dsa_topk_indices = torch.full(
+                    (size, self.output_dsa_topk_indices_dim),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                self.output_dsa_topk_indices = None
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.cached_tokens.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-            self.output_topk_p.data_ptr(),
-            self.output_topk_index.data_ptr(),
-            self.output_hidden_states.data_ptr(),
-            self.bootstrap_room.data_ptr(),
+        bufs = [
+            self.output_ids,
+            self.cached_tokens,
+            self.output_token_logprobs_val,
+            self.output_token_logprobs_idx,
+            self.output_top_logprobs_val,
+            self.output_top_logprobs_idx,
         ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.cached_tokens.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-            self.output_topk_p.nbytes,
-            self.output_topk_index.nbytes,
-            self.output_hidden_states.nbytes,
-            self.bootstrap_room.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.cached_tokens[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-            self.output_topk_p[0].nbytes,
-            self.output_topk_index[0].nbytes,
-            self.output_hidden_states[0].nbytes,
-            self.bootstrap_room[0].nbytes,
-        ]
+        if self.enable_sampling_mask:
+            bufs.extend(
+                [
+                    self.output_token_sampling_mask_len,
+                    self.output_token_sampling_mask_idx,
+                    self.output_token_sampling_logprobs,
+                ]
+            )
+        bufs.extend(
+            [
+                self.output_topk_p,
+                self.output_topk_index,
+                self.output_hidden_states,
+            ]
+        )
+        if self.output_dsa_topk_indices is not None:
+            bufs.append(self.output_dsa_topk_indices)
+        bufs.append(self.bootstrap_room)
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
+        sampling_mask_len = None
+        sampling_mask_idx = None
+        sampling_logprobs = None
+        if self.enable_sampling_mask:
+            sampling_mask_len = self.output_token_sampling_mask_len[idx].clone()
+            sampling_mask_idx = self.output_token_sampling_mask_idx[idx].clone()
+            sampling_logprobs = self.output_token_sampling_logprobs[idx].clone()
         return (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
@@ -303,19 +433,41 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx].clone(),
             self.output_top_logprobs_val[idx].clone(),
             self.output_top_logprobs_idx[idx].clone(),
+            sampling_mask_len,
+            sampling_mask_idx,
+            sampling_logprobs,
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            (
+                self.output_dsa_topk_indices[idx].clone()
+                if self.output_dsa_topk_indices is not None
+                else None
+            ),
             self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
+        # counts and slots 4-6 are reused for multimodal prompt token counts
+        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
+
+        # Compute multimodal prompt token counts on the prefill node so decode
+        # can report them in usage.
+        if req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.cached_tokens[req.metadata_buffer_index][4] = image_t
+        self.cached_tokens[req.metadata_buffer_index][5] = audio_t
+        self.cached_tokens[req.metadata_buffer_index][6] = video_t
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -327,6 +479,14 @@ class MetadataBuffers:
                 )
 
             if req.logprob.output_top_logprobs_val:  # not none or empty list
+                top_logprobs_len = len(req.logprob.output_top_logprobs_val[0])
+                max_top_logprobs_len = self.output_top_logprobs_val.shape[1]
+                if top_logprobs_len > max_top_logprobs_len:
+                    raise RuntimeError(
+                        f"top_logprobs_num {top_logprobs_len} exceeds "
+                        f"disaggregation metadata capacity {max_top_logprobs_len}. "
+                        "Lower top_logprobs_num or increase the metadata buffer."
+                    )
                 self.output_top_logprobs_val[req.metadata_buffer_index][
                     : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
@@ -342,6 +502,44 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
+        if req.return_sampling_mask:
+            if not self.enable_sampling_mask:
+                raise RuntimeError(
+                    "return_sampling_mask with disaggregation requires "
+                    "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+                )
+            # Sentinel -1: the decode side records None for this handoff token.
+            self.output_token_sampling_mask_len[req.metadata_buffer_index][0] = -1
+            sampling_masks = req.output_token_sampling_mask
+            sampling_logprobs = req.output_token_sampling_logprobs
+            if sampling_masks:
+                sampling_mask = sampling_masks[0]
+                sampling_logprob = sampling_logprobs[0] if sampling_logprobs else None
+                if sampling_mask is not None and sampling_logprob is not None:
+                    mask_len = len(sampling_mask)
+                    max_mask_len = self.output_token_sampling_mask_idx.shape[1]
+                    if mask_len > max_mask_len:
+                        raise RuntimeError(
+                            f"Sampling mask length {mask_len} exceeds disaggregation "
+                            f"metadata capacity {max_mask_len}. Increase "
+                            "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS."
+                        )
+                    self.output_token_sampling_mask_len[req.metadata_buffer_index][
+                        0
+                    ] = mask_len
+                    if mask_len:
+                        self.output_token_sampling_mask_idx[
+                            req.metadata_buffer_index, :mask_len
+                        ].copy_(
+                            torch.tensor(
+                                sampling_mask,
+                                dtype=torch.int32,
+                                device=self.output_token_sampling_mask_idx.device,
+                            )
+                        )
+                    self.output_token_sampling_logprobs[req.metadata_buffer_index][
+                        0
+                    ] = float(sampling_logprob)
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
             # speculative_eagle_topk should not be greater than 16 currently
@@ -356,6 +554,14 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            if self.output_dsa_topk_indices is not None:
+                dsa_topk_indices = req.output_dsa_topk_indices
+                if dsa_topk_indices is not None:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
+                        dsa_topk_indices
+                    )
+                else:
+                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
@@ -408,10 +614,13 @@ def get_kv_class(
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
 ) -> Optional[Type]:
-    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+    from sglang.srt.disaggregation.base import KVArgs
+
+    # Every backend shares the same KVArgs container.
+    if class_type == KVClassType.KVARGS:
+        return KVArgs
 
     if transfer_backend == TransferBackend.MOONCAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
@@ -420,15 +629,12 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender,
-            KVClassType.RECEIVER: (MooncakeKVReceiver),
+            KVClassType.RECEIVER: MooncakeKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.MORI:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mori import (
             MoriKVBootstrapServer,
             MoriKVManager,
@@ -437,13 +643,11 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MoriKVManager,
             KVClassType.SENDER: MoriKVSender,
-            KVClassType.RECEIVER: (MoriKVReceiver),
+            KVClassType.RECEIVER: MoriKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: MoriKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.ASCEND:
         from sglang.srt.disaggregation.ascend import (
             AscendKVBootstrapServer,
@@ -451,18 +655,14 @@ def get_kv_class(
             AscendKVReceiver,
             AscendKVSender,
         )
-        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: AscendKVManager,
             KVClassType.SENDER: AscendKVSender,
-            KVClassType.RECEIVER: (AscendKVReceiver),
+            KVClassType.RECEIVER: AscendKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.NIXL:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.nixl import (
             NixlKVBootstrapServer,
             NixlKVManager,
@@ -471,110 +671,70 @@ def get_kv_class(
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender,
-            KVClassType.RECEIVER: (NixlKVReceiver),
+            KVClassType.RECEIVER: NixlKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
-        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.FAKE:
-        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import (
             FakeKVManager,
             FakeKVReceiver,
             FakeKVSender,
         )
 
+        # No bootstrap server: the fake backend never registers one.
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: FakeKVManager,
             KVClassType.SENDER: FakeKVSender,
-            KVClassType.RECEIVER: (FakeKVReceiver),
+            KVClassType.RECEIVER: FakeKVReceiver,
         }
-        return class_mapping.get(class_type)
+    else:
+        raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
-    raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
+    return class_mapping.get(class_type)
 
 
-def page_indices_to_cp_rank_page_indices(
-    page_indices: np.ndarray,
-    total_pages: int,
-    cp_rank: int,
-    cp_size: int,
-) -> np.ndarray:
-    """
-    Filter page_indices (which are *global* page ids in the KV pool) to those
-    belonging to the given CP rank for this request.
-
-    For a single request, its pages occupy a contiguous global range
-    [first_page, first_page + total_pages). We first compute the local
-    split [0, total_pages) across cp_size ranks, then shift that local
-    range by first_page back into the global page id space and take
-    the intersection with page_indices.
-
-    Returns:
-        Subset of page_indices that fall in this rank's global
-        [start_page, end_page) slice for the given CP rank.
-    """
-    if cp_size <= 1:
-        return page_indices
-
-    if page_indices.size == 0:
-        return np.asarray(page_indices)
-
-    first_page = int(page_indices.min())
+def _get_cp_rank_page_bounds(
+    total_pages: int, cp_rank: int, cp_size: int
+) -> Tuple[int, int]:
     base = total_pages // cp_size
     rem = total_pages % cp_size
-
-    if rem == 0:
-        local_start = cp_rank * base
-        local_end = local_start + base
-    else:
-        local_start = cp_rank * base + min(cp_rank, rem)
-        n_pages = base + (1 if cp_rank < rem else 0)
-        local_end = local_start + n_pages
-
-    # Map back to global page ids.
-    start_page = first_page + local_start
-    end_page = first_page + local_end
-
-    mask = (page_indices >= start_page) & (page_indices < end_page)
-    return np.asarray(page_indices)[mask]
+    local_start = cp_rank * base + min(cp_rank, rem)
+    n_pages = base + (1 if cp_rank < rem else 0)
+    return local_start, local_start + n_pages
 
 
 def filter_kv_indices_for_cp_rank(
-    kv_mgr: CommonKVManager, kv_indices: np.ndarray, index_slice: slice
+    kv_mgr: CommonKVManager,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    total_pages: Optional[int] = None,
 ) -> Tuple[np.ndarray, slice]:
     """Filters kv_indices and index_slice for the current CP rank."""
-    total_pages = len(kv_indices)
+    if total_pages is None:
+        total_pages = len(kv_indices)
     cp_rank = kv_mgr.attn_cp_rank
     cp_size = kv_mgr.attn_cp_size
 
-    rank_page_indices = page_indices_to_cp_rank_page_indices(
-        page_indices=kv_indices,
-        total_pages=total_pages,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-    )
+    if cp_size <= 1:
+        return kv_indices, index_slice
 
-    if rank_page_indices.size == 0:
+    rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
+    chunk_start = index_slice.start if index_slice.start is not None else 0
+    chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
+    first_pos = max(rank_start, chunk_start) - chunk_start
+    last_pos = min(rank_end, chunk_end) - chunk_start
+
+    if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
-        new_index_slice = slice(index_slice.start, index_slice.start)
+        new_index_slice = slice(chunk_start, chunk_start)
     else:
-        mask = np.isin(kv_indices, rank_page_indices)
-        if not mask.any():
-            new_kv_indices = kv_indices[:0]
-            new_index_slice = slice(index_slice.start, index_slice.start)
-        else:
-            first_pos = int(mask.argmax())
-            last_pos = len(mask) - int(mask[::-1].argmax())
-
-            new_kv_indices = kv_indices[first_pos:last_pos]
-            new_index_slice = slice(
-                index_slice.start + first_pos,
-                index_slice.start + last_pos,
-            )
+        new_kv_indices = kv_indices[first_pos:last_pos]
+        new_index_slice = slice(
+            chunk_start + first_pos,
+            chunk_start + last_pos,
+        )
     return new_kv_indices, new_index_slice
 
 
@@ -590,6 +750,300 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def compute_mamba_state_slice_blocks(
+    src_dim: int,
+    dst_dim: int,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank_in_group: int,
+    local_tp_rank_in_group: int,
+    conv_shard_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Blocks to copy one mamba state item across differing attn-TP sizes.
+
+    Returns ``(src_dim_start, dst_dim_start, num_dims)`` triples in units of the
+    sliceable (3rd) dimension. Single-axis states (temporal_state, or when
+    ``conv_shard_groups`` is None) return one contiguous block -- byte-identical to
+    the legacy behavior.
+
+    GDN conv_state is ``cat([query | key | value])`` where each sub-block (full
+    dims == ``conv_shard_groups``, e.g. ``[key_dim, key_dim, value_dim]``) is
+    head-sharded INDEPENDENTLY across attn-TP. In the SCATTER direction
+    (1 prefill rank -> several decode ranks) a single contiguous slice straddles
+    the q/k/v boundaries and delivers wrong channels. The AGGREGATION direction
+    (several prefill ranks -> 1 decode rank) has the symmetric problem: a single
+    contiguous write interleaves the sub-blocks by writer. Both directions emit one
+    block per sub-block for conv_state; temporal_state and non-GDN states (when
+    ``conv_shard_groups`` is None) keep the single contiguous slice.
+    """
+    use_subdims = (
+        conv_shard_groups is not None
+        and sum(conv_shard_groups) == src_dim * src_attn_tp_size
+    )
+
+    if src_attn_tp_size > dst_attn_tp_size:
+        # Aggregation: several prefill ranks each write their shard into one decode slot.
+        writers_per_decode = src_attn_tp_size // dst_attn_tp_size
+        local_writer_idx = local_tp_rank_in_group % writers_per_decode
+        if not use_subdims:
+            return [(0, local_writer_idx * src_dim, src_dim)]
+        # conv_state: a plain contiguous write would interleave the sub-blocks by
+        # writer ([q0,k0,v0,q1,k1,v1,...]); place this writer's shard of each
+        # independently head-sharded sub-block at its grouped offset so the decode
+        # buffer is [q0,q1,...,k0,k1,...,v0,v1,...].
+        blocks: List[Tuple[int, int, int]] = []
+        src_off = 0
+        dst_off = 0
+        for full_sd in conv_shard_groups:
+            src_sub = full_sd // src_attn_tp_size
+            dst_sub = full_sd // dst_attn_tp_size
+            blocks.append((src_off, dst_off + local_writer_idx * src_sub, src_sub))
+            src_off += src_sub
+            dst_off += dst_sub
+        return blocks
+
+    # Scatter: 1 prefill rank feeds several decode ranks.
+    if not use_subdims:
+        src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+        return [(src_dim_start, 0, dst_dim)]
+
+    # conv_state: gather the decode rank's [q | k | v] shard from the three
+    # independently head-sharded sub-blocks of the src tensor. dst is contiguous.
+    blocks: List[Tuple[int, int, int]] = []
+    src_off = 0
+    dst_off = 0
+    for full_sd in conv_shard_groups:
+        src_sub = full_sd // src_attn_tp_size  # this prefill rank's shard of sub-block
+        dst_sub = full_sd // dst_attn_tp_size  # this decode rank's shard of sub-block
+        src_start = src_off + (dst_tp_rank_in_group * dst_sub) % src_sub
+        blocks.append((src_start, dst_off, dst_sub))
+        src_off += src_sub
+        dst_off += dst_sub
+    return blocks
+
+
+def compute_mamba_state_slice_byte_blocks(
+    *,
+    src_item_len: int,
+    dst_item_len: int,
+    src_dim: int,
+    dst_dim: int,
+    outer_count: int,
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank_in_group: int,
+    local_tp_rank_in_group: int,
+    conv_shard_groups: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Convert logical TP slices into physical byte blocks for one state slot.
+
+    ``outer_count`` is one for the usual ``[slice_dim, ...]`` layout. Kimi
+    conv state is ``[K - 1, slice_dim]``, so each logical channel slice expands
+    into one byte block per convolution row.
+    """
+    src_bytes_per_dim = src_item_len // (src_dim * outer_count)
+    dst_bytes_per_dim = dst_item_len // (dst_dim * outer_count)
+    logical_blocks = compute_mamba_state_slice_blocks(
+        src_dim=src_dim,
+        dst_dim=dst_dim,
+        src_attn_tp_size=src_attn_tp_size,
+        dst_attn_tp_size=dst_attn_tp_size,
+        dst_tp_rank_in_group=dst_tp_rank_in_group,
+        local_tp_rank_in_group=local_tp_rank_in_group,
+        conv_shard_groups=conv_shard_groups,
+    )
+
+    blocks = []
+    for outer_idx in range(outer_count):
+        src_row_offset = outer_idx * src_dim * src_bytes_per_dim
+        dst_row_offset = outer_idx * dst_dim * dst_bytes_per_dim
+        for src_dim_start, dst_dim_start, num_dims in logical_blocks:
+            blocks.append(
+                (
+                    src_row_offset + src_dim_start * src_bytes_per_dim,
+                    dst_row_offset + dst_dim_start * dst_bytes_per_dim,
+                    num_dims * src_bytes_per_dim,
+                )
+            )
+    return blocks
+
+
+def build_transfer_entry_pairs(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+    allow_positional_fallback: bool = False,
+) -> List[Tuple[int, int]]:
+    """Pair prefill-local transfer entries with decode entries by layer id."""
+    if n_src == 0:
+        return []
+    if bool(src_layer_ids) != bool(dst_layer_ids):
+        if not allow_positional_fallback:
+            raise RuntimeError(
+                "Layer metadata must be provided by both PD peers or neither"
+            )
+        src_layer_ids = []
+        dst_layer_ids = []
+    if src_layer_ids:
+        if len(src_layer_ids) != n_src or len(dst_layer_ids) != n_dst:
+            raise RuntimeError(
+                "Layer metadata length must match transfer entries: "
+                f"src metadata={len(src_layer_ids)} entries={n_src}, "
+                f"dst metadata={len(dst_layer_ids)} entries={n_dst}"
+            )
+        # Layer ids can repeat across tensor groups (for example K/V or multiple
+        # state tensors), so pair occurrences in order rather than by plain lookup.
+        dst_pos = {}
+        for j, lid in enumerate(dst_layer_ids):
+            dst_pos.setdefault(lid, deque()).append(j)
+        pairs = []
+        for i, lid in enumerate(src_layer_ids):
+            if not dst_pos.get(lid):
+                raise RuntimeError(
+                    f"Decode peer is missing a transfer entry for model layer {lid}"
+                )
+            pairs.append((i, dst_pos[lid].popleft()))
+        return pairs
+    if n_dst < n_src or (n_src != n_dst and not allow_positional_fallback):
+        # Without layer ids a positional pairing would silently transfer the
+        # wrong layers (e.g. PP prefill peered with a stale decode server).
+        raise RuntimeError(
+            "PP-heterogeneous transfer requires layer ids on "
+            f"both peers; got src={n_src} dst={n_dst} entries"
+        )
+    return [(i, i) for i in range(n_src)]
+
+
+def build_kv_layer_ids(
+    *,
+    token_to_kv_pool,
+    draft_token_to_kv_pool,
+    num_draft_entries: int,
+    num_hidden_layers: int,
+) -> List[int]:
+    """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
+
+    Draft KV buffers are appended after the target's, so they need ids of their
+    own: build_transfer_entry_pairs requires the id list to cover every entry,
+    and a target-only list would be rejected. The draft numbers its layers from
+    zero, which would collide with the target's, so its entries are remapped
+    into a reserved band above the target's layer range. Both PD peers run this
+    against the same draft config and so agree on the band.
+
+    Returns [] for pools that cannot report ids, leaving the peers on positional
+    pairing.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+        return []
+    layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if draft_token_to_kv_pool is None:
+        return layer_ids
+
+    draft_ids = _draft_entry_layer_ids(
+        pool=draft_token_to_kv_pool, num_entries=num_draft_entries
+    )
+    # Rank the draft's own ids by first appearance, so the band stays dense and
+    # contiguous whatever the draft config numbers its layers.
+    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
+    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+
+
+def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if isinstance(pool, HybridLinearKVPool):
+        ids = pool.get_kv_layer_ids()
+    else:
+        # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
+        # group; derive the group count rather than assuming MHA vs MLA.
+        if pool.layer_num <= 0 or num_entries % pool.layer_num != 0:
+            raise RuntimeError(
+                "Draft KV buffers must register a whole number of per-layer "
+                f"groups: entries={num_entries}, layers={pool.layer_num}"
+            )
+        ids = list(range(pool.layer_num)) * (num_entries // pool.layer_num)
+    if len(ids) != num_entries:
+        raise RuntimeError(
+            "Draft KV layer ids must cover every registered entry: "
+            f"ids={len(ids)}, entries={num_entries}"
+        )
+    return ids
+
+
+def resolve_dcp_dst_entry_indices(
+    src_layer_ids: List[int],
+    dst_layer_ids: List[int],
+    n_src: int,
+    n_dst: int,
+) -> List[int]:
+    """Destination entry index for each local KV entry, for a DCP relayout.
+
+    DCP re-splits the KV by context while PP re-splits it by layer, so the two
+    index spaces only line up when neither peer is pipelined. Both backends
+    need the same resolution, hence the shared helper.
+    """
+    if not src_layer_ids and not dst_layer_ids:
+        # Legacy/non-PP layout. n_dst may exceed n_src when the decode side
+        # runs speculative decoding and the prefill side does not.
+        return list(range(n_src))
+    # A one-sided mapping is rejected by build_transfer_entry_pairs itself.
+    return [
+        j
+        for _, j in build_transfer_entry_pairs(
+            src_layer_ids, dst_layer_ids, n_src, n_dst
+        )
+    ]
+
+
+def build_staging_slot_metadata(
+    *,
+    kv_layer_ids: List[int],
+    num_draft_entries: int,
+    kv_pool,
+    draft_kv_pool,
+):
+    """Buffers and per-slot layer ids for the staging gather.
+
+    The gather writes every k_buffer and then every v_buffer, while kv_layer_ids
+    follows kv_data_ptrs ([K target, V target, K draft, V draft]), so the two
+    orders diverge as soon as a draft pool is registered.
+
+    Returns (k_buffers, v_buffers, slot_layer_ids), or None for a pool that has
+    no contiguous K/V tensors to stage.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+
+    # A hybrid pool keeps its contiguous K/V tensors on the inner full-attention
+    # pool, and the draft pool is wrapped the same way.
+    if isinstance(kv_pool, HybridLinearKVPool):
+        kv_pool = kv_pool.full_kv_pool
+    if isinstance(draft_kv_pool, HybridLinearKVPool):
+        draft_kv_pool = draft_kv_pool.full_kv_pool
+    if not isinstance(kv_pool, MHATokenToKVPool):
+        return None
+
+    ids = list(kv_layer_ids or [])
+    num_target = len(ids) - num_draft_entries
+    half = num_target // 2
+    k_buffers, k_ids = list(kv_pool.k_buffer), ids[:half]
+    v_buffers, v_ids = list(kv_pool.v_buffer), ids[half:num_target]
+
+    draft_half = num_draft_entries // 2
+    if draft_half:
+        if not isinstance(draft_kv_pool, MHATokenToKVPool):
+            # An empty id list puts the sender back on kv_data_ptrs order, which
+            # is what staging did before draft KV existed.
+            return k_buffers, v_buffers, []
+        k_buffers += list(draft_kv_pool.k_buffer)
+        v_buffers += list(draft_kv_pool.v_buffer)
+        k_ids += ids[num_target : num_target + draft_half]
+        v_ids += ids[num_target + draft_half :]
+    return k_buffers, v_buffers, k_ids + v_ids
+
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -597,6 +1051,9 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
+    slice_outer_counts: Optional[List[int]] = None,
+    layer_ids: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -605,6 +1062,9 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
+    kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
+    kv_args.state_layer_ids.append(layer_ids or [])
 
 
 def setup_state_kv_args(
@@ -621,15 +1081,42 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
+        HybridLinearKVPool,
+        MHATokenToKVPoolMXFP8,
+        MiniMaxSparseKVPool,
+    )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.state_slice_outer_counts = []
+    kv_args.state_layer_ids = []
+    kv_args.is_hybrid_mla_backend = False
+    kv_args.state_conv_shard_groups = []
 
-    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
+        append_state_component(
+            kv_args,
+            StateType.BLOCK_SCALE,
+            *token_to_kv_pool.get_kv_scale_buf_infos(),
+        )
+
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+        if token_to_kv_pool.index_kv_pool is not None:
+            raise NotImplementedError(
+                "PD disaggregation for MiniMax sparse layers with index value "
+                "(index_kv_pool) is not yet supported; only K-only sparse layers are."
+            )
+        if token_to_kv_pool.index_k_pool is not None:
+            dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
+            append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+    elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
@@ -638,14 +1125,83 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # MXFP8 KV: each sub-pool's block scales ride as their own component
+            # so they inherit the index payload of the KV they describe.
+            # Only the concrete SWAKVPool owns a full sub-pool; other
+            # BaseSWAKVPool implementations describe their state per entry.
+            if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
+                token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8
+            ):
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE,
+                    *token_to_kv_pool.get_kv_scale_buf_infos(),
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.BLOCK_SCALE_SWA,
+                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
+                )
+            # unified_kv: the SWA ring lives in the unified buffers (no separate
+            # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
+            if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
+                token_to_kv_pool, "get_unified_swa_ring_buf_infos"
+            ):
+                ring_ptrs, ring_lens, ring_item_lens = (
+                    token_to_kv_pool.get_unified_swa_ring_buf_infos()
+                )
+                if ring_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.SWA_RING,
+                        ring_ptrs,
+                        ring_lens,
+                        ring_item_lens,
+                    )
+            if hasattr(token_to_kv_pool, "get_c128_state_buf_infos"):
+                c128_ptrs, c128_lens, c128_item_lens = (
+                    token_to_kv_pool.get_c128_state_buf_infos()
+                )
+                if c128_ptrs:
+                    append_state_component(
+                        kv_args,
+                        StateType.C128_STATE,
+                        c128_ptrs,
+                        c128_lens,
+                        c128_item_lens,
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
             )
+            kv_args.is_hybrid_mla_backend = is_mla_backend(
+                token_to_kv_pool.full_kv_pool
+            )
+            conv_shard_groups = (
+                token_to_kv_pool.get_state_conv_shard_groups()
+                if hasattr(token_to_kv_pool, "get_state_conv_shard_groups")
+                else None
+            )
+            slice_outer_counts = (
+                token_to_kv_pool.get_state_slice_outer_counts()
+                if hasattr(token_to_kv_pool, "get_state_slice_outer_counts")
+                else None
+            )
+            # Global layer ids let the sender pair src/dst entries when the
+            # prefill PP stage registers only its own subset of mamba layers.
+            layer_ids = token_to_kv_pool.get_state_layer_ids()
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
+                slice_outer_counts,
+                layer_ids,
             )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
@@ -669,6 +1225,92 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+        c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
+        if c128_ptrs:
+            append_state_component(
+                kv_args,
+                AscendStateType.DSV4_C128,
+                c128_ptrs,
+                c128_lens,
+                c128_item_lens,
+            )
+
+    # DSV4 NextN shares the target allocator, so target and draft use the same
+    # local SWA indices. Keep draft buffers in a separate positional component
+    # to avoid mixing them into the target's heterogeneous state layout, while
+    # reusing the existing SWA transport dispatch on both GPU and NPU.
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
+        draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
+    ):
+        if not draft_token_to_kv_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
+        ):
+            raise RuntimeError(
+                "DSV4 draft state transfer expects SWA-only NextN layers"
+            )
+        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+            raise RuntimeError(
+                "DSV4 target and draft pools must use the same unified-KV mode"
+            )
+
+        if token_to_kv_pool._unified_kv:
+            target_geometry = (
+                token_to_kv_pool.unified_swa_window,
+                token_to_kv_pool.unified_swa_ring_size,
+                token_to_kv_pool.unified_swa_pages,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.unified_swa_window,
+                draft_token_to_kv_pool.unified_swa_ring_size,
+                draft_token_to_kv_pool.unified_swa_pages,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share SWA ring geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_unified_swa_ring_buf_infos()
+            )
+            draft_state_type = StateType.SWA_RING
+        else:
+            if (
+                token_to_kv_pool.full_to_swa_index_mapping
+                is not draft_token_to_kv_pool.full_to_swa_index_mapping
+            ):
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share the SWA index mapping"
+                )
+            target_geometry = (
+                token_to_kv_pool.page_size,
+                token_to_kv_pool.sliding_window,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.page_size,
+                draft_token_to_kv_pool.sliding_window,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share paged SWA geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_state_buf_infos()
+            )
+            draft_state_type = StateType.SWA
+
+        if draft_ptrs:
+            append_state_component(
+                kv_args,
+                draft_state_type,
+                draft_ptrs,
+                draft_lens,
+                draft_item_lens,
+            )
+
     if (
         StateType.MAMBA not in kv_args.state_types
         and req_to_token_pool is not None
@@ -681,8 +1323,25 @@ def setup_state_kv_args(
                 if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
+            conv_shard_groups = (
+                req_to_token_pool.get_state_conv_shard_groups()
+                if hasattr(req_to_token_pool, "get_state_conv_shard_groups")
+                else None
+            )
+            slice_outer_counts = (
+                req_to_token_pool.get_state_slice_outer_counts()
+                if hasattr(req_to_token_pool, "get_state_slice_outer_counts")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+                kv_args,
+                StateType.MAMBA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                dim,
+                conv_shard_groups,
+                slice_outer_counts,
             )
 
 
