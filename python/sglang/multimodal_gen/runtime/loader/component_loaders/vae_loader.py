@@ -503,12 +503,16 @@ class VAELoader(WeightOverrideComponentLoader):
 
         auto_map = config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
-        if direct_gpu_weight_loading and auto_model_map:
+        if direct_gpu_weight_loading and auto_model_map and not native_only:
             raise ComponentCheckpointUnsupportedError(
                 f"Direct GPU loading for {component_name!r} requires a native "
                 "ModelRegistry VAE; custom Diffusers auto_map code is unsupported"
             )
-        if auto_model_map and component_weights_path != component_model_path:
+        if (
+            auto_model_map
+            and not native_only
+            and component_weights_path != component_model_path
+        ):
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} uses a custom Diffusers class that cannot "
                 "consume a weights-only override"

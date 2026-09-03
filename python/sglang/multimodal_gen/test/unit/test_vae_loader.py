@@ -243,6 +243,59 @@ class TestDirectGPUVAEState(unittest.TestCase):
         self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
         self.assertTrue(torch.equal(loaded.scale, expected_scale))
 
+    def test_native_vae_ignores_diffusers_auto_map_for_weight_override(self):
+        loader = vae_loader.VAELoader()
+        expected_weight = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+        expected_scale = torch.tensor([3.0], dtype=torch.bfloat16)
+
+        with TemporaryDirectory() as root:
+            checkpoint = pathlib.Path(root) / "override.safetensors"
+            safetensors_save_file(
+                {"proj.weight": expected_weight, "scale": expected_scale}, checkpoint
+            )
+
+            for direct_gpu_loading in (False, True):
+                with self.subTest(direct_gpu_loading=direct_gpu_loading):
+                    pipeline_config = QwenImagePipelineConfig()
+                    pipeline_config.native_only_components = ("vae",)
+                    server_args = _FakeServerArgs(pipeline_config)
+                    server_args.component_direct_gpu_weight_loading = {
+                        "vae": direct_gpu_loading
+                    }
+
+                    with (
+                        patch.object(
+                            vae_loader,
+                            "get_diffusers_component_config",
+                            return_value={
+                                "_class_name": "TestVAE",
+                                "auto_map": {"AutoModel": "custom.TestVAE"},
+                            },
+                        ),
+                        patch.object(
+                            loader,
+                            "resolve_component_weights_path",
+                            return_value=str(checkpoint),
+                        ),
+                        patch.object(
+                            vae_loader.ModelRegistry,
+                            "resolve_model_cls",
+                            return_value=(self._StandardVAE, None),
+                        ),
+                        patch.object(
+                            loader, "target_device", return_value=torch.device("cpu")
+                        ),
+                        patch.object(
+                            vae_loader.current_platform,
+                            "optimize_vae",
+                            side_effect=lambda vae: vae,
+                        ),
+                    ):
+                        loaded = loader.load_customized(root, server_args, "vae")
+
+                    self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
+                    self.assertTrue(torch.equal(loaded.scale, expected_scale))
+
     def test_quantized_checkpoint_does_not_fall_back_from_direct_loading(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())
