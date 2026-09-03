@@ -96,11 +96,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -1764,11 +1760,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
+        is_new_req_slot = req.kv.req_pool_idx is None
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
         )
+        if is_new_req_slot:
+            clear_c4_req_states = getattr(
+                self.token_to_kv_pool, "clear_c4_req_states", None
+            )
+            if clear_c4_req_states is not None:
+                clear_c4_req_states(req_pool_indices)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
