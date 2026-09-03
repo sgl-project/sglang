@@ -1985,9 +1985,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
-            _orig_o_proj_forward = self.o_proj.forward
+            o_proj = self.o_proj
+            _orig_o_proj_forward = o_proj.forward
 
-            def _gated_o_proj_forward(x, *args, **kwargs):
+            def _apply_output_gate(x):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 precomputed = self._gate_precomputed
@@ -2011,9 +2012,15 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
-                return _orig_o_proj_forward(x, *args, **kwargs)
+                return x
 
-            self.o_proj.forward = _gated_o_proj_forward
+            def _gated_o_proj_forward(x, *args, **kwargs):
+                return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
+
+            # The LoRA wrapper calls quant_method.apply on the base layer and never
+            # sees this forward; it must gate (and join the gate stream) itself.
+            o_proj.lora_input_transform = _apply_output_gate
+            o_proj.forward = _gated_o_proj_forward
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
