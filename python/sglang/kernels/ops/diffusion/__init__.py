@@ -363,6 +363,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "VDN-H3 linear branch: alpha-bridged boundary gather in one pass.",
     ),
     (
+        "diffusion.vdn_run_scans",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_run_scans",
+        _CUDA,
+        "VDN-H3 linear branch: persistent forward/reverse frame scans.",
+    ),
+    (
         "diffusion.vdn_linear_epilogue",
         KernelBackend.TRITON,
         "attention.vdn_linear_branch_triton:vdn_linear_epilogue",
@@ -563,6 +570,7 @@ _EXPORTS: dict[str, str] = {
     "get_block_map": "attention.sparse_linear_attn_triton",
     "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
     "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
+    "vdn_run_scans": "attention.vdn_linear_branch_triton",
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
     "vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
     "vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",

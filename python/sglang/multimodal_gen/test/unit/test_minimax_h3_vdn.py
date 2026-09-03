@@ -660,6 +660,27 @@ def test_fused_branch_kernels_match_eager_chain() -> None:
 
 
 @requires_cuda
+def test_fused_scan_matches_eager_scan() -> None:
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
+
+    k, v, beta, alpha = _random_stats("cuda", seed=6)
+    A, B = frame_statistics(k, v, beta, a_fp32=True)
+    transition, injection = delta_factor_apply(
+        "vdn_solve", alpha, A, B, tokens_per_frame=S_
+    )
+    text_state = torch.randn(H_, D_, D_, device="cuda")
+    for ts in (None, text_state):
+        vdn.set_fused_kernels_enabled(False)
+        try:
+            p_ref, s_ref = run_scans(transition, injection, ts)
+        finally:
+            vdn.set_fused_kernels_enabled(True)
+        p_got, s_got = run_scans(transition, injection, ts)
+        assert torch.allclose(p_got, p_ref, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(s_got, s_ref, atol=1e-4, rtol=1e-4)
+
+
+@requires_cuda
 def test_fused_gather_matches_eager_gather() -> None:
     from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
 
@@ -676,12 +697,24 @@ def test_fused_gather_matches_eager_gather() -> None:
             vdn.set_fused_kernels_enabled(False)
             try:
                 ref = gather_linear_state(
-                    prefix, suffix, alpha, bounds, bridge=bridge, text_state=ts, out_dtype=torch.float32
+                    prefix,
+                    suffix,
+                    alpha,
+                    bounds,
+                    bridge=bridge,
+                    text_state=ts,
+                    out_dtype=torch.float32,
                 )
             finally:
                 vdn.set_fused_kernels_enabled(True)
             got = gather_linear_state(
-                prefix, suffix, alpha, bounds, bridge=bridge, text_state=ts, out_dtype=torch.float32
+                prefix,
+                suffix,
+                alpha,
+                bounds,
+                bridge=bridge,
+                text_state=ts,
+                out_dtype=torch.float32,
             )
             assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5), (bridge, ts is None)
 

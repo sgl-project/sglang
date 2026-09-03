@@ -369,7 +369,7 @@ def _gather_state_kernel(
     fa = tl.load(AFTER + f)
     has_b = tl.load(HASB + f)
     has_a = tl.load(HASA + f)
-    plane = (rows[:, None] * DK + cols[None, :])
+    plane = rows[:, None] * DK + cols[None, :]
     off_b = ((fb * H + h) * DV) * DK + plane
     off_a = ((fa * H + h) * DV) * DK + plane
     sb = tl.load(PREFIX + off_b, mask=valid[:, None], other=0.0)
@@ -416,32 +416,118 @@ def vdn_gather_linear_state(
     """The boundary gather of the linear branch as one kernel over the
     [F, H, dv, dk] fp32 state banks (eager: ~7 passes over ~350 MB)."""
     if not prefix.is_cuda:
-        raise ValueError("vdn_gather_linear_state is a Triton kernel; inputs must be on CUDA")
+        raise ValueError(
+            "vdn_gather_linear_state is a Triton kernel; inputs must be on CUDA"
+        )
     F, H, DV, DK = prefix.shape
     _check_head_dim(DK)
     prefix = prefix.contiguous()
     suffix = suffix.contiguous()
     if bridge:
         log_alpha = torch.log(alpha.float().clamp_min(1e-12))
-        logp = torch.cat([torch.zeros_like(log_alpha[:1]), log_alpha.cumsum(0)]).contiguous()
+        logp = torch.cat(
+            [torch.zeros_like(log_alpha[:1]), log_alpha.cumsum(0)]
+        ).contiguous()
     else:
         logp = prefix  # unused
     text = text_state.float().contiguous() if text_state is not None else prefix
     out = torch.empty(prefix.shape, dtype=out_dtype, device=prefix.device)
     i32 = lambda t: t.to(torch.int32).contiguous()  # noqa: E731
     _gather_state_kernel[(F, H, triton.cdiv(DV, _BLOCK_ROWS))](
-        prefix, suffix, logp, text,
-        i32(before_idx), i32(after_idx), i32(has_before), i32(has_after),
-        i32(bridge_before), i32(bridge_after),
-        out, H, DV,
-        HAS_TEXT=text_state is not None, BRIDGE=bridge, BLOCK_V=_BLOCK_ROWS, DK=DK,
+        prefix,
+        suffix,
+        logp,
+        text,
+        i32(before_idx),
+        i32(after_idx),
+        i32(has_before),
+        i32(has_after),
+        i32(bridge_before),
+        i32(bridge_after),
+        out,
+        H,
+        DV,
+        HAS_TEXT=text_state is not None,
+        BRIDGE=bridge,
+        BLOCK_V=_BLOCK_ROWS,
+        DK=DK,
         num_warps=4,
     )
     return out
 
 
+# --------------------------------------------------------------------------
+# persistent frame scan: state_t = state_{t-1} @ transition_t + injection_t
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _scan_kernel(
+    TRANS,  # [F, H, dk, dk] fp32
+    INJ,  # [F, H, dv, dk] fp32
+    START,  # [H, dv, dk] fp32 (or INJ when HAS_START is False)
+    OUT,  # [F, H, dv, dk] fp32
+    F,
+    H,
+    HAS_START: tl.constexpr,
+    REVERSE: tl.constexpr,
+    DV: tl.constexpr,
+    DK: tl.constexpr,
+):
+    h = tl.program_id(0)
+    rows = tl.arange(0, DV)
+    cols = tl.arange(0, DK)
+    plane = rows[:, None] * DK + cols[None, :]
+    tplane = tl.arange(0, DK)[:, None] * DK + cols[None, :]
+    if HAS_START:
+        state = tl.load(START + (h * DV) * DK + plane)
+    else:
+        state = tl.zeros((DV, DK), dtype=tl.float32)
+    for i in range(0, F):
+        if REVERSE:
+            f = F - 1 - i
+        else:
+            f = i
+        trans = tl.load(TRANS + ((f * H + h) * DK) * DK + tplane)
+        inj = tl.load(INJ + ((f * H + h) * DV) * DK + plane)
+        # full fp32 (IEEE) accumulation: the recurrence runs ~100 steps and the
+        # released checkpoints were trained against fp32 state math
+        state = tl.dot(state, trans, inj, input_precision="ieee")
+        tl.store(OUT + ((f * H + h) * DV) * DK + plane, state)
+
+
+def vdn_run_scans(
+    transitions: torch.Tensor,
+    injections: torch.Tensor,
+    text_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward and reverse frame scans as two persistent kernels (one program
+    per head and direction) instead of 2F baddbmm launches; same fp32
+    recurrence, prefix[t] = frames 0..t, suffix[t] = frames t..F-1."""
+    if not transitions.is_cuda:
+        raise ValueError("vdn_run_scans is a Triton kernel; inputs must be on CUDA")
+    F, H, DK, _ = transitions.shape
+    DV = injections.shape[2]
+    _check_head_dim(DK)
+    _check_head_dim(DV)
+    transitions = transitions.float().contiguous()
+    injections = injections.float().contiguous()
+    start = text_state.float().contiguous() if text_state is not None else injections
+    prefix = torch.empty_like(injections)
+    suffix = torch.empty_like(injections)
+    common = dict(HAS_START=text_state is not None, DV=DV, DK=DK, num_warps=8)
+    _scan_kernel[(H,)](
+        transitions, injections, start, prefix, F, H, REVERSE=False, **common
+    )
+    _scan_kernel[(H,)](
+        transitions, injections, start, suffix, F, H, REVERSE=True, **common
+    )
+    return prefix, suffix
+
+
 __all__ = [
     "vdn_frame_stats_prep",
+    "vdn_run_scans",
     "vdn_gather_linear_state",
     "vdn_linear_epilogue",
     "vdn_silu_l2norm",

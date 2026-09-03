@@ -328,8 +328,9 @@ def _fa_varlen(
     max_q: int,
     max_k: int,
     scale: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    out = flash_attn_varlen_func(
+    result = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -340,8 +341,13 @@ def _fa_varlen(
         softmax_scale=scale,
         causal=False,
         ver=_flash_attn_backend.fa_ver,
+        out=out,
     )
-    return out[0] if isinstance(out, tuple) else out
+    result = result[0] if isinstance(result, tuple) else result
+    if out is not None and result.data_ptr() != out.data_ptr():
+        out.copy_(result)
+        return out
+    return result
 
 
 class HybridWindowAttentionH3Impl(AttentionImpl):
@@ -495,7 +501,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
             value_used = value_used.contiguous()
         if plan.dense_q.numel():
             out[plan.dense_q] = _fa_varlen(
-                query[plan.dense_q],
+                torch.index_select(query, 0, plan.dense_q),
                 key_used,
                 value_used,
                 cu_q=plan.dense_cu_q,
@@ -505,22 +511,35 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 scale=self.softmax_scale,
             )
         for p in plan.passes:
-            sel = (
-                slice(*p["win_q_slice"]) if p["win_q_slice"] is not None else p["win_q"]
-            )
-            q_win = query[sel]
-            if not q_win.is_contiguous():
-                q_win = q_win.contiguous()
-            out[sel] = _fa_varlen(
-                q_win,
-                key[p["kv_gather"]],
-                value[p["kv_gather"]],
-                cu_q=p["cu_q"],
-                cu_k=p["cu_k"],
-                max_q=p["max_q"],
-                max_k=p["max_k"],
-                scale=self.softmax_scale,
-            )
+            # index_select runs the vectorized gather; advanced indexing takes
+            # the generic index kernel at a fraction of the bandwidth
+            kw = torch.index_select(key, 0, p["kv_gather"])
+            vw = torch.index_select(value, 0, p["kv_gather"])
+            if p["win_q_slice"] is not None:
+                start, stop = p["win_q_slice"]
+                _fa_varlen(
+                    query[start:stop],
+                    kw,
+                    vw,
+                    cu_q=p["cu_q"],
+                    cu_k=p["cu_k"],
+                    max_q=p["max_q"],
+                    max_k=p["max_k"],
+                    scale=self.softmax_scale,
+                    out=out[start:stop],
+                )
+            else:
+                out[p["win_q"]] = _fa_varlen(
+                    torch.index_select(query, 0, p["win_q"]),
+                    kw,
+                    vw,
+                    cu_q=p["cu_q"],
+                    cu_k=p["cu_k"],
+                    max_q=p["max_q"],
+                    max_k=p["max_k"],
+                    scale=self.softmax_scale,
+                )
+            del kw, vw
         return out
 
 
