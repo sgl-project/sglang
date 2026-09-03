@@ -124,8 +124,10 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    AttentionAndMoeLayers,
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
+    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -253,6 +255,14 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SamplingPrewarmResult:
+    """Memory requirements observed while pre-warming a sampling path."""
+
+    sampling_input_bytes: int = 0
+    sampling_headroom_bytes: int = 0
+
+
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
@@ -300,8 +310,7 @@ class ModelRunner:
     def sampling_observer(self, observer: Optional[SamplingObserver]) -> None:
         if observer is not None and not self.supports_sampling_observer():
             raise ValueError(
-                "sampling observers are not supported by the configured "
-                "sampling path"
+                "sampling observers are not supported by the configured sampling path"
             )
         self._sampling_observer = observer
 
@@ -377,6 +386,7 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
+        self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
 
@@ -470,9 +480,9 @@ class ModelRunner:
         )
 
         if self.ps.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self.init_weight_updater()
@@ -1011,7 +1021,7 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
-        self.kv_index_translator.assert_backends_carry_translator(
+        self.kv_index_translator.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
 
@@ -1057,6 +1067,11 @@ class ModelRunner:
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
             n_prepared,
         )
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        """Warm the sampling path after graph initialization."""
+        self.sampling_prewarm_result = SamplingPrewarmResult()
+        return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
@@ -1420,6 +1435,10 @@ class ModelRunner:
         )
 
         return DecodeCudaGraphRunner
+
+    def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
+        """Return the model layers used by prefill CUDA graph execution."""
+        return compute_attention_and_moe_layers(layer_model)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None

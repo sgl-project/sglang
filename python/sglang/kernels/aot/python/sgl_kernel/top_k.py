@@ -33,9 +33,9 @@ def fast_topk_v2(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    assert topk == 2048, (
+        "fast_topk_v2 is only optimized for deepseek v3.2 model, where topk=2048"
+    )
     assert score.dim() == 2
     topk_indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk(score, topk_indices, lengths, row_starts)
@@ -68,9 +68,9 @@ def fast_topk_transform_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    assert topk == 2048, (
+        "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    )
     assert score.dim() == 2
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
@@ -138,9 +138,9 @@ def fast_topk_transform_ragged_fused(
     Returns:
         The topk indices tensor of shape (B, topk)
     """
-    assert (
-        topk == 2048
-    ), "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    assert topk == 2048, (
+        "fast_topk_transform_ragged_fused is only optimized for deepseek v3.2 model, where topk=2048"
+    )
     assert score.dim() == 2
     topk_indices_ragged = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_ragged_fused(
