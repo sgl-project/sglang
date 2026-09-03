@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.configs.model_configimport (
+from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
