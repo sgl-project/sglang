@@ -28,7 +28,6 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestNumTokenNonPaddedLayoutTable(CustomTestCase):
-
     # (label, attn_tp_size, sharded, padded_bucket, real-per-dp-group,
     #  expected [per attn-tp rank] per dp group)
     _LAYOUTS = [
