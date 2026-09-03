@@ -2038,7 +2038,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2207,11 +2206,7 @@ class DeepseekSparseAttnBackend(
                         sm_scale=layer.scaling,
                         d_v=layer.v_head_dim,
                     )
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = self._sparse_q_all(q_all, q_nope, q_rope, kv_cache)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2380,7 +2375,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
@@ -2502,12 +2496,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "tilelang":
-            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
-            # has already been set to a zero-copy view of q in the else branch
-            # above and we can reuse it directly. The `not _is_hip` clause keeps
-            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
-            if q_all is None or not _is_hip:
-                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            q_all = self._sparse_q_all(q_all, q_nope, q_rope, kv_cache)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -3141,6 +3130,45 @@ class DeepseekSparseAttnBackend(
             softmax_scale=layer.scaling,
             causal=causal,
         )
+
+    def _sparse_q_all(
+        self,
+        q_all: Optional[torch.Tensor],
+        q_nope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        kv_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """The q the sparse-MLA kernels consume.
+
+        On HIP with an fp8 KV cache, concat_and_cast_q_fp8_pad writes the concat
+        and the bf16->fp8 cast the kernel would otherwise do at its own entry in
+        one pass. It indexes with tl.arange, so the head and dim counts have to
+        be powers of two; anything else takes the plain concat below.
+        """
+        if (
+            _is_hip
+            and q_rope is not None
+            and kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and q_nope.dtype == q_rope.dtype == torch.bfloat16
+            and all(
+                v & (v - 1) == 0
+                for v in (q_nope.shape[1], q_nope.shape[-1], q_rope.shape[-1])
+            )
+        ):
+            tokens, heads, nope = q_nope.shape
+            q_fp8 = torch.empty(
+                (tokens, heads, nope + q_rope.shape[-1]),
+                dtype=kv_cache.dtype,
+                device=q_nope.device,
+            )
+            concat_and_cast_q_fp8_pad(q_fp8, q_nope, q_rope, heads)
+            return q_fp8
+        # Cat-skip: q_rope=None means the caller already handed us the
+        # concatenated form and q_all is a zero-copy view of it. `not _is_hip`
+        # keeps CUDA byte-identical.
+        if q_all is None or not _is_hip:
+            return concat_mla_absorb_q_general(q_nope, q_rope)
+        return q_all
 
     def _forward_tilelang(
         self,
