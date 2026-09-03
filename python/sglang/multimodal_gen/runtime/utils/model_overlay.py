@@ -48,8 +48,7 @@ BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "OpenVDN/vdn-minimax-h3": {
         "overlay_repo_id": "kevin-mi/VDN-H3-overlay",
-        # TODO(VDN-h3): pin to the pushed commit sha once the overlay is uploaded.
-        "overlay_revision": "main",
+        "overlay_revision": "2bf8c73689d54d49e176efcdaf00504b1a7e1ad8",
     },
 }
 
