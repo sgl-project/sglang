@@ -2473,10 +2473,19 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if k_scale is not None and not (
+                isinstance(k_scale, (int, float)) and k_scale == 1
+            ):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if v_scale is not None and not (
+                isinstance(v_scale, (int, float)) and v_scale == 1
+            ):
                 cache_v.div_(v_scale)
+            if (
+                self.dtype == torch.float8_e4m3fn
+            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
+                cache_k = cache_k.clamp(-448.0, 448.0)
+                cache_v = cache_v.clamp(-448.0, 448.0)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2846,10 +2855,19 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if k_scale is not None and not (
+                isinstance(k_scale, (int, float)) and k_scale == 1
+            ):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if v_scale is not None and not (
+                isinstance(v_scale, (int, float)) and v_scale == 1
+            ):
                 cache_v.div_(v_scale)
+            if (
+                self.dtype == torch.float8_e4m3fn
+            ):  # fp32/bf16 -> e4m3fn returns NaN beyond +-448
+                cache_k = cache_k.clamp(-448.0, 448.0)
+                cache_v = cache_v.clamp(-448.0, 448.0)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
