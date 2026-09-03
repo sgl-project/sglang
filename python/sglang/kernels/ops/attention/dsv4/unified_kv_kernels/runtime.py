@@ -82,6 +82,47 @@ def _swa_scatter_kernel(
     tl.store(unified_ptr + loc * D + offs, vals, mask=mask)
 
 
+@triton.jit
+def _swa_scatter_two_pool_kernel(
+    kv_nope_ptr,  # [T, D_NOPE] packed bytes
+    kv_rope_ptr,  # [T, D_ROPE] bf16
+    state_slot_ptr,  # [T] int
+    positions_ptr,  # [T] int
+    final_pos_ptr,  # [T] int
+    unified_nope_ptr,  # [pages, D_NOPE] packed bytes
+    unified_rope_ptr,  # [pages, D_ROPE] bf16
+    n_rows,
+    ring_stride,
+    win: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    HAS_FINAL: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    """Move both halves of one two-pool row with one launch."""
+    row = tl.program_id(0)
+    if row >= n_rows:
+        return
+    pos = tl.load(positions_ptr + row)
+    if HAS_FINAL:
+        fp = tl.load(final_pos_ptr + row)
+        if pos <= fp - win:
+            return
+    state_slot = tl.load(state_slot_ptr + row)
+    loc = state_slot * ring_stride + (pos % ring_stride)
+
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_offs < D_NOPE
+    nope = tl.load(kv_nope_ptr + row * D_NOPE + nope_offs, mask=nope_mask, other=0)
+    tl.store(unified_nope_ptr + loc * D_NOPE + nope_offs, nope, mask=nope_mask)
+
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_mask = rope_offs < D_ROPE
+    rope = tl.load(kv_rope_ptr + row * D_ROPE + rope_offs, mask=rope_mask, other=0.0)
+    tl.store(unified_rope_ptr + loc * D_ROPE + rope_offs, rope, mask=rope_mask)
+
+
 def store_swa_into_unified(
     *,
     kv: torch.Tensor,  # [T, head_dim] bf16, or [T, nope_row_bytes] packed fp8
@@ -154,6 +195,35 @@ def store_swa_into_unified(
             num_warps=8,
         )
 
+    if two_pool:
+        # Both halves use the same row index and lifetime. Keeping them in one
+        # program removes the second launch on target-verify and prefill.
+        assert kv.element_size() == 1
+        assert unified_kv.is_contiguous() and unified_kv_rope.is_contiguous()
+        D_nope = kv.shape[1]
+        D_rope = kv_rope.shape[1]
+        assert unified_kv.shape[1] == D_nope
+        assert unified_kv_rope.shape[1] == D_rope
+        _swa_scatter_two_pool_kernel[(n_rows,)](
+            kv.view(torch.uint8),
+            kv_rope,
+            state_slot,
+            positions,
+            fp_arg,
+            unified_kv.view(torch.uint8),
+            unified_kv_rope,
+            n_rows,
+            ring_stride,
+            win=win,
+            D_NOPE=D_nope,
+            D_ROPE=D_rope,
+            HAS_FINAL=has_final,
+            BLOCK_NOPE=triton.next_power_of_2(D_nope),
+            BLOCK_ROPE=triton.next_power_of_2(D_rope),
+            num_warps=8,
+        )
+        return
+
     if kv.element_size() == 1:
         # single-byte rows (any fp8 variant) are a pure byte move, and the E8M0
         # scale bytes aren't floats -- uint8 avoids a triton convert for `other=`
@@ -161,9 +231,6 @@ def store_swa_into_unified(
         _scatter(kv.view(torch.uint8), unified_kv.view(torch.uint8))
     else:
         _scatter(kv, unified_kv)
-
-    if two_pool:
-        _scatter(kv_rope, unified_kv_rope)
 
 
 @triton.jit
