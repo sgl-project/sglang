@@ -25,6 +25,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=465, stage="base-c", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
+MTP_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
@@ -47,7 +48,7 @@ class TestDSV4FlashFP4B200MTP(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
+        cls.model = try_cached_model(MTP_MODEL)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
