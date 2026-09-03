@@ -1716,6 +1716,19 @@ class Req(ReqDllmMixin):
         if self.finished_len is not None and self.finished_len > max_new_tokens:
             self.finished_reason = FINISH_LENGTH(length=max_new_tokens)
             self.finished_len = max_new_tokens
+        self._cap_reasoning_tokens_at_finished_len()
+
+    def _cap_reasoning_tokens_at_finished_len(self) -> None:
+        """Bound ``reasoning_tokens`` by the tokens actually emitted.
+
+        ``update_reasoning_tokens`` advances over the whole accepted run, and it
+        runs before the finish state truncates the output at ``finished_len``.
+        A speculative run that crosses the budget therefore leaves the counter
+        above the emitted length. Reasoning tokens are a prefix of the output,
+        so ``finished_len`` is a hard upper bound.
+        """
+        if self.finished_len is not None and self.reasoning_tokens > self.finished_len:
+            self.reasoning_tokens = self.finished_len
 
     def update_finish_state(self, new_accepted_len: int = 1):
         if self.finished():
@@ -1753,6 +1766,7 @@ class Req(ReqDllmMixin):
                 length=self.sampling_params.max_new_tokens
             )
             self.finished_len = self.sampling_params.max_new_tokens
+            self._cap_reasoning_tokens_at_finished_len()
             return
 
         if self.grammar is not None and self.grammar.is_terminated():
