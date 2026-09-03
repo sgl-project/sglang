@@ -16,6 +16,8 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.float8_e4m3fnuz: "fp8_e4m3",
     torch.float8_e5m2: "fp8_e5m2",
     torch.bfloat16: "bf16",
+    torch.int8: "int8_g64",
+    torch.uint8: "int4_g32",
 }
 
 
@@ -57,6 +59,14 @@ def configure_kv_cache_dtype(
             kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype == "mxfp8":
         kv_cache_dtype = torch.float8_e4m3fn
+    elif server_args_kv_cache_dtype == "int8_g64":
+        kv_cache_dtype = torch.int8
+    elif server_args_kv_cache_dtype == "int4_g32":
+        kv_cache_dtype = torch.uint8
+    elif (
+        server_args_kv_cache_dtype == "int8ring_int4"
+    ):  # int4_g32 rows + int8_g64 ring (tiered pool)
+        kv_cache_dtype = torch.uint8
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
     elif server_args_kv_cache_dtype == "fp4_e2m1":

@@ -4047,11 +4047,28 @@ class HybridLinearKVPool(KVCache):
             layer, *args, layer_id_override=local_layer_id, **kwargs
         )
 
+    def get_kv_smooth_buffer(self, layer_id: int):
+        # int8_g64 full_kv_pool exposes per-channel smoothing constants (plumbed
+        # but identity; a static smoothing A/B was not adopted).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_smooth_buffer(layer_id)
+
     def get_kv_scale_buffer(self, layer_id: int):
         # MXFP8 full_kv_pool exposes per-32 UE8M0 K/V scale buffers.
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_scale_buffer(layer_id)
+
+    def get_kv_ring_buffer(self, layer_id: int):
+        # int8ring_int4 full_kv_pool exposes the per-layer int8 ring (K, V, K scales, V scales).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_kv_ring_buffer(layer_id)
+
+    def get_kv_ring_owner(self):
+        # int8ring_int4 full_kv_pool: ring-row owner table (shared by all layers).
+        return self.full_kv_pool.get_kv_ring_owner()
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
