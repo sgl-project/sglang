@@ -441,10 +441,15 @@ crate-type = ["cdylib"]
                     "PATH": "/usr/bin",
                     "CXXFLAGS": "-O2",
                     "RUSTFLAGS": "-Ctarget-cpu=x86-64",
+                    "LIBTORCH_USE_PYTORCH": "1",
                 },
             )
 
-            self.assertEqual(build.environment["LIBTORCH_USE_PYTORCH"], "1")
+            self.assertNotIn("LIBTORCH_USE_PYTORCH", build.environment)
+            self.assertEqual(build.environment["LIBTORCH"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_INCLUDE"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_LIB"], str(torch_root))
+            self.assertEqual(build.environment["LIBTORCH_CXX11_ABI"], "1")
             self.assertEqual(build.environment["LIBTORCH_BYPASS_VERSION_CHECK"], "1")
             self.assertIn(str(compat_header), build.environment["CXXFLAGS"])
             self.assertIn(
