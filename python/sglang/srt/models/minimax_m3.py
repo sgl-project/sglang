@@ -1390,10 +1390,16 @@ class MiniMaxM3DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+        if self.is_layer_sparse:
             hidden_states = self.mlp(
-                hidden_states,
+                hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        elif hidden_states.shape[0] != 0:
+            hidden_states = self.mlp(
+                x=hidden_states,
                 should_allreduce_fusion=should_allreduce_fusion,
                 use_reduce_scatter=use_reduce_scatter,
             )
