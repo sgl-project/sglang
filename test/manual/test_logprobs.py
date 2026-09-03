@@ -218,7 +218,6 @@ def generate_baseline(
 
 
 class TestLogprobsDense(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         """Set up the test class - initialize the engine once for all tests."""

@@ -90,9 +90,9 @@ class LoopGateProjection(nn.Module):
         """
         num_heads, num_tokens, head_dim = query.shape
 
-        assert (
-            num_heads == self.num_heads
-        ), f"Expected {self.num_heads} heads, got {num_heads}"
+        assert num_heads == self.num_heads, (
+            f"Expected {self.num_heads} heads, got {num_heads}"
+        )
 
         query_flat = query.reshape(-1, head_dim)
 

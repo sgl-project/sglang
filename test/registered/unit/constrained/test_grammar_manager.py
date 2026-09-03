@@ -26,6 +26,9 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.sampling.sampling_params import (
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "base-a-test-cpu")
@@ -42,6 +45,7 @@ def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     scheduler.server_args.reasoning_parser = None
     scheduler.server_args.constrained_json_whitespace_pattern = None
     scheduler.server_args.constrained_json_disable_any_whitespace = False
+    scheduler.model_config.request_selectable_think_end_id_sequences = None
 
     # Distributed group mocks
     scheduler.dp_tp_cpu_group = MagicMock()
@@ -302,6 +306,39 @@ class TestProcessReqWithGrammar(unittest.TestCase):
         mgr.process_req_with_grammar(req)
 
         self.assertEqual(req.grammar.max_think_tokens, 7)
+
+    def test_cache_hit_applies_only_request_selected_terminator(self):
+        mgr = self._make_mgr()
+        mgr.scheduler.model_config.request_selectable_think_end_id_sequences = [
+            [2, 3],
+            [8, 9],
+        ]
+        grammar_obj = ReasonerGrammarObject(
+            grammar=None,
+            think_end_ids=[2, 3],
+        )
+        grammar_obj.maybe_init_reasoning(True)
+        mgr.grammar_backend.get_cached_or_future_value.return_value = (
+            grammar_obj,
+            True,
+        )
+
+        req = _make_req(
+            json_schema="schema",
+            custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [8, 9]},
+        )
+        req.require_reasoning = True
+        mgr.process_req_with_grammar(req)
+
+        self.assertEqual(req.grammar.think_end_ids, (8, 9))
+
+        for token_id in (2, 3):
+            req.grammar.accept_token(token_id)
+        self.assertTrue(req.grammar._is_thinking())
+
+        for token_id in (8, 9):
+            req.grammar.accept_token(token_id)
+        self.assertTrue(req.grammar._is_generation())
 
     def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
         mgr = self._make_mgr()

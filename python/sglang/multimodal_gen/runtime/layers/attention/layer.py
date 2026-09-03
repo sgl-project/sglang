@@ -562,9 +562,9 @@ class UlyssesAttention_VSA(UlyssesAttention):
                 "K/V-gather SP does not support video sparse attention."
             )
         # Check text tokens are not supported for VSA now
-        assert (
-            replicated_q is None and replicated_k is None and replicated_v is None
-        ), "Replicated QKV is not supported for VSA now"
+        assert replicated_q is None and replicated_k is None and replicated_v is None, (
+            "Replicated QKV is not supported for VSA now"
+        )
         # Check input shapes
         assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected 4D tensors"
 
@@ -1042,9 +1042,9 @@ class USPAttention(nn.Module):
                     inv_indices = attn_mask_meta["inv_indices"]
                     # Guard against a caller passing meta from a different
                     # mask shape (silent corruption otherwise).
-                    assert (
-                        inv_indices.shape[0] == bs * seq
-                    ), "attn_mask_meta shape does not match attn_mask"
+                    assert inv_indices.shape[0] == bs * seq, (
+                        "attn_mask_meta shape does not match attn_mask"
+                    )
                     # All-False mask: FA varlen rejects zero-length input.
                     # Fall through to SDPA which handles it via broadcast.
                     # (Joint attention with an image side is always non-empty
@@ -1169,9 +1169,9 @@ class USPAttention(nn.Module):
                     # Zero-copy tail path: run varlen FA straight over the
                     # padded layout, each row split into [valid | pad] segments
                     # (contiguous reshapes only, no repacking).
-                    assert (
-                        cu_tail.numel() == 2 * bs + 1
-                    ), "cu_seqlens_tail does not match the batch size"
+                    assert cu_tail.numel() == 2 * bs + 1, (
+                        "cu_seqlens_tail does not match the batch size"
+                    )
                     out = flash_attn_varlen_func(
                         q=q.reshape(bs * seq, *q.shape[2:]),
                         k=k.reshape(bs * seq, *k.shape[2:]),
@@ -1259,9 +1259,9 @@ class USPAttention(nn.Module):
                 gathered_mask_meta = build_varlen_mask_meta(gathered_mask)
                 indices = gathered_mask_meta["indices"]
                 inv_indices = gathered_mask_meta["inv_indices"]
-                assert (
-                    inv_indices.shape[0] == bs * seq
-                ), "gathered attn_mask shape does not match q/k/v"
+                assert inv_indices.shape[0] == bs * seq, (
+                    "gathered attn_mask shape does not match q/k/v"
+                )
                 if indices.shape[0] > 0:
                     q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
                     out_unpad = flash_attn_varlen_func(

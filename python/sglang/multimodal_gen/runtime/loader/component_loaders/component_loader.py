@@ -655,9 +655,9 @@ class ComponentLoader(ABC):
             ]
             expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
-            assert (
-                transformers_or_diffusers == expected_library
-            ), f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            assert transformers_or_diffusers == expected_library, (
+                f"{loader_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            )
             loader = loader_cls()
             loader.component_type = structural_component_name
             loader.component_architecture = component_architecture
