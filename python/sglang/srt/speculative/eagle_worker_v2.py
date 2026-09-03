@@ -68,7 +68,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
-    _prune_draft_extend_logits,
 )
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -100,6 +99,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
+from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -129,6 +129,13 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+
+def _can_prune_eager_draft_extend_logits(
+    can_run_decode_cuda_graph: bool,
+) -> bool:
+    """Whether eager ROCm draft-extend may project only selected request rows."""
+    return not can_run_decode_cuda_graph and _is_hip and not require_gathered_buffer()
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
@@ -947,13 +954,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=False,
             )
 
-        # ROCm eager may prune before lm_head when no gathered DP buffer
-        # requires every draft-window row. CUDA-graph pruning is unconditional
-        # after #35546; this flag only affects the eager path.
-        prune_draft_extend_logits = _prune_draft_extend_logits()
-        if prune_draft_extend_logits:
-            forward_batch.spec_info.select_index = select_index
-
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
@@ -964,6 +964,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
         )
+        prune_eager_draft_extend_logits = _can_prune_eager_draft_extend_logits(
+            can_run_decode_cuda_graph
+        )
+        if prune_eager_draft_extend_logits:
+            forward_batch.spec_info.select_index = select_index
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -1017,10 +1022,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Reorganize the spec info for the next batch
         if not can_run_decode_cuda_graph:
-            # Graph already returns selected rows. Eager CUDA still has
-            # full-width logits. ROCm eager prunes before lm_head via
-            # spec_info.select_index, so only hidden states still need gather.
-            if not prune_draft_extend_logits:
+            # Eager CUDA still returns full-width logits. Eligible ROCm eager
+            # batches prune before lm_head, so only hidden states need gather.
+            if not prune_eager_draft_extend_logits:
                 draft_logits_output.next_token_logits = (
                     draft_logits_output.next_token_logits[select_index]
                 )

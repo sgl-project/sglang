@@ -44,7 +44,6 @@ from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
-    is_hip,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -54,14 +53,6 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
-
-
-_is_hip = is_hip()
-
-
-def _prune_draft_extend_logits() -> bool:
-    """Whether ROCm draft-extend may project only its selected request rows."""
-    return _is_hip and not require_gathered_buffer()
 
 
 @dataclass
@@ -138,11 +129,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.capture_forward_mode = self.forward_mode
-        self.capture_hidden_mode = (
-            CaptureHiddenMode.NULL
-            if self.eagle_worker.speculative_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
-        )
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
 
@@ -436,7 +423,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
         if self.buffers.dsa_seed_topk_capture is not None:

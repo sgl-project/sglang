@@ -13,15 +13,14 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
     EAGLEWorkerV2,
-    _prune_draft_extend_logits,
+    _can_prune_eager_draft_extend_logits,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -140,67 +139,32 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
-    def test_draft_extend_row_pruning_keeps_full_hidden_capture(self):
-        hidden_states = torch.arange(24, device=DEVICE).reshape(6, 4)
-        select_index = torch.tensor([1, 5], dtype=torch.long, device=DEVICE)
-        metadata = LogitsMetadata(
-            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            draft_extend_select_index=select_index,
-        )
-
-        (
-            pruned_states,
-            pruned_states_before_norm,
-            aux_pruned_states,
-            sample_indices,
-            _,
-            _,
-        ) = LogitsProcessor._get_pruned_states(
-            None, hidden_states, None, None, metadata
-        )
-        stored_hidden_states = LogitsProcessor._get_hidden_states_to_store(
-            None,
-            hidden_states,
-            None,
-            None,
-            pruned_states,
-            pruned_states_before_norm,
-            aux_pruned_states,
-            sample_indices,
-            metadata,
-        )
-
-        torch.testing.assert_close(pruned_states, hidden_states[select_index])
-        self.assertEqual(pruned_states.shape, (2, 4))
-        self.assertIs(stored_hidden_states, hidden_states)
-        self.assertEqual(stored_hidden_states.shape, (6, 4))
-
-    def test_draft_extend_pruning_gates_eager_rocm_only(self):
+    def test_draft_extend_pruning_is_eager_rocm_only(self):
         with patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            "sglang.srt.speculative.eagle_worker_v2._is_hip",
             True,
         ), patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
+            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
             return_value=False,
         ):
-            self.assertTrue(_prune_draft_extend_logits())
+            self.assertTrue(_can_prune_eager_draft_extend_logits(False))
+            self.assertFalse(_can_prune_eager_draft_extend_logits(True))
         with patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            "sglang.srt.speculative.eagle_worker_v2._is_hip",
             True,
         ), patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
+            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
             return_value=True,
         ):
-            self.assertFalse(_prune_draft_extend_logits())
+            self.assertFalse(_can_prune_eager_draft_extend_logits(False))
         with patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
+            "sglang.srt.speculative.eagle_worker_v2._is_hip",
             False,
         ), patch(
-            "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner.require_gathered_buffer",
+            "sglang.srt.speculative.eagle_worker_v2.require_gathered_buffer",
             return_value=False,
         ):
-            self.assertFalse(_prune_draft_extend_logits())
+            self.assertFalse(_can_prune_eager_draft_extend_logits(False))
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
