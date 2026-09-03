@@ -31,7 +31,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    aiter_topk_transform_paged,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -867,6 +870,16 @@ class C4IndexerBackendMixin:
                     c4_sparse_page_indices[rows],
                     indexer_metadata.c4_page_size,
                     row_raw_indices,
+                )
+            elif self.dsa_topk_backend.is_aiter():
+                aiter_topk_transform_paged(
+                    logits,
+                    c4_seq_lens[rows],
+                    page_table[rows],
+                    indexer_metadata.c4_page_size,
+                    c4_sparse_page_indices.shape[1],
+                    out=c4_sparse_page_indices[rows],
+                    out_raw_indices=row_raw_indices,
                 )
             elif self.dsa_topk_backend.should_use_topk_v2() and raw_indices is None:
                 topk_transform_paged_v2(
