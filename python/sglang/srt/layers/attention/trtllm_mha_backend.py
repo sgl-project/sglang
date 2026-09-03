@@ -469,9 +469,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """Initialize CUDA graph state for TRTLLM MHA."""
-        self.kv_read_tables = self.kv_index_translator.make_capture_tables(
-            max_bs=max_bs, max_context_len=self.max_context_len
-        )
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
@@ -888,7 +885,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
-                    self.forward_metadata, forward_batch, ragged_layout, bs
+                    self.forward_metadata,
+                    forward_batch,
+                    ragged_layout,
+                    bs,
+                    in_capture=in_capture,
                 )
         elif forward_mode.is_draft_extend_v2():
             self.forward_metadata = self.draft_extend_metadata[bs]
@@ -898,21 +899,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         if self.kv_index_translator.is_translating:
-            # Unified pool: refresh the capture-stable read table (this runs
+            # Unified pool: refill this mode's own page table (this runs
             # out-of-graph on BOTH capture and every replay-prep; the recorded
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
-            kv_view = self.kv_index_translator.build_index_table(
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=forward_batch.seq_lens[:bs],
-                into=self.kv_read_tables,
-            )
             metadata = self.forward_metadata
-            if in_capture:
-                # Bind ONCE: the attention kernels bake these pointers at capture.
-                metadata.page_table = kv_view.ids[:bs]
-                if kv_view.sliding_window_ids is not None:
-                    metadata.swa_page_table = kv_view.sliding_window_ids[:bs]
+            # `cache_seqlens_int32` is what the attention kernels bound their
+            # page-table reads by, and the fused metadata call above wrote it.
+            # A target verify reads `draft_token_num` further than `seq_lens`
+            # goes, so filling to `seq_lens` leaves those columns untranslated.
+            self.kv_index_translator.fill_read_table(
+                out=metadata.page_table,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=metadata.cache_seqlens_int32,
+                sliding_window_out=metadata.swa_page_table,
+            )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
             if (
@@ -921,7 +922,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 n = forward_batch.out_cache_loc.shape[0]
                 self.cuda_graph_swa_out_cache_loc[n:].zero_()
-                if in_capture and self.kv_index_translator.is_translating:
+                if in_capture:
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
@@ -944,6 +945,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
         ragged_layout: RaggedVerifyLayout,
         bs: int,
+        in_capture: bool = False,
     ) -> None:
         """Eagerly rebuild the target-verify graph metadata for ragged verify.
 
@@ -971,11 +973,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
-            self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc
+                    )
                 )
-            )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self._apply_cuda_graph_metadata(

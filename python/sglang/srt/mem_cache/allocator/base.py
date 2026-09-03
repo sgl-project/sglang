@@ -93,6 +93,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def get_kvcache(self):
         return self._kvcache
 
+    def get_all_free_pages(self):
+        # Debug / invariant census; None when the pool has no page free list.
+        if self.free_pages is None:
+            return None
+        if self.release_pages is None or len(self.release_pages) == 0:
+            return self.free_pages
+        return torch.cat((self.free_pages, self.release_pages))
+
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []

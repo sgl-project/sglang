@@ -9,9 +9,11 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData
+from sglang.srt.utils import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
 
 logger = logging.getLogger(__name__)
+
+MEDIA_URL_PART_TYPES = ("image_url", "input_image", "video_url", "audio_url")
 
 # ============================================================================
 # JINJA TEMPLATE CONTENT FORMAT DETECTION
@@ -121,7 +123,19 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
 
 
 def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
-    """Detect call-ID use so rendered media can be realigned without model-specific allowlists."""
+    """Detect templates that associate tool results with tool_calls by tool_call_id.
+
+    Such templates may emit media placeholders in tool_calls order rather than
+    request message order. Templates that sort/group by the tool_call_id string
+    value are intentionally excluded: their order cannot be reproduced from
+    message order alone.
+
+    This is an over-approximation: templates that merely print or validate
+    tool_call_id while rendering in message order (e.g. Mistral) also match.
+    That is safe because canonicalization keeps extraction and rendering
+    consistent for those templates too; it only reorders prompts the client
+    had already sent out of tool_calls order.
+    """
     if not isinstance(chat_template, str):
         return False
 
@@ -151,7 +165,7 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
         ):
             return True
 
-    attribute_filters = {"groupby", "map", "rejectattr", "selectattr", "sort"}
+    attribute_filters = {"map", "rejectattr", "selectattr"}
     for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
         if filter_node.name not in attribute_filters:
             continue
@@ -230,16 +244,19 @@ def process_content_for_template_format(
                         for key in GLM_MEDIA_CONFIG_KEYS
                         if video_obj.get(key) is not None
                     }
-                    if not preprocess_kwargs and mdp is None:
+                    if mdp is not None:
+                        preprocess_kwargs["max_dynamic_patch"] = mdp
+                    if not preprocess_kwargs:
                         video_data.append(chunk["video_url"]["url"])
                     else:
-                        # Keep structured info for backend, but template only sees {"type":"video"}
-                        item = {"url": video_obj["url"]}
-                        if mdp is not None:
-                            item["max_dynamic_patch"] = mdp
-                        if preprocess_kwargs:
-                            item["preprocess_kwargs"] = preprocess_kwargs
-                        video_data.append(item)
+                        # VideoData survives load_video on every processor; a
+                        # plain dict only the GLM consumer understands.
+                        video_data.append(
+                            VideoData(
+                                url=video_obj["url"],
+                                preprocess_kwargs=preprocess_kwargs,
+                            )
+                        )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility

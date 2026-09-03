@@ -212,6 +212,7 @@ class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
+    video_preprocessing_device = None
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
@@ -814,10 +815,8 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = processor_device
 
         # Long-video preprocessing stays on CPU to avoid competing with scheduler GPU pools.
-        if videos:
-            video_device = getattr(self, "video_preprocessing_device", None)
-            if video_device is not None:
-                kwargs["device"] = video_device
+        if videos and self.video_preprocessing_device is not None:
+            kwargs["device"] = self.video_preprocessing_device
 
         # Avoid double BOS when the chat template already wrote one.
         if self._tokenizer_auto_adds_specials and isinstance(input_text, str):
