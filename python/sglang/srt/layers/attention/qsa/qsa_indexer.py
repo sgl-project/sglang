@@ -330,6 +330,11 @@ class QSAIndexer(MultiPlatformOp):
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
+            plan_valid = metadata.compress_plan_valid
+            if plan_valid is not None:
+                group_locs = torch.where(
+                    plan_valid[:, None], group_locs, member_rows[:, None]
+                )
             source_keys = token_k
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
