@@ -27,10 +27,17 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from sglang.kernels.ops.diffusion import (
+    can_use_vsa_block_sparse_sm100,
+    vsa_block_sparse_sm100,
+)
+
 # BLOCK_M / BLOCK_N are structural, not tunable: the kernel indexes the top-k
 # list per BLOCK_M q-tile and addresses keys as kv_idx * BLOCK_N, so both must
 # match the granularity q2k_index and variable_block_sizes were built at.
 VSA_H3_KERNEL_BLOCK = 64
+
+__all__ = ["can_use_vsa_block_sparse_sm100"]
 
 # Pinned instead of autotuned: on B300 num_warps=4 wins at every sequence
 # length and num_stages=5 is within 0.5% of the best (7 spills); FastVideo
@@ -107,10 +114,12 @@ def vsa_h3_block_sparse_attn_forward(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     out: torch.Tensor | None = None,
+    native: bool = False,
 ) -> torch.Tensor:
     """q/k/v: contiguous [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad
     rows zero. q2k_index/q2k_num: contiguous [B, H, n_tiles, max_kv] /
-    [B, H, n_tiles] int32."""
+    [B, H, n_tiles] int32. ``native`` runs FastVideo's tcgen05 kernel (sm_100a /
+    sm_103a, even n_tiles) instead of the Triton kernel."""
     batch, heads, seq_q, head_dim = q.shape
     seq_kv = k.shape[2]
     if seq_q % VSA_H3_KERNEL_BLOCK or seq_kv % VSA_H3_KERNEL_BLOCK:
@@ -125,6 +134,18 @@ def vsa_h3_block_sparse_attn_forward(
         )
     if out is None:
         out = torch.empty_like(q)
+    if native:
+        vsa_block_sparse_sm100(
+            q,
+            k,
+            v,
+            q2k_index.view(-1, q2k_index.shape[-1]),
+            q2k_num.view(-1),
+            variable_block_sizes,
+            out,
+            1.0 / math.sqrt(head_dim),
+        )
+        return out
     block = [1, 1, VSA_H3_KERNEL_BLOCK, head_dim]
     desc_q, desc_k, desc_v, desc_o = (
         TensorDescriptor.from_tensor(t, block_shape=block) for t in (q, k, v, out)

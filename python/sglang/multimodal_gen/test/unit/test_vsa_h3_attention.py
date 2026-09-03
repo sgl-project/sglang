@@ -245,6 +245,36 @@ def test_return_compress_fold_on_row_shards_is_bit_identical() -> None:
     assert torch.equal(out, folded)
 
 
+@requires_cuda
+def test_odd_tile_count_matches_dense() -> None:
+    """The native kernel pairs query tiles, so an odd tile count runs with one
+    padded empty tile; every real row must still match dense attention."""
+    device = torch.device("cuda")
+    prefix = (70, 0, 40)
+    meta = VideoSparseAttentionH3MetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=VIDEO_SHAPE,
+        patch_size=(1, 1, 1),
+        VSA_sparsity=0.0,
+        prefix_segments=prefix,
+        device=device,
+    )
+    assert meta.num_tiles % 2 == 1
+    used = sum(prefix) + math.prod(VIDEO_SHAPE)
+    total = (used + 63) // 64 * 64
+    generator = torch.Generator(device="cpu").manual_seed(11)
+    q, k, v = (
+        torch.randn((total, HEADS, HEAD_DIM), generator=generator).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(3)
+    )
+    out = _run(_impl(), meta, used, total, q, k, v)
+    diff = (out[:used].float() - _dense_reference(q, k, v, used)).abs().max().item()
+    assert diff < 2e-2, f"odd tile count vs dense max diff {diff}"
+    assert torch.all(out[used:] == 0)
+
+
 def test_metadata_tile_geometry_accounts_every_row() -> None:
     device = torch.device("cpu")
     meta = _build_metadata(0.9, device)

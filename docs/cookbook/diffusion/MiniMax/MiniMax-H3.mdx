@@ -676,9 +676,10 @@ other step count is rejected. FastH3 requests default to
 RoPE and runs its attention on cuDNN SDPA; `quality: "lossless"` keeps the
 reference decode.
 
-`video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: an in-tree
-Triton block-sparse kernel (SM90 / SM100 / SM103) over segment-pure prefix
-tiles and (4, 4, 4) video tiles, driven by the checkpoint's trained
+`video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: in-tree
+block-sparse kernels (FastVideo's native tcgen05 forward on SM100 / SM103, a
+Triton tile-64 kernel on SM90) over segment-pure prefix tiles and (4, 4, 4)
+video tiles, driven by the checkpoint's trained
 `to_gate_compress` compression branch. Select it for the transformer only, as
 with cube sparse attention: the packed DiT blocks run sparse while the token
 refiner falls back to dense FA inside the backend, and the text encoder and
