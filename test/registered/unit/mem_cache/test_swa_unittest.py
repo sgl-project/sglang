@@ -727,9 +727,9 @@ class TestSWA(unittest.TestCase):
             EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
         )
         assert isinstance(evict_result, EvictResult)
-        assert (
-            evict_result.swa_num_tokens_evicted >= swa_num_tokens
-        ), f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
+        assert evict_result.swa_num_tokens_evicted >= swa_num_tokens, (
+            f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
+        )
         tree.pretty_print()
 
         full_num_tokens, swa_num_tokens = 1, 2
@@ -738,12 +738,12 @@ class TestSWA(unittest.TestCase):
             EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
         )
         assert isinstance(evict_result, EvictResult)
-        assert (
-            evict_result.num_tokens_evicted >= full_num_tokens
-        ), f"evicted {evict_result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
-        assert (
-            evict_result.swa_num_tokens_evicted >= swa_num_tokens
-        ), f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
+        assert evict_result.num_tokens_evicted >= full_num_tokens, (
+            f"evicted {evict_result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
+        )
+        assert evict_result.swa_num_tokens_evicted >= swa_num_tokens, (
+            f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
+        )
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]

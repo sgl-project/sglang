@@ -190,9 +190,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(
-            reqs[i].kv.kv_allocated_len > 0 for i in reusing
-        ), "a reused row must carry allocated KV"
+        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
+            "a reused row must carry allocated KV"
+        )
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -1766,9 +1766,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        assert req_pool_indices is not None, (
+            "req_pool_indices is full! There is a bug in memory estimation."
+        )
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2202,9 +2202,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert (
-                output_token_sampling_mask_idx is not None
-            ), "sampling mask buffer disabled on decode side"
+            assert output_token_sampling_mask_idx is not None, (
+                "sampling mask buffer disabled on decode side"
+            )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

@@ -465,10 +465,13 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         self.assertIsNotNone(v)
         from unittest import mock
 
-        with mock.patch.object(
-            torch, "unique", side_effect=AssertionError("unique = host sync")
-        ), mock.patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+        with (
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+            ),
         ):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])

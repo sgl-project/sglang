@@ -224,8 +224,7 @@ class GptOssSparseMoeBlock(nn.Module):
             )
             extra_kwargs = {
                 # for moe gate_up_proj and down_proj and their bias loading
-                "use_weight_loader_fused": quant_config_name
-                != "mxfp4"
+                "use_weight_loader_fused": quant_config_name != "mxfp4"
             }
 
         self.experts = experts_type(
@@ -977,9 +976,9 @@ class GptOssForCausalLM(nn.Module):
         original_intermediate_size = getattr(
             self.config, "original_intermediate_size", intermediate_size
         )
-        assert (
-            intermediate_size % mxfp4_block == 0
-        ), f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        assert intermediate_size % mxfp4_block == 0, (
+            f"{intermediate_size=} must be divisible by {mxfp4_block=}"
+        )
         intermediate_size_block = intermediate_size // mxfp4_block
 
         per_rank_intermediate_size_block = math.ceil(
