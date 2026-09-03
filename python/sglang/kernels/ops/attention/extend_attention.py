@@ -465,7 +465,19 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N):
+    # The extend stage's floor, with q at its absolute position
+    # (cur_seq_len_prefix + cur_block_m * BLOCK_M) because kv is indexed within the
+    # prefix; tight for any BLOCK_M/BLOCK_N, and SKIP_TILE already made the skipped
+    # tiles no-ops. Past the first window's m-blocks no query reaches the prefix.
+    prefix_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        prefix_start = (
+            tl.maximum(
+                cur_seq_len_prefix + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(prefix_start, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
@@ -1122,7 +1134,20 @@ def _fwd_kernel_unified(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     # Unified loop: process all KV tokens (prefix + extend)
-    for start_n in range(0, cur_seq_kv_len, BLOCK_N):
+    #
+    # The two-stage kernel's floor. cur_window_start appears on both sides of the
+    # mask below and cancels, so A = cur_seq_prefix_len + cur_block_m * BLOCK_M -
+    # SLIDING_WINDOW_SIZE. This loop spans prefix and extend KV alike, so the one
+    # floor drops the fully-masked tiles of both.
+    unified_start = 0
+    if SLIDING_WINDOW_SIZE > 0:
+        unified_start = (
+            tl.maximum(
+                cur_seq_prefix_len + cur_block_m * BLOCK_M - SLIDING_WINDOW_SIZE, 0
+            )
+            // BLOCK_N
+        ) * BLOCK_N
+    for start_n in range(unified_start, cur_seq_kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_kv_len
 
