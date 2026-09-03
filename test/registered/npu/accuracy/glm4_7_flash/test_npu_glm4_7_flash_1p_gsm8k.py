@@ -54,7 +54,6 @@ OTHER_ARGS = [
 
 
 class TestNPUGlm4_7Flash_1P_GSM8K(TestNpuAccuracyTestCaseBase):
-
     model = GLM_4_7_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

@@ -37,12 +37,12 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
 
             sf_packed_recreated = transform_scale_ue8m0(sf_fp32_recreated, mn=mn)
 
-            assert torch.all(
-                sf_packed_original == sf_packed_recreated
-            ), f"{sf_packed_original=} {sf_packed_recreated}"
-            assert torch.all(
-                sf_fp32_original == sf_fp32_recreated
-            ), f"{sf_fp32_original=} {sf_fp32_recreated}"
+            assert torch.all(sf_packed_original == sf_packed_recreated), (
+                f"{sf_packed_original=} {sf_packed_recreated}"
+            )
+            assert torch.all(sf_fp32_original == sf_fp32_recreated), (
+                f"{sf_fp32_original=} {sf_fp32_recreated}"
+            )
 
 
 class TestApplyFp8LinearScaleDispatch(CustomTestCase):
@@ -97,14 +97,16 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                     "is_sm120": False,
                 }
                 capabilities[capability] = True
-                with patch.object(
-                    fp8_utils,
-                    "get_platform",
-                    return_value=SimpleNamespace(**capabilities),
-                ), patch.object(
-                    fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
-                ), patch.object(
-                    fp8_utils, "get_exec", return_value=exec_config
+                with (
+                    patch.object(
+                        fp8_utils,
+                        "get_platform",
+                        return_value=SimpleNamespace(**capabilities),
+                    ),
+                    patch.object(
+                        fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm
+                    ),
+                    patch.object(fp8_utils, "get_exec", return_value=exec_config),
                 ):
                     fp8_utils.apply_fp8_linear(
                         input,
@@ -157,15 +159,18 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
                 (mat_a.shape[0], mat_b.shape[1]), dtype=out_dtype, device=mat_a.device
             )
 
-        with patch.object(
-            fp8_utils,
-            "get_platform",
-            return_value=SimpleNamespace(
-                is_sm90=False,
-                is_sm100=False,
-                is_sm120=False,
+        with (
+            patch.object(
+                fp8_utils,
+                "get_platform",
+                return_value=SimpleNamespace(
+                    is_sm90=False,
+                    is_sm100=False,
+                    is_sm120=False,
+                ),
             ),
-        ), patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm):
+            patch.object(fp8_utils, "fp8_scaled_mm", side_effect=fake_fp8_scaled_mm),
+        ):
             fp8_utils.apply_fp8_linear(
                 input,
                 weight,

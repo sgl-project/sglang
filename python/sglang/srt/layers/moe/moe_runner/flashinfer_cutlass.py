@@ -264,12 +264,12 @@ def fused_experts_none_to_flashinfer_cutlass(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
@@ -289,12 +289,12 @@ def fused_experts_flashinfer_to_flashinfer_cutlass(
         FlashinferCombineInput,
     )
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    assert (
-        not runner_config.apply_router_weight_on_input
-    ), "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
+    assert not runner_config.apply_router_weight_on_input, (
+        "apply_router_weight_on_input is not supported for FlashInfer CUTLASS"
+    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,
@@ -316,9 +316,9 @@ def fused_experts_none_to_flashinfer_mxfp4(
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    assert isinstance(
-        quant_info, FlashInferCutlassMxfp4MoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    assert isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
+    )
 
     flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
 
