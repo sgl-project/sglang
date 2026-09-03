@@ -1,7 +1,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Optional
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 import torch
 
@@ -19,6 +19,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardMode,
     compute_position,
 )
 from sglang.srt.runtime_context import (
@@ -86,6 +87,41 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+@runtime_checkable
+class _SupportsDSparkTargetHiddenProjection(Protocol):
+    def set_dspark_target_hidden_projector(
+        self,
+        projector: Callable[[torch.Tensor], torch.Tensor],
+        *,
+        num_context_features: int,
+    ) -> bool: ...
+
+    def should_project_dspark_target_hidden(
+        self,
+        *,
+        forward_mode: ForwardMode,
+        capture_hidden_mode: CaptureHiddenMode,
+    ) -> bool: ...
+
+
+def _configure_target_hidden_projection(
+    *, target_model, draft_model, is_deepseek_v4_draft: bool
+) -> bool:
+    """Install the optional token-major projection before the target SP gather."""
+    if is_deepseek_v4_draft:
+        return False
+    if not draft_model.supports_pre_gather_target_hidden_projection:
+        return False
+    if not isinstance(target_model, _SupportsDSparkTargetHiddenProjection):
+        return False
+    return bool(
+        target_model.set_dspark_target_hidden_projector(
+            draft_model.project_target_hidden,
+            num_context_features=int(draft_model.num_context_features),
+        )
+    )
 
 
 class DSparkWorkerV2(BaseSpecWorker):
@@ -227,6 +263,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 ),
                 lm_head=lm_head,
             )
+        self._target_hidden_projection_enabled = False
 
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
@@ -377,6 +414,16 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with self._draft_context():
             self._draft_worker.init_attention_backends()
+        self._target_hidden_projection_enabled = _configure_target_hidden_projection(
+            target_model=self.target_worker.model_runner.model,
+            draft_model=self.draft_model,
+            is_deepseek_v4_draft=self._draft_is_moe,
+        )
+        if self._target_hidden_projection_enabled and self.ps.tp_rank == 0:
+            logger.info(
+                "DSpark prefill target-hidden projection runs before "
+                "sequence-parallel gather."
+            )
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -487,6 +534,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         batch_output = self.target_worker.forward_batch_generation(
             batch, capture_hidden_mode=CaptureHiddenMode.FULL
         )
+        # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
+        target_hidden_is_projected = (
+            self._target_hidden_projection_enabled
+            and self.target_worker.model_runner.model.should_project_dspark_target_hidden(
+                forward_mode=batch.forward_mode,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+        )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
@@ -542,6 +597,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
+            target_hidden_is_projected=target_hidden_is_projected,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
