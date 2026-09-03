@@ -98,13 +98,13 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       gpqa_pct: {
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -112,7 +112,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -120,7 +120,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -130,7 +130,7 @@ sgl-eval run gpqa \\
       },
       aime25_pct: {
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -138,7 +138,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -146,7 +146,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -156,7 +156,7 @@ sgl-eval run aime25 \\
       },
       mmmu_pro_pct: {
         "flash-vision":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run mmmu_pro \\
   --reasoning-effort max \\
   --temperature 1.0 --top-p 0.95 \\
@@ -3083,7 +3083,8 @@ sgl-eval run mmmu_pro \\
     // verified on B200 via the MMMU-Pro round (4×B200, image batches).
     // Balanced / high-throughput stay target-only: those recipes run DP
     // attention, which DSpark is incompatible with on the current release.
-    // Non-B200 hardware — final verification in progress.
+    // GB300 verified via the same MMMU-Pro round (4×GB300); B300 /
+    // GB200 / H200 / H100 — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -3244,8 +3245,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
       flags: [
@@ -3259,8 +3259,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -3277,8 +3276,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",

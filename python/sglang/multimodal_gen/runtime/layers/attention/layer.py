@@ -289,6 +289,8 @@ def prepare_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum
 ) -> None:
     """Build and cache the impl for ``target``; may raise, mutates nothing."""
+    if layer._required_attention_backend is not None:
+        return
     if target in layer._attn_impl_by_backend:
         return
     backend_cls = get_attn_backend(
@@ -313,6 +315,8 @@ def apply_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum | None
 ) -> None:
     """Flip to a prepared impl (None = construction default); cannot fail."""
+    if layer._required_attention_backend is not None:
+        return
     target = target or layer._default_attn_backend
     if target is layer.backend:
         return
@@ -331,6 +335,7 @@ class UlyssesAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
@@ -353,7 +358,10 @@ class UlyssesAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=required_attention_backend,
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -375,6 +383,7 @@ class UlyssesAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
         self.causal = causal
         self.sp_attention_mode, self.sp_attention_mode_is_auto = (
@@ -553,9 +562,9 @@ class UlyssesAttention_VSA(UlyssesAttention):
                 "K/V-gather SP does not support video sparse attention."
             )
         # Check text tokens are not supported for VSA now
-        assert (
-            replicated_q is None and replicated_k is None and replicated_v is None
-        ), "Replicated QKV is not supported for VSA now"
+        assert replicated_q is None and replicated_k is None and replicated_v is None, (
+            "Replicated QKV is not supported for VSA now"
+        )
         # Check input shapes
         assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4, "Expected 4D tensors"
 
@@ -598,6 +607,7 @@ class LocalAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         default_attention_backend: AttentionBackendEnum | None = None,
         is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
@@ -616,6 +626,7 @@ class LocalAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
         )
@@ -638,6 +649,7 @@ class LocalAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
 
     def forward(
@@ -731,6 +743,7 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
@@ -767,6 +780,7 @@ class USPAttention(nn.Module):
             head_size,
             dtype,
             supported_attention_backends=supported_attention_backends,
+            selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
         )
@@ -798,6 +812,7 @@ class USPAttention(nn.Module):
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
+        self._required_attention_backend = required_attention_backend
         self.dtype = dtype
         self.causal = causal
         self.dropout_p = dropout_rate
@@ -1027,9 +1042,9 @@ class USPAttention(nn.Module):
                     inv_indices = attn_mask_meta["inv_indices"]
                     # Guard against a caller passing meta from a different
                     # mask shape (silent corruption otherwise).
-                    assert (
-                        inv_indices.shape[0] == bs * seq
-                    ), "attn_mask_meta shape does not match attn_mask"
+                    assert inv_indices.shape[0] == bs * seq, (
+                        "attn_mask_meta shape does not match attn_mask"
+                    )
                     # All-False mask: FA varlen rejects zero-length input.
                     # Fall through to SDPA which handles it via broadcast.
                     # (Joint attention with an image side is always non-empty
@@ -1154,9 +1169,9 @@ class USPAttention(nn.Module):
                     # Zero-copy tail path: run varlen FA straight over the
                     # padded layout, each row split into [valid | pad] segments
                     # (contiguous reshapes only, no repacking).
-                    assert (
-                        cu_tail.numel() == 2 * bs + 1
-                    ), "cu_seqlens_tail does not match the batch size"
+                    assert cu_tail.numel() == 2 * bs + 1, (
+                        "cu_seqlens_tail does not match the batch size"
+                    )
                     out = flash_attn_varlen_func(
                         q=q.reshape(bs * seq, *q.shape[2:]),
                         k=k.reshape(bs * seq, *k.shape[2:]),
@@ -1244,9 +1259,9 @@ class USPAttention(nn.Module):
                 gathered_mask_meta = build_varlen_mask_meta(gathered_mask)
                 indices = gathered_mask_meta["indices"]
                 inv_indices = gathered_mask_meta["inv_indices"]
-                assert (
-                    inv_indices.shape[0] == bs * seq
-                ), "gathered attn_mask shape does not match q/k/v"
+                assert inv_indices.shape[0] == bs * seq, (
+                    "gathered attn_mask shape does not match q/k/v"
+                )
                 if indices.shape[0] > 0:
                     q_unpad, k_unpad, v_unpad = fused_pack_qkv(q, k, v, indices)
                     out_unpad = flash_attn_varlen_func(
