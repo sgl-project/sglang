@@ -175,9 +175,10 @@ class SchedulerMetricsReporter:
         }.get(getattr(self.scheduler, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_correct_drafts + bs, bs).
-        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
+        # `*_accept_tokens` includes accepted drafts and non-draft output tokens;
+        # `*_correct_drafts` counts accepted draft proposals only.
         self.spec_num_accept_tokens = 0  # per-log-interval
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
@@ -398,16 +399,15 @@ class SchedulerMetricsReporter:
         self,
         bs: int,
         num_correct_drafts: int,
+        num_accept_tokens: int,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
     ):
-        self.spec_num_accept_tokens += num_correct_drafts + bs
+        self.spec_num_accept_tokens += num_accept_tokens
+        self.spec_num_correct_drafts += num_correct_drafts
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
-
-        # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -572,6 +572,7 @@ class SchedulerMetricsReporter:
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accept_tokens = 0
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -757,13 +758,13 @@ class SchedulerMetricsReporter:
         self,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_correct_drafts: int = 0,
+        num_generated_tokens: int = 0,
     ):
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_correct_drafts
+            decode_tokens = num_generated_tokens
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -826,7 +827,7 @@ class SchedulerMetricsReporter:
             spec_block_accept_length = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
-            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_correct_drafts
             if get_spec().speculative_num_draft_tokens:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
@@ -853,7 +854,8 @@ class SchedulerMetricsReporter:
             )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_correct_drafts = 0
+            self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "

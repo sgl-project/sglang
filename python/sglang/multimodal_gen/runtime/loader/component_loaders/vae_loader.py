@@ -15,8 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    WeightOverrideComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -43,8 +43,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_decode_precision,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
+    filter_duplicate_precision_variant_safetensors,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
@@ -393,17 +392,21 @@ def _assign_direct_gpu_vae_state(
         )
 
 
-class VAELoader(ComponentLoader):
+class VAELoader(WeightOverrideComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
-    supports_direct_gpu_weight_loading = True
 
-    def supports_direct_gpu_weight_loading_for_component(
-        self, component_name: str
+    def resolve_component_direct_gpu_loading(
+        self, server_args: ServerArgs, component_name: str
     ) -> bool:
-        return component_name in ("vae", "video_vae")
+        requested = server_args.should_direct_gpu_weight_load_component(component_name)
+        if requested and component_name not in ("vae", "video_vae"):
+            raise ComponentCheckpointUnsupportedError(
+                f"Direct GPU loading is not implemented for {component_name!r}"
+            )
+        return requested
 
     def select_weight_files(
         self,
@@ -424,25 +427,6 @@ class VAELoader(ComponentLoader):
         self, server_args: ServerArgs, component_name: str
     ) -> str | None:
         return server_args.component_precisions.get(component_name)
-
-    @staticmethod
-    def resolve_model_weights_path(
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        weights_override = getattr(server_args, "component_weights_paths", {}).get(
-            component_name
-        )
-        if weights_override is None:
-            return component_model_path
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
@@ -467,14 +451,10 @@ class VAELoader(ComponentLoader):
         cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
-        direct_gpu_weight_loading = server_args.should_direct_gpu_weight_load_component(
-            component_name
+        direct_gpu_weight_loading = self.resolve_component_direct_gpu_loading(
+            server_args, component_name
         )
-        if direct_gpu_weight_loading and component_name not in ("vae", "video_vae"):
-            raise ComponentCheckpointUnsupportedError(
-                f"Direct GPU loading is not implemented for {component_name!r}"
-            )
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,
@@ -490,9 +470,9 @@ class VAELoader(ComponentLoader):
         )
 
         class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         component_type = self.structural_component_type(component_name)
         if component_type in ("vae", "video_vae"):
@@ -591,7 +571,11 @@ class VAELoader(ComponentLoader):
                 )
             safetensors_list = [component_weights_path]
         else:
-            safetensors_list = _list_safetensors_files(component_weights_path)
+            # VAE configs may explicitly choose a precision variant, so their
+            # selector must run before the canonical fallback.
+            safetensors_list = _list_safetensors_files(
+                component_weights_path, raw_candidates=True
+            )
             safetensors_list = self.select_weight_files(
                 safetensors_list,
                 component_weights_path,
@@ -599,10 +583,13 @@ class VAELoader(ComponentLoader):
                 component_name,
                 vae_precision,
             )
+            safetensors_list = filter_duplicate_precision_variant_safetensors(
+                safetensors_list
+            )
 
-        assert (
-            len(safetensors_list) >= 1
-        ), f"Found no safetensors files in {component_weights_path}"
+        assert len(safetensors_list) >= 1, (
+            f"Found no safetensors files in {component_weights_path}"
+        )
         if direct_gpu_weight_loading:
             _assign_direct_gpu_vae_state(
                 vae,
