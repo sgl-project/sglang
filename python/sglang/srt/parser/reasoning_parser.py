@@ -471,6 +471,63 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         )
 
 
+class K2V3Detector(BaseReasoningFormatDetector):
+    """Reasoning detector for canonical K2 Horizon IFM tokens.
+
+    K2 Horizon's template prefills the opening token, so generated text starts
+    inside reasoning and this parser is always forced on. ``reasoning_effort``
+    selects the matching IFM token pair.
+    """
+
+    _EFFORT_TOKENS = {
+        "high": ("<ifm|think>", "</ifm|think>"),
+        "medium": ("<ifm|think_fast>", "</ifm|think_fast>"),
+        "low": ("<ifm|think_faster>", "</ifm|think_faster>"),
+    }
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+        reasoning_effort: object = "high",
+    ):
+        if not force_reasoning:
+            raise ValueError("K2-v3 reasoning parser requires force_reasoning=True")
+
+        # Five release templates reject unsupported levels. The 0.9B template's
+        # fallback emits the medium token, so medium is the only possible wire
+        # format for an unsupported value that reaches generation.
+        effort = (
+            reasoning_effort
+            if isinstance(reasoning_effort, str)
+            and reasoning_effort in self._EFFORT_TOKENS
+            else "medium"
+        )
+        start_token, end_token = self._EFFORT_TOKENS[effort]
+        super().__init__(
+            start_token,
+            end_token,
+            force_reasoning=True,
+            stream_reasoning=stream_reasoning,
+            # Common prefix of the singular and plural tool-call open tags.
+            # This also closes reasoning for a malformed turn that omits its
+            # explicit </ifm|think...> token.
+            tool_start_token="<ifm|tool_call",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            reasoning_default="always",
+            force_nonempty_content=force_nonempty_content,
+        )
+        # Catalog only: scheduler-side request validation encodes these, but
+        # the active matcher must use just the delimiter selected above.
+        self.request_selectable_think_end_tokens = tuple(
+            tokens[1] for tokens in self._EFFORT_TOKENS.values()
+        )
+
+
 class KimiK3Detector(BaseReasoningFormatDetector):
     """Detector for the Kimi K3 XTML think channel.
 
@@ -1938,6 +1995,7 @@ class ReasoningParser:
         "ling3": Ling3Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
+        "k2_horizon": K2V3Detector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
@@ -2006,6 +2064,22 @@ class ReasoningParser:
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True
+
+        if model_type.lower() == "k2_horizon":
+            # Template kwargs are the final values passed to Jinja and therefore
+            # take precedence over the convenience fields on API requests.
+            effort = chat_template_kwargs.get("reasoning_effort")
+            if effort is None:
+                effort = getattr(request, "reasoning_effort", None)
+            if effort is None:
+                # The Responses API carries the same value in its standard
+                # nested shape (``reasoning.effort``). Prompt rendering already
+                # mirrors it into a ChatCompletionRequest; parsing must select
+                # the matching IFM delimiter as well.
+                reasoning = getattr(request, "reasoning", None)
+                effort = getattr(reasoning, "effort", None)
+            if effort is not None:
+                kwargs["reasoning_effort"] = effort
 
         if tokenizer is not None:
             sig = inspect.signature(detector_class)

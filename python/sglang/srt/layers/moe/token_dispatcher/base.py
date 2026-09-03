@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 
 
 class _RemovableDispatcherHandle:
-
     next_id = 0  # Global counter for unique IDs
 
     def __init__(self, hooks_dict: OrderedDict):
@@ -56,7 +55,6 @@ class _RemovableDispatcherHandle:
 
 
 class DispatcherBaseHooks:
-
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
 
@@ -70,7 +68,6 @@ class DispatcherBaseHooks:
 
 
 class _PreDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self,
         dispatcher: BaseDispatcher,
@@ -85,7 +82,6 @@ class _PreDispatchHooks(DispatcherBaseHooks):
 
 
 class _PostDispatchHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
     ) -> Optional[DispatchOutput]:
@@ -97,7 +93,6 @@ class _PostDispatchHooks(DispatcherBaseHooks):
 
 
 class _PreCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
     ) -> Optional[CombineInput]:
@@ -109,7 +104,6 @@ class _PreCombineHooks(DispatcherBaseHooks):
 
 
 class _PostCombineHooks(DispatcherBaseHooks):
-
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -124,7 +118,6 @@ class _PostCombineHooks(DispatcherBaseHooks):
 
 
 class DispatchOutputChecker:
-
     @staticmethod
     def format_is_standard(
         dispatch_output: DispatchOutput,
@@ -175,7 +168,6 @@ class DispatchOutputChecker:
 
 
 class DispatchOutputFormat(Enum):
-
     STANDARD = "standard"
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
