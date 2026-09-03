@@ -204,6 +204,19 @@ def _format_calibration_timing(records) -> str:
     )
 
 
+def _probe_total_duration_ns(records, target_units) -> int:
+    """Wall time of the representative full-shape probe (0 without one)."""
+    successful = [record for record in records if record.succeeded]
+    if target_units is not None:
+        at_target = [r for r in successful if r.workload_units() >= target_units]
+        if at_target:
+            successful = at_target
+    if not successful:
+        return 0
+    record = max(successful, key=lambda r: (r.workload_units(), r.total_duration_ms))
+    return max(0, int(record.total_duration_ms * 1_000_000))
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -1470,8 +1483,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             regressions = []
             for report in reports:
-                reference_ns = report.estimated_request_duration_ns
-                measured_ns = report.measured_request_duration_ns
+                reference_ns = report.reference_probe_duration_ns
+                measured_ns = report.probe_duration_ns
                 tolerance_ns = max(
                     MIN_POST_ADJUSTMENT_REGRESSION_NS,
                     int(reference_ns * POST_ADJUSTMENT_REGRESSION_FRACTION),
@@ -1481,9 +1494,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             if regressions:
                 _, regressed = max(regressions, key=lambda item: item[0])
                 cause = (
-                    "post-adjustment calibration regressed request duration "
-                    f"from {regressed.estimated_request_duration_ns / 1e9:.2f}s "
-                    f"to {regressed.measured_request_duration_ns / 1e9:.2f}s"
+                    "post-adjustment calibration regressed the probe's duration "
+                    f"from {regressed.reference_probe_duration_ns / 1e9:.2f}s "
+                    f"to {regressed.probe_duration_ns / 1e9:.2f}s"
                 )
                 if self.is_output_rank:
                     logger.warning("Auto residency: %s; rolling back", cause)
@@ -1994,6 +2007,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         if include_candidates:
             self._auto_residency_repeated_components = repeated_components
+        probe_duration_ns = _probe_total_duration_ns(records, target_units)
+        reference_probe_duration_ns = getattr(
+            self, "_auto_residency_reference_probe_duration_ns", None
+        )
+        if (
+            not warmup_oom
+            and reference_probe_duration_ns is None
+            and probe_duration_ns > 0
+        ):
+            reference_probe_duration_ns = probe_duration_ns
+            self._auto_residency_reference_probe_duration_ns = probe_duration_ns
         reference_request_duration_ns = (
             self._auto_residency_reference_request_duration_ns
         )
@@ -2167,6 +2191,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ),
             estimated_request_duration_ns=estimated_request_duration_ns,
             measured_request_duration_ns=measured_request_duration_ns,
+            probe_duration_ns=probe_duration_ns,
+            reference_probe_duration_ns=reference_probe_duration_ns or 0,
             candidate_latency_savings_ns=candidate_latency_savings_ns,
             candidates=candidates,
             warmup_oom=warmup_oom,
