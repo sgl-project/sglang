@@ -267,6 +267,7 @@ struct LaunchKernel {
   struct KernelConfig {
     bool use_pdl = false;
     std::optional<dim3> cluster_dim = std::nullopt;
+    bool cooperative = false;
   };
 
  public:
@@ -309,6 +310,24 @@ struct LaunchKernel {
     return *this;
   }
 
+  /// \brief Require the whole grid to be co-resident, for `cooperative_groups::this_grid()`.
+  /// \note The caller must size the grid to fit; see `host::runtime::get_blocks_per_sm`.
+  auto enable_cooperative(bool enabled = true) -> LaunchKernel& {
+#ifdef USE_ROCM
+    // Unlike PDL this is a correctness requirement, so silently dropping the
+    // attribute would hang the kernel at its first grid barrier.
+    RuntimeCheck(!enabled, "cooperative launch is not supported on this platform");
+#else
+    if (enabled) {
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeCooperative;
+      attr.val.cooperative = 1;
+      m_config.attrs = m_attrs;
+    }
+#endif
+    return *this;
+  }
+
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
 #ifdef USE_ROCM
     (void)cluster_dim;
@@ -332,6 +351,7 @@ struct LaunchKernel {
   auto config(const KernelConfig& config) -> LaunchKernel& {
     if (config.use_pdl) this->enable_pdl(true);
     if (config.cluster_dim) this->enable_cluster(*config.cluster_dim);
+    if (config.cooperative) this->enable_cooperative(true);
     return *this;
   }
 
@@ -373,7 +393,8 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[2];
+  // One slot per attribute the enable_* methods can set at the same time.
+  cudaLaunchAttribute m_attrs[3];
 };
 
 // The empty-true-branch if/else form keeps a trailing `else` in user code
