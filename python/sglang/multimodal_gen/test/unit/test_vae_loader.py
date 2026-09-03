@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 from safetensors.torch import save_file as safetensors_save_file
 
+from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
+    MiniMaxH3AudioVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -24,8 +27,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentCheckpointUnsupportedError,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
+    _adopt_plain_weight_norm_state,
     _assign_direct_gpu_vae_state,
     _backfill_ltx2_audio_vae_latent_stats,
+    _consume_vae_checkpoint_arch_metadata,
     _direct_gpu_vae_state_slots,
     _match_checkpoint_dtypes,
     _require_native_loader_for_quantized_vae,
@@ -147,6 +152,54 @@ class TestMatchCheckpointDtypes(unittest.TestCase):
         self.assertIs(loaded["extra"], before)
 
 
+class TestPlainWeightNormCheckpoint(unittest.TestCase):
+    def test_adopts_a_folded_weight_without_reconstructing_it(self):
+        module = nn.Sequential(
+            torch.nn.utils.parametrizations.weight_norm(
+                nn.Conv1d(2, 3, kernel_size=3, bias=False)
+            )
+        )
+        expected = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) / 19
+        loaded = {"0.weight": expected}
+
+        self.assertEqual(_adopt_plain_weight_norm_state(module, loaded), 1)
+        module.load_state_dict(loaded, strict=True)
+
+        self.assertEqual(set(module.state_dict()), {"0.weight"})
+        self.assertTrue(torch.equal(module[0].weight, expected))
+
+    def test_keeps_legacy_weight_norm_state_parameterized(self):
+        module = nn.Sequential(
+            torch.nn.utils.parametrizations.weight_norm(
+                nn.Conv1d(2, 3, kernel_size=3, bias=False)
+            )
+        )
+        original_state = module.state_dict()
+        loaded = {
+            "0.weight_g": original_state["0.parametrizations.weight.original0"].clone(),
+            "0.weight_v": original_state["0.parametrizations.weight.original1"].clone(),
+        }
+
+        self.assertEqual(_adopt_plain_weight_norm_state(module, loaded), 0)
+        module.load_state_dict(loaded, strict=True)
+
+        self.assertIn("0.parametrizations.weight.original0", module.state_dict())
+
+    def test_moves_checkpoint_latent_stats_into_arch_config(self):
+        config = MiniMaxH3AudioVAEConfig()
+        loaded = {
+            "latents_mean": torch.arange(32, dtype=torch.float32),
+            "latents_std": torch.arange(1, 33, dtype=torch.float32),
+        }
+
+        consumed = _consume_vae_checkpoint_arch_metadata(loaded, config, {})
+
+        self.assertEqual(consumed, ("latents_mean", "latents_std"))
+        self.assertEqual(config.arch_config.latents_mean, list(range(32)))
+        self.assertEqual(config.arch_config.latents_std, list(range(1, 33)))
+        self.assertEqual(loaded, {})
+
+
 class TestDirectGPUVAEState(unittest.TestCase):
     class _StandardVAE(nn.Module):
         def __init__(self, *_args, **_kwargs):
@@ -169,11 +222,48 @@ class TestDirectGPUVAEState(unittest.TestCase):
                 [str(checkpoint)],
                 component_name="vae",
                 device=torch.device("cpu"),
+                vae_config=QwenImagePipelineConfig().vae_config,
             )
 
         self.assertTrue(torch.equal(vae.proj.weight, expected_weight))
         self.assertTrue(torch.equal(vae.scale, expected_scale))
         self.assertFalse(any(tensor.is_meta for tensor in vae.state_dict().values()))
+
+    def test_direct_load_adopts_folded_weight_norm_and_checkpoint_metadata(self):
+        class _WeightNormVAE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.utils.parametrizations.weight_norm(
+                    nn.Conv1d(2, 3, kernel_size=3, bias=False)
+                )
+
+        expected = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) / 19
+        config = MiniMaxH3AudioVAEConfig()
+        with TemporaryDirectory() as root:
+            checkpoint = pathlib.Path(root) / "model.safetensors"
+            safetensors_save_file(
+                {
+                    "proj.weight": expected,
+                    "latents_mean": torch.arange(32, dtype=torch.float32),
+                    "latents_std": torch.arange(1, 33, dtype=torch.float32),
+                },
+                checkpoint,
+            )
+            with torch.device("meta"):
+                vae = _WeightNormVAE()
+            adaptations = _assign_direct_gpu_vae_state(
+                vae,
+                [str(checkpoint)],
+                component_name="audio_vae",
+                device=torch.device("cpu"),
+                vae_config=config,
+            )
+
+        self.assertEqual(adaptations, (1, ("latents_mean", "latents_std")))
+        self.assertEqual(set(vae.state_dict()), {"proj.weight"})
+        self.assertTrue(torch.equal(vae.proj.weight, expected))
+        self.assertEqual(config.arch_config.latents_mean, list(range(32)))
+        self.assertEqual(config.arch_config.latents_std, list(range(1, 33)))
 
     def test_rejects_nonstandard_state_lifecycle(self):
         class _CustomVAE(self._StandardVAE):
