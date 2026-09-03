@@ -30,6 +30,10 @@ _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
 class AscendKVManager(MooncakeKVManager):
+    # The relay is a CUDA/Triton kernel over an NVLink NCCL group, neither of
+    # which exists here; reject at the gate instead of in the relay kernel.
+    supports_decode_kv_broadcast = False
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
