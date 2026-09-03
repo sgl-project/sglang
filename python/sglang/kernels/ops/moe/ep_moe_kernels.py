@@ -601,7 +601,17 @@ def silu_and_mul_masked_post_quant_fwd(
         num_warps = 1
         NUM_STAGES = 6
     else:
-        groups_total = size_n // quant_group_size
+        # Channel-wise callers pass quant_group_size == size_n, so after the
+        # next_power_of_2() above, size_n // quant_group_size is 0 for every
+        # model whose moe_intermediate_size is not a power of two (e.g. 1536).
+        # `0 % gpb == 0` then holds for any gpb, the loop never shrinks it, and
+        # BLOCK_N comes out 4x larger than needed. That quadruples shared
+        # memory -- the gemm1_alpha branch keeps gate and up live in fp32 and
+        # then does a 2D reshape/reduce, so 8192-wide blocks ask for ~320KB
+        # against a 256KB budget and Triton dies with OutOfResources -- and it
+        # makes N_GROUPS > 1, which stores several scales per token into the
+        # (E, T, 1) tensor that channel-wise callers allocate.
+        groups_total = max(size_n // quant_group_size, 1)
         gpb = 4
         while gpb > 1:
             block_n = quant_group_size * gpb
@@ -622,6 +632,22 @@ def silu_and_mul_masked_post_quant_fwd(
     else:
         hidden_dim_split_block_num = 1
     assert BLOCK_N % quant_group_size == 0
+
+    if not use_mxfp4:
+        # scale_base walks the last scale dim by hidden_block * N_GROUPS, and
+        # the GEMM1_ALPHA branch stores N_GROUPS scales per block (the plain
+        # silu branch stores one). So the caller's scale tensor has to hold
+        # hidden_dim_split_block_num * N_GROUPS of them, otherwise the writes
+        # spill into the neighbouring tokens' scales -- silent corruption that
+        # only shows up as degraded output. mxfp4 uses its own [E, S//2, T]
+        # layout and offsets by offs_scale_pairs instead, so it is excluded.
+        n_groups = BLOCK_N // quant_group_size
+        scale_slots = output_scale.shape[-1]
+        assert hidden_dim_split_block_num * n_groups <= scale_slots, (
+            f"output_scale too small: the kernel writes "
+            f"{hidden_dim_split_block_num} hidden block(s) x {n_groups} "
+            f"scale(s) per token, but output_scale.shape[-1] == {scale_slots}"
+        )
 
     grid = (
         hidden_dim_split_block_num,
