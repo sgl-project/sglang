@@ -23,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -449,6 +450,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.dsa_topk_backend = DSATopKBackend.resolve(model_runner)
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
