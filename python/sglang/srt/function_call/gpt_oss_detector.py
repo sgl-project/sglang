@@ -48,7 +48,7 @@ class GptOssDetector(BaseFormatDetector):
         # Parse with HarmonyParser
         events = self.harmony_parser.parse(text)
         # Flush buffer for complete parsing
-        events += self.harmony_parser.parse("")
+        events += self.harmony_parser.finish()
 
         tool_indices = self._get_tool_indices(tools)
         calls = []
@@ -72,6 +72,33 @@ class GptOssDetector(BaseFormatDetector):
 
         normal_text = " ".join(normal_parts).strip()
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush HarmonyParser state when the output stream ends."""
+        events = self.harmony_parser.finish()
+        if not events:
+            self._buffer = ""
+            return StreamingParseResult(normal_text="", calls=[])
+
+        tool_indices = getattr(self, "_tool_indices", self._get_tool_indices(tools))
+        calls = []
+        normal_parts = []
+        tool_index = max(self.current_tool_id, 0)
+        for event in events:
+            if event.event_type == "tool_call":
+                tool_call = self._extract_tool_call_from_event(
+                    event.raw_text if event.raw_text else event.content,
+                    tool_indices,
+                    tool_index,
+                )
+                if tool_call:
+                    calls.append(tool_call)
+                    tool_index += 1
+            elif event.event_type == "normal":
+                normal_parts.append(event.content)
+
+        self._buffer = ""
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]

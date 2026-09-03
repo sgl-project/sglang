@@ -309,6 +309,38 @@ class TestHarmonyParser(CustomTestCase):
         self.assertIsInstance(self.parser.strategy, TextStrategy)
         self.assertEqual(len(events2), 1)
 
+    def test_finish_flushes_incomplete_final_without_message(self):
+        """Flush a final response whose channel omits the message marker."""
+        answer = "<|start|>assistant<|channel|>final The answer is 42."
+
+        events = self.parser.parse(answer)
+        events.extend(self.parser.finish())
+
+        self.assertEqual(
+            "".join(event.content for event in events if event.event_type == "normal"),
+            "The answer is 42.",
+        )
+        self.assertEqual(self.parser.finish(), [])
+
+    def test_finish_flushes_plain_text(self):
+        """Flush plain text held before a parser strategy can be selected."""
+        self.assertEqual(self.parser.parse("plain response"), [])
+
+        events = self.parser.finish()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].event_type, "normal")
+        self.assertEqual(events[0].content, "plain response")
+
+    def test_empty_parse_flushes_buffer(self):
+        """Keep parse(\"\") compatible with existing end-of-stream callers."""
+        self.parser.parse("<|start|>assistant<|channel|>final The answer")
+
+        events = self.parser.parse("")
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].content, "The answer")
+
     def test_streaming_commentary_filler(self):
         """Test that 'commentary' filler is filtered in streaming case."""
         # Test when commentary arrives as a separate chunk after <|call|>
