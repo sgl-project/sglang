@@ -3,13 +3,13 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
@@ -62,7 +62,7 @@ class TestGLM51HiSparseEvalAMD(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process"):
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
