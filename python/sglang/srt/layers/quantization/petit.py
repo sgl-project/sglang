@@ -72,16 +72,36 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "PetitNvFp4Config":
-        quant_config = cls.get_from_keys(config, ["quantization"])
+        # Two checkpoint shapes reach here: hf_quant_config.json nests the
+        # metadata under "quantization", while a config.json
+        # "quantization_config" block is already flat. The alternative key
+        # spellings below mirror the ModelOpt parsing in
+        # ModelConfig._parse_modelopt_quant_config.
+        quant_config = config.get("quantization", config)
         quant_method = quant_config["quant_algo"]
         group_size = quant_config.get("group_size", None)
+        if group_size is None:
+            config_groups = quant_config.get("config_groups", {})
+            first_group = next(iter(config_groups.values()), {})
+            group_size = first_group.get("weights", {}).get("group_size")
+        if group_size is None and quant_method == "NVFP4":
+            group_size = 16
         verify_petit_nvfp4_supported(quant_method, group_size)
 
         is_checkpoint_nvfp4_serialized = "NVFP4" in quant_method
-        kv_cache_quant_algo = quant_config["kv_cache_quant_algo"]
+        kv_cache_quant_algo = quant_config.get("kv_cache_quant_algo")
+        kv_cache_scheme = quant_config.get("kv_cache_scheme")
+        if kv_cache_quant_algo is None and isinstance(kv_cache_scheme, dict):
+            if (
+                kv_cache_scheme.get("type") == "float"
+                and kv_cache_scheme.get("num_bits") == 8
+            ):
+                kv_cache_quant_algo = "FP8"
         if not kv_cache_quant_algo:
             kv_cache_quant_algo = "auto"
-        exclude_modules = quant_config.get("exclude_modules", None)
+        exclude_modules = quant_config.get(
+            "exclude_modules", quant_config.get("ignore")
+        )
         if not (group_size and kv_cache_quant_algo and (exclude_modules is not None)):
             logger.warning(
                 f"group_size: {group_size},"
@@ -109,8 +129,18 @@ class PetitNvFp4Config(QuantizationConfig):
 
     @classmethod
     def is_petit_nvfp4_compatible(cls, quant_config: Dict[str, Any]) -> bool:
+        if not _is_hip:
+            return False
         quant_method = quant_config.get("quant_method", "").lower()
-        return _is_hip and quant_method == "modelopt"
+        if quant_method == "modelopt":
+            return True
+        # Newer ModelOpt exports name the method after the format instead of the
+        # producer. Those reach ROCm as "modelopt_fp4"; the dense NVFP4 ones are
+        # served here because modelopt_fp4 has no ROCm kernels.
+        return (
+            quant_method == "modelopt_fp4"
+            and (quant_config.get("quant_algo", "") or "").upper() == "NVFP4"
+        )
 
     def is_layer_excluded(self, prefix: str, exclude_modules: list):
         for pattern in exclude_modules:
@@ -122,12 +152,27 @@ class PetitNvFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
                 prefix, self.exclude_modules
             ):
                 return UnquantizedLinearMethod()
             return PetitNvFp4LinearMethod(self)
+        if isinstance(layer, FusedMoE) and not (
+            is_layer_skipped(prefix, self.exclude_modules)
+            or self.is_layer_excluded(prefix, self.exclude_modules)
+        ):
+            # Returning None here would hand the packed FP4 experts to the
+            # unquantized MoE method, which fails much later with an opaque
+            # shape mismatch. This path only covers dense linear layers.
+            raise NotImplementedError(
+                "The ROCm NVFP4 (petit_nvfp4) backend does not support quantized "
+                f"MoE layers, but '{prefix}' is one. Only dense linear layers are "
+                "supported; exclude the experts from the checkpoint or use a "
+                "different quantization method."
+            )
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -252,4 +297,5 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
             bias=bias,
+            backend=layer.nvfp4_backend,
         )

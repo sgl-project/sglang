@@ -171,9 +171,9 @@ The following table summarizes quantization method support across NVIDIA and AMD
     <tr>
       <td><code>petit_nvfp4</code></td>
       <td>No</td>
-      <td>Yes (MI250/MI300X/MI325X)</td>
+      <td>Yes (MI250/MI300X/MI325X/R9700)</td>
       <td>No</td>
-      <td>Enables NVFP4 on ROCm via <a href="https://github.com/causalflow-ai/petit-kernel">Petit</a>; use <code>modelopt_fp4</code> on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See <a href="https://lmsys.org/blog/2025-09-21-petit-amdgpu/">LMSYS blog</a> and <a href="https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html">AMD ROCm blog</a>.</td>
+      <td>Enables dense W4A16 NVFP4 on ROCm; auto-selected when loading ModelOpt NVFP4 checkpoints on AMD. MI250/MI300X/MI325X use <a href="https://github.com/causalflow-ai/petit-kernel">Petit</a>; RDNA4 (<code>gfx1201</code>, Radeon AI PRO R9700) uses the in-tree HIP/Triton backend and does not require Petit. Use <code>modelopt_fp4</code> on NVIDIA Blackwell. See <a href="https://lmsys.org/blog/2025-09-21-petit-amdgpu/">LMSYS blog</a> and <a href="https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html">AMD ROCm blog</a>.</td>
     </tr>
     <tr>
       <td><code>bitsandbytes</code></td>

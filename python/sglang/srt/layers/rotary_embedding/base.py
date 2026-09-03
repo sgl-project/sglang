@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx1201_supported,
     is_hip,
     is_mps,
     is_musa,
@@ -75,6 +76,17 @@ if _is_xpu:
     from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
+def _should_force_native_rope() -> bool:
+    # gfx1201: released ROCm sgl-kernel wheels are not built for that arch, so
+    # the fused RoPE entry point is unavailable there. Queried lazily -- reading
+    # device properties at import time would initialise a HIP context in every
+    # process that merely imports this module.
+    return is_gfx1201_supported() or (
+        publish_role() is not None
+        and get_exec().deterministic.rl_on_policy_target is not None
+    )
+
+
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
@@ -94,10 +106,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-        self._force_native = (
-            publish_role() is not None
-            and get_exec().deterministic.rl_on_policy_target is not None
-        )
+        self._force_native = _should_force_native_rope()
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.

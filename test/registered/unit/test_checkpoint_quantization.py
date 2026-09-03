@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest import mock
+
+import torch
 
 from transformers import PretrainedConfig
 
@@ -33,17 +36,20 @@ class TestResolveCheckpointQuantSpec(CustomTestCase):
                 self.assertEqual(canonicalize_modelopt_quant_algo(quant_algo), expected)
 
     def test_srt_modelopt_override_uses_the_exact_algorithm_allowlist(self):
-        self.assertEqual(
-            QuantizationConfig._modelopt_override_quantization_method(
-                {"quant_algo": "NVFP4"}, "modelopt"
-            ),
-            "modelopt_fp4",
-        )
-        self.assertIsNone(
-            QuantizationConfig._modelopt_override_quantization_method(
-                {"quant_algo": "NVFP4_FAKE"}, "modelopt"
+        # Pinned to a non-HIP build: on ROCm the ModelOpt configs decline dense
+        # NVFP4 so that PetitNvFp4Config can claim it.
+        with mock.patch.object(torch.version, "hip", None):
+            self.assertEqual(
+                QuantizationConfig._modelopt_override_quantization_method(
+                    {"quant_algo": "NVFP4"}, "modelopt"
+                ),
+                "modelopt_fp4",
             )
-        )
+            self.assertIsNone(
+                QuantizationConfig._modelopt_override_quantization_method(
+                    {"quant_algo": "NVFP4_FAKE"}, "modelopt"
+                )
+            )
 
     def test_top_level_quantization_config(self):
         config = {

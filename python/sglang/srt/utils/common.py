@@ -1041,6 +1041,23 @@ def is_gfx95_supported():
         return False
 
 
+@lru_cache(maxsize=None)
+def is_gfx1201_supported(device: Optional[int] = None) -> bool:
+    """Whether `device` is an AMD gfx1201 GPU (RDNA4 -- Radeon AI PRO R9700).
+
+    `device` defaults to the current one. False on every non-HIP build, so
+    callers do not need their own is_hip(). Matched exactly: the RDNA4 paths
+    keyed off this are validated on gfx1201 only, not on gfx1200 or gfx11xx.
+    """
+    if not torch.version.hip or not torch.cuda.is_available():
+        return False
+    if device is None:
+        device = torch.cuda.current_device()
+    gcn_arch = getattr(torch.cuda.get_device_properties(device), "gcnArchName", "")
+    # gcnArchName carries optional feature suffixes, e.g. "gfx1201:sramecc+:xnack-".
+    return gcn_arch.split(":", 1)[0].lower() == "gfx1201"
+
+
 @lru_cache(maxsize=1)
 def is_gfx942_supported():
     """

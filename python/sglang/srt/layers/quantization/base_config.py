@@ -212,6 +212,14 @@ class QuantizationConfig(ABC):
         # Check if this is a ModelOpt config
         quant_algo = hf_quant_config.get("quant_algo", "").upper()
 
+        # ROCm has no modelopt_fp4 kernels, so the ModelOpt configs decline a
+        # dense NVFP4 checkpoint there and let PetitNvFp4Config -- which sits
+        # later in QUANTIZATION_METHODS -- claim it. Only the exact "NVFP4"
+        # algorithm is declined; the AWQ/W4A16 variants Petit cannot serve keep
+        # resolving to modelopt_fp4 and its explicit "unsupported on ROCm" error.
+        if quant_algo == "NVFP4" and torch.version.hip is not None:
+            return None
+
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
             canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
