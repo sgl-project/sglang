@@ -198,8 +198,8 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             "sglang.srt.speculative.spec_utils.mambaish_config",
             return_value={"some": "config"},
         ), patch(
-            "sglang.srt.speculative.spec_utils.get_exec",
-            return_value=MagicMock(mamba=MagicMock(mamba_track_interval=256)),
+            "sglang.srt.speculative.spec_utils.mamba_track_grid",
+            return_value=256,
         ):
             commit_mamba_states_after_verify(
                 target_worker,

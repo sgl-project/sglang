@@ -24,6 +24,14 @@ class MiniMaxH3AudioVAEConfig(VAEConfig):
     load_encoder: bool = True
     load_decoder: bool = True
 
+    def update_model_arch(self, source_model_dict: dict) -> None:
+        # Native-Diffusers AutoencoderKLMiniMaxH3Audio config field name.
+        aliases = {"sampling_rate": "sample_rate"}
+        model_dict = {
+            aliases.get(key, key): value for key, value in source_model_dict.items()
+        }
+        super().update_model_arch(model_dict)
+
     def post_init(self) -> None:
         validate_minimax_h3_vae_latent_stats(
             self.arch_config,

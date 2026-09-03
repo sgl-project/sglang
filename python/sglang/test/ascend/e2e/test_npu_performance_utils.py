@@ -26,6 +26,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     NAMESPACE,
     SERVICE_PORT,
     check_role,
+    kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
@@ -178,8 +179,8 @@ MINIMAX_M2_5_EAGLE3_MODEL_PATH = (
 QWEN3_5_397B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
 )
-DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH = (
-    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp"
+DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 )
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
@@ -188,6 +189,8 @@ KIMI_K2_6_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/Kimi-K2
 KIMI_K2_6_EAGLE3_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/lightseekorg/kimi-k2.6-eagle3"
 )
+KIMI_K3_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/sgl-npu/Kimi-K3-W4A8"
+KIMI_K3_DSPARK_MODEL_PATH = "/root/.cache/modelscope/hub/models/RadixArk/Kimi-K3-DSpark"
 GLM_4_6V_FLASH_MODEL_PATH = "/root/.cache/modelscope/hub/models/ZhipuAI/GLM-4.6V-Flash"
 QWEN3_VL_8B_THINKING_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3-VL-8B-Thinking"
@@ -205,6 +208,9 @@ MAX_SERVER_KEEP_ALIVE_TIME = 3600
 
 # Timeouts and delays
 SERVER_INITIALIZATION_DELAY = 120
+BENCHMARK_STDOUT_DRAIN_GRACE = 10  # Grace seconds to wait for the direct child to exit after it drains stdout / exits
+BENCHMARK_STDOUT_IDLE_TIMEOUT = 300  # Idle timeout: no output for this long means the benchmark is stuck, then force-kill
+BENCHMARK_WATCHDOG_POLL_INTERVAL = 30  # Watchdog polling interval (seconds)
 
 # Test parameters
 PROMPTS_MULTIPLIER = 4
@@ -474,6 +480,9 @@ def run_bench_serving(
     # Run benchmark command and capture output
     metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
 
+    # Launch the benchmark in its own session/process group so a dead server
+    # cannot wedge the run: on timeout we nuke the whole group (including any
+    # re-parented descendants) instead of waiting forever on its stdout.
     process = subprocess.Popen(
         cmd_args,
         stdout=subprocess.PIPE,
@@ -481,11 +490,59 @@ def run_bench_serving(
         text=True,
         bufsize=1,
         env=env,
+        start_new_session=True,
     )
+
+    reader_done = threading.Event()
+    # Timestamp of the last output line; the watchdog reads it to detect a
+    # silent/stuck benchmark.
+    last_activity = time.time()
+
+    def _kill_on_timeout():
+        while True:
+            # Direct child has exited, but stdout may still be held open by a
+            # grandchild; wait for the reader to drain within the grace period,
+            # otherwise force-kill the whole process group.
+            if process.poll() is not None:
+                if not reader_done.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE):
+                    logger.error(
+                        f"Benchmark stdout still open after process exit, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # stdout has drained, but the direct child may still be alive:
+            # give it a bounded time to exit, otherwise nuke the group.
+            if reader_done.is_set():
+                try:
+                    process.wait(timeout=BENCHMARK_STDOUT_DRAIN_GRACE)
+                except subprocess.TimeoutExpired:
+                    logger.error(
+                        f"Benchmark {process.pid} still alive after stdout EOF, "
+                        f"killing process group {process.pid}"
+                    )
+                    kill_process_group(process)
+                return
+            # No output for too long while still alive -> likely hung.
+            idle = time.time() - last_activity
+            if idle > BENCHMARK_STDOUT_IDLE_TIMEOUT:
+                logger.error(
+                    f"Benchmark produced no output for {idle:.0f}s "
+                    f"(> {BENCHMARK_STDOUT_IDLE_TIMEOUT}s), "
+                    f"killing process group {process.pid}"
+                )
+                kill_process_group(process)
+                return
+            time.sleep(BENCHMARK_WATCHDOG_POLL_INTERVAL)
+
+    watchdog = threading.Thread(target=_kill_on_timeout, daemon=True)
+    watchdog.start()
+
     try:
         # Read output line by line
         with open(result_file, "a", encoding="utf-8") as f:
             for line in process.stdout:
+                last_activity = time.time()
                 if line.strip():
                     print(line, end="")
                 f.write(line)
@@ -508,6 +565,7 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+        reader_done.set()
         process.wait()
         if process.returncode != 0:
             logger.error(
@@ -516,6 +574,7 @@ def run_bench_serving(
     except Exception as e:
         logger.error(f"Error running benchmark: {e}")
     finally:
+        reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
 

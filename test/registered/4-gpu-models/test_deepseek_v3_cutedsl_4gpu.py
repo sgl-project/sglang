@@ -93,10 +93,6 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.92)
 
 
-@unittest.skipIf(
-    True,
-    "Skipping since the current DeepEP doesn't accept the --enable-single-batch-overlap flag. To be fixed after https://github.com/sgl-project/DeepEP/pull/10",
-)
 class TestDummyWithSBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
