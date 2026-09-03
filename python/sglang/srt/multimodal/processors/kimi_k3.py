@@ -347,8 +347,6 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     x, self._transparent_bg_config
                 ),
             )
-            # Bounded preprocessing returns one tensor per image; this path has
-            # no feature sink, so pack them for the grid/length check below.
             pixel_values = torch.cat(pixel_values) if pixel_values else pixel_values
         else:
             # The checkpoint CPU processor couples prompt composition with media

@@ -549,8 +549,6 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
     def fake_preprocess(images, resize_configs, *args, **kwargs):
         ids = [int(image[0, 0, 0]) for image in images]
         calls.append(ids)
-        # _gpu_preprocess_images now returns per-image tensors (bounded
-        # preprocessing); the model materializes them into one buffer.
         pixel_values = [
             torch.full(size=(patch_counts[i], 2), fill_value=float(i)) for i in ids
         ]
