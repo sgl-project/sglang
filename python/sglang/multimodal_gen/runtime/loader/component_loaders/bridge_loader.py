@@ -7,10 +7,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PlainStateDictComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
-from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
-    filter_duplicate_precision_variant_safetensors,
-)
+from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     RESIDENT,
@@ -66,9 +63,6 @@ class BridgeLoader(PlainStateDictComponentLoader):
 
         # Find all safetensors files
         safetensors_list = _list_safetensors_files(component_weights_path)
-        safetensors_list = filter_duplicate_precision_variant_safetensors(
-            safetensors_list
-        )
         if not safetensors_list:
             raise ValueError(f"No safetensors files found in {component_weights_path}")
 

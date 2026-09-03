@@ -14,7 +14,6 @@ from functools import partial
 from typing import Callable, Optional
 
 import torch
-from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from safetensors import safe_open
 from torch import nn
 
@@ -37,13 +36,7 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
 )
-from sglang.multimodal_gen.runtime.loader.utils import (
-    _list_safetensors_files,
-    filter_duplicate_precision_variant_safetensors,
-)
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
-)
+from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     ComponentResidencyError,
@@ -645,17 +638,7 @@ def resolve_transformer_checkpoint_files(
 
     safetensors_list = _list_safetensors_files(component_model_path)
     if safetensors_list:
-        # Preserve legacy cleanup for the base component. Explicit overrides
-        # are resolved above, where an index is already the final authority.
-        safetensors_list = filter_duplicate_safetensors_files(
-            safetensors_list,
-            os.path.dirname(safetensors_list[0]),
-            SAFE_WEIGHTS_INDEX_NAME,
-        )
         safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
-        safetensors_list = filter_duplicate_precision_variant_safetensors(
-            safetensors_list
-        )
 
     if not safetensors_list:
         raise ValueError(f"no safetensors files found in {component_model_path}")

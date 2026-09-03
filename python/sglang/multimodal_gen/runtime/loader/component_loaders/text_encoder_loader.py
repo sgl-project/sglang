@@ -67,14 +67,13 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     remap_gguf_tensor_meta,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     checkpoint_bytes,
-    filter_duplicate_precision_variant_safetensors,
     get_param_names_mapping,
     set_default_torch_dtype,
     skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -585,23 +584,20 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
-            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if pattern == "*.safetensors":
+                hf_weights_files = _list_safetensors_files(
+                    hf_folder,
+                    index_file=index_file,
+                    key_filter=key_filter,
+                )
+            else:
+                hf_weights_files = glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
                 if pattern == "*.safetensors":
                     use_safetensors = True
                 break
 
-        if use_safetensors:
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                hf_folder,
-                index_file,
-                key_filter=key_filter,
-            )
-            hf_weights_files = filter_duplicate_precision_variant_safetensors(
-                hf_weights_files
-            )
-        else:
+        if not use_safetensors:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
