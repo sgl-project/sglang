@@ -80,9 +80,10 @@ def _inputs(seq_lens, head_num, page_size, max_kv_splits, seed):
         )
     else:
         n_pages = (n_slots + page_size - 1) // page_size
+        # Build by page, then expose the dense 3-D per-layer view used by decode.
         pool = torch.randn(
             n_pages, page_size, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen
-        )
+        ).view(n_pages * page_size, 1, LK)
         n_slots = n_pages * page_size
 
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=dev)
