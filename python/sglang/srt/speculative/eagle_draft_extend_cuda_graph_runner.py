@@ -139,12 +139,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
-        self.alloc_num_token = self.max_bs * max(
-            self.captured_req_width,
-            resolve_num_tokens_per_req(
-                phase="draft_extend",
-                num_draft_tokens=max_speculative_num_draft_tokens(),
-            ),
+        self.alloc_num_token = self.max_bs * resolve_num_tokens_per_req(
+            phase="draft_extend", num_draft_tokens=max_speculative_num_draft_tokens()
         )
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
