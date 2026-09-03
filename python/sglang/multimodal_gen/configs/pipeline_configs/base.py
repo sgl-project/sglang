@@ -204,6 +204,9 @@ class PipelineConfig:
     # False when changing component placement after a calibration request is
     # known to alter the pipeline's numerical path.
     supports_auto_residency: bool = True
+    # Fewest denoising steps a request may ask for. Calibration probes that
+    # shorten a request (the resident-only validation pass) never go below it.
+    minimum_inference_steps: int = 1
     # Components that cannot fall back to a native Transformers/Diffusers
     # implementation because their pipeline requires SGLang-specific behavior.
     native_only_components: tuple[str, ...] = ()

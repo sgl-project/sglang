@@ -499,7 +499,18 @@ def estimate_layerwise_layer_uses(
                                 target_num_inference_steps=(target_num_inference_steps),
                             )
                             stage_count = per_layer_counts[layer_index]
-                            if stage_count <= 1:
+                            # One call in a stage that itself ran once says
+                            # nothing about per-iteration use; a repeated
+                            # stage's layers are per-iteration until a probe
+                            # with more iterations shows otherwise. (A 2-step
+                            # probe of a pipeline that runs steps-1 iterations
+                            # measured a 50-layer DiT as one-shot.)
+                            per_iteration = stage_count > 1 or (
+                                stage_count == 1
+                                and measured_iterations <= 1
+                                and stage_name in repeated_stages
+                            )
+                            if not per_iteration:
                                 scaled += stage_count
                             else:
                                 scaled += (
@@ -515,14 +526,31 @@ def estimate_layerwise_layer_uses(
                             stage_name in repeated_stages
                             for stage_name in component_stages.get(component_name, ())
                         )
+                        measured_iterations, target_iterations = (
+                            source_steps,
+                            target_num_inference_steps,
+                        )
+                        for stage_name in component_stages.get(component_name, ()):
+                            if stage_name in record.stage_iterations:
+                                measured_iterations, target_iterations = (
+                                    _stage_iterations(
+                                        record,
+                                        stage_name,
+                                        repeated_stages=repeated_stages,
+                                        target_num_inference_steps=(
+                                            target_num_inference_steps
+                                        ),
+                                    )
+                                )
+                                break
                         if (
                             component_is_repeated
-                            and count > 1
-                            and target_num_inference_steps > source_steps
+                            and (count > 1 or (count == 1 and measured_iterations <= 1))
+                            and target_iterations > measured_iterations
                         ):
                             scaled = (
-                                count * target_num_inference_steps + source_steps - 1
-                            ) // source_steps
+                                count * target_iterations + measured_iterations - 1
+                            ) // measured_iterations
                     target[layer_index] = max(target[layer_index], scaled)
     return {
         component_name: {

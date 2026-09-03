@@ -571,10 +571,12 @@ def build_warmup_reqs(
         if warmup_resolutions is None
         else None
     )
+    # Explicit --warmup-resolutions choose the probe's shape, not whether the
+    # planner gets calibrated: the step floor and the stage timers stay on.
+    # Without them a 2-step warmup ran a single DiT iteration on a pipeline
+    # that denoises steps-1 times, and every layer measured as one-shot.
     collect_auto_residency_metrics = (
-        warmup_resolutions is None
-        and server_based_warmup
-        and auto_residency_args_skip_reason(server_args) is None
+        server_based_warmup and auto_residency_args_skip_reason(server_args) is None
     )
     if collect_auto_residency_metrics and sampling_defaults.num_inference_steps:
         warmup_steps = min(
