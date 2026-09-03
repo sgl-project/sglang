@@ -70,7 +70,5 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         ):
             overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-            logger.info(
-                "Use flashinfer_mxfp4 as MoE runner backend for " f"{model_arch}."
-            )
+            logger.info(f"Use flashinfer_mxfp4 as MoE runner backend for {model_arch}.")
     return overrides

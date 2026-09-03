@@ -51,7 +51,6 @@ def triton_attention_benchmark(extra_args=None, mem_fraction_static="0.84"):
 
 
 class TestTritonAttentionBackend(CustomTestCase):
-
     @triton_attention_benchmark(
         [
             "--json-model-override-args",

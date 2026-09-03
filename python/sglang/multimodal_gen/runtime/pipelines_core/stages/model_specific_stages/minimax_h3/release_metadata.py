@@ -63,7 +63,7 @@ class MiniMaxH3ReleaseMetadata:
         partition = raw.get("partition")
         if partition not in {"fl2va", "ref2va"}:
             raise ValueError(
-                "model_index.json._minimax_h3.partition must be one of " "fl2va, ref2va"
+                "model_index.json._minimax_h3.partition must be one of fl2va, ref2va"
             )
         tasks = _string_list(raw.get("tasks"), "model_index.json._minimax_h3.tasks")
         aliases = raw.get("task_aliases", {})

@@ -67,7 +67,6 @@ def list_files(
 
 
 class S3Connector(BaseFileConnector):
-
     def __init__(self, url: str) -> None:
         import boto3
 
