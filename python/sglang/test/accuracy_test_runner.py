@@ -189,11 +189,11 @@ def run_accuracy_test(
     """
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running ACCURACY test for {model.model_path}")
     print(f"  Dataset: {params.dataset}")
     print(f"  Baseline: {params.baseline_accuracy}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     success, error, metrics = _run_simple_eval(
         model=model,

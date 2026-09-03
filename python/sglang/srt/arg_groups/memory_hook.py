@@ -177,9 +177,9 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             )
             decode_cuda_graph_config.bs = generate_cpu_graph_batch_sizes(server_args)
 
-        assert (
-            cfg.torch_compile_max_bs > 0
-        ), "cuda_graph_config[decode].bs should contain positive batch sizes"
+        assert cfg.torch_compile_max_bs > 0, (
+            "cuda_graph_config[decode].bs should contain positive batch sizes"
+        )
         decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
     if prefill_cuda_graph_config.max_bs is None:

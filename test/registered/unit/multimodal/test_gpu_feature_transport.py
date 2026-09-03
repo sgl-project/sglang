@@ -1,7 +1,10 @@
+import asyncio
+import concurrent.futures
+import threading
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import torch
 
@@ -214,6 +217,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport = CudaVmmFeatureTransport(SimpleNamespace(), None)
 
         self.assertEqual(transport.prepare_for_dispatch([None]), [])
+        self.assertEqual(asyncio.run(transport.prepare_for_dispatch_async([None])), [])
         transport.cancel_for_dispatch([])
         transport.shutdown()
         self.assertIsNone(transport.pool)
@@ -243,6 +247,28 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool.wrap_tensors.return_value = proxies
         items = [
             MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        transport.wrap_items(items)
+
+        transport.pool.wrap_tensors.assert_called_once_with(features)
+        transport.pool.wrap_tensor.assert_not_called()
+        self.assertEqual([item.feature for item in items], proxies)
+
+    def test_video_clip_features_are_packed_per_request(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmFeatureTransport,
+        )
+
+        transport = object.__new__(CudaVmmFeatureTransport)
+        transport.pool = MagicMock()
+        features = [torch.arange(4), torch.arange(4, 8)]
+        proxies = [object(), object()]
+        transport.pool.wrap_tensors.return_value = proxies
+        items = [
+            MultimodalDataItem(modality=Modality.VIDEO, feature=feature)
             for feature in features
         ]
 
@@ -351,7 +377,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
         manager = object.__new__(TokenizerManager)
         transport = MagicMock()
-        transport.prepare_for_dispatch.return_value = []
+        transport.prepare_for_dispatch_async = AsyncMock(return_value=[])
         manager.cuda_vmm_feature_transport = transport
         manager._dispatch_to_scheduler = MagicMock()
         tokenized_obj = SimpleNamespace(
@@ -362,10 +388,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         with patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj):
-            manager._send_one_request(tokenized_obj)
+            asyncio.run(manager._send_one_request(tokenized_obj))
 
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
-        transport.prepare_for_dispatch.assert_called_once_with((None,))
+        transport.prepare_for_dispatch_async.assert_awaited_once_with((None,))
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_failed_dispatch_cancels_published_items(self):
@@ -388,16 +414,16 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             time_stats=MagicMock(),
             wrap_pickle_fields=MagicMock(),
         )
-        transport.prepare_for_dispatch.return_value = items
+        transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "send failed"),
         ):
-            manager._send_one_request(tokenized_obj)
+            asyncio.run(manager._send_one_request(tokenized_obj))
 
-        transport.prepare_for_dispatch.assert_called_once_with(
+        transport.prepare_for_dispatch_async.assert_awaited_once_with(
             (tokenized_obj.mm_inputs,)
         )
         transport.cancel_for_dispatch.assert_called_once_with(items)
@@ -424,17 +450,157 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             time_stats=time_stats,
             wrap_pickle_fields=MagicMock(),
         )
-        transport.prepare_for_dispatch.return_value = items
+        transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
             self.assertRaisesRegex(RuntimeError, "bookkeeping failed"),
         ):
-            manager._send_one_request(tokenized_obj)
+            asyncio.run(manager._send_one_request(tokenized_obj))
 
         manager._dispatch_to_scheduler.assert_called_once_with(tokenized_obj)
         transport.cancel_for_dispatch.assert_not_called()
+
+    def test_async_publication_keeps_event_loop_responsive(self):
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmFeatureTransport,
+        )
+
+        transport = object.__new__(CudaVmmFeatureTransport)
+        transport.pool = object()
+        transport._publisher_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1
+        )
+        started = threading.Event()
+        event_loop_responsive = threading.Event()
+        release = threading.Event()
+        prepared = [object()]
+
+        def block_publication(_):
+            started.set()
+            release.wait()
+            return prepared
+
+        def unblock_if_event_loop_stalls():
+            started.wait()
+            if not event_loop_responsive.wait(timeout=0.5):
+                release.set()
+
+        transport.prepare_for_dispatch = MagicMock(side_effect=block_publication)
+        mm_inputs = SimpleNamespace(mm_items=[object()])
+
+        async def run():
+            watchdog = threading.Thread(target=unblock_if_event_loop_stalls)
+            watchdog.start()
+            try:
+                task = asyncio.create_task(
+                    transport.prepare_for_dispatch_async([mm_inputs])
+                )
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                event_loop_responsive.set()
+                self.assertFalse(task.done())
+                release.set()
+                self.assertEqual(await task, prepared)
+            finally:
+                started.set()
+                event_loop_responsive.set()
+                release.set()
+                watchdog.join()
+
+        try:
+            asyncio.run(run())
+        finally:
+            transport._publisher_executor.shutdown(wait=True)
+
+    def test_text_only_publication_bypasses_publisher_executor(self):
+        from sglang.srt.utils.cuda_vmm_transport_utils import (
+            CudaVmmFeatureTransport,
+        )
+
+        transport = object.__new__(CudaVmmFeatureTransport)
+        transport.pool = object()
+        transport._publisher_executor = MagicMock()
+
+        result = asyncio.run(
+            transport.prepare_for_dispatch_async([None, SimpleNamespace(mm_items=[])])
+        )
+
+        self.assertEqual(result, [])
+        transport._publisher_executor.submit.assert_not_called()
+
+    def test_pageable_copy_source_is_pinned(self):
+        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
+
+        source = torch.arange(4)
+        pinned = torch.arange(4)
+        with patch.object(
+            torch.Tensor, "pin_memory", autospec=True, return_value=pinned
+        ) as pin_memory:
+            result = vmm._prepare_pinned_copy_source(source)
+
+        self.assertIs(result, pinned)
+        pin_memory.assert_called_once_with()
+
+    def test_packed_cpu_sources_use_one_pinned_staging_buffer(self):
+        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
+
+        sources = [torch.arange(4, dtype=torch.int32), torch.arange(2)]
+        layouts, packed_data_nbytes = vmm._build_packed_tensor_layout(sources)
+        staging = torch.empty(packed_data_nbytes, dtype=torch.uint8)
+
+        with patch.object(vmm.torch, "empty", return_value=staging) as empty:
+            result = vmm._pack_pinned_copy_sources(sources, layouts, packed_data_nbytes)
+
+        self.assertIs(result, staging)
+        empty.assert_called_once_with(
+            packed_data_nbytes,
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        for source, layout in zip(sources, layouts, strict=True):
+            actual = staging[
+                layout.relative_offset : layout.relative_offset + layout.data_nbytes
+            ]
+            self.assertTrue(torch.equal(actual, source.reshape(-1).view(torch.uint8)))
+
+    def test_recycler_polls_all_chunks_in_one_batch(self):
+        from sglang.srt.utils import cuda_vmm_transport_utils as vmm
+
+        pool = object.__new__(vmm.CudaVmmMemoryPool)
+        pool.device_index = 0
+        pool.consumer_count = 2
+        pool._recycle_stream = object()
+        pool.memory_pool = MagicMock()
+        pool.available_chunks = []
+        pool.occupied_chunks = [
+            vmm._CudaVmmMemoryChunk(0, 64),
+            vmm._CudaVmmMemoryChunk(64, 128),
+        ]
+        acknowledgement_words = object()
+        acknowledgement_counts = MagicMock()
+        acknowledgement_counts.cpu.return_value.tolist.return_value = [2, 1]
+
+        with (
+            patch.object(vmm.torch.cuda, "device", return_value=nullcontext()),
+            patch.object(vmm.torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(
+                vmm.torch, "stack", return_value=acknowledgement_words
+            ) as stack,
+            patch.object(
+                vmm.torch,
+                "count_nonzero",
+                return_value=acknowledgement_counts,
+            ) as count_nonzero,
+        ):
+            pool._recycle_chunks()
+
+        stack.assert_called_once()
+        count_nonzero.assert_called_once_with(acknowledgement_words, dim=1)
+        self.assertEqual(pool.available_chunks, [vmm._CudaVmmMemoryChunk(0, 64)])
+        self.assertEqual(pool.occupied_chunks, [vmm._CudaVmmMemoryChunk(64, 128)])
 
     def test_prepare_batch_cancels_prior_groups_on_failure(self):
         from sglang.srt.utils.cuda_vmm_transport_utils import (
@@ -495,6 +661,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport = object.__new__(CudaVmmFeatureTransport)
         pool = MagicMock()
         transport.pool = pool
+        transport._publisher_executor = None
         manager.cuda_vmm_feature_transport = transport
         manager._subprocess_watchdog = None
         engine = object.__new__(Engine)
@@ -524,6 +691,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport = object.__new__(CudaVmmFeatureTransport)
         pool = MagicMock()
         transport.pool = pool
+        transport._publisher_executor = None
         manager.cuda_vmm_feature_transport = transport
         # A real record: the launcher publishes it partway through, and what it
         # reads after that comes out of the bags, which only project from a
@@ -576,6 +744,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         pool.shutdown.side_effect = [RuntimeError("shutdown failed"), None]
         transport.pool = pool
+        transport._publisher_executor = None
 
         with self.assertRaisesRegex(RuntimeError, "shutdown failed"):
             transport.shutdown()

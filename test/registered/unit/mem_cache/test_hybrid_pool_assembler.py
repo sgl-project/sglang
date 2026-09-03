@@ -49,9 +49,7 @@ class TestDeviceAllocEviction(CustomTestCase):
     def test_sufficient_capacity_skips_eviction(self):
         cache = MagicMock()
         cache.token_to_kv_pool_allocator.swa_available_size.return_value = 10
-        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = (
-            10
-        )
+        cache.req_to_token_pool.mamba_allocator.schedulable_available_size.return_value = 10
 
         _evict_swa_for_device_alloc(cache, required_size=10)
         _evict_mamba_for_device_alloc(cache, required_size=10)

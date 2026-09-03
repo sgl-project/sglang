@@ -181,7 +181,6 @@ def generate_continuous_batched_examples(
 
     IND_E = None
     for spec in example_lens_by_batch:
-
         # get the (maybe partial) example seen in this cont batch
         dt2, X2, B2, C2 = get_continuous_batch(spec)
 
@@ -356,7 +355,6 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     ) in generate_continuous_batched_examples(
         cases, num_examples, seqlen, last_taken, exhausted, n_heads, d_head, itype
     ):
-
         chunk_indices, chunk_offsets = (
             Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size, cu_seqlens[-1]
@@ -383,7 +381,6 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
 
         # just test the last in sequence
         for i in range(num_examples):
-
             # just test one dim and dstate
             Y_eg = Y[0, cu_seqlens[i] : cu_seqlens[i + 1], 0, 0]
             Y_min_eg = Y_min[i][:, 0, 0]
