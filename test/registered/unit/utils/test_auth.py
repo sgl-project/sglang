@@ -1,12 +1,10 @@
 """Unit tests for srt/utils/auth.py — no server, no model loading."""
 
 import unittest
-from enum import Enum
 
 from sglang.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
-    _normalize_auth_level,
     auth_level,
     decide_request_auth,
 )
@@ -33,15 +31,6 @@ class TestAuthLevel(CustomTestCase):
         self.assertIsInstance(AuthLevel.NORMAL, str)
         # str mixin allows direct comparison with string values
         self.assertEqual(AuthLevel.NORMAL, "normal")
-
-    def test_normalizes_equivalent_enum_from_reloaded_module(self):
-        class ReloadedAuthLevel(str, Enum):
-            ADMIN_FORCE = "admin_force"
-
-        self.assertEqual(
-            _normalize_auth_level(ReloadedAuthLevel.ADMIN_FORCE),
-            AuthLevel.ADMIN_FORCE,
-        )
 
 
 class TestAuthLevelDecorator(CustomTestCase):

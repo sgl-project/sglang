@@ -25,14 +25,6 @@ class AuthLevel(str, Enum):
     ADMIN_FORCE = "admin_force"
 
 
-def _normalize_auth_level(level: Any) -> AuthLevel:
-    """Normalize route metadata that may come from a reloaded auth module."""
-    try:
-        return AuthLevel(level)
-    except (TypeError, ValueError):
-        return AuthLevel.NORMAL
-
-
 def auth_level(level: AuthLevel):
     """Mark endpoint with auth level (stored in endpoint metadata)."""
 
@@ -43,18 +35,25 @@ def auth_level(level: AuthLevel):
     return decorator
 
 
+def _iter_effective_routes(app: Any):
+    """Iterate path operation routes across supported FastAPI versions."""
+    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
+        app, "routes", []
+    )
+    try:
+        from fastapi.routing import iter_route_contexts
+    except ImportError:
+        return iter(routes)
+    return iter_route_contexts(routes)
+
+
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
     """Best-effort resolve auth level by matching the request to a route."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    # Prefer app.router.routes when available; fall back to app.routes.
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-
-    for route in routes:
+    for route in _iter_effective_routes(app):
         try:
             match, child_scope = route.matches(scope)
         except Exception:
@@ -62,22 +61,16 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
         if match == Match.FULL:
             endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
             level = getattr(endpoint, "_auth_level", None)
-            return _normalize_auth_level(level)
+            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
 
     return AuthLevel.NORMAL
 
 
 def app_has_admin_force_endpoints(app: Any) -> bool:
     """Return True if any route endpoint is marked as ADMIN_FORCE."""
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
-    )
-    for route in routes:
+    for route in _iter_effective_routes(app):
         endpoint = getattr(route, "endpoint", None)
-        if (
-            _normalize_auth_level(getattr(endpoint, "_auth_level", None))
-            == AuthLevel.ADMIN_FORCE
-        ):
+        if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
             return True
     return False
 

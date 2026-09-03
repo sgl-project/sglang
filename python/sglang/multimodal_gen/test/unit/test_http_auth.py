@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
-from sglang.srt.utils.auth import AuthLevel
+from sglang.srt.utils.auth import AuthLevel, _iter_effective_routes
 
 
 def _server_args(api_key=None, admin_api_key=None):
@@ -22,7 +22,11 @@ def _server_args(api_key=None, admin_api_key=None):
 
 
 def _route_auth_level(app, path):
-    route = next(route for route in app.routes if route.path == path)
+    route = next(
+        route
+        for route in _iter_effective_routes(app)
+        if getattr(route, "path", None) == path
+    )
     return getattr(route.endpoint, "_auth_level", AuthLevel.NORMAL)
 
 
