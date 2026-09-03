@@ -18,12 +18,17 @@ from typing import TYPE_CHECKING, Dict, Union
 
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    is_deepseek_dsa,
+    is_deepseek_v4,
+)
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
@@ -51,8 +56,39 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _get_update_attr_type(self):
         return self.attr_type[AttentionArch.MLA]
 
+    def can_run_graph(self, forward_batch: ForwardBatch):
+        can_run_graph = super().can_run_graph(forward_batch)
+        if (
+            not self.eagle_worker.seed_dsa_topk_from_draft_extend
+            or self.attn_dp_size <= 1
+        ):
+            return can_run_graph
+
+        # PR #30839 falls back to eager when an IndexShare seed is unavailable.
+        # Under attention DP, seed availability is request-local: a real rank can
+        # miss the PD seed while idle ranks have no request at all. All ranks must
+        # nevertheless choose the same graph/eager path because the draft forward
+        # contains TP/EP collectives. Reduce the final decision across the model TP
+        # group, which contains all attention-DP ranks for this pipeline stage.
+        spec_info = forward_batch.spec_info
+        seed_ready = forward_batch.forward_mode.is_idle() or (
+            spec_info is not None and spec_info.dsa_topk_indices is not None
+        )
+        decision = torch.tensor(
+            int(can_run_graph and seed_ready),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(
+            decision,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.model_runner.tp_group.device_group,
+        )
+        return bool(decision.item())
+
     def _replay_graph(self, shape_key, forward_batch):
-        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
+        hf_config = self.model_runner.model_config.hf_config
+        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (

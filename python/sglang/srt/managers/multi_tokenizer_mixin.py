@@ -36,7 +36,7 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -61,6 +61,9 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -211,6 +214,15 @@ def _handle_output_by_index(output, i):
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
             ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
             ),
@@ -248,8 +260,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -319,6 +335,15 @@ def _handle_output_by_index(output, i):
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
             ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
+            ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
             ),
@@ -362,6 +387,10 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -381,29 +410,31 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
+        # paused while waiting for input and fed once per processed message.
         while True:
-            recv_obj = sock_recv(self.recv_from_scheduler)
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is None:
-                continue
-
-            # Fan out the output back to the originating tokenizer worker(s).
-            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-            # forward either batched or single requests, so handle both shapes.
-            if isinstance(recv_obj, BaseBatchReq):
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                    new_output = _handle_output_by_index(output, i)
+            if output is not None:
+                # Fan out the output back to the originating tokenizer worker(s).
+                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                # forward either batched or single requests, so handle both shapes.
+                if isinstance(recv_obj, BaseBatchReq):
+                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                        new_output = _handle_output_by_index(output, i)
+                        self.socket_mapping.send_output(
+                            ipc_name, new_output, is_tokenizer=True
+                        )
+                elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
-                        ipc_name, new_output, is_tokenizer=True
+                        recv_obj.http_worker_ipc, output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReq):
-                self.socket_mapping.send_output(
-                    recv_obj.http_worker_ipc, output, is_tokenizer=True
-                )
-            else:
-                raise ValueError(
-                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                )
+                else:
+                    raise ValueError(
+                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+            self.soft_watchdog.feed()
 
 
 class MultiTokenizerRouter:
@@ -420,6 +451,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -446,18 +478,21 @@ class MultiTokenizerRouter:
         # read SHM only. Drain it event-driven via the socket's fd instead of
         # polling on a timer.
         self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+        if zmq_reader_owner("MultiTokenizerRouter"):
             self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="MultiTokenizerRouter"
+                port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
+
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
 
     def _run_loop(self):
         self._loop.run_forever()
@@ -563,9 +598,9 @@ class MultiDetokenizerRouter:
 
             # Single request: route by its own http_worker_ipc.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                assert recv_obj.http_worker_ipc is not None, (
+                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                )
                 self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 
@@ -632,26 +667,18 @@ class TokenizerWorker(TokenizerManager):
         import torch
 
         torch.set_num_threads(1)
-        # prevent init prefill bootstrapserver again
-        disaggregation_mode = server_args.disaggregation_mode
-        server_args.override(
-            "tokenizer_worker.suppress_bootstrap", disaggregation_mode="null"
+        super().__init__(
+            server_args,
+            port_args,
+            start_pd_bootstrap_service=False,
         )
-        super().__init__(server_args, port_args)
 
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-        # For PD disaggregtion
-        self.server_args.override(
-            "tokenizer_worker.restore_disaggregation_mode",
-            disaggregation_mode=disaggregation_mode,
-        )
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
+        # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting
@@ -780,7 +807,9 @@ def read_from_shared_memory(name: str) -> Any:
 
 
 def write_data_for_multi_tokenizer(
-    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
+    port_args: PortArgs,
+    server_args: ServerArgs,
+    scheduler_info: Dict,
 ):
     """Write args information to share memory for multi-tokenizer"""
     # get main process ID

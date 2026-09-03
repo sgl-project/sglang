@@ -158,7 +158,7 @@ class StorageBackendFactory:
         mem_pool_host: Any,
     ) -> HiCacheStorage:
         """Create built-in backend with original initialization logic."""
-        if backend_name == "file":
+        if backend_name in ("file", "sim"):
             return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
@@ -187,6 +187,8 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "mori":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "shm":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -194,6 +196,10 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "sim", "sglang.srt.mem_cache.storage.sim_storage", "SimHiCacheStorage"
 )
 
 StorageBackendFactory.register_backend(
@@ -236,4 +242,10 @@ StorageBackendFactory.register_backend(
     "mori",
     "sglang.srt.mem_cache.storage.umbp.umbp_store",
     "UMBPStore",
+)
+
+StorageBackendFactory.register_backend(
+    "shm",
+    "sglang.srt.mem_cache.storage.shm",
+    "HiCacheShm",
 )

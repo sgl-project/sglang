@@ -1,11 +1,11 @@
 import argparse
-import dataclasses
 from typing import Tuple
 
 from transformers import AutoProcessor
 
 from sglang import Engine
 from sglang.lang.chat_template import get_chat_template_by_model_path
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import DEFAULT_IMAGE_URL
@@ -37,15 +37,16 @@ def get_input_ids(
 def token_in_out_example(
     server_args: ServerArgs,
 ):
+    cfg = resolving_view(server_args)
     input_ids, image_data = get_input_ids(
         server_args,
         ModelConfig(
-            server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            model_override_args=server_args.json_model_override_args,
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            model_override_args=cfg.json_model_override_args,
         ),
     )
-    backend = Engine(**dataclasses.asdict(server_args))
+    backend = Engine(server_args=server_args)
 
     output = backend.generate(
         input_ids=input_ids,
@@ -67,8 +68,9 @@ if __name__ == "__main__":
     ServerArgs.add_cli_args(parser)
     args = [
         "--model-path=Qwen/Qwen2-VL-2B",
+        "--skip-tokenizer-init",
     ]
     args = parser.parse_args(args=args)
     server_args = ServerArgs.from_cli_args(args)
-    server_args.skip_tokenizer_init = True
+    server_args.resolve_once()
     token_in_out_example(server_args)

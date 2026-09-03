@@ -3,12 +3,12 @@ import unittest
 import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
-from utils import parametrize, precision
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import parametrize, precision
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=54, suite="base-b-test-cpu")
 
 flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
@@ -81,7 +81,6 @@ def flash_attn_non_varlen_ref(
 
 
 class TestFlashAttn(CustomTestCase):
-
     @parametrize(
         batch=[4],
         max_seqlen_q=[35, 96],

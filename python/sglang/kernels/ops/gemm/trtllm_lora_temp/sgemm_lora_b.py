@@ -66,6 +66,10 @@ def _sgemm_lora_b_kernel(
     # For fused output scaling
     scalings,
     ENABLE_PDL: tl.constexpr = False,
+    APPLY_SCALING: tl.constexpr = True,
+    PADDED_RANK: tl.constexpr = True,
+    FLAT_GRID: tl.constexpr = False,
+    ATOMIC_ADD: tl.constexpr = True,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA B matrix
@@ -84,9 +88,16 @@ def _sgemm_lora_b_kernel(
             the base model's output for a fused add operation.
     """
 
-    pid_s = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-    batch_id = tl.program_id(axis=2)
+    if FLAT_GRID:
+        pid = tl.program_id(axis=0)
+        batch_id = tl.program_id(axis=1)
+        num_pid_n = tl.cdiv(N, BLOCK_N)
+        pid_s = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        pid_s = tl.program_id(axis=0)
+        pid_n = tl.program_id(axis=1)
+        batch_id = tl.program_id(axis=2)
     w_index = tl.load(weight_indices + batch_id)
     rank = tl.load(lora_ranks + w_index)
 
@@ -98,7 +109,9 @@ def _sgemm_lora_b_kernel(
     if pid_s * BLOCK_S >= seg_len:  # also covers seg_len == 0
         return
     seg_start = tl.load(seg_indptr + batch_id)
-    scaling = tl.load(scalings + w_index)
+    scaling = tl.load(scalings + w_index) if APPLY_SCALING else 1.0
+    if not PADDED_RANK:
+        K = tl.minimum(K, rank)
 
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
@@ -122,19 +135,24 @@ def _sgemm_lora_b_kernel(
     )
     output_mask = (s_offset[:, None] < seg_len) & n_mask
 
-    x_tile = tl.load(
-        x_ptrs,
-        mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K),
-        other=0.0,
-    )
-    w_tile = tl.load(
-        w_ptrs,
-        mask=(k_offset[:, None] < K) & n_mask,
-        other=0.0,
-    )
-
-    # cast fused: the split-K shrink returns fp32, plain path bf16 (no-op)
-    partial_sum = tl.dot(x_tile.to(w_tile.dtype), w_tile) * scaling
+    partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        k_remaining = K - k * BLOCK_K
+        x_tile = tl.load(
+            x_ptrs,
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < k_remaining),
+            other=0.0,
+        )
+        w_tile = tl.load(
+            w_ptrs,
+            mask=(k_offset[:, None] < k_remaining) & n_mask,
+            other=0.0,
+        )
+        # The split-K shrink returns fp32; cast it on-load to the weight dtype.
+        partial_sum += tl.dot(x_tile.to(w_tile.dtype), w_tile)
+        x_ptrs += BLOCK_K * x_stride_1
+        w_ptrs += BLOCK_K * w_stride_2
+    partial_sum *= scaling
 
     # All input reads are done; hint the runtime to launch the dependent kernel.
     if ENABLE_PDL:
@@ -143,7 +161,11 @@ def _sgemm_lora_b_kernel(
     # Store result to output matrix (cast to the OUTPUT dtype: x may be the fp32
     # split-K shrink accumulator while base_output is bf16)
     partial_sum = partial_sum.to(output.dtype.element_ty)
-    tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+    if ATOMIC_ADD:
+        tl.atomic_add(output_ptr, partial_sum, mask=output_mask, sem="relaxed")
+    else:
+        partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
+        tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
 def sgemm_lora_b_fwd(
@@ -174,11 +196,14 @@ def sgemm_lora_b_fwd(
         )
         and S * R >= _CUBLAS_MIN_S_RANK
         and weights.shape[0] == 1
+        and x.dtype == weights.dtype
     ):  # single-adapter fast path: only valid with one resident slot
         return _sgemm_lora_b_cublas(x, weights, batch_info, base_output)
     # Block shapes
     BLOCK_S = 16
-    BLOCK_R = triton.next_power_of_2(R)
+    # Pad to >=16 for Triton MMA K>=16 (rank<16 adapters); k_offset < K=R masks the
+    # padded contraction rows to 0, so the result is unchanged.
+    BLOCK_R = max(16, triton.next_power_of_2(R))
     BLOCK_N = 256
 
     grid = (
@@ -219,5 +244,68 @@ def sgemm_lora_b_fwd(
         batch_info.scalings,
         ENABLE_PDL=enable_pdl,
         **pdl_kwargs,
+    )
+    return output
+
+
+def shared_sink_sgemm_lora_b_fwd(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    base_output: torch.Tensor = None,
+    *,
+    apply_scaling: bool,
+    padded_rank: bool,
+) -> torch.Tensor:
+    """Shared-sink expand with the measured fixed-width schedule."""
+    assert x.is_contiguous()
+    assert weights.is_contiguous()
+    assert x.ndim == 2
+    assert weights.ndim == 3
+
+    num_tokens = x.shape[0]
+    output_width = weights.shape[-2]
+    rank_width = weights.shape[-1]
+    assert x.shape[-1] == rank_width
+
+    block_s = 16
+    block_rank = 16
+    block_n = 256
+    grid = (
+        triton.cdiv(batch_info.max_len, block_s) * triton.cdiv(output_width, block_n),
+        batch_info.bs,
+    )
+    output = (
+        torch.zeros((num_tokens, output_width), device=x.device, dtype=x.dtype)
+        if base_output is None
+        else base_output
+    )
+    _sgemm_lora_b_kernel[grid](
+        x,
+        weights,
+        output,
+        output_width,
+        rank_width,
+        x.stride(0),
+        x.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        output.stride(0),
+        output.stride(1),
+        batch_info.seg_lens,
+        batch_info.seg_indptr,
+        batch_info.weight_indices,
+        batch_info.lora_ranks,
+        batch_info.permutation,
+        batch_info.permutation is not None,
+        block_s,
+        block_n,
+        block_rank,
+        batch_info.scalings,
+        APPLY_SCALING=apply_scaling,
+        PADDED_RANK=padded_rank,
+        FLAT_GRID=True,
+        ATOMIC_ADD=False,
     )
     return output

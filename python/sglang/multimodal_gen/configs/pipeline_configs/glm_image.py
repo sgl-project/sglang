@@ -13,6 +13,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     SpatialImagePipelineConfig,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
 
 @dataclass
@@ -47,6 +49,19 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def __post_init__(self):
         self.vae_scale_factor = self.vae_config.get_vae_scale_factor()
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+    def supports_dynamic_batching(self):
+        server_args = get_global_server_args()
+        return server_args.srt_encoder_url is not None
+
+    def supports_native_grouped_requests(self):
+        return True
+
+    def supports_sequential_dit_inference(self):
+        return True
+
+    def supports_sequential_multi_output_inference(self):
+        return current_platform.is_npu()
 
     def get_freqs_cis(self, batch, device, rotary_emb, dtype):
         height = batch.height // self.vae_scale_factor
@@ -86,12 +101,12 @@ class GlmImagePipelineConfig(SpatialImagePipelineConfig):
     def get_decode_scale_and_shift(self, device, dtype, vae):
         latents_mean = (
             torch.tensor(self.vae_config.latents_mean)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         latents_std = (
             torch.tensor(self.vae_config.latents_std)
-            .view(1, self.vae_config.latent_channels, 1, 1)
+            .reshape(1, self.vae_config.latent_channels, 1, 1)
             .to(device, dtype)
         )
         return 1.0 / latents_std, latents_mean

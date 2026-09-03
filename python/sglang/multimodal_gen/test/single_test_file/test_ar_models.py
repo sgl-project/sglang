@@ -16,6 +16,7 @@ import os
 import unittest
 from pathlib import Path
 
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_AR_MODEL_NAME_FOR_TEST,
     find_free_port,
@@ -53,17 +54,27 @@ class ARCluster(DisaggCluster):
         log = _LOG_DIR / "ar.log"
         self._logs["ar"] = log
 
+        # The AR sub-encoder and processor live in subfolders of the model repo
+        # (``vision_language_encoder/`` and ``processor/``).  A HuggingFace repo
+        # id cannot carry a subfolder, so passing e.g.
+        # ``zai-org/GLM-Image/vision_language_encoder/`` as --model-path fails
+        # with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'".
+        # Resolve the repo to a local snapshot first and pass the local
+        # subfolder directories, which are valid filesystem paths.
+        local_model = maybe_download_model(self.model)
+
         cmd = [
             "sglang",
             "serve",
             "--model-path",
-            f"{self.model}/vision_language_encoder/",
+            os.path.join(local_model, "vision_language_encoder"),
             "--tokenizer-path",
-            f"{self.model}/processor/",
+            os.path.join(local_model, "processor"),
             "--enable-multimodal",
             "--cuda-graph-bs",
             "1",
-            "--disable-fast-image-processor",
+            "--image-processor-backend",
+            "pil",
             "--tp-size",
             str(len(gpus)),
             "--port",
@@ -83,8 +94,7 @@ class ARCluster(DisaggCluster):
             )
         except Exception as e:
             raise RuntimeError(
-                f"AR model failed to start for {self.name}. Log tail:\n"
-                f"{_tail_log(log)}"
+                f"AR model failed to start for {self.name}. Log tail:\n{_tail_log(log)}"
             ) from e
 
     def _launch_server_head(self) -> None:
@@ -133,7 +143,6 @@ class ARCluster(DisaggCluster):
 
 
 class _ARTestBase(_DisaggTestBase):
-
     @classmethod
     def setUpClass(cls) -> None:
         super(CustomTestCase, cls).setUpClass()

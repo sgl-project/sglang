@@ -34,9 +34,9 @@ class PureSWARadixCache(RadixCache):
         self.sliding_window_size = params.sliding_window_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for PureSWARadixCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for PureSWARadixCache"
+        )
         return True
 
     def swa_evictable_size(self):
@@ -62,7 +62,9 @@ class PureSWARadixCache(RadixCache):
         num_tokens = max(params.num_tokens, params.swa_num_tokens)
         return super().evict(EvictParams(num_tokens=num_tokens))
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         """Cache request when it finishes.
 
         Only inserts the prefill portion [0, evict_floor) into the radix tree.
@@ -73,27 +75,30 @@ class PureSWARadixCache(RadixCache):
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
+        kv_committed_len = kv_len_to_handle
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.kv.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.kv.req_pool_idx, :kv_committed_len
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         keys_len = len(radix_key)
 
-        old_prefix_len = req.cache_protected_len
-        swa_evict_floor = req.swa_evict_floor
-        swa_evicted_seqlen = req.swa_evicted_seqlen
+        old_prefix_len = req.kv.cache_protected_len
+        swa_evict_floor = req.kv.swa_evict_floor
+        swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
         if self.page_size > 1 and swa_evict_floor > 0:
             swa_evict_floor = -(-swa_evict_floor // self.page_size) * self.page_size

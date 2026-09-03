@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -11,21 +12,27 @@ from typing import (
     Union,
 )
 
+import torch
 import zmq
-from torch.distributed import barrier
+from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
+    discard_shm_features,
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.runtime_context import get_disagg, get_parallel, is_ep_scale_joiner
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -35,16 +42,19 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+    from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
     from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
         ScriptedTokenizerRecvProxy,
     )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerRequestReceiver:
-    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy]
+    recv_from_tokenizer: Union[zmq.Socket, ScriptedTokenizerRecvProxy, RustServer]
     recv_from_rpc: Optional[zmq.Socket]
     recv_skipper: Any
     input_blocker: Any
@@ -103,6 +113,15 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
+                # Rust ringbuffer backend: drain the in-process ring fed by the
+                # embedded Rust TokenizerManager instead of a zmq socket. Same
+                # non-blocking, msgpack-decoded contract as the zmq path below.
+                if envs.SGLANG_RUST_SERVER.get():
+                    recv_reqs.extend(
+                        self.recv_from_tokenizer.drain(self.max_recv_per_poll)
+                    )
+                    return recv_reqs
+
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
@@ -139,50 +158,26 @@ class SchedulerRequestReceiver:
         return recv_reqs
 
     def _broadcast_reqs_across_ranks(self, recv_reqs: Optional[List]) -> List:
-        if self.server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
                 control_reqs = None
 
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
             # controller, so we broadcast within attn_tp_group + attn_cp_group
             # instead of the full tp_group.  This avoids an expensive
             # all-ranks gloo sync.
-            _local_ctrl = self.server_args.enable_dp_attention_local_control_broadcast
+            _local_ctrl = (
+                get_parallel().enable_dp_attention_local_control_broadcast
+                or is_ep_scale_joiner()
+            )
             if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
+                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
@@ -217,40 +212,80 @@ class SchedulerRequestReceiver:
         # Process MM requests under EPD-disaggregation mode
         if (
             self.ps.pp_rank == 0
-            and self.server_args.language_only
-            and self.server_args.encoder_transfer_backend
+            and get_disagg().language_only
+            and get_disagg().encoder_transfer_backend
             in ["zmq_to_scheduler", "mooncake"]
         ):
             recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
             for req, error_msg, error_code in abort_reqs:
-                status_code = (
-                    HTTPStatus.BAD_REQUEST
-                    if error_code == 400
-                    else HTTPStatus.INTERNAL_SERVER_ERROR
-                )
+                if error_code is None:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                elif isinstance(error_code, HTTPStatus):
+                    status_code = error_code
+                else:
+                    status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
-                # The broadcast source returns with its original objects while
-                # peer ranks may still be unpickling ShmPointerMMData
-                # (-> shm_open).  Synchronize the same CPU groups that carried
-                # SHM-backed work requests before materialize() unlinks them.
-                if self.server_args.enable_dp_attention:
-                    if self.ps.attn_tp_size > 1:
-                        barrier(group=self.attn_tp_cpu_group)
-                    if self.ps.attn_cp_size > 1:
-                        barrier(group=self.attn_cp_cpu_group)
-                elif self.ps.tp_size > 1:
-                    barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
+        """Materialize SHM features or mark the request failed on every rank."""
+        if not recv_reqs or not self.model_config.is_multimodal:
+            return
+
+        tokenized_reqs = []
+        for req in recv_reqs:
+            if isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+                tokenized_reqs.append(req)
+            elif isinstance(
+                req,
+                (BatchTokenizedGenerateReqInput, BatchTokenizedEmbeddingReqInput),
+            ):
+                tokenized_reqs.extend(req.batch)
+        if not tokenized_reqs or not has_shm_features(tokenized_reqs):
+            return
+
+        # 1. wait until every rank has opened the shared feature segments
+        parallel = get_parallel()
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                barrier(group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                barrier(group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            barrier(group=self.tp_cpu_group)
+
+        # 2. materialize independently so one bad VLM request does not stop the loop
+        failed = torch.zeros(len(tokenized_reqs), dtype=torch.int32)
+        for index, req in enumerate(tokenized_reqs):
+            if not has_shm_features([req]):
+                continue
+            try:
                 unwrap_shm_features(req)
+            except Exception:
+                logger.exception(
+                    "Failed to materialize shared-memory multimodal features for rid=%s",
+                    req.rid,
+                )
+                discard_shm_features(req)
+                failed[index] = 1
+
+        # 3. all ranks reject the same requests before entering model collectives
+        if parallel.enable_dp_attention:
+            if self.ps.attn_tp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
+            if self.ps.attn_cp_size > 1:
+                all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
+        elif self.ps.tp_size > 1:
+            all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
+
+        error = MMInputsProcessError(
+            "Failed to materialize shared-memory multimodal features on a scheduler rank."
+        )
+        for index, req in enumerate(tokenized_reqs):
+            if failed[index].item():
+                discard_shm_features(req)
+                req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [
