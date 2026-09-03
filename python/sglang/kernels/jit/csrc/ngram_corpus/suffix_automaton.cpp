@@ -181,7 +181,7 @@ std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len
 Result SuffixAutomaton::buildRecency(
     const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
   auto anchors = match(context, len, param.max_sam_match_depth);
-  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_sam_match_depth) - 1);
+  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth) - 1);
   const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
   std::vector<Node> tree(draft_token_num + 1);
   int root = 0;
@@ -189,8 +189,9 @@ Result SuffixAutomaton::buildRecency(
 
   for (const auto& anchor : anchors) {
     std::queue<std::tuple<int, double, int>> queue;
+    const auto breadth_match_depth = std::min<int32_t>(anchor.matched_len, max_match_depth);
     queue.push(
-        {root, (max_match_depth - anchor.matched_len) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
+        {root, (max_match_depth - breadth_match_depth) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
       auto [parent, cur_breadth, state] = queue.front();
       queue.pop();
