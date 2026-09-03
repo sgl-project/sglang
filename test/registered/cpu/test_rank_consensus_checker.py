@@ -226,9 +226,9 @@ class TestAssertSame(RankConsensusCheckerTestCase):
 
         err = err_box.get()
         shutdown()
-        assert isinstance(
-            err, RuntimeError
-        ), f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        assert isinstance(err, RuntimeError), (
+            f"Expected RuntimeError from stray-thread assert_same, got {err!r}"
+        )
 
     def test_assert_same_rejects_non_scheduler_thread(self):
         """Check that assert_same() must be called in the scheduler thread.  Otherwise report error."""

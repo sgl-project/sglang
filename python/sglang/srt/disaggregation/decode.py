@@ -190,9 +190,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(
-            reqs[i].kv.kv_allocated_len > 0 for i in reusing
-        ), "a reused row must carry allocated KV"
+        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
+            "a reused row must carry allocated KV"
+        )
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -1766,9 +1766,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        assert req_pool_indices is not None, (
+            "req_pool_indices is full! There is a bug in memory estimation."
+        )
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2157,6 +2157,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
+        if not replayed_boundary:
+            # The handoff token is generated on the prefill worker, so it does
+            # not pass through the decode worker's normal batch-result path.
+            # Account for it here using the same request-selected reasoning
+            # terminator matcher as subsequent decode tokens.  A rebootstrap
+            # boundary has already been accounted for before retraction and
+            # must not be consumed twice.
+            self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
+                decode_req.req, committed_output_id
+            )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
         # cached_tokens[0]. Seed already_computed with it so that
@@ -2202,9 +2212,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert (
-                output_token_sampling_mask_idx is not None
-            ), "sampling mask buffer disabled on decode side"
+            assert output_token_sampling_mask_idx is not None, (
+                "sampling mask buffer disabled on decode side"
+            )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)
