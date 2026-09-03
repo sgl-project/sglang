@@ -51,12 +51,16 @@ class _RecordingAllocator:
         self.alloc_calls: List[int] = []
         self.free_calls: List[torch.Tensor] = []
         self.fail_alloc = False
+        self.capacity = 1 << 30
         self._next_slot = 1000
         self._outstanding = 0
 
+    def available_size(self) -> int:
+        return self.capacity - self._outstanding
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         self.alloc_calls.append(need_size)
-        if self.fail_alloc:
+        if self.fail_alloc or need_size > self.available_size():
             return None
         start = self._next_slot
         self._next_slot += need_size
@@ -418,6 +422,42 @@ class TestFuzzyResultApplication(CustomTestCase):
         self.assertIsNone(req.kv.fuzzy_match_result)
         self.assertIsNone(req.kv.fuzzy_donor_node)
         self.assertIsNone(req.kv.fuzzy_realized_locs)
+
+
+class TestRealizationEviction(CustomTestCase):
+    def test_full_pool_evicts_unlocked_entries_but_never_the_donor(self):
+        """Realization slots come from the free pool; when the pool is full
+        of unlocked entries the match must evict to fit (as prefill admission
+        does) instead of silently falling back. Measured on GPU: 3 of 24
+        wrapper-shift items served at 8K and 1 of 24 at 16K, exactly the
+        number that fit before the pool filled. The donor is pinned before
+        eviction so it can never be the entry freed."""
+        cache, provider, allocator = _make_cache()
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        stale = _seed_exact(
+            cache, token_ids=[5, 6, 7, 8], values=[20, 21, 22, 23]
+        ).last_device_node
+        # Only the two resident entries fit; a two-token realization needs room.
+        allocator._outstanding = 8
+        allocator.capacity = 8
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=2,
+            kv_indices=[10, 11],
+            cached_start_pos=2,
+            donor_last_node_id=donor.id,
+        )
+        req = _StubReq(rid="needs-room")
+
+        result = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+
+        self.assertEqual(result.fuzzy_matched_len, 2)
+        self.assertIsNotNone(req.kv.fuzzy_realized_locs)
+        self.assertEqual(donor.lock_ref, 1)
+        self.assertIn(donor.id, cache._node_registry)
+        self.assertNotIn(stale.id, cache._node_registry)
+        self.assertEqual(allocator.alloc_calls[-1], 2)
 
 
 class TestDonorLifecycle(CustomTestCase):

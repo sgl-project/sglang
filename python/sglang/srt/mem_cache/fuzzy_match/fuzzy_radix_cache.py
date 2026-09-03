@@ -32,6 +32,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     InsertResult,
     MatchPrefixParams,
     MatchResult,
@@ -260,10 +261,19 @@ class FuzzyRadixCache(RadixCache):
             return result
 
         # Donor KV carries RoPE for its original positions; the model runner
-        # must realize it into freshly allocated slots. Allocate before
-        # mutating request state so a capacity failure falls back cleanly.
+        # must realize it into freshly allocated slots. Pin the donor first so
+        # making room cannot free it, then evict unlocked entries the way
+        # prefill admission does; a capacity failure still falls back cleanly.
+        new_pin = donor_node is not None and donor_node is not req.kv.fuzzy_donor_node
+        if new_pin:
+            self.inc_lock_ref(donor_node)
+        shortfall = fuzzy_matched_len - self.token_to_kv_pool_allocator.available_size()
+        if shortfall > 0:
+            self.evict(EvictParams(num_tokens=shortfall))
         realized_locs = self.token_to_kv_pool_allocator.alloc(fuzzy_matched_len)
         if realized_locs is None:
+            if new_pin:
+                self.dec_lock_ref(donor_node)
             logger.debug(
                 "[FUZZY RADIX] no pool capacity for %d fuzzy tokens; "
                 "falling back to exact-only",
@@ -274,13 +284,12 @@ class FuzzyRadixCache(RadixCache):
         self._reclaim_realization_slots(req)
         req.kv.fuzzy_realized_locs = realized_locs
 
-        if donor_node is not None and donor_node is not req.kv.fuzzy_donor_node:
-            # Release any prior donor pin before acquiring a new one
+        if new_pin:
+            # Release any prior donor pin now that the new one holds
             # (chunked-prefill / re-scheduling case). A re-fire on the same
             # donor keeps the existing single pin.
             if req.kv.fuzzy_donor_node is not None:
                 self.dec_lock_ref(req.kv.fuzzy_donor_node)
-            self.inc_lock_ref(donor_node)
             req.kv.fuzzy_donor_node = donor_node
 
         req.kv.fuzzy_match_result = fuzzy_result

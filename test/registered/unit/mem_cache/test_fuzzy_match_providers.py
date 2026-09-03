@@ -319,6 +319,9 @@ class _DeviceOnlyAllocator:
         self._next = 1000
         self._lock = threading.Lock()
 
+    def available_size(self) -> int:
+        return 1 << 30
+
     def alloc(self, size: int):
         with self._lock:
             start = self._next
