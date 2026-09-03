@@ -15,9 +15,8 @@ on:
       # The key's prefix lives in this file, so a bump there also moves the key.
       - '.github/workflows/_pr-test-rust-ext-build.yml'
       - 'scripts/ci/utils/stage_rust_ext_modules.sh'
-      # Not hashed into the key, but they decide what is saved and looked up: this
-      # file carries each seeded arch's prefix, and the action carries the shape
-      # consumers derive. A change to either has to re-seed to be readable.
+      # Not hashed into the key, but they decide what is saved and looked up: the
+      # prefix per seeded arch, and the shape consumers derive.
       - '.github/workflows/seed-rust-ext-cache.yml'
       - '.github/actions/download-rust-ext/action.yml'
   workflow_dispatch:
@@ -41,14 +40,11 @@ jobs:
       runs_on: ubuntu-22.04
     secrets: inherit
 
-  # One entry per arch, since the arch is part of the key. Spelled out rather than
-  # matrixed so it reads the same as pr-test.yml's pair of producer jobs.
+  # One entry per arch, since the arch is part of the key.
   seed-aarch64:
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04-arm
-      # See the input's own description: the collect job's objdump must read
-      # aarch64 ELF, and the hosted binutils is single-target.
       collect_runs_on: ubuntu-22.04-arm
       artifact_name: rust-ext-aarch64
       cache_key_prefix: rust-ext-aarch64-cp310-cp312

@@ -7,10 +7,8 @@
 # version than the test runners have. Only set where the modules were just
 # compiled - on a cache hit these are the same bytes that already passed.
 #
-# EXPECT_PREFIX (optional): the cache key prefix the caller is about to save
-# under, checked against the one the modules themselves imply. The arch and the
-# interpreter set are both in every EXT_SUFFIX, so this is the ground truth for a
-# key that a caller would otherwise only assert.
+# EXPECT_PREFIX (optional): the cache key prefix the caller is about to use,
+# checked against the one the modules imply. EXT_SUFFIX carries both halves.
 set -euo pipefail
 shopt -s nullglob
 # upload-artifact strips the longest common prefix it matched, so a missing
@@ -56,9 +54,8 @@ for module in mem_cache mem_cache_inspection; do
 done
 status=0
 
-# What the bytes say the key should be, e.g. rust-ext-x86_64-cp310-cp312. Both
-# halves come out of the suffix set checked above, so a caller cannot mislabel an
-# entry: EXT_SUFFIX is `.cpython-<abi>-<arch>-linux-gnu.so`.
+# What the bytes say the key should be, from the suffix set checked above:
+# EXT_SUFFIX is `.cpython-<abi>-<arch>-linux-gnu.so`.
 expect_prefix="${EXPECT_PREFIX:-}"
 if [ -n "${expect_prefix}" ]; then
     arches=$(printf '%s\n' "${expected_suffixes}" \
@@ -86,19 +83,17 @@ max_allowed="${MAX_GLIBC:-}"
 
 # Newer glibc than the test runners fails at import: "GLIBC_2.xx not found".
 for so in "${built[@]}"; do
-    # objdump gets its own invocation rather than heading a pipeline: in a pipeline
-    # its failure is invisible, and the empty symbol list a wrong-arch objdump
-    # leaves behind ("file format not recognized") then reads exactly like "needs
-    # no glibc at all" and passes this gate silently.
+    # Its own invocation, not the head of a pipeline: there its failure is
+    # invisible, and the empty symbol list a wrong-arch objdump leaves behind reads
+    # exactly like "needs no glibc", passing this gate silently.
     if ! symbols=$(objdump -T "$so" 2>&1); then
         echo "::error::objdump could not read ${so}: ${symbols}"
         echo "::error::this gate must run on the same architecture as the modules"
         status=1
         continue
     fi
-    # grep exits 1 with no match; without `|| true` pipefail kills the script. Now
-    # that objdump is known to have succeeded, no match really is no requirement -
-    # the count is printed so a zero has a denominator either way.
+    # grep exits 1 with no match; without `|| true` pipefail kills the script. With
+    # objdump known to have succeeded, no match really is no requirement.
     references=$(printf '%s\n' "${symbols}" | grep -coE 'GLIBC_2\.[0-9]+' || true)
     needed=$(printf '%s\n' "${symbols}" \
         | grep -oE 'GLIBC_2\.[0-9]+' \

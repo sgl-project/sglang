@@ -152,12 +152,6 @@ jobs:
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
       scheduled: true
-      # An aarch64 prebuild exists now (pr-test.yml's rust-ext-build-aarch64), and
-      # base-c's gb300 stage takes it - so this stage is deliberately left on the
-      # source build, as the aarch64 half of the compile-during-install coverage
-      # (base-b-test-4-gpu-b200 is the x86_64 half, per PR). A 360-minute budget
-      # with no queue behind it is the cheapest place to pay for it.
-      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-h200:

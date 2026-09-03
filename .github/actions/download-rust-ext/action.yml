@@ -38,13 +38,9 @@ runs:
       shell: bash
       run: bash scripts/ci/utils/ensure_zstd.sh
 
-    # Derived, with no input to override it: the prefix encodes the arch and the
-    # interpreter set (PyO3 modules are portable across neither), and `uname -m`
-    # plus the running interpreter are the only things here that know either.
-    # Consumers range from stages that know their pool to rerun-test.yml,
-    # dispatched onto any label there is, so none of them could pass it reliably.
-    # An arch nothing built for resolves to a prefix nothing saved: a plain miss
-    # and a source build, the same outcome as no cache at all.
+    # Derived rather than passed in: the prefix encodes the arch, and rerun-test.yml
+    # is dispatched onto any label there is. An arch nothing built for misses, which
+    # is a source build - the same outcome as no cache at all.
     - name: Resolve the cache key prefix for this runner
       id: prefix
       if: steps.artifact.outcome != 'success'

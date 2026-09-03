@@ -2,12 +2,9 @@
 """Check that the rust-ext cache key agrees across the sites that build it.
 
 A consumer derives its prefix from the runner it lands on; a producer is told one
-by its caller. Neither file can see the other, and a disagreement costs no error
-at runtime - just a miss, and a job that quietly source-builds.
-
-`stage_rust_ext_modules.sh` checks a producer's prefix against the modules it
-built, which is the authority. This runs before any runner is queued, and covers
-the half that check cannot see: which prefix a consumer stage will look up.
+by its caller. A disagreement costs no error at runtime - just a miss, and a job
+that quietly source-builds. `stage_rust_ext_modules.sh` holds a producer to the
+modules it built; this covers the half that cannot see, the consumer's.
 """
 
 import pathlib
@@ -23,8 +20,7 @@ STAGE_WORKFLOW = "_pr-test-stage.yml"
 RUNNER_CONFIGS = "scripts/ci/runner_configs.yml"
 WORKFLOW_GLOB = ".github/workflows/*.yml"
 
-# Declared, not read off the label text: `4-gpu-gb300` is Grace and names no arm,
-# and a missing label is an error asking for an entry rather than a guess.
+# Declared, not read off the label text: `4-gpu-gb300` is Grace and names no arm.
 RUNNER_ARCHES = {
     "ubuntu-latest": "x86_64",
     "ubuntu-22.04": "x86_64",
@@ -61,9 +57,8 @@ class _Unparsable(Exception):
     """A YAML file this check has to read does not parse."""
 
 
-# NamedTuple, not msgspec.Struct: lint.yml installs pre-commit and nothing else,
-# so a `language: system` hook may import the stdlib and PyYAML (a pre-commit
-# dependency) only - sglang's own deps are not there.
+# NamedTuple, not msgspec.Struct: lint.yml installs pre-commit alone, so a
+# `language: system` hook gets the stdlib and PyYAML and none of sglang's deps.
 class _Producer(NamedTuple):
     """One caller of the build workflow: what it saves under, and from where."""
 
@@ -75,8 +70,7 @@ class _Producer(NamedTuple):
 
 
 class _StageCaller(NamedTuple):
-    """One test stage on one pool. `runner_config` is None when it is an
-    expression this check cannot resolve to a pool."""
+    """One test stage on one pool; `runner_config` is None when it cannot resolve."""
 
     file: str
     job: str
@@ -127,7 +121,7 @@ def _prefix_pattern(literal: str) -> "re.Pattern[str]":
     head, _, tail = literal.partition(_UNAME)
     arches = "|".join(re.escape(arch) for arch in sorted(set(RUNNER_ARCHES.values())))
     # The tail is captured, not fixed, so a prefix naming the wrong interpreters
-    # still yields an arch and does not strand its consumers behind a second error.
+    # still yields an arch rather than stranding its consumers behind a second error.
     return re.compile(
         f"^{re.escape(head)}({arches})-(.+)$"
         if tail.startswith("-")
@@ -137,8 +131,8 @@ def _prefix_pattern(literal: str) -> "re.Pattern[str]":
 
 def _restore_key_uses_derived_prefix(action: pathlib.Path) -> bool:
     """Whether the cache restore key interpolates the resolve step's output."""
-    # The literal existing in the file proves nothing: a key pointed back at an
-    # input leaves it dead, every consumer looking up a prefix no producer saves.
+    # The literal existing proves nothing: a key pointed elsewhere leaves it dead,
+    # every consumer looking up a prefix no producer saves.
     steps = _load(action).get("runs", {}).get("steps", [])
     resolve_ids = [
         step.get("id")
@@ -220,8 +214,7 @@ def _stage_callers(root: pathlib.Path) -> list[_StageCaller]:
                 continue
             declared = str(with_["runner_config"])
             producer = _NEEDS_JOB.search(str(with_.get("rust_ext_artifact", "")))
-            # One entry per pool, since it is the pool's arch that decides which
-            # prefix that install looks up; None marks one this check cannot resolve.
+            # One entry per pool: the pool's arch decides which prefix it looks up.
             resolved = _runner_configs_of(job=job, declared=declared)
             found += [
                 _StageCaller(

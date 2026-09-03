@@ -60,9 +60,9 @@ on:
         default: ''
       skip_prebuilt_rust_ext:
         description: >
-          Take neither the artifact nor the cache, and compile during install. For a
-          stage deliberately kept on the source-build path - the prebuild covers both
-          architectures now, so this is a choice about coverage rather than a gap.
+          Take neither the artifact nor the cache, and compile during install. No
+          stage sets it: both architectures have a prebuild. Kept as the opt-out for
+          a pool that gets one later than its stages do.
         type: boolean
         default: false
 

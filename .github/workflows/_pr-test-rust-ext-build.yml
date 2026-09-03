@@ -28,18 +28,15 @@ on:
         required: true
       restore_runs_on:
         description: >
-          Runner label for the cache-hit path. Wants free capacity and nothing else:
-          it neither compiles nor reads the modules, only republishes bytes, so it
-          is the one job here with no architecture requirement.
+          Runner label for the cache-hit path. Only republishes bytes, so it wants
+          free capacity and is the one job here with no architecture requirement.
         type: string
         default: ubuntu-latest
       collect_runs_on:
         description: >
-          Runner label for the collect job. Must be runs_on's ARCHITECTURE: this job
-          reads the modules' GLIBC symbols with objdump, and the hosted images ship
-          a single-target binutils, so an x86_64 objdump cannot read an aarch64 .so.
-          The gate then reports what it could not read and fails, rather than seeing
-          an empty symbol list and passing.
+          Runner label for the collect job. Must be runs_on's ARCHITECTURE: its GLIBC
+          gate reads the .so with objdump, and the hosted images ship a single-target
+          binutils.
         type: string
         default: ubuntu-latest
       artifact_name:
@@ -53,17 +50,14 @@ on:
       max_glibc:
         description: >
           Highest GLIBC symbol version the built .so files may require. A ceiling set
-          by the oldest image that has to LOAD them, not by whoever builds them - the
-          pools are not all on one image. x86_64's oldest loader is jammy at 2.35.
+          by the oldest image that has to LOAD them, not by whoever builds them; the
+          pools are not all on one image, and x86_64's oldest is jammy at 2.35.
         type: string
         default: '2.35'
       save_cache:
         description: >
-          Write the built modules to the cache. Off leaves the run's artifact as the
-          only handoff, so the stages of this run still get it and later runs
-          recompile. For an arch whose entries would mostly evict something else in a
-          repo already at the 10 GB cache limit, and whose cross-run value comes from
-          the default-branch entry seed-rust-ext-cache.yml writes anyway.
+          Write the built modules to the cache. Off leaves this run's artifact as the
+          only handoff, so its own stages still get them and later runs recompile.
         type: boolean
         default: true
       git_ref:
@@ -150,12 +144,9 @@ jobs:
                   || echo "(gh cache list unavailable: token lacks actions:read)"
           fi
 
-      # No MAX_GLIBC: these are the bytes the collect job already checked before
-      # saving them under this key, and this job may not even be the right arch to
-      # read them. The module count is still worth re-checking, so a truncated entry
-      # fails here rather than as a test import error - and EXPECT_PREFIX with it,
-      # which is filename-only, so it holds an entry to the key it was found under
-      # however it got there.
+      # No MAX_GLIBC: collect checked these bytes, and this job may not be the arch
+      # that can read them. The filename-only checks still run, so a truncated or
+      # mislabelled entry fails here rather than as a test import error.
       - name: Stage modules for upload
         if: steps.cache.outputs.cache-hit == 'true'
         env:
@@ -358,11 +349,8 @@ jobs:
       # First point that sees every interpreter, which is what the suffix-set check
       # compares. MAX_GLIBC belongs here rather than in the restore job: these are
       # freshly compiled bytes, not ones that already passed under this key.
-      # EXPECT_PREFIX is what makes the key an assertion rather than a claim: the
-      # script derives the arch and the interpreter set from the modules' own
-      # EXT_SUFFIX and fails if they are not the ones this job is about to save
-      # under. Nothing else compares the two - a caller's prefix and its runner
-      # label are both just strings until here.
+      # EXPECT_PREFIX makes the key an assertion: nothing else compares a caller's
+      # prefix against the modules it actually built.
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
