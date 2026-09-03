@@ -127,10 +127,15 @@ class KimiK2Detector(BaseFormatDetector):
         return name, call_index
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
-        """Infer function name when the model omits it (bare counter ID).
+        """Infer the function name when the tool_call_id does not carry one
+        (bare counter or client-style id).
 
-        Matches argument keys against tool parameter schemas, preferring the
-        tool whose declared properties best match the actual arguments.
+        With a single tool the answer is unambiguous. Otherwise the arguments
+        must be a JSON object that structurally satisfies exactly one tool
+        schema: every required property present and no undeclared property.
+        Zero or several candidates return ``None`` so the caller drops the
+        call instead of guessing; a wrong guess would hand the client an
+        executable call to a tool the model did not choose.
         """
         if not tools:
             return None
@@ -144,30 +149,35 @@ class KimiK2Detector(BaseFormatDetector):
             return None
 
         try:
-            arg_keys = set(json.loads(function_args).keys())
+            args = json.loads(function_args)
         except (json.JSONDecodeError, TypeError):
             logger.debug(
                 "Could not parse function_args for tool name inference "
                 "(may be partial JSON in streaming)"
             )
             return None
+        if not isinstance(args, dict):
+            return None
+        arg_keys = set(args)
 
-        # Pick the tool whose properties best match the argument keys.
-        best_name = None
-        best_score = -1
+        candidates = []
         for tool in tools:
             params = tool.function.parameters or {}
             props = set(get_schema_properties(params).keys())
-            if not props:
-                continue
-            overlap = len(arg_keys & props)
-            extra = len(arg_keys - props)
-            score = overlap - extra
-            if score > best_score:
-                best_score = score
-                best_name = tool.function.name
+            required = params.get("required")
+            required = set(required) & props if isinstance(required, list) else set()
+            if required <= arg_keys and arg_keys <= props:
+                candidates.append(tool.function.name)
 
-        return best_name
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            logger.warning(
+                "Tool name inference is ambiguous: arguments with keys %s satisfy %s",
+                sorted(arg_keys),
+                candidates,
+            )
+        return None
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
@@ -284,10 +294,11 @@ class KimiK2Detector(BaseFormatDetector):
                 # Resolve function name (cached across chunks within a section).
                 name_just_resolved = False
                 if self._current_stream_function_name is None:
+                    # Name inference needs the complete argument object, so
+                    # until the end marker arrives only ids that carry a name
+                    # (or a single-tool request) can resolve.
                     args_for_inference = (
-                        buffer[args_start:end_idx]
-                        if end_idx != -1
-                        else buffer[args_start:]
+                        buffer[args_start:end_idx] if end_idx != -1 else None
                     )
                     resolved = self._resolve_function_name(
                         function_id, tools, args_for_inference
@@ -431,7 +442,9 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name")
 
-        if not self.tool_call_id_counter_regex.match(function_id):
+        if function_args is not None and not self.tool_call_id_counter_regex.match(
+            function_id
+        ):
             logger.debug(
                 "Non-standard tool_call_id %r; inferring tool name from arguments",
                 function_id,

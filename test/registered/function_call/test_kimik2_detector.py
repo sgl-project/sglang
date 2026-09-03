@@ -1534,21 +1534,27 @@ class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
     # --- streaming ---
 
     def test_streaming_client_id_multi_tool_resolves_at_end_marker(self):
-        chunks = [
+        """With several tools the name cannot be inferred from partial JSON,
+        so nothing is emitted until the chunk carrying <|tool_call_end|>."""
+        before = [
             "<|tool_calls_section_begin|>",
             "<|tool_call_begin|>call_3<|tool_call_argument_begin|>",
             '{"city": ',
             '"Tokyo"}',
-            "<|tool_call_end|>",
-            "<|tool_calls_section_end|>",
         ]
-        tool_calls, normal = _collect_streaming_tool_calls(
-            self.detector, chunks, self.tools
+        for chunk in before:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.assertEqual(result.calls, [])
+            self.assertEqual(result.normal_text, "")
+        final = self.detector.parse_streaming_increment("<|tool_call_end|>", self.tools)
+        self.assertEqual(len(final.calls), 1)
+        self.assertEqual(final.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(final.calls[0].parameters), {"city": "Tokyo"})
+        tail = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_end|>", self.tools
         )
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["name"], "get_weather")
-        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"})
-        self.assertEqual(normal, "")
+        self.assertEqual(tail.calls, [])
+        self.assertEqual(tail.normal_text, "")
 
     def test_streaming_client_id_single_tool_streams_before_end_marker(self):
         single_tool = [_make_tool("search")]
@@ -1594,6 +1600,179 @@ class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
             self.detector, chunks, self.tools
         )
         self.assertEqual([tc["name"] for tc in tool_calls], ["get_weather"])
+        self.assertNotIn("<|tool_call", normal)
+
+
+class TestKimiK2ToolNameInferenceStrictness(unittest.TestCase):
+    """``_infer_tool_name`` returns a name only when the arguments satisfy
+    exactly one tool schema (all required keys present, no undeclared keys).
+
+    Agent tool sets share argument names (``file_path`` across Read, Write and
+    Edit; ``pattern``/``path`` across Glob, Grep and LS). A key-overlap score
+    with list-order tie-breaking would silently pick the first tool, handing
+    the client an executable call to a tool the model did not choose. That
+    is worse than dropping the call, so ambiguity resolves to ``None``.
+    """
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool(
+                "Read",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "offset": {"type": "number"},
+                        "limit": {"type": "number"},
+                    },
+                    "required": ["file_path"],
+                },
+            ),
+            _make_tool(
+                "Write",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                },
+            ),
+            _make_tool(
+                "Edit",
+                {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            ),
+            _make_tool(
+                "Glob",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            _make_tool(
+                "Grep",
+                {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "path": {"type": "string"},
+                        "output_mode": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            ),
+            _make_tool(
+                "LS",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "ignore": {"type": "array"},
+                    },
+                    "required": ["path"],
+                },
+            ),
+            _make_tool("Ping", {"type": "object", "properties": {}}),
+        ]
+
+    def _infer(self, args, tools=None):
+        return self.detector._infer_tool_name(tools or self.tools, args)
+
+    def test_required_keys_disambiguate_shared_names(self):
+        self.assertEqual(self._infer('{"file_path": "/x"}'), "Read")
+        self.assertEqual(self._infer('{"file_path": "/x", "content": "c"}'), "Write")
+        self.assertEqual(
+            self._infer('{"file_path": "/x", "old_string": "a", "new_string": "b"}'),
+            "Edit",
+        )
+        self.assertEqual(self._infer('{"path": "/x"}'), "LS")
+        self.assertEqual(self._infer('{"pattern": "a", "output_mode": "c"}'), "Grep")
+
+    def test_result_does_not_depend_on_tool_order(self):
+        reversed_tools = list(reversed(self.tools))
+        for args in ('{"file_path": "/x"}', '{"path": "/x"}', '{"pattern": "a"}'):
+            with self.subTest(args=args):
+                self.assertEqual(self._infer(args), self._infer(args, reversed_tools))
+
+    def test_ambiguous_arguments_return_none_and_warn(self):
+        # {"pattern", "path"} satisfies both Glob and Grep.
+        with self.assertLogs(
+            "sglang.srt.function_call.kimik2_detector", level="WARNING"
+        ) as logs:
+            self.assertIsNone(self._infer('{"pattern": "a", "path": "/x"}'))
+        self.assertTrue(any("ambiguous" in line for line in logs.output))
+        self.assertIsNone(self._infer('{"pattern": "a"}'))
+
+    def test_missing_required_or_unknown_key_returns_none(self):
+        self.assertIsNone(self._infer('{"old_string": "a", "new_string": "b"}'))
+        self.assertIsNone(self._infer('{"file_path": "/x", "bogus": 1}'))
+        self.assertIsNone(self._infer('{"bogus": 1}'))
+
+    def test_empty_object_matches_only_a_no_argument_tool(self):
+        self.assertEqual(self._infer("{}"), "Ping")
+        two_no_arg = self.tools + [_make_tool("Pong", {"type": "object"})]
+        self.assertIsNone(self._infer("{}", two_no_arg))
+
+    def test_non_object_json_returns_none_without_leaking(self):
+        self.assertIsNone(self._infer("[1, 2]"))
+        self.assertIsNone(self._infer('"text"'))
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>call_3"
+            '<|tool_call_argument_begin|>{"file_path": "/x", "bogus": 1}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertNotIn("<|tool_call", result.normal_text)
+
+    def test_single_tool_is_accepted_without_argument_check(self):
+        # Mirrors the malformed-arguments contract elsewhere in this file:
+        # with one tool the name is unambiguous and argument validation is
+        # the client's job.
+        self.assertEqual(self._infer('{"bogus": 1}', [self.tools[0]]), "Read")
+
+    def test_bare_counter_and_client_id_share_the_rule(self):
+        for fid in ("0", "call_3", "toolu_01AkmjoowNgNx2qNfJzc8z2F"):
+            with self.subTest(function_id=fid):
+                name, _ = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"path": "/x"}'
+                )
+                self.assertEqual(name, "LS")
+                name, _ = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"pattern": "a", "path": "/x"}'
+                )
+                self.assertIsNone(name)
+
+    def test_streaming_ambiguous_section_is_skipped_without_wedging(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"pattern": "a", "path": "/x"}',
+            "<|tool_call_end|>",
+            '<|tool_call_begin|>call_4<|tool_call_argument_begin|>{"path": "/y"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, normal = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual([tc["name"] for tc in tool_calls], ["LS"])
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"path": "/y"})
         self.assertNotIn("<|tool_call", normal)
 
 
