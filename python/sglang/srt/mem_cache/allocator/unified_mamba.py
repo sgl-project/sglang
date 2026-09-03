@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
+    _relieve_for_alloc,
     _chain_byte_accounting_violations,
     _end_pair_chain,
 )
@@ -147,6 +148,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
+
+
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
         return self
 
@@ -159,6 +162,13 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         self.free_group_end()
         self.free_group_begin()
+
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Make deferred Full reclaim visible to the Mamba capacity view."""
+        self.flush_deferred_full_frees()
+        if target_size > self.mamba_allocator.available_size():
+            _relieve_for_alloc(self.mamba_allocator, target_size)
 
 
     def mamba_slot_full_token_cost(self) -> int:

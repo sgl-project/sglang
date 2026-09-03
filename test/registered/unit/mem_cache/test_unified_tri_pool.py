@@ -20,8 +20,14 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
+from unittest.mock import MagicMock
 
 import torch
+
+import sglang.srt.mem_cache.allocator.unified_sub_pool as mea
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
@@ -37,6 +43,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
     init_unified_mamba_swa_pools,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # Hermetic convention of this directory's pool tests: plain unittest.TestCase,
@@ -113,6 +120,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         n_full=32,
         n_swa=16,
         n_state=8,
+        page_size=1,
         lazy_compaction=False,
     ):
         full, swa, mamba = _tri_specs()
@@ -126,6 +134,7 @@ class TestUnifiedTriPool(unittest.TestCase):
             sub_pool_specs=[full, swa, mamba],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
@@ -136,6 +145,7 @@ class TestUnifiedTriPool(unittest.TestCase):
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
+            page_size=page_size,
             need_sort=False,
             forward_stream=None,
             lazy_compaction=lazy_compaction,
@@ -312,6 +322,90 @@ class TestUnifiedTriPool(unittest.TestCase):
 
         _relieve_for_alloc(allocator, 1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
+
+    def test_full_donor_stops_after_float_exposes_mamba_capacity(self):
+        for page_size, lazy_compaction in ((1, False), (4, True)):
+            with self.subTest(page_size=page_size, lazy_compaction=lazy_compaction):
+                _, allocator, _, _ = self._build(
+                    page_size=page_size, lazy_compaction=lazy_compaction
+                )
+                mamba_slots = UnifiedMambaSlotAllocator(
+                    allocator.mamba_allocator,
+                    max_size=allocator.mamba_allocator.max_slots - 1,
+                    device=_DEV,
+                )
+
+                full_leaves = []
+                while True:
+                    indices = allocator.alloc(allocator.page_size)
+                    if indices is None:
+                        break
+                    full_leaves.append(indices)
+                self.assertTrue(full_leaves)
+                residual_mamba = mamba_slots.schedulable_available_size()
+                if residual_mamba:
+                    self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
+                while mamba_slots.alloc(1) is not None:
+                    pass
+                self.assertGreater(mamba_slots.available_size(), 0)
+                self.assertEqual(mamba_slots.schedulable_available_size(), 0)
+
+                cache = object.__new__(UnifiedRadixCache)
+                cache.disable = False
+                cache.tree_components = (
+                    ComponentType.FULL,
+                    ComponentType.SWA,
+                    ComponentType.MAMBA,
+                )
+                cache.is_swa_enabled = True
+                cache.cache_controller = None
+                cache.metrics_collector = None
+                cache.token_to_kv_pool_allocator = allocator
+                cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_slots)
+
+                tree_core = MagicMock()
+                tree_core.full_evictable_size.return_value = len(full_leaves)
+                tree_core.mamba_evictable_size.return_value = 0
+                walk = {"request_cnt": 0, "freed_leaves": 0}
+
+                def start(component_type, request_cnt):
+                    self.assertEqual(component_type, ComponentType.FULL)
+                    walk["request_cnt"] = request_cnt
+
+                def next_node(component_type, tracker):
+                    self.assertEqual(component_type, ComponentType.FULL)
+                    if tracker[ComponentType.FULL] >= walk["request_cnt"] or walk[
+                        "freed_leaves"
+                    ] >= len(full_leaves):
+                        return None, False
+                    return walk["freed_leaves"] + 1, True
+
+                def evict_leaf(node_id, tracker):
+                    self.assertEqual(node_id, walk["freed_leaves"] + 1)
+                    indices = full_leaves[-node_id]
+                    tracker[ComponentType.FULL] += int(indices.numel())
+                    allocator.full_attn_allocator.free(indices)
+                    walk["freed_leaves"] += 1
+                    return None
+
+                tree_core.evict_device_start.side_effect = start
+                cache.tree_core = tree_core
+                cache._evict_device_next_node = MagicMock(side_effect=next_node)
+                cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
+
+                swa_live_before = allocator.swa_attn_allocator._live_pages()
+                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+
+                self.assertEqual(walk["freed_leaves"], 1)
+                self.assertEqual(result.num_tokens_evicted, page_size)
+                self.assertEqual(result.swa_num_tokens_evicted, 0)
+                self.assertEqual(result.mamba_num_evicted, 0)
+                self.assertEqual(
+                    allocator.swa_attn_allocator._live_pages(), swa_live_before
+                )
+                self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
+                self.assertIsNotNone(mamba_slots.alloc(1))
+                self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
 class TestTriPagedFreeGroup(unittest.TestCase):

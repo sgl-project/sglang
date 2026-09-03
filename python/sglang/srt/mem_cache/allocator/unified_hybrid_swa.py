@@ -837,6 +837,8 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
                 flt = b
         _float_open_short_side(flt, demand)
 
+
+
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
         return self
 
@@ -849,6 +851,15 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             return
         self.free_group_end()
         self.free_group_begin()
+
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose Full reclaim, then move the SWA float away from Mamba."""
+        self.flush_deferred_full_frees()
+        if target_size <= self.mamba_allocator.available_size():
+            return
+        self.full_attn_allocator._flush(urgent=True)
+        _relieve_for_alloc(self.mamba_allocator, target_size)
 
 
     def mamba_slot_full_token_cost(self) -> int:

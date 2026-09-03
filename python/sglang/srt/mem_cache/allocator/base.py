@@ -29,6 +29,10 @@ class MambaFullCacheDonor(Protocol):
 
     def flush_deferred_full_frees(self) -> None: ...
 
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose layout-specific reclaim so Mamba capacity is queryable."""
+        ...
+
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod

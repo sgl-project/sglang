@@ -600,7 +600,7 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self._evict(initial_params, available_size_targets)
 
         if mamba_target is not None and mamba_full_donor is not None:
-            mamba_full_donor.flush_deferred_full_frees()
+            mamba_full_donor.prepare_mamba_allocation(mamba_target[1])
             mamba_free_ids = self.req_to_token_pool.mamba_allocator.available_size()
             mamba_capacity = self._component_available_size(ComponentType.MAMBA)
 
@@ -786,7 +786,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
                 assert donor is not None, "Mamba target requires a Full donor"
-                donor.flush_deferred_full_frees()
+                donor.prepare_mamba_allocation(target_size)
             # Schedulable capacity includes donor holes that allocation can compact.
             return self._component_available_size(target_component) >= target_size
 

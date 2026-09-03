@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import UnifiedMambaSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
