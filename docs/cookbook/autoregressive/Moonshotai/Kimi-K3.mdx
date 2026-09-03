@@ -30,7 +30,7 @@ Then run the **Python** output of the command panel below in that environment.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest                                  # NVIDIA (CUDA)
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817     # AMD MI350X / MI355X (ROCm)
+docker pull lmsysorg/sglang-rocm:v0.5.18-rocm720-mi35x-20260903     # AMD MI350X / MI355X (ROCm)
 ```
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
@@ -167,7 +167,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 | GB200 4×4 | TP16/DCP16 | MNNVL auto-detected |
 | H200 2×8 (4×8 on Unified High-Throughput) | TP16/EP16 + symm-mem, Marlin + FlashMLA; High-Throughput widens to TP32/EP32 over 4 nodes at mem-frac 0.90 with `extra_buffer_lazy` | same block on every node; export the cross-node NIC (`GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME`, `SGLANG_HOST_IP`); keep `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1` |
 | H100 4×8 | TP32/EP32, Marlin + FlashMLA | SM90a build of the K3 image; pin NCCL/Gloo to the same NIC on all nodes; least post-weight headroom (80 GB) |
-| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported |
+| MI350X/MI355X 1×8 | TP8 ROCm/AITER | AITER A8W4 FlyDSL MoE, Triton attention (`SGLANG_MLA_DECODE_TUNE=1` for gfx950 MLA decode geometry), graph bs up to 256, fp8 kvcache; DSPARK supported. Activation-quant and fused-KDA-decode knobs: [AMD ROCm/AITER environment](#amd-env) |
 | Atlas 800I A3 4×8 (32 cards / 64 dies) | TP64/DP4 + DeepEP | PD-mixed `Unified` only; DSPARK baked in; pin `GLOO`/`HCCL_SOCKET_IFNAME` on every node |
 
 **DCP notes** — the DCP cells are Balanced and High-Throughput on every Blackwell platform, in both the `Unified` and `Decode` roles:
@@ -180,6 +180,19 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 - Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `--moe-a2a-backend` is set.
 
 No cell has a serving round in this exact shape — treat them as starting points to verify.
+
+<a id="amd-env" />
+
+**AMD ROCm/AITER environment (MI350X / MI355X).** The MI35x cell emits `SGLANG_USE_AITER=1 SGLANG_AITER_K3_OPT=1 AITER_FLYDSL_FORCE=1 AITER_SITUV2_A8W4=1` — the first three turn on the AITER ROCm path, its K3-specific fused kernels, and the FlyDSL MoE kernels; the rest of this table is what you can change on top. Everything here is gfx950/ROCm-only and inert elsewhere. These knobs first ship in the `20260903` daily ROCm image pinned above — on an older image they are simply unread — and the two SiTU rows also need an AITER revision at or past [ROCm/aiter#4534](https://github.com/ROCm/aiter/pull/4534) (FlyDSL 0.3.0).
+
+| Env var | Default | Effect |
+|---|---|---|
+| `AITER_SITUV2_A8W4=1` | unset | SiTU v2 MoE with A8W4 activation quantization, on AITER's GU-interleaved preshuffled weight layout. The performance default the cell ships. |
+| `AITER_SITUV2_A4W4=1` | unset | A4W4 instead, on the generic separated shuffle layout. Numerically correct but slower than A8W4 (530.8 vs 537.3 tok/s median output on 8×MI35x). Setting **both** gives A8W4 precedence — SGLang follows AITER and keeps the GU-interleaved layout. |
+| `SGLANG_K3_KDA_FUSED_BACKEND=aiter` | unset | Opt in to the fused ROCm KDA decode boundary: the `f_b` projection is deferred into the gfx950 FlyDSL kernel so decode fuses `f_b` + convolution + recurrent state update + gated RMSNorm. Any other value (or unset) keeps the unfused KDA path. |
+| `SGLANG_K3_FLYDSL_SOURCE` | `auto` | Which FlyDSL implementation backs the fused decode: `auto` prefers SGLang's vendored kernels and falls back to the AITER module, `sglang` / `aiter` pin one. Leave it alone unless you are bisecting the two. |
+
+The fused KDA backend is fail-closed at two levels: it arms during model init only when the flag is exactly `aiter` **and** the gfx950 FlyDSL kernels are importable, and each decode step re-validates shapes, dtypes, strides, state indices, and output buffers before dispatch — anything unexpected falls back to the stock KDA implementation rather than erroring. Batch size 2 automatically picks a separately validated kernel schedule; every other batch keeps the original build options. Measured on a 69-layer graph the fused boundary is 9.20 → 8.38 µs/layer (−8.9%), with GSM8K 1319 at 0.950.
 
 ## 3. Advanced Usage
 
