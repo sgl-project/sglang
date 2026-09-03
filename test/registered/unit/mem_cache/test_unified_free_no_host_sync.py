@@ -265,8 +265,7 @@ class TestFreeSegment(unittest.TestCase):
     """Mirrors `test_paged_free_segment.TestFreeSegment`."""
 
     def test_matches_unique_over_tail_alignments(self):
-        """Sweep page-aligned starts against ends that cover a partial tail
-        page, a single partial page, and the full row."""
+        """Page-aligned starts against every tail alignment."""
         for num_tokens in (1, PAGE_SIZE, PAGE_SIZE + 1, 3 * PAGE_SIZE - 1):
             for start in range(0, num_tokens, PAGE_SIZE):
                 for end in (start + 1, num_tokens):
@@ -473,8 +472,7 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
 
     def test_unaligned_start_pos_is_rejected(self):
-        """The stride-rep path requires a page-aligned start; a mid-page start
-        must fail loudly instead of releasing the head page whole."""
+        """A mid-page start must fail loudly, not release the head page whole."""
         alloc = self._swa_composite(lazy=True)
         v = alloc.alloc(8 * self.PS)
         with self.assertRaises(AssertionError):

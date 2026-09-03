@@ -251,9 +251,8 @@ class DecodeKVCacheOffloadManager:
         # them mid-decode races with concurrent admission over live slots.
         ranges = [(0, kv_committed_len)]
 
-        # Over-allocated slots (spec v2; otherwise start_p == end_p). Aligned to
-        # the allocator page, which DCP widens past the schedule page, so the
-        # tail never shares a page with the committed range above.
+        # Over-allocated slots (spec v2), aligned to the allocator page -- DCP
+        # widens it past the schedule page -- so they share no page with the row.
         start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
         allocator_page_size = self.token_to_kv_pool_allocator.page_size
         if allocator_page_size > 1:

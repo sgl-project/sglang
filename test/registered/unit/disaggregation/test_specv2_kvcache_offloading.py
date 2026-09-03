@@ -127,7 +127,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Committed [0:20] as one row range; no overalloc free.
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
@@ -144,7 +143,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Committed [0:20], overallocated [20:28].
         self.assertEqual(len(freed), 2)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         self.assertTrue(torch.equal(freed[1], torch.arange(20, 28, dtype=torch.int64)))
@@ -163,8 +161,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Committed [0:10]; overallocated start_p = ceil_align(10, 4) = 12 =>
-        # [12:28]. Page 2 ([8:12)) belongs to the committed range's partial tail.
+        # ceil_align(10, 4) = 12: page 2 goes with the committed tail.
         self.assertEqual(len(freed), 2)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
         self.assertTrue(torch.equal(freed[1], torch.arange(12, 28, dtype=torch.int64)))
@@ -182,7 +179,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Committed [0:10]; no overalloc since start_p == end_p
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
 
@@ -219,7 +215,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # One free for the committed row range [0:20].
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         # State entry is removed at the end of _release_finished_req.
@@ -262,7 +257,6 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager.finalize_release_on_finish(req)
 
-        # _release_finished_req frees the committed row range [0:13] at once.
         self.assertEqual(len(freed), 1)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 13, dtype=torch.int64)))
         # No state entry is left behind.

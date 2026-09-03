@@ -282,18 +282,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Fixed-shape counterpart of free(): a page's tokens sit consecutively
-        in the kv row and the segment starts on a page boundary, so the page
-        representatives are the stride slice ``free_index[::page_size]`` -- no
-        torch.unique, whose data-dependent output shape forces a device sync.
-        Contract: see base; a page must be freed by only one call per group."""
+        """Fixed-shape counterpart of free(): the segment starts on a page
+        boundary and a page's tokens sit consecutively in the kv row, so
+        ``free_index[::page_size]`` names every page -- no torch.unique, whose
+        data-dependent output shape forces a device sync. A page must be freed
+        by only one call per group."""
         if free_index.numel() == 0:
             return
 
         ps = self.page_size
-        assert start_pos % ps == 0, (
-            f"free_segment start {start_pos} is not aligned to page_size {ps}"
-        )
+        assert start_pos % ps == 0, f"unaligned segment start {start_pos}"
         reps = free_index[::ps]
 
         if self.debug_mode:

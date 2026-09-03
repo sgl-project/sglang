@@ -1394,13 +1394,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending(freed_p_pages)
 
     def _page_reps(self, free_index: torch.Tensor, start_pos: int) -> torch.Tensor:
-        """One TOKEN per page of a kv-row segment: the start is page-aligned and
-        a page's tokens are consecutive in the row, so `free_index[::page_size]`
-        names every touched page without `torch.unique` (a device sync)."""
+        """Stride page representatives of a page-aligned kv-row segment; see
+        `PagedTokenToKVPoolAllocator.free_segment`."""
         ps = self.page_size
-        assert start_pos % ps == 0, (
-            f"free_segment start {start_pos} is not aligned to page_size {ps}"
-        )
+        assert start_pos % ps == 0, f"unaligned segment start {start_pos}"
         return free_index[::ps]
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
