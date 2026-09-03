@@ -587,3 +587,30 @@ def test_mapped_populator_populates_each_layer_once_per_request():
         assert populator.wait(3) is True
     finally:
         populator.close()
+
+
+def test_stage_end_pages_out_the_head_that_will_not_fit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        layerwise_offload,
+        "_advise_mapped_source_cold",
+        lambda tensor, reclaim=False: calls.append((tensor.numel(), reclaim)),
+    )
+    manager = layerwise_offload.LayerwiseOffloadManager.__new__(
+        layerwise_offload.LayerwiseOffloadManager
+    )
+    manager._streamed_order = [0, 1, 2, 3]
+    manager._mapped_cpu_weights = {
+        idx: {"w": torch.zeros(1024, dtype=torch.uint8)} for idx in range(4)
+    }
+    # Everything fits: cold only.
+    assert manager.advise_mapped_pages_cold(room_bytes=8192) == 0
+    assert [reclaim for _, reclaim in calls] == [False] * 4
+    calls.clear()
+    # Two layers do not fit: the first two are paged out, the rest left cold.
+    assert manager.advise_mapped_pages_cold(room_bytes=2048) == 2048
+    assert [reclaim for _, reclaim in calls] == [True, True, False, False]
+    calls.clear()
+    # No room figure: the old behaviour.
+    assert manager.advise_mapped_pages_cold() == 0
+    assert [reclaim for _, reclaim in calls] == [False] * 4

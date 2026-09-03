@@ -1375,21 +1375,54 @@ class LayerwiseOffloadManager:
             if layer_idx not in retain:
                 self.release_layer(layer_idx)
 
-    def advise_mapped_pages_cold(self) -> None:
-        """Mark every mapped layer's file pages cold at the end of this stage.
+    def advise_mapped_pages_cold(self, *, room_bytes: Optional[int] = None) -> int:
+        """Hand this stage's mapped pages back in the order that keeps the next
+        request fast. Returns the bytes paged out.
 
         With host and device in one pool the page cache cannot always hold the
-        whole request cycle (encoder, DiT, VAE). LRU then evicts, at each phase
-        boundary, exactly the pages the next phase needs -- a cyclic scan just
-        larger than the cache misses everywhere. Deactivating a component's
-        pages once its stage is over tells the kernel which pages to give up
-        first, so the phase that follows evicts what was just used instead of
-        what it is about to use. Measured on a GB10: ~100 GiB re-read per
-        request without this, ~30 GiB with it.
+        whole request cycle. Plain LRU then evicts, at each phase boundary,
+        exactly the pages the next phase needs: a cyclic scan just larger
+        than the cache misses everywhere (measured on a GB10: ~100 GiB re-read
+        per request). Deactivating a component's pages (MADV_COLD) once its
+        stage is over fixes the cross-component case.
+
+        When the component's own stream is larger than the room the cache will
+        have for it (``room_bytes``), the same pathology happens inside the
+        stage: faulting layer 40 in evicts layer 0, which the next request
+        reads first. Measured on a GB10 with a 45 GiB encoder and ~30 GiB of
+        room, every page fault reclaimed synchronously and the stage took
+        38 s at 1.2 GiB/s. So the head of the stream -- as many layers as do
+        not fit -- is paged out now, deterministically, and the tail is left
+        cold: the next request reads the head from disk at full parallel
+        speed into free pages and hits the cache for everything else.
         """
-        for weights in self._mapped_cpu_weights.values():
-            for tensor in weights.values():
-                _advise_mapped_source_cold(tensor)
+        order = [
+            idx for idx in self._streamed_order if self._mapped_cpu_weights.get(idx)
+        ]
+        order += [
+            idx
+            for idx in self._mapped_cpu_weights
+            if idx not in set(order) and self._mapped_cpu_weights.get(idx)
+        ]
+        layer_bytes = {
+            idx: sum(
+                t.numel() * t.element_size()
+                for t in self._mapped_cpu_weights[idx].values()
+            )
+            for idx in order
+        }
+        total = sum(layer_bytes.values())
+        excess = 0
+        if room_bytes is not None and total > room_bytes:
+            excess = total - room_bytes
+        paged_out = 0
+        for idx in order:
+            reclaim = paged_out < excess
+            for tensor in self._mapped_cpu_weights[idx].values():
+                _advise_mapped_source_cold(tensor, reclaim=reclaim)
+            if reclaim:
+                paged_out += layer_bytes[idx]
+        return paged_out
 
     def _ensure_mapped_populator(self) -> Optional[_MappedPopulator]:
         if self._mapped_populator is None and _libc is not None:
