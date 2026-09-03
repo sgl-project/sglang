@@ -489,7 +489,7 @@ class AscendAttnBackend(AttentionBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
-            origin_out_cache_loc=forward_batch.origin_out_cache_loc,
+            origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
