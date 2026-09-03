@@ -230,6 +230,23 @@ register_kernel(
         ),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_fp8_skinny",
+        backend=KernelBackend.KDA,
+        target=f"{_KDA_PACKAGE}.sm120_fp8_skinny_gemm:try_sm120_fp8_skinny_gemm",
+        capabilities=_SM120,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16", "float8_e4m3fn", "float32"),
+            description=(
+                "Static per-tensor FP8 linear for skinny verify batches on SM120"
+            ),
+        ),
+        description=(
+            "KDA-generated SM120 CUTLASS skinny GEMM with reference FP8 quantization."
+        ),
+    )
+)
 
 
 def fp8_scaled_mm(
@@ -297,6 +314,23 @@ def try_qwen3x_nvfp4_gemm(
     )
 
 
+def try_sm120_fp8_skinny_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+    output_scale: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor | None:
+    """Run the validated SM120 FP8 verify path, or return ``None``."""
+    return get_kernel("gemm.sm120_fp8_skinny", KernelBackend.KDA)(
+        input,
+        weight,
+        input_scale,
+        output_scale,
+        bias,
+    )
+
+
 __all__ = [
     "Fp8ScaledMMOp",
     "bmm_fp8",
@@ -304,6 +338,7 @@ __all__ = [
     "fp8_scaled_mm",
     "tiny_gemm_bf16",
     "try_qwen3x_nvfp4_gemm",
+    "try_sm120_fp8_skinny_gemm",
 ]
 
 

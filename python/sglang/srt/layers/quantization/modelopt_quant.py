@@ -544,6 +544,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             and torch.cuda.get_device_capability()[0] == 12
             and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
         )
+        self.use_kda_fp8_skinny = (
+            is_cuda()
+            and torch.cuda.get_device_capability() == (12, 0)
+            and os.environ.get("SGLANG_DISABLE_KDA_FP8_SKINNY_GEMM", "0") != "1"
+        )
 
     def create_weights(
         self,
@@ -614,11 +619,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         if (
-            self.use_sm120_gemv
+            (self.use_sm120_gemv or self.use_kda_fp8_skinny)
             and layer.weight_scale.numel() == 1
             and layer.input_scale.numel() == 1
         ):
-            # Combined GEMM epilogue scale for the SM120 M=1 GEMV fast path.
+            # Combined epilogue scale shared by the SM120 GEMV and KDA paths.
             layer.sm120_gemv_alpha = (
                 (layer.input_scale.float() * layer.weight_scale.float())
                 .reshape(1)
@@ -666,6 +671,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
 
                 qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
                 return sm120_fp8_gemv(qinput, w, layer.sm120_gemv_alpha)
+        if self.use_kda_fp8_skinny:
+            # The existing SM120 GEMV stays first for M=1 shapes that it
+            # accepts; cold-L2 CUDA Graph benchmarks show it is faster there.
+            # KDA handles the qualified M>=2 shapes, oversized M=1 projections,
+            # and M=1 when the native GEMV is explicitly disabled.
+            from sglang.kernels.ops.gemm import try_sm120_fp8_skinny_gemm
+
+            output = try_sm120_fp8_skinny_gemm(
+                x,
+                layer.weight,
+                layer.input_scale,
+                getattr(layer, "sm120_gemv_alpha", None),
+                bias,
+            )
+            if output is not None:
+                return output
         if layer.use_flashinfer_bmm:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
@@ -2674,9 +2695,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
                 }
-                assert weight_scale.shape[-1] == expected_blocks[name], (
-                    f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
-                )
+                assert (
+                    weight_scale.shape[-1] == expected_blocks[name]
+                ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
             else:
                 if weight_scale.shape[assert_dim] % 4 != 0:
                     logger.warning(
@@ -2685,9 +2706,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         tuple(weight_scale.shape),
                         getattr(self.quant_config, "group_size", None),
                     )
-            assert weight_scale.dtype == torch.float8_e4m3fn, (
-                f"{name} Weight Blockscale must be represented as FP8-E4M3"
-            )
+            assert (
+                weight_scale.dtype == torch.float8_e4m3fn
+            ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
         if (
@@ -2903,7 +2924,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch
         # tuple). Defer per-attribute access to the branches that actually
@@ -3020,9 +3040,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
+            assert (
+                not moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
