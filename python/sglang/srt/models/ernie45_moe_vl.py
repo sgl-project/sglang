@@ -227,7 +227,6 @@ class Ernie4_5_VLMoeMoE(nn.Module):
             layer_id >= vision_moe_layer_start_index
             and layer_id <= vision_moe_layer_end_index
         ):
-
             self.vision_experts_gate = ReplicatedLinear(
                 config.hidden_size,
                 config.moe_num_experts[1],
