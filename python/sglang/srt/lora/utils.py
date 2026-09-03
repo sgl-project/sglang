@@ -164,7 +164,9 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None) or getattr(config, "num_shared_experts", None)
+            n_shared = getattr(config, "n_shared_experts", None) or getattr(
+                config, "num_shared_experts", None
+            )
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return config.hidden_size, inter * 2
@@ -174,7 +176,9 @@ def get_default_hidden_dim(
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
             moe_inter = getattr(config, "moe_intermediate_size", None)
-            n_shared = getattr(config, "n_shared_experts", None) or getattr(config, "num_shared_experts", None)
+            n_shared = getattr(config, "n_shared_experts", None) or getattr(
+                config, "num_shared_experts", None
+            )
             if moe_inter is not None and n_shared is not None:
                 inter = moe_inter * n_shared
         return inter, config.hidden_size
