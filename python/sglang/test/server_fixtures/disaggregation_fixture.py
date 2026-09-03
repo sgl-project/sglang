@@ -508,15 +508,6 @@ def _maybe_set_roce_gid_index(ib_devices) -> bool:
 
 
 def _maybe_set_ucx_net_devices(ib_devices) -> bool:
-    """Pin UCX to the test's RDMA devices; return True if this call set it.
-
-    The NIXL backend does not consume --disaggregation-ib-device, so UCX falls
-    back to opening every RDMA device on the host. On runners with many NICs
-    (e.g. 8 IB ports plus a RoCE bond) that full-device init can stall for
-    minutes inside the driver, which surfaces as a hung create_backend. Scoping
-    UCX_NET_DEVICES to the two devices the fixture already selected keeps NIXL
-    on the same NICs as mooncake. A user-provided UCX_NET_DEVICES is left as is.
-    """
     if not ib_devices or os.environ.get("UCX_NET_DEVICES"):
         return False
     if ib_devices.lstrip().startswith("{"):
@@ -526,6 +517,8 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     if not devices:
         return False
     net_devices = ",".join(f"{d}:1" for d in devices)
+    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
+    # device on the host, and that full-device init can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices
     logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

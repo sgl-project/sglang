@@ -3462,8 +3462,6 @@ def parse_connector_type(url: str) -> str:
 
 
 def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
-    """A call that overruns ``timeout_s`` cannot be cancelled: the caller must
-    abort process startup, which reaps the daemon thread still stuck in it."""
     result: list = []
     error: list = []
 
@@ -3473,6 +3471,7 @@ def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> 
         except BaseException as e:
             error.append(e)
 
+    # An overrunning fn cannot be cancelled; only process exit reaps the daemon thread.
     thread = threading.Thread(target=_target, daemon=True)
     thread.start()
     thread.join(timeout_s)
