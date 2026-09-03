@@ -352,8 +352,7 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         request_tps = f"{per_request:.2f}" if per_request is not None else "—"
         tpf = f"{tokens_per_forward:.3f}" if tokens_per_forward is not None else "—"
         lines.append(
-            f"| {name} | {metrics['accuracy']:.2%} | "
-            f"{tpf} | {tps} | {request_tps} |"
+            f"| {name} | {metrics['accuracy']:.2%} | {tpf} | {tps} | {request_tps} |"
         )
     lines.extend(
         [

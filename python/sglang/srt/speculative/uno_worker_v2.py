@@ -475,8 +475,9 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_seq_lens_cpu = None
             draft_seq_lens_sum = None
 
-        draft_positions = committed_seq_lens.to(torch.int64)[:, None] + (
-            self._tail_offsets[None, : self.forward_width]
+        draft_positions = (
+            committed_seq_lens.to(torch.int64)[:, None]
+            + (self._tail_offsets[None, : self.forward_width])
         )
         req_pool_indices_long = batch.req_pool_indices.to(torch.int64)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
@@ -663,8 +664,8 @@ class UnoWorkerV2(BaseSpecWorker):
             draft_seq_lens_sum = None
             verify_seq_lens_sum = None
 
-        logical_positions = committed_seq_lens.to(torch.int64)[:, None] + (
-            self._tail_offsets[None, :]
+        logical_positions = (
+            committed_seq_lens.to(torch.int64)[:, None] + (self._tail_offsets[None, :])
         )
         req_pool_indices_long = batch.req_pool_indices.to(torch.int64)
         req_to_token = self.model_runner.req_to_token_pool.req_to_token

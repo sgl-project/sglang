@@ -350,9 +350,7 @@ def _build_tree_kernel(
             + batch * PROB_BATCH_STRIDE
             + selected_depth * PROB_DEPTH_STRIDE
             + selected_rank * PROB_RANK_STRIDE
-        ).to(
-            tl.float32
-        )
+        ).to(tl.float32)
         selected_token = tl.load(
             top_token_ids
             + batch * TOKEN_BATCH_STRIDE
