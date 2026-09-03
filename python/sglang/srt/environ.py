@@ -1118,10 +1118,6 @@ class Envs:
     # Prefill: True uses DeepEP's expanded layout (skips ep_scatter); False uses
     # the non-expand ep_scatter/ep_gather path.
     SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND = EnvBool(True)
-    # Prefill do_expand: fold topk weights into down_proj's fp32 input scale
-    # (exact) instead of scaling the bf16 down_output; False keeps
-    # scale_expanded_rows_. Ignored under ue8m0 (scale is a power of two).
-    SGLANG_DEEPEP_V2_FUSE_WEIGHT_INTO_SCALE = EnvBool(True)
     # GPU-side ElasticBuffer barrier timeout (seconds); raise it so idle ranks
     # tolerate the first-request JIT compile. 0 keeps DeepEP's default (100s).
     SGLANG_DEEPEP_V2_GPU_TIMEOUT_SECS = EnvInt(0)

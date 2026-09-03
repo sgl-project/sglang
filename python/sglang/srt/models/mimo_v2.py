@@ -434,8 +434,6 @@ class MiMoV2MoE(nn.Module):
         )
 
         # todo : implement tbo forward needed
-        # is_deepep_v2() must be included or deepep_v2 skips this branch and
-        # leaves ep_size / num_experts unset.
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_deepep_v2()

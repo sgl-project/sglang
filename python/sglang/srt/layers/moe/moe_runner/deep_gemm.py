@@ -497,17 +497,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             torch.cuda.synchronize()
             logger.warning("DeepEP v2 expanded contig activation returned")
 
-        # down_proj is linear and fp8 dequant is fp8_q * scale, so folding the
-        # per-row topk weight into down_input's fp32 scale is exact and lets combine
-        # skip weighting the [all_tokens, H] bf16 down_output. Not for ue8m0 (scale
-        # is a power of two; scale*w would need re-rounding).
+        # down_proj is linear and fp8 dequant is q*scale, so folding the per-row topk
+        # weight into down_input's fp32 scale is exact and skips weighting the bf16
+        # down_output. ue8m0 scale is a power of two, so it weights down_output instead.
         deepep_v2_expanded = running_state.get(
             "deepep_v2_expanded", False
         ) and not running_state.get("deepep_v2_masked", False)
         fuse_weight_into_scale = (
             deepep_v2_expanded
             and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and envs.SGLANG_DEEPEP_V2_FUSE_WEIGHT_INTO_SCALE.get()
             and running_state.get("topk_weights") is not None
         )
         if fuse_weight_into_scale:
@@ -1680,8 +1678,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
                 expected_m=deepep_v2_expected_m,
             )
 
-        # Real expert id per row (incl. padding) straight from device psum; padding
-        # rows compute harmless garbage that combine skips via handle metadata.
         num_local_experts = psum_num_recv_tokens_per_expert.shape[0]
         m_indices = fill_m_indices_from_psum(
             psum_num_recv_tokens_per_expert,
@@ -1712,7 +1708,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
         (all_tokens, K), device=hidden_states.device, dtype=hidden_states.dtype
     )
     if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-        # Packed UE8M0 scales require zero padding lanes.
         input_tensor_scale = torch.zeros(
             (ceil_div(K // 128, 4), all_tokens),
             device=hidden_states.device,
@@ -1724,7 +1719,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
         )
     m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
-    # Contiguous psum already includes the 128-row expert alignment.
     expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
     ep_scatter_from_psum(
         hidden_states,
@@ -1764,7 +1758,6 @@ def post_permute_deep_gemm_to_deepep_v2(
         hidden_states = runner_output.hidden_states
         topk_weights = running_state["topk_weights"]
         if running_state.get("deepep_v2_masked", False):
-            # Expanded combine does not consume top-k weights.
             from sglang.kernels.ops.moe.ep_moe_kernels import masked_slab_to_expand
 
             hidden_states = masked_slab_to_expand(
@@ -1778,9 +1771,8 @@ def post_permute_deep_gemm_to_deepep_v2(
         if topk_weights is not None and not running_state.get(
             "deepep_v2_weight_prefused", False
         ):
-            # Weight the expanded rows in place before combine (which ignores
-            # topk_weights in expand mode); coalesced kernel, ~3x over mul_.
-            # Skipped when the weight was already folded into down_input's scale.
+            # Weight the expanded rows before combine (skipped when already folded
+            # into down_input's scale); combine ignores topk_weights in expand mode.
             from sglang.kernels.ops.moe.ep_moe_kernels import scale_expanded_rows_
 
             scale_expanded_rows_(hidden_states, topk_weights)

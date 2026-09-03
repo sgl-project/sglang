@@ -175,6 +175,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -1084,9 +1085,6 @@ class ModelRunner:
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
-        # Build the deepep_v2 ElasticBuffer here (after capture, before serving) so
-        # the first request does not pay the lazy build. Skip if decode graph
-        # capture already built it; the eager / PD-prefill path needs it explicit.
         decode_runner_captured = (
             self.decode_cuda_graph_runner is not None
             and not isinstance(self.decode_cuda_graph_runner, EagerRunner)
@@ -1094,8 +1092,8 @@ class ModelRunner:
         if not decode_runner_captured:
             prebuild_deepep_v2_buffers(
                 model=self.model,
-                disaggregation_mode=self.server_args.disaggregation_mode,
-                chunked_prefill_size=self.server_args.chunked_prefill_size,
+                disaggregation_mode=get_disagg().disaggregation_mode,
+                chunked_prefill_size=get_schedule().chunked_prefill_size,
                 attn_tp_size=get_parallel().attn_tp_size,
             )
 

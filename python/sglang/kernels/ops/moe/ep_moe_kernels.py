@@ -1315,6 +1315,8 @@ def ep_scatter_from_psum(
         output_index,
         output_index.stride(0),
         output_index.stride(1),
+        0,
+        num_experts,
         topk_num=recv_topk.shape[1],
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
@@ -2633,10 +2635,8 @@ def _fwd_kernel_scale_expanded_rows(
     BLOCK_H: tl.constexpr,
     HIDDEN_IS_MULTIPLE: tl.constexpr,
 ):
-    # In-place row scaling x[r,:] *= weight[r]; hand-written because
-    # x.mul_(w.unsqueeze(1))'s stride-0 broadcast forces the scalar kernel.
-    # x_stride1 handles column-major views (e.g. the transposed fp8 down_input
-    # scale) where the hidden axis is not unit-stride.
+    # In-place row scaling x[r,:] *= weight[r]; x_stride1 handles column-major
+    # views like the transposed fp8 down_input scale (hidden axis not unit-stride).
     row = tl.program_id(0).to(tl.int64)
     blk = tl.program_id(1)
 
@@ -2669,9 +2669,9 @@ def scale_expanded_rows_(
     """
     assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
     rows, hidden = x.shape
-    assert (
-        row_weights.numel() >= rows
-    ), f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    assert row_weights.numel() >= rows, (
+        f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    )
 
     if rows == 0:
         return x
