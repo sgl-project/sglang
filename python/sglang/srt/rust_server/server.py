@@ -35,6 +35,7 @@ from sglang.srt.utils.flatten import (
     NestedRowColumns,
     RaggedPairColumns,
 )
+from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
@@ -76,24 +77,11 @@ class RustServer:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         server_args = scheduler.server_args
-        # `TokenizerManager` merges these under each request's own sampling params
-        # (`{**preferred, **obj.sampling_params}`), and this server replaces that
-        # manager wholesale — so honouring the flag is not implemented here yet.
-        # Refuse rather than run: silently dropping it means generating with
-        # sampling the operator did not configure, and `/get_model_info` would go on
-        # advertising values no request ever receives.
-        if get_serving().preferred_sampling_params:
-            raise ValueError(
-                "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
-                "(the Python TokenizerManager merges it into every request; the rust "
-                "ingress has no equivalent). Launch without SGLANG_RUST_SERVER, or "
-                "drop --preferred-sampling-params and send those values per request."
-            )
         # Per-DP-rank HTTP port with client load balancing. `None` when DP is off,
         # so the rank is not conflated with rank 0 of a one-rank group.
         dp_rank = scheduler.ps.attn_dp_rank if scheduler.ps.dp_size > 1 else None
         listen_port = get_serving().port + (dp_rank or 0)
-        listen_addr = f"{get_serving().host}:{listen_port}"
+        listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
         launch_cores, server_cores = _partition_cores(
             mm_workers=(
@@ -242,9 +230,9 @@ class RustServer:
 
         # Invariant: control requests always carry a rust-minted rid; without
         # one the response is unroutable, so fail loudly rather than drop it.
-        assert (
-            recv_req.rid is not None
-        ), f"control response without rid: {type(output).__name__}"
+        assert recv_req.rid is not None, (
+            f"control response without rid: {type(output).__name__}"
+        )
         # No local try/except: a failed push propagates to run_scheduler_process's
         # outer handler, which logs the full traceback (scheduler-fatal either way).
         payload = (
@@ -371,7 +359,9 @@ class RustServer:
                     assert len(col) in (
                         0,
                         batch_size,
-                    ), f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    ), (
+                        f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
+                    )
                     populated |= len(col) > 0
                 if populated:
                     active.append(extra)

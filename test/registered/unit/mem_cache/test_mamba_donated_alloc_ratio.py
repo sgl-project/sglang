@@ -117,7 +117,9 @@ class TestMambaRatioEnvGate(unittest.TestCase):
         strategy = (
             "extra_buffer_lazy"
             if lazy
-            else "extra_buffer" if extra_buffer else "no_buffer"
+            else "extra_buffer"
+            if extra_buffer
+            else "no_buffer"
         )
         from sglang.srt import runtime_context as rc
 
