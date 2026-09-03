@@ -208,6 +208,7 @@ class AttentionBackend(ABC):
         shape: Union[int, Iterable[int]],
         dtype: torch.dtype,
         device,
+        *,
         fill_value: float = 0,
     ) -> torch.Tensor:
         return alloc_graph_state_buffer(
@@ -216,7 +217,7 @@ class AttentionBackend(ABC):
             (shape,) if isinstance(shape, int) else tuple(shape),
             dtype,
             device,
-            fill_value,
+            fill_value=fill_value,
         )
 
     def share_cuda_graph_state_dict(

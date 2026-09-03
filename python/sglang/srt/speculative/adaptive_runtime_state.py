@@ -66,16 +66,6 @@ class AdaptiveSpecPolicy(Protocol):
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
 
-def adaptive_build_order(policy: AdaptiveSpecPolicy) -> list[int]:
-    """Candidate steps by descending graph footprint (captured batch size,
-    then steps); the state built first owns the pooled graph buffers."""
-
-    def graph_footprint(steps: int) -> tuple[int, int]:
-        return (max(policy.cuda_graph_bs_for_step(steps) or [0]), steps)
-
-    return sorted(policy.candidate_steps, key=graph_footprint, reverse=True)
-
-
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
@@ -84,8 +74,7 @@ class AdaptiveController:
       - apply_runtime_state(state) → apply it to the worker
 
     The worker only needs to:
-      1. Call register() for the initial state, then init_states()
-         once during startup.
+      1. Call init_states() once during startup.
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
@@ -97,31 +86,18 @@ class AdaptiveController:
         self.worker = worker
         self.params: AdaptiveSpecPolicy = policy
         self._states: dict[int, SpecRuntimeState] = {}
+        self._active_state: SpecRuntimeState | None = None
 
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
 
-    def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
-        """Register a pre-built runtime state.
-
-        *steps* defaults to state.speculative_num_steps when not given.
-        """
-        key = steps if steps is not None else state.speculative_num_steps
-        self._states[key] = state
-
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
-        """Build and register runtime states for all candidate steps.
-
-        The remaining states are built in ``adaptive_build_order`` so the
-        narrower ones alias the pooled graph buffers of the first state.
-        """
+        """Build the runtime state of every candidate step, largest graph
+        footprint first so the rest alias its pooled buffers."""
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
         for steps in self._build_order():
-            if steps in self._states:
-                continue
-
             pruned_bs = self.params.cuda_graph_bs_for_step(steps)
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
@@ -134,7 +110,11 @@ class AdaptiveController:
         self._activate(self.worker.speculative_num_steps)
 
     def _build_order(self) -> list[int]:
-        return adaptive_build_order(self.params)
+        def graph_footprint(steps: int) -> tuple[int, int, int]:
+            max_bs = max(self.params.cuda_graph_bs_for_step(steps) or [0])
+            return (max_bs * (steps + 1), max_bs, steps)
+
+        return sorted(self.candidate_steps, key=graph_footprint, reverse=True)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = self.params.get_steps_for_batch(batch_size)
@@ -157,4 +137,7 @@ class AdaptiveController:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
+        if state is self._active_state:
+            return
         self.worker.apply_runtime_state(state)
+        self._active_state = state

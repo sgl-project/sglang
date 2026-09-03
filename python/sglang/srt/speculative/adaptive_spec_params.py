@@ -6,7 +6,6 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 from __future__ import annotations
 
 import bisect
-import contextlib
 import json
 import logging
 import math
@@ -17,8 +16,6 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_spec
-from sglang.srt.speculative.adaptive_runtime_state import adaptive_build_order
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -140,51 +137,6 @@ def resolve_candidate_steps_from_config(
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
-
-
-def resolve_initial_capture_spec(
-    *, initial_steps: int, cfg_path: str | None, cuda_graph_bs: list[int] | None
-) -> tuple[int, list[int] | None]:
-    """The candidate captured first owns the pooled graph buffers, so the
-    initial capture takes the largest-footprint candidate and its pruned
-    batch sizes (``None`` keeps the full list)."""
-    policy = AdaptiveSpeculativeParams(initial_steps=initial_steps, cfg_path=cfg_path)
-    policy.set_cuda_graph_bs(cuda_graph_bs)
-    steps = adaptive_build_order(policy)[0]
-    return steps, policy.cuda_graph_bs_for_step(steps) or None
-
-
-@contextlib.contextmanager
-def initial_capture_override(
-    *, initial_steps: int, cfg_path: str | None, cuda_graph_bs: list[int] | None
-):
-    spec = get_spec()
-    backup = (
-        spec.speculative_num_steps,
-        spec.speculative_num_draft_tokens,
-        get_exec().graph.cuda_graph_bs_decode,
-    )
-    steps, pruned_bs = resolve_initial_capture_spec(
-        initial_steps=initial_steps, cfg_path=cfg_path, cuda_graph_bs=cuda_graph_bs
-    )
-    get_context().override(
-        "adaptive_spec.capture_override",
-        speculative_num_steps=steps,
-        speculative_num_draft_tokens=steps + 1,
-    )
-    if pruned_bs is not None:
-        get_context().override(
-            "adaptive_spec.capture_override", cuda_graph_bs_decode=pruned_bs
-        )
-    try:
-        yield steps
-    finally:
-        get_context().override(
-            "adaptive_spec.capture_restore",
-            speculative_num_steps=backup[0],
-            speculative_num_draft_tokens=backup[1],
-            cuda_graph_bs_decode=backup[2],
-        )
 
 
 class AdaptiveStepSlot:

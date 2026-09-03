@@ -1071,7 +1071,7 @@ class TritonAttnBackend(AttentionBackend):
                 (max_num_tokens,),
                 torch.int32,
                 self.device,
-                self.max_kv_splits,
+                fill_value=self.max_kv_splits,
             )
         else:
             self.cuda_graph_num_kv_splits = cuda_graph_num_kv_splits_buf
@@ -1124,7 +1124,7 @@ class TritonAttnBackend(AttentionBackend):
                 (max_num_tokens,),
                 torch.int32,
                 self.device,
-                self.max_kv_splits,
+                fill_value=self.max_kv_splits,
             )
 
             self.cuda_graph_window_kv_offsets = self.alloc_cuda_graph_state(
@@ -2156,7 +2156,7 @@ class TritonMultiStepDraftBackend:
             (max_num_tokens,),
             torch.int32,
             self.device,
-            self.attn_backends[0].max_kv_splits,
+            fill_value=self.attn_backends[0].max_kv_splits,
         )
 
         for i in range(self.speculative_num_steps - 1):

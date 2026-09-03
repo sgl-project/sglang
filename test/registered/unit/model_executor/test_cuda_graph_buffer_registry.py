@@ -707,7 +707,12 @@ class TestPoolBackedAlloc(unittest.TestCase):
             "adaptive.target", "kv_indices", (8, 4), torch.int64, "cpu"
         )
         draft = input_buffers.alloc_graph_state_buffer(
-            "adaptive.draft_extend", "kv_indices", (8, 4), torch.int64, "cpu", 3
+            "adaptive.draft_extend",
+            "kv_indices",
+            (8, 4),
+            torch.int64,
+            "cpu",
+            fill_value=3,
         )
         self.assertEqual(target_b.data_ptr(), target_a.data_ptr())
         self.assertEqual(tuple(target_b.shape), (8, 4))

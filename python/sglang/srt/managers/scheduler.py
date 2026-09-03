@@ -1040,7 +1040,11 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
-        self.tp_worker.init_cuda_graphs()
+        self.tp_worker.init_cuda_graphs(
+            capture_decode_cuda_graph=not getattr(
+                self.draft_worker, "owns_target_decode_graphs", False
+            )
+        )
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 

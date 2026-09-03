@@ -305,6 +305,10 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    @property
+    def owns_target_decode_graphs(self) -> bool:
+        return False
+
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()

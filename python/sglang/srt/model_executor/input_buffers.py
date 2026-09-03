@@ -28,8 +28,7 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     registrants keep the tensors their graphs were captured against, so no
     already-captured buffer is ever repointed. Because a smaller request never
     allocates, the footprint depends on registration order: the adaptive
-    worker captures the largest-footprint candidate (batch size, then steps)
-    first and builds the remaining states in that same order.
+    controller builds its states largest graph footprint first.
 
     This pool governs *every* ``share_buffers()`` caller. Cross-runner sharing
     is safe because these are per-replay inputs: each runner fills the region
@@ -69,10 +68,10 @@ def alloc_graph_state_buffer(
     shape: Tuple[int, ...],
     dtype: torch.dtype,
     device,
+    *,
     fill_value: float = 0,
 ) -> torch.Tensor:
-    """Pool-first variant of ``share_graph_state_buffer``: allocate only when no
-    canonical with enough rows exists."""
+    """Pool-first ``share_graph_state_buffer``: allocate only on a miss."""
     device = torch.device(device)
     if namespace is not None:
         key: _PoolKey = (f"{namespace}.{name}", dtype, device, tuple(shape[1:]))
@@ -91,9 +90,7 @@ def alloc_graph_state_grid(
     dtype: torch.dtype,
     device,
 ) -> torch.Tensor:
-    """Pool a 2-D ``(rows, cols)`` grid whose rows are consumed independently
-    (the per-step draft kv_indices): a request that fits inside the canonical
-    grid gets the strided corner view ``canonical[:rows, :cols]``."""
+    """Pool a 2-D grid as the corner view ``canonical[:rows, :cols]``."""
     device = torch.device(device)
     if namespace is None:
         return torch.zeros((rows, cols), dtype=dtype, device=device)

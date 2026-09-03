@@ -1273,8 +1273,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
     def _stage_hidden_states(self, out) -> None:
-        """Copy the graph's hidden-state output into the process-wide static
-        buffer so per-shape (and per adaptive-state) activations are released."""
+        """Stage hidden states into the shared static output buffer."""
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.hidden_states is None
