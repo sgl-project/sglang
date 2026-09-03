@@ -1072,9 +1072,7 @@ class HiSparseCoordinator:
             num_tokens_per_req,
             dtype=torch.int64,
             device=seq_lens.device,
-        ).repeat(
-            num_reqs
-        )
+        ).repeat(num_reqs)
 
         full_to_device_mapping = (
             self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
@@ -1771,9 +1769,9 @@ class HiSparseCoordinator:
         self.finish_pending_draft_extend_backup()
         self.finish_pending_mtp_demand_commit()
 
-        self._reset_mtp_demand_request_state(req.req_pool_idx)
-        self._free_mtp_demand_buffer(req.req_pool_idx)
-        self._reset_mtp_union_request_state(req.req_pool_idx)
+        self._reset_mtp_demand_request_state(req.kv.req_pool_idx)
+        self._free_mtp_demand_buffer(req.kv.req_pool_idx)
+        self._reset_mtp_union_request_state(req.kv.req_pool_idx)
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1790,7 +1788,7 @@ class HiSparseCoordinator:
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-        mtp_staging = self.req_to_mtp_staging[req.req_pool_idx]
+        mtp_staging = self.req_to_mtp_staging[req.kv.req_pool_idx]
         if mtp_staging.numel() > 0:
             allocated_mtp_staging = mtp_staging[mtp_staging > 0]
             if allocated_mtp_staging.numel() > 0:

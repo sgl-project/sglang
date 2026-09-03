@@ -177,7 +177,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_global_dwdp_manager,
     get_lora,
-    get_memory,
     get_model,
     get_observability,
     get_parallel,

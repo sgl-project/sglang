@@ -1,6 +1,9 @@
 import unittest
 
 from sglang.kernels.ops.attention.flash_attention_v3 import _call_fa3_kernel
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestFlashAttentionV3Compatibility(unittest.TestCase):

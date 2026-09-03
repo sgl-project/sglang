@@ -811,9 +811,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if kvc.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            self.c4_shrink_factor = parse_hisparse_config(
-                kvc.server_args
-            ).host_to_device_ratio
+            self.c4_shrink_factor = parse_hisparse_config().host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1

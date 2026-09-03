@@ -1814,7 +1814,7 @@ class TestHiSparseUnit(unittest.TestCase):
             )
         topk = torch.stack(rows).unsqueeze(0)
         req_pool_indices = torch.tensor(
-            [req.req_pool_idx], dtype=torch.int64, device="cuda"
+            [req.kv.req_pool_idx], dtype=torch.int64, device="cuda"
         )
         seq_lens = torch.full((4,), fill_len, dtype=torch.int32, device="cuda")
         self.coordinator.num_real_reqs.fill_(1)

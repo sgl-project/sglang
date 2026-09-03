@@ -55,7 +55,7 @@ class TestHisparseDecodeBatchReqPoolCpu(unittest.TestCase):
                 topk_index=torch.tensor([[token]]),
                 hidden_states=torch.tensor([[probability]]),
                 bonus_tokens=torch.tensor([req.output_ids[-1]]),
-                future_indices=torch.tensor([req.req_pool_idx]),
+                future_indices=torch.tensor([req.kv.req_pool_idx]),
             )
 
         with patch(
