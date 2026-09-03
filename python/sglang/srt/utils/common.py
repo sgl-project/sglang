@@ -476,7 +476,8 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         total_free_memory = psutil.virtual_memory().available
-        n_numa_node: int = len(get_cpu_ids_by_node()[1])
+        (mode, cpu_ids_by_node) = get_cpu_ids_by_node()
+        n_numa_node: int = len(cpu_ids_by_node)
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
@@ -4171,12 +4172,11 @@ def parse_lscpu_topology():
     for line in output.splitlines():
         if not line.startswith("#"):
             parts = re.split(r"[,:]+", line)
-            parts = [int(p) for p in parts if p.strip()]
-            if len(parts) != 8:
-                logger.warning("Skipping malformed lscpu line: %s", line.strip())
-                continue
+            line_info = list()
+            for p in parts:
+                line_info.append(int(p) if p.isdigit() else 0)
             # (cpu, core, socket, node, L3)
-            cpu_info.append(parts[:4] + [parts[-1]])
+            cpu_info.append(line_info[:4] + [line_info[-1]])
 
     # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
