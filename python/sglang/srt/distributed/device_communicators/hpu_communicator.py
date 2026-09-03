@@ -13,7 +13,6 @@ if is_hpu():
 
 
 class HpuCommunicator:
-
     def __init__(self, group: ProcessGroup):
         if not is_hpu():
             self.disabled = True
