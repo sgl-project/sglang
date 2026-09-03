@@ -207,7 +207,8 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
-    req = SimpleNamespace(num_frames=345, width=1344, height=768)
+    # the generic builder rewrites req.num_frames (17 here); the flag wins
+    req = SimpleNamespace(num_frames=17, width=1344, height=768)
     default = MiniMaxH3SamplingParams._synthetic_warmup_target(
         req, SimpleNamespace(warmup_num_frames=None, warmup_resolutions=None)
     )

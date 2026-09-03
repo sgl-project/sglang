@@ -171,11 +171,14 @@ class MiniMaxH3SamplingParams(SamplingParams):
             "aspect_ratio": "16:9",
             "duration_seconds": 5.0,
         }
-        if getattr(server_args, "warmup_num_frames", None) is not None:
-            num_frames = int(req.num_frames)
+        warmup_num_frames = getattr(server_args, "warmup_num_frames", None)
+        if warmup_num_frames is not None:
+            # Read the flag itself: the generic builder re-derives req.num_frames
+            # from the VAE temporal geometry, which is not the H3 contract. H3
+            # delivers 24 fps and its resolver aligns the count to 17n+5.
+            num_frames = int(warmup_num_frames)
             if num_frames <= 0:
                 raise ValueError("--warmup-num-frames must be positive for MiniMax H3")
-            # H3 delivers 24 fps; the resolver aligns the frame count to 17n+5
             target["duration_seconds"] = num_frames / 24.0
         if getattr(server_args, "warmup_resolutions", None) is not None:
             width, height = int(req.width), int(req.height)
