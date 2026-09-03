@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    mamba_spec_conv_window_tail_offset,
     resolve_dcp_dst_entry_indices,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -1356,9 +1357,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
-                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
-                    src_item_lens
-                ) != list(dst_item_lens):
+                need_tp_slice = (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                )
+                if (
+                    need_tp_slice
+                    and (not src_dim_per_tensor or not dst_dim_per_tensor)
+                    and list(src_item_lens) != list(dst_item_lens)
+                ):
                     raise RuntimeError(
                         "Mamba state layouts differ between prefill and decode "
                         f"(src item_lens={src_item_lens}, dst item_lens="
@@ -1403,6 +1411,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            dst_item_lens,
                         )
                         or rc
                     )
@@ -1501,6 +1510,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_state_item_lens: Optional[list[int]] = None,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1514,10 +1524,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
-            length = src_state_item_lens[i]
-            src_addr = src_state_data_ptrs[i] + length * int(prefill_mamba_index[0])
-            dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
-            transfer_blocks.append((src_addr, dst_addr, length))
+            src_item_len = src_state_item_lens[i]
+            dst_item_len = (
+                dst_state_item_lens[j]
+                if dst_state_item_lens and j < len(dst_state_item_lens)
+                else src_item_len
+            )
+            if src_item_len > dst_item_len > 0:
+                raise RuntimeError(
+                    "Prefill mamba/KDA slot is larger than decode "
+                    f"(src item_len={src_item_len}, dst item_len={dst_item_len}). "
+                    "Decode must allocate at least the committed conv window."
+                )
+            src_addr = src_state_data_ptrs[i] + src_item_len * int(
+                prefill_mamba_index[0]
+            )
+            dst_addr = (
+                dst_state_ptr
+                + dst_item_len * int(dst_mamba_index[0])
+                + mamba_spec_conv_window_tail_offset(src_item_len, dst_item_len)
+            )
+            transfer_blocks.append((src_addr, dst_addr, src_item_len))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
@@ -1569,6 +1596,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+                dst_state_item_lens,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -1588,6 +1616,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_item_len = dst_state_item_lens[j]
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[j]
+            # Slice as if conv windows matched, then shift into the spec tail.
+            same_window_dst_item_len = (
+                src_item_len // src_dim * dst_dim
+                if src_dim > 0
+                else dst_item_len
+            )
+            window_tail = mamba_spec_conv_window_tail_offset(
+                src_item_len, dst_item_len, src_dim, dst_dim
+            )
 
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
@@ -1606,7 +1643,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 bytes_to_send,
             ) in compute_mamba_state_slice_byte_blocks(
                 src_item_len=src_item_len,
-                dst_item_len=dst_item_len,
+                dst_item_len=same_window_dst_item_len,
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
@@ -1622,7 +1659,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     + src_offset
                 )
                 dst_addr = (
-                    dst_state_ptr + dst_item_len * int(dst_mamba_index[0]) + dst_offset
+                    dst_state_ptr
+                    + dst_item_len * int(dst_mamba_index[0])
+                    + dst_offset
+                    + window_tail
                 )
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
