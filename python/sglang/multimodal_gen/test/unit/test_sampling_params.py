@@ -26,8 +26,10 @@ from sglang.multimodal_gen.configs.sample.glmimage import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    QUALITY_LEVELS,
     SamplingParams,
     _json_safe,
+    quality_allows_kernel_fusions,
 )
 from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
@@ -52,9 +54,15 @@ class TestSamplingParamsValidate(unittest.TestCase):
     def test_quality_defaults_to_lossless(self):
         self.assertEqual(SamplingParams().quality, "lossless")
 
-    def test_quality_accepts_the_two_validated_levels(self):
-        self.assertEqual(SamplingParams(quality="lossless").quality, "lossless")
-        self.assertEqual(SamplingParams(quality="high").quality, "high")
+    def test_quality_levels_are_cumulative(self):
+        self.assertEqual(QUALITY_LEVELS, ("lossless", "extra-high", "high"))
+        for quality in QUALITY_LEVELS:
+            with self.subTest(quality=quality):
+                self.assertEqual(SamplingParams(quality=quality).quality, quality)
+
+        self.assertFalse(quality_allows_kernel_fusions("lossless"))
+        self.assertTrue(quality_allows_kernel_fusions("extra-high"))
+        self.assertTrue(quality_allows_kernel_fusions("high"))
 
     def test_quality_rejects_invalid_values(self):
         for bad in ("ultra", "draft", "fast", "", True, 1):
@@ -338,9 +346,11 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
     def test_quality_is_request_scoped_cli_arg(self):
         self.assertNotIn("quality", self._parse_cli_kwargs([]))
-        self.assertEqual(
-            self._parse_cli_kwargs(["--quality", "high"])["quality"], "high"
-        )
+        for quality in ("extra-high", "high"):
+            with self.subTest(quality=quality):
+                self.assertEqual(
+                    self._parse_cli_kwargs(["--quality", quality])["quality"], quality
+                )
 
     def test_get_cli_args_maps_spectrum_prefixed_flags(self):
         kwargs = self._parse_cli_kwargs(

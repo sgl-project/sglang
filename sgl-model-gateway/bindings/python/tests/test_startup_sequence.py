@@ -788,7 +788,7 @@ def test_find_available_ports_and_wait_health(monkeypatch):
     monkeypatch.setattr(
         ls.time,
         "perf_counter",
-        lambda: (base.__setitem__("t", base["t"] + 0.1) or base["t"]),
+        lambda: base.__setitem__("t", base["t"] + 0.1) or base["t"],
     )
 
     assert ls.wait_for_server_health("127.0.0.1", 12345, timeout=1)
@@ -922,7 +922,6 @@ def test_launch_server_process_declares_on_a_resolved_record(monkeypatch):
         )
 
         with patch("sglang_router.launch_router.logger") as mock_logger:
-
             with pytest.raises(
                 ValueError, match="PD disaggregation mode requires --prefill"
             ):
