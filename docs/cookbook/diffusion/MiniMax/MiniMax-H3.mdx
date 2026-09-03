@@ -1382,14 +1382,17 @@ and the same clip length:
 | OpenVDN reference, FP8, 4× B200 Ulysses (standard / 3+1 branch-parallel) | 2.68 / 2.61 | 21.4 / 20.9 s | – | – |
 | SGLang, BF16, 1× B200, DiT layerwise offload (auto policy) | 7.86 | 64.1 s | 9.5 s | 147,608 MB |
 | SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
+| SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
 | SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed` | **2.51** | 23.2 s | 3.5 s | 97,894 MB |
 | SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed` | **2.44** | 22.5 s | 3.4 s | 63,022 MB |
 
 On one B200 the auto memory policy streams the DiT layers from host memory
 (the 62 GB DiT, the 66 GB conditioner and the VAEs do not all fit resident
-with the 120 GB headroom the policy keeps), so the single-GPU rows are
-transfer-bound; `--layerwise-offload-components text_encoder` keeps the DiT
-resident instead. Per DiT block the hybrid attention costs about 117 ms at this
+with the 120 GB headroom the policy keeps); keeping the FP8 DiT resident with
+`--layerwise-offload-components text_encoder` changes nothing measurable, so
+the single-GPU rows are compute-bound. The BF16 DiT does not fit resident at
+this clip length on one 183 GB card (the 104k-row activations alone take
+about 100 GB). Per DiT block the hybrid attention costs about 117 ms at this
 shape (window FlashAttention 46 ms, projections 24 ms, the linear branch and
 its fused kernels the rest); the in-tree tile kernel (`vdn_window_kernel:
 "tiles"`) measures 226 ms against 169 ms for the decomposed path before the
