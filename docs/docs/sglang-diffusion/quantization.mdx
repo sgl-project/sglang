@@ -469,21 +469,25 @@ into the same rotate kernel; both are bitwise identical to the per-linear ops.
 sglang generate \
   --model-path Qwen/Qwen-Image \
   --quantization convrot_int8_customkernel \
-  --quantization-ignored-layers img_mod txt_mod txt_mlp.net.2 \
   --prompt "a beautiful sunset" \
   --save-output
 ```
 
-The ignored-layer list above keeps the three Qwen-Image shapes in BF16 whose
-GEMMs see only a handful of rows (AdaLN modulation, text-stream FFN
-down-projection): there the rotate-quantize launch plus a CTA-starved INT8
-GEMM costs more than the BF16 GEMM it replaces.
+Every eligible linear is quantized: the Qwen-Image DiT weights halve (38.0 to
+19.0 GiB) and peak GPU memory at 1024x1024 drops from 56 GB to 37 GB. Adding
+`--quantization-ignored-layers img_mod txt_mod txt_mlp.net.2` keeps the three
+shapes whose GEMMs see only a handful of rows (AdaLN modulation, text-stream FFN
+down-projection) in BF16. It saves less memory (45.5 GB peak) and its speed
+relative to full quantization differs between hosts (faster on one GB200 host,
+slower on another), so use it only where speed matters more than memory.
 
 Measured end to end against BF16 on Qwen-Image (1024x1024, 50 steps, CFG 4) on
-GB200: 1.11x on one GPU and 1.07x on two GPUs with CFG parallelism. The fused op
-itself runs 1.12x-1.66x faster than the cuBLAS BF16 GEMM at the Qwen-Image
-shapes on H200. A follow-up change to the denoising loop widens these margins on
-1, 2 and 4 GPUs; its numbers are reported with that change.
+GB200 with every layer quantized: 1.09x on one GPU and 1.09x on two GPUs with
+CFG parallelism; with the ignore list, 1.03x to 1.11x on one GPU depending on
+the host and 1.04x to 1.07x on two. The fused op itself runs 1.12x-1.66x faster than the cuBLAS BF16
+GEMM at the Qwen-Image shapes on H200 and 1.5x on the FFN up-projection on GB200.
+A follow-up change to the denoising loop widens these margins on 1, 2 and 4
+GPUs; its numbers are reported with that change.
 
 <Warning>
 `convrot_int8_customkernel` is approximate: same-seed outputs are visually
