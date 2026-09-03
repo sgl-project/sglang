@@ -267,7 +267,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
                     seed=(
                         _seed_override
                         if _seed_override is not None
-                        else self.seed if isinstance(self.seed, int) else None
+                        else self.seed
+                        if isinstance(self.seed, int)
+                        else None
                     ),
                 )
             )
