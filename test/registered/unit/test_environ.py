@@ -53,6 +53,22 @@ class TestEnvField(unittest.TestCase):
         self.assertTrue(envs.SGLANG_TEST_RETRACT.is_set())
         self.assertIsNone(envs.SGLANG_TEST_RETRACT.get())
 
+    def test_override_restores_on_exception(self):
+        # The env var must be restored even when the `with` body raises;
+        # otherwise it leaks into os.environ for the rest of the process.
+        envs.SGLANG_TEST_RETRACT.set(True)
+        with self.assertRaises(RuntimeError):
+            with envs.SGLANG_TEST_RETRACT.override(False):
+                self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
+                raise RuntimeError("boom")
+        self.assertIs(envs.SGLANG_TEST_RETRACT.get(), True)
+
+        envs.SGLANG_TEST_RETRACT.clear()
+        with self.assertRaises(RuntimeError):
+            with envs.SGLANG_TEST_RETRACT.override(False):
+                raise RuntimeError("boom")
+        self.assertFalse(envs.SGLANG_TEST_RETRACT.is_set())
+
     def test_override_with_exit_stack(self):
         envs.SGLANG_TEST_RETRACT.set(None)
         exit_stack = ExitStack()
