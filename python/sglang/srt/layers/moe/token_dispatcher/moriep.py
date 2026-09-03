@@ -492,6 +492,7 @@ class _MoriEPDispatcherImplBase:
 
         return (
             resolve_aiter_dispatch_format(
+                self.quant_config.get("quant_type"),
                 self.quant_config.get("weight_dtype"),
                 activation=self.quant_config.get("activation", "silu"),
                 swiglu_limit=self.quant_config.get("swiglu_limit"),
@@ -593,14 +594,7 @@ class _MoriEPDispatcherImplBase:
         self.quant_config = quant_config
         weight_dtype = quant_config.get("weight_dtype", None)
 
-        if weight_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            # per_1x128 takes fp8 activations directly, so the weight dtype
-            # does settle it here.
-            self.dispatch_dtype = DispatchDtype.fp8
-        elif weight_dtype == torch.float4_e2m1fn_x2:
-            self.dispatch_dtype = self._resolve_mxfp4_dispatch_dtype(quant_config)
-        else:
-            self.dispatch_dtype = DispatchDtype.bf16
+        self.dispatch_dtype = self._resolve_dispatch_dtype(quant_config)
 
         # Combine has no receiver format to match (bf16 in, bf16 out), so it is
         # keyed off the weight dtype rather than the dispatch format: an MXFP4
@@ -614,29 +608,17 @@ class _MoriEPDispatcherImplBase:
         # Apply env var override immediately so dispatch_a sees correct flags
         self._apply_dispatch_dtype_override()
 
-    def _resolve_mxfp4_dispatch_dtype(self, quant_config: dict) -> DispatchDtype:
-        """Pick the wire format for MXFP4 expert weights.
-
-        MXFP4 weights run on a16w4 / a8w4 / a4w4 and the weight dtype does not
-        say which, so this defers to the AITER runner.
-        """
+    def _resolve_dispatch_dtype(self, quant_config: dict) -> DispatchDtype:
+        """Pick the wire format from the activation dtype the MoE consumes."""
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterDispatchFormat,
             resolve_aiter_dispatch_format,
         )
 
-        if "activation" not in quant_config:
-            # Older quant methods send a bare weight_dtype; defaulting the
-            # missing keys would read as SEPARATED and pick fp4, which is a guess.
-            logger.info_once(
-                "[MORI] auto dispatch_dtype=bf16: quant method did not report the "
-                "MoE activation, so the receiving kernel is unknown"
-            )
-            return DispatchDtype.bf16
-
         choice = resolve_aiter_dispatch_format(
+            quant_config.get("quant_type"),
             quant_config.get("weight_dtype"),
-            activation=quant_config["activation"],
+            activation=quant_config.get("activation", "silu"),
             swiglu_limit=quant_config.get("swiglu_limit"),
         )
         actionable = choice.actionable
@@ -653,6 +635,8 @@ class _MoriEPDispatcherImplBase:
                 )
         elif choice.format == AiterDispatchFormat.MXFP4:
             chosen, why = DispatchDtype.fp4, choice.reason
+        elif choice.format == AiterDispatchFormat.FP8:
+            chosen, why = DispatchDtype.fp8, choice.reason
         else:
             chosen, why = DispatchDtype.bf16, choice.reason
 

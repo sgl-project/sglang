@@ -2199,7 +2199,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             layer.dispatcher.set_quant_config(
-                build_dispatcher_quant_config(layer, layer.w13_weight.dtype)
+                build_dispatcher_quant_config(
+                    layer, layer.w13_weight.dtype, self._aiter_moe_quant_type()
+                )
             )
 
     def _prepare_flashinfer_trtllm_activation_params(self, layer: Module) -> None:
@@ -2713,6 +2715,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self._cutlass_buffers_ready = True
 
+    def _aiter_moe_quant_type(self):
+        """The quant_type this method hands AITER.
+
+        Also what the dispatcher needs: it separates the two fp8 activation
+        formats, which share a payload but not a scale layout.
+        """
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+
+        if not self.block_quant:
+            return AiterQuantType.PER_TOKEN
+        return (
+            AiterQuantType.PER_1X32
+            if self.is_fp4_expert
+            else AiterQuantType.PER_128X128
+        )
+
     def maybe_get_hip_aiter_quant_info(
         self,
         layer: torch.nn.Module,
@@ -2722,21 +2740,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return None
         assert not no_combine, f"{no_combine=} is not supported."
 
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            AiterMoeQuantInfo,
-            AiterQuantType,
-        )
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
 
         w13_weight = layer.w13_weight
         w2_weight = layer.w2_weight
 
+        quant_type = self._aiter_moe_quant_type()
         if self.block_quant:
-            quant_type = (
-                AiterQuantType.PER_1X32
-                if self.is_fp4_expert
-                else AiterQuantType.PER_128X128
-            )
-
             if self.is_fp4_expert:
                 fp4_weight_dtype = _require_fp4_dtype()
                 w13_weight = w13_weight.view(fp4_weight_dtype)
@@ -2747,7 +2757,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale = layer.w13_weight_scale_inv
             w2_scale = layer.w2_weight_scale_inv
         else:
-            quant_type = AiterQuantType.PER_TOKEN
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
         return AiterMoeQuantInfo(

@@ -411,18 +411,23 @@ class BaseDispatcher(ABC):
 
 
 def build_dispatcher_quant_config(
-    layer: torch.nn.Module, weight_dtype: Optional[torch.dtype]
+    layer: torch.nn.Module,
+    weight_dtype: Optional[torch.dtype],
+    quant_type: Optional[Any] = None,
 ) -> dict:
     """Describe a MoE layer's numerics to its dispatcher.
 
-    For MXFP4 weights the wire format also depends on the activation and gate
-    mode, so ``weight_dtype`` alone is not enough. ``weight_dtype`` is semantic,
-    not storage: MXFP4 is stored as uint8 but reported as float4_e2m1fn_x2.
-    Consumers must tolerate the other two keys being absent.
+    The wire format follows the activation dtype the MoE kernel consumes, which
+    depends on all four of these. ``quant_type`` is the ``AiterQuantType`` the
+    layer will hand AITER; it is what separates the two fp8 activation formats,
+    whose scale layouts differ. ``weight_dtype`` is semantic, not storage: MXFP4
+    is stored as uint8 but reported as float4_e2m1fn_x2. Consumers must tolerate
+    every key but ``weight_dtype`` being absent.
     """
     runner_config = getattr(layer, "moe_runner_config", None)
     return {
         "weight_dtype": weight_dtype,
+        "quant_type": quant_type,
         "activation": getattr(runner_config, "activation", "silu"),
         "swiglu_limit": getattr(runner_config, "swiglu_limit", None),
     }

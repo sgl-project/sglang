@@ -879,13 +879,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             layer.w2_weight.is_shuffled = True
 
         if hasattr(layer, "dispatcher"):
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
             from sglang.srt.layers.moe.token_dispatcher.base import (
                 build_dispatcher_quant_config,
             )
 
             # Weights are stored as torch.uint8 but semantically MXFP4
             layer.dispatcher.set_quant_config(
-                build_dispatcher_quant_config(layer, torch.float4_e2m1fn_x2)
+                build_dispatcher_quant_config(
+                    layer, torch.float4_e2m1fn_x2, AiterQuantType.PER_1X32
+                )
             )
 
     def create_moe_runner(
