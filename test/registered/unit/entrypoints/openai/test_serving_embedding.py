@@ -49,6 +49,7 @@ if "sgl_kernel" not in sys.modules:
     sys.meta_path.insert(0, _SglKernelMockFinder())
 
 from fastapi import Request
+from starlette.datastructures import Headers
 
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
@@ -364,6 +365,36 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             "encoding_format must be either",
             self.serving_embedding._validate_request(invalid_request),
         )
+
+    # ---------- x-request-id header passthrough ----------
+    def test_batch_expands_one_header_rid_per_item(self):
+        """One header rid labels a batch, expanded into per-item rids.
+
+        A gateway emits a single x-request-id per HTTP request and cannot know the
+        batch size, so a batch must not require one rid per item.
+        """
+        adapted = self._adapt_batch({"x-request-id": "batch"})
+        self.assertEqual(adapted.rid, ["batch_0", "batch_1"])
+        self.assertEqual([adapted[0].rid, adapted[1].rid], ["batch_0", "batch_1"])
+
+    def test_batch_takes_per_item_rids_from_the_header(self):
+        """Several header values label the batch items directly, in wire order."""
+        adapted = self._adapt_batch({"x-request-id": "first, second"})
+        self.assertEqual(adapted.rid, ["first", "second"])
+        self.assertEqual([adapted[0].rid, adapted[1].rid], ["first", "second"])
+
+    def _adapt_batch(self, headers: dict):
+        batch_req = EmbeddingRequest(
+            model="test-model",
+            input=["first", "second"],
+            encoding_format="float",
+        )
+        raw = Mock(spec=Request)
+        raw.headers = Headers(headers)
+
+        adapted, _ = self.serving_embedding._convert_to_internal_request(batch_req, raw)
+        adapted.normalize_batch_and_arguments()
+        return adapted
 
 
 if __name__ == "__main__":

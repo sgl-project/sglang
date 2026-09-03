@@ -4,7 +4,10 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    resolve_rid_from_headers,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-b-test-cpu")
@@ -103,6 +106,59 @@ class TestApplyRoutingHeaders(unittest.TestCase):
         obj = _obj()
         with self.assertRaises(HTTPException):
             apply_header_overrides(obj, Headers({"x-override-priority": "high"}))
+
+
+class TestResolveRidFromHeaders(unittest.TestCase):
+    """x-request-id is list-valued, so both wire forms must parse the same way."""
+
+    def test_absent_or_blank_header_names_no_identity(self):
+        self.assertIsNone(resolve_rid_from_headers(Headers({})))
+        self.assertIsNone(resolve_rid_from_headers(Headers({"x-request-id": "  "})))
+        self.assertIsNone(resolve_rid_from_headers(Headers({"x-request-id": " , "})))
+
+    def test_one_value_is_a_string(self):
+        self.assertEqual(
+            resolve_rid_from_headers(Headers({"x-request-id": "abc"})), "abc"
+        )
+
+    def test_blank_entries_are_dropped(self):
+        for value in ("abc,", ",abc", "abc, "):
+            self.assertEqual(
+                resolve_rid_from_headers(Headers({"x-request-id": value})), "abc"
+            )
+
+    def test_comma_separated_values_become_a_list(self):
+        self.assertEqual(
+            resolve_rid_from_headers(Headers({"x-request-id": "a, b ,c"})),
+            ["a", "b", "c"],
+        )
+
+    def test_repeated_lines_are_equivalent_to_one_comma_joined_line(self):
+        """RFC 9110 5.3: repeated lines of a list-valued field carry one list.
+
+        The documented way to name every sample of a batch is one line per batch
+        item, so the merged and split spellings must resolve identically.
+        """
+        two_lines = Headers(raw=[(b"x-request-id", b"a"), (b"x-request-id", b"b")])
+        self.assertEqual(resolve_rid_from_headers(two_lines), ["a", "b"])
+
+        per_batch_item = Headers(
+            raw=[(b"x-request-id", b"a-0, a-1"), (b"x-request-id", b"b-0, b-1")]
+        )
+        self.assertEqual(
+            resolve_rid_from_headers(per_batch_item), ["a-0", "a-1", "b-0", "b-1"]
+        )
+        self.assertEqual(
+            resolve_rid_from_headers(
+                Headers({"x-request-id": "a-0, a-1, b-0, b-1"}),
+            ),
+            resolve_rid_from_headers(per_batch_item),
+        )
+
+    def test_wire_order_is_preserved(self):
+        """Position is the only thing mapping a rid to its batch item."""
+        headers = Headers(raw=[(b"x-request-id", b"b, a"), (b"x-request-id", b"c")])
+        self.assertEqual(resolve_rid_from_headers(headers), ["b", "a", "c"])
 
 
 if __name__ == "__main__":

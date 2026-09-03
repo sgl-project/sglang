@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -611,6 +612,77 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestParallelSamplingRidDerivation(CustomTestCase):
+    """Parallel sampling must dispatch the rids normalization already derived.
+
+    The sample requests used to be re-keyed with fresh uuids, which left the
+    states pre-created for them (one per sub-request) without an owner: nothing
+    ever sent those rids to the scheduler, so the response path never removed
+    them. With a caller-supplied rid the leaked keys are deterministic, so the
+    next request carrying the same x-request-id collided on them.
+    """
+
+    def _dispatch(self, tm, rid, n, text="hi"):
+        dispatched = []
+
+        async def fake_tokenize(sub_obj):
+            return SimpleNamespace(
+                rid=sub_obj.rid,
+                input_ids=[1, 2, 3],
+                mm_inputs=None,
+                sampling_params=SimpleNamespace(max_new_tokens=8),
+                stream=False,
+                time_stats=None,
+            )
+
+        async def fake_wait(sub_obj, request=None):
+            # Stand in for the scheduler response path, the only remover.
+            tm.rid_to_state.pop(sub_obj.rid, None)
+            yield {"meta_info": {"id": sub_obj.rid}}
+
+        async def fake_send(tokenized):
+            dispatched.append(tokenized.rid)
+
+        tm._tokenize_one_request = fake_tokenize
+        tm._send_one_request = fake_send
+        tm._wait_one_response = fake_wait
+
+        obj = GenerateReqInput(text=text, rid=rid, sampling_params={"n": n})
+
+        async def run():
+            async for _ in tm.generate_request(obj):
+                pass
+
+        asyncio.run(run())
+        return dispatched
+
+    def test_samples_are_dispatched_under_the_caller_rid(self):
+        tm = _make_tm_for_generate(self)
+        dispatched = self._dispatch(tm, rid="R", n=4)
+        self.assertEqual(dispatched, ["R_0_prime", "R_0", "R_1", "R_2", "R_3"])
+
+    def test_parallel_sampling_leaves_no_state_behind(self):
+        tm = _make_tm_for_generate(self)
+        self._dispatch(tm, rid="R", n=4)
+        self.assertEqual(tm.rid_to_state, {})
+
+    def test_the_same_rid_can_be_reused_by_a_later_request(self):
+        """A router retry forwards the same x-request-id, so reuse must work."""
+        tm = _make_tm_for_generate(self)
+        for _ in range(3):
+            self._dispatch(tm, rid="R", n=4)
+        self.assertEqual(tm.rid_to_state, {})
+
+    def test_each_prompt_of_a_batch_gets_its_own_warmup_and_samples(self):
+        tm = _make_tm_for_generate(self)
+        dispatched = self._dispatch(tm, rid="R", n=2, text=["p0", "p1"])
+        self.assertEqual(
+            dispatched,
+            ["R_0_0_prime", "R_1_0_prime", "R_0_0", "R_0_1", "R_1_0", "R_1_1"],
+        )
+        self.assertEqual(tm.rid_to_state, {})
 
 
 class TestWaitOneResponseAfterStateFreed(CustomTestCase):

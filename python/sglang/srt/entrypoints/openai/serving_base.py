@@ -12,6 +12,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
+from sglang.srt.entrypoints.request_headers import resolve_rid_from_headers
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.server_args import ServerArgs
@@ -291,3 +292,19 @@ class OpenAIServingBase(ABC):
                 )
 
         return body_routed_dp_rank
+
+    def extract_rid_from_header(
+        self,
+        raw_request: Request,
+        body_rid: Optional[Union[List[str], str]] = None,
+    ) -> Optional[Union[List[str], str]]:
+        """Resolve the rid, preferring the x-request-id header over the body rid.
+
+        One header value labels the whole request and a batch expands it into
+        per-item rids; several values label the items directly.
+        """
+        if raw_request is None:
+            return body_rid
+
+        header_rid = resolve_rid_from_headers(raw_request.headers)
+        return header_rid if header_rid is not None else body_rid
