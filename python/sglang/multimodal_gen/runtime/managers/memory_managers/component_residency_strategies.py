@@ -202,7 +202,15 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.wait_for_use(module, use, state)
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
-            module.to("cpu", non_blocking=True)
+            # A non-blocking device->host move lands in pinned host memory the
+            # size of the component. On a shared pool that pins a second copy
+            # of the weights next to the device copy still being read from
+            # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
+            # and exhausted a GB10. Take the synchronous, pageable path there.
+            module.to(
+                "cpu",
+                non_blocking=not current_platform.device_shares_host_memory(),
+            )
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(

@@ -272,10 +272,18 @@ def keep_checkpoint_mapped(*, weight_bytes: int, component: str) -> bool:
     choice -- its pages are resident, where a mapping's first use pays a fault.
     """
     from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        host_copies_are_redundant,
         host_copies_would_not_fit,
         host_memory_available_bytes,
     )
 
+    if host_copies_are_redundant():
+        logger.info(
+            "%s stays on its checkpoint mapping: host and device share one "
+            "memory pool, so a copy would hold the same bytes twice.",
+            component,
+        )
+        return True
     if not host_copies_would_not_fit(weight_bytes):
         return False
     logger.info(

@@ -45,6 +45,12 @@ pynvml = import_pynvml()  # type: ignore[no-untyped-call]
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+@lru_cache(maxsize=None)
+def _device_is_integrated(device_index: int) -> bool:
+    # A static device property, asked on every planner cost evaluation.
+    return bool(torch.cuda.get_device_properties(device_index).is_integrated)
+
+
 def device_id_to_physical_device_id(device_id: int) -> int:
     if "CUDA_VISIBLE_DEVICES" in os.environ:
         device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
@@ -616,6 +622,15 @@ class CudaPlatformBase(Platform):
             free_gpu_memory = float(tensor.item())
 
         return free_gpu_memory / (1 << 30)
+
+    @classmethod
+    def device_shares_host_memory(cls) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            return _device_is_integrated(torch.cuda.current_device())
+        except (RuntimeError, AssertionError):
+            return False
 
     @classmethod
     def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
