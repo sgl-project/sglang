@@ -1,5 +1,6 @@
 """CPU-only unit tests for the per-path Mamba checkpoint cap."""
 
+from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -104,11 +105,14 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError,
-                "must be -1 \\(unlimited\\) or a positive integer",
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "must be -1 \\(unlimited\\) or a positive integer",
+                ),
             ):
-                args._handle_mamba_backend()
+                handle_mamba_backend(args)
 
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, core, cache = _build_unified_chain(cap=2)

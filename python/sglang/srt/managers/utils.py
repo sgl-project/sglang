@@ -386,7 +386,7 @@ def msgpack_decode_explained(data: bytes) -> Any:
             if m is not None:
                 idx = int(m.group(1))
                 if 1 <= idx <= len(fields):
-                    msg = f"{msg[:m.start()]}$.{fields[idx - 1]}{msg[m.end():]}"
+                    msg = f"{msg[: m.start()]}$.{fields[idx - 1]}{msg[m.end() :]}"
         raise MsgpackDecodeError(rid, msg) from e
 
 

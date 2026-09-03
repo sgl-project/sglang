@@ -215,6 +215,23 @@ The prediction is clamped to `--auto-duration-min-seconds` /
 `--auto-duration-max-seconds` (default 1–20 s) and snapped to the VAE's temporal
 grid, so the result is always a valid frame count. It overrides `--num-frames`.
 
+For an online server, pass the same LTX-2.5-only controls through `extra_body`:
+
+```python Python
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30010/v1")
+video = client.videos.create(
+    model="Lightricks/LTX-2.5-Diffusers",
+    prompt="A red fox walking through a snowy forest at dawn.",
+    extra_body={
+        "auto_duration": True,
+        "auto_duration_min_seconds": 2.0,
+        "auto_duration_max_seconds": 8.0,
+    },
+)
+```
+
 ### 4.4 Two-stage (higher quality)
 
 Stage 1 runs at half the requested resolution, the latents are upsampled 2x, and
@@ -288,6 +305,14 @@ sglang serve \
   --model-path Lightricks/LTX-2.5-Diffusers \
   --pipeline-class-name LTX2Pipeline \
   --load-diffusion-decoder
+```
+
+```python Python
+video = client.videos.create(
+    model="Lightricks/LTX-2.5-Diffusers",
+    prompt="A red fox walking through a snowy forest at dawn.",
+    extra_body={"use_diffusion_decoder": True},
+)
 ```
 
 This keeps the default server footprint unchanged while still allowing VAE and
