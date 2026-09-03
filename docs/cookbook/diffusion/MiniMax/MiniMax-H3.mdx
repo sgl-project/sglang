@@ -1364,6 +1364,37 @@ TP2 + Ulysses2 (3.42 s, 62,290 MB), FSDP + Ulysses4 (3.42 s, 50,984 MB), and
 online `--quantization fp8` (2.93 s, 64,204 MB) trade a little latency for
 peak memory.
 
+### VDN-H3 on B200
+
+A 4× B200 (SM100, 183 GB) host served [VDN-H3](#7-vdn-h3-hybrid-attention-8-step-distill)
+on the paper workload: 1344×768 at 24 fps with audio for 14.375 s (345 frames,
+102 latent frames, about 104k packed rows), `task: "t2va"`,
+`num_inference_steps: 9` (8 DiT forwards), seed 1000, `hybrid_window_attn_h3`
+with the decomposed window kernel, eager. "Steady s/NFE" is the mean of
+forwards 2 to 8 of the served request; the first forward adds the one-time
+window-metadata build (about 3 s). The OpenVDN reference rows ran the released
+inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
+and the same clip length:
+
+| Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
+| --- | ---: | ---: | ---: | ---: |
+| OpenVDN reference, FP8, 1× B200 | 6.47 | 51.7 s | – | – |
+| OpenVDN reference, FP8, 4× B200 Ulysses (standard / 3+1 branch-parallel) | 2.68 / 2.61 | 21.4 / 20.9 s | – | – |
+| SGLang, BF16, 1× B200, DiT layerwise offload (auto policy) | 7.86 | 64.1 s | 9.5 s | 147,608 MB |
+| SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
+| SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed` | **2.51** | 23.2 s | 3.5 s | 97,894 MB |
+| SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed` | **2.44** | 22.5 s | 3.4 s | 63,022 MB |
+
+On one B200 the auto memory policy streams the DiT layers from host memory
+(the 62 GB DiT, the 66 GB conditioner and the VAEs do not all fit resident
+with the 120 GB headroom the policy keeps), so the single-GPU rows are
+transfer-bound; `--layerwise-offload-components text_encoder` keeps the DiT
+resident instead. Per DiT block the hybrid attention costs about 117 ms at this
+shape (window FlashAttention 46 ms, projections 24 ms, the linear branch and
+its fused kernels the rest); the in-tree tile kernel (`vdn_window_kernel:
+"tiles"`) measures 226 ms against 169 ms for the decomposed path before the
+branch fusions, so decomposed is the default on SM100.
+
 ### H200 topology comparison
 
 The same four-card H200 host completed both lossless resident placements with
