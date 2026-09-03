@@ -228,23 +228,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    # Draft pools are DCP-replicated, not sharded: budget all copies.
-                    dcp_size = kvc.ps.attn_dcp_size
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * dcp_size
+                    draft_kv_size = int(
+                        target_kv_size * draft_num_layers / target_kv_num_layers
                     )
-                    draft_indexer_size = (
-                        self._compute_dsa_indexer_cell_size(
-                            kvc=kvc,
-                            num_layers=draft_num_layers,
-                            allocate_all_layers=True,
-                        )
-                        * dcp_size
+                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
+                        kvc=kvc,
+                        num_layers=draft_num_layers,
+                        allocate_all_layers=True,
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
-                    draft_num_layers *= kvc.ps.attn_dcp_size
                     self._cell_size = int(
                         self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
@@ -586,10 +579,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     - self._draft_swa_layers_num
                     - self._draft_swa_full_layers_num
                 )
-                dcp_size = kvc.ps.attn_dcp_size
-                self._draft_swa_layers_num *= dcp_size
-                self._draft_swa_full_layers_num *= dcp_size
-                self._draft_full_layers_num *= dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
