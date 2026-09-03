@@ -3,7 +3,9 @@
 
 mod zmq_helpers;
 
+mod bucket_domains;
 mod cache_aware_zmq;
+mod decode;
 mod fused_score;
 mod kv_events_hash_parity;
 mod kv_events_tree_concurrent;
