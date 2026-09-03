@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -9,6 +10,15 @@ from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def test_release_host_resources_delegates_to_inner_cache():
+    inner = SimpleNamespace(release_host_resources=Mock())
+    tree_cache = StreamingSession(inner)
+
+    tree_cache.release_host_resources()
+
+    inner.release_host_resources.assert_called_once_with()
 
 
 class _FakeAllocator(BaseTokenToKVPoolAllocator):
