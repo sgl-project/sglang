@@ -465,6 +465,15 @@ def test_validate_server_args_requires_packed_varlen_backend():
         with pytest.raises(ValueError, match="does not implement packed varlen"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
+    server_args.component_attention_backends = {"transformer": "cube_sparse_attn"}
+    server_args.resolve_component_attention_backend = lambda *_names: (
+        AttentionBackendEnum.CUBE_SPARSE_ATTN,
+        "transformer",
+    )
+    server_args.ring_degree = 2
+    with pytest.raises(ValueError, match="ring parallelism requires"):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
 
 def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()

@@ -194,9 +194,9 @@ def _direct_warm(worker_url: str, model_id: str, prefix: str) -> None:
         },
         timeout=60.0,
     )
-    assert (
-        r.status_code == 200
-    ), f"direct warm to {worker_url} failed: HTTP {r.status_code} {r.text!r}"
+    assert r.status_code == 200, (
+        f"direct warm to {worker_url} failed: HTTP {r.status_code} {r.text!r}"
+    )
 
 
 def _route_through(router_url: str, model_id: str, prompt: str) -> str:
@@ -212,9 +212,9 @@ def _route_through(router_url: str, model_id: str, prompt: str) -> str:
     after = _success_counts_by_worker(router_url)
     deltas = {w: after.get(w, 0) - before.get(w, 0) for w in set(after) | set(before)}
     winners = [w for w, d in deltas.items() if d > 0]
-    assert (
-        len(winners) == 1
-    ), f"expected exactly one worker delta on {router_url}, got {deltas}"
+    assert len(winners) == 1, (
+        f"expected exactly one worker delta on {router_url}, got {deltas}"
+    )
     return winners[0]
 
 
@@ -309,15 +309,15 @@ def test_routers_route_by_prefix_content(
                         landed = _route_through(
                             router.base_url, spec["model"], PREFIX_X
                         )
-                        assert (
-                            landed == worker_x.url
-                        ), f"router {label}: PREFIX_X must route to {worker_x.url}; landed on {landed}"
+                        assert landed == worker_x.url, (
+                            f"router {label}: PREFIX_X must route to {worker_x.url}; landed on {landed}"
+                        )
                         landed = _route_through(
                             router.base_url, spec["model"], PREFIX_Y
                         )
-                        assert (
-                            landed == worker_y.url
-                        ), f"router {label}: PREFIX_Y must route to {worker_y.url}; landed on {landed}"
+                        assert landed == worker_y.url, (
+                            f"router {label}: PREFIX_Y must route to {worker_y.url}; landed on {landed}"
+                        )
                 except Exception:
                     _dump_logs(logs)
                     raise

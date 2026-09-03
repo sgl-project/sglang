@@ -37,7 +37,6 @@ def _patch_hf_transformers_utils(get_tokenizer, get_config=None):
 
 
 class TestTemplateManagerReasoningDetection(unittest.TestCase):
-
     def _detect(self, template, vocab):
         force, config = detect_reasoning_pattern(template)
         parser = detect_reasoning_parser(
@@ -145,15 +144,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             # An explicit boolean=false second argument is equivalent to the
             # one-argument form.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(true, false) -%}",
+                "{%- set enable_thinking = enable_thinking | default(true, false) -%}",
                 True,
             ),
             # Boolean mode with a false default still maps False -> False and
             # True -> True, so it is a working default-off toggle.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(false, true) -%}",
+                "{%- set enable_thinking = enable_thinking | default(false, true) -%}",
                 False,
             ),
             (

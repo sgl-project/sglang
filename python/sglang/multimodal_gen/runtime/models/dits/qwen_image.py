@@ -762,9 +762,9 @@ class QwenImageCrossAttention(nn.Module):
         self.inner_kv_dim = self.inner_dim
 
         tp_size = get_tp_world_size()
-        assert (
-            self.num_heads % tp_size == 0
-        ), f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        assert self.num_heads % tp_size == 0, (
+            f"num_heads ({self.num_heads}) must be divisible by tp_size ({tp_size})"
+        )
         self.local_num_heads = self.num_heads // tp_size
         self._unquantized_added_qkv_is_packed = False
 
