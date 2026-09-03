@@ -68,6 +68,8 @@ class FakeKVSender(BaseKVSender):
         self,
         kv_indices: list[int],
         aux_index: Optional[int] = None,
+        num_request_pages: Optional[int] = None,
+        send_page_offset: int = 0,
     ):
         logger.debug(
             f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}"

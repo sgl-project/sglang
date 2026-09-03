@@ -86,11 +86,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm is not None:
+            spec_algorithm = (cfg.speculative_algorithm or "").upper()
+            # NEXTN is resolved to EAGLE after this validation hook runs.
+            if spec_algorithm and spec_algorithm not in ("EAGLE", "NEXTN"):
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                    "--disaggregation-decode-enable-radix-cache supports "
+                    "speculative decoding only for EAGLE and NEXTN, but got "
+                    f"--speculative-algorithm {cfg.speculative_algorithm}"
                 )
 
             if resolved_view(server_args).enable_dp_attention:

@@ -1195,6 +1195,8 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
+        self.num_request_pages = 0
+        self.send_page_offset = 0
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
@@ -1240,9 +1242,19 @@ class CommonKVSender(BaseKVSender):
         except Exception as e:
             logger.error(f"Failed to register prefill dp_rank: {e}")
 
-    def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+    def init(
+        self,
+        num_kv_indices: int,
+        aux_index: Optional[int] = None,
+        num_request_pages: Optional[int] = None,
+        send_page_offset: int = 0,
+    ):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        self.num_request_pages = (
+            num_kv_indices if num_request_pages is None else num_request_pages
+        )
+        self.send_page_offset = send_page_offset
         logger.debug(
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
@@ -1297,7 +1309,8 @@ class CommonKVSender(BaseKVSender):
                 self.kv_mgr,
                 kv_indices,
                 index_slice,
-                total_pages=self.num_kv_indices,
+                total_pages=self.num_request_pages,
+                page_offset=self.send_page_offset,
             )
         elif self.kv_mgr.is_dummy_cp_rank:
             if not is_last_chunk:
