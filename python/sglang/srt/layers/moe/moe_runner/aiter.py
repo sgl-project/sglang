@@ -374,6 +374,10 @@ class AiterDispatchChoice(NamedTuple):
     actionable: bool = False
 
 
+# fp8 checkpoints carry either variant and both ride the same wire format.
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
 @functools.cache
 def _aiter_dispatch_dtype_api():
     """AITER's `resolve_activation_dtype`, on builds that expose it."""
@@ -389,12 +393,16 @@ def _aiter_dispatch_dtype_api():
     # payload with fp32 scales every 128 elements, per_1x32 with e8m0
     # microscales every 32. Combinations absent here have no MoRI format --
     # per_Token fp8 above all -- and fall back to bf16.
+    #
+    # Keyed on `dtypes.fp8`, but AITER returns the weight dtype itself for
+    # per_1x128, so an fnuz checkpoint on an fn build answers with the other
+    # variant. Both mean the same wire format, hence _FP8_DTYPES below.
     wire_format = {
         (AiterQuantType.PER_128X128, dtypes.fp8): AiterDispatchFormat.FP8,
         (AiterQuantType.PER_1X32, dtypes.fp8): AiterDispatchFormat.MXFP8,
         (AiterQuantType.PER_1X32, dtypes.fp4x2): AiterDispatchFormat.MXFP4,
     }
-    return resolve_activation_dtype, GateMode, dtypes.bf16, wire_format
+    return resolve_activation_dtype, GateMode, dtypes.bf16, dtypes.fp8, wire_format
 
 
 def resolve_aiter_dispatch_format(
@@ -425,7 +433,7 @@ def resolve_aiter_dispatch_format(
             "the dispatch format follow what the MoE consumes",
             actionable=True,
         )
-    resolve_activation_dtype, GateMode, aiter_bf16, wire_format = api
+    resolve_activation_dtype, GateMode, aiter_bf16, aiter_fp8, wire_format = api
 
     # Mirrors AiterRunnerCore.run: only a clamped-SwiGLU layer sets gate_mode.
     interleave = bool(swiglu_limit and swiglu_limit > 0) and get_bool_env_var(
@@ -452,6 +460,8 @@ def resolve_aiter_dispatch_format(
         )
     if q_dtype_a == aiter_bf16:
         return AiterDispatchChoice(AiterDispatchFormat.BF16, "MoE consumes bf16")
+    if q_dtype_a in _FP8_DTYPES:
+        q_dtype_a = aiter_fp8
 
     fmt = wire_format.get((quant_type, q_dtype_a))
     if fmt is None:
