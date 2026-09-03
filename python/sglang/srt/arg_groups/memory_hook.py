@@ -377,6 +377,8 @@ def adjust_mem_fraction_for_vlm(
     gpu_mem,
 ) -> float:
     if post_capture_kv_sizing:
+        # Graph and activation memory will be measured after capture, so only
+        # reserve a fixed 8 GiB of VLM headroom for image-encoder execution here.
         return (
             mem_fraction_static - 8 * 1024 / gpu_mem
             if gpu_mem is not None
