@@ -5,6 +5,7 @@ pub mod active_load;
 pub mod admission;
 pub mod cache_aware;
 pub mod cache_aware_zmq;
+pub mod decode;
 pub mod engine_load;
 pub mod factory;
 pub mod kv_events;
