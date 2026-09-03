@@ -164,6 +164,29 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     assert req.finished()
 
 
+@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+@patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
+def test_grammar_rejection_retires_prefill_before_transfer(
+    maybe_cache_unfinished_req, release_kv_cache
+):
+    scheduler = _Scheduler()
+    req = _Req(inflight_middle_chunks=0)
+    req.to_finish = None
+    req.grammar = Mock()
+    req.grammar.accept_token.side_effect = ValueError("invalid token")
+
+    scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+
+    req.grammar.accept_token.assert_called_once_with(11)
+    assert req.grammar.finished
+    assert req.finished()
+    release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+    maybe_cache_unfinished_req.assert_not_called()
+    scheduler.send_kv_chunk.assert_not_called()
+    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+    assert scheduler.disagg_prefill_inflight_queue == []
+
+
 def test_aborted_result_releases_mamba_allocated_before_kv():
     scheduler = _Scheduler()
     scheduler.enable_hicache_storage = False

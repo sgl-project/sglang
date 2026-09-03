@@ -767,6 +767,24 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    req.grammar.finished = req.finished()
+                    if is_aborted(req):
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        advance_logprob_pt(i, req)
+                        continue
+
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -805,17 +823,6 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
