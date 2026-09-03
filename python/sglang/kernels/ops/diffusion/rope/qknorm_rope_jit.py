@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_pre_ampere_cuda,
     load_jit,
     make_cpp_args,
 )
@@ -64,6 +65,11 @@ def _can_use_fused_qknorm_rope(
     pack_kv: bool,
     cache_has_full_width: bool,
 ) -> bool:
+    if is_pre_ampere_cuda():
+        logger.info(
+            "Skipping JIT fused QKNorm+RoPE on pre-Ampere GPU; using torch fallback"
+        )
+        return False
     if dtype not in _SUPPORTED_DTYPES or cache_dtype not in _SUPPORTED_CACHE_DTYPES:
         logger.warning(
             "Unsupported dtype pair (%s, %s) for JIT fused QKNorm+RoPE",

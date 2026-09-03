@@ -3,10 +3,13 @@
 from unittest.mock import patch
 
 from sglang.kernels.jit.utils.arch import is_pre_ampere_cuda
-from sglang.kernels.jit.utils.compile.loader import load_jit
+from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+    can_use_fused_inplace_qknorm_rope,
+)
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+import torch
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -28,10 +31,20 @@ class TestPreAmpereJitSkip(CustomTestCase):
     def test_is_pre_ampere_cuda_ampere(self, _cap, _avail):
         self.assertFalse(is_pre_ampere_cuda())
 
-    @patch("sglang.kernels.jit.utils.compile.loader.is_pre_ampere_cuda", return_value=True)
-    def test_load_jit_skips_pre_ampere(self, _pre):
-        with self.assertRaisesRegex(RuntimeError, "pre-Ampere"):
-            load_jit("unit_test_skip_marker")
+    @patch(
+        "sglang.kernels.ops.diffusion.rope.qknorm_rope_jit.is_pre_ampere_cuda",
+        return_value=True,
+    )
+    def test_qknorm_rope_skips_jit_probe_on_pre_ampere(self, _pre):
+        self.assertFalse(
+            can_use_fused_inplace_qknorm_rope(
+                128,
+                128,
+                True,
+                torch.bfloat16,
+                torch.float32,
+            )
+        )
 
     @patch(
         "sglang.srt.layers.quantization.fp8_utils.cutlass_fp8_supported",

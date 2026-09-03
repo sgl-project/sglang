@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 
-from sglang.kernels.jit.utils.arch import get_default_target_flags, is_pre_ampere_cuda
+from sglang.kernels.jit.utils.arch import get_default_target_flags
 from sglang.kernels.jit.utils.common import is_hip_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja
 from sglang.kernels.jit.utils.compile.paths import (
@@ -85,12 +85,6 @@ def load_jit(
             for flag in (extra_cuda_cflags or [])
             if flag not in ("--use_fast_math", "-use_fast_math")
         ]
-
-    if is_pre_ampere_cuda():
-        raise RuntimeError(
-            "CUDA JIT compilation is skipped on pre-Ampere GPUs (compute "
-            "capability < 8.0). Use registered Triton or PyTorch fallbacks."
-        )
 
     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
     for dep in sorted(set(extra_dependencies or [])):
