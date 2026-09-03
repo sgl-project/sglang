@@ -630,9 +630,9 @@ class TboForwardBatchPreparer:
                 sum_field="extend_num_tokens",
             )
 
-        assert (
-            child_a.extend_num_tokens == half_seq_lens_sum
-        ), f"{child_a.extend_num_tokens=}, {half_seq_lens_sum=}"
+        assert child_a.extend_num_tokens == half_seq_lens_sum, (
+            f"{child_a.extend_num_tokens=}, {half_seq_lens_sum=}"
+        )
 
         child_a.seq_lens_cpu = copy.deepcopy(child_a.seq_lens_cpu)
         child_a.seq_lens_cpu[-1] = (
@@ -674,9 +674,9 @@ class TboForwardBatchPreparer:
         out_num_token_non_padded: torch.Tensor,
         out_num_token_non_padded_cpu: Optional[int] = None,
     ):
-        assert (
-            end_token_index >= start_token_index
-        ), f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        assert end_token_index >= start_token_index, (
+            f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -688,9 +688,9 @@ class TboForwardBatchPreparer:
             "out_cache_loc",
         ]:
             old_value = getattr(batch, key)
-            assert (
-                old_value.shape[0] == num_tokens
-            ), f"{key=} {old_value=} {num_tokens=} {batch=}"
+            assert old_value.shape[0] == num_tokens, (
+                f"{key=} {old_value=} {num_tokens=} {batch=}"
+            )
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         attention_tp_size = get_parallel().attn_tp_size
@@ -736,9 +736,9 @@ class TboForwardBatchPreparer:
                     start_seq_index : min(end_seq_index, len(old_value))
                 ]
                 continue
-            assert (
-                len(old_value) == num_seqs
-            ), f"{key=} {old_value=} {num_seqs=} {batch=}"
+            assert len(old_value) == num_seqs, (
+                f"{key=} {old_value=} {num_seqs=} {batch=}"
+            )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
         spec_info = getattr(batch, "spec_info")
