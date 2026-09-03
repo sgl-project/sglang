@@ -1850,6 +1850,7 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    prefetch_stats: Dict[str, float] = field(default_factory=dict)
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
@@ -1866,7 +1867,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
-
+        self._last_prefetch_outcomes: dict[str, float] = {}
+        self.prefetch_outcomes_total = Counter(
+            name="sglang:hicache_prefetch_outcomes_total",
+            documentation=(
+                "HiCache L3 prefetch outcomes. The outcome label is bounded to "
+                "attempts, issued, decline reasons, and revoke reasons."
+            ),
+            labelnames=[*labels.keys(), "outcome"],
+        )
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
             documentation="Number of prefetched prompt tokens.",
@@ -1940,6 +1949,30 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+    def log_prefetch_outcomes(self, prefetch_stats: Mapping[str, float]) -> None:
+        """Export cumulative cache outcomes as monotonic Prometheus counters.
+
+        UnifiedRadixCache owns the source counters and may reset them while this
+        collector survives a storage detach/reattach. A lower snapshot therefore
+        starts a new epoch: export its current value, never a negative delta.
+        """
+        for outcome in (
+            "attempts",
+            "issued",
+            "declined_too_short",
+            "declined_rate_limited",
+            "revoked_insufficient",
+            "revoked_full_miss",
+        ):
+            current = max(float(prefetch_stats.get(outcome, 0)), 0.0)
+            previous = self._last_prefetch_outcomes.get(outcome, 0.0)
+            increment = current if current < previous else current - previous
+            if increment > 0:
+                self.prefetch_outcomes_total.labels(**self.labels, outcome=outcome).inc(
+                    increment
+                )
+            self._last_prefetch_outcomes[outcome] = current
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1975,6 +2008,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        self.log_prefetch_outcomes(storage_metrics.prefetch_stats)
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):
