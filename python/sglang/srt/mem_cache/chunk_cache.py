@@ -81,10 +81,7 @@ class ChunkCache(BasePrefixCache):
     ):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
-        ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -130,9 +127,9 @@ class SWAChunkCache(ChunkCache):
         self.chunked_prefill_size = params.chunked_prefill_size
 
     def supports_swa(self) -> bool:
-        assert (
-            self.sliding_window_size is not None
-        ), "sliding_window_size must be set for SWAChunkCache"
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for SWAChunkCache"
+        )
         return True
 
     def evict(self, params: EvictParams) -> EvictResult:

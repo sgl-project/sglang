@@ -251,6 +251,9 @@ class ServerArgs(DisaggServerArgsMixin):
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
     )
+    _requested_component_attention_backends: dict[str, str] | None = field(
+        default=None, repr=False, compare=False
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -958,6 +961,16 @@ class ServerArgs(DisaggServerArgsMixin):
                 self.component_attention_backends
             )
         )
+        if self._requested_component_attention_backends is None:
+            self._requested_component_attention_backends = dict(
+                self.component_attention_backends
+            )
+        else:
+            self._requested_component_attention_backends = (
+                self._normalize_component_attention_backends(
+                    self._requested_component_attention_backends
+                )
+            )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -1186,6 +1199,13 @@ class ServerArgs(DisaggServerArgsMixin):
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
+
+    def requested_component_attention_backend(self, component_name: str) -> str | None:
+        assert self._requested_component_attention_backends is not None
+        return self._requested_component_attention_backends.get(component_name)
+
+    def has_requested_component_attention_backends(self) -> bool:
+        return bool(self._requested_component_attention_backends)
 
     def is_component_attention_backend_automatic(
         self, component_name: str | None
@@ -1768,16 +1788,7 @@ class ServerArgs(DisaggServerArgsMixin):
         component_paths: dict[str, str] = {}
         component_weights_paths = dict(self.component_weights_paths)
         for component, path in self.component_paths.items():
-            supports_weight_file_override = (
-                is_dit_component_name(component)
-                or is_text_encoder_component_name(component)
-                or is_image_encoder_component_name(component)
-                or is_vae_component_name(component)
-            )
-            if (
-                not supports_weight_file_override
-                or not is_explicit_weight_file_reference(path)
-            ):
+            if not is_explicit_weight_file_reference(path):
                 component_paths[component] = path
                 continue
             existing = component_weights_paths.get(component)
@@ -2534,7 +2545,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",

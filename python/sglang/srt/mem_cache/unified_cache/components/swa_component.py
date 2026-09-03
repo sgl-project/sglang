@@ -70,7 +70,9 @@ class SWAComponent(TreeComponent):
 
         assert isinstance(
             params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-        ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+        ), (
+            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+        )
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
@@ -178,6 +180,74 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
+    def _unified_allocator(self):
+        """The unified SWA composite, or None when running on the static pool."""
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+            return allocator
+        return None
+
+    def _page_pairs(
+        self, full_value: torch.Tensor, incoming_full_value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Page ids of two token ranges that address the SAME logical tokens.
+
+        Dedupes by FIRST OCCURRENCE with one shared mask rather than
+        `torch.unique`: unique sorts by id value, and allocation hands out
+        virtual ids in no particular order, so sorting would pair page k of one
+        range with an unrelated page of the other. One mask keeps the pairing
+        positional, hence logical.
+        """
+        page_size = self.tree_core.page_size
+        kept = full_value.detach().to(torch.int64) // page_size
+        incoming = incoming_full_value.detach().to(torch.int64) // page_size
+        assert kept.numel() == incoming.numel(), (
+            f"locked-full recovery needs a 1:1 token correspondence, got "
+            f"{kept.numel()} kept vs {incoming.numel()} incoming"
+        )
+        starts = torch.ones_like(kept, dtype=torch.bool)
+        starts[1:] = kept[1:] != kept[:-1]
+        incoming_starts = torch.ones_like(incoming, dtype=torch.bool)
+        incoming_starts[1:] = incoming[1:] != incoming[:-1]
+        assert torch.equal(starts, incoming_starts), (
+            "the two ranges break into pages at different offsets, so no "
+            "page-granular ownership transfer expresses the token mapping"
+        )
+        return kept[starts], incoming[starts]
+
+    def _transfer_swa_pages(
+        self,
+        allocator,
+        full_value: torch.Tensor,
+        incoming_full_value: torch.Tensor,
+    ) -> None:
+        """Move swa page OWNERSHIP from the incoming ids onto the node's ids.
+
+        The static recipe re-points the node's locked full ids at the incoming
+        swa pages through `full_to_swa_index_mapping`. Under the unified pool
+        the swa sub-pool's v2p IS that mapping, so the same move is a rebind:
+        give the node's virtual pages the incoming pages' physical pages, then
+        tombstone the incoming ones. No page is allocated or freed, so no
+        capacity changes — only ownership does.
+        """
+        swa = allocator.swa_attn_allocator
+        kept_pages, incoming_pages = self._page_pairs(full_value, incoming_full_value)
+        physical = swa.virtual_to_physical[incoming_pages]
+        # `> 0` strict: -1 = tombstoned, 0 = the padding sink. The incoming ids
+        # were just allocated by the in-flight request, so every page must be
+        # live; a violation means we would hand the node the sink and serve
+        # zeros, which is worth a hard failure rather than silent corruption.
+        assert bool((physical > 0).all()), (
+            f"incoming swa pages must all be live, got {physical.tolist()}"
+        )
+        swa.bind(kept_pages, physical)
+        swa.virtual_to_physical.index_fill_(0, incoming_pages, -1)
+        swa.clear_inverse_history()
+
     def refresh_lru(
         self,
         phase: LRURefreshPhase,
@@ -283,12 +353,12 @@ class SWAComponent(TreeComponent):
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
-        assert (
-            node.component_data[self.component_type].lock_ref == 0
-        ), f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
-        assert (
-            swa_evicted_seqlen % self.tree_core.page_size == 0
-        ), f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        assert node.component_data[self.component_type].lock_ref == 0, (
+            f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
+        )
+        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
+            f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        )
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
@@ -359,13 +429,13 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         if node.component_data[ct].value is not None:
             return
-        assert (
-            node.component_data[ct].lock_ref == 0
-        ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        assert node.component_data[ct].lock_ref == 0, (
+            f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        )
         swa_evicted_seqlen = params.swa_evicted_seqlen
-        assert (
-            swa_evicted_seqlen % self.tree_core.page_size == 0
-        ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
+            f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        )
 
         if swa_evicted_seqlen <= total_prefix_len:
             pass  # entire node is within the SWA window
@@ -466,9 +536,9 @@ class SWAComponent(TreeComponent):
         new_parent.component_data[self.component_type].lock_ref = child.component_data[
             self.component_type
         ].lock_ref
-        new_parent.component_data[self.component_type].session_ref = (
-            child.component_data[self.component_type].session_ref
-        )
+        new_parent.component_data[
+            self.component_type
+        ].session_ref = child.component_data[self.component_type].session_ref
         assert new_parent.component_data[self.component_type].session_ids is None
 
         child_swa_value = child.component_data[self.component_type].value
@@ -486,9 +556,9 @@ class SWAComponent(TreeComponent):
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].host_value = (
-                child_swa_host_value[:split_len].clone()
-            )
+            new_parent.component_data[
+                self.component_type
+            ].host_value = child_swa_host_value[:split_len].clone()
             child.component_data[self.component_type].host_value = child_swa_host_value[
                 split_len:
             ].clone()
@@ -1280,8 +1350,24 @@ class SWAComponent(TreeComponent):
                 alloc.set_full_to_swa_mapping(full, swa)
             return
         if isinstance(action, RecoverSWAWithLockedFull):
-            # Keep the locked full; remap it onto the incoming full's SWA translation,
+            # Keep the locked full; hand the node the INCOMING ids' swa pages,
             # freeing only the incoming full, then store the swa on the node.
+            unified = self._unified_allocator()
+            if unified is not None:
+                # No `full_to_swa_index_mapping` here: the swa sub-pool's v2p IS
+                # the mapping. Rebind page ownership, then free through the
+                # composite -- its `swa_v2p_pages > 0` filter skips the
+                # just-tombstoned swa side, releasing only the full one.
+                self._transfer_swa_pages(
+                    unified, action.kept_full, action.incoming_full
+                )
+                unified.free(action.incoming_full)
+                self.tree_core.set_component_device_value(
+                    action.node_id,
+                    self.component_type,
+                    self._translate_full_to_swa(action.kept_full),
+                )
+                return
             swa_value = self._translate_full_to_swa(action.incoming_full)
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)

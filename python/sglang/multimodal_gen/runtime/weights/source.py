@@ -263,8 +263,7 @@ def _select_named_file(candidates: tuple[str, ...], weight_name: str) -> str:
     if not basename_matches:
         raise FileNotFoundError(f"Requested weight {weight_name!r} was not found")
     raise ValueError(
-        f"Weight name {weight_name!r} matches multiple files: "
-        f"{list(basename_matches)}"
+        f"Weight name {weight_name!r} matches multiple files: {list(basename_matches)}"
     )
 
 

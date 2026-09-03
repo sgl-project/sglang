@@ -24,7 +24,6 @@ from sglang.srt.entrypoints.tool import Tool
 
 
 class ConversationContext(ABC):
-
     @abstractmethod
     def append_output(self, output) -> None:
         pass
@@ -43,7 +42,6 @@ class ConversationContext(ABC):
 
 
 class SimpleContext(ConversationContext):
-
     def __init__(self):
         self.last_output = None
 
@@ -61,7 +59,6 @@ class SimpleContext(ConversationContext):
 
 
 class HarmonyContext(ConversationContext):
-
     def __init__(
         self,
         messages: list,
@@ -182,7 +179,6 @@ class HarmonyContext(ConversationContext):
 
 
 class StreamingHarmonyContext(HarmonyContext):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.last_output = None
