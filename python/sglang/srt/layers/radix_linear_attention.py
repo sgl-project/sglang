@@ -68,13 +68,29 @@ class RadixLinearAttention(nn.Module):
         self.k_dim = num_k_heads * head_k_dim
         self.v_dim = num_v_heads * head_v_dim
 
-        self.conv_weights = conv_weights
+        self._conv_source = conv_weights
         self.bias = bias
         self.activation = activation
 
         self.A_log = A_log
         self.dt_bias = dt_bias
         self.lower_bound = None
+
+    @property
+    def conv_weights(self):
+        """Convolution weights, derived fresh on every access.
+
+        When an nn.Module (nn.Conv1d) is passed, the 2D view is built from the
+        CURRENT parameter. This is required because --cpu-offload-gb replaces
+        param.data; a view stored once then points at stale memory. Tensors
+        and tuples pass through unchanged so other models (KDA, ShortConv,
+        Lightning) are unaffected.
+        """
+        src = self._conv_source
+        if isinstance(src, nn.Module):
+            w = src.weight
+            return w.view(w.size(0), w.size(2))
+        return src
 
     def forward(
         self,

@@ -111,11 +111,34 @@ class OffloaderV1(BaseOffloader):
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
-        for p in module.parameters():
+        # With MoE expert streaming, offload expert weights only. Everything
+        # else (attention, GDN, norms, hyper-connections) is needed on EVERY
+        # token and belongs on the GPU; experts are needed 10 out of 512 per
+        # token and are fetched selectively. Without this selection the
+        # offloader moves whole layers and keeps transferring their
+        # non-expert part - measured at 4.8 GB per token, which eats the
+        # speedup again.
+        if os.environ.get("SGLANG_MOE_EXPERT_STREAM") == "1":
+            _params = [
+                q for n, q in module.named_parameters() if _is_streamed_expert_param(n)
+            ]
+        else:
+            _params = list(module.parameters())
+        _n_offloaded = 0
+        _n_streamed = 0
+        for p in _params:
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
                 break
+            _n_offloaded += 1
+            _n_streamed += int(
+                any(
+                    p is q
+                    for n, q in module.named_parameters()
+                    if _is_streamed_expert_param(n)
+                )
+            )
 
             # `torch.empty_like` does not support `pin_memory` argument
             cpu_data = torch.empty_strided(
@@ -131,6 +154,12 @@ class OffloaderV1(BaseOffloader):
             self._cpu_offload_bytes += p.data.numel() * p.data.element_size()
             offloaded_parameters = True
 
+        # When every offloaded parameter is a streamed expert param, the hook
+        # below would build device_state from a state_dict() that EXCLUDES all
+        # of them and reparametrize the module with tensors that are already
+        # on the device. That is pure overhead on every forward - skip it.
+        if offloaded_parameters and _n_offloaded == _n_streamed and _n_streamed > 0:
+            offloaded_parameters = False
         if offloaded_parameters:
             original_forward = module.forward
 
@@ -141,14 +170,47 @@ class OffloaderV1(BaseOffloader):
                     # if the parameter is already on the device, it will be a no-op
                     k: v.to(device, non_blocking=True)
                     for k, v in module.state_dict().items()
+                    if not _is_streamed_expert_param(k)
                 }
-                output = functional_call(module, device_state, args=args, kwargs=kwargs)
+                # tie_weights=False: the state_dict contains tied tensors
+                # under several names (for Qwen4-Exp e.g. linear_attn.A_log and
+                # linear_attn.attn.A_log). With the default True,
+                # functional_call fails with "got multiple values for keys ...
+                # which are tied".
+                output = functional_call(
+                    module, device_state, args=args, kwargs=kwargs, tie_weights=False
+                )
                 module.forward = forward
                 return output
 
             module.forward = forward
 
         return module
+
+
+_STREAMED_EXPERT_SUFFIXES = (
+    "w13_qweight",
+    "w2_qweight",
+    "w13_scales",
+    "w2_scales",
+    "w13_qzeros",
+    "w2_qzeros",
+)
+
+
+def _is_streamed_expert_param(key: str) -> bool:
+    """Does this state_dict key belong to the streamed MoE experts?
+
+    These tensors must NOT be copied to the GPU wholesale: they are by far the
+    largest item (32 GB), yet only 10 of 512 experts are needed per token. MoE
+    expert streaming fetches them selectively. Without this exclusion ~26 GB
+    move over PCIe per token and the GPU only waits.
+    """
+    if os.environ.get("SGLANG_MOE_EXPERT_STREAM") != "1":
+        return False
+    return ("experts." in key or key.startswith("experts")) and key.rsplit(".", 1)[
+        -1
+    ] in _STREAMED_EXPERT_SUFFIXES
 
 
 class OffloaderV2(BaseOffloader):
@@ -262,8 +324,13 @@ def _hook_module_forward_raw(module, on_forward_end, get_parameter_and_buffer_di
 
     def forward(*args, **kwargs):
         module.forward = original_forward
+        # see comment above: tied tensors under several names
         output = functional_call(
-            module, get_parameter_and_buffer_dicts(), args=args, kwargs=kwargs
+            module,
+            get_parameter_and_buffer_dicts(),
+            args=args,
+            kwargs=kwargs,
+            tie_weights=False,
         )
         on_forward_end()
         module.forward = forward
@@ -376,6 +443,11 @@ class _CpuParamOffloader(_BaseParamOffloader):
     def __init__(self, module, param_name):
         super().__init__(module, param_name)
         _move_param_to_cpu(self._param, pin_memory=True)
+        # Hard reference to the pinned host storage. Without it the tensor
+        # is only reachable through the module attribute, which functional_call
+        # replaces with the GPU copy. MoE expert streaming needs the original
+        # storage to fetch individual experts.
+        self.cpu_data = self._param.data
 
     def create_device_tensor(self):
         return self._param.to("cuda", non_blocking=True)
