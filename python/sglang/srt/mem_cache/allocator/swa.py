@@ -421,9 +421,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 ref_pages = torch.unique(free_index.cpu() // ps)
                 got_pages = torch.sort(page_reps.cpu() // ps)[0]
                 assert torch.equal(ref_pages, got_pages), "range is not whole pages"
-            assert bool(
-                (swa_reps.cpu() > 0).all()
-            ), "out-of-window range has unmapped slots"
+            assert bool((swa_reps.cpu() > 0).all()), (
+                "out-of-window range has unmapped slots"
+            )
         # Clear before any later cache action in this group can re-point these
         # full indices; a later free_swa then reads 0 and its filter drops it.
         self.clear_full_to_swa_mapping(free_index)
@@ -636,9 +636,9 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
         if self.debug_mode:
-            assert bool(
-                (free_index.cpu() > 0).all()
-            ), "out-of-window range holds slot 0"
+            assert bool((free_index.cpu() > 0).all()), (
+                "out-of-window range holds slot 0"
+            )
         if self.free_group is not None:
             self.free_page_ids_group.append(self._copy_for_free_group(free_index))
             return
