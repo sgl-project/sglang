@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -922,18 +923,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
-        plan = build_dcp_token_transfer_plan(
-            prefill_kv_indices,
-            dst_kv_indices,
-            physical_page_size=physical_page_size,
-            dcp_size=dst_dcp_size,
-            dcp_rank=dst_dcp_rank,
-            src_page_offset=src_page_offset,
-            decode_prefix_len=decode_prefix_len,
-            num_kv_tokens=num_kv_tokens,
-        )
-        if plan.src_token_indices.size == 0:
-            return 0
 
         src_layer_ids = self.kv_args.kv_layer_ids
         if src_layer_ids or dst_layer_ids:
@@ -950,38 +939,87 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
+        num_draft = self.kv_args.num_draft_entries
+        num_target = len(src_kv_ptrs) - num_draft
+
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        draft_plan = None
+        if num_draft > 0:
+            # Draft rows are DCP-replicated on the decode: every chunk token
+            # goes to this rank, addressed at widened virtual locs.
+            draft_plan = build_dcp_replicated_token_transfer_plan(
+                prefill_kv_indices,
+                dst_kv_indices,
+                physical_page_size=physical_page_size,
+                dcp_size=dst_dcp_size,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+            )
+        if plan.src_token_indices.size == 0 and (
+            draft_plan is None or draft_plan.src_token_indices.size == 0
+        ):
+            return 0
+
+        target_src_kv_ptrs = src_kv_ptrs[:num_target]
         src_token_indices = plan.src_token_indices
-        dst_token_indices = plan.dst_token_indices
-        if pack_buffer is not None:
+        if pack_buffer is not None and src_token_indices.size:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
             packed = try_pack_dcp_src(
                 pack_buffer=pack_buffer,
-                kv_data_ptrs=src_kv_ptrs,
+                kv_data_ptrs=target_src_kv_ptrs,
                 src_token_indices=src_token_indices,
-                token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
+                token_item_lens=dcp_token_item_lens[:num_target],
             )
             if packed is not None:
-                src_kv_ptrs, src_token_indices = packed
+                target_src_kv_ptrs, src_token_indices = packed
 
-        layers_current_pp_stage = len(src_kv_ptrs)
-        src_groups, dst_groups = group_concurrent_contiguous(
-            src_token_indices,
-            dst_token_indices,
-        )
-
-        layers_params = [
-            (
-                src_kv_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
-                dcp_token_item_lens[layer_id],
+        # (src_ptr, dst_ptr, token_item_len, (src_groups, dst_groups)) per entry;
+        # target entries share the strided groups, draft entries the replicated ones.
+        layers_params = []
+        if src_token_indices.size:
+            target_groups = group_concurrent_contiguous(
+                src_token_indices,
+                plan.dst_token_indices,
             )
-            for layer_id in range(layers_current_pp_stage)
-        ]
+            layers_params += [
+                (
+                    target_src_kv_ptrs[entry],
+                    dst_kv_ptrs[entry],
+                    dcp_token_item_lens[entry],
+                    target_groups,
+                )
+                for entry in range(num_target)
+            ]
+        if draft_plan is not None and draft_plan.src_token_indices.size:
+            draft_groups = group_concurrent_contiguous(
+                draft_plan.src_token_indices,
+                draft_plan.dst_token_indices,
+            )
+            layers_params += [
+                (
+                    src_kv_ptrs[num_target + entry],
+                    dst_kv_ptrs[num_target + entry],
+                    dcp_token_item_lens[num_target + entry],
+                    draft_groups,
+                )
+                for entry in range(num_draft)
+            ]
 
         def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, token_item_len: int
+            src_ptr: int, dst_ptr: int, token_item_len: int, groups
         ) -> List[Tuple[int, int, int]]:
+            src_groups, dst_groups = groups
             return [
                 (
                     src_ptr + int(src_group[0]) * token_item_len,
@@ -991,24 +1029,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for src_group, dst_group in zip(src_groups, dst_groups)
             ]
 
-        def process_layer(src_ptr: int, dst_ptr: int, token_item_len: int) -> int:
+        def process_layer(
+            src_ptr: int, dst_ptr: int, token_item_len: int, groups
+        ) -> int:
             return self._transfer_data(
                 mooncake_session_id,
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len),
+                set_transfer_blocks(src_ptr, dst_ptr, token_item_len, groups),
             )
 
         if self.enable_custom_mem_pool:
             futures = [
-                executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
-                for src_ptr, dst_ptr, token_item_len in layers_params
+                executor.submit(process_layer, *layer_params)
+                for layer_params in layers_params
             ]
             return self._await_transfer_futures(futures)
 
         transfer_blocks = []
-        for src_ptr, dst_ptr, token_item_len in layers_params:
-            transfer_blocks.extend(
-                set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
-            )
+        for layer_params in layers_params:
+            transfer_blocks.extend(set_transfer_blocks(*layer_params))
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def send_kvcache_slice(
@@ -2095,10 +2133,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_rank,
                     )
                     if decode_kv_args.requires_dcp_relayout:
+                        # The registration wire carries one dst item len (the
+                        # first, a target entry); draft entries page at the
+                        # widened dst page size and are validated on NIXL only.
+                        num_entries = len(self.kv_args.kv_item_lens)
+                        num_draft = self.kv_args.num_draft_entries
+                        dst_item_lens: List[Optional[int]] = [
+                            decode_kv_args.dst_kv_item_len
+                        ] * (num_entries - num_draft) + [None] * num_draft
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
-                                [decode_kv_args.dst_kv_item_len]
-                                * len(self.kv_args.kv_item_lens)
+                                dst_item_lens,
+                                decode_kv_args.dst_dcp_size,
                             )
                         )
                         self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
