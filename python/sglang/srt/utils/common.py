@@ -4399,6 +4399,13 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # GDN (GatedDeltaNet) projections
     "in_proj_qkvz",
     "in_proj_ba",
+    # KDA (Kimi Delta Attention) gate projections (GLM-5.3-Flash, Kimi Linear);
+    # KDA q/k/v/o are addressed through q_proj/k_proj/v_proj/o_proj above.
+    "b_proj",
+    "f_a_proj",
+    "f_b_proj",
+    "g_a_proj",
+    "g_b_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

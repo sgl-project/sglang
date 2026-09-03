@@ -135,6 +135,14 @@ if _use_aiter_gfx95:
 logger = logging.getLogger(__name__)
 
 
+def _lora_serving_enabled() -> bool:
+    """True when the server serves LoRA adapters (``--enable-lora`` / ``--lora-paths``)."""
+    server_args = get_server_args()
+    return bool(getattr(server_args, "enable_lora", False)) or bool(
+        getattr(server_args, "lora_paths", None)
+    )
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -363,7 +371,15 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # LoRA wraps the unfused `qkv_proj` / `b_proj` / `f_*` / `g_*` linears
+        # (see `Glm5NextForConditionalGeneration.supported_lora_modules`); the
+        # fused `MergedColumnParallelRepeatedLinear` / `ColumnParallelBatchedLinear`
+        # have no LoRA wrapper, so keep the unfused layout when LoRA is on.
+        self.do_fuse_qkvbfg = (
+            quant_config is None
+            and head_shard_size == self.tp_size
+            and not _lora_serving_enabled()
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1217,6 +1233,85 @@ class Glm5NextForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    # ---- LoRA ----------------------------------------------------------------
+    # GLM-5.3-Flash mixes two attention geometries (KDA linear attention on the
+    # `kda_layers`, DSA sparse MLA on the rest) and two MLP geometries (dense
+    # for the first `first_k_dense_replace` layers, MoE + shared expert after),
+    # so the LoRA buffer shapes depend on the layer. The config-driven default
+    # (`sglang.srt.lora.utils.get_default_hidden_dim`) assumes one attention
+    # shape for every layer, hence the per-layer hook below. The KDA
+    # projections are only wrappable in the unfused layout, which
+    # `Glm5NextLinearAttention` selects whenever LoRA serving is enabled.
+    supported_lora_modules = [
+        # KDA linear attention (q/k/v stacked into qkv_proj; gates unfused)
+        "qkv_proj",
+        "o_proj",
+        "b_proj",
+        "f_a_proj",
+        "f_b_proj",
+        "g_a_proj",
+        "g_b_proj",
+        # DSA sparse MLA (indexer projections are supported by the generic
+        # DSA path but need SGLANG_DISABLE_DSA_INDEXER_FUSION=1)
+        "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
+        # dense MLP (first_k_dense_replace layers) and the MoE shared expert;
+        # routed experts ride along via the *_moe buffers when both are targeted
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
+    def _lora_is_sparse_layer(self, layer_idx: int) -> bool:
+        cfg = self.config
+        moe_layer_freq = getattr(cfg, "moe_layer_freq", 1) or 1
+        return (
+            getattr(cfg, "n_routed_experts", None) is not None
+            and layer_idx >= cfg.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """Per-layer (input_dim, output_dim) of the LoRA-wrapped base module."""
+        from sglang.srt.lora.utils import get_default_hidden_dim
+
+        cfg = self.config
+        linear_attn_config = cfg.linear_attn_config
+        kda_heads = linear_attn_config["num_heads"]
+        kda_head_dim = linear_attn_config["head_dim"]
+        kda_proj = kda_heads * kda_head_dim
+
+        if module_name == "qkv_proj":
+            # Only KDA layers own q/k/v projections (num_k_heads == num_v_heads
+            # == num_heads); DSA layers have no module of this name, so the
+            # buffer allocated for them is simply never bound.
+            return cfg.hidden_size, 3 * kda_proj
+        if module_name == "o_proj":
+            if cfg.is_kda_layer(layer_idx):
+                return kda_proj, cfg.hidden_size
+            return cfg.num_attention_heads * cfg.v_head_dim, cfg.hidden_size
+        if module_name in ("f_a_proj", "g_a_proj"):
+            return cfg.hidden_size, kda_head_dim
+        if module_name in ("f_b_proj", "g_b_proj"):
+            return kda_head_dim, kda_proj
+        if module_name == "b_proj":
+            return cfg.hidden_size, kda_heads
+        if module_name in ("gate_up_proj", "down_proj"):
+            inter = cfg.intermediate_size
+            if self._lora_is_sparse_layer(layer_idx):
+                inter = cfg.moe_intermediate_size * (cfg.n_shared_experts or 1)
+            if module_name == "gate_up_proj":
+                return cfg.hidden_size, inter * 2
+            return inter, cfg.hidden_size
+        if module_name == "gate_up_proj_moe":
+            return cfg.hidden_size, cfg.moe_intermediate_size * 2
+        if module_name == "down_proj_moe":
+            return cfg.moe_intermediate_size, cfg.hidden_size
+        # DSA MLA, indexer and embeddings share the DeepSeek-V3.2 geometry.
+        return get_default_hidden_dim(module_name, cfg, layer_idx)
 
     def __init__(
         self,
