@@ -93,6 +93,10 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    # Tokens covered by a fuzzy (non-exact) match this round. The fuzzy span
+    # is merged into the request prefix, so this is a SUBSET of
+    # log_hit_tokens; subtract it to get exact-only hits.
+    log_fuzzy_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -116,6 +120,9 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            log_fuzzy_tokens=sum(
+                req.kv.cache_fuzzy_matched_len for req in adder.can_run_list
+            ),
         )
 
 
@@ -610,11 +617,17 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
+        fuzzy_token_msg = (
+            f"#fuzzy-token: {prefill_stats.log_fuzzy_tokens}, "
+            if prefill_stats.log_fuzzy_tokens
+            else ""
+        )
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{fuzzy_token_msg}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "

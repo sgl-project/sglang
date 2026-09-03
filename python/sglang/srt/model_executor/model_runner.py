@@ -925,6 +925,9 @@ class ModelRunner:
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
 
+        # Init fuzzy KV realizer (radix-cache backend "fuzzy_match")
+        self.maybe_init_fuzzy_kv_realizer()
+
         self.maybe_init_hisparse_coordinator()
 
         self.init_routed_experts_capturer()
@@ -1431,6 +1434,27 @@ class ModelRunner:
             model_runner=self, init_new_workspace=init_new_workspace
         )
 
+    def maybe_init_fuzzy_kv_realizer(self):
+        self.fuzzy_kv_realizer = None
+        if self.server_args.radix_cache_backend == "fuzzy_match":
+            from sglang.srt.mem_cache.fuzzy_match.realizer import FuzzyKVRealizer
+
+            self.fuzzy_kv_realizer = FuzzyKVRealizer(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                model=self.model,
+            )
+            if (
+                not self.fuzzy_kv_realizer.pool_supported
+                or self.fuzzy_kv_realizer.rotary_emb is None
+            ):
+                raise ValueError(
+                    "--radix-cache-backend=fuzzy_match requires a standard "
+                    "multi-head attention KV pool and a rotary embedding "
+                    "(MLA-style pools and non-RoPE models are not supported). "
+                    "Remove --radix-cache-backend to serve this model."
+                )
+
     def _decode_cuda_graph_runner_cls(self):
         """Decode CUDA-graph runner class to construct.
 
@@ -1791,6 +1815,11 @@ class ModelRunner:
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+
+            # Realize fuzzy-matched donor KV (copy + RoPE correction) on the
+            # forward stream, before the extend dispatch below reads the pool.
+            if self.fuzzy_kv_realizer is not None and forward_batch.fuzzy_reqs:
+                self.fuzzy_kv_realizer.realize(fuzzy_reqs=forward_batch.fuzzy_reqs)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:

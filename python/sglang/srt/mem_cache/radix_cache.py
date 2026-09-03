@@ -514,6 +514,12 @@ class RadixCache(BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            self._on_finished_insert(
+                req=req,
+                insert_result=result,
+                kv_indices=kv_indices,
+                token_ids=token_ids,
+            )
             freed_end = result.prefix_len
         else:
             freed_end = key_len
@@ -532,6 +538,20 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
+
+    def _on_finished_insert(
+        self,
+        req: Req,
+        insert_result: InsertResult,
+        kv_indices: torch.Tensor,
+        token_ids: List[int],
+    ) -> None:
+        """Hook between the finished-request insert and duplicate-slot freeing.
+
+        Subclasses that index finished requests (e.g. fuzzy-match backends)
+        override this to observe the request's KV while its pool slots are
+        still live. The base cache does nothing.
+        """
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

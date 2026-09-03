@@ -876,6 +876,18 @@ class ReqKvInfo:
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
 
+    # Fuzzy KV reuse state (only set by the fuzzy_match radix backend).
+    # Prompt tokens covered by a fuzzy (non-exact) match this round; consumed
+    # and zeroed by the model runner after realization.
+    cache_fuzzy_matched_len: int = 0
+    # The provider's FuzzyMatchResult for this round, if any.
+    fuzzy_match_result: Optional[Any] = None
+    # Donor TreeNode pinned (inc_lock_ref) until this request finishes.
+    fuzzy_donor_node: Optional[Any] = None
+    # Pool slots pre-allocated for RoPE-corrected donor KV; freed by
+    # cache_finished_req if the forward pass never consumed them.
+    fuzzy_realized_locs: Optional[torch.Tensor] = None
+
     def swa_dead_lo(self, page_size: int) -> int:
         # Lowest SWA position this request may free itself: above the tree-owned
         # prefix and above the eviction shield, page-aligned upward.
@@ -1486,6 +1498,7 @@ class Req(ReqDllmMixin):
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
                 self.kv.cache_protected_len = len(self.prefix_indices)
+            self.kv.cache_fuzzy_matched_len = match_result.fuzzy_matched_len or 0
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1769,6 +1782,9 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.kv.cache_protected_len = 0
+        self.kv.cache_fuzzy_matched_len = 0
+        self.kv.fuzzy_match_result = None
+        self.kv.fuzzy_realized_locs = None
         self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False

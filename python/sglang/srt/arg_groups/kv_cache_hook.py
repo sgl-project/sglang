@@ -507,3 +507,55 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
             "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
         )
+
+
+def handle_fuzzy_match_backend(server_args: Any) -> None:
+    """Validate the fuzzy_match radix-cache backend's operating envelope.
+
+    Position-corrected donor reuse is token-granular and mutates request KV
+    state on the forward stream, so it is confined to the configurations it
+    has been validated against.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.radix_cache_backend != "fuzzy_match":
+        return
+
+    if not (0.0 <= cfg.fuzzy_semantic_threshold <= 1.0):
+        raise ValueError(
+            f"--fuzzy-semantic-threshold must be in [0.0, 1.0], got "
+            f"{cfg.fuzzy_semantic_threshold}"
+        )
+    if not (0.0 <= cfg.fuzzy_min_reuse_ratio <= 1.0):
+        raise ValueError(
+            f"--fuzzy-min-reuse-ratio must be in [0.0, 1.0], got "
+            f"{cfg.fuzzy_min_reuse_ratio}"
+        )
+    if cfg.fuzzy_min_match_length < 1:
+        raise ValueError(
+            f"--fuzzy-min-match-length must be >= 1, got "
+            f"{cfg.fuzzy_min_match_length}"
+        )
+    if cfg.page_size is not None and cfg.page_size != 1:
+        raise ValueError(
+            "--radix-cache-backend=fuzzy_match requires --page-size=1: "
+            "fuzzy spans are token-granular and do not respect page "
+            "alignment yet."
+        )
+    if cfg.tp_size > 1 or cfg.pp_size > 1:
+        raise ValueError(
+            "--radix-cache-backend=fuzzy_match currently supports tp_size=1 "
+            "and pp_size=1 only: per-rank schedulers could diverge on fuzzy "
+            "match decisions."
+        )
+    if not cfg.disable_overlap_schedule:
+        logger.warning(
+            "--radix-cache-backend=fuzzy_match forces "
+            "--disable-overlap-schedule: donor realization mutates request "
+            "KV state on the forward stream and is not ordered against "
+            "overlapped batch preparation."
+        )
+        declare_resolution(
+            server_args,
+            "handle_fuzzy_match_backend",
+            disable_overlap_schedule=True,
+        )
