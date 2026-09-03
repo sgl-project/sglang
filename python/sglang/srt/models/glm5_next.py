@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -336,7 +337,26 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # A global quant_config does not mean these six projections are
+        # quantized: GLM-5.3-Flash ships FP8 experts with BF16 attention. Ask
+        # per prefix, since the fused modules can only eat unquantized weights.
+        self.do_fuse_qkvbfg = (
+            head_shard_size == self.tp_size
+            and are_linear_prefixes_unquantized(
+                quant_config,
+                [
+                    f"{prefix}.{name}"
+                    for name in (
+                        "qkv_proj",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                    )
+                ],
+            )
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -350,7 +370,12 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # The gate above already proved the source weights are
+                # unquantized. This name exists in no checkpoint, so an ignore
+                # list written in terms of the real ones is not guaranteed to
+                # cover it -- handing it the global config risks quantizing a
+                # layer whose source weights are BF16.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
