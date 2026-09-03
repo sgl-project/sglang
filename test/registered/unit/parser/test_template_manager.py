@@ -144,15 +144,13 @@ class TestTemplateManagerReasoningDetection(unittest.TestCase):
             # An explicit boolean=false second argument is equivalent to the
             # one-argument form.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(true, false) -%}",
+                "{%- set enable_thinking = enable_thinking | default(true, false) -%}",
                 True,
             ),
             # Boolean mode with a false default still maps False -> False and
             # True -> True, so it is a working default-off toggle.
             (
-                "{%- set enable_thinking = enable_thinking"
-                " | default(false, true) -%}",
+                "{%- set enable_thinking = enable_thinking | default(false, true) -%}",
                 False,
             ),
             (

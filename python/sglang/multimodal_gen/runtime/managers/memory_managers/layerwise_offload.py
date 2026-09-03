@@ -729,9 +729,9 @@ class LayerwiseOffloadManager:
                         # below swaps that same object's storage for a (1,)
                         # placeholder, leaving the placeholder in the store.
                         # Keep an independent tensor over the mapped storage.
-                        self._mapped_cpu_weights[layer_idx][
-                            name
-                        ] = local_weight.detach().view_as(local_weight)
+                        self._mapped_cpu_weights[layer_idx][name] = (
+                            local_weight.detach().view_as(local_weight)
+                        )
                         self._weight_metadata[layer_idx][name] = {
                             "dtype": local_weight.dtype,
                             "shape": tuple(local_weight.shape),
