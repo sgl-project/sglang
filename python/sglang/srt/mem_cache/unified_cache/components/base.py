@@ -132,6 +132,11 @@ class TreeComponent(ABC):
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
+    # Whether a linker transfer's device_indices are page-aligned token slots
+    # covering the prefix tail. False for slot-addressed state (Mamba), which the
+    # COMMIT page slicing in UnifiedCacheLinkerWrapper cannot reshape.
+    linker_indices_are_paged: bool = True
+
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
 

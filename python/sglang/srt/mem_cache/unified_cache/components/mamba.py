@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    linker_indices_are_paged = False
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool

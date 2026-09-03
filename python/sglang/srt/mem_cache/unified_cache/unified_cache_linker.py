@@ -430,7 +430,9 @@ class UnifiedCacheLinkerWrapper:
         )
         for component, transfer in transfers:
             component_canonical = canonical_full
-            if phase == ExternalLinkerLoadPhase.COMMIT:
+            if phase == ExternalLinkerLoadPhase.COMMIT and (
+                component.linker_indices_are_paged
+            ):
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
