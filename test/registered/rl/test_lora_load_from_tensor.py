@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 from huggingface_hub import snapshot_download
@@ -20,6 +21,26 @@ EXPECTED_OUTPUT = (
     " Alice, and I am a software engineer. I am excited to share my journey"
 )
 MAX_NEW_TOKENS = 16
+
+
+def load_lora_via_stream(engine, lora_name, tensors, config_dict):
+    """Wire-load an adapter over the stream path: register (control plane) +
+    prefixed tensors through a sync_base=False weight-update session."""
+    result = engine.register_lora_adapter(lora_name=lora_name, config_dict=config_dict)
+    if not result.success:
+        return SimpleNamespace(success=False, error_message=result.error_message)
+    engine.begin_weight_update(selector="all", sync_base=False)
+    engine.update_weights_from_tensor(
+        named_tensors=[
+            (f"{lora_name}:{key}", tensor) for key, tensor in tensors.items()
+        ]
+    )
+    success, message = engine.end_weight_update()
+    return SimpleNamespace(success=success, error_message=message)
+
+
+def loaded_adapter_names(engine):
+    return list(engine.tokenizer_manager.lora_registry._registry.keys())
 
 
 class TestLoRALoadFromTensor(CustomTestCase):
@@ -45,10 +66,10 @@ class TestLoRALoadFromTensor(CustomTestCase):
         with open(os.path.join(lora_adapter, "adapter_config.json"), "r") as f:
             cls.lora_config_dict = json.load(f)
 
-    def test_lora_lru_eviction(self):
-        print("[Test]Testing LRU LoRA eviction...")
+    def test_lora_stream_register_rejected_over_cap(self):
+        """Streamed adapters have no path to reload from, so the cap rejects new
+        registrations instead of evicting; same-name upserts stay allowed."""
         MAX_LOADED_LORAS = 8
-        print(f"[Test]Max loaded LoRAs: {MAX_LOADED_LORAS}")
         test_engine = sgl.Engine(
             model_path=MODEL_PATH,
             enable_lora=True,
@@ -59,56 +80,61 @@ class TestLoRALoadFromTensor(CustomTestCase):
             max_loaded_loras=MAX_LOADED_LORAS,
         )
 
-        # Load 10 LoRA adapters, max allowed is 8
-        # This should trigger LRU eviction when we exceed the limit
         TEST_LORA_COUNT = 10
         for i in range(TEST_LORA_COUNT):
-            print(f"[Test]Loading LoRA adapter {i+1}/10: self_cognition_Alice_{i}")
-            result = test_engine.load_lora_adapter_from_tensors(
-                lora_name=f"self_cognition_Alice_{i}",
-                tensors=self.lora_tensors,
-                config_dict=self.lora_config_dict,
+            result = load_lora_via_stream(
+                test_engine,
+                f"self_cognition_Alice_{i}",
+                self.lora_tensors,
+                self.lora_config_dict,
             )
-            self.assertTrue(
-                result.success,
-                f"Failed to load LoRA adapter {i}: {result.error_message}",
-            )
-            print(
-                f"[Test]Successfully loaded LoRA {i+1}, current loaded adapters: {list(result.loaded_adapters.keys())}"
-            )
+            if i < MAX_LOADED_LORAS:
+                self.assertTrue(
+                    result.success,
+                    f"Failed to load LoRA adapter {i}: {result.error_message}",
+                )
+            else:
+                self.assertFalse(
+                    result.success,
+                    f"Adapter {i} should have been rejected over the cap",
+                )
+                self.assertIn("max-loaded-loras", result.error_message)
 
-        EXPECTED_LORA_ADAPTERS = [
-            "self_cognition_Alice_2",
-            "self_cognition_Alice_3",
-            "self_cognition_Alice_4",
-            "self_cognition_Alice_5",
-            "self_cognition_Alice_6",
-            "self_cognition_Alice_7",
-            "self_cognition_Alice_8",
-            "self_cognition_Alice_9",
-        ]
-        EXPECTED_LORA_COUNT = 8
+        loaded = loaded_adapter_names(test_engine)
         self.assertEqual(
-            len(result.loaded_adapters),
-            EXPECTED_LORA_COUNT,
-            f"Loaded adapters count does not match expected result: {len(result.loaded_adapters)} != {EXPECTED_LORA_COUNT}",
+            loaded,
+            [f"self_cognition_Alice_{i}" for i in range(MAX_LOADED_LORAS)],
+            f"Loaded adapters do not match the first {MAX_LOADED_LORAS} registrations: {loaded}",
         )
-        self.assertEqual(
-            list(result.loaded_adapters.keys()),
-            EXPECTED_LORA_ADAPTERS,
-            f"Loaded adapters do not match expected result: {list(result.loaded_adapters.keys())} != {EXPECTED_LORA_ADAPTERS}",
+
+        # Same-name upsert must still pass at the cap.
+        result = load_lora_via_stream(
+            test_engine,
+            "self_cognition_Alice_0",
+            self.lora_tensors,
+            self.lora_config_dict,
         )
-        print(
-            f"[Test]LRU eviction test passed! Final loaded adapters: {len(result.loaded_adapters)}"
+        self.assertTrue(result.success, f"Upsert at cap failed: {result.error_message}")
+
+    def test_register_rejects_name_holding_the_separator(self):
+        """A name holding ':' could never be matched by its own streamed tensors,
+        since the first ':' is what splits adapter from tensor key."""
+        result = self.engine.register_lora_adapter(
+            lora_name="team:alice",
+            config_dict=self.lora_config_dict,
         )
+        self.assertFalse(result.success, "':' in an adapter name must be rejected")
+        self.assertIn("must not contain ':'", result.error_message)
+        self.assertNotIn("team:alice", loaded_adapter_names(self.engine))
 
     def test_lora_e2e_load_from_tensor_params(self):
         print("[Test]Testing LoRA load from tensor params...")
 
-        result = self.engine.load_lora_adapter_from_tensors(
-            lora_name="self_cognition_Alice",
-            tensors=self.lora_tensors,
-            config_dict=self.lora_config_dict,
+        result = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice",
+            self.lora_tensors,
+            self.lora_config_dict,
         )
         self.assertTrue(
             result.success,
@@ -150,10 +176,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
         print("[Test]Testing LoRA load, unload, load from tensor params...")
 
         # Load LoRA adapter from tensors
-        result = self.engine.load_lora_adapter_from_tensors(
-            lora_name="self_cognition_Alice_multiple",
-            tensors=self.lora_tensors,
-            config_dict=self.lora_config_dict,
+        result = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice_multiple",
+            self.lora_tensors,
+            self.lora_config_dict,
         )
         self.assertTrue(
             result.success,
@@ -175,10 +202,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 lora_path=["self_cognition_Alice_multiple"],
             )
         # Load LoRA adapter again
-        result_again = self.engine.load_lora_adapter_from_tensors(
-            lora_name="self_cognition_Alice_multiple",
-            tensors=self.lora_tensors,
-            config_dict=self.lora_config_dict,
+        result_again = load_lora_via_stream(
+            self.engine,
+            "self_cognition_Alice_multiple",
+            self.lora_tensors,
+            self.lora_config_dict,
         )
         self.assertTrue(
             result_again.success,
@@ -240,10 +268,8 @@ class TestLoRALoadFromTensor(CustomTestCase):
                 "down_proj",
             ],
         ) as srt_runner:
-            result = srt_runner.engine.load_lora_adapter_from_tensors(
-                lora_name=lora_name,
-                tensors=self.lora_tensors,
-                config_dict=self.lora_config_dict,
+            result = load_lora_via_stream(
+                srt_runner.engine, lora_name, self.lora_tensors, self.lora_config_dict
             )
             self.assertTrue(
                 result.success,
@@ -334,23 +360,27 @@ class TestLoRALoadFromTensor(CustomTestCase):
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
-        named_tensors = list(self.lora_tensors.items())
-        bucket = FlattenedTensorBucket(named_tensors=[(n, t) for n, t in named_tensors])
+        lora_name = "self_cognition_Alice_flattened"
+        named_tensors = [
+            (f"{lora_name}:{key}", tensor) for key, tensor in self.lora_tensors.items()
+        ]
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         bucket_dict = {
             "flattened_tensor": bucket.get_flattened_tensor(),
             "metadata": bucket.get_metadata(),
         }
         serialized = MultiprocessingSerializer.serialize(bucket_dict, output_str=True)
 
-        # flattened_bucket callers pass one serialized copy per TP rank, same
-        # as Engine.update_weights_from_tensor.
-        result = self.engine.load_lora_adapter_from_tensors(
-            lora_name="self_cognition_Alice_flattened",
-            tensors=[serialized],
-            config_dict=self.lora_config_dict,
-            load_format="flattened_bucket",
+        result = self.engine.register_lora_adapter(
+            lora_name=lora_name, config_dict=self.lora_config_dict
         )
         self.assertTrue(result.success, f"Failed: {result.error_message}")
+        self.engine.begin_weight_update(selector="all", sync_base=False)
+        self.engine.update_weights_from_tensor(
+            named_tensors=[serialized], load_format="flattened_bucket"
+        )
+        success, message = self.engine.end_weight_update()
+        self.assertTrue(success, f"Failed: {message}")
 
         output = self.engine.generate(
             prompt=[TEST_PROMPT],
