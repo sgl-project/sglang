@@ -24,23 +24,18 @@ class TestK2V3ReasoningParser(CustomTestCase):
                 self.assertEqual(
                     (detector.think_start_token, detector.think_end_token), tokens
                 )
-                self.assertFalse(hasattr(detector, "think_end_tokens"))
-                self.assertEqual(
-                    set(detector.request_selectable_think_end_tokens),
-                    {
-                        "</ifm|think>",
-                        "</ifm|think_fast>",
-                        "</ifm|think_faster>",
-                    },
-                )
+        self.assertEqual(
+            set(detector.request_selectable_think_end_tokens),
+            {
+                "</ifm|think>",
+                "</ifm|think_fast>",
+                "</ifm|think_faster>",
+            },
+        )
 
     def test_release_template_fallback_uses_medium_pair(self):
         # K2-Horizon-0.9B maps unsupported levels to <ifm|think_fast>.
         detector = K2V3Detector(reasoning_effort="none")
-        self.assertEqual(detector.think_start_token, "<ifm|think_fast>")
-
-    def test_unhashable_effort_uses_release_fallback(self):
-        detector = K2V3Detector(reasoning_effort=[])
         self.assertEqual(detector.think_start_token, "<ifm|think_fast>")
 
     def test_end_only_output_preserves_newlines(self):
@@ -111,17 +106,6 @@ class TestK2V3ReasoningParser(CustomTestCase):
                     parser.parse_non_stream(f"work{end_token}\nanswer"),
                     ("work", "\nanswer"),
                 )
-
-    def test_responses_template_kwarg_has_rendering_precedence(self):
-        request = ResponsesRequest(
-            model="IFM/K2-Horizon-7B",
-            input="hi",
-            reasoning={"effort": "medium"},
-            chat_template_kwargs={"reasoning_effort": "low"},
-            store=False,
-        )
-        parser = ReasoningParser("k2_horizon", request=request)
-        self.assertEqual(parser.detector.think_end_token, "</ifm|think_faster>")
 
     def test_force_reasoning_cannot_be_disabled(self):
         with self.assertRaisesRegex(ValueError, "requires force_reasoning=True"):

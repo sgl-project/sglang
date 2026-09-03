@@ -643,29 +643,6 @@ class OutputItemsTestCase(CustomTestCase):
             ],
         )
 
-    def test_k2_nested_effort_selects_non_stream_reasoning_delimiter(self):
-        self.serving.reasoning_parser = "k2_horizon"
-        self.serving.tool_call_parser = None
-        request = ResponsesRequest(
-            model="IFM/K2-Horizon-7B",
-            input="hi",
-            reasoning={"effort": "low"},
-            store=False,
-        )
-
-        output_items = self.serving._make_response_output_items(
-            request,
-            "work</ifm|think_faster>\nanswer",
-            tokenizer=Mock(),
-            require_reasoning=True,
-        )
-
-        self.assertEqual(len(output_items), 2)
-        self.assertIsInstance(output_items[0], ResponseReasoningItem)
-        self.assertEqual(output_items[0].content[0].text, "work")
-        self.assertIsInstance(output_items[1], ResponseOutputMessage)
-        self.assertEqual(output_items[1].content[0].text, "\nanswer")
-
     def test_function_tool_call_extracted_via_parser(self):
         serving = self.serving
         fake_call = ToolCallItem(

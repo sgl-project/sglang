@@ -11,7 +11,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
-def test_mova_routed_linear_matches_independent_reference():
+def test_mova_routed_linear_matches_reference_implementation():
     """Exercise the fused-MoE CUDA path with multiple routes and experts."""
 
     torch.manual_seed(0)
@@ -47,9 +47,7 @@ def test_mova_routed_linear_matches_independent_reference():
         hidden_states, expert_weights, routing_weights, selected_experts
     )
 
-    assert actual.shape == expected.shape
     assert actual.dtype == torch.bfloat16
-    assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
 

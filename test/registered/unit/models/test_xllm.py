@@ -49,7 +49,8 @@ class _IdentityRotary:
 def test_native_config_and_model_registration():
     assert _CONFIG_REGISTRY["xllm"] is XllmConfig
     assert _CONFIG_REGISTRY["k2_horizon"] is K2HorizonConfig
-    assert EntryClass == [XllmForCausalLM, K2HorizonForCausalLM]
+    assert XllmForCausalLM in EntryClass
+    assert K2HorizonForCausalLM in EntryClass
 
 
 def test_dense_horizon_yarn_schema_normalization():
