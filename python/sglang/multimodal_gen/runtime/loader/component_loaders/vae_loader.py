@@ -467,9 +467,9 @@ class VAELoader(WeightOverrideComponentLoader):
         )
 
         class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         component_type = self.structural_component_type(component_name)
         if component_type in ("vae", "video_vae"):
@@ -577,9 +577,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 vae_precision,
             )
 
-        assert (
-            len(safetensors_list) >= 1
-        ), f"Found no safetensors files in {component_weights_path}"
+        assert len(safetensors_list) >= 1, (
+            f"Found no safetensors files in {component_weights_path}"
+        )
         if direct_gpu_weight_loading:
             _assign_direct_gpu_vae_state(
                 vae,
