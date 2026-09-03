@@ -152,8 +152,7 @@ def _resize_center_crop_uint8_cthw(
     """Resize and center-crop ``uint8 [3, T, H, W]`` transfer frames."""
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
-            "Transfer frames must have shape [3, T, H, W], got "
-            f"{tuple(frames.shape)}"
+            f"Transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
@@ -178,8 +177,7 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     """Pad ``[1, 3, T, H, W]`` with reflected temporal content."""
     if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
         raise ValueError(
-            "Transfer video must have shape [1, 3, T, H, W], got "
-            f"{tuple(video.shape)}"
+            f"Transfer video must have shape [1, 3, T, H, W], got {tuple(video.shape)}"
         )
     if target_frames <= 0:
         raise ValueError("Transfer target frame count must be positive")
@@ -242,8 +240,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         stride = frames_per_chunk - conditional_frames
         if stride <= 0:
             raise ValueError(
-                "num_conditional_frames must be smaller than "
-                "num_video_frames_per_chunk"
+                "num_conditional_frames must be smaller than num_video_frames_per_chunk"
             )
         remaining = total_frames - frames_per_chunk
         return 1 + math.ceil(remaining / stride), stride

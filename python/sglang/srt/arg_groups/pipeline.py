@@ -318,6 +318,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_speculative_decoding(server_args)
 
+    # After the speculative hook so speculative_algorithm is final.
+    from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
+
+    handle_layernorm_sp(server_args)
+
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     validate_cutedsl_a2a_token_budget(server_args)
 
