@@ -79,12 +79,8 @@ class GlobalTree {
   double initialContribution(int32_t matched_length) const;
   void seedFrontier();
   template <typename TypedCursor>
-  void appendCandidate(
-      const TypedCursor& cursor,
-      int32_t token,
-      TypedCursor successor,
-      uint64_t mass,
-      uint64_t total_mass);
+  void
+  appendCandidate(const TypedCursor& cursor, int32_t token, TypedCursor successor, uint64_t mass, uint64_t total_mass);
   void appendCursorTransitionsCandidates(const Cursor& cursor);
   void expandSelectCursors(uint32_t global_parent_id, uint32_t cursor_begin, uint32_t cursor_count);
   void selectNextNode();

@@ -69,11 +69,7 @@ void GlobalTree::seedFrontier() {
 
 template <typename TypedCursor>
 void GlobalTree::appendCandidate(
-    const TypedCursor& cursor,
-    int32_t token,
-    TypedCursor successor,
-    uint64_t mass,
-    uint64_t total_mass) {
+    const TypedCursor& cursor, int32_t token, TypedCursor successor, uint64_t mass, uint64_t total_mass) {
   if (mass == 0) {
     return;
   }
@@ -81,12 +77,13 @@ void GlobalTree::appendCandidate(
   const double conditional_probability = static_cast<double>(mass) / static_cast<double>(total_mass);
   const double contribution_score = cursor.contribution_score * conditional_probability;
   successor.contribution_score = contribution_score;
-  candidate_buffer_.push_back(ScratchCandidate{
-      .successor = std::move(successor),
-      .contribution_score = contribution_score,
-      .token = token,
-      .insertion_sequence = next_insertion_sequence_++,
-  });
+  candidate_buffer_.push_back(
+      ScratchCandidate{
+          .successor = std::move(successor),
+          .contribution_score = contribution_score,
+          .token = token,
+          .insertion_sequence = next_insertion_sequence_++,
+      });
 }
 
 void GlobalTree::appendCursorTransitionsCandidates(const Cursor& cursor) {
@@ -102,11 +99,7 @@ void GlobalTree::appendCursorTransitionsCandidates(const Cursor& cursor) {
     const auto total_mass = anchor.sam->frequencyTransitions(sam_cursor.state, max_breadth_, sam_transitions_);
     for (const auto& transition : sam_transitions_) {
       appendCandidate(
-          sam_cursor,
-          transition.token,
-          SamCursor{sam_cursor.sam_index, transition.state},
-          transition.mass,
-          total_mass);
+          sam_cursor, transition.token, SamCursor{sam_cursor.sam_index, transition.state}, transition.mass, total_mass);
     }
   }
 }
@@ -139,14 +132,15 @@ void GlobalTree::expandSelectCursors(uint32_t global_parent_id, uint32_t cursor_
     for (size_t candidate_index = group_begin; candidate_index < group_end; ++candidate_index) {
       cursor_arena_.push_back(candidate_buffer_[candidate_index].successor);
     }
-    frontier_.push_back(FrontierEdge{
-        .contribution_score = best.contribution_score,
-        .parent_id = global_parent_id,
-        .cursor_begin = cursor_begin,
-        .cursor_count = static_cast<uint32_t>(group_end - group_begin),
-        .token = best.token,
-        .insertion_sequence = best.insertion_sequence,
-    });
+    frontier_.push_back(
+        FrontierEdge{
+            .contribution_score = best.contribution_score,
+            .parent_id = global_parent_id,
+            .cursor_begin = cursor_begin,
+            .cursor_count = static_cast<uint32_t>(group_end - group_begin),
+            .token = best.token,
+            .insertion_sequence = best.insertion_sequence,
+        });
     group_begin = group_end;
   }
 }
@@ -175,8 +169,7 @@ Result GlobalTree::materialize(int32_t last_token) const {
     proposal_parents.push_back(static_cast<int32_t>(nodes_[node_id].parent_id));
   }
 
-  return fillResultWithParentArray(
-      last_token, proposal_budget_ + 1, proposal_tokens, proposal_parents);
+  return fillResultWithParentArray(last_token, proposal_budget_ + 1, proposal_tokens, proposal_parents);
 }
 
 }  // namespace ngram

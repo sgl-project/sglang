@@ -222,9 +222,7 @@ Result SuffixAutomaton::buildRecency(
   for (const auto& anchor : anchors) {
     std::queue<std::tuple<int, double, int>> queue;
     queue.push(
-        {root,
-         (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth,
-         anchor.state});
+        {root, (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
       auto [parent, cur_breadth, state] = queue.front();
       queue.pop();

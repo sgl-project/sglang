@@ -921,9 +921,7 @@ class TestReconstructIndicesFromTreeMask(CustomTestCase):
         )
 
         self.assertEqual(retrieve_index.tolist(), [[0, 1, 2, 3], [4, 5, 6, 7]])
-        self.assertEqual(
-            retrieve_next_token.tolist(), [[1, 2, -1, -1], [1, 2, 3, -1]]
-        )
+        self.assertEqual(retrieve_next_token.tolist(), [[1, 2, -1, -1], [1, 2, 3, -1]])
         self.assertEqual(
             retrieve_next_sibling.tolist(),
             [[-1, 3, -1, -1], [-1, -1, -1, -1]],

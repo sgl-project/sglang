@@ -251,9 +251,7 @@ class TestNgramCountryCardDisabled(_CountryCardBenchmarkMixin, NgramServerBase):
     global_tree_mode = "disabled"
 
 
-class TestNgramCountryCardPathProbability(
-    _CountryCardBenchmarkMixin, NgramServerBase
-):
+class TestNgramCountryCardPathProbability(_CountryCardBenchmarkMixin, NgramServerBase):
     global_tree_mode = "path_probability"
 
 

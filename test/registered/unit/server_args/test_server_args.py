@@ -1641,9 +1641,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
             speculative_ngram_global_tree_mode="path_probability",
         )
         handle_speculative_decoding(args)
-        self.assertEqual(
-            args.speculative_ngram_global_tree_mode, "path_probability"
-        )
+        self.assertEqual(args.speculative_ngram_global_tree_mode, "path_probability")
 
     def test_global_tree_mode_defaults_to_specificity_path_probability(self):
         args = prepare_server_args(["--model-path", "dummy"])

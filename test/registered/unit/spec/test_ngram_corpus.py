@@ -750,9 +750,7 @@ class TestNgramCorpusGlobalTree(CustomTestCase):
             corpus.synchronize()
             return corpus
 
-        probability_ids, _ = _batch_get(
-            build("path_probability"), [[1, 2, 3, 4]]
-        )
+        probability_ids, _ = _batch_get(build("path_probability"), [[1, 2, 3, 4]])
         specificity_ids, _ = _batch_get(
             build("specificity_path_probability"), [[1, 2, 3, 4]]
         )
@@ -774,9 +772,7 @@ class TestNgramCorpusGlobalTree(CustomTestCase):
             corpus.synchronize()
             return corpus
 
-        probability_ids, _ = _batch_get(
-            build("path_probability"), [[1, 2, 3, 4]]
-        )
+        probability_ids, _ = _batch_get(build("path_probability"), [[1, 2, 3, 4]])
         specificity_ids, _ = _batch_get(
             build("specificity_path_probability"), [[1, 2, 3, 4]]
         )
@@ -901,12 +897,8 @@ class TestNgramCorpusGlobalTree(CustomTestCase):
                 _load_external_documents(corpus, corpus_id, documents[corpus_id])
             return corpus
 
-        forward_ids, forward_masks = _batch_get(
-            build(["alpha", "zeta"]), [[1, 2, 3]]
-        )
-        reverse_ids, reverse_masks = _batch_get(
-            build(["zeta", "alpha"]), [[1, 2, 3]]
-        )
+        forward_ids, forward_masks = _batch_get(build(["alpha", "zeta"]), [[1, 2, 3]])
+        reverse_ids, reverse_masks = _batch_get(build(["zeta", "alpha"]), [[1, 2, 3]])
 
         self.assertEqual(forward_ids.tolist(), [3, 20])
         np.testing.assert_array_equal(forward_ids, reverse_ids)
