@@ -28,7 +28,7 @@ FULL_PAGES = 128
 SWA_PAGES = 64
 
 
-def _make_allocator(page_size=PAGE) -> SWATokenToKVPoolAllocator:
+def _make_allocator(page_size=PAGE, device="cpu") -> SWATokenToKVPoolAllocator:
     kvcache = MagicMock(spec=BaseSWAKVPool)
     kvcache.full_kv_pool = None
     kvcache.swa_kv_pool = None
@@ -37,7 +37,7 @@ def _make_allocator(page_size=PAGE) -> SWATokenToKVPoolAllocator:
         size_swa=SWA_PAGES * page_size,
         page_size=page_size,
         dtype=torch.float16,
-        device="cpu",
+        device=device,
         kvcache=kvcache,
         need_sort=False,
     )
@@ -82,9 +82,18 @@ def _bitwise_state(alloc):
 
 
 def _assert_states_equal(test, a, b):
-    test.assertTrue(torch.equal(a[0], b[0]), f"free_pages differ:\n{a[0]}\n{b[0]}")
+    # Compared as sets: a grouped segment free releases its page ids in one
+    # fixed-shape batch ahead of the filtered batch, so the free-list order may
+    # differ from the eager path while the freed pages are identical.
+    test.assertTrue(
+        torch.equal(torch.sort(a[0]).values, torch.sort(b[0]).values),
+        f"free_pages differ:\n{a[0]}\n{b[0]}",
+    )
     if a[1] is not None or b[1] is not None:
-        test.assertTrue(torch.equal(a[1], b[1]), "release_pages differ")
+        test.assertTrue(
+            torch.equal(torch.sort(a[1]).values, torch.sort(b[1]).values),
+            "release_pages differ",
+        )
     test.assertTrue(torch.equal(a[2], b[2]), "mapping differs")
     test.assertEqual(a[3], b[3], "availability differs")
 
@@ -204,6 +213,24 @@ class TestSyncFreeSwaInplaceStatic(CustomTestCase):
         self.assertEqual(req.kv.swa_evicted_seqlen, 256)
         b = _bitwise_state(alloc_b)
         _assert_states_equal(self, a, b)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "sync debug mode needs CUDA")
+    def test_grouped_segment_free_does_not_synchronize(self):
+        """The production route (maybe_evict_swa wraps the ratchet in a free
+        group) must issue no data-dependent-shape op on either page size."""
+        for page_size in (PAGE, 1):
+            alloc = _make_allocator(page_size, device="cuda")
+            n = 4 * page_size
+            full = alloc.full_attn_allocator.alloc(n)
+            alloc.set_full_to_swa_mapping(full, alloc.swa_attn_allocator.alloc(n))
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                alloc.free_group_begin()
+                alloc.free_swa_segment_inplace(full, start_pos=0)
+                alloc.free_group_end()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
 
     def test_pure_swa_inplace(self):
         kvcache = MagicMock(spec=BaseSWAKVPool)

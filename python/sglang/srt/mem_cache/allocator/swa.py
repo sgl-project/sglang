@@ -4,7 +4,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_bool_env_var, is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
@@ -96,7 +96,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
         self.swa_free_group = []
         self.full_free_group = []
+        # Page ids from segment frees issued inside a free group. Ownership is
+        # resolved at enqueue, so they release at group end with no liveness filter.
+        self.swa_free_page_ids_group = []
         self._swa_mapping_may_be_partial = False
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.clear()
@@ -397,49 +401,59 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         ops only (no unique/nonzero -> no stream sync under the in-flight
         forward): page reps are the stride slice ``free_index[::page_size]``,
         and a first-time-freed range below the frontier has every mapping
-        live, so the ``> 0`` filter is skippable. Same call site and timing;
-        bitwise-identical end state. Partial mappings, unaligned inputs, and
-        in-group calls fall back to free_swa.
+        live, so the ``> 0`` filter is skippable. Inside a free group the
+        mapping is still read and cleared now (same ownership timing as
+        free_swa); only the page ids are deferred to free_group_end. Partial
+        mappings and unaligned inputs fall back to free_swa.
         """
         n = free_index.numel()
         if n == 0:
             return
         ps = self.page_size
-        if (
-            self.free_group is not None
-            or self._swa_mapping_may_be_partial
-            or start_pos % ps != 0
-            or n % ps != 0
-        ):
+        if self._swa_mapping_may_be_partial or start_pos % ps != 0 or n % ps != 0:
             self.free_swa(free_index)
             return
 
-        if ps == 1:
-            swa_slots = self.full_to_swa_index_mapping[free_index]
-            self.swa_attn_allocator.free(swa_slots)
-            self.clear_full_to_swa_mapping(free_index)
-            return
-
-        page_reps = free_index[::ps]
+        page_reps = free_index if ps == 1 else free_index[::ps]
         swa_reps = self.full_to_swa_index_mapping[page_reps]
-        if self.swa_attn_allocator.debug_mode:
-            ref_pages = torch.unique(free_index.cpu() // ps)
-            got_pages = torch.sort(page_reps.cpu() // ps)[0]
-            assert torch.equal(ref_pages, got_pages), "range is not whole pages"
+        if self.debug_mode:
+            if ps > 1:
+                ref_pages = torch.unique(free_index.cpu() // ps)
+                got_pages = torch.sort(page_reps.cpu() // ps)[0]
+                assert torch.equal(ref_pages, got_pages), "range is not whole pages"
             assert bool(
                 (swa_reps.cpu() > 0).all()
             ), "out-of-window range has unmapped slots"
-        swa_page_ids = torch.sort(swa_reps // ps).values
-        self.swa_attn_allocator.free_page_ids(swa_page_ids)
+        # Clear before any later cache action in this group can re-point these
+        # full indices; a later free_swa then reads 0 and its filter drops it.
         self.clear_full_to_swa_mapping(free_index)
+        swa_page_ids = swa_reps if ps == 1 else swa_reps // ps
+        if self.free_group is not None:
+            self.swa_free_page_ids_group.append(swa_page_ids)
+            return
+        self._release_swa_page_ids(swa_page_ids)
+
+    def _release_swa_page_ids(self, swa_page_ids: torch.Tensor):
+        # Requests own disjoint pages, so the ids are distinct: cat + sort is the
+        # whole release, no unique and no filter. Sorted for parity with free().
+        if self.page_size == 1:
+            self.swa_attn_allocator.free(swa_page_ids)
+        else:
+            self.swa_attn_allocator.free_page_ids(torch.sort(swa_page_ids).values)
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_group_begin(self):
         super().free_group_begin()
         self.swa_free_group = []
         self.full_free_group = []
+        self.swa_free_page_ids_group = []
 
     def free_group_end(self):
         super().free_group_end()
+        if self.swa_free_page_ids_group:
+            swa_free_page_ids_group = self.swa_free_page_ids_group
+            self.swa_free_page_ids_group = []
+            self._release_swa_page_ids(torch.cat(swa_free_page_ids_group))
         if self.swa_free_group:
             swa_free_group = self.swa_free_group
             self.swa_free_group = []
@@ -492,6 +506,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
         self.swa_free_group = []
         self.full_free_group = []
+        self.swa_free_page_ids_group = []
         self._swa_mapping_may_be_partial = False
 
     def get_cpu_copy(self, indices, mamba_indices=None):
@@ -543,6 +558,8 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_pages = None
         self.release_pages = None
         self.free_group = None
+        self.free_page_ids_group = []
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
 
         self._kvcache = kvcache
         self.swa_attn_allocator.clear()
@@ -614,12 +631,19 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.free_group.append(self._copy_for_free_group(free_index))
 
     def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
+        # Identity mapping: an out-of-window range holds only live slots, so it
+        # skips the `> 0` filter in-group as well (separate list from free_group).
         if free_index.numel() == 0:
             return
-        if self.free_group is None:
-            self.swa_attn_allocator.free(free_index)
-        else:
-            self.free_group.append(self._copy_for_free_group(free_index))
+        if self.debug_mode:
+            assert bool(
+                (free_index.cpu() > 0).all()
+            ), "out-of-window range holds slot 0"
+        if self.free_group is not None:
+            self.free_page_ids_group.append(self._copy_for_free_group(free_index))
+            return
+        self.swa_attn_allocator.free(free_index)
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_full(self, free_index: torch.Tensor):
         # All-SWA models have no full-attention pool, so there is nothing to
@@ -630,12 +654,18 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # full_free_group, which this pure-SWA variant does not have.
     def free_group_begin(self):
         BaseTokenToKVPoolAllocator.free_group_begin(self)
+        self.free_page_ids_group = []
 
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
         if pending:
             self.free(torch.cat(pending))
+        page_ids, self.free_page_ids_group = self.free_page_ids_group, []
+        if page_ids:
+            self.swa_attn_allocator.free(torch.cat(page_ids))
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def clear(self):
         self.swa_attn_allocator.clear()
         self.free_group = None
+        self.free_page_ids_group = []
