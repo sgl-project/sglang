@@ -11,6 +11,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+from test_deferred_decode_kv_release import (
+    ABORT_GENERATION,
+    DeferredAbortNotificationScenarios,
+    TaggedAbortNotificationScenarios,
+    WorkerFailureAbortScenarios,
+)
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -21,13 +27,6 @@ from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-
-from test_deferred_decode_kv_release import (
-    ABORT_GENERATION,
-    DeferredAbortNotificationScenarios,
-    TaggedAbortNotificationScenarios,
-    WorkerFailureAbortScenarios,
-)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
