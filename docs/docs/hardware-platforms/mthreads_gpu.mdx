@@ -31,12 +31,13 @@ Start from an environment with the prerequisites above installed.
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-python -m pip install --upgrade pip
+python -m pip install --upgrade pip "setuptools<82" wheel
 cp python/pyproject_other.toml python/pyproject.toml
 python -m pip install -e "python[all_musa]" \
   --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple \
   --extra-index-url https://pypi.org/simple \
-  --trusted-host dl.mthreads.com
+  --trusted-host dl.mthreads.com \
+  --no-build-isolation
 
 cd python/sglang/kernels/aot
 cp pyproject_musa.toml pyproject.toml
@@ -52,13 +53,13 @@ The Dockerfile installs the MUSA runtime and Python stack declared by
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
 
-docker build -f docker/musa.Dockerfile -t sglang_image .
+docker build -f docker/musa.Dockerfile -t sglang:main-musa .
 ```
 
 Run the image with MUSA devices exposed by the host container toolkit.
 
 ```bash Command
-alias drun='docker run -it --rm \
+alias drun='docker run -it --rm --network=host \
   --env MTHREADS_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --env MTHREADS_DRIVER_CAPABILITIES=all \
   --shm-size=32g \
@@ -68,8 +69,7 @@ alias drun='docker run -it --rm \
 Launch the server:
 
 ```bash Command
-drun -p 30000:30000 \
-  sglang_image \
+drun sglang:main-musa \
   python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3-8B \
   --device musa \
@@ -97,7 +97,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
 Or run a benchmark:
 
 ```bash Command
-drun sglang_image \
+drun sglang:main-musa \
   python3 -m sglang.bench_serving \
   --backend sglang \
   --dataset-name random \

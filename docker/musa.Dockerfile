@@ -2,11 +2,10 @@
 
 # Usage:
 #   docker build -f docker/musa.Dockerfile -t sglang:main-musa .
-#   docker run --rm -it \
+#   docker run --rm -it --network=host \
 #     --env MTHREADS_VISIBLE_DEVICES=0 \
 #     --env MTHREADS_DRIVER_CAPABILITIES=all \
 #     --shm-size=32g \
-#     -p 8000:8000 \
 #     sglang:main-musa
 
 ARG BASE_IMAGE=ubuntu:22.04
