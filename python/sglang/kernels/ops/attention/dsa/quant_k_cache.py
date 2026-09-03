@@ -3,6 +3,57 @@ import triton
 import triton.language as tl
 
 
+def gather_dsa_kv_scales(
+    scale_src,
+    scale_dst,
+    kv_indices,
+    kv_indptr,
+    kv_indptr_idx,
+):
+    _gather_dsa_kv_scales[(32,)](
+        scale_src,
+        scale_dst,
+        kv_indices,
+        kv_indptr,
+        scale_src.stride(0),
+        KV_INDPTR_IDX=kv_indptr_idx,
+        NUM_TILES=scale_src.shape[-1],
+        BLOCK=256,
+    )
+
+
+@triton.jit
+def _gather_dsa_kv_scales(
+    scale_src,
+    scale_dst,
+    kv_indices,
+    kv_indptr,
+    scale_src_stride,
+    KV_INDPTR_IDX: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    active = tl.load(kv_indptr + KV_INDPTR_IDX)
+    block_start = pid * BLOCK
+    tiles = tl.arange(0, NUM_TILES)
+    while block_start < active:
+        offsets = block_start + tl.arange(0, BLOCK)
+        mask = offsets < active
+        rows = tl.load(kv_indices + offsets, mask=mask, other=0)
+        values = tl.load(
+            scale_src + rows[:, None] * scale_src_stride + tiles[None, :],
+            mask=mask[:, None],
+        )
+        tl.store(
+            scale_dst + rows[:, None] * NUM_TILES + tiles[None, :],
+            values,
+            mask=mask[:, None],
+        )
+        block_start += num_programs * BLOCK
+
+
 def quantize_k_cache(cache_k):
     return _quantize_k_cache_fast_wrapped(cache_k)
 
@@ -22,19 +73,27 @@ def quantize_k_cache_separate(
         k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope)
                 Must have dim_nope=512 for FP8 MLA quantization
         k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope)
-                Must have dim_rope=64 for FP8 MLA quantization
+                Must have dim_rope=64 for FP8 MLA quantization, or dim_rope=0
+                for no-PE MLA (empty rope); None is treated
+                the same as an empty rope.
         tile_size: quantization tile size (default 128)
 
     Returns:
         Tuple of (nope_part, rope_part) where:
         - nope_part: (num_tokens, 1, 528) as uint8 view, contains [nope_fp8(512) | scales(16)]
         - rope_part: (num_tokens, 1, 128) as uint8 view, contains [rope_bf16_bytes(128)]
+                     (empty, (num_tokens, 1, 0), when dim_rope=0)
 
         These two tensors can be directly passed to set_mla_kv_buffer_triton(kv_buffer, loc, nope_part, rope_part)
     """
     # Squeeze middle dimension if present
     k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
-    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+    if k_rope is None or k_rope.numel() == 0:
+        k_rope_2d = torch.empty(
+            (k_nope_2d.shape[0], 0), dtype=k_nope_2d.dtype, device=k_nope_2d.device
+        )
+    else:
+        k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
 
     num_tokens = k_nope_2d.shape[0]
     dim_nope = k_nope_2d.shape[1]
@@ -43,8 +102,8 @@ def quantize_k_cache_separate(
     # Validate dimensions for FP8 MLA
     if dim_nope != 512:
         raise ValueError(f"Expected dim_nope=512 for FP8 MLA, got {dim_nope}")
-    if dim_rope != 64:
-        raise ValueError(f"Expected dim_rope=64 for FP8 MLA, got {dim_rope}")
+    if dim_rope not in (0, 64):
+        raise ValueError(f"Expected dim_rope=64 (or 0 for no-PE MLA), got {dim_rope}")
     if k_rope_2d.shape[0] != num_tokens:
         raise ValueError(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
@@ -234,7 +293,12 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
     nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
-    rope_view = rope_part_u8.view(torch.bfloat16)
+    if dim_rope > 0:
+        rope_view = rope_part_u8.view(torch.bfloat16)
+    else:
+        rope_view = torch.empty(
+            (num_tokens, 0), dtype=torch.bfloat16, device=k_rope.device
+        )
 
     # Kernel launch parameters
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)

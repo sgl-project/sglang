@@ -1453,7 +1453,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
-                return_indexer_topk=obj.return_indexer_topk,
+                # --enable-return-indexer-topk implies per-request return: the
+                # flag is only ever set for RL rollout engines, where every
+                # request wants the capture, and the per-request body field is
+                # silently dropped by typed proxies whose /generate spec does
+                # not know it (sgl-router-for-miles parses GenerateRequest with
+                # return_routed_experts but no return_indexer_topk, so the
+                # opt-in never reached the scheduler through the router).
+                return_indexer_topk=(
+                    obj.return_indexer_topk
+                    or self.server_args.enable_return_indexer_topk
+                ),
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,

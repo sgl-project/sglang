@@ -212,6 +212,27 @@ def get_default_hidden_dim(
             return config.hidden_size, get_dsa_index_head_dim(config)
         else:  # indexer.weights_proj
             return config.hidden_size, get_dsa_index_n_heads(config)
+    elif module_name in KDA_GATE_LORA_NAMES:
+        # KDA (Kimi Delta Attention: GLM-5.3-Flash, Kimi Linear) gate
+        # projections; the head geometry lives in `linear_attn_config`.
+        linear_attn_config = getattr(config, "linear_attn_config", None) or {}
+        num_heads = linear_attn_config.get("num_heads") or getattr(
+            config, "linear_num_heads", None
+        )
+        head_dim = linear_attn_config.get("head_dim") or getattr(
+            config, "linear_head_dim", None
+        )
+        if num_heads is None or head_dim is None:
+            raise NotImplementedError(
+                f"get_hidden_dim: {module_name} needs linear_attn_config "
+                "(num_heads, head_dim) in the model config"
+            )
+        if module_name in ("f_a_proj", "g_a_proj"):
+            return config.hidden_size, head_dim
+        elif module_name in ("f_b_proj", "g_b_proj"):
+            return head_dim, num_heads * head_dim
+        else:  # b_proj
+            return config.hidden_size, num_heads
     elif module_name == "gate_up_proj_moe":
         moe_inter = (
             getattr(config, "moe_intermediate_size", None) or config.intermediate_size
@@ -345,10 +366,19 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
+# KDA (Kimi Delta Attention) gate projections, e.g. GLM-5.3-Flash / Kimi Linear
+# in the unfused layout: beta (b_proj), forget gate (f_a_proj -> f_b_proj) and
+# output-norm gate (g_a_proj -> g_b_proj). q/k/v/o reuse qkv_proj / o_proj.
+KDA_GATE_LORA_NAMES = frozenset(
+    {"b_proj", "f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"}
+)
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    # KDA low-rank gate inputs are ReplicatedLinear (head_dim outputs)
+    "f_a_proj",
+    "g_a_proj",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -367,6 +397,10 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        # KDA column-parallel gates shard by head on the attention-TP group
+        "b_proj",
+        "f_b_proj",
+        "g_b_proj",
     }
 )
 
@@ -382,6 +416,7 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "in_proj",
         "in_proj_qkvz",
         "in_proj_ba",
+        *KDA_GATE_LORA_NAMES,
         "up_proj",
         "gate_up_proj",
         "down_proj",

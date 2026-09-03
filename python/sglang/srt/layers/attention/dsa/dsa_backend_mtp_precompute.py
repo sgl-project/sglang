@@ -35,6 +35,7 @@ class PrecomputedMetadata:
     # Basic seqlens
     cache_seqlens: torch.Tensor  # int32, [bs]
     cu_seqlens_k: torch.Tensor  # int32, [bs+1]
+    req_pool_indices: torch.Tensor  # int64, [bs]
 
     # Page table
     page_indices: torch.Tensor  # int32, [bs, max_len] or [expanded_bs, max_len]
@@ -121,7 +122,14 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if _is_cuda and not _is_hip:
+        if (
+            _is_cuda
+            and not _is_hip
+            and (
+                self.dsa_index_kpool <= 1
+                or getattr(self, "experimental_kpool_metadata_fusion", False)
+            )
+        ):
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
@@ -159,6 +167,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
+                index_kpool=self.dsa_index_kpool,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -173,6 +182,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_k=cu_seqlens_k,
+                req_pool_indices=req_pool_indices,
                 page_indices=page_indices,
                 real_page_table=real_page_table,
                 seqlens_expanded=seqlens_expanded,
@@ -193,7 +203,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
 
         # Compute DSA seqlens
         dsa_cache_seqlens = compute_dsa_seqlens(
-            cache_seqlens, dsa_index_topk=self.dsa_index_topk
+            cache_seqlens,
+            dsa_index_topk=self.dsa_index_topk,
+            index_kpool=self.dsa_index_kpool,
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
@@ -218,6 +230,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
+            req_pool_indices=req_pool_indices,
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,
@@ -240,7 +253,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if _is_cuda and not _is_hip:
+        if _is_cuda and not _is_hip and self.dsa_index_kpool <= 1:
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_target_verify_metadata,
             )
@@ -305,6 +318,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             return PrecomputedMetadata(
                 cache_seqlens=cache_seqlens,
                 cu_seqlens_k=cu_seqlens_k,
+                req_pool_indices=req_pool_indices,
                 page_indices=page_indices,
                 real_page_table=real_page_table,
                 seqlens_expanded=seqlens_expanded,
@@ -342,7 +356,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         )
 
         # Compute DSA seqlens
-        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
+        dsa_cache_seqlens = compute_dsa_seqlens(
+            seqlens_expanded,
+            self.dsa_index_topk,
+            index_kpool=self.dsa_index_kpool,
+        )
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # DSA cumsum
@@ -365,6 +383,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         return PrecomputedMetadata(
             cache_seqlens=cache_seqlens,
             cu_seqlens_k=cu_seqlens_k,
+            req_pool_indices=req_pool_indices,
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,

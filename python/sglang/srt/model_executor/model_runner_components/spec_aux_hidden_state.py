@@ -36,6 +36,7 @@ def resolve_spec_aux_hidden_state_config(
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
+        model_config=model_config,
         spec_algorithm=spec_algorithm,
         is_draft_worker=is_draft_worker,
     )
@@ -53,47 +54,49 @@ def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
     server_args: ServerArgs,
+    model_config: ModelConfig,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    if (
+    if not (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
-        and server_args.speculative_draft_model_path
     ):
-        # Load draft config to get layer count for KV cache sizing
+        return
+
+    draft_model_config = model_config
+    if server_args.speculative_draft_model_path:
         draft_model_config = ModelConfig.from_server_args(
             server_args,
             model_path=server_args.speculative_draft_model_path,
             model_revision=server_args.speculative_draft_model_revision,
             is_draft_model=True,
         )
-        num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
-        if num_nextn_predict_layers is not None:
-            config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-        else:
-            config.eagle_draft_num_layers = int(
-                max(
-                    draft_model_config.num_hidden_layers,
-                    draft_model_config.num_attention_layers,
-                )
+    num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+    if num_nextn_predict_layers is not None:
+        config.eagle_draft_num_layers = int(num_nextn_predict_layers)
+    elif server_args.speculative_draft_model_path:
+        config.eagle_draft_num_layers = int(
+            max(
+                draft_model_config.num_hidden_layers,
+                draft_model_config.num_attention_layers,
             )
+        )
+    else:
+        return
 
-        if spec_algorithm.is_eagle3():
-            config.eagle_use_aux_hidden_state = True
-            try:
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
-                )
-                config.eagle_use_aux_hidden_state = eagle_config.get(
-                    "use_aux_hidden_state", True
-                )
-                config.eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                config.eagle_aux_hidden_state_layer_ids = None
+    if spec_algorithm.is_eagle3():
+        config.eagle_use_aux_hidden_state = True
+        try:
+            eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
+            config.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
+            config.eagle_aux_hidden_state_layer_ids = eagle_config[
+                "eagle_aux_hidden_state_layer_ids"
+            ]
+        except Exception:
+            config.eagle_aux_hidden_state_layer_ids = None
 
 
 def _resolve_dflash_aux_hidden_state(

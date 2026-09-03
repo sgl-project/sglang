@@ -7,13 +7,16 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -60,15 +63,23 @@ def forward_dsa_indexer_for_mha(
     layer_id: int,
 ) -> None:
     """Fill the indexer K cache and publish an MTP seed when requested."""
+    from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+
     spec_info = forward_batch.spec_info
     seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
+    # With the rollout indexer-topk capturer active, the topk must be computed
+    # even though dense MHA ignores it: the R3 replay payload needs each
+    # token's (sequence-relative) selection, which for these short rows is the
+    # full causal prefix. Without this the capture buffer keeps its zero
+    # initialization for MHA prefill tokens and replay would attend token 0.
+    capture = get_global_indexer_capturer() is not None
     topk_indices = indexer(
         x=hidden_states,
         q_lora=q_lora,
         positions=positions,
         forward_batch=forward_batch,
         layer_id=layer_id,
-        return_indices=seed_buf is not None,
+        return_indices=seed_buf is not None or capture,
     )
     if seed_buf is None:
         return
@@ -424,18 +435,34 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if (
+            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
+        ) and not is_cp_v2_active(forward_batch):
+            # CP-v1 keeps Q rank-local, but every rank owns a complete KV pool.
+            # Rebuild the zigzag-split latent KV in global token order before
+            # writing it with the (unsplit) out_cache_loc indices.
+            kv_a, k_pe = self.rebuild_cp_kv_cache(
+                latent_cache.squeeze(1),
+                forward_batch,
+                kv_a.unsqueeze(1),
+                k_pe,
+            )
+        else:
+            kv_a = kv_a.unsqueeze(1)
+
         if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a, k_pe
             )
         elif _is_npu:
             # To reduce a time-costing split operation
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a, k_pe
             )
         else:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache
@@ -510,9 +537,22 @@ class DeepseekMHAForwardMixin:
     def _concat_and_cast_mha_k(
         self: DeepseekV2AttentionMLA,
         k_nope: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_pe: torch.Tensor | None,
         forward_batch: ForwardBatch,
     ):
+        if self.qk_rope_head_dim == 0:
+            assert k_pe is None or k_pe.shape[-1] == 0
+            k = k_nope.contiguous()
+            if (
+                _is_cuda
+                and self.current_attention_backend == "fa3"
+                and self.kv_cache_dtype != "auto"
+            ):
+                # fa3 requires k in the pool dtype when KV cache is fp8; the
+                # concat branch below does the same cast for roped models.
+                k = k.to(get_token_to_kv_pool().dtype)
+            return k
+
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (

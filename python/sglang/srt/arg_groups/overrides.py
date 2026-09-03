@@ -597,6 +597,7 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
 )
@@ -1511,6 +1512,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
+        "Glm5NextForConditionalGeneration",
     }
 )
 
@@ -1528,6 +1530,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "BailingMoeV2_5ForCausalLM",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -1756,6 +1759,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
     }
@@ -2523,6 +2527,62 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}
+
+
+# MoE runner backends whose TopK forward never materializes per-token expert
+# ids (TopK.forward_cuda returns a BYPASSED / TRITON_KERNEL output and the
+# routing runs inside the fused kernel). topk.py's
+# capture_routed_experts_if_allowed is never reached on these paths, so the
+# routed-experts capturer (state_capturer/routed_experts.py) would return its
+# zero-initialized host buffer: every token appears routed to expert 0 x topk.
+# A miles R3 (--use-rollout-routing-replay) consumer then replays those
+# duplicate ids and the training engine's MoE dispatcher crashes in alltoall
+# ("Split sizes doesn't match total dim 0 size").
+_TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
+    {
+        "flashinfer_trtllm",
+        "experimental_sgl_trtllm",
+        "triton_kernel",
+        "flashinfer_mxfp4",
+    }
+)
+
+
+@register_post_process
+def _routed_experts_capture_backend_guard(view: Any) -> dict:
+    """--enable-return-routed-experts needs a topk-id-materializing MoE runner.
+
+    Slot pass at the tail of _handle_moe_kernel_config, after every
+    moe_runner_backend resolution (arch overrides like
+    _deepseek_moe_quant_resolution may have picked flashinfer_trtllm on
+    SM100): downgrade a topk-bypassing runner back to 'auto' when that is
+    safe for the quantization (auto resolves to a StandardTopKOutput-
+    consuming runner there), otherwise fail loudly instead of shipping an
+    all-zero routed-experts payload.
+    """
+    if not view.enable_return_routed_experts:
+        return {}
+    if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
+        return {}
+    if view.quantization in (None, "fp8"):
+        logger.warning(
+            "--enable-return-routed-experts cannot capture routed experts "
+            f"under moe_runner_backend={view.moe_runner_backend!r}: its TopK "
+            "output is bypassed into the fused kernel and per-token expert "
+            "ids are never materialized. Falling back to "
+            "moe_runner_backend='auto' so the capture path "
+            "(select_experts -> capture_routed_experts_if_allowed) runs."
+        )
+        return {"moe_runner_backend": "auto"}
+    raise ValueError(
+        "--enable-return-routed-experts is incompatible with "
+        f"moe_runner_backend={view.moe_runner_backend!r}: TopK is bypassed "
+        "into the fused kernel, so per-token routed-expert ids are never "
+        "materialized, and no safe automatic fallback exists for "
+        f"quantization={view.quantization!r}. Pass a topk-materializing "
+        "--moe-runner-backend explicitly (e.g. triton) or drop "
+        "--enable-return-routed-experts."
+    )
 
 
 @register_post_process
