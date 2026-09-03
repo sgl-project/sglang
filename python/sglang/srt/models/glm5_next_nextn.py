@@ -52,6 +52,13 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             return None
         return super()._resolve_nextn_quant_config(config, quant_config)
 
+    def _get_nextn_embedding_tp_kwargs(self) -> dict:
+        # The shared GLM target embedding is sharded over the model TP group.
+        # Under DP attention, DeepSeek drafts instead select the attention-TP
+        # group, which can have size 1, and then index the shared local shard as
+        # a full vocabulary table.
+        return {"enable_tp": True, "use_attn_tp_group": False}
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(
             getattr(config, "text_config", config),
