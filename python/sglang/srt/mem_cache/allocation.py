@@ -682,20 +682,44 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            device_type = getattr(
-                batch.device, "type", str(batch.device).split(":", 1)[0]
-            )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
+            allocator = tree_cache.token_to_kv_pool_allocator
+            if batch is not None and batch.hisparse_coordinator is not None:
+                # Spec decode reserves logical target slots here. Target verify
+                # later binds those slots to HiSparse's extra page; allocating
+                # target physical pages first both wastes memory and breaks the
+                # physical paged allocator's last_loc chain after the reserve is
+                # released. Draft KV has its own logical GPU-page mapping.
+                evict_from_tree_cache(
+                    tree_cache,
+                    num_needed_tokens + len(nxt_kv_lens_cpu) * allocator.page_size,
+                )
+                out_cache_loc = allocator.alloc_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+                if out_cache_loc is None:
+                    raise RuntimeError(
+                        "HiSparse spec decode failed to allocate logical KV slots."
+                    )
+            else:
+                device_type = getattr(
+                    batch.device, "type", str(batch.device).split(":", 1)[0]
+                )
+                out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(
