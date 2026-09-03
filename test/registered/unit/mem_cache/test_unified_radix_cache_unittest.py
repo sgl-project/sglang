@@ -3676,6 +3676,8 @@ class UnifiedRadixCacheSuite:
             self.cfg, enable_kv_cache_events=True
         )
         self._init_buffer_hicache(cons, storage_dir)
+        cons.enable_storage_metrics = True
+        cons.storage_metrics_collector = mock.Mock()
         cons.take_events()
         avail0 = self._host_avail_sizes(cons)
         dev_avail0 = cons.token_to_kv_pool_allocator.available_size()
@@ -3783,8 +3785,14 @@ class UnifiedRadixCacheSuite:
             and e.medium == StorageMedium.CPU
         ]
         self.assertEqual(cpu_events, [])
+        cons.storage_metrics_collector.log_storage_prefetch_hit_tokens.assert_called_once_with(
+            len(seq)
+        )
+        cons.storage_metrics_collector.log_prefetched_tokens.assert_called_once_with(
+            len(seq)
+        )
+        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
 
-        self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
         cons.sanity_check()
 
     def test_buffer_only_cache_salt_uses_the_request_namespace(self):
@@ -4148,6 +4156,8 @@ class UnifiedRadixCacheSuite:
 
         cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
         self._init_buffer_hicache(cons, storage_dir)
+        cons.enable_storage_metrics = True
+        cons.storage_metrics_collector = mock.Mock()
         avail0 = self._host_avail_sizes(cons)
 
         req_id = "sibling-publish"
@@ -4188,6 +4198,7 @@ class UnifiedRadixCacheSuite:
         k, v = self._snapshot_full_kv(cons_alloc, m.device_indices)
         self.assertTrue(torch.equal(k, sib_kv[0]))
         self.assertTrue(torch.equal(v, sib_kv[1]))
+        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
         cons.sanity_check()
 
     def test_buffer_only_load_back_drops_on_full_overlap_masked_by_swa_tombstone(
@@ -8448,6 +8459,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.tree_core.insert_host.return_value = insert_result
         operation = mock.MagicMock()
         operation.request_id = "req"
+        operation.completed_tokens = 8
         cache.ongoing_prefetch = {
             operation.request_id: (
                 7,
@@ -8588,6 +8600,8 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         """The caller owns every completed buffer when host insertion drops."""
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = mock.Mock()
 
         parent_id = self._insert_device(
             cache, allocator, list(range(1, 1 + 3 * self.ps))
@@ -8633,6 +8647,7 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             anchor_lock_params,
             comp_xfers,
         )
+        cache._record_storage_prefetch_hit(req_id, completed_tokens)
         cache.cache_controller.prefetch_tokens_occupied = completed_tokens
         hashes = [f"h{i}" for i in range(completed_tokens // self.ps)]
         operation.hash_value = hashes
@@ -8681,7 +8696,36 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
         self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
+        cache.storage_metrics_collector.log_storage_prefetch_hit_tokens.assert_called_once_with(
+            completed_tokens
+        )
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            completed_tokens, "dropped"
+        )
 
+        cache.sanity_check()
+
+    def test_write_through_eviction_counts_unbacked_tokens(self):
+        if _selected_tree_core_test_backend() == "rust":
+            # The unbacked-eviction tracker is a Python tree-core feature;
+            # UnifiedRadixCache only enables it for that backend.
+            self.skipTest(
+                "write-through unbacked-eviction tracking is Python-core only"
+            )
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+        cache.metrics_collector = mock.Mock()
+
+        seq = list(range(1, 1 + 2 * self.ps))
+        self._insert_device(cache, allocator, seq)
+        result = cache.evict(EvictParams(num_tokens=len(seq)))
+
+        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
+        cache.metrics_collector.increment_dropped_tokens.assert_called_once_with(
+            num_tokens=len(seq),
+            reason="write_through_unbacked_eviction",
+            pool=PoolName.KV.value,
+        )
         cache.sanity_check()
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
@@ -8945,6 +8989,20 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
         self.assertEqual(pipeline.try_lock_anchor(self._REQ), "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
+
+    def test_positive_hit_with_lost_anchor_is_reported_as_shrunk(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._storage_prefetch_missed_rids = set()
+        cache._finish_storage_prefetch = mock.Mock()
+        cache.revoke_pending_prefetch = mock.Mock()
+
+        cache._handle_storage_prefetch_anchor_loss(self._REQ)
+
+        cache._finish_storage_prefetch.assert_called_once_with(
+            self._REQ, fulfilled_tokens=0, reason="shrunk"
+        )
+        self.assertIn(self._REQ, cache._storage_prefetch_missed_rids)
+        cache.revoke_pending_prefetch.assert_called_once_with(self._REQ)
 
     def test_over_cap_reports_cap_skip_before_matching(self):
         cache = self._make_cache(live_match_len=len(self._PREFIX))

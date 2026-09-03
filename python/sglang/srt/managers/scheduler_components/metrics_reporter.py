@@ -48,6 +48,11 @@ RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
+# gen_throughput is computed only on decode-stats ticks; when decode is starved
+# (e.g. long chunked-prefill stretches) the last window's value would otherwise
+# be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
+# so past it the true recent decode throughput is ~0.
+GEN_THROUGHPUT_STALENESS_SECONDS = 30.0
 
 
 class _CacheHitRateWindow:
@@ -152,6 +157,16 @@ class SchedulerMetricsReporter:
         # Windowed rate for waiting-queue load estimation only; the exported
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
+
+    def _current_gen_throughput(self, now: float) -> float:
+        """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
+
+        Mirrors the pause-path zeroing in Scheduler.pause_generation: a stale
+        decode window must not keep exporting its throughput forever.
+        """
+        if now - self.last_decode_stats_tic > GEN_THROUGHPUT_STALENESS_SECONDS:
+            self.last_gen_throughput = 0.0
+        return self.last_gen_throughput
 
     def _init_metrics(
         self,
@@ -717,6 +732,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+            # Refresh here too: prefill-heavy stretches can run long between
+            # decode-stats ticks, and the gauge must decay rather than hold.
+            self.stats.gen_throughput = self._current_gen_throughput(now)
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
@@ -875,8 +893,6 @@ class SchedulerMetricsReporter:
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
-        cache_hit_rate = 0.0
-
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
@@ -934,7 +950,9 @@ class SchedulerMetricsReporter:
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.cache_hit_rate = cache_hit_rate
+            # cache_hit_rate is prefill-owned (per-report semantics); decode
+            # ticks must not reset it, or the exported gauge reads 0 whenever
+            # a decode report lands between prefill reports.
             self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
 
             # Memory pool usage ratios / Absolute token counts

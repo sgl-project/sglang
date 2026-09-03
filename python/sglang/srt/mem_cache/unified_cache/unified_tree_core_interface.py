@@ -50,10 +50,12 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
+    unbacked_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
