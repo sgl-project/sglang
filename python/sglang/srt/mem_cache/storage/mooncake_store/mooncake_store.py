@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import json
 import logging
@@ -6,6 +7,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, List, Optional, Tuple
 
 import requests
@@ -332,6 +334,93 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+
+    @cached_property
+    def _has_request_context_support(self) -> bool:
+        """Check if the installed MooncakeDistributedStore supports request context propagation.
+
+        Result is cached on first access since the installed Mooncake
+        version is fixed for the lifetime of the process.
+        """
+        return hasattr(type(self.store), "set_request_context")
+
+    def set_request_context(
+        self,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+        caller_id: Optional[str] = None,
+        caller_role: Optional[str] = None,
+    ):
+        """Set per-request context on the calling thread.
+
+        The context is propagated as an out-of-band attachment on subsequent
+        store RPC calls (put, get, batch operations, etc.) and logged by the
+        Mooncake master.  Fields left as None keep their previous value (or
+        remain empty on the first call).
+
+        Args:
+            request_id: Application-level correlation id.
+            trace_id: Distributed trace id.
+            span_id: Current span id.
+            parent_span_id: Parent span id.
+            caller_id: Which dummy-client / TP rank issued the RPC (which
+                client). always-on, independent of tracing.
+            caller_role: Caller's thread role, e.g. prefetch / backup. Which
+                thread within the client. always-on, independent of tracing.
+        """
+        if self.store is None:
+            return
+        if not self._has_request_context_support:
+            return
+        self.store.set_request_context(
+            request_id=request_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            caller_id=caller_id,
+            caller_role=caller_role,
+        )
+
+    def clear_request_context(self):
+        """Clear the per-request context on the calling thread."""
+        if self.store is None:
+            return
+        if not self._has_request_context_support:
+            return
+        self.store.clear_request_context()
+
+    @contextlib.contextmanager
+    def request_context(
+        self,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+        caller_id: Optional[str] = None,
+        caller_role: Optional[str] = None,
+    ):
+        """Context manager that sets request context for the duration of the block.
+
+        Usage::
+
+            with store.request_context(request_id="req-001", trace_id="trace-abc"):
+                store.put(key, value)
+            # context is automatically cleared after the block
+        """
+        self.set_request_context(
+            request_id=request_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            caller_id=caller_id,
+            caller_role=caller_role,
+        )
+        try:
+            yield
+        finally:
+            self.clear_request_context()
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
@@ -854,6 +943,35 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ]
         return component_keys, key_multiplier
 
+    @staticmethod
+    def _request_context_from_extra_info(
+        extra_info: Optional[HiCacheStorageExtraInfo],
+    ) -> dict:
+        """Pull request-context fields out of HiCacheStorageExtraInfo.extra_info.
+
+        The controller carries per-request metadata (request_id, trace_id, ...)
+        in the ``extra_info`` dict of :class:`HiCacheStorageExtraInfo`; this
+        returns them as a kwargs dict for :meth:`request_context`.
+        """
+        if extra_info is None:
+            return {}
+        ed = getattr(extra_info, "extra_info", None)
+        if not isinstance(ed, dict):
+            return {}
+        # caller_id / caller_role are always-on (independent of tracing); the
+        # trace_* fields are filled only when the controller exported a hicache
+        # root span (tracing on + 'hicache' in --trace-modules). None values are
+        # filtered so absent fields keep their previous per-thread state.
+        keys = (
+            "request_id",
+            "trace_id",
+            "span_id",
+            "parent_span_id",
+            "caller_id",
+            "caller_role",
+        )
+        return {k: ed[k] for k in keys if ed.get(k) is not None}
+
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -881,7 +999,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
-            ex = self._batch_exist(component_keys, extra_info)
+            with self.request_context(
+                **self._request_context_from_extra_info(extra_info)
+            ):
+                ex = self._batch_exist(component_keys, extra_info=extra_info)
             if key_multiplier > 0:
                 page_exists = [
                     all(
@@ -977,14 +1098,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=False)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            return self._batch_io_v2(transfers, is_set=False)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict:
-        return self._batch_io_v2(transfers, is_set=True)
+        # Write path carries the request context: the backup op's
+        # caller_id/caller_role and -- when the hicache span was exported -- its
+        # trace_id/span_id reach the bridge so backup spans correlate to the
+        # (real or virtual) root.
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -1105,9 +1232,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            get_results = self._get_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
@@ -1128,53 +1256,60 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
             return [True] * len(keys)
 
-        # Apply config prefix if available.
-        keys = self._tag_keys(keys)
+        # Write path carries the request context: the backup op's
+        # caller_id/caller_role and -- when the hicache span was exported --
+        # its trace_id/span_id reach the bridge so backup spans correlate to
+        # the (real or virtual) root.
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            # Apply config prefix if available.
+            keys = self._tag_keys(keys)
 
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
-        key_multiplier = len(key_strs) // len(keys)
-        group_ids = (
-            self._expand_group_ids(keys, key_multiplier)
-            if self._can_use_group_semantics()
-            else None
-        )
-        exist_result = self._batch_exist(key_strs)
-
-        set_keys = []
-        set_buffer_ptrs = []
-        set_buffer_sizes = []
-        set_indices = []
-        set_results = [-1] * len(key_strs)
-        for i in range(len(key_strs)):
-            if exist_result[i] != 1:
-                set_keys.append(key_strs[i])
-                set_buffer_ptrs.append(buffer_ptrs[i])
-                set_buffer_sizes.append(buffer_sizes[i])
-                set_indices.append(i)
-            else:
-                set_results[i] = 0
-
-        # Only set non-existing keys to storage
-        if len(set_keys) > 0:
-            start_time = time.perf_counter()
-            put_results = self._put_batch_zero_copy_impl(
-                set_keys,
-                set_buffer_ptrs,
-                set_buffer_sizes,
-                self._filter_group_ids(group_ids, set_indices),
+            key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+                keys, host_indices
             )
-            end_time = time.perf_counter()
+            key_multiplier = len(key_strs) // len(keys)
+            group_ids = (
+                self._expand_group_ids(keys, key_multiplier)
+                if self._can_use_group_semantics()
+                else None
+            )
+            exist_result = self._batch_exist(key_strs)
 
-            if self.enable_storage_metrics:
-                self.backup_pgs.append(len(set_keys))
-                self.backup_bandwidth.append(
-                    len(set_keys) / (end_time - start_time) * self.gb_per_page
+            set_keys = []
+            set_buffer_ptrs = []
+            set_buffer_sizes = []
+            set_indices = []
+            set_results = [-1] * len(key_strs)
+            for i in range(len(key_strs)):
+                if exist_result[i] != 1:
+                    set_keys.append(key_strs[i])
+                    set_buffer_ptrs.append(buffer_ptrs[i])
+                    set_buffer_sizes.append(buffer_sizes[i])
+                    set_indices.append(i)
+                else:
+                    set_results[i] = 0
+
+            # Only set non-existing keys to storage
+            if len(set_keys) > 0:
+                start_time = time.perf_counter()
+                put_results = self._put_batch_zero_copy_impl(
+                    set_keys,
+                    set_buffer_ptrs,
+                    set_buffer_sizes,
+                    self._filter_group_ids(group_ids, set_indices),
                 )
+                end_time = time.perf_counter()
 
-            for i in range(len(set_indices)):
-                set_results[set_indices[i]] = put_results[i]
+                if self.enable_storage_metrics:
+                    self.backup_pgs.append(len(set_keys))
+                    self.backup_bandwidth.append(
+                        len(set_keys) / (end_time - start_time) * self.gb_per_page
+                    )
 
-        return self._batch_postprocess(set_results, is_set_operate=True)
+                for i in range(len(set_indices)):
+                    set_results[set_indices[i]] = put_results[i]
+
+            return self._batch_postprocess(set_results, is_set_operate=True)
 
     def set(
         self,
@@ -1322,7 +1457,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys, extra_info)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            exist_result = self._batch_exist(query_keys, extra_info=extra_info)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
