@@ -1496,6 +1496,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     "keeping the selected placement.",
                     result,
                 )
+                if envs.SGLANG_DIFFUSION_DEBUG_HOST_MEMORY:
+                    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_breakdown import (
+                        log_host_memory_breakdown,
+                    )
+
+                    log_host_memory_breakdown(
+                        self._auto_residency_modules(), label="after auto residency"
+                    )
             return OutputBatch(
                 output=plan_summary_payload(
                     plan=plan, status=PLACEMENT_STATUS_VALIDATED
