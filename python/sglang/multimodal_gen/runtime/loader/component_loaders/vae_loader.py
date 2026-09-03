@@ -162,6 +162,13 @@ def _decode_dtype_store_path(
     )
 
 
+def _load_store(path: str) -> dict:
+    """Map the store read-only where host copies are redundant (see loader.utils)."""
+    from sglang.multimodal_gen.runtime.loader.utils import _load_safetensors_file
+
+    return _load_safetensors_file(path)
+
+
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
     """Adopt a decode-dtype store if it matches the module, else refuse."""
     state = vae.state_dict()
@@ -191,7 +198,7 @@ def _rehome_cast_weights_to_file(
     path = _decode_dtype_store_path(component_model_path, component_name, dtype)
     try:
         if os.path.exists(path):
-            mapped = safetensors_load_file(path)
+            mapped = _load_store(path)
             if mapped and _assign_matching_store(vae, mapped, dtype):
                 return len(mapped), True
             raise ValueError("existing decode-dtype store does not match the module")
@@ -207,7 +214,7 @@ def _rehome_cast_weights_to_file(
         tmp = f"{path}.tmp.{os.getpid()}"
         safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
         os.replace(tmp, path)
-        mapped = safetensors_load_file(path)
+        mapped = _load_store(path)
         if set(mapped) != set(cast_state):
             raise ValueError("decode-dtype store does not match the cast weights")
         vae.load_state_dict(mapped, strict=False, assign=True)
