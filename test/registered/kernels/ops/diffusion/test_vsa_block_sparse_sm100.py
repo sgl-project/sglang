@@ -1,4 +1,5 @@
 import math
+import sys
 
 import pytest
 import torch
@@ -97,3 +98,7 @@ def test_rejects_odd_tile_count():
     sizes = torch.full((3,), BLOCK, device="cuda", dtype=torch.int32)
     with pytest.raises(Exception, match="even"):
         vsa_block_sparse_sm100(q, q, q, idx, num, sizes, torch.empty_like(q), 0.1)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
