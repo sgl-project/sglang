@@ -83,7 +83,12 @@ def _assert_matches_reference(
     [
         # Around every 64-row boundary up through one chunked-prefill
         # compressed-window size (chunk=4096 -> 1024 compressed rows).
-        *[base + d for base in range(0, 1088, BLOCK_N) for d in (-1, 0, 1) if base + d > 0],
+        *[
+            base + d
+            for base in range(0, 1088, BLOCK_N)
+            for d in (-1, 0, 1)
+            if base + d > 0
+        ],
     ],
 )
 @pytest.mark.parametrize(
@@ -132,9 +137,7 @@ def test_tilelang_prefill_mqa_nonzero_starts(keys: int):
     )
     ends = ends.clamp_max(keys)
     ends = torch.maximum(ends, starts + 1)
-    _assert_matches_reference(
-        q, k, starts, ends, label=f"nonzero_starts keys={keys}"
-    )
+    _assert_matches_reference(q, k, starts, ends, label=f"nonzero_starts keys={keys}")
 
 
 def test_tilelang_prefill_mqa_mixed_pack_exact_boundaries():
@@ -182,8 +185,12 @@ def test_tilelang_prefill_mqa_large_random_pack():
         keys = int(torch.randint(1, 1088, (1,)).item())
         q = torch.randn(rows, HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(keys, 1, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        starts = torch.randint(0, max(1, keys), (rows,), dtype=torch.int32, device="cuda")
-        ends = starts + torch.randint(1, max(2, keys), (rows,), dtype=torch.int32, device="cuda")
+        starts = torch.randint(
+            0, max(1, keys), (rows,), dtype=torch.int32, device="cuda"
+        )
+        ends = starts + torch.randint(
+            1, max(2, keys), (rows,), dtype=torch.int32, device="cuda"
+        )
         ends = ends.clamp_max(keys)
         ends = torch.maximum(ends, starts + 1)
         _assert_matches_reference(
@@ -223,9 +230,7 @@ def _run_raw_prefill_kernel(
     ends_pad = ends.contiguous()
     pad = padded_rows - rows
     if pad:
-        q_padded = torch.cat(
-            [q_padded, q_padded.new_zeros(pad, HEADS, HEAD_DIM)]
-        )
+        q_padded = torch.cat([q_padded, q_padded.new_zeros(pad, HEADS, HEAD_DIM)])
         starts_pad = torch.cat([starts_pad, starts_pad[-1:].expand(pad)])
         ends_pad = torch.cat([ends_pad, ends_pad[-1:].expand(pad)])
     _tilelang_qsa_mqa_prefill_kernel(heads=HEADS, head_dim=HEAD_DIM, block_q=BLOCK_Q)(
@@ -244,7 +249,7 @@ def _stray_write_count(logits: torch.Tensor, starts, ends) -> int:
     for r in range(starts.shape[0]):
         s, e = int(starts[r]), int(ends[r])
         bad += int(torch.isfinite(logits[r, :s]).sum().item())
-        bad += int(torch.isfinite(logits[r, e:logits.shape[1]]).sum().item())
+        bad += int(torch.isfinite(logits[r, e : logits.shape[1]]).sum().item())
     return bad
 
 
@@ -308,9 +313,9 @@ def test_tilelang_prefill_raw_kernel_no_stray_writes_nonzero_starts(keys: int):
     logits = _run_raw_prefill_kernel(q, k, starts, ends)
     torch.cuda.synchronize()
     stray = _stray_write_count(logits, starts, ends)
-    assert stray == 0, (
-        f"Raw prefill kernel (keys={keys}) wrote {stray} stray pre-mask values"
-    )
+    assert (
+        stray == 0
+    ), f"Raw prefill kernel (keys={keys}) wrote {stray} stray pre-mask values"
 
 
 def test_tilelang_prefill_mask_kernel_is_idempotent_on_clean_logits():

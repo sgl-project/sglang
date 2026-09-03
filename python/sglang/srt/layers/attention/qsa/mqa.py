@@ -153,7 +153,9 @@ if HAS_TILELANG:
                 for qi in T.serial(block_q):
                     row_idx = row_base + qi
                     s = T.if_then_else(row_idx < rows, Starts[row_idx], T.int32(keys))
-                    e = T.if_then_else(row_idx < rows, T.min(Ends[row_idx], keys), T.int32(0))
+                    e = T.if_then_else(
+                        row_idx < rows, T.min(Ends[row_idx], keys), T.int32(0)
+                    )
                     start_min = T.min(start_min, s)
                     end_max = T.max(end_max, e)
 
