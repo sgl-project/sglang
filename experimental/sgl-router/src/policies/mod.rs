@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod active_load;
+pub mod admission;
 pub mod cache_aware_zmq;
 pub mod engine_load;
 pub mod factory;
@@ -15,6 +16,7 @@ pub mod scoring;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::{adapter, TokenizerRegistry};
@@ -30,8 +32,8 @@ pub struct RequestTokens {
     pub engine_equivalent: bool,
 }
 
-/// External indexer answer prepared by the async ingress path for a
-/// cache-aware policy.
+/// External indexer answer prepared by the async ingress path for the
+/// synchronous cache-aware policy.
 pub struct ExternalPrefixSignal {
     pub outcome: sgl_kv_indexer::PrefixOutcome,
     pub query_blocks: usize,
@@ -139,12 +141,19 @@ pub(crate) fn extract_prompt_text_from_value(v: &serde_json::Value) -> Option<St
 }
 
 /// Immutable request data consumed by a routing policy.
+#[derive(Clone)]
 pub struct SelectionContext<'a> {
     model: &'a ModelId,
     request_body: Option<&'a [u8]>,
     routing_key: Option<&'a str>,
+    session_id: Option<&'a str>,
+    candidate_range_id: &'a str,
+    input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+    load_snapshot: Option<&'a EngineLoadSnapshot>,
+    affinity_lookup_enabled: bool,
+    affinity_assignment_enabled: bool,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -153,8 +162,14 @@ impl<'a> SelectionContext<'a> {
             model,
             request_body,
             routing_key: None,
+            session_id: None,
+            candidate_range_id: "global",
+            input_tokens: None,
             request_tokens: None,
             external_prefix: None,
+            load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -167,8 +182,14 @@ impl<'a> SelectionContext<'a> {
             model,
             request_body,
             routing_key,
+            session_id: None,
+            candidate_range_id: "global",
+            input_tokens: None,
             request_tokens: None,
             external_prefix: None,
+            load_snapshot: None,
+            affinity_lookup_enabled: true,
+            affinity_assignment_enabled: true,
         }
     }
 
@@ -178,11 +199,48 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
+    /// 附加 Session-Aware session id。
+    pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// 标识本次 policy 的候选域。
+    pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
+        self.candidate_range_id = candidate_range_id;
+        self
+    }
+
+    /// 附加请求 input token 数。
+    pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.input_tokens = Some(input_tokens);
+        self
+    }
+
     pub fn with_external_prefix(
         mut self,
         external_prefix: Option<&'a ExternalPrefixSignal>,
     ) -> Self {
         self.external_prefix = external_prefix;
+        self
+    }
+
+    /// 附加请求开始时捕获的 Engine Load snapshot。
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
+        self.load_snapshot = Some(load_snapshot);
+        self
+    }
+
+    /// 禁用 affinity lookup 和 assignment。
+    pub fn without_affinity_lookup(mut self) -> Self {
+        self.affinity_lookup_enabled = false;
+        self.affinity_assignment_enabled = false;
+        self
+    }
+
+    /// 保留 affinity lookup，但禁用 assignment 写入。
+    pub fn without_affinity_assignment(mut self) -> Self {
+        self.affinity_assignment_enabled = false;
         self
     }
 
@@ -198,6 +256,17 @@ impl<'a> SelectionContext<'a> {
         self.routing_key
     }
 
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id
+    }
+
+    pub fn candidate_range_id(&self) -> &str {
+        self.candidate_range_id
+    }
+    pub fn input_tokens(&self) -> Option<u64> {
+        self.input_tokens
+    }
+
     /// Returns ingress-computed routing tokens.
     pub fn request_tokens(&self) -> Option<&[u32]> {
         self.request_tokens
@@ -206,12 +275,159 @@ impl<'a> SelectionContext<'a> {
     pub fn external_prefix(&self) -> Option<&ExternalPrefixSignal> {
         self.external_prefix
     }
+
+    pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
+        self.load_snapshot
+    }
+
+    pub fn affinity_lookup_enabled(&self) -> bool {
+        self.affinity_lookup_enabled
+    }
+
+    pub fn affinity_assignment_enabled(&self) -> bool {
+        self.affinity_assignment_enabled
+    }
+}
+
+/// Policy 产生的 primary/backup 提案。
+#[derive(Clone)]
+pub struct SelectionProposal {
+    pub primary: Arc<Worker>,
+    pub backup: Option<Arc<Worker>>,
+    pub kind: ProposalKind,
+    /// EligibilityFilter 之后可用于 fallback 的 worker。
+    pub eligible_workers: Option<Vec<Arc<Worker>>>,
+}
+
+/// 一个 Cache-Aware Prefill 候选，`E = L - H`。
+#[derive(Clone)]
+pub struct CacheCandidate {
+    pub worker: Arc<Worker>,
+    pub matched_prefix_tokens: u64,
+    pub uncached_tokens: u64,
+    /// 候选所属 domain。
+    pub candidate_range_id: String,
+    /// 使用 `E` 检查的可选 pending Prefill 上限。
+    pub max_pending_prefill_tokens: Option<u64>,
+}
+
+/// 有界 Cache-Aware 候选集。
+#[derive(Clone)]
+pub struct CacheCandidateProposal {
+    pub candidates: Vec<CacheCandidate>,
+    pub cache_switch_margin_tokens: u64,
+}
+
+/// Prefill policy 返回 pair 或 Cache-Aware 候选集。
+#[derive(Clone)]
+pub enum PrefillProposal {
+    Pair(SelectionProposal),
+    CacheCandidates(CacheCandidateProposal),
+}
+
+impl PrefillProposal {
+    /// 将 EligibilityFilter 结果应用到两种 proposal。
+    pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
+        match self {
+            Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
+            Self::CacheCandidates(mut proposal) => {
+                proposal.candidates.retain(|candidate| {
+                    workers
+                        .iter()
+                        .any(|worker| worker.id == candidate.worker.id)
+                });
+                Self::CacheCandidates(proposal)
+            }
+        }
+    }
+}
+
+impl SelectionProposal {
+    /// 创建无 backup 的提案。
+    pub fn primary(primary: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: None,
+            kind: ProposalKind::Generic,
+            eligible_workers: None,
+        }
+    }
+
+    /// 创建 primary/backup 提案。
+    pub fn with_backup(primary: Arc<Worker>, backup: Arc<Worker>) -> Self {
+        Self {
+            primary,
+            backup: Some(backup),
+            kind: ProposalKind::PowerOfTwo,
+            eligible_workers: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ProposalKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
+        self.eligible_workers = Some(workers);
+        self
+    }
+}
+
+/// primary/backup 的来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalKind {
+    Generic,
+    PowerOfTwo,
+    SessionAffinity,
+    CacheAffinity,
+    Score,
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
 
-    /// Whether policy selection needs request tokens.
+    /// Produces a primary worker and an optional backup.
+    fn propose(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<SelectionProposal> {
+        self.select(workers, ctx).map(SelectionProposal::primary)
+    }
+
+    /// Produces a prefill proposal, including cache-aware candidate sets.
+    fn propose_prefill(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<PrefillProposal> {
+        self.propose(workers, ctx).map(PrefillProposal::Pair)
+    }
+
+    /// Commits policy-owned affinity state after choosing the final prefill worker.
+    fn commit_prefill_selection(
+        &self,
+        _ctx: &SelectionContext<'_>,
+        _proposal_kind: ProposalKind,
+        _selected: &Arc<Worker>,
+    ) {
+    }
+
+    /// Indicates whether this policy uses shared prefill admission and guards.
+    fn uses_shared_prefill_admission(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy's routing decision needs request tokens (i.e.
+    /// it routes by prompt prefix). Ingress tokenization itself is no longer
+    /// gated on this — that is a model property (`has_chat_encoder`) decided at
+    /// ingress via [`request_tokens_for`]. This flag is the EXTRA gate that
+    /// keeps the cache-aware policy's RAW-prompt routing path alive: a
+    /// cache-aware model with no chat encoder still wants its `/v1/completions`
+    /// /`text` prompt tokenized for tree matching, which `has_chat_encoder`
+    /// alone would not trigger. Default `false` for load-only and sticky
+    /// routes; only the cache-aware policy overrides it.
     fn needs_request_tokens(&self) -> bool {
         false
     }
