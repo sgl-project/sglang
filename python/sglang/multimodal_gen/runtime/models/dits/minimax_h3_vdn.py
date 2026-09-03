@@ -225,12 +225,30 @@ class VDNFrameAlpha(nn.Module):
         self.A_log = _make_param((local_heads,), dtype=_FP32, shard_dim=0)
         self.dt_bias = _make_param((local_heads * head_dim,), dtype=_FP32, shard_dim=0)
 
-    def forward(self, frame_mean: torch.Tensor) -> torch.Tensor:
-        """frame_mean [F, hidden] fp32 -> alpha [F, H_local, d] fp32."""
+    def forward(
+        self, frame_mean: torch.Tensor, heads: slice | None = None
+    ) -> torch.Tensor:
+        """frame_mean [F, hidden] fp32 -> alpha [F, H, d] fp32 for the head
+        range ``heads`` (Ulysses: this rank's shard of the TP-local heads)."""
+        if heads is None:
+            up_w, dt_bias, a_log, n_heads = (
+                self.up.weight,
+                self.dt_bias,
+                self.A_log,
+                self.local_heads,
+            )
+        else:
+            rows = slice(heads.start * self.head_dim, heads.stop * self.head_dim)
+            up_w, dt_bias, a_log = (
+                self.up.weight[rows],
+                self.dt_bias[rows],
+                self.A_log[heads],
+            )
+            n_heads = heads.stop - heads.start
         delta = F.linear(frame_mean.float(), self.down.weight.float())
-        delta = F.linear(delta, self.up.weight.float()) + self.dt_bias
-        scale = torch.exp(self.A_log)[:, None]
-        delta = delta.view(-1, self.local_heads, self.head_dim)
+        delta = F.linear(delta, up_w.float()) + dt_bias
+        scale = torch.exp(a_log)[:, None]
+        delta = delta.view(-1, n_heads, self.head_dim)
         return torch.exp(-scale * F.softplus(delta))
 
 
@@ -291,18 +309,23 @@ class VDNShortConv(nn.Module):
         tokens: torch.Tensor,
         num_frames: int,
         frame_size: tuple[int, int],
+        heads: slice | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The 5x5 depthwise half on [F*S, H, d] tokens -> ([F, S, C], w_tm [C, 5])."""
-        heads, head_dim = tokens.shape[-2], tokens.shape[-1]
+        """The 5x5 depthwise half on [F*S, H, d] tokens -> ([F, S, C], w_tm [C, 5]);
+        ``heads`` selects the weight channels of a head range."""
+        n_heads, head_dim = tokens.shape[-2], tokens.shape[-1]
         grid_h, grid_w = frame_size
-        channels = heads * head_dim
+        channels = n_heads * head_dim
+        w_sp = getattr(self, f"{proj}_sp")["weight"]
+        w_tm = getattr(self, f"{proj}_tm")["weight"]
+        if heads is not None:
+            rows = slice(heads.start * head_dim, heads.stop * head_dim)
+            w_sp, w_tm = w_sp[rows], w_tm[rows]
         # [F*S, H, d] read as channels_last [F, C, gh, gw]: cuDNN NHWC depthwise
         volume = tokens.reshape(num_frames, grid_h, grid_w, channels).permute(0, 3, 1, 2)
-        w_sp = getattr(self, f"{proj}_sp")["weight"]
         volume = F.conv2d(volume, w_sp, padding=SHORT_CONV_KERNEL // 2, groups=channels)
         x = volume.permute(0, 2, 3, 1).reshape(num_frames, grid_h * grid_w, channels)
-        w_tm = getattr(self, f"{proj}_tm")["weight"].squeeze(1).to(x.dtype)
-        return x, w_tm
+        return x, w_tm.squeeze(1).to(x.dtype)
 
 
 class VDNRMSNorm(nn.Module):
@@ -344,6 +367,7 @@ def linear_features(
     conv: VDNShortConv | None,
     num_frames: int | None,
     frame_size: tuple[int, int] | None,
+    heads: slice | None = None,
 ) -> torch.Tensor:
     """[N, H, d] raw projection -> [N, H, d] branch features:
     [short conv ->] SiLU [-> L2 norm for q, k]."""
@@ -351,9 +375,9 @@ def linear_features(
     if conv is not None and proj in conv.targets:
         if frame_size is None or num_frames is None:
             raise ValueError("the short conv needs the (frames, height, width) grid")
-        heads, head_dim = tokens.shape[-2], tokens.shape[-1]
-        x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size)
-        out = _temporal_shift(x, w_tm).reshape(-1, heads, head_dim)
+        heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
+        x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size, heads=heads)
+        out = _temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim)
         return _activate(out, l2norm)
     return _activate(tokens, l2norm)
 
@@ -373,7 +397,14 @@ def frame_statistics(
     if a_fp32:
         kf32 = kf.float()
         scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
-        A = torch.matmul(scaled32.transpose(-1, -2), kf32)
+        # TF32 (10 mantissa bits) keeps I + A well conditioned where bf16
+        # does not, and runs the GEMM on tensor cores; scoped to this matmul.
+        prev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            A = torch.matmul(scaled32.transpose(-1, -2), kf32)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev
     else:
         A = torch.matmul(
             (kf * beta.unsqueeze(-1).to(kf.dtype)).contiguous().transpose(-1, -2), kf
@@ -573,7 +604,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         one delta-rule chunk (no conv, no causal scan; alpha plays no part
         because the old state is zero), scaled by TEXT_STATE_SCALE."""
         length = text_k_raw.shape[0]
-        heads, head_dim = self.local_heads, self.head_dim
+        heads, head_dim = text_k_raw.shape[1], self.head_dim
         key = linear_features(text_k_raw, proj="k", conv=None, num_frames=None, frame_size=None)
         value = linear_features(text_v_raw, proj="v", conv=None, num_frames=None, frame_size=None)
         key = key.view(1, length, heads, head_dim).permute(0, 2, 1, 3)
@@ -601,8 +632,14 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         text_k_raw: torch.Tensor | None = None,
         text_v_raw: torch.Tensor | None = None,
         text_beta: torch.Tensor | None = None,
+        heads: slice | None = None,
     ) -> torch.Tensor:
-        """Linear readout for every video row, [V, H_local * d] in q's dtype.
+        """Linear readout for every video row, [V, H * d] in q's dtype.
+
+        ``heads``: under Ulysses each rank owns every head's weights but
+        processes one head range of the full sequence after the all-to-all;
+        the per-head parameters (alpha's up/dt_bias/A_log, the conv channels)
+        take that slice. beta / gate arrive already head-sharded.
 
         q_raw/k_raw/v_raw: the VIDEO rows' raw (pre-QK-norm, pre-RoPE)
         projections [V, H_local, d]; beta [V, H_local]; gate [V, H_local, d];
@@ -622,12 +659,13 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
                 text_state = self.text_state(text_k_raw, text_v_raw, text_beta)
 
         skip_ends = hybrid.anchor_frames == "both"
+        n_heads = q_raw.shape[1]
         if not skip_ends:
             return self._readout(
                 q_raw, k_raw, v_raw, beta, gate, frame_mean, num_frames, per_frame,
-                bounds, layout.frame_size, text_state,
+                bounds, layout.frame_size, text_state, heads,
             )
-        out = q_raw.new_empty(num_frames * per_frame, self.local_heads * self.head_dim)
+        out = q_raw.new_empty(num_frames * per_frame, n_heads * self.head_dim)
         if num_frames <= 2:
             return out.zero_()
         inner = slice(per_frame, (num_frames - 1) * per_frame)
@@ -635,7 +673,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             q_raw[inner], k_raw[inner], v_raw[inner], beta[inner], gate[inner],
             frame_mean[1:-1], num_frames - 2, per_frame,
             [(lo - 1, hi - 1) for lo, hi in bounds[1 : num_frames - 1]],
-            layout.frame_size, text_state,
+            layout.frame_size, text_state, heads,
         )
         out[:per_frame].zero_()
         out[(num_frames - 1) * per_frame :].zero_()
@@ -655,21 +693,22 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         bounds: list[tuple[int, int]],
         frame_size: tuple[int, int],
         text_state: torch.Tensor | None,
+        heads: slice | None,
     ) -> torch.Tensor:
-        heads, head_dim = self.local_heads, self.head_dim
-        shape = (num_frames, per_frame, heads, head_dim)
+        n_heads, head_dim = q_raw.shape[1], self.head_dim
+        shape = (num_frames, per_frame, n_heads, head_dim)
         conv = self.short_conv
         # 1. features (q frame-major for the bmm readout)
-        query = linear_features(q_raw, proj="q", conv=conv, num_frames=num_frames, frame_size=frame_size)
-        key = linear_features(k_raw, proj="k", conv=conv, num_frames=num_frames, frame_size=frame_size)
-        value = linear_features(v_raw, proj="v", conv=conv, num_frames=num_frames, frame_size=frame_size)
+        query = linear_features(q_raw, proj="q", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
+        key = linear_features(k_raw, proj="k", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
+        value = linear_features(v_raw, proj="v", conv=conv, num_frames=num_frames, frame_size=frame_size, heads=heads)
         query_by_frame = query.view(shape).permute(0, 2, 1, 3)
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
-        beta_by_frame = beta.view(num_frames, per_frame, heads).permute(0, 2, 1)
+        beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
         # 2. per-frame statistics
         A, B = frame_statistics(key_by_frame, value_by_frame, beta_by_frame, a_fp32=self.hybrid.a_fp32)
-        alpha = self.alpha(frame_mean)
+        alpha = self.alpha(frame_mean, heads=heads)
         # 3. scans
         transitions, injections = delta_factor_apply(
             self.hybrid.delta_rule, alpha, A, B, tokens_per_frame=per_frame

@@ -1116,8 +1116,10 @@ def _maybe_prepare_hybrid_h3_metadata(
         # QK-norm + RoPE run after the Ulysses all-to-all on the head shard
         # over the full sequence, so every rank needs the whole cache.
         with torch.inference_mode():
-            img_position_ids = packed["img_position_ids"][None].to(torch.float32)
-            rope_freqs = model.rope(img_position_ids).to(device)
+            img_position_ids = (
+                packed["img_position_ids"][None].to(torch.float32).to(device)
+            )
+            rope_freqs = model.rope(img_position_ids)
             rope_cache_full = (
                 _rope_cos_sin_cache(rope_freqs, dtype=torch.bfloat16),
                 torch.arange(layout.seq_len, device=device, dtype=torch.long),

@@ -131,6 +131,7 @@ class _DecomposedPlan:
     __slots__ = (
         "dense_q",
         "win_q",
+        "win_q_slice",
         "kv_gather",
         "cu_q",
         "cu_k",
@@ -198,7 +199,17 @@ class _DecomposedPlan:
             k_lens.append(int(ki.numel()))
 
         self.has_windows = bool(groups)
+        # Under anchors="both" the window queries are exactly frames 1..F-2,
+        # one contiguous row range: slice instead of gathering/scattering
+        # ~1.4 GB of q and out per block.
+        self.win_q_slice = None
         if self.has_windows:
+            flat = [f for frames in groups for f in frames]
+            if flat == list(range(flat[0], flat[0] + len(flat))):
+                self.win_q_slice = (
+                    layout.frame_rows(flat[0])[0],
+                    layout.frame_rows(flat[-1])[1],
+                )
             self.win_q = torch.cat(q_idx)
             self.kv_gather = torch.cat(kv_idx)
             zero = torch.zeros(1, dtype=torch.long)
@@ -481,16 +492,32 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 scale=self.softmax_scale,
             )
         if plan.has_windows:
-            out[plan.win_q] = _fa_varlen(
-                query[plan.win_q],
-                key[plan.kv_gather],
-                value[plan.kv_gather],
-                cu_q=plan.cu_q,
-                cu_k=plan.cu_k,
-                max_q=plan.max_q,
-                max_k=plan.max_k,
-                scale=self.softmax_scale,
-            )
+            if plan.win_q_slice is not None:
+                start, stop = plan.win_q_slice
+                q_win = query[start:stop]
+                if not q_win.is_contiguous():
+                    q_win = q_win.contiguous()
+                out[start:stop] = _fa_varlen(
+                    q_win,
+                    key[plan.kv_gather],
+                    value[plan.kv_gather],
+                    cu_q=plan.cu_q,
+                    cu_k=plan.cu_k,
+                    max_q=plan.max_q,
+                    max_k=plan.max_k,
+                    scale=self.softmax_scale,
+                )
+            else:
+                out[plan.win_q] = _fa_varlen(
+                    query[plan.win_q],
+                    key[plan.kv_gather],
+                    value[plan.kv_gather],
+                    cu_q=plan.cu_q,
+                    cu_k=plan.cu_k,
+                    max_q=plan.max_q,
+                    max_k=plan.max_k,
+                    scale=self.softmax_scale,
+                )
         return out
 
 

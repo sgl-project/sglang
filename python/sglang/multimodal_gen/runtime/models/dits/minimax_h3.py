@@ -865,6 +865,10 @@ def _minimax_h3_hybrid_attention_core_impl(
 
     linear_out = None
     if not meta.full_cover:
+        head_range = None
+        if ulysses_active:
+            local_heads = q.shape[1]
+            head_range = slice(ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads)
         readout = branch(
             q_raw=q[video_start:video_end],
             k_raw=k[video_start:video_end],
@@ -876,9 +880,14 @@ def _minimax_h3_hybrid_attention_core_impl(
             text_k_raw=k[:text_len],
             text_v_raw=v[:text_len],
             text_beta=beta[:text_len],
+            heads=head_range,
         )
-        linear_out = q.new_zeros(q.shape[0], readout.shape[-1])
-        linear_out[video_start:video_end] = readout
+        if ulysses_active:
+            # rows go back to their owners: pad the non-video rows with zeros
+            linear_out = q.new_zeros(q.shape[0], readout.shape[-1])
+            linear_out[video_start:video_end] = readout
+        else:
+            linear_out = readout
         del readout
 
     if ulysses_active:
@@ -1381,7 +1390,13 @@ class MiniMaxH3Attention(nn.Module):
         if linear_out is not None:
             assert self.to_out_linear is not None
             far, _ = self.to_out_linear(linear_out)
-            out.add_(far)
+            if far.shape[0] == total:
+                out.add_(far)
+            else:
+                # single-rank path: the readout covers the video rows only
+                meta = get_forward_context().attn_metadata
+                layout = meta.layout
+                out[layout.video_start : layout.video_end].add_(far)
         return out
 
 
