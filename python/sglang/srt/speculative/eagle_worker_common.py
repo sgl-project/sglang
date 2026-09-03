@@ -340,6 +340,9 @@ def build_eagle_verify_input(
             num_steps,
             num_draft_tokens,
             device,
+            # DP ranks must agree on graph-vs-eager; can_run_graph() picks max(fb, spec_info),
+            # so idle's NULL lets forward_batch alone decide capture mode, matching active.
+            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
     # Write straight into the backend's buffer when it owns one and this batch
