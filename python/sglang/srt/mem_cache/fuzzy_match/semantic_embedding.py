@@ -39,7 +39,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     # 0.3.17 is the first release whose provider defaults to copying every
     # layer. Earlier releases zero the layers their mask flags, which costs
     # measurable output quality on reused spans.
-    _MIN_SEMBLEND_VERSION = "0.3.20"
+    _MIN_SEMBLEND_VERSION = "0.3.21"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
