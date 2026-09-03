@@ -678,6 +678,11 @@ def silu_and_mul_masked_post_quant_fwd(
         assert get_device_sm() >= 89, (
             f"MXFP4 _silu_and_mul_post_quant_kernel impl requires e2m1 PTX instruction (PPU for SM 8.9+)"
         )
+        assert not gemm1_alpha, (
+            "gemm1_alpha (oai-swiglu) has no MXFP4 e2m1 packing branch in "
+            "_silu_and_mul_post_quant_kernel; the alpha path only quantizes to "
+            "fp8/int8"
+        )
         fp8_max = 6.0  # max abs value of e2m1 format
         fp8_min = -6.0
     else:
@@ -811,6 +816,8 @@ def _silu_and_mul_kernel(
     size_n,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    GEMM1_ALPHA: tl.constexpr,
+    GEMM1_CLAMP_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -842,10 +849,17 @@ def _silu_and_mul_kernel(
             mask=offs_in_d < size_n,
             other=0.0,
         ).to(tl.float32)
-        gate = gate / (1 + tl.exp(-gate))
-        gate_up = up * gate
-        # Compute SiLU in fp32 for better precision, then cast back to the
-        # input dtype.
+        if GEMM1_ALPHA > 0:
+            # oai-swiglu (MiniMax-M3 / gpt-oss), same formula as
+            # _silu_and_mul_post_quant_kernel.
+            gate = tl.minimum(gate, GEMM1_CLAMP_LIMIT)
+            up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
+            gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
+        else:
+            gate = gate / (1 + tl.exp(-gate))
+            gate_up = up * gate
+        # Compute the activation in fp32 for better precision, then cast back to
+        # the input dtype.
         gate_up = gate_up.to(input_ptr.dtype.element_ty)
         tl.store(
             output_ptr_offs + token_index * stride_output_1,
@@ -858,11 +872,16 @@ def silu_and_mul_masked_fwd(
     input: torch.Tensor,
     output: torch.Tensor,
     masked_m: torch.Tensor,
+    gemm1_alpha: float = 0.0,
+    gemm1_clamp_limit: float = 0.0,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
     output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
     masked_m shape [expert_num]
+
+    gemm1_alpha > 0 switches from silu(g)*u to the oai-swiglu used by
+    MiniMax-M3 / gpt-oss: clamp(g,max=L)*sigmoid(clamp(g,max=L)*alpha)*(clamp(u,+-L)+1)
     """
 
     assert input.is_contiguous()
@@ -902,6 +921,8 @@ def silu_and_mul_masked_fwd(
         size_n,
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
+        GEMM1_ALPHA=gemm1_alpha if gemm1_alpha is not None else 0.0,
+        GEMM1_CLAMP_LIMIT=gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0,
         num_warps=num_warps,
     )
     return output
