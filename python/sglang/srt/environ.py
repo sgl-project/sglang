@@ -409,6 +409,14 @@ class Envs:
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
 
     # ===================================================================
+    # CI reporting: per-model metrics jsonl for nightly XPU dashboard
+    # ===================================================================
+    # When set, XPU nightly tests append one JSON record per model to this file
+    # so xpu-ci-job-monitor.yml can render per-model ref/actual/status/duration
+    # tables. Unset (the default) is a full no-op — pre-existing CI unaffected.
+    SGLANG_TEST_METRICS_FILE = EnvStr(None)
+
+    # ===================================================================
     # PD and scripted-runtime tests
     # ===================================================================
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -850,6 +858,18 @@ class Envs:
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # Above 8192 tokens of context, aiter's non-static workspace is large enough
+    # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
+    # honor an explicitly passed --mem-fraction-static instead. Off by default:
+    # the reserve is load-bearing, and skipping it OOMs long-context aiter serving
+    # that fits comfortably with it (67.32 GiB request against 47.40 GiB free on a
+    # 288 GB MI355 in nightly-4-gpu-mi35x-minimax-m3). Worth setting only when the
+    # scaled fraction is itself too small to hold the model weights.
+    SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION = EnvBool(False)
+    # Route Kimi-K3-style h12 + fp8 MLA decode through aiter Triton Gluon when
+    # import and Triton cga_layout prerequisites hold. Set to 0 to force the
+    # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
+    SGLANG_AITER_MLA_GLUON = EnvBool(True)
 
     # DSV4 Aiter flags
     SGLANG_OPT_USE_AITER_SILU_MUL = EnvBool(False)
@@ -1066,6 +1086,10 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # Persistent CuTe DSL AOT objects. Resolved lazily so it tracks
+    # SGLANG_CACHE_DIR; set to an empty string to keep compilation
+    # process-local. Must be trusted: cached objects are loaded into the process.
+    SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
@@ -1075,6 +1099,10 @@ class Envs:
     # is what makes reverting an edit an instant hit instead of a rebuild; set
     # it to trade that away for disk (1 keeps only the most recent build).
     SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+    # Raise instead of compiling when a module misses the cache, so a
+    # deployment that expects a pre-seeded cache fails loudly at startup
+    # rather than silently eating a cold compile.
+    SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1273,6 +1301,9 @@ class Envs:
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
+    # Mint capture's measured footprint as one span so the graph pool is carved
+    # out of a single contiguous region instead of grown segment by segment.
+    SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
