@@ -20,11 +20,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    get_bool_env_var,
-    get_int_env_var,
-    is_gfx1250_supported,
-)
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -403,8 +399,6 @@ def resolve_aiter_dispatch_format(
     weight_dtype: Optional[torch.dtype],
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
-    *,
-    is_gfx1250: Optional[bool] = None,
 ) -> AiterDispatchChoice:
     """Which activation format AITER's fused_moe wants for MXFP4 expert weights.
 
@@ -418,15 +412,6 @@ def resolve_aiter_dispatch_format(
     if weight_dtype != torch.float4_e2m1fn_x2:
         # Only MXFP4 weights are ambiguous; callers settle the rest themselves.
         return AiterDispatchChoice(AiterDispatchFormat.BF16, "not MXFP4 weights")
-
-    if is_gfx1250 is None:
-        is_gfx1250 = is_gfx1250_supported()
-
-    if is_gfx1250:
-        # AITER wants fp4 here, but MoRI EP is unverified on this arch.
-        return AiterDispatchChoice(
-            AiterDispatchFormat.BF16, "MoRI EP unverified on gfx1250"
-        )
 
     api = _aiter_dispatch_dtype_api()
     if api is None:
