@@ -12,6 +12,10 @@ from sglang.kernels.ops.attention.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.suffix_attention_merge import (
+    can_use_fused_suffix_attention_merge,
+    merge_suffix_attention_in_place,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
@@ -235,9 +239,9 @@ class FlashAttentionBackend(AttentionBackend):
             "on the fa3/fa4 backend."
         )
         if self.has_local_attention:
-            assert (
-                model_runner.attention_chunk_size is not None
-            ), "Attention chunk size is required for local attention"
+            assert model_runner.attention_chunk_size is not None, (
+                "Attention chunk size is required for local attention"
+            )
             self.attention_chunk_size = model_runner.attention_chunk_size
 
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
@@ -930,9 +934,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # create expand page table
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
@@ -1094,9 +1096,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             text_col = forward_batch.encoder_lens.long().unsqueeze(
                 1
-            ) + arange_text.unsqueeze(
-                0
-            )  # (bs, max_seq_len_k)
+            ) + arange_text.unsqueeze(0)  # (bs, max_seq_len_k)
             text_row = forward_batch.req_pool_indices.unsqueeze(1).expand(-1, text_max)
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 text_row, text_col
@@ -1583,14 +1583,36 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+            if (
+                use_cascade_attn
+                and forward_batch.spec_algorithm.is_uno()
+                and can_use_fused_suffix_attention_merge(
+                    layer=layer,
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    extra_kwargs=kwargs,
+                )
+            ):
+                suffix_metadata = self.forward_metadata_spec_decode_expand
+                o = merge_suffix_attention_in_place(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    suffix_page_table=suffix_metadata.page_table,
+                    suffix_cache_seqlens=suffix_metadata.cache_seqlens_int32,
+                    prefix=o,
+                    prefix_lse=softmax_lse,
+                    softmax_scale=layer.scaling,
+                )
+            elif use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # Here metadata_expand.page_table is not divided with page_size.
-                    # This is because we loose the fine control of  what token to attend,
-                    # but has to attend to some block completely.
+                    # The suffix table stores physical token slots, so expose
+                    # the paged cache as page-size-one blocks.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
@@ -1717,9 +1739,9 @@ class FlashAttentionBackend(AttentionBackend):
                     # Concat q_nope + q_rope along dim=-1 so the wrapper's
                     # chunk(2, dim=0) keeps their alignment; split back
                     # inside the closure.
-                    assert (
-                        not use_cascade_attn
-                    ), "Cascade attention under MLA CP is not supported in v1."
+                    assert not use_cascade_attn, (
+                        "Cascade attention under MLA CP is not supported in v1."
+                    )
                     q_fused = torch.cat([q_nope, q_rope], dim=-1)
 
                     def _mla_cp_attn(
@@ -2987,9 +3009,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # metadata_expand.cu_seqlens_q already set in capture
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
@@ -3334,9 +3354,9 @@ class FlashAttentionBackend(AttentionBackend):
         metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
-        assert (
-            self.page_size == 1
-        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        assert self.page_size == 1, (
+            "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        )
 
         cache_seqlens_int32 = (
             metadata.cache_seqlens_int32.repeat_interleave(
@@ -3640,8 +3660,7 @@ def make_local_attention_virtual_batches(
     block_starts = k_seqstarts_absolute // page_size
 
     assert attn_chunk_size % page_size == 0, (
-        f"attn_chunk_size {attn_chunk_size} is not "
-        f"divisible by page_size {page_size}"
+        f"attn_chunk_size {attn_chunk_size} is not divisible by page_size {page_size}"
     )
     pages_per_local_batch = attn_chunk_size // page_size
 
