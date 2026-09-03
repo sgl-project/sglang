@@ -40,7 +40,10 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_parallel,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
@@ -109,6 +112,20 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
+        # DFLASH target verify under dp attention: the captured dp-gather
+        # geometry goes stale when per-rank batch sizes diverge (uneven
+        # batching / partial batches), corrupting the verify output. Fall
+        # back to eager, mirroring the draft worker's dp-attention policy.
+        self._dflash_dp_eager = (
+            not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash_family()
+            and get_parallel().enable_dp_attention
+        )
+        if self._dflash_dp_eager:
+            logger.warning(
+                "Disable DFLASH target verify graph replay because dp "
+                "attention is enabled (verify runs eager)."
+            )
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
@@ -116,6 +133,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
+
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if self._dflash_dp_eager:
+            return False
+        return super().can_run_graph(forward_batch)
 
     def _init_arch_map(self):
         if self.is_dllm:

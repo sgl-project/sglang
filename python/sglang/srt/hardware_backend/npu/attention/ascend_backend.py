@@ -2038,6 +2038,15 @@ class AscendAttnBackend(AttentionBackend):
             if not self.graph_mode:
                 num_token_padding = query.shape[0]
                 query = query[: forward_batch.num_token_non_padded_cpu]
+                # DP padding leaves padded rows in seq_lens_cpu while q is
+                # trimmed to real tokens above. Trim the kv lens to the real
+                # batch so actualSeqLengthsKv matches the operator's
+                # batchSize (TND layout). Only target_verify has a uniform
+                # per-request width; draft_extend_v2 keeps padded rows.
+                if forward_batch.forward_mode.is_target_verify():
+                    real_bs = (
+                        query.shape[0] // self.speculative_num_draft_tokens
+                    )
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph-mode target_verify path: the v2 operator's
@@ -2049,6 +2058,12 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
+            if (
+                not self.graph_mode
+                and forward_batch.forward_mode.is_target_verify()
+                and len(actual_seq_lengths_kv) > real_bs
+            ):
+                actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 actual_seq_lengths = (
@@ -2073,6 +2088,13 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables_swa
             else:
                 block_table = self.forward_metadata.block_tables
+            if (
+                not self.graph_mode
+                and forward_batch.forward_mode.is_target_verify()
+                and block_table.shape[0] > real_bs
+            ):
+                # Drop DP padding rows (see real_bs comment above).
+                block_table = block_table[:real_bs]
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
                 mask = None
@@ -2109,7 +2131,7 @@ class AscendAttnBackend(AttentionBackend):
                     query,
                     k_cache,
                     v_cache,
-                    block_table=self.forward_metadata.block_tables,
+                    block_table=block_table,
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
