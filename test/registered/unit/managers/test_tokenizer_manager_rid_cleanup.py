@@ -642,8 +642,11 @@ class TestParallelSamplingRidDerivation(CustomTestCase):
             tm.rid_to_state.pop(sub_obj.rid, None)
             yield {"meta_info": {"id": sub_obj.rid}}
 
+        async def fake_send(tokenized):
+            dispatched.append(tokenized.rid)
+
         tm._tokenize_one_request = fake_tokenize
-        tm._send_one_request = lambda tokenized: dispatched.append(tokenized.rid)
+        tm._send_one_request = fake_send
         tm._wait_one_response = fake_wait
 
         obj = GenerateReqInput(text=text, rid=rid, sampling_params={"n": n})

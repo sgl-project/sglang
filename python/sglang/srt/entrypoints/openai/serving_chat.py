@@ -89,7 +89,10 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
-from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
+from sglang.srt.parser.jinja_template_utils import (
+    MEDIA_URL_PART_TYPES,
+    process_content_for_template_format,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
@@ -717,6 +720,66 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_tokens = max(0, prompt_tokens - self._KIMI_K3_GENERATION_STUB_TOKENS)
         return prompt_tokens
 
+    @staticmethod
+    def _sort_tool_message_run(
+        run: List[Dict[str, Any]], tool_calls: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Order a tool-message run by tool_call position.
+
+        Templates that associate results by tool_call_id render the run in
+        tool_calls order; sorting the run upfront keeps extraction order and
+        placeholder order the same. Runs the template itself would refuse to
+        associate (missing/duplicate/unknown ids) are left untouched, as are
+        text-only runs, whose order text-only templates may rely on.
+        """
+        if len(run) < 2:
+            return run
+        call_ids = [tc.get("id") for tc in tool_calls]
+        if any(call_id is None for call_id in call_ids) or len(set(call_ids)) != len(
+            call_ids
+        ):
+            return run
+        result_ids = [message.get("tool_call_id") for message in run]
+        if any(result_id not in call_ids for result_id in result_ids) or len(
+            set(result_ids)
+        ) != len(result_ids):
+            return run
+        has_media = any(
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") in MEDIA_URL_PART_TYPES
+                for part in message["content"]
+            )
+            for message in run
+        )
+        if not has_media:
+            return run
+        position = {call_id: index for index, call_id in enumerate(call_ids)}
+        return sorted(run, key=lambda message: position[message["tool_call_id"]])
+
+    @classmethod
+    def _canonicalize_tool_message_order(
+        cls, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        canonical = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            canonical.append(message)
+            index += 1
+            tool_calls = message.get("tool_calls") or []
+            if message.get("role") != "assistant" or not tool_calls:
+                continue
+            run = []
+            while index < len(messages) and messages[index].get("role") in (
+                "tool",
+                "function",
+            ):
+                run.append(messages[index])
+                index += 1
+            canonical.extend(cls._sort_tool_message_run(run, tool_calls))
+        return canonical
+
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -1329,6 +1392,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids, assistant_prefix
                 )
         else:
+            if self.template_manager.jinja_template_may_reorder_tool_results:
+                messages = self._canonicalize_tool_message_order(messages)
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""

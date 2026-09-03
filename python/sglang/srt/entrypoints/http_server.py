@@ -234,9 +234,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     publish(server_args, role="tokenizer")
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        get_serving().api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert get_serving().api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -822,9 +822,9 @@ async def server_info():
     HiCache mirror by `GET /hicache/storage-backend`.
     """
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -1529,9 +1529,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -2401,8 +2404,7 @@ def _wait_and_warmup(
     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
             get_exec().moe.ep_join_mode,
         )
 

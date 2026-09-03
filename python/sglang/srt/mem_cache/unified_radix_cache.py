@@ -462,8 +462,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 # content would drop-newest and punch storage holes.
                 write_backlog_cap=2 * self.token_to_kv_pool_allocator.size_full,
             )
-            self.cache_controller.host_write_staged_tokens_fn = (
-                lambda: self.buffer_pipeline.write_staged_tokens_
+            self.cache_controller.host_write_staged_tokens_fn = lambda: (
+                self.buffer_pipeline.write_staged_tokens_
             )
 
         # State initialization
@@ -842,10 +842,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         if self.disable:
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, :kv_len_to_handle
-            ]
-            self.token_to_kv_pool_allocator.free_segment(kv_indices, start_pos=0)
+            self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -899,17 +896,16 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.insert(insert_params)
 
             # Free unaligned tail (+ deferred truncation tail)
-            segments = [(kv_indices[page_aligned_len:], page_aligned_len)]
+            ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
-                segments.append((kv_indices_full[tail_free_start:], tail_free_start))
-            self.token_to_kv_pool_allocator.free_segments(segments)
+                ranges.append((tail_free_start, len(kv_indices_full)))
+            self.free_kv_row(req.kv, ranges)
         else:
-            self.token_to_kv_pool_allocator.free_segment(
-                kv_indices[req.kv.cache_protected_len :],
-                start_pos=req.kv.cache_protected_len,
-            )
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
-        self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        # Synthetic profiling requests may own KV without locking a tree node.
+        if req.last_node is not None:
+            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
@@ -1002,12 +998,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
@@ -1201,9 +1197,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.kv.req_pool_idx, window_start:num_tokens
             ].to(torch.int64)
             swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
-            assert bool(
-                (swa_indices > 0).all()
-            ), f"unmapped SWA window positions for request {req.rid}"
+            assert bool((swa_indices > 0).all()), (
+                f"unmapped SWA window positions for request {req.rid}"
+            )
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
@@ -2615,9 +2611,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert (
-            count_values[-2] == -count_values[-1]
-        ), "write_back duplicate-reclaim victims diverged across TP ranks"
+        assert count_values[-2] == -count_values[-1], (
+            "write_back duplicate-reclaim victims diverged across TP ranks"
+        )
         return (
             count_values[0],
             count_values[1],
@@ -2701,9 +2697,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert (
-                sync_tensor[1].item() == -sync_tensor[2].item()
-            ), "write_back duplicate-reclaim victims diverged across TP ranks"
+            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
