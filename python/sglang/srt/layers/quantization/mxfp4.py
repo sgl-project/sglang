@@ -98,14 +98,9 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    # On SM107, BF16/FP16 inputs (notably GPT-OSS) use FlashInfer so activation
-    # quantization matches its MXFP4 MoE consumer. Kimi-K3 is the exception:
-    # when routing has not already quantized the activations, it can reach this
-    # fallback with an exact-width, row-strided FP32 tensor. FlashInfer's MXFP8
-    # quantizer rejects FP32, while SGLang's quantizer supports it and emits the
-    # same linear MXFP8/UE8M0 layout used when Kimi-K3 quantizes during routing.
-    # Inputs that need padding continue to use FlashInfer, which pads them to
-    # hidden_size before quantization.
+    # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
+    # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
+    # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
     elif x.shape[-1] != hidden_size or (
         _is_sm107_supported() and x.dtype != torch.float32
     ):
