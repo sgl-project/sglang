@@ -98,7 +98,10 @@ class TestHybridLinearAttentionMetadata(CustomTestCase):
         mixed_qkv = torch.empty((0, 16))
         layer = SimpleNamespace(num_v_heads=2, head_v_dim=4)
         forward_batch = SimpleNamespace(
-            batch_size=0, forward_mode=ForwardMode.TARGET_VERIFY
+            # MLP-sync padding can preserve a fabricated request row even
+            # after RadixLinearAttention trims the physical token tensor.
+            batch_size=1,
+            forward_mode=ForwardMode.TARGET_VERIFY,
         )
 
         output = backend.forward(
