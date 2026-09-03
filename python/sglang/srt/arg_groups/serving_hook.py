@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
+    is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
 from sglang.utils import is_in_ci
@@ -419,11 +420,11 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120
+        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-            "DeepGEMM FP4 indexer support."
+            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
     # it, mirroring the forward scale split: the ue8m0 path

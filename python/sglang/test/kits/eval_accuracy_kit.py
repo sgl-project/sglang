@@ -111,7 +111,7 @@ def _run_sgl_eval(
     asserts the score meets ``score_threshold``, and checks the speculative accept
     length. ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking":
     True}`` so the server separates reasoning from the final answer. Skips the test
-    if sgl-eval (git-only) is not installed. Returns the RunResult.
+    if sgl-eval is not installed. Returns the RunResult.
     """
     assert (
         score_threshold == score_threshold
@@ -122,10 +122,7 @@ def _run_sgl_eval(
         from sgl_eval.sampler import ChatCompletionSampler
         from sgl_eval.types import GenConfig
     except ImportError:
-        test_case.skipTest(
-            "sgl-eval not installed; pip install "
-            "'sgl-eval @ git+https://github.com/sgl-project/sgl-eval'"
-        )
+        test_case.skipTest("sgl-eval not installed; pip install 'sglang[test]'")
 
     base_url = test_case.base_url.rstrip("/")
     if not base_url.endswith("/v1"):

@@ -98,7 +98,12 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+    # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
+    # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
+    # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
+    elif x.shape[-1] != hidden_size or (
+        _is_sm107_supported() and x.dtype != torch.float32
+    ):
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
