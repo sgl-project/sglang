@@ -1681,19 +1681,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
 
         cd = node.component_data[comp.component_type]
-        if EvictLayer.DEVICE in target and cd.lock_ref != 0:
-            return False
-        if EvictLayer.HOST in target and cd.host_lock_ref != 0:
-            return False
-
         # A comp whose TRUE internal priority outranks the trigger is only a
-        # candidate because leaf-collapse flattened priorities. Its session
-        # reference can also legitimately pin it independently of the trigger.
+        # candidate because leaf-collapse flattened priorities; a lock on it is
+        # a legitimate pin and must be spared. A lock on a strictly-lower-
+        # priority tier is a real strand and must trip the assertions below.
         if comp.eviction_priority(is_leaf=False) >= trigger.eviction_priority(
             is_leaf=False
         ):
+            if EvictLayer.DEVICE in target and cd.lock_ref != 0:
+                return False
+            if EvictLayer.HOST in target and cd.host_lock_ref != 0:
+                return False
             if cd.session_ref > 0 and trigger.session_ref(node) == 0:
                 return False
+        if EvictLayer.DEVICE in target:
+            assert cd.lock_ref == 0
+        if EvictLayer.HOST in target:
+            assert cd.host_lock_ref == 0
         return True
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):

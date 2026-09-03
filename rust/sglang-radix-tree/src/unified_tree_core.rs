@@ -2382,6 +2382,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         let trigger_component = self.component_by_type_(trigger_component_type);
         let trigger_priority = trigger_component.eviction_priority(is_leaf);
+        let trigger_internal_priority =
+            trigger_component.eviction_priority(/* is_leaf = */ false);
+
         for i in 0..self.components.len() {
             let component = Arc::clone(&self.components[i]);
             let ct = component.component_type();
@@ -2393,6 +2396,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     target,
                     is_leaf,
                     trigger_priority,
+                    trigger_internal_priority,
                 )
                 .unwrap_or_else(|message| panic!("{message}"));
             if !should_evict {
@@ -2420,8 +2424,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Decide whether one component participates in a cascade eviction.
     ///
-    /// Locked values are ownership barriers and never participate in the
-    /// cascade, regardless of the component's relative priority.
+    /// Lock violations are returned instead of panicking so the inspection
+    /// binding can translate them to Python ``AssertionError``. Production
+    /// cascade eviction converts the same error back into its existing panic.
     fn should_cascade_evict_component_(
         &self,
         node_id: NodeIdx_,
@@ -2430,6 +2435,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         target: EvictLayer,
         is_leaf: bool,
         trigger_priority: i64,
+        trigger_internal_priority: i64,
     ) -> Result<bool, String> {
         let component_type = component.component_type();
         if component.eviction_priority(is_leaf) > trigger_priority
@@ -2449,11 +2455,26 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
         let lock_ref = node.device_lock_ref(component_type);
         let host_lock_ref = node.host_lock_ref(component_type);
+        // A component whose true internal priority outranks the trigger is
+        // present only because leaf-collapse flattened priorities. Its lock is
+        // a legitimate pin; a lower-priority component's lock is a strand.
+        if component.eviction_priority(/* is_leaf = */ false) >= trigger_internal_priority {
+            if target.contains(EvictLayer::Device) && lock_ref != 0 {
+                return Ok(false);
+            }
+            if target.contains(EvictLayer::Host) && host_lock_ref != 0 {
+                return Ok(false);
+            }
+        }
         if target.contains(EvictLayer::Device) && lock_ref != 0 {
-            return Ok(false);
+            return Err(format!(
+                "cascade_evict_: a {component_type:?} device lock strands node {node_id}"
+            ));
         }
         if target.contains(EvictLayer::Host) && host_lock_ref != 0 {
-            return Ok(false);
+            return Err(format!(
+                "cascade_evict_: a {component_type:?} host lock strands node {node_id}"
+            ));
         }
         Ok(true)
     }
@@ -4512,6 +4533,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         };
         let trigger_component = self.component_by_type_(trigger_component_type);
         let trigger_priority = trigger_component.eviction_priority(is_leaf);
+        let trigger_internal_priority =
+            trigger_component.eviction_priority(/* is_leaf = */ false);
         for component in &self.components {
             self.should_cascade_evict_component_(
                 node_id,
@@ -4520,6 +4543,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 target,
                 is_leaf,
                 trigger_priority,
+                trigger_internal_priority,
             )?;
         }
         Ok(())

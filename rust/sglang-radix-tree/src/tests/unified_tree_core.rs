@@ -4716,12 +4716,13 @@ fn cascade_spares_a_locked_component_of_equal_internal_priority() {
 }
 
 #[test]
-fn cascade_spares_a_locked_lower_internal_priority_component() {
+#[should_panic(expected = "a Swa device lock strands node")]
+fn cascade_panics_on_a_locked_lower_internal_priority_component() {
+    // A lock on a strictly-lower-priority tier is a real strand.
     let mut tc = core();
-    let recorder = Arc::new(SwaEvictionComponentForTest::new(
+    tc.register_component_(Arc::new(SwaEvictionComponentForTest::new(
         /* leaf_priority = */ 0, /* internal_priority = */ 1,
-    ));
-    tc.register_component_(recorder.clone());
+    )));
     let a = cascade_aux_setup(&mut tc);
     tc.arena.node_mut(a).values[SWA.idx()].lock_ref = 1;
     let mut tracker = HashMap::new();
@@ -4734,9 +4735,6 @@ fn cascade_spares_a_locked_lower_internal_priority_component() {
         &mut hf,
         EvictLayer::Device,
     );
-    assert!(recorder.evictions.lock().unwrap().is_empty());
-    assert!(tc.arena.node(a).values[SWA.idx()].value.is_some());
-    assert_eq!(tc.arena.node(a).values[SWA.idx()].lock_ref, 1);
 }
 
 // An H-tier aux carrier: a raw child holding only an SWA host value.
@@ -4784,12 +4782,13 @@ fn cascade_host_spares_a_locked_component_of_equal_internal_priority() {
 }
 
 #[test]
-fn cascade_host_spares_a_locked_lower_internal_priority_component() {
+#[should_panic(expected = "a Swa host lock strands node")]
+fn cascade_host_panics_on_a_locked_lower_internal_priority_component() {
+    // A host lock on a strictly-lower-priority tier is a real strand.
     let mut tc = core();
-    let recorder = Arc::new(SwaEvictionComponentForTest::new(
+    tc.register_component_(Arc::new(SwaEvictionComponentForTest::new(
         /* leaf_priority = */ 0, /* internal_priority = */ 1,
-    ));
-    tc.register_component_(recorder.clone());
+    )));
     let a = cascade_host_aux_setup(&mut tc);
     tc.arena
         .node_mut(a)
@@ -4804,9 +4803,6 @@ fn cascade_host_spares_a_locked_lower_internal_priority_component() {
         &mut hf,
         EvictLayer::Host,
     );
-    assert!(recorder.evictions.lock().unwrap().is_empty());
-    assert!(tc.arena.has_host_value(a, SWA));
-    assert_eq!(tc.arena.host_lock_ref(a, SWA), 1);
 }
 
 #[test]
