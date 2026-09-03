@@ -466,9 +466,16 @@ class AiterAttnBackend(AttentionBackend):
                 intra_batch_mode = False
             # Zero-pad topology (h12->qh16): prefer Gluon decode over PS kernel.
             if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
-                _use_mla_ps_kernel = False
-                fast_mode = False
-                intra_batch_mode = False
+                # Disable ps only when gluon kernel is selected to avoid falling
+                # back to incorrect aiter kernel
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=self.head_pad_mode,
+                    num_head=self.num_head,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ):
+                    _use_mla_ps_kernel = False
+                    fast_mode = False
+                    intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
