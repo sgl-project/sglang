@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -72,34 +73,43 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
-    is_sm90_supported,
-    is_sm100_supported,
 )
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
-_is_sm90_supported = _is_cuda and is_sm90_supported()
-_is_sm100_supported = _is_cuda and is_sm100_supported()
+_is_sm90_supported = _is_cuda and get_platform().is_sm90
+_is_sm100_supported = _is_cuda and get_platform().is_sm100
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
 if _use_aiter:
-    from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
-    from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
-
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype as _aiter_fp8_dtype
+
+    if _is_gfx1250_supported:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    else:
+        from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
+        from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
 
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -129,6 +139,22 @@ def _fused_rmsnorm_fp8_per_token_quant(
         If residual is None:  (out_fp8, scale)
         If residual provided: ((out_fp8, scale), residual_out)
     """
+    if _is_gfx1250_supported:
+        # per-token quant == group quant with group_size == hidden size, giving
+        # an (M, 1) scale.
+        N = hidden_states.shape[-1]
+        (out_fp8, scale), _out1, _out2, residual_out = fused_rms_fp8_group_quant(
+            hidden_states,
+            weight,
+            epsilon,
+            group_size=N,
+            dtype_quant=_aiter_fp8_dtype,
+            res1=residual,
+        )
+        if residual is not None:
+            return (out_fp8, scale), residual_out
+        return (out_fp8, scale)
+
     M, N = hidden_states.shape
     out_fp8 = torch.empty((M, N), dtype=_aiter_fp8_dtype, device=hidden_states.device)
     scale = torch.empty(M, dtype=torch.float32, device=hidden_states.device)
@@ -169,7 +195,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
-        and get_server_args().flashinfer_allreduce_fusion_backend is not None
+        and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
         and not is_flashinfer_allreduce_unavailable()
         # Symbolic size checks stay last: under Dynamo tracing they guard on
         # the dynamic token dim, so statically-off configs must short-circuit
@@ -190,7 +216,7 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and total_bytes <= 8 * 1024 * 8192
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
-        and get_server_args().enable_aiter_allreduce_fusion
+        and get_exec().comm.enable_aiter_allreduce_fusion
     )
 
 
@@ -269,7 +295,7 @@ class AttnTpContext:
     def init_context(self, q_lora_rank, is_dsa):
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
-            get_server_args().enable_attn_tp_input_scattered
+            get_parallel().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
             and not is_dsa
@@ -278,9 +304,9 @@ class AttnTpContext:
             and get_moe_a2a_backend().is_none()
             and not enable_moe_dense_fully_dp()
             and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-            and get_server_args().speculative_algorithm != "EAGLE3"
+            and get_spec().speculative_algorithm != "EAGLE3"
         )
-        if get_server_args().enable_attn_tp_input_scattered:
+        if get_parallel().enable_attn_tp_input_scattered:
             if not self.allow_input_scattered:
                 logging.info(
                     "attn_tp_input_scattered is not enabled while other conditions are not met"
@@ -411,7 +437,7 @@ class LayerScatterModes:
             not context.is_layer_sparse
             and context.is_next_layer_sparse
             and enable_moe_dense_fully_dp()
-            and get_server_args().enable_two_batch_overlap
+            and get_exec().overlap.enable_two_batch_overlap
         )
 
     @classmethod
@@ -438,11 +464,11 @@ class LayerScatterModes:
 
 
 def enable_moe_dense_fully_dp():
-    return get_server_args().moe_dense_tp_size == 1
+    return get_parallel().moe_dense_tp_size == 1
 
 
 def enable_dwdp():
-    return get_server_args().dwdp_size > 1
+    return get_parallel().dwdp_size > 1
 
 
 class LayerCommunicator:
@@ -458,6 +484,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -475,8 +502,32 @@ class LayerCommunicator:
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
-            get_server_args().speculative_algorithm
+            get_spec().speculative_algorithm
         )
+
+        # Under LayerNorm SP the norm/residual run on the sequence shard with no
+        # collectives, so delegate to an all-SCATTERED sibling while the region is
+        # active. _is_sp_variant stops the sibling from building its own.
+        self._sp_variant: Optional[LayerCommunicator] = None
+        if not _is_sp_variant and layernorm_sp.layernorm_sp_enabled():
+            self._sp_variant = LayerCommunicator(
+                layer_scatter_modes=LayerScatterModes(
+                    layer_input_mode=ScatterMode.SCATTERED,
+                    attn_mode=ScatterMode.SCATTERED,
+                    mlp_mode=ScatterMode.SCATTERED,
+                    middle_residual_mode=ScatterMode.SCATTERED,
+                    layer_output_mode=ScatterMode.SCATTERED,
+                ),
+                input_layernorm=input_layernorm,
+                post_attention_layernorm=post_attention_layernorm,
+                allow_reduce_scatter=allow_reduce_scatter,
+                is_last_layer=is_last_layer,
+                qkv_latent_func=qkv_latent_func,
+                force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
+                enable_fused_ar_quant=enable_fused_ar_quant,
+                fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
+                _is_sp_variant=True,
+            )
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -567,6 +618,24 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        # residual is None marks the first decoder layer, where the SP region
+        # opens: re-evaluated per forward so a crash mid-loop cannot leak into
+        # the next one.
+        if self._sp_variant is not None:
+            if residual is None:
+                get_forward().set(
+                    "sp_active", forward_batch.forward_mode == ForwardMode.EXTEND
+                )
+                if get_forward().sp_active:
+                    hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+            if get_forward().sp_active:
+                return self._sp_variant.prepare_attn(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    quant_format,
+                    post_residual_addition,
+                )
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -744,9 +813,9 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        assert hidden_states.shape[0] % self._context.tp_size == 0, (
+            f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        )
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
@@ -763,6 +832,10 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        if self._sp_variant is not None and get_forward().sp_active:
+            return self._sp_variant.prepare_mlp(
+                hidden_states, residual, forward_batch, cache
+            )
         if cache is not None:
             self._context.cache = cache
 
@@ -780,6 +853,10 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if self._sp_variant is not None and get_forward().sp_active:
+            return self._sp_variant.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
@@ -816,6 +893,18 @@ class LayerCommunicator:
         if is_enable_moe_cp_allgather():
             return False
 
+        # Fusing makes the next layer's residual+LN absorb the post-experts
+        # all-reduce, and that fused kernel reduces over a single group. Under
+        # hybrid EP+TP the post-experts reduction spans two disjoint groups
+        # (moe_expert_parallel_all_reduce over _MOE_EP, then
+        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
+        # should_skip_post_experts_all_reduce() skips *both* once fusion is
+        # published -- so the fused reduce would cover only half the peers and
+        # silently return under-reduced activations.
+        parallel = get_parallel()
+        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+            return False
+
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
@@ -846,7 +935,7 @@ class LayerCommunicator:
                     and get_parallel().tp_size != 6
                     and not is_dp_attention_enabled()
                     and get_moe_a2a_backend().is_none()
-                    and get_server_args().enable_aiter_allreduce_fusion
+                    and get_exec().comm.enable_aiter_allreduce_fusion
                 )
             )
             and (not self.is_last_layer)
@@ -989,6 +1078,22 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if (
+            hidden_states_input_mode == ScatterMode.SCATTERED
+            and residual_input_mode == ScatterMode.SCATTERED
+            and hidden_states_output_mode == ScatterMode.SCATTERED
+            and residual_output_mode == ScatterMode.SCATTERED
+        ):
+            # Megatron LayerNorm sequence parallelism (layers/layernorm_sp.py):
+            # activations stay sequence-sharded across the attn->mlp boundary, so
+            # there is nothing to gather or scatter here -- just the residual add
+            # plus LayerNorm on the local shard. The row-parallel o_proj already
+            # issued the reduce-scatter (g-bar) that the all-reduce would have
+            # done, and the g all-gather is fused into the next column-parallel
+            # linear. Distinct from the branch above because under pure TP
+            # attn_tp_size == tp_size > 1, so that gate does not fire.
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
@@ -1151,7 +1256,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not handled:
                 quantize_communications = (
                     not forward_batch.forward_mode.is_decode_or_idle()
-                    and get_server_args().enable_quant_communications
+                    and get_exec().comm.enable_quant_communications
                 )
                 if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(

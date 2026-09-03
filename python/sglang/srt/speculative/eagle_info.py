@@ -6,7 +6,7 @@ import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
@@ -199,7 +199,7 @@ class EagleDraftInput(SpecInput):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
-                if get_server_args().speculative_use_rejection_sampling
+                if get_spec().speculative_use_rejection_sampling
                 else None
             ),
             capture_hidden_mode=capture_hidden_mode,
@@ -315,8 +315,8 @@ class EagleDraftExtendInput(SpecInput):
 
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits
-    # processor runs lm_head only on these rows. None under gathered-buffer
-    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
     select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to

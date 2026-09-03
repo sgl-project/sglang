@@ -21,17 +21,35 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
     SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
+    SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
+    SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
+    SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
+    SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
+    SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
+    # on by default; engages only on 2 ranks with peer-to-peer access and falls
+    # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
+    # the resolver below -- that is the value the runtime reads.
+    SGLANG_DIFFUSION_IPC_A2A: bool = True
+    # a deadlock backstop, not a per-step budget: a rank can legitimately stall
+    # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
+    # retires the transport on every rank and fails the request
+    SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS: float = 10000.0
+    # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
+    # slots and is never freed, so multi-resolution serving needs a cap
+    SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -58,6 +76,7 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: str = "auto"
     SGLANG_USE_ROCM_VAE: bool = False
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
@@ -96,6 +115,14 @@ def _lazy_int(key: str, default: str | int | None = None) -> Callable[[], int | 
 
 def _lazy_float(key: str, default: str | float) -> Callable[[], float]:
     return lambda: float(os.getenv(key, str(default)))
+
+
+def _lazy_optional_float(key: str) -> Callable[[], float | None]:
+    def _getter():
+        val = os.getenv(key)
+        return float(val) if val is not None else None
+
+    return _getter
 
 
 def _lazy_bool(key: str, default: str = "false") -> Callable[[], bool]:
@@ -197,6 +224,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
+    # Import an installed package that registers out-of-tree diffusion models
+    # and pipelines. This is shared with the SRT model plugin mechanism.
+    "SGLANG_EXTERNAL_MODEL_PACKAGE": _lazy_str("SGLANG_EXTERNAL_MODEL_PACKAGE", ""),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
@@ -206,6 +236,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
     "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
+    # Kill-switch for the courier thread that ships checkpoint-mapped layers to
+    # the device off the compute thread. The courier already falls back to the
+    # synchronous copy on any failure; this forces that path up front.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER"
+    ),
+    # Test hook: make the host memory budget behave as if the machine had this
+    # many GiB of RAM (available = this figure minus the process's own
+    # anonymous memory). CI uses it to exercise the constrained placement
+    # paths -- mapped weights, partial pinning, the courier -- on runners whose
+    # real hosts are never short of memory.
+    "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB"
+    ),
+    # Test-only: cap the CUDA caching allocator at this many GiB, so a large
+    # CI card behaves like the consumer card a case is written for. Without
+    # the cap the allocator is free to reserve past the pretended budget and
+    # a peak-VRAM baseline stops meaning "fits the card".
+    "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
+        "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
+    ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
@@ -217,8 +268,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
     ),
+    # Kill-switch: keep VAE decoder weights in their checkpoint dtype at load
+    # instead of the decode compute dtype the decode stage would round them to
+    # on first use anyway.
+    "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST"
+    ),
+    # Kill-switch: keep the decode-dtype VAE decoder weights in anonymous host
+    # memory instead of a file-backed cache mapping the page cache can drop.
+    "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
+    # of the file-backed LoRA merge cache.
+    "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
+    ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
+    # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
+    "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
+    "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
+        "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
+    ),
+    "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
+        "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
+    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -267,6 +342,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When disabled, FP8 weights are dequantized to compute dtype before matmul.
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
+    ),
+    # Dequantize storage-only FP8 linear weights to the compute dtype once,
+    # at first use (bit-identical outputs; trades weight VRAM for skipping
+    # the per-forward dequant pass). Weights are kept FP8-resident when free
+    # memory is low or when this flag is disabled.
+    "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE", "true"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),

@@ -8,7 +8,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -191,10 +191,10 @@ def prepare_for_draft_extend(
         # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
         # backend max() reads from list without a per-iter D2H sync.
         forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_cuda_graph:
+    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
@@ -204,7 +204,7 @@ def prepare_for_draft_extend(
         # On NPU with --disable-cuda-graph, block_table shape won't match
         # after prepare_mlp_sync_batch padding; defer re-init to
         # forward_extend (post-pad) instead.
-        if not is_npu() or can_cuda_graph:
+        if not is_npu() or can_run_decode_cuda_graph:
             forward_batch.mark_forward_metadata_ready()
     return forward_batch
 
@@ -307,10 +307,10 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
-    can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
+    can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    return forward_batch, can_cuda_graph
+    return forward_batch, can_run_decode_cuda_graph
 
 
 def build_eagle_verify_input(
@@ -351,9 +351,7 @@ def build_eagle_verify_input(
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
     else:
         mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
-        tree_mask_buf = (
-            verify_mask.buffer if verify_mask.fits(bs, num_draft_tokens) else None
-        )
+        tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
 
     # build_tree_kernel uses seq_lens_sum only to size the (non-preallocated)
     # FULL_MASK tree mask; over-size is safe. Skip per-iter .sum().item() D2H via UB.
@@ -469,7 +467,6 @@ def run_eagle_verify(
     plan_stream: Any,
     plan_stream_ctx: Any,
     topk: int,
-    num_steps: int,
     num_draft_tokens: int,
     device: str,
     metadata_ready_pre_pad: bool,
@@ -627,7 +624,7 @@ def run_eagle_verify(
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
+        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front

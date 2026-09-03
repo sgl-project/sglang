@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from sglang.srt.layers.attention.verify_mask import (
     maybe_create_verify_mask,
     tree_mask_numel,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -61,25 +63,35 @@ class TestVerifyMaskSizing(CustomTestCase):
 
 
 class TestVerifyMaskCapacity(CustomTestCase):
-    """A batch past the captured max_bs must not silently reuse the compact
-    layout -- it has no context-dimension slack to absorb the overflow."""
+    """A batch past the captured max_bs must not silently reuse the buffer."""
 
     def test_compact_layout_fits_up_to_max_bs(self):
         # is_read=False pins QLEN_ONLY; the read layout is build-dependent.
         mask = _create(is_read=False)
-        self.assertTrue(mask.fits(_MAX_BS, _DRAFT))
-        self.assertTrue(mask.fits(1, _DRAFT))
+        self.assertTrue(mask.fits(_MAX_BS))
+        self.assertTrue(mask.fits(1))
 
     def test_compact_layout_does_not_fit_beyond_max_bs(self):
         mask = _create(is_read=False)
-        self.assertFalse(mask.fits(_MAX_BS + 1, _DRAFT))
+        self.assertFalse(mask.fits(_MAX_BS + 1))
 
-    def test_full_mask_always_fits(self):
-        """FULL_MASK is exempt from the check -- see fits()."""
+    def test_full_mask_does_not_fit_beyond_max_bs(self):
+        """FULL_MASK's context dimension is per-request slack, not spare room
+        for extra requests -- it must not be exempt from the check. Built
+        explicitly because default_tree_mask_mode() is host-dependent."""
         mask = VerifyMask(
-            buffer=torch.zeros(8, dtype=torch.bool), mode=TreeMaskMode.FULL_MASK
+            buffer=torch.zeros(
+                tree_mask_numel(
+                    TreeMaskMode.FULL_MASK, _MAX_BS, _DRAFT, _MAX_CONTEXT_LEN
+                ),
+                dtype=torch.bool,
+            ),
+            mode=TreeMaskMode.FULL_MASK,
+            max_bs=_MAX_BS,
         )
-        self.assertTrue(mask.fits(_MAX_BS * 1000, _DRAFT))
+
+        self.assertTrue(mask.fits(_MAX_BS))
+        self.assertFalse(mask.fits(_MAX_BS + 1))
 
 
 class TestVerifyMaskGate(CustomTestCase):
@@ -100,6 +112,7 @@ class TestVerifyMaskGate(CustomTestCase):
 class _FakeAttnBackend:
     def __init__(self, verify_mask):
         self.needs_cpu_seq_lens = False
+        self.extend_dummy_seqs_capped_by_req_pool = False
         self.verify_mask = verify_mask
 
 
@@ -107,8 +120,27 @@ def _mask(numel, **kwargs):
     return VerifyMask(
         buffer=torch.zeros(numel, dtype=torch.bool),
         mode=TreeMaskMode.QLEN_ONLY,
+        max_bs=_MAX_BS,
         **kwargs,
     )
+
+
+@contextlib.contextmanager
+def _published(speculative_attention_mode):
+    """The backend reads the mode from the config bags, so publish one.
+
+    A stand-in on the model runner stopped being read when the mode became a
+    published leaf -- the record it would come from is not the one this process
+    resolved.
+    """
+    override = get_context().override_server_args(
+        speculative_attention_mode=speculative_attention_mode
+    )
+    override.install()
+    try:
+        yield
+    finally:
+        override.restore()
 
 
 def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
@@ -116,15 +148,18 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
+        kv_index_translator=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
+        model_config=SimpleNamespace(context_len=_MAX_CONTEXT_LEN),
     )
-    return HybridAttnBackend(
-        model_runner,
-        prefill_backend=_FakeAttnBackend(prefill_mask),
-        decode_backend=_FakeAttnBackend(decode_mask),
-    )
+    with _published(speculative_attention_mode):
+        return HybridAttnBackend(
+            model_runner,
+            prefill_backend=_FakeAttnBackend(prefill_mask),
+            decode_backend=_FakeAttnBackend(decode_mask),
+        )
 
 
 class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
@@ -145,11 +180,9 @@ class TestHybridAttnBackendHandsOutSelectedChildMask(CustomTestCase):
         self.assertIs(backend.verify_mask, prefill_mask)
 
     def test_capacity_check_needs_nothing_from_the_backend(self):
-        """A composite backend carries no max_context_len of its own: fits()
-        reaching back through the backend would raise AttributeError here."""
         backend = _make_hybrid_backend("prefill", _mask(64, is_read=False), None)
 
-        self.assertTrue(backend.verify_mask.fits(_MAX_BS, _DRAFT))
+        self.assertTrue(backend.verify_mask.fits(_MAX_BS))
 
 
 class TestTreeMaskNumel(CustomTestCase):

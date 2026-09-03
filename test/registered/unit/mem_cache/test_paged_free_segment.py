@@ -6,11 +6,15 @@ deferral. See PagedTokenToKVPoolAllocator.free_segment for why unique is avoided
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -63,11 +67,12 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_segment(row[:0], start_pos=0)
         self.assertEqual(len(alloc.free_pages), before)
 
-    def test_need_sort_routes_to_release_pages(self):
+    def test_need_sort_defers_released_pages(self):
         alloc = _make_allocator(need_sort=True)
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
         alloc.free_segment(row, start_pos=0)
-        self.assertEqual(len(alloc.release_pages), 2)
+        self.assertEqual(len(alloc.staged_pages), 1)
+        self.assertEqual(alloc.num_staged_pages, 2)
 
     def test_group_defers_until_group_end(self):
         alloc = _make_allocator()
@@ -78,6 +83,19 @@ class TestFreeSegment(unittest.TestCase):
         self.assertEqual(len(alloc.free_pages), before)
         alloc.free_group_end()
         self.assertEqual(len(alloc.free_pages), before + 2)
+
+    def test_group_owns_deferred_page_representatives(self):
+        alloc = _make_allocator()
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        expected_pages = torch.unique(row // PAGE_SIZE)
+
+        alloc.free_group_begin()
+        alloc.free_segment(row, start_pos=0)
+        row.zero_()
+        alloc.free_group_end()
+
+        freed_pages = alloc.free_pages[: expected_pages.numel()]
+        self.assertTrue(torch.equal(torch.sort(freed_pages)[0], expected_pages))
 
     def test_group_end_debug_assert_catches_cross_call_double_free(self):
         # legacy free() + free_segment() on the same page in one group must
@@ -91,8 +109,8 @@ class TestFreeSegment(unittest.TestCase):
         with self.assertRaises(AssertionError):
             alloc.free_group_end()
 
-    def test_group_end_debug_assert_covers_release_pages(self):
-        # need_sort routes frees into release_pages; the duplicate check must
+    def test_group_end_debug_assert_covers_staged_releases(self):
+        # need_sort stages frees in chunks; the duplicate check must
         # not go vacuous there (PD disaggregation runs with need_sort=True).
         alloc = _make_allocator(need_sort=True)
         alloc.debug_mode = True
@@ -102,6 +120,43 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_segment(row, start_pos=0)
         with self.assertRaises(AssertionError):
             alloc.free_group_end()
+
+    def test_overallocated_tail_uses_allocator_page_size_under_dcp(self):
+        # Scaled-down DCP example: the configured logical page is 1 while the
+        # allocator page is widened to 4. cache_finished_req has already freed
+        # the committed tail [4, 5), so over-allocation cleanup for [5, 7)
+        # must not release the same physical page again.
+        alloc = _make_allocator()
+        alloc.debug_mode = True
+        row = _make_kv_row(alloc, 2 * PAGE_SIZE)
+        tree_cache = SimpleNamespace(
+            token_to_kv_pool_allocator=alloc,
+            req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
+        )
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))
+
+        before = len(alloc.free_pages)
+        alloc.free_group_begin()
+        alloc.free_segment(row[PAGE_SIZE : PAGE_SIZE + 1], start_pos=PAGE_SIZE)
+        with (
+            patch(
+                "sglang.srt.mem_cache.common.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+            patch(
+                "sglang.srt.mem_cache.common.get_serving",
+                return_value=SimpleNamespace(strip_thinking_cache=False),
+            ),
+        ):
+            _release_overallocated_kv_indices(
+                req,
+                start_p=PAGE_SIZE + 1,
+                end_p=2 * PAGE_SIZE - 1,
+                tree_cache=tree_cache,
+            )
+        alloc.free_group_end()
+
+        self.assertEqual(len(alloc.free_pages), before + 1)
 
 
 class TestFreeSegments(unittest.TestCase):

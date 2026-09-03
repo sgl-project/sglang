@@ -38,7 +38,8 @@ Closed-loop exact fold (the state / output error split):
   ``"tf32"`` (~5e-4, tensor-core path; worst case through the (I+A)^{-1}
   amplification 2^(BS-1) still lands at the floor). ``"ieee"`` / ``"tf32x3"``
   remain selectable for ablations. The committed state is untouched by any of
-  these dots (requires the fp32 SSM checkpoint; enforced in server_args).
+  these dots (fp32 SSM checkpoint is the server_args default; a 16-bit
+  checkpoint is allowed with a warning, unvalidated for GDN).
 
 Differences from the vLLM reference:
   * SGLang passes **split** ``q`` / ``k`` / ``v`` tensors (already split + post
@@ -677,9 +678,9 @@ def _launch_gdn_spec(
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
     B = query_start_loc.shape[0] - 1
-    assert (
-        max_cache_len & (max_cache_len - 1) == 0
-    ), "circular cache requires power-of-two max_cache_len"
+    assert max_cache_len & (max_cache_len - 1) == 0, (
+        "circular cache requires power-of-two max_cache_len"
+    )
     assert d_cache.shape[2] == max_cache_len
 
     BK = triton.next_power_of_2(K)
