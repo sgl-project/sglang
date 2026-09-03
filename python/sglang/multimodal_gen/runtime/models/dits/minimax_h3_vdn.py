@@ -28,9 +28,10 @@ every head).
 
 from __future__ import annotations
 
+import functools
 import math
-from dataclasses import dataclass
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -49,6 +50,10 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+)
 
 _BF16 = torch.bfloat16
 _FP32 = torch.float32
@@ -64,8 +69,7 @@ SHORT_CONV_KERNEL = 5
 # --------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class VDNH3Layout:
+class VDNH3Layout(msgspec.Struct, frozen=True):
     """Where the modalities sit in SGLang's packed H3 sequence
     ``[text L | cond C | audio A | video V | pad P]``.
 
@@ -188,47 +192,53 @@ def _make_param(
     return param
 
 
-class _Linear(nn.Module):
-    """``nn.Linear``-shaped parameters with optional head-sharded output rows."""
+def _head_sharded_linear(
+    in_features: int, out_features: int, *, bias: bool, prefix: str
+) -> ColumnParallelLinear:
+    """bf16 linear whose output rows are head-major and TP-sharded by head."""
+    return ColumnParallelLinear(
+        in_features,
+        out_features,
+        bias=bias,
+        gather_output=False,
+        params_dtype=_BF16,
+        quant_config=None,
+        prefix=prefix,
+    )
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        *,
-        bias: bool,
-        dtype: torch.dtype,
-        shard_output: bool,
-    ) -> None:
-        super().__init__()
-        self.weight = _make_param(
-            (out_features, in_features),
-            dtype=dtype,
-            shard_dim=0 if shard_output else None,
-        )
-        if bias:
-            self.bias = _make_param(
-                (out_features,), dtype=dtype, shard_dim=0 if shard_output else None
-            )
-        else:
-            self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+def _replicated_linear(
+    in_features: int, out_features: int, *, prefix: str
+) -> ReplicatedLinear:
+    """bf16 bottleneck projection shared by every head (replicated under TP)."""
+    return ReplicatedLinear(
+        in_features,
+        out_features,
+        bias=False,
+        params_dtype=_BF16,
+        quant_config=None,
+        prefix=prefix,
+    )
 
 
 class VDNFrameAlpha(nn.Module):
     """alpha_t = exp(-exp(A_log) * softplus(up(down(frame_mean)) + dt_bias)),
     per frame / head / key channel, in fp32 (KDA's double-exponential gate)."""
 
-    def __init__(self, hidden_size: int, local_heads: int, head_dim: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        heads: int,
+        local_heads: int,
+        head_dim: int,
+        *,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.local_heads, self.head_dim = local_heads, head_dim
-        self.down = _Linear(
-            hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False
-        )
-        self.up = _Linear(
-            head_dim, local_heads * head_dim, bias=False, dtype=_BF16, shard_output=True
+        self.down = _replicated_linear(hidden_size, head_dim, prefix=f"{prefix}.down")
+        self.up = _head_sharded_linear(
+            head_dim, heads * head_dim, bias=False, prefix=f"{prefix}.up"
         )
         # fp32 islands: the scan multiplies alpha across ~100 frames, so a bf16
         # gate compounds into tens of percent of retention error.
@@ -265,33 +275,40 @@ class VDNFrameAlpha(nn.Module):
 class VDNOutputGate(nn.Module):
     """Low-rank sigmoid gate: sigmoid(up(down(x))) -> [T, H_local, d]."""
 
-    def __init__(self, hidden_size: int, local_heads: int, head_dim: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        heads: int,
+        local_heads: int,
+        head_dim: int,
+        *,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.local_heads, self.head_dim = local_heads, head_dim
-        self.down = _Linear(
-            hidden_size, head_dim, bias=False, dtype=_BF16, shard_output=False
-        )
-        self.up = _Linear(
-            head_dim, local_heads * head_dim, bias=True, dtype=_BF16, shard_output=True
+        self.down = _replicated_linear(hidden_size, head_dim, prefix=f"{prefix}.down")
+        self.up = _head_sharded_linear(
+            head_dim, heads * head_dim, bias=True, prefix=f"{prefix}.up"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.up(self.down(x))).view(
-            -1, self.local_heads, self.head_dim
-        )
+        hidden, _ = self.down(x)
+        gate, _ = self.up(hidden)
+        return torch.sigmoid(gate).view(-1, self.local_heads, self.head_dim)
 
 
 class VDNSoftmaxGate(nn.Module):
     """Per-(token, head) sigmoid gate on the softmax branch output."""
 
-    def __init__(self, hidden_size: int, local_heads: int) -> None:
+    def __init__(self, hidden_size: int, heads: int, *, prefix: str) -> None:
         super().__init__()
-        self.up = _Linear(
-            hidden_size, local_heads, bias=True, dtype=_BF16, shard_output=True
+        self.up = _head_sharded_linear(
+            hidden_size, heads, bias=True, prefix=f"{prefix}.up"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.up(x))
+        gate, _ = self.up(x)
+        return torch.sigmoid(gate)
 
 
 class VDNShortConv(nn.Module):
@@ -350,13 +367,10 @@ class VDNShortConv(nn.Module):
         return x, w_tm.squeeze(1).to(x.dtype)
 
 
-class VDNRMSNorm(nn.Module):
-    """RMSNorm(head_dim) with fp32 second-moment accumulation (VDN ops.rms_norm)."""
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        super().__init__()
-        self.eps = eps
-        self.weight = _make_param((dim,), dtype=_BF16, shard_dim=None)
+def _branch_norm(dim: int, eps: float = 1e-6) -> nn.RMSNorm:
+    """Weight holder for the branch's RMSNorm(head_dim); the arithmetic runs in
+    linear_epilogue / vdn_linear_epilogue (fp32 second moment, one rounding)."""
+    return nn.RMSNorm(dim, eps=eps, dtype=_BF16)
 
 
 # --------------------------------------------------------------------------
@@ -531,6 +545,27 @@ def run_scans(
     return prefix, suffix
 
 
+@functools.lru_cache(maxsize=64)
+def _gather_indices(
+    bounds: tuple[tuple[int, int], ...], num_frames: int, device: str
+) -> tuple[torch.Tensor, ...]:
+    """Index tensors of the boundary gather, built once per (bounds, F,
+    device): they depend on the geometry only, and rebuilding them from
+    Python lists per block would cost two synchronizing H2D copies each."""
+    dev = torch.device(device)
+    last_before = torch.tensor([lo for lo, _ in bounds], device=dev) - 1
+    first_after = torch.tensor([hi for _, hi in bounds], device=dev) + 1
+    return (
+        last_before,
+        first_after,
+        last_before.clamp(min=0),
+        first_after.clamp(max=num_frames - 1),
+        last_before >= 0,
+        first_after < num_frames,
+        torch.arange(num_frames, device=dev),
+    )
+
+
 def gather_linear_state(
     prefix: torch.Tensor,
     suffix: torch.Tensor,
@@ -546,14 +581,15 @@ def gather_linear_state(
     Out-of-range sides read the text state (the scans' virtual start) when one
     was given, else contribute nothing. -> [F, H, dv, dk] in ``out_dtype``."""
     num_frames = prefix.shape[0]
-    device = prefix.device
-    last_before = torch.tensor([lo for lo, _ in bounds], device=device) - 1
-    first_after = torch.tensor([hi for _, hi in bounds], device=device) + 1
-    before_idx = last_before.clamp(min=0)
-    after_idx = first_after.clamp(max=num_frames - 1)
-    has_before = last_before >= 0
-    has_after = first_after < num_frames
-    frames = torch.arange(num_frames, device=device)
+    (
+        last_before,
+        first_after,
+        before_idx,
+        after_idx,
+        has_before,
+        has_after,
+        frames,
+    ) = _gather_indices(tuple(bounds), num_frames, str(prefix.device))
 
     state_before = prefix[before_idx]
     state_after = suffix[after_idx]
@@ -620,6 +656,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         hybrid: VDNHybridAttentionArchConfig,
         *,
         local_heads: int,
+        prefix: str = "linear_attention",
     ) -> None:
         super().__init__()
         if hybrid.linear_head_dim != arch.attention_head_dim:
@@ -637,18 +674,24 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         self.short_conv = (
             VDNShortConv(channels, hybrid.short_conv) if hybrid.short_conv else None
         )
-        self.alpha = VDNFrameAlpha(hidden, local_heads, self.head_dim)
-        self.beta_proj = _Linear(
-            hidden, local_heads, bias=False, dtype=_BF16, shard_output=True
+        heads = arch.num_attention_heads
+        self.alpha = VDNFrameAlpha(
+            hidden, heads, local_heads, self.head_dim, prefix=f"{prefix}.alpha"
         )
-        self.output_gate = VDNOutputGate(hidden, local_heads, self.head_dim)
-        self.norm = VDNRMSNorm(self.head_dim)
+        self.beta_proj = _head_sharded_linear(
+            hidden, heads, bias=False, prefix=f"{prefix}.beta_proj"
+        )
+        self.output_gate = VDNOutputGate(
+            hidden, heads, local_heads, self.head_dim, prefix=f"{prefix}.output_gate"
+        )
+        self.norm = _branch_norm(self.head_dim)
 
     # ---- pieces the attention module computes on the row shard (Ulysses) ----
 
     def beta(self, x: torch.Tensor) -> torch.Tensor:
         """x [T, hidden] -> beta [T, H_local] (sigmoid)."""
-        return torch.sigmoid(self.beta_proj(x))
+        beta, _ = self.beta_proj(x)
+        return torch.sigmoid(beta)
 
     def gate(self, x: torch.Tensor) -> torch.Tensor:
         """x [T, hidden] -> output gate [T, H_local, d]."""

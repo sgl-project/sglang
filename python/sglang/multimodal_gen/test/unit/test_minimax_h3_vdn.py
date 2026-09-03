@@ -101,12 +101,8 @@ def _server_args(**overrides) -> SimpleNamespace:
     return ns
 
 
-def test_vdn_h3_pipeline_config_forces_hybrid_backend_and_rejects() -> None:
+def test_vdn_h3_pipeline_config_rejections() -> None:
     config = VDNH3PipelineConfig()
-    assert (
-        config.resolve_transformer_attention_backend(_server_args())
-        is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
-    )
     with pytest.raises(ValueError, match="--model-variant does not apply"):
         config.validate_server_args(_server_args(model_variant="ref2va"))
     with pytest.raises(
@@ -432,25 +428,10 @@ def test_branch_head_slice_equals_full_run() -> None:
     assert torch.all(full[:tpf] == 0) and torch.all(full[-tpf:] == 0)
     assert full[tpf:-tpf].abs().sum() > 0
 
-    # head-sliced run on heads [1, 3)
+    # the Ulysses contract: the same module on a head range of the full
+    # sequence (sliced q/k/v/beta/gate, per-head params sliced inside)
     hs = slice(1, 3)
-    sliced = MiniMaxH3VDNLinearBranch(
-        MiniMaxH3DiTArchConfig(
-            num_attention_heads=heads, attention_head_dim=head_dim, hidden_size=hidden
-        ),
-        hybrid,
-        local_heads=2,
-    ).to(device)
-    with torch.no_grad():
-        src = dict(branch.named_parameters())
-        for name, p in sliced.named_parameters():
-            full_p = src[name]
-            if full_p.shape == p.shape:
-                p.copy_(full_p)
-            else:
-                rows = p.shape[0]
-                p.copy_(full_p.narrow(0, hs.start * (rows // 2), rows))
-    part = sliced(
+    part = branch(
         q_raw=q[:, hs],
         k_raw=k[:, hs],
         v_raw=v[:, hs],
@@ -461,6 +442,7 @@ def test_branch_head_slice_equals_full_run() -> None:
         text_k_raw=tk[:, hs],
         text_v_raw=tv[:, hs],
         text_beta=tbeta[:, hs],
+        heads=hs,
     ).view(V, 2, head_dim)
     diff = (part.float() - full[:, hs].float()).abs().max().item()
     assert diff < 2e-2, f"head slice vs full run max diff {diff}"
@@ -720,12 +702,13 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
 def _load_materializer():
     import importlib.util
 
+    from sglang.multimodal_gen import envs
     from sglang.multimodal_gen.runtime.utils.model_overlay import (
         BUILTIN_MODEL_OVERLAY_REGISTRY,
     )
 
     spec = BUILTIN_MODEL_OVERLAY_REGISTRY[VDN_MODEL_ID]
-    local = os.environ.get("SGLANG_VDN_H3_OVERLAY_DIR")
+    local = envs.SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR
     if local:
         path = os.path.join(local, "_overlay", "materialize.py")
     else:

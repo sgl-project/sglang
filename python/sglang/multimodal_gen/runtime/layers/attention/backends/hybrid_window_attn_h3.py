@@ -128,7 +128,7 @@ class _DecomposedPlan:
     [globals | window frames | anchor-column frames] keys in one varlen call.
     """
 
-    __slots__ = ("dense_q", "passes", "has_windows", "gathered_rows")
+    __slots__ = ("dense_q", "dense_cu_q", "dense_cu_k", "passes", "has_windows")
 
     def __init__(
         self,
@@ -163,6 +163,12 @@ class _DecomposedPlan:
             global_ranges + [layout.frame_rows(f) for f in sorted(dense_rows)]
         )
         self.dense_q = cat_ranges(dense_ranges)
+        # request-static varlen bounds for the dense leg: built once here, not
+        # from Python lists (a pageable H2D copy + stream sync) in every block
+        self.dense_cu_q = torch.tensor(
+            [0, int(self.dense_q.numel())], dtype=torch.int32, device=device
+        )
+        self.dense_cu_k = torch.tensor([0, used], dtype=torch.int32, device=device)
 
         groups: list[list[int]] = []
         for f in range(num_frames):
@@ -240,7 +246,6 @@ class _DecomposedPlan:
 
         self.passes = passes
         self.has_windows = bool(passes)
-        self.gathered_rows = sum(int(p["kv_gather"].numel()) for p in passes)
         win_rows = sum(int(p["win_q"].numel()) for p in passes)
         covered = int(self.dense_q.numel()) + win_rows
         if covered != used:
@@ -361,12 +366,6 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
             FlashAttentionImpl,
         )
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
-        # The platform resolver selects FA4 on Blackwell before the first
-        # forward; direct constructions (tests, tools) go through the same gate.
-        if current_platform.is_cuda():
-            current_platform._prepare_flash_attention_for_blackwell()
 
         self._dense_fallback = FlashAttentionImpl(
             num_heads=num_heads,
@@ -423,13 +422,13 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         """query/key/value: [T, H, D] packed rows (post-norm, post-RoPE) ->
         [T, H, D]; ``softmax_gate`` [T, H] scales the output per (row, head).
         Rows at and past ``used`` (padding) are zero."""
-        if self.layer_idx is None or attn_metadata is None:
-            if attn_metadata is None and self.layer_idx is not None:
-                raise RuntimeError(
-                    "hybrid_window_attn_h3 needs per-request attention metadata "
-                    "from the MiniMax-H3 denoising stage; none was set in the "
-                    "forward context."
-                )
+        if self.layer_idx is not None and attn_metadata is None:
+            raise RuntimeError(
+                "hybrid_window_attn_h3 needs per-request attention metadata "
+                "from the MiniMax-H3 denoising stage; none was set in the "
+                "forward context."
+            )
+        if self.layer_idx is None:
             return self.dense_varlen(
                 query,
                 key,
@@ -464,7 +463,7 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
             )
-        elif meta.kernel == "decomposed":
+        elif meta.decomposed is not None:
             out = self._decomposed(query, key, value, meta.decomposed, used)
         else:
             from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels import (
@@ -495,49 +494,33 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         if not value_used.is_contiguous():
             value_used = value_used.contiguous()
         if plan.dense_q.numel():
-            n_dense = int(plan.dense_q.numel())
-            cu_q = torch.tensor([0, n_dense], dtype=torch.int32, device=query.device)
-            cu_k = torch.tensor([0, used], dtype=torch.int32, device=query.device)
             out[plan.dense_q] = _fa_varlen(
                 query[plan.dense_q],
                 key_used,
                 value_used,
-                cu_q=cu_q,
-                cu_k=cu_k,
-                max_q=n_dense,
+                cu_q=plan.dense_cu_q,
+                cu_k=plan.dense_cu_k,
+                max_q=int(plan.dense_q.numel()),
                 max_k=used,
                 scale=self.softmax_scale,
             )
         for p in plan.passes:
-            kw = key[p["kv_gather"]]
-            vw = value[p["kv_gather"]]
-            if p["win_q_slice"] is not None:
-                start, stop = p["win_q_slice"]
-                q_win = query[start:stop]
-                if not q_win.is_contiguous():
-                    q_win = q_win.contiguous()
-                out[start:stop] = _fa_varlen(
-                    q_win,
-                    kw,
-                    vw,
-                    cu_q=p["cu_q"],
-                    cu_k=p["cu_k"],
-                    max_q=p["max_q"],
-                    max_k=p["max_k"],
-                    scale=self.softmax_scale,
-                )
-            else:
-                out[p["win_q"]] = _fa_varlen(
-                    query[p["win_q"]],
-                    kw,
-                    vw,
-                    cu_q=p["cu_q"],
-                    cu_k=p["cu_k"],
-                    max_q=p["max_q"],
-                    max_k=p["max_k"],
-                    scale=self.softmax_scale,
-                )
-            del kw, vw
+            sel = (
+                slice(*p["win_q_slice"]) if p["win_q_slice"] is not None else p["win_q"]
+            )
+            q_win = query[sel]
+            if not q_win.is_contiguous():
+                q_win = q_win.contiguous()
+            out[sel] = _fa_varlen(
+                q_win,
+                key[p["kv_gather"]],
+                value[p["kv_gather"]],
+                cu_q=p["cu_q"],
+                cu_k=p["cu_k"],
+                max_q=p["max_q"],
+                max_k=p["max_k"],
+                scale=self.softmax_scale,
+            )
         return out
 
 

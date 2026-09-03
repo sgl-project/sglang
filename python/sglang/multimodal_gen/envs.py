@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
+    SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR: str | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -259,6 +260,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CI card behaves like the consumer card a case is written for. Without
     # the cap the allocator is free to reserve past the pretended budget and
     # a peak-VRAM baseline stops meaning "fits the card".
+    # Test-only: a local checkout of the VDN-H3 overlay repo, so the
+    # materializer unit test runs against the working copy instead of the
+    # pinned hub revision.
+    "SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR": lambda: os.getenv(
+        "SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR"
+    ),
     "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
         "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
     ),

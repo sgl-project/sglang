@@ -56,7 +56,6 @@ class WindowTilePlan:
             window_mask_frames,
         )
 
-        self.layout = layout
         used = layout.used
         num_frames = layout.num_frames
         bounds, dense_rows, dense_cols = window_mask_frames(hybrid, num_frames)
@@ -65,13 +64,9 @@ class WindowTilePlan:
         tiles: list[tuple[int, int]] = []
         tile_frame: list[int] = []  # -1 for global rows
         for start, stop in layout.global_ranges:
-            if stop <= layout.video_start:
-                # text | cond | audio may be several segments; tiling each
-                # global range as one segment keeps tiles segment-pure enough
-                # for a dense-row group (they are all dense queries anyway).
-                segs = _segment_tiles(start, stop)
-            else:
-                segs = _segment_tiles(start, stop)
+            # global rows are dense queries, so one tiling per global range is
+            # segment-pure enough
+            segs = _segment_tiles(start, stop)
             tiles.extend(segs)
             tile_frame.extend([-1] * len(segs))
         prefix_tile_ids = list(range(len(tiles)))
@@ -83,8 +78,6 @@ class WindowTilePlan:
             frame_tile_ids.append(ids)
             tiles.extend(segs)
             tile_frame.extend([f] * len(segs))
-        # global rows AFTER the video (audio sits before video in t2va, but
-        # keep the general case): already covered by layout.global_ranges above
         n_tiles = len(tiles)
         self.num_tiles = n_tiles
         self.seq_pad = n_tiles * TILE
@@ -93,7 +86,6 @@ class WindowTilePlan:
             raise ValueError(
                 f"tile plan covers {int(sizes.sum())} of {used} packed rows"
             )
-        starts = torch.tensor([r for r, _ in tiles], dtype=torch.long)
         # padded position -> packed row (or -1); packed row -> padded position
         pack_index = torch.full((self.seq_pad,), -1, dtype=torch.int32)
         unpack_index = torch.empty(used, dtype=torch.int32)
@@ -129,10 +121,8 @@ class WindowTilePlan:
         self._q2k_index_1h = q2k_index.to(device)
         self._q2k_num_1h = q2k_num.to(device)
         self.max_kv = max_kv
-        self.density = float(sum(len(l) for l in lists)) / (n_tiles * n_tiles)
         self._per_head: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._workspace: dict[tuple, dict[str, torch.Tensor]] = {}
-        self.starts = starts
 
     def index_lists(self, heads: int) -> tuple[torch.Tensor, torch.Tensor]:
         """[1, H, n_tiles, max_kv] / [1, H, n_tiles] int32, head-major

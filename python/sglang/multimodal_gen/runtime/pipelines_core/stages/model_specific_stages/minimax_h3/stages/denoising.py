@@ -1075,7 +1075,7 @@ def _maybe_prepare_hybrid_h3_metadata(
         is not AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
     ):
         return None
-    hybrid = getattr(model.arch, "hybrid_attention", None)
+    hybrid = model.arch.hybrid_attention
     if hybrid is None:
         raise ValueError(
             "--attention-backend hybrid_window_attn_h3 needs a VDN-H3 checkpoint "

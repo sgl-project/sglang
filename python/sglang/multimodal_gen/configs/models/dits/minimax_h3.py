@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+import msgspec
+
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 MINIMAX_H3_PACKED_SEQUENCE_ALIGNMENT = 64
@@ -14,8 +16,7 @@ VDN_H3_ANCHOR_FRAME_MODES = ("none", "columns", "rows", "both")
 VDN_H3_SHORT_CONV_TARGETS = ("q", "k", "v")
 
 
-@dataclass
-class VDNHybridAttentionArchConfig:
+class VDNHybridAttentionArchConfig(msgspec.Struct):
     """VDN-H3 hybrid attention (window softmax + frame-wise linear branch).
 
     Mirrors the resolved ``hybrid_attention`` transform config VDN stamps into
@@ -42,8 +43,6 @@ class VDNHybridAttentionArchConfig:
     short_conv: tuple[str, ...] = ("k", "v")
 
     def __post_init__(self) -> None:
-        if isinstance(self.short_conv, list):
-            self.short_conv = tuple(self.short_conv)
         if self.delta_rule not in VDN_H3_DELTA_RULES:
             raise ValueError(
                 f"hybrid_attention.delta_rule={self.delta_rule!r}; expected one of "

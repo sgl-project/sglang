@@ -469,6 +469,23 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
   PDLTriggerSecondary<kUsePDL>();
 }
 
+/// \brief Shared launch tail of the three host runners: pick the index-type
+/// instantiation, size the persistent grid from the occupancy table, launch.
+template <auto kKernelI32, auto kKernelI64, typename Params>
+void launch_qknorm_rope(const Params& params, bool is_int32, uint32_t num_works, DLDevice device, bool use_pdl) {
+  using namespace host;
+  const auto selected_kernel = is_int32 ? kKernelI32 : kKernelI64;
+  const uint32_t kNumSM = runtime::get_sm_count(device.device_id);
+  static const uint32_t kOccupancyTable[2] = {
+      runtime::get_blocks_per_sm(kKernelI32, kThreadsPerBlock),
+      runtime::get_blocks_per_sm(kKernelI64, kThreadsPerBlock),
+  };
+  const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
+  const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
+  const auto num_blocks = std::min(max_blocks, needed_blocks);
+  LaunchKernel(num_blocks, kThreadsPerBlock, device).enable_pdl(use_pdl)(selected_kernel, params);
+}
+
 template <
     int64_t kHeadDim,
     int64_t kRopeDim,
@@ -551,18 +568,9 @@ struct QKNormRopeKernel {
         .eps = eps,
     };
 
-    const auto is_int32 = id_type.is_type<int32_t>();
-    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
-    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
-    static const uint32_t kOccupancyTable[2] = {
-        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
-        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
-    };
-    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
-    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
-    const auto num_blocks = std::min(max_blocks, needed_blocks);
-    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+    launch_qknorm_rope<kernel<int32_t>, kernel<int64_t>>(
+        params, id_type.is_type<int32_t>(), num_works, device.unwrap(), kUsePDL);
   }
 };
 
@@ -657,18 +665,9 @@ struct QKNormRopeOutOfPlaceKernel {
     params.k_out_stride_bytes = static_cast<int64_t>(Dko.unwrap() * sizeof(DType));
     params.out_head_stride_bytes = out_head_stride_bytes;
 
-    const auto is_int32 = id_type.is_type<int32_t>();
-    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
-    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
-    static const uint32_t kOccupancyTable[2] = {
-        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
-        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
-    };
-    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
-    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
-    const auto num_blocks = std::min(max_blocks, needed_blocks);
-    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+    launch_qknorm_rope<kernel<int32_t>, kernel<int64_t>>(
+        params, id_type.is_type<int32_t>(), num_works, device.unwrap(), kUsePDL);
   }
 };
 
@@ -784,20 +783,11 @@ struct QKNormRopePackKVKernel {
     params.prefix_tokens = static_cast<uint32_t>(prefix_tokens);
     params.suffix_tokens = static_cast<uint32_t>(suffix_tokens);
 
-    const auto is_int32 = id_type.is_type<int32_t>();
-    const auto selected_kernel = is_int32 ? kernel<int32_t> : kernel<int64_t>;
-    const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
-    static const uint32_t kOccupancyTable[2] = {
-        runtime::get_blocks_per_sm(kernel<int32_t>, kThreadsPerBlock),
-        runtime::get_blocks_per_sm(kernel<int64_t>, kThreadsPerBlock),
-    };
-    const auto max_blocks = kOccupancyTable[is_int32 ? 0 : 1] * kNumSM;
     const uint32_t num_prefix_works = static_cast<uint32_t>(batch_size * prefix_tokens) * num_kv_heads;
     const uint32_t num_works =
         (num_qo_heads + num_kv_heads) * num_tokens + 2 * num_prefix_works + num_tokens * num_kv_heads;
-    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
-    const auto num_blocks = std::min(max_blocks, needed_blocks);
-    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap()).enable_pdl(kUsePDL)(selected_kernel, params);
+    launch_qknorm_rope<kernel<int32_t>, kernel<int64_t>>(
+        params, id_type.is_type<int32_t>(), num_works, device.unwrap(), kUsePDL);
   }
 };
 

@@ -1018,9 +1018,16 @@ class MiniMaxH3Attention(nn.Module):
         self.to_out_linear: RowParallelLinear | None = None
         if self.hybrid is not None:
             if self.hybrid.enable_softmax_gate:
-                self.softmax_gate = VDNSoftmaxGate(arch.hidden_size, self.num_heads)
+                self.softmax_gate = VDNSoftmaxGate(
+                    arch.hidden_size,
+                    arch.num_attention_heads,
+                    prefix=f"{prefix}.softmax_gate",
+                )
             self.linear_attention = MiniMaxH3VDNLinearBranch(
-                arch, self.hybrid, local_heads=self.num_heads
+                arch,
+                self.hybrid,
+                local_heads=self.num_heads,
+                prefix=f"{prefix}.linear_attention",
             )
             self.to_out_linear = RowParallelLinear(
                 self.inner_dim,

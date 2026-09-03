@@ -338,14 +338,6 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
             'audited high-quality deployment. Use quality="lossless".'
         )
 
-    def resolve_transformer_attention_backend(
-        self, server_args
-    ) -> AttentionBackendEnum | None:
-        selected = super().resolve_transformer_attention_backend(server_args)
-        if selected is None:
-            return AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
-        return selected
-
     def validate_server_args(self, server_args) -> None:
         if server_args.model_variant is not None:
             raise ValueError(
@@ -386,19 +378,6 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "the breakable CUDA graph yet; disable them."
             )
         super().validate_server_args(server_args)
-        if selected_backend is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
-            # A component override for the token refiner is fine (it stays
-            # dense either way); the transformer must not be overridden away.
-            component = (server_args.component_attention_backends or {}).get(
-                "transformer"
-            )
-            if component is not None and str(component).strip().lower() not in (
-                "hybrid_window_attn_h3",
-            ):
-                raise ValueError(
-                    "VDN-H3 transformer attention must stay hybrid_window_attn_h3; "
-                    f"got component override {component!r}"
-                )
 
 
 __all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig", "VDNH3PipelineConfig"]

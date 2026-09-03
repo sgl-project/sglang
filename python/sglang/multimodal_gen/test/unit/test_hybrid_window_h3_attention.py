@@ -93,7 +93,16 @@ def _skip_if_kernel_unavailable(kernel: str) -> None:
         )
 
 
+def _prepare_flash_attention() -> None:
+    # the platform resolver selects FA4 on Blackwell before the first forward;
+    # a direct construction has to pass the same gate
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    current_platform._prepare_flash_attention_for_blackwell()
+
+
 def _impl() -> HybridWindowAttentionH3Impl:
+    _prepare_flash_attention()
     impl = HybridWindowAttentionH3Impl(
         num_heads=HEADS,
         head_size=HEAD_DIM,
@@ -246,6 +255,7 @@ def test_dense_fallback_off_the_dit_blocks() -> None:
     """The token refiner resolves the same backend but runs plain dense FA."""
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device, seed=5)
+    _prepare_flash_attention()
     impl = HybridWindowAttentionH3Impl(
         num_heads=HEADS,
         head_size=HEAD_DIM,
