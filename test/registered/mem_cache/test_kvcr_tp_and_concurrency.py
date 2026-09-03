@@ -37,6 +37,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     ROUTER_HINT_KEY,
     SOURCE_LOCATIONS_ACTION_TYPE,
@@ -98,6 +101,8 @@ def _storage_config(
     dp_size: int = 1,
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
+    is_mla_model: bool = False,
+    tp_rank_is_attention_scoped: bool | None = None,
     **extra,
 ) -> HiCacheStorageConfig:
     """One scheduler's config.
@@ -114,6 +119,8 @@ def _storage_config(
         "cache_abi": "test-cache-abi",
     }
     extra_config.update(extra)
+    if tp_rank_is_attention_scoped is None:
+        tp_rank_is_attention_scoped = dp_size > 1
     return HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=tp_size,
@@ -121,13 +128,14 @@ def _storage_config(
         pp_size=1,
         attn_cp_rank=attn_cp_rank,
         attn_cp_size=attn_cp_size,
-        is_mla_model=False,
+        is_mla_model=is_mla_model,
         enable_storage_metrics=False,
         is_page_first_layout=True,
         model_name="test-model",
         dp_rank=dp_rank,
         dp_size=dp_size,
         extra_config=extra_config,
+        tp_rank_is_attention_scoped=tp_rank_is_attention_scoped,
     )
 
 
@@ -138,6 +146,8 @@ def _store(
     dp_size: int = 1,
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
+    is_mla_model: bool = False,
+    tp_rank_is_attention_scoped: bool | None = None,
     **extra,
 ) -> KVCRStore:
     """A KVCRStore with no mem_pool, so the core is never constructed."""
@@ -149,6 +159,8 @@ def _store(
             dp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            is_mla_model=is_mla_model,
+            tp_rank_is_attention_scoped=tp_rank_is_attention_scoped,
             **extra,
         ),
         mem_pool=None,
@@ -287,6 +299,64 @@ class TPColocationTest(unittest.TestCase):
             },
         )
 
+    def test_cp_ranks_get_distinct_ports_when_dp_size_is_one(self):
+        """DSV4 round-robin CP has DP=1 and attention-TP=1.
+
+        In that topology every scheduler reports tp_rank=0, so CP must still be
+        part of the bind offset or all ranks silently contend for the base port.
+        """
+        ports = {
+            cp_rank: _store(
+                0,
+                1,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=4,
+                is_mla_model=True,
+                tp_rank_is_attention_scoped=True,
+            )._control_port()
+            for cp_rank in range(4)
+        }
+
+        self.assertEqual(
+            ports,
+            {
+                0: _BASE_CONTROL_PORT,
+                1: _BASE_CONTROL_PORT + 1,
+                2: _BASE_CONTROL_PORT + 2,
+                3: _BASE_CONTROL_PORT + 3,
+            },
+        )
+
+    def test_every_cp_rank_rejects_a_base_port_that_cannot_fit_the_group(self):
+        for cp_rank in range(4):
+            with (
+                self.subTest(cp_rank=cp_rank),
+                self.assertRaisesRegex(ValueError, "highest rank"),
+            ):
+                _store(
+                    0,
+                    1,
+                    attn_cp_rank=cp_rank,
+                    attn_cp_size=4,
+                    is_mla_model=True,
+                    tp_rank_is_attention_scoped=True,
+                    control_port=65533,
+                )._control_port()
+
+    def test_global_tp_rank_is_not_double_counted_by_cp_metadata(self):
+        """Without DP attention, tp_rank already identifies the scheduler."""
+        store = _store(
+            3,
+            4,
+            attn_cp_rank=3,
+            attn_cp_size=4,
+            is_mla_model=True,
+        )
+
+        self.assertEqual(store._control_port(), _BASE_CONTROL_PORT + 3)
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25003")
+
 
 @_needs_kvcr
 class SourceEndpointRankTest(unittest.TestCase):
@@ -358,6 +428,23 @@ class DPColocationTest(unittest.TestCase):
                 (1, 1): _BASE_CONTROL_PORT + 3,
             },
         )
+
+    def test_scoped_dp_cp_tp_coordinates_cover_one_unique_port_block(self):
+        ports = {
+            _store(
+                tp_rank,
+                2,
+                dp_rank,
+                2,
+                attn_cp_rank=cp_rank,
+                attn_cp_size=2,
+            )._control_port()
+            for dp_rank in range(2)
+            for cp_rank in range(2)
+            for tp_rank in range(2)
+        }
+
+        self.assertEqual(ports, set(range(_BASE_CONTROL_PORT, _BASE_CONTROL_PORT + 8)))
 
     def test_the_dialed_source_port_ignores_our_dp_rank(self):
         """The router already picked the source DP rank; we add only our own
@@ -651,6 +738,7 @@ class HybridPoolManifestTest(unittest.TestCase):
         dp_size=1,
         attn_cp_rank=0,
         attn_cp_size=1,
+        is_mla_model=False,
         cache_abi="test-cache-abi",
         page_first=True,
         logical_page_size=2,
@@ -664,6 +752,7 @@ class HybridPoolManifestTest(unittest.TestCase):
             dp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
+            is_mla_model=is_mla_model,
             cache_abi=cache_abi,
         )
         store._storage_config.is_page_first_layout = page_first
@@ -720,7 +809,110 @@ class HybridPoolManifestTest(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertNotEqual(baseline, key)
 
-        self.assertIn(b"#v3/", baseline)
+        self.assertIn(b"#v4/", baseline)
+
+    def test_dsv4_rank_replicas_share_the_tp0_component_keys(self):
+        tp0 = self._component_key(tp_rank=0, tp_size=4, is_mla_model=True)
+        tp3 = self._component_key(tp_rank=3, tp_size=4, is_mla_model=True)
+
+        self.assertEqual(tp0, tp3)
+
+    def test_dsv4_rank_replicas_dial_tp0_of_the_matching_cp_slice(self):
+        store = _store(
+            3,
+            4,
+            dp_size=2,
+            attn_cp_rank=1,
+            attn_cp_size=2,
+            is_mla_model=True,
+        )
+        anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(_ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4)
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25004")
+
+    def test_every_dsv4_tp_lookup_resolves_to_the_single_depositor(self):
+        pool_names = (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        )
+        stores = []
+        owner_addresses = set()
+        for rank in range(2):
+            store = _store(rank, 2, is_mla_model=True)
+            anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+            store.register_mem_pool_host(anchor)
+            store.register_mem_host_pool_v2(anchor, PoolName.KV)
+            store.register_mem_host_pool_v2(
+                _ManifestPool(2, [8]), PoolName.DEEPSEEK_V4_C4
+            )
+            store._pool_contexts = store._collect_pool_contexts()
+            store._freeze_hybrid_key_namespace()
+            stores.append(store)
+
+            controller = object.__new__(HybridCacheController)
+            controller.backup_skip = rank != 0
+            controller.storage_backend_type = "kvcr"
+            controller.mem_pool_host = SimpleNamespace(entry_map={})
+            if all(
+                controller.should_backup(PoolTransfer(name=name)) for name in pool_names
+            ):
+                owner_addresses.add(
+                    (
+                        f"tcp://10.0.0.7:{store._control_port()}",
+                        store._segment_key(
+                            "0123456789abcdefdeadbeef",
+                            0,
+                            PoolName.DEEPSEEK_V4_C4,
+                        ),
+                    )
+                )
+
+        self.assertEqual(len(owner_addresses), 1)
+        for store in stores:
+            hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+            target_address = (
+                hint.source_control_endpoint,
+                store._segment_key(
+                    "0123456789abcdefdeadbeef", 0, PoolName.DEEPSEEK_V4_C4
+                ),
+            )
+            self.assertIn(target_address, owner_addresses)
+
+        # Do not generalize the DSV4 rule to Kimi's TP-sharded Mamba state.
+        self.assertTrue(controller.should_backup(PoolTransfer(name=PoolName.MAMBA)))
+
+    def test_rank_sharded_mamba_hybrid_still_dials_the_matching_tp_rank(self):
+        store = _store(
+            3,
+            4,
+            dp_size=2,
+            attn_cp_rank=1,
+            attn_cp_size=2,
+            is_mla_model=True,
+        )
+        anchor = SimpleNamespace(kv_buffer=None, page_size=2)
+        store.register_mem_pool_host(anchor)
+        store.register_mem_host_pool_v2(anchor, PoolName.KV)
+        store.register_mem_host_pool_v2(_ManifestPool(2, [8]), PoolName.MAMBA)
+        store._pool_contexts = store._collect_pool_contexts()
+        store._freeze_hybrid_key_namespace()
+
+        hint = store._parse_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
+
+        self.assertEqual(hint.source_control_endpoint, "tcp://10.0.0.7:25007")
 
     def test_logical_anchor_v1_io_and_existence_are_virtual_successes(self):
         self.store._kvcr = _ExplodingKVCR()
@@ -888,11 +1080,11 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual({desc.size for desc in c4_descriptors.values()}, {8})
         self.assertEqual({desc.size for desc in c128_descriptors.values()}, {24})
         self.assertTrue(
-            all(b"#v3/" in key and b"/deepseek_v4_c4/" in key for key in c4_descriptors)
+            all(b"#v4/" in key and b"/deepseek_v4_c4/" in key for key in c4_descriptors)
         )
         self.assertTrue(
             all(
-                b"#v3/" in key and b"/deepseek_v4_c128/" in key
+                b"#v4/" in key and b"/deepseek_v4_c128/" in key
                 for key in c128_descriptors
             )
         )

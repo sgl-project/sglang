@@ -159,9 +159,23 @@ _ABANDONED_OP_HISTORY = 256
 _CONTROL_SCHEME = "tcp://"
 _UNDIALABLE_HINT_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
-# Hybrid physical keys changed once when pool qualification was introduced and
-# again here when cross-worker compatibility became part of their identity.
-_HYBRID_KEY_SCHEMA_VERSION = "v3"
+# Hybrid physical keys changed once when pool qualification was introduced,
+# again when cross-worker compatibility became part of their identity, and now
+# when TP-replicated DeepSeek-V4 pools acquired one shared owner namespace.
+_HYBRID_KEY_SCHEMA_VERSION = "v4"
+
+_DEEPSEEK_V4_PHYSICAL_POOLS = frozenset(
+    {
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+        PoolName.DEEPSEEK_V4_C128_STATE,
+    }
+)
+_DEEPSEEK_V4_ALLOWED_POOLS = _DEEPSEEK_V4_PHYSICAL_POOLS | {PoolName.SWA}
 
 
 @dataclass(frozen=True)
@@ -403,6 +417,13 @@ def _within_dp_offset(storage_config: HiCacheStorageConfig) -> int:
     return storage_config.attn_cp_rank * storage_config.tp_size + storage_config.tp_rank
 
 
+def _source_rank_offset(storage_config: HiCacheStorageConfig) -> int:
+    """Offset from the router's selected DP base to our matching source rank."""
+    if not storage_config.tp_rank_is_attention_scoped:
+        return storage_config.tp_rank
+    return _within_dp_offset(storage_config)
+
+
 def _rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
     """This scheduler's port offset from the configured base port.
 
@@ -412,17 +433,16 @@ def _rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
     per DP group, and two ranks that pick the same port is invisible from the
     outside (see ``_control_port``).
 
-    Both branches compute the same thing -- this scheduler's engine-global TP
-    rank -- from whichever coordinates the config carries. With attention DP on,
-    ``tp_rank``/``tp_size`` are attention-scoped (``cache_controller``
-    substitutes ``attn_tp_*``), and SGLang lays ranks out as
+    When ``tp_rank``/``tp_size`` are attention-scoped (``cache_controller``
+    substitutes ``attn_tp_*``), SGLang lays ranks out as
     ``tp_rank = (dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size +
     attn_tp_rank`` (``compute_dp_attention_world_info``), which is exactly what
-    is reassembled here. With it off, ``tp_rank`` already spans every scheduler
-    of the engine, and ``dp_rank`` is 0, so the offset stays byte-identical to
-    the TP-only behaviour that was validated on hardware.
+    is reassembled here. DSV4 round-robin CP has ``dp_size == 1`` and
+    ``tp_size == 1``, so rank scope must be explicit rather than inferred from
+    DP width. When ranks are not attention-scoped, ``tp_rank`` already is the
+    engine-global coordinate and adding CP would double-count it.
     """
-    if storage_config.dp_size <= 1:
+    if not storage_config.tp_rank_is_attention_scoped:
         return storage_config.tp_rank
     return storage_config.dp_rank * _dp_stride(storage_config) + _within_dp_offset(
         storage_config
@@ -435,7 +455,7 @@ def _highest_rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
     Mirrors ``_rank_port_offset`` with every rank coordinate at its maximum, so
     the two must be edited together.
     """
-    if storage_config.dp_size <= 1:
+    if not storage_config.tp_rank_is_attention_scoped:
         return storage_config.tp_size - 1
     return storage_config.dp_size * _dp_stride(storage_config) - 1
 
@@ -743,6 +763,10 @@ class KVCRStore(HiCacheStorage):
             )
 
         storage = self._storage_config
+        if self._is_tp_replicated_dsv4():
+            tp_identity = ("replicated", storage.tp_size)
+        else:
+            tp_identity = ("sharded", storage.tp_size, storage.tp_rank)
         identity = (
             _HYBRID_KEY_SCHEMA_VERSION,
             cache_abi,
@@ -759,7 +783,8 @@ class KVCRStore(HiCacheStorage):
                 )
             ),
             (storage.pp_size, storage.pp_rank),
-            (storage.tp_size, storage.tp_rank),
+            tp_identity,
+            storage.tp_rank_is_attention_scoped,
             (storage.attn_cp_size, storage.attn_cp_rank),
             storage.is_mla_model,
             storage.tp_lcm_size,
@@ -769,6 +794,23 @@ class KVCRStore(HiCacheStorage):
         if self._compatibility_digest not in (None, digest):
             raise RuntimeError("KVCR hybrid key namespace changed after it was frozen.")
         self._compatibility_digest = digest
+
+    def _is_tp_replicated_dsv4(self) -> bool:
+        """Whether this manifest is the TP-replicated DeepSeek-V4 stack.
+
+        DeepSeek-V4's compressed cache and SWA state are identical across TP
+        ranks. HiCache therefore deposits them only from TP0, just as its
+        Mooncake backend does. Kimi-style hybrid stacks are deliberately not
+        inferred from ``is_mla_model`` alone because their Mamba state is
+        TP-sharded and must keep rank-specific ownership.
+        """
+        pool_names = set(self._pool_contexts)
+        return (
+            self._storage_config.is_mla_model
+            and self._logical_anchor
+            and bool(pool_names & _DEEPSEEK_V4_PHYSICAL_POOLS)
+            and pool_names <= _DEEPSEEK_V4_ALLOWED_POOLS
+        )
 
     def _control_port(self) -> int:
         """Bind port for this rank's KVCR control channel.
@@ -1575,8 +1617,10 @@ class KVCRStore(HiCacheStorage):
         the source's advertised per-DP-rank map down to one endpoint before the
         hint ships. What it cannot resolve is the rank *within* that DP group --
         it has no TP concept, so the port it names is that DP rank's first
-        scheduler. Each attention rank holds a different slice of every head, so
-        rank ``i`` of our DP group must pull from rank ``i`` of the source's.
+        scheduler. For a sharded cache, rank ``i`` of our DP group must pull from
+        rank ``i`` of the source's. DeepSeek-V4 is the exception: its physical
+        cache pools are TP-replicated and HiCache deposits them only from TP0,
+        so every target TP rank pulls from TP0 of its matching CP slice.
         Realigning here mirrors what :meth:`_control_port` does on the bind side,
         with only the within-DP part of the offset since the DP part is the
         router's to apply.
@@ -1600,7 +1644,17 @@ class KVCRStore(HiCacheStorage):
         hint = RouterHint.maybe_from_extra_info(extra_info)
         if hint is None:
             return None
-        offset = _within_dp_offset(self._storage_config)
+        if self._is_tp_replicated_dsv4():
+            # Dynamo's endpoint names TP0/CP0 of the selected source DP rank.
+            # Keep the CP slice, but route every TP replica to that slice's TP0
+            # owner instead of to an empty same-rank KVCR instance.
+            offset = 0
+            if self._storage_config.tp_rank_is_attention_scoped:
+                offset = (
+                    self._storage_config.attn_cp_rank * self._storage_config.tp_size
+                )
+        else:
+            offset = _source_rank_offset(self._storage_config)
         endpoint = _offset_endpoint_port(hint.source_control_endpoint, offset)
         if endpoint is None:
             logger.warning(

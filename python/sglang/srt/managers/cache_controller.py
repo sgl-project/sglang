@@ -726,7 +726,8 @@ class HiCacheController:
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
 
-        if is_dp_attention_enabled():
+        tp_rank_is_attention_scoped = is_dp_attention_enabled()
+        if tp_rank_is_attention_scoped:
             self.tp_rank = get_parallel().attn_tp_rank
             self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
@@ -783,6 +784,7 @@ class HiCacheController:
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
+            tp_rank_is_attention_scoped=tp_rank_is_attention_scoped,
         )
 
     def reset(self):
