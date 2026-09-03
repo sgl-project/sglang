@@ -278,7 +278,7 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             and not cfg.language_model_only
             and cfg.disaggregation_mode != "decode"
         ):
-            adjust_mem_fraction_for_vlm(server_args, model_config)
+            adjust_mem_fraction_for_vlm(server_args, model_config, gpu_mem)
 
     # If symm mem is enabled and prealloc size is not set, set it to 4GB
     if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
@@ -349,10 +349,25 @@ def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
     return 0.0
 
 
-def adjust_mem_fraction_for_vlm(server_args: Any, model_config):
+def adjust_mem_fraction_for_vlm(server_args: Any, model_config, gpu_mem=None):
     cfg = resolving_view(server_args)
     vision_config = getattr(model_config.hf_config, "vision_config", None)
     if vision_config is None:
+        return
+
+    if post_capture_kv_sizing_planned(server_args):
+        # Post-capture sizing measures real free memory after graph capture, so
+        # reserve a fixed 8 GiB for VLM runtime allocations instead of the
+        # capacity-scaled heuristic below.
+        if gpu_mem is None:
+            return
+        declare_resolution(
+            server_args,
+            "adjust_mem_fraction_for_vlm",
+            mem_fraction_static=round(
+                cfg.mem_fraction_static - 8 * 1024 / gpu_mem, 3
+            ),
+        )
         return
 
     # roughly reduce the mem_fraction_static base on params of Vit
