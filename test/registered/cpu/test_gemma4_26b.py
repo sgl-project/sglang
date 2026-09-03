@@ -51,8 +51,11 @@ class TestGemma4_26BCPU(unittest.TestCase):
                 batch_sizes=[16],
                 input_lens=(1024,),
                 output_lens=(1024,),
-                baseline_ftl_s=1.2,
-                baseline_itl_ms=45.0,
+                # Re-baselined for tp=2 on GNR (the model's 16 heads are not
+                # divisible by 6). Measured FTL ~3.4s / ITL ~110ms; margins
+                # added. The original 1.2s/45ms targets assumed a higher tp.
+                baseline_ftl_s=4.5,
+                baseline_itl_ms=130.0,
                 include_latency_breakdown=True,
             ),
             share_server=True,
