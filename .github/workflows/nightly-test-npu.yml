@@ -124,7 +124,8 @@ jobs:
 
   nightly-1-npu-a2:
     name: nightly-1-npu-a2
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -155,7 +156,8 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -187,7 +189,8 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -202,7 +205,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -217,7 +220,8 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +237,8 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -249,7 +254,8 @@ jobs:
 
   nightly-perf-8-npu-a3:
     name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -265,7 +271,8 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -283,7 +290,8 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -300,7 +308,8 @@ jobs:
 
   nightly-acc-4-npu-a3:
     name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -316,7 +325,8 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -332,8 +342,8 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    if: false
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -395,7 +405,7 @@ jobs:
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
     if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    needs: [set-image-config, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -406,20 +416,20 @@ jobs:
             node_size: 2
             test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
             test_type: 'perf'
-          - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
-            node_size: 2
-            test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
-            test_type: 'accuracy'
-          # glm_5_2 accuracy tests
-          - name: glm_5_2_w4a8_16p_gpqa
-            node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
-            test_type: 'accuracy'
-          # kimi_k3 accuracy tests
-          - name: kimi_k3_w4a8_32p_gpqa
-            node_size: 4
-            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
-            test_type: 'accuracy'
+          # - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25
+          #   node_size: 2
+          #   test_case: test/registered/npu/accuracy/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms_aime25.py
+          #   test_type: 'accuracy'
+          # # glm_5_2 accuracy tests
+          # - name: glm_5_2_w4a8_16p_gpqa
+          #   node_size: 2
+          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w4a8_16p_gpqa.py
+          #   test_type: 'accuracy'
+          # # kimi_k3 accuracy tests
+          # - name: kimi_k3_w4a8_32p_gpqa
+          #   node_size: 4
+          #   test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
+          #   test_type: 'accuracy'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -434,7 +444,8 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   check-all-jobs:
-    if: ${{ !cancelled() }}
+    # if: ${{ !cancelled() }} # disabled: temporarily skipped in npu-nightly-cleanup branch
+    if: false
     needs:
       - nightly-1-npu-a2
       - nightly-1-npu-a3

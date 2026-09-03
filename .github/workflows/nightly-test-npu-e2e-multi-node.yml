@@ -79,7 +79,8 @@ jobs:
         KUBECONFIG: /root/.cache/.cache/kb.yaml
         KUBECTL: /root/.cache/.cache/kubectl
         NAMESPACE: sgl-project
-        KUBE_JOB_NAME: ascend-sglang-test-${{ github.run_id }}
+        KUBE_JOB_NAME: asc-${{ inputs.test_type }}-${{ github.run_id }}-${{ github.run_attempt }}
+        SGLANG_SOURCE_RELATIVE_PATH: tests/sglang-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.test_config_name }}
         SGLANG_IS_IN_CI: true
         ASCEND_E2E_TEST_CONFIG_PATH: python/sglang/test/ascend/e2e
         SGLANG_USE_MODELSCOPE: true
@@ -100,38 +101,52 @@ jobs:
 
       - name: Prepare code for testing
         run: |
-          # copy source code to shared-disk
-          # Append run_id to isolate concurrent runs sharing the same PVC.
+          # copy source code to shared-disk; unique per run+attempt+test config so parallel jobs don't overwrite each other
           current_path=$(pwd)
-          target_path=/root/.cache/tests/sglang-${{ github.run_id }}
+          target_path=/root/.cache/${SGLANG_SOURCE_RELATIVE_PATH}
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
 
       - name: Clear resources
+        timeout-minutes: 10
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
+
+          # Probe and force-delete within $NAMESPACE; at most 10 retries (~5 min) to avoid an infinite loop
+          max_retry=10
+          for i in $(seq 1 ${max_retry}); do
+            if kubectl get po -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds... (attempt ${i}/${max_retry})"
+              echo "Matching pods before deletion:"
+              kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" || true
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE --force --grace-period=0 || true
             else
               echo "No sglang job exist, start test case..."
               break
             fi
           done
 
+          # Fallback: force-delete leftovers and clear finalizers to avoid polluting later runs
+          remaining=$(kubectl get po -n $NAMESPACE 2>/dev/null | grep "${pod_name_prefix}" | awk '{print $1}')
+          if [ -n "${remaining}" ]; then
+            echo "WARNING: pods still remain after ${max_retry} retries, force delete with finalizer cleanup:"
+            echo "Remaining pods:"
+            kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" || true
+            echo "${remaining}" | xargs kubectl delete pod -n $NAMESPACE --force --grace-period=0 || true
+            echo "${remaining}" | xargs kubectl patch pod -n $NAMESPACE -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+          fi
+
       - name: Run test
         timeout-minutes: 300
         run: |
-          # sglang_source_relative_path is shared-disk path
-          # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
-          sglang_source_relative_path=tests/sglang-${{ github.run_id }}
+          # sglang_source_relative_path is shared-disk path; unique per run+attempt+test config
+          sglang_source_relative_path=${SGLANG_SOURCE_RELATIVE_PATH}
           sglang_source_path=/root/.cache/${sglang_source_relative_path}
           echo "Source code path: ${sglang_source_path}"
 
@@ -235,22 +250,38 @@ jobs:
 
       - name: Post process
         if: always()
+        timeout-minutes: 10
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
+          kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME || true
           kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
+
+          # Probe and force-delete within $NAMESPACE; at most 10 retries (~5 min) to avoid an infinite loop
+          max_retry=10
+          for i in $(seq 1 ${max_retry}); do
+            if kubectl get po -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds... (attempt ${i}/${max_retry})"
+              echo "Matching pods before deletion:"
+              kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" || true
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+              kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE --force --grace-period=0 || true
             else
-              echo "No sglang job exist, start test case..."
+              echo "No sglang job exist, cleanup done."
               break
             fi
           done
+          # Fallback: force-delete leftovers and clear finalizers
+          remaining=$(kubectl get po -n $NAMESPACE 2>/dev/null | grep "${pod_name_prefix}" | awk '{print $1}')
+          if [ -n "${remaining}" ]; then
+            echo "WARNING: pods still remain after ${max_retry} retries, force delete with finalizer cleanup:"
+            echo "Remaining pods:"
+            kubectl get po -n $NAMESPACE | grep "${pod_name_prefix}" || true
+            echo "${remaining}" | xargs kubectl delete pod -n $NAMESPACE --force --grace-period=0 || true
+            echo "${remaining}" | xargs kubectl patch pod -n $NAMESPACE -p '{"metadata":{"finalizers":[]}}' --type=merge || true
+          fi
+
           # Cleanup the run-scoped source code directory on the shared PVC.
-          rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true
+          rm -rf /root/.cache/${SGLANG_SOURCE_RELATIVE_PATH} || true
