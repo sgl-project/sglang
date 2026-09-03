@@ -1292,7 +1292,9 @@ def test_swa_straddling_insert_crosses_the_boundary_actions():
     assert free_tail.indices[0].tolist() == [12, 13]
     assert isinstance(rebuild, SWARebuild)
     assert rebuild.source_value.tolist() == [22, 23]
-    assert isinstance(free_duplicates, FreeDeviceKV)
+    # Below the floor the duplicate's SWA peers are gone: full side only.
+    assert isinstance(free_duplicates, FreeDeviceKVFullOnly)
+    assert free_duplicates.indices[0].tolist() == [20, 21]
 
 
 def test_every_pool_name_crosses_the_prefetch_commit_boundary():

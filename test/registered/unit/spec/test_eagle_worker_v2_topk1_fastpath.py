@@ -17,9 +17,6 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-    EAGLEDraftExtendCudaGraphRunner,
-)
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import (
     EagleDraftWorker,
@@ -179,7 +176,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         self.assertIs(stored_hidden_states, hidden_states)
         self.assertEqual(stored_hidden_states.shape, (6, 4))
 
-    def test_draft_extend_pruning_and_graph_row_count_gates(self):
+    def test_draft_extend_pruning_gates_eager_rocm_only(self):
         with patch(
             "sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner._is_hip",
             True,
@@ -204,14 +201,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             return_value=False,
         ):
             self.assertFalse(_prune_draft_extend_logits())
-
-        runner = EAGLEDraftExtendCudaGraphRunner.__new__(
-            EAGLEDraftExtendCudaGraphRunner
-        )
-        runner.prune_draft_extend_logits = True
-        self.assertEqual(runner._num_logit_rows(batch_size=3, num_tokens=12), 3)
-        runner.prune_draft_extend_logits = False
-        self.assertEqual(runner._num_logit_rows(batch_size=3, num_tokens=12), 12)
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
