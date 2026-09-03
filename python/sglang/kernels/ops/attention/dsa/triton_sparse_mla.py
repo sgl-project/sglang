@@ -2,9 +2,16 @@
 
 A per-query flash-attention kernel over the indexer-selected topk KV. On
 gfx950 this is ~1.6x faster than the TileLang partial+combine kernel for the
-prefill regime (n_groups=1): the attention tile is tiny (M=16 heads = one
-16x16 MFMA), so a small-warp per-program kernel avoids the intra-block
-coordination overhead of the 256-thread TileLang block.
+prefill regime (n_groups=1): the attention tile is tiny (up to 16 heads,
+padded to one 16x16 MFMA), so a small-warp per-program kernel avoids the
+intra-block coordination overhead of the 256-thread TileLang block.
+
+The head padding is here because tl.dot needs a 16-row tile on this path. A
+Gluon kernel can run BLOCK_M below 16 natively instead -- see ROCm/aiter#4919,
+which adds a gfx950 sparse-MLA covering the same GLM-5 prefill shapes -- so if
+this path ever dispatches there, the padding becomes redundant rather than
+wrong. It is not urgent: measured at H=4/8/12 the padded rows add no KV traffic
+and cost nothing, because the kernel is selected-KV bandwidth bound.
 """
 
 import torch
@@ -51,6 +58,7 @@ def _sparse_mla_fwd_kernel(
     fp8_max,
     topk,
     H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     DIM: tl.constexpr,
     D_V: tl.constexpr,
     D_TAIL: tl.constexpr,
@@ -58,22 +66,27 @@ def _sparse_mla_fwd_kernel(
 ):
     s_i = tl.program_id(0)
 
-    h = tl.arange(0, H)
+    h = tl.arange(0, BLOCK_H)
+    hmask = h < H
     dv = tl.arange(0, D_V)
     dt = tl.arange(0, D_TAIL)
     # q is read as two separate tensors (q_nope width D_V, q_rope width D_TAIL):
     # the upstream concat into a single [.., DIM] tensor is skipped since this
     # kernel splits q into main/tail anyway.
-    q_main = tl.load(q_nope_ptr + s_i * H * D_V + h[:, None] * D_V + dv[None, :]).to(
-        q_nope_ptr.dtype.element_ty
-    )  # [H, D_V]
+    q_main = tl.load(
+        q_nope_ptr + s_i * H * D_V + h[:, None] * D_V + dv[None, :],
+        mask=hmask[:, None],
+        other=0.0,
+    ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_H, D_V]
     q_tail = tl.load(
-        q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
-    ).to(q_nope_ptr.dtype.element_ty)  # [H, D_TAIL]
+        q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :],
+        mask=hmask[:, None],
+        other=0.0,
+    ).to(q_nope_ptr.dtype.element_ty)  # [BLOCK_H, D_TAIL]
 
-    m_i = tl.full([H], -float("inf"), tl.float32)
-    l_i = tl.zeros([H], tl.float32)
-    acc = tl.zeros([H, D_V], tl.float32)
+    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_H, D_V], tl.float32)
 
     n = tl.arange(0, BLOCK_N)
     for k0 in range(0, topk, BLOCK_N):
@@ -92,7 +105,7 @@ def _sparse_mla_fwd_kernel(
         qk = tl.dot(q_main, tl.trans(kv_main)).to(tl.float32)
         qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)
         qk = qk * sm_scale
-        qk = tl.where(valid[None, :], qk, -float("inf"))
+        qk = tl.where(hmask[:, None] & valid[None, :], qk, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, axis=1))
         # Guard an all-masked row (m_new == -inf): shift by 0 instead so that
@@ -113,6 +126,7 @@ def _sparse_mla_fwd_kernel(
     tl.store(
         o_ptr + s_i * H * D_V + h[:, None] * D_V + dv[None, :],
         acc.to(o_ptr.dtype.element_ty),
+        mask=hmask[:, None],
     )
 
 
@@ -149,6 +163,7 @@ def triton_sparse_mla_fwd(
         _FP8_MAX,
         topk,
         H=H,
+        BLOCK_H=max(16, triton.next_power_of_2(H)),
         DIM=dim,
         D_V=d_v,
         D_TAIL=d_tail,
