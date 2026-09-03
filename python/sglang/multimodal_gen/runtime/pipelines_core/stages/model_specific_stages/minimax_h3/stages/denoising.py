@@ -741,6 +741,14 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 server_args=server_args,
                 device=device,
             )
+            if build_vsa_h3_step_metadata is None:
+                build_vsa_h3_step_metadata = _maybe_prepare_hybrid_h3_metadata(
+                    model=model,
+                    packed=packed,
+                    ctx=ctx,
+                    server_args=server_args,
+                    device=device,
+                )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
@@ -1043,6 +1051,101 @@ def _maybe_prepare_vsa_h3_step_metadata(
             dense_layers=dense_layers,
             dense_first_n_steps=dense_first_n_steps,
         )
+
+    return build
+
+
+def _maybe_prepare_hybrid_h3_metadata(
+    *,
+    model: Any,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Request-static VDN-H3 hybrid attention metadata (window plan, packed
+    layout, full-sequence RoPE cache under Ulysses), or None off that path.
+
+    Unlike VSA-H3's per-step top-k, the chunk window and anchors depend only
+    on the packed layout, so one metadata object serves every step.
+    """
+    model._resolve_attention_backend_once()
+    if (
+        model._resolved_attention_backend
+        is not AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+    ):
+        return None
+    hybrid = getattr(model.arch, "hybrid_attention", None)
+    if hybrid is None:
+        raise ValueError(
+            "--attention-backend hybrid_window_attn_h3 needs a VDN-H3 checkpoint "
+            "(transformer/config.json with hybrid_attention); this checkpoint has "
+            "no linear branch. Use --attention-backend fa for MiniMax-H3."
+        )
+    if ctx.is_ref2va or ctx.include_cond:
+        raise NotImplementedError(
+            "VDN-H3 is trained for the t2va packed layout; condition rows "
+            "(fl2va keyframes, ref2va references) are not supported."
+        )
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_ring_ctx,
+        get_ulysses_ctx,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
+        HybridWindowAttentionH3MetadataBuilder,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _rope_cos_sin_cache,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
+        vdn_h3_layout_from_packed,
+    )
+
+    config = server_args.attention_backend_config or {}
+    kernel = str(config.get("vdn_window_kernel", "decomposed"))
+    layout = vdn_h3_layout_from_packed(
+        packed, latent_t=ctx.latent_t, latent_h=ctx.latent_h, latent_w=ctx.latent_w
+    )
+    rope_cache_full = None
+    ulysses_ws, _ = get_ulysses_ctx()
+    ring_ws, _ = get_ring_ctx()
+    if ring_ws > 1:
+        raise ValueError("VDN-H3 does not support ring parallelism")
+    if ulysses_ws > 1:
+        # QK-norm + RoPE run after the Ulysses all-to-all on the head shard
+        # over the full sequence, so every rank needs the whole cache.
+        with torch.inference_mode():
+            img_position_ids = packed["img_position_ids"][None].to(torch.float32)
+            rope_freqs = model.rope(img_position_ids).to(device)
+            rope_cache_full = (
+                _rope_cos_sin_cache(rope_freqs, dtype=torch.bfloat16),
+                torch.arange(layout.seq_len, device=device, dtype=torch.long),
+            )
+    metadata = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout,
+        hybrid=hybrid,
+        device=device,
+        kernel=kernel,
+        rope_cache_full=rope_cache_full,
+    )
+    logger.info(
+        "VDN-H3 hybrid attention: kernel=%s frames=%d tokens/frame=%d text=%d "
+        "used=%d/%d chunk=%d radius=%d anchors=%s full_cover=%s",
+        kernel,
+        layout.num_frames,
+        layout.tokens_per_frame,
+        layout.text_len,
+        layout.used,
+        layout.seq_len,
+        hybrid.chunk,
+        hybrid.radius,
+        hybrid.anchor_frames,
+        metadata.full_cover,
+    )
+
+    def build(step_index: int):
+        return metadata
 
     return build
 

@@ -79,6 +79,10 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
+    MiniMaxH3VDNLinearBranch,
+    VDNSoftmaxGate,
+)
 from sglang.multimodal_gen.runtime.models.parameter import BlockQuantScaleParameter
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -730,7 +734,168 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
+def _minimax_h3_hybrid_attention_core_impl(
+    attention: MiniMaxH3Attention,
+    x: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_gate: torch.Tensor | None,
+    beta: torch.Tensor,
+    linear_gate: torch.Tensor,
+    *,
+    rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+    ulysses_active: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """VDN-H3 hybrid attention core: window softmax + linear branch.
+
+    Takes the RAW (pre-QK-norm, pre-RoPE) q/k/v because the linear branch
+    consumes them NoPE; QK-norm + RoPE run here, out of place, on the softmax
+    branch's copies. Under Ulysses one packed all-to-all moves raw q/k/v,
+    then norm + RoPE apply on the head shard over the full sequence with the
+    request's full-sequence RoPE cache (metadata); beta / gates travel by
+    head, the frame mean is one all-reduce of partial sums. The branch is
+    per-head independent given (beta, gate, alpha), so head sharding is
+    exact. Returns (gated softmax output [T_local, H, d], linear readout
+    [T_local, H * d] or None when the window covers the whole clip).
+    """
+    from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
+        HybridWindowAttentionH3Metadata,
+    )
+
+    meta = get_forward_context().attn_metadata
+    if not isinstance(meta, HybridWindowAttentionH3Metadata):
+        raise RuntimeError(
+            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
+            "forward context; the MiniMax-H3 denoising stage installs it per request "
+            f"(got {type(meta).__name__})."
+        )
+    layout = meta.layout
+    video_start, video_end = layout.video_start, layout.video_end
+    num_frames, tokens_per_frame = layout.num_frames, layout.tokens_per_frame
+    text_len = layout.text_len
+    branch = attention.linear_attention
+    hidden = x.shape[-1]
+
+    if ulysses_active:
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_group,
+        )
+        from sglang.multimodal_gen.runtime.layers.usp import (
+            _usp_input_all_to_all,
+            _usp_input_all_to_all_packed_qkv,
+            _usp_output_all_to_all,
+        )
+
+        ulysses_ws, ulysses_rank = get_ulysses_ctx()
+        local_rows = x.shape[0]
+        row_start = ulysses_rank * local_rows
+        # per-frame partial sums of this rank's video rows, reduced over SP
+        frame_sums = torch.zeros(num_frames, hidden, dtype=_FP32_DTYPE, device=x.device)
+        lo = max(row_start, video_start)
+        hi = min(row_start + local_rows, video_end)
+        if lo < hi:
+            frame_index = (
+                torch.arange(lo, hi, device=x.device) - video_start
+            ) // tokens_per_frame
+            frame_sums.index_add_(
+                0, frame_index, x[lo - row_start : hi - row_start].to(_FP32_DTYPE)
+            )
+        frame_mean = get_sp_group().all_reduce(frame_sums) / tokens_per_frame
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        beta = _usp_input_all_to_all(beta[None, :, :, None], head_dim=2)[0, :, :, 0]
+        linear_gate = _usp_input_all_to_all(linear_gate[None], head_dim=2)[0]
+        if softmax_gate is not None:
+            softmax_gate = _usp_input_all_to_all(
+                softmax_gate[None, :, :, None], head_dim=2
+            )[0, :, :, 0]
+        if meta.rope_cache_full is None:
+            raise RuntimeError(
+                "VDN-H3 under Ulysses needs the full-sequence RoPE cache in the "
+                "attention metadata"
+            )
+        cos_sin_cache, positions = meta.rope_cache_full
+    else:
+        frame_mean = (
+            x[video_start:video_end]
+            .view(num_frames, tokens_per_frame, hidden)
+            .mean(dim=1, dtype=_FP32_DTYPE)
+        )
+        if rope_cache is None:
+            raise RuntimeError("VDN-H3 hybrid attention requires the RoPE cache")
+        cos_sin_cache, positions = rope_cache
+
+    # QK-norm + RoPE out of place: the branch keeps reading the raw q/k.
+    q_sm = q.clone()
+    k_sm = k.clone()
+    if attention._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+        fused_inplace_qknorm_rope(
+            q_sm,
+            k_sm,
+            attention.q_norm.weight,
+            attention.k_norm.weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=attention.q_norm.eps,
+            head_dim=attention.head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+    else:
+        q_sm, k_sm = _apply_qk_norm(
+            q_sm, k_sm, attention.q_norm, attention.k_norm, attention.head_dim
+        )
+        q_sm, k_sm = _apply_rope_qk(q_sm, k_sm, cos_sin_cache, positions)
+
+    softmax_out = attention._attention_impl.forward_varlen(
+        q_sm,
+        k_sm,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
+        cu_seqlens_host=cu_seqlens_host,
+        attn_metadata=meta,
+        softmax_gate=softmax_gate,
+    )
+    del q_sm, k_sm
+
+    linear_out = None
+    if not meta.full_cover:
+        readout = branch(
+            q_raw=q[video_start:video_end],
+            k_raw=k[video_start:video_end],
+            v_raw=v[video_start:video_end],
+            beta=beta[video_start:video_end],
+            gate=linear_gate[video_start:video_end],
+            frame_mean=frame_mean,
+            layout=layout,
+            text_k_raw=k[:text_len],
+            text_v_raw=v[:text_len],
+            text_beta=beta[:text_len],
+        )
+        linear_out = q.new_zeros(q.shape[0], readout.shape[-1])
+        linear_out[video_start:video_end] = readout
+        del readout
+
+    if ulysses_active:
+        softmax_out = _usp_output_all_to_all(softmax_out[None], head_dim=2)[0]
+        if linear_out is not None:
+            linear_out = _usp_output_all_to_all(
+                linear_out.view(1, linear_out.shape[0], q.shape[1], q.shape[2]),
+                head_dim=2,
+            )[0]
+            linear_out = linear_out.reshape(linear_out.shape[0], -1)
+    return softmax_out, linear_out
+
+
 _minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+_minimax_h3_hybrid_attention_core_bcg = eager_on_graph(True)(
+    _minimax_h3_hybrid_attention_core_impl
+)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -827,6 +992,36 @@ class MiniMaxH3Attention(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.to_gate_compress",
             )
+        # VDN-H3 hybrid attention: per-head softmax gate, the linear branch
+        # and its own output projection. Only DiT blocks convert; the token
+        # refiner keeps dense attention (VDN converts transformer_blocks only).
+        self.hybrid = arch.hybrid_attention if prefix.startswith("blocks.") else None
+        self.softmax_gate: VDNSoftmaxGate | None = None
+        self.linear_attention: MiniMaxH3VDNLinearBranch | None = None
+        self.to_out_linear: RowParallelLinear | None = None
+        if self.hybrid is not None:
+            if self.hybrid.enable_softmax_gate:
+                self.softmax_gate = VDNSoftmaxGate(arch.hidden_size, self.num_heads)
+            self.linear_attention = MiniMaxH3VDNLinearBranch(
+                arch, self.hybrid, local_heads=self.num_heads
+            )
+            self.to_out_linear = RowParallelLinear(
+                self.inner_dim,
+                arch.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+                params_dtype=_BF16_DTYPE,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_out_linear",
+            )
+
+    @property
+    def hybrid_active(self) -> bool:
+        return (
+            self.hybrid is not None
+            and self._attention_backend_enum
+            is AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
+        )
 
     def _set_attention_backend(self, backend) -> None:
         if (
@@ -1058,6 +1253,22 @@ class MiniMaxH3Attention(nn.Module):
         q = q.view(total, self.num_heads, self.head_dim)
         k = k.view(total, self.num_heads, self.head_dim)
         v = v.view(total, self.num_heads, self.head_dim)
+        if self.hybrid_active:
+            if ring_active:
+                raise NotImplementedError(
+                    "VDN-H3 hybrid attention does not support ring parallelism"
+                )
+            return self._forward_hybrid(
+                x,
+                q,
+                k,
+                v,
+                rope_cache=rope_cache,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_host=cu_seqlens_host,
+                max_seqlen=max_seqlen,
+                ulysses_active=ulysses_active,
+            )
         if rope_cache is None:
             q, k = _apply_qk_norm(
                 q,
@@ -1120,6 +1331,57 @@ class MiniMaxH3Attention(nn.Module):
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
+        return out
+
+
+    def _forward_hybrid(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_host: tuple[int, ...] | None,
+        max_seqlen: int,
+        ulysses_active: bool,
+    ) -> torch.Tensor:
+        """VDN-H3: out = to_out(gate_sm * window_softmax) + to_out_linear(linear).
+
+        Everything computed from x here (gates, beta) is row-local, so it runs
+        on this rank's row shard before the core exchanges rows for heads.
+        """
+        total = x.shape[0]
+        assert self.linear_attention is not None
+        softmax_gate = self.softmax_gate(x) if self.softmax_gate is not None else None
+        beta = self.linear_attention.beta(x)
+        linear_gate = self.linear_attention.gate(x)
+        attention_core = (
+            _minimax_h3_hybrid_attention_core_bcg
+            if self.bcg_breakpoint
+            else _minimax_h3_hybrid_attention_core_impl
+        )
+        softmax_out, linear_out = attention_core(
+            self,
+            x,
+            q,
+            k,
+            v,
+            softmax_gate,
+            beta,
+            linear_gate,
+            rope_cache=rope_cache,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+        )
+        out, _ = self.out_proj(softmax_out.reshape(total, self.num_heads * self.head_dim))
+        if linear_out is not None:
+            assert self.to_out_linear is not None
+            far, _ = self.to_out_linear(linear_out)
+            out.add_(far)
         return out
 
 
