@@ -1083,7 +1083,7 @@ class SchedulerDisaggMixin:
         )
         use_prefetch = self._compute_ready_queue is not None
         logger.info(
-            "Pool mode %s rank %d event loop started " "(multi_rank=%s, prefetch=%s)",
+            "Pool mode %s rank %d event loop started (multi_rank=%s, prefetch=%s)",
             role_name,
             self.gpu_id,
             is_multi_rank,

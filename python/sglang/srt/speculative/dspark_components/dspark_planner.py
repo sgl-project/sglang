@@ -260,9 +260,9 @@ class DSparkVerifyPlanner:
             return None
         compute_confidence_hook = getattr(self.draft_model, "compute_confidence", None)
         if compute_confidence_hook is not None:
-            assert (
-                confidence_tap is not None
-            ), "dsv4 compute_confidence needs the compute_base_logits tap"
+            assert confidence_tap is not None, (
+                "dsv4 compute_confidence needs the compute_base_logits tap"
+            )
             with torch.inference_mode():
                 return compute_confidence_hook(
                     anchor_tokens=anchor_tokens,
@@ -1001,7 +1001,6 @@ def _additive_step_time_tensor(
 
 
 class HostConfidenceBudgetPlanner:
-
     def __init__(
         self,
         *,
