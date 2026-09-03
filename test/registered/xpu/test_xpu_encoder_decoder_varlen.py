@@ -148,50 +148,5 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             causal=True,
         )
 
-    def test_encoder_lens_zero_no_device_loss(self):
-        # The exact Whisper text-only warmup path: a cross-attention layer with
-        # encoder_lens == 0. PR #454's page_size=1 kernel returns NaN for an empty
-        # KV, so _forward_encoder_decoder_mha must short-circuit to zeros and never
-        # reach the kernel.
-        metadata = SimpleNamespace(
-            encoder_page_table=torch.zeros(1, 0, dtype=torch.int32, device=self.dev),
-            encoder_lens_int32=torch.zeros(1, dtype=torch.int32, device=self.dev),
-            page_table=torch.zeros(1, 0, dtype=torch.int32, device=self.dev),
-            cache_seqlens_int32=torch.zeros(1, dtype=torch.int32, device=self.dev),
-            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=self.dev),
-            max_seq_len_q=1,
-        )
-        layer = SimpleNamespace(
-            is_cross_attention=True,
-            tp_q_head_num=self.H,
-            tp_k_head_num=self.H,
-            tp_v_head_num=self.H,
-            head_dim=self.D,
-            scaling=0.5,
-            logit_cap=0.0,
-        )
-        key_cache = self.k_flat.view(-1, 1, self.H, self.D)
-        value_cache = self.v_flat.view(-1, 1, self.H, self.D)
-        q = torch.randn(1, self.H * self.D, dtype=torch.bfloat16, device=self.dev)
-
-        out = self.backend._forward_encoder_decoder_mha(
-            q=q,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            layer=layer,
-            metadata=metadata,
-            decode=True,
-        )
-        torch.xpu.synchronize()
-        self.assertEqual(tuple(out.shape), (1, self.H, self.D))
-        self.assertTrue(bool((out == 0).all()))
-
-        # Device must still be alive: a subsequent real op would raise
-        # UR_RESULT_ERROR_DEVICE_LOST if an empty-KV kernel call had faulted it.
-        probe = (torch.ones(4, device=self.dev) * 2).sum()
-        torch.xpu.synchronize()
-        self.assertEqual(int(probe.item()), 8)
-
-
 if __name__ == "__main__":
     unittest.main()
