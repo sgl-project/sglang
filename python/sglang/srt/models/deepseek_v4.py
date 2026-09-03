@@ -1466,9 +1466,10 @@ class MQALayer(MqaAttentionBase):
                 # it. The backend stores them after attention from the pair.
                 swa_cache, swa_loc = None, None
                 swa_page_size, bf16_store = 1, False
-                # kv is a strided slice of qkv_a; the kernel has no stride
-                # arguments, same copy the arms around this one pay.
-                kv = kv.contiguous()
+                # kv stays the strided slice of qkv_a. Under fp8 the kernel only
+                # reads it -- the packed pair goes to k_nope_out/k_rope_out, it
+                # does not norm in place -- and it takes the row stride as an
+                # argument, so materialising it was a copy on every fp8 layer.
             elif unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
