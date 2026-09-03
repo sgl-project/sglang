@@ -298,6 +298,7 @@ class DSAMockModelRunner(ModelRunner):
         self.prefill_attention_backend_str = case.backend
         self.decode_attention_backend_str = case.backend
         self.draft_attention_backend = None
+        self.is_draft_worker = False
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
@@ -403,6 +404,7 @@ class DSAMockModelRunner(ModelRunner):
             kv_cache_dim=pool_kv_cache_dim,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
@@ -1454,8 +1456,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,

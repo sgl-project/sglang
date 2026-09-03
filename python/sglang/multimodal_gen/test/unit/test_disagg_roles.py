@@ -520,7 +520,8 @@ class TestImageVAEEncodingStageComponentName(_GlobalStageArgsMixin, unittest.Tes
     def test_component_name_can_follow_non_default_vae_key(self):
         stage = ImageVAEEncodingStage(vae=object(), component_name="video_vae")
         server_args = SimpleNamespace(
-            pipeline_config=SimpleNamespace(vae_precision="bf16")
+            component_precisions={},
+            pipeline_config=SimpleNamespace(vae_precision="bf16"),
         )
 
         uses = stage.component_uses(server_args, "image_vae_encoding")
