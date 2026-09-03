@@ -114,7 +114,6 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         self.assertIs(result.cache_controller, cache_controller)
         self.assertIs(result.component_host_pools[FULL], kv_host_pool)
         self.assertEqual(result.pools_desc, "KV + INDEXER(k-only)")
-        self.assertEqual(result.transfer_layer_num, 8)
         self.assertEqual(len(result.sidecars), 1)
         self.assertEqual(result.sidecars[0].pool_name, PoolName.INDEXER)
         self.assertEqual(result.sidecars[0].indices_from_pool, PoolName.KV)
@@ -187,7 +186,6 @@ class TestApplyStackResult(unittest.TestCase):
             component_host_pools={FULL: full_host, SWA: swa_host, MAMBA: mamba_host},
             sidecars=[sidecar],
             register_req_to_token_counter=True,
-            transfer_layer_num=8,
             pools_desc="KV + SWA + MAMBA",
         )
 
@@ -219,7 +217,6 @@ class TestApplyStackResult(unittest.TestCase):
             component_host_pools={FULL: MagicMock()},
             sidecars=[],
             register_req_to_token_counter=False,
-            transfer_layer_num=1,
             pools_desc="KV",
         )
 
