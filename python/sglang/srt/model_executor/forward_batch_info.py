@@ -1420,9 +1420,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # branch handles decode rows padded to a 1-token extend.
                 if hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
+                    assert self.seq_lens.shape[0] == 0, (
+                        "extend-idle conversion expects an empty rank"
+                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev

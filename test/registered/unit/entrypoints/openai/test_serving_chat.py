@@ -39,6 +39,9 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.jinja_template_utils import (
+    jinja_template_may_reorder_tool_results,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,6 +82,24 @@ _DSV4_OFFICIAL_ENCODER = (
     '{"low": "", "high": "h", "max": "m"}\n'
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
+
+_TOOL_RESULT_REORDER_TEMPLATE = """
+{%- for assistant in messages
+    if assistant.role == 'assistant' and assistant.tool_calls -%}
+    {%- for tool_call in assistant.tool_calls -%}
+        {%- for result in messages
+            if result.role == 'tool' and result.tool_call_id == tool_call.id -%}
+            {%- for part in result.content -%}
+                {%- if part.type == 'text' -%}
+                    {{- part.text -}}
+                {%- else -%}
+                    {{- '<' + part.type + '>' -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- endfor -%}
+{%- endfor -%}
+"""
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
@@ -163,6 +184,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -191,6 +213,166 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _render_tool_results_in_call_order(messages, **kwargs):
+        """Block-level tool_call_id association, like the GLM chat templates."""
+        del kwargs
+        rendered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            index += 1
+            tool_calls = message.get("tool_calls") or []
+            if message.get("role") != "assistant" or not tool_calls:
+                continue
+            run = []
+            while index < len(messages) and messages[index].get("role") == "tool":
+                run.append(messages[index])
+                index += 1
+            by_id = {result.get("tool_call_id"): result for result in run}
+            for tool_call in tool_calls:
+                result = by_id.get(tool_call.get("id"))
+                if result is None:
+                    continue
+                for part in result.get("content") or []:
+                    if part.get("type") == "text":
+                        rendered.append(part.get("text", ""))
+                    else:
+                        rendered.append(f"<{part.get('type')}>")
+        return "".join(rendered)
+
+    @staticmethod
+    def _tool_round(call_ids, result_ids, part_type="image_url"):
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": call_id, "function": {"name": call_id, "arguments": {}}}
+                for call_id in call_ids
+            ],
+        }
+        part_key = {"image_url": "image_url", "video_url": "video_url"}[part_type]
+        results = [
+            {
+                "role": "tool",
+                "tool_call_id": result_id,
+                "content": [{"type": part_type, part_key: {"url": result_id}}],
+            }
+            for result_id in result_ids
+        ]
+        return [assistant] + results
+
+    def test_canonicalize_tool_message_order_sorts_media_runs(self):
+        messages = self._tool_round(
+            ["call-a", "call-b"], ["call-b", "call-a"]
+        ) + self._tool_round(["call-c", "call-d"], ["call-d", "call-c"], "video_url")
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(
+            [
+                message["tool_call_id"]
+                for message in canonical
+                if message.get("role") == "tool"
+            ],
+            ["call-a", "call-b", "call-c", "call-d"],
+        )
+
+    def test_canonicalize_tool_message_order_keeps_unassociable_runs(self):
+        cases = {
+            "unknown_id": (["call-a", "call-b"], ["call-b", "call-z"]),
+            "duplicate_result_id": (["call-a", "call-b"], ["call-b", "call-b"]),
+            "missing_call_id": ([None, "call-b"], ["call-b", None]),
+        }
+        for name, (call_ids, result_ids) in cases.items():
+            with self.subTest(name=name):
+                messages = self._tool_round(call_ids, result_ids)
+                canonical = self.chat._canonicalize_tool_message_order(messages)
+                self.assertEqual(canonical, messages)
+
+    def test_canonicalize_tool_message_order_keeps_text_only_runs(self):
+        messages = self._tool_round(["call-a", "call-b"], ["call-b", "call-a"])
+        for message in messages[1:]:
+            message["content"] = [{"type": "text", "text": "done"}]
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(canonical, messages)
+
+    def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.template_manager.jinja_template_may_reorder_tool_results = (
+            jinja_template_may_reorder_tool_results(_TOOL_RESULT_REORDER_TEMPLATE)
+        )
+        self.assertTrue(self.template_manager.jinja_template_may_reorder_tool_results)
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            self._render_tool_results_in_call_order
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {"name": "a", "arguments": {}},
+                        },
+                        {
+                            "id": "call-b",
+                            "type": "function",
+                            "function": {"name": "b", "arguments": {}},
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-b",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-b"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-a"}}],
+                },
+            ],
+        )
+
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-a", "image-b"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+        rendered_messages = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(
+            [m.get("tool_call_id") for m in rendered_messages if "tool_call_id" in m],
+            ["call-a", "call-b"],
+        )
+
+        # An already-ordered request must produce the exact same render input.
+        ordered_request = ChatCompletionRequest(
+            model="x",
+            messages=request.messages[:2] + request.messages[2:][::-1],
+        )
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
+        self.assertEqual(
+            rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        )
+
+        self.template_manager.jinja_template_may_reorder_tool_results = False
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-b", "image-a"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they

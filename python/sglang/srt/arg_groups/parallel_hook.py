@@ -59,8 +59,7 @@ def handle_context_parallelism(server_args: Any):
                 and not cfg.language_model_only
             ):
                 raise ValueError(
-                    "MiMo V2 CP-v2 only supports text inference; add "
-                    "--language-only."
+                    "MiMo V2 CP-v2 only supports text inference; add --language-only."
                 )
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
@@ -81,40 +80,40 @@ def handle_context_parallelism(server_args: Any):
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert (
-            cfg.tp_size % view.attn_cp_size == 0
-        ), "tp_size must be divisible by attn_cp_size"
-        assert (
-            cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0
-        ), "tp_size must be divisible by dp_size * attn_cp_size"
+        assert cfg.tp_size % view.attn_cp_size == 0, (
+            "tp_size must be divisible by attn_cp_size"
+        )
+        assert cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0, (
+            "tp_size must be divisible by dp_size * attn_cp_size"
+        )
 
-        assert (
-            not cfg.enable_aiter_allreduce_fusion
-        ), "Aiter allreduce fusion is not supported with context parallelism"
+        assert not cfg.enable_aiter_allreduce_fusion, (
+            "Aiter allreduce fusion is not supported with context parallelism"
+        )
 
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert (
-            cfg.tp_size % cfg.moe_dp_size == 0
-        ), "tp_size must be divisible by moe_dp_size"
-        assert (
-            view.ep_size * cfg.moe_dp_size <= cfg.tp_size
-        ), "ep_size * moe_dp_size must be less than or equal to tp_size"
+        assert cfg.tp_size % cfg.moe_dp_size == 0, (
+            "tp_size must be divisible by moe_dp_size"
+        )
+        assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, (
+            "ep_size * moe_dp_size must be less than or equal to tp_size"
+        )
         assert cfg.pp_size == 1, "PP is not supported with context parallelism"
 
         if view.ep_size > 1:
-            assert (
-                view.ep_size * cfg.moe_dp_size == cfg.tp_size
-            ), "ep_size * moe_dp_size must be equal to tp_size"
+            assert view.ep_size * cfg.moe_dp_size == cfg.tp_size, (
+                "ep_size * moe_dp_size must be equal to tp_size"
+            )
 
-        assert (
-            not cfg.enable_aiter_allreduce_fusion
-        ), "Aiter allreduce fusion is not supported with context parallelism"
+        assert not cfg.enable_aiter_allreduce_fusion, (
+            "Aiter allreduce fusion is not supported with context parallelism"
+        )
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert (
-            cfg.moe_dp_size == 1
-        ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        assert cfg.moe_dp_size == 1, (
+            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+        )
 
     from sglang.srt.layers.cp.base import init_cp_strategy
 
@@ -244,26 +243,26 @@ def handle_dwdp(server_args: Any):
     if cfg.dwdp_size <= 1:
         return
 
-    assert (
-        cfg.dwdp_size >= 2
-    ), f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
-    assert (
-        cfg.dwdp_size == cfg.tp_size
-    ), f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
+    assert cfg.dwdp_size >= 2, (
+        f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
+    )
+    assert cfg.dwdp_size == cfg.tp_size, (
+        f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
+    )
     assert cfg.disaggregation_mode in (
         "null",
         "prefill",
     ), "DWDP requires --disaggregation-mode null or prefill"
-    assert (
-        not cfg.enable_eplb
-    ), "EPLB dynamic migration conflicts with static DWDP partitioning"
-    assert (
-        cfg.speculative_algorithm is None
-    ), "DWDP does not support speculative decoding (MTP/draft workers)"
+    assert not cfg.enable_eplb, (
+        "EPLB dynamic migration conflicts with static DWDP partitioning"
+    )
+    assert cfg.speculative_algorithm is None, (
+        "DWDP does not support speculative decoding (MTP/draft workers)"
+    )
     assert cfg.pp_size == 1, "DWDP requires pp_size == 1"
-    assert (
-        not cfg.enable_two_batch_overlap
-    ), "DWDP's prefetch event protocol does not support two-batch overlap"
+    assert not cfg.enable_two_batch_overlap, (
+        "DWDP's prefetch event protocol does not support two-batch overlap"
+    )
 
     if cfg.disaggregation_mode == "null":
         logger.warning(
@@ -359,7 +358,9 @@ def handle_elastic_ep(server_args: Any):
             assert cfg.eplb_algorithm in [
                 "elasticity_aware",
                 "elasticity_aware_hierarchical",
-            ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+            ], (
+                "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
+            )
 
         assert cfg.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
@@ -370,9 +371,9 @@ def handle_elastic_ep(server_args: Any):
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
     if cfg.ep_join_mode is not None:
-        assert (
-            cfg.elastic_ep_backend is not None
-        ), "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
+        assert cfg.elastic_ep_backend is not None, (
+            "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
+        )
         if cfg.ep_join_mode == "scale":
             assert cfg.node_rank == 1, (
                 "Elastic EP scale-up requires one joining TP group at "
@@ -390,9 +391,9 @@ def handle_elastic_ep(server_args: Any):
         )
         assert cfg.ep_join_rank_offset >= 0, "elastic EP join rank offset must be >= 0."
     if cfg.max_ep_size is not None:
-        assert (
-            cfg.elastic_ep_backend is not None
-        ), "--max-ep-size requires --elastic-ep-backend to be set."
+        assert cfg.elastic_ep_backend is not None, (
+            "--max-ep-size requires --elastic-ep-backend to be set."
+        )
         assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
 
     scaling_active = (
@@ -407,16 +408,15 @@ def handle_elastic_ep(server_args: Any):
         )
     if scaling_active:
         resolved = resolved_view(server_args)
-        assert (
-            cfg.elastic_ep_scale_timeout > 0
-        ), "--elastic-ep-scale-timeout must be greater than zero."
-        assert cfg.tokenizer_worker_num == 1, (
-            "Elastic EP runtime scale-up currently requires "
-            "--tokenizer-worker-num 1."
+        assert cfg.elastic_ep_scale_timeout > 0, (
+            "--elastic-ep-scale-timeout must be greater than zero."
         )
-        assert (
-            not cfg.use_ray
-        ), "Elastic EP runtime scale-up does not support --use-ray."
+        assert cfg.tokenizer_worker_num == 1, (
+            "Elastic EP runtime scale-up currently requires --tokenizer-worker-num 1."
+        )
+        assert not cfg.use_ray, (
+            "Elastic EP runtime scale-up does not support --use-ray."
+        )
         assert not cfg.enable_elastic_expert_backup, (
             "Elastic EP runtime scale-up does not support "
             "--enable-elastic-expert-backup."

@@ -35,11 +35,15 @@ from sglang.kernels.ops.diffusion import (
     QualityGatedFusion,
     can_use_ln_modulate,
     flashinfer_rmsnorm_diagnostic_hint,
+    flux2_nvfp4_swiglu_quant_active,
     fused_ln_modulate,
     fused_ln_modulate_active,
+    mark_flux2_nvfp4_swiglu_quant_site,
     mark_fused_ln_modulate_site,
+    mount_flux2_nvfp4_swiglu_quant,
     mount_fused_ln_modulate,
     tensors_equal,
+    unmount_flux2_nvfp4_swiglu_quant,
     unmount_fused_ln_modulate,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -90,6 +94,18 @@ def test_quality_gate_rejection_is_all_or_nothing():
     )
     assert not any(fusion.is_enabled(site) for site in root)
     assert not fusion.mount(nn.Module())
+
+
+def test_flux2_nvfp4_swiglu_quant_is_disabled_until_quality_gate_mounts():
+    site = nn.Module()
+    root = nn.ModuleList([site])
+    mark_flux2_nvfp4_swiglu_quant_site(site)
+
+    assert not flux2_nvfp4_swiglu_quant_active(site)
+    assert mount_flux2_nvfp4_swiglu_quant(root)
+    assert flux2_nvfp4_swiglu_quant_active(site)
+    unmount_flux2_nvfp4_swiglu_quant(root)
+    assert not flux2_nvfp4_swiglu_quant_active(site)
 
 
 def test_qwen_image_added_qkv_site_is_request_scoped():

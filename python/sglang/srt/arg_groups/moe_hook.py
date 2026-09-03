@@ -47,7 +47,9 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp8",
             "modelopt_mixed",
             None,
-        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+        ], (
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+        )
         assert view.ep_size in [
             1,
             cfg.tp_size,
@@ -58,7 +60,9 @@ def handle_moe_kernel_config(server_args: Any):
         assert (
             view.quantization in ["modelopt_fp4", "modelopt_mixed", "nvfp4_online"]
             or model_config_of(server_args).nvfp4_moe_meta is not None
-        ), f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
+        ), (
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer CuteDSL MOE currently supports only: 'modelopt_fp4', 'modelopt_mixed' (with NVFP4 MoE layers), 'nvfp4_online', or hybrid NVFP4 models."
+        )
         assert view.ep_size in [
             1,
             cfg.tp_size,
@@ -90,7 +94,9 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_mixed",
             "compressed-tensors",
             None,
-        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+        ], (
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'nvfp4_online', 'fp8', 'modelopt_fp8', 'modelopt_mixed', 'compressed-tensors', or bfloat16 (None)."
+        )
 
     if view.moe_runner_backend == "flashinfer_trtllm_routed":
         assert view.quantization in [
@@ -100,7 +106,9 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_mixed",
             "nvfp4_online",
             None,
-        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+        ], (
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+        )
 
     # The runner-driven shared-experts fusion disables moved to the
     # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
@@ -113,9 +121,9 @@ def handle_moe_kernel_config(server_args: Any):
         "fp8",
         "mxfp8",
     ]:
-        assert (
-            resolved_view(server_args).ep_size == 1
-        ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+        assert resolved_view(server_args).ep_size == 1, (
+            "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+        )
 
 
 def handle_a2a_moe(server_args: Any):
@@ -256,7 +264,9 @@ def handle_a2a_moe(server_args: Any):
         assert (
             resolved_view(server_args).enable_dp_attention
             and cfg.dp_size == cfg.tp_size
-        ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+        ), (
+            "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
+        )
         if cfg.deepep_mode != "auto":
             logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
         use_cutedsl_w4a16 = (
