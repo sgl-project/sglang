@@ -792,3 +792,21 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         rollback.assert_not_called()
         self.assertEqual(worker._auto_residency_applied, [first_round])
         self.assertEqual(worker._auto_residency_round_sizes, [1])
+
+
+def test_short_validation_respects_pipeline_minimum_steps():
+    from sglang.multimodal_gen.runtime.server_warmup import _short_validation_step_limit
+
+    assert _short_validation_step_limit(SimpleNamespace(pipeline_config=None)) == 1
+    assert (
+        _short_validation_step_limit(
+            SimpleNamespace(pipeline_config=SimpleNamespace(minimum_inference_steps=1))
+        )
+        == 1
+    )
+    assert (
+        _short_validation_step_limit(
+            SimpleNamespace(pipeline_config=SimpleNamespace(minimum_inference_steps=2))
+        )
+        == 2
+    )
