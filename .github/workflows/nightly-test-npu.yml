@@ -140,12 +140,12 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: nightly-1-npu-a3
-      runner_config: linux-aarch64-a3-800i-2
+      runner_config: linux-aarch64-a3-2-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
@@ -286,7 +286,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800i-16
+      runner: linux-aarch64-a3-16-
       test_type: 'accuracy'
       test_suite: debug-nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
