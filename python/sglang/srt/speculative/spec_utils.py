@@ -96,6 +96,15 @@ if _is_cpu:
 logger = logging.getLogger(__name__)
 
 
+def resolve_max_speculative_num_steps() -> int:
+    """Widest draft step count any adaptive state can reach; the configured
+    step count when adaptive speculative decoding is off."""
+    spec = get_spec()
+    if spec.speculative_adaptive:
+        return max_speculative_num_draft_tokens() - 1
+    return spec.speculative_num_steps
+
+
 def resolve_num_tokens_per_req(
     *,
     phase: Literal["draft_decode", "draft_extend", "target_verify"],

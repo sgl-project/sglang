@@ -568,6 +568,50 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "swa_page_table": self._alloc_swa_page_table(max_bs, max_num_pages),
             }
 
+        self.share_cuda_graph_state_dict(
+            self.decode_cuda_graph_metadata,
+            "decode",
+            (
+                "cache_seqlens",
+                "page_table",
+                "swa_page_table",
+                "cu_seqlens_k",
+                "page_table_draft_decode",
+                "swa_page_table_draft_decode",
+            ),
+        )
+        if self.cuda_graph_swa_out_cache_loc is not None:
+            self.cuda_graph_swa_out_cache_loc = self.share_cuda_graph_state(
+                "swa_out_cache_loc", self.cuda_graph_swa_out_cache_loc
+            )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 0
+        ):
+            self.share_cuda_graph_state_dict(
+                self.target_verify_metadata,
+                "verify",
+                (
+                    "cache_seqlens",
+                    "cu_seqlens_k",
+                    "page_table",
+                    "swa_page_table",
+                    "encoder_cache_seqlens",
+                    "encoder_page_table",
+                ),
+            )
+            self.share_cuda_graph_state_dict(
+                self.draft_extend_metadata,
+                "draft_extend",
+                (
+                    "cache_seqlens",
+                    "cu_seqlens_q",
+                    "cu_seqlens_k",
+                    "page_table",
+                    "swa_page_table",
+                ),
+            )
+
     def _build_cuda_graph_metadata(
         self,
         bs: int,

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.model_executor.input_buffers import share_graph_state_buffer
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -59,6 +60,8 @@ class AttentionBackend(ABC):
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
+
+    cuda_graph_state_namespace: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
@@ -192,6 +195,24 @@ class AttentionBackend(ABC):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
+
+    def share_cuda_graph_state(self, name: str, buffer: torch.Tensor) -> torch.Tensor:
+        """Pool a cuda-graph state buffer under this backend's namespace; see
+        ``share_graph_state_buffer``."""
+        return share_graph_state_buffer(self.cuda_graph_state_namespace, name, buffer)
+
+    def share_cuda_graph_state_dict(
+        self, metadata: dict, role: str, keys: Iterable[str]
+    ) -> None:
+        for key in keys:
+            buffer = metadata.get(key)
+            if isinstance(buffer, torch.Tensor):
+                metadata[key] = self.share_cuda_graph_state(f"{role}.{key}", buffer)
+
+    def child_cuda_graph_state_namespace(self, tag: str) -> Optional[str]:
+        if self.cuda_graph_state_namespace is None:
+            return None
+        return f"{self.cuda_graph_state_namespace}.{tag}"
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self,

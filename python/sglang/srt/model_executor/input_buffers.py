@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Collection, Dict, Tuple
+from typing import Collection, Dict, Optional, Tuple
 
 import torch
 
@@ -54,6 +54,23 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
         _forward_input_buffer_pool[key] = new_buffer
         canonical = new_buffer
     return canonical[: new_buffer.shape[0]]
+
+
+def share_graph_state_buffer(
+    namespace: Optional[str], name: str, buffer: torch.Tensor
+) -> torch.Tensor:
+    """Pool an attention backend's cuda-graph state buffer under ``namespace``.
+
+    ``None`` keeps the buffer private (the non-adaptive default). Adaptive
+    speculative decoding gives every backend of one role -- target verify,
+    draft extend, draft-decode step ``i`` -- the same namespace, so the
+    per-state backends alias one allocation per field under the row-prefix
+    rule of ``share_input_buffer``. Same contract: the owning replay rewrites
+    what it reads, and the states never run concurrently.
+    """
+    if namespace is None:
+        return buffer
+    return share_input_buffer(f"{namespace}.{name}", buffer)
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import numpy as np
 import torch
 
@@ -2481,6 +2482,53 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             # For decoder-only models, skip encoder_metadata allocation
             self.encoder_metadata = {}
+
+        self.share_cuda_graph_state_dict(
+            self.decode_cuda_graph_metadata,
+            "decode",
+            (
+                "cache_seqlens",
+                "cu_seqlens_k",
+                "page_table",
+                "page_table_draft_decode",
+                "swa_page_table",
+            ),
+        )
+        if self._sched_meta_buf is not None:
+            self._sched_meta_buf = self.share_cuda_graph_state(
+                "sched_meta", self._sched_meta_buf
+            )
+        if self.has_local_attention:
+            self.share_cuda_graph_state_dict(
+                self.decode_cuda_graph_local_attn_metadata,
+                "local_attn",
+                ("local_query_start_loc", "local_seqused_k", "local_block_table"),
+            )
+        if self.use_sliding_window_kv_pool:
+            self.cuda_graph_swa_out_cache_loc = self.share_cuda_graph_state(
+                "swa_out_cache_loc", self.cuda_graph_swa_out_cache_loc
+            )
+        if (
+            self.speculative_num_draft_tokens is not None
+            and self.speculative_num_draft_tokens > 0
+        ):
+            self.share_cuda_graph_state_dict(
+                self.target_verify_metadata,
+                "verify",
+                ("cache_seqlens", "cu_seqlens_k", "page_table", "swa_page_table"),
+            )
+            self.share_cuda_graph_state_dict(
+                self.draft_extend_metadata,
+                "draft_extend",
+                ("cache_seqlens", "cu_seqlens_k", "page_table", "swa_page_table"),
+            )
+            if self._verify_mask is not None:
+                self._verify_mask = msgspec.structs.replace(
+                    self._verify_mask,
+                    buffer=self.share_cuda_graph_state(
+                        "verify_mask", self._verify_mask.buffer
+                    ),
+                )
 
     def _bind_metadata_buffers(
         self,

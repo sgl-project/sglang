@@ -33,6 +33,7 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.input_buffers import share_graph_state_buffer
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -44,6 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
+    resolve_max_speculative_num_steps,
 )
 from sglang.srt.utils import (
     is_flashinfer_available,
@@ -490,10 +492,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
-            cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len,),
-                dtype=torch.int32,
-                device="cuda",
+            cuda_graph_kv_indices = self.share_cuda_graph_state(
+                "kv_indices",
+                torch.zeros(
+                    (max_bs * self.max_context_len,),
+                    dtype=torch.int32,
+                    device="cuda",
+                ),
             )
         else:
             cuda_graph_kv_indices = kv_indices_buf
@@ -1284,10 +1289,19 @@ class FlashInferMLAMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.max_context_len
         )
-        self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, kv_indices_width),
-            dtype=torch.int32,
-            device="cuda",
+        self.cuda_graph_kv_indices = share_graph_state_buffer(
+            getattr(self, "cuda_graph_state_namespace", None),
+            "kv_indices",
+            torch.zeros(
+                (
+                    max(
+                        self.speculative_num_steps, resolve_max_speculative_num_steps()
+                    ),
+                    kv_indices_width,
+                ),
+                dtype=torch.int32,
+                device="cuda",
+            ),
         )
 
         for i in range(self.speculative_num_steps - 1):

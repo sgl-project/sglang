@@ -690,6 +690,37 @@ class TestPoolBackedAlloc(unittest.TestCase):
             eager_b.get_slot("ids").buffer.data_ptr(),
         )
 
+    def test_share_graph_state_buffer_is_namespaced(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        private = torch.zeros((8, 4), dtype=torch.int64)
+        self.assertIs(
+            input_buffers.share_graph_state_buffer(None, "kv_indices", private),
+            private,
+        )
+
+        target_a = input_buffers.share_graph_state_buffer(
+            "adaptive.target", "kv_indices", torch.zeros((16, 4), dtype=torch.int64)
+        )
+        target_b = input_buffers.share_graph_state_buffer(
+            "adaptive.target", "kv_indices", torch.zeros((8, 4), dtype=torch.int64)
+        )
+        draft = input_buffers.share_graph_state_buffer(
+            "adaptive.draft_extend",
+            "kv_indices",
+            torch.zeros((8, 4), dtype=torch.int64),
+        )
+        self.assertEqual(target_b.data_ptr(), target_a.data_ptr())
+        self.assertEqual(tuple(target_b.shape), (8, 4))
+        self.assertNotEqual(draft.data_ptr(), target_a.data_ptr())
+        self.assertNotEqual(
+            draft.data_ptr(),
+            input_buffers.share_input_buffer(
+                "kv_indices", torch.zeros((8, 4), dtype=torch.int64)
+            ).data_ptr(),
+        )
+
     def test_share_input_buffer_aliases_row_prefixes_only(self):
         from sglang.srt.model_executor import input_buffers
 

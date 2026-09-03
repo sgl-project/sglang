@@ -144,7 +144,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
+            self.max_bs, self.alloc_num_token
         )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()

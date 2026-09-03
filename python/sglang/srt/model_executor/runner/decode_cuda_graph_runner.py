@@ -375,7 +375,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.alloc_num_token = max(
             self.max_num_token,
             self.max_bs
@@ -383,6 +382,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 num_draft_tokens=max_speculative_num_draft_tokens()
             ),
         )
+        self.attn_backend.init_cuda_graph_state(self.max_bs, self.alloc_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
