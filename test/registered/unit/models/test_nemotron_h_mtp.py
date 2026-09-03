@@ -6,7 +6,13 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from sglang.srt.models.nemotron_h_mtp import NemotronHMultiTokenPredictor
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMixedPrecisionConfig,
+)
+from sglang.srt.models.nemotron_h_mtp import (
+    NemotronHForCausalLMMTP,
+    NemotronHMultiTokenPredictor,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -84,6 +90,26 @@ class TestNemotronHMultiTokenPredictor(CustomTestCase):
         expected = target_embeddings.clone()
         expected[-1] = model.embed_tokens(torch.tensor(2))
         torch.testing.assert_close(layer.inputs_embeds, expected)
+
+
+class TestNemotronHForCausalLMMTP(CustomTestCase):
+    def test_maps_quantized_mtp_metadata(self):
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "language_model.mtp.layers.0.mixer.q_proj": {"quant_algo": "FP8"}
+                },
+            }
+        )
+        quant_config.apply_weight_name_mapper(
+            NemotronHForCausalLMMTP.hf_to_sglang_mapper
+        )
+
+        self.assertEqual(
+            quant_config._resolve_quant_algo("mtp.layers.0.mixer.q_proj"),
+            "FP8",
+        )
 
 
 if __name__ == "__main__":

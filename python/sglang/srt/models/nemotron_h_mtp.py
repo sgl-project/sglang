@@ -38,6 +38,7 @@ from sglang.srt.models.nemotron_h import (
     NemotronHMoEDecoderLayer,
 )
 from sglang.srt.models.nemotron_h_utils import is_attn_layer
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -323,6 +324,10 @@ class NemotronHMultiTokenPredictor(nn.Module):
 
 
 class NemotronHForCausalLMMTP(NemotronHForCausalLM):
+    hf_to_sglang_mapper = NemotronHForCausalLM.hf_to_sglang_mapper | WeightsMapper(
+        orig_to_new_prefix={"language_model.mtp.": "mtp."}
+    )
+
     def __init__(
         self,
         config: NemotronHConfig,
