@@ -253,6 +253,11 @@ jobs:
       collect_runs_on: ubuntu-22.04-arm
       artifact_name: rust-ext-aarch64
       cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      # One stage consumes this, and the repo is at its 10 GB cache limit, so a
+      # per-branch entry here would mostly evict an x86_64 one that many stages
+      # read. seed-rust-ext-cache.yml still writes the default-branch entry, which
+      # is the one every PR can read; a PR that moves the key recompiles instead.
+      save_cache: false
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit

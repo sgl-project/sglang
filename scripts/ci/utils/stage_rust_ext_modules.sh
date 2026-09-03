@@ -6,6 +6,11 @@
 # MAX_GLIBC (optional): also reject a module requiring a newer GLIBC symbol
 # version than the test runners have. Only set where the modules were just
 # compiled - on a cache hit these are the same bytes that already passed.
+#
+# EXPECT_PREFIX (optional): the cache key prefix the caller is about to save
+# under, checked against the one the modules themselves imply. The arch and the
+# interpreter set are both in every EXT_SUFFIX, so this is the ground truth for a
+# key that a caller would otherwise only assert.
 set -euo pipefail
 shopt -s nullglob
 # upload-artifact strips the longest common prefix it matched, so a missing
@@ -49,11 +54,37 @@ for module in mem_cache mem_cache_inspection; do
     cp "${tree_core[@]}" rust-ext-staging/mem_cache/rust_tree_core/
     built+=("${tree_core[@]}")
 done
+status=0
+
+# What the bytes say the key should be, e.g. rust-ext-x86_64-cp310-cp312. Both
+# halves come out of the suffix set checked above, so a caller cannot mislabel an
+# entry: EXT_SUFFIX is `.cpython-<abi>-<arch>-linux-gnu.so`.
+expect_prefix="${EXPECT_PREFIX:-}"
+if [ -n "${expect_prefix}" ]; then
+    arches=$(printf '%s\n' "${expected_suffixes}" \
+        | sed -n 's/^\.cpython-[0-9]*-\([^-]*\)-linux-gnu\.so$/\1/p' | sort -u)
+    # Lexicographic, so a producer's prefix must list its interpreters that way.
+    abis=$(printf '%s\n' "${expected_suffixes}" \
+        | sed -n 's/^\.cpython-\([0-9]*\)-.*$/cp\1/p' | sort -u | tr '\n' '-' | sed 's/-$//')
+    if [ -z "${arches}" ] || [ -z "${abis}" ] || [ "$(printf '%s\n' "${arches}" | wc -l)" -ne 1 ]; then
+        echo "::error::cannot derive a cache key prefix from these suffixes:"
+        printf '%s\n' "${expected_suffixes}"
+        status=1
+    else
+        derived="rust-ext-${arches}-${abis}"
+        echo "cache key prefix: declared ${expect_prefix}, modules imply ${derived}"
+        if [ "${derived}" != "${expect_prefix}" ]; then
+            echo "::error::about to save under ${expect_prefix}, but these modules are ${derived}"
+            echo "::error::a consumer derives the prefix from its own arch and interpreter, so this entry would never be read - or worse, read by the wrong pool"
+            status=1
+        fi
+    fi
+fi
+
 max_allowed="${MAX_GLIBC:-}"
-[ -n "${max_allowed}" ] || exit 0
+[ -n "${max_allowed}" ] || exit $status
 
 # Newer glibc than the test runners fails at import: "GLIBC_2.xx not found".
-status=0
 for so in "${built[@]}"; do
     # objdump gets its own invocation rather than heading a pipeline: in a pipeline
     # its failure is invisible, and the empty symbol list a wrong-arch objdump

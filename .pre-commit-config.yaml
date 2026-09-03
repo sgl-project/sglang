@@ -101,10 +101,12 @@ repos:
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
       - id: check-rust-ext-cache-prefix
-        name: check rust-ext cache key prefix defaults match
+        name: check rust-ext cache key prefix agrees across producers/consumers
         entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
         language: system
-        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
+        # Every workflow, not just the two halves of the key: the check also reads
+        # each caller's prefix and runner labels.
+        files: ^\.github/(workflows/.*\.yml|actions/download-rust-ext/action\.yml)$
         pass_filenames: false
       - id: check-no-bare-pytest-main
         name: reject bare pytest.main calls in __main__ blocks

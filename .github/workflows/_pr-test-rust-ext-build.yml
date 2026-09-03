@@ -51,9 +51,21 @@ on:
         type: string
         default: rust-ext-x86_64-cp310-cp312
       max_glibc:
-        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
+        description: >
+          Highest GLIBC symbol version the built .so files may require. A ceiling set
+          by the oldest image that has to LOAD them, not by whoever builds them - the
+          pools are not all on one image. x86_64's oldest loader is jammy at 2.35.
         type: string
         default: '2.35'
+      save_cache:
+        description: >
+          Write the built modules to the cache. Off leaves the run's artifact as the
+          only handoff, so the stages of this run still get it and later runs
+          recompile. For an arch whose entries would mostly evict something else in a
+          repo already at the 10 GB cache limit, and whose cross-run value comes from
+          the default-branch entry seed-rust-ext-cache.yml writes anyway.
+        type: boolean
+        default: true
       git_ref:
         type: string
         default: ''
@@ -139,10 +151,15 @@ jobs:
           fi
 
       # No MAX_GLIBC: these are the bytes the collect job already checked before
-      # saving them under this key. The module count is still worth re-checking,
-      # so a truncated entry fails here rather than as a test import error.
+      # saving them under this key, and this job may not even be the right arch to
+      # read them. The module count is still worth re-checking, so a truncated entry
+      # fails here rather than as a test import error - and EXPECT_PREFIX with it,
+      # which is filename-only, so it holds an entry to the key it was found under
+      # however it got there.
       - name: Stage modules for upload
         if: steps.cache.outputs.cache-hit == 'true'
+        env:
+          EXPECT_PREFIX: ${{ inputs.cache_key_prefix }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
 
       - name: Upload extension modules
@@ -341,19 +358,27 @@ jobs:
       # First point that sees every interpreter, which is what the suffix-set check
       # compares. MAX_GLIBC belongs here rather than in the restore job: these are
       # freshly compiled bytes, not ones that already passed under this key.
+      # EXPECT_PREFIX is what makes the key an assertion rather than a claim: the
+      # script derives the arch and the interpreter set from the modules' own
+      # EXT_SUFFIX and fails if they are not the ones this job is about to save
+      # under. Nothing else compares the two - a caller's prefix and its runner
+      # label are both just strings until here.
       - name: Verify modules and stage for upload
         env:
           MAX_GLIBC: ${{ inputs.max_glibc }}
+          EXPECT_PREFIX: ${{ inputs.cache_key_prefix }}
         run: bash scripts/ci/utils/stage_rust_ext_modules.sh
 
       # Without it the entry saved below lands under a version no reader with zstd
       # can find. This runner's image ships without it.
       - name: Ensure zstd so the restore job can read what this job saves
+        if: inputs.save_cache
         run: bash scripts/ci/utils/ensure_zstd.sh
 
       # After the verify step, so a rejected build cannot poison this key for every
       # later run.
       - name: Save built modules
+        if: inputs.save_cache
         uses: actions/cache/save@v4
         with:
           path: |

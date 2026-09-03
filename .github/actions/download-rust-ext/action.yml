@@ -10,10 +10,6 @@ inputs:
     description: "rust-ext-build's artifact in this run; empty uses only the cache."
     required: false
     default: ''
-  cache_key_prefix:
-    description: 'Must match what _pr-test-rust-ext-build.yml saves under.'
-    required: false
-    default: rust-ext-x86_64-cp310-cp312
 
 outputs:
   hit:
@@ -42,6 +38,23 @@ runs:
       shell: bash
       run: bash scripts/ci/utils/ensure_zstd.sh
 
+    # Derived, with no input to override it: the prefix encodes the arch and the
+    # interpreter set (PyO3 modules are portable across neither), and `uname -m`
+    # plus the running interpreter are the only things here that know either.
+    # Consumers range from stages that know their pool to rerun-test.yml,
+    # dispatched onto any label there is, so none of them could pass it reliably.
+    # An arch nothing built for resolves to a prefix nothing saved: a plain miss
+    # and a source build, the same outcome as no cache at all.
+    - name: Resolve the cache key prefix for this runner
+      id: prefix
+      if: steps.artifact.outcome != 'success'
+      shell: bash
+      run: |
+        set -euo pipefail
+        resolved="rust-ext-$(uname -m)-cp310-cp312"
+        echo "cache key prefix: ${resolved}"
+        echo "value=${resolved}" >> "$GITHUB_OUTPUT"
+
     # Second, not first: the cache is evictable and this repo sits at its 10 GB
     # limit. A run reads its own branch's entries plus the default branch's, so
     # seed-rust-ext-cache.yml and the branch's own rust-ext-build both land here.
@@ -53,7 +66,7 @@ runs:
         path: |
           python/sglang/srt/rust_extensions/_*.so
           python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-        key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+        key: ${{ steps.prefix.outputs.value }}-${{ hashFiles('rust/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
 
     # Job-wide, but only setup.py reads it, and only while building.
     # Whether the modules suit this interpreter is not decided here:
