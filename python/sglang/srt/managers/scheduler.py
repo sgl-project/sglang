@@ -2293,6 +2293,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_chunked_req=lambda: self.chunked_req,
         )
 
     def init_rank_consensus_checker(self) -> None:
