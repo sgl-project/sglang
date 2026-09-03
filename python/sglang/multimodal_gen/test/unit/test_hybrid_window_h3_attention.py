@@ -85,6 +85,14 @@ def _masked_reference(q, k, v, mask: torch.Tensor, used: int) -> torch.Tensor:
     return (torch.softmax(scores, dim=-1) @ vf).permute(1, 0, 2)
 
 
+def _skip_if_kernel_unavailable(kernel: str) -> None:
+    if kernel == "tiles":
+        pytest.importorskip(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels",
+            reason="static-tile window kernel not available",
+        )
+
+
 def _impl() -> HybridWindowAttentionH3Impl:
     impl = HybridWindowAttentionH3Impl(
         num_heads=HEADS,
@@ -165,6 +173,7 @@ def test_mask_reference_partition_is_exact() -> None:
 @requires_cuda
 @pytest.mark.parametrize("kernel", HYBRID_WINDOW_H3_KERNELS)
 def test_window_matches_masked_dense(kernel: str) -> None:
+    _skip_if_kernel_unavailable(kernel)
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device)
     hybrid = _hybrid()
@@ -183,6 +192,7 @@ def test_window_matches_masked_dense(kernel: str) -> None:
 @requires_cuda
 @pytest.mark.parametrize("kernel", HYBRID_WINDOW_H3_KERNELS)
 def test_full_cover_matches_dense(kernel: str) -> None:
+    _skip_if_kernel_unavailable(kernel)
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device, seed=11)
     hybrid = _hybrid(radius=NUM_FRAMES)

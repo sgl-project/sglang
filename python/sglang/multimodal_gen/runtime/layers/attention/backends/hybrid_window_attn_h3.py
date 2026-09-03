@@ -333,6 +333,12 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
             FlashAttentionImpl,
         )
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        # The platform resolver selects FA4 on Blackwell before the first
+        # forward; direct constructions (tests, tools) go through the same gate.
+        if current_platform.is_cuda():
+            current_platform._prepare_flash_attention_for_blackwell()
 
         self._dense_fallback = FlashAttentionImpl(
             num_heads=num_heads,
