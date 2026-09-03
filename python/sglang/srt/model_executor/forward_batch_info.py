@@ -1512,7 +1512,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]
-        self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.input_ids is not None:
+            self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)

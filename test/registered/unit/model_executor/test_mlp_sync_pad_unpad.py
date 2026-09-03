@@ -96,6 +96,28 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
         self.assertIsNone(spec_info.hidden_states)
 
+    def test_embedding_only_target_verify_can_be_padded(self):
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=1,
+            input_ids=None,
+            input_embeds=torch.ones(1, 4),
+            req_pool_indices=torch.tensor([5]),
+            seq_lens=torch.tensor([7]),
+            out_cache_loc=torch.tensor([0]),
+            seq_lens_sum=7,
+            positions=torch.tensor([6]),
+            seq_lens_cpu=torch.tensor([7]),
+            lora_ids=[None],
+        )
+
+        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=2, bs=1)
+
+        self.assertIsNone(fb.input_ids)
+        torch.testing.assert_close(
+            fb.input_embeds, torch.tensor([[1.0, 1.0, 1.0, 1.0], [0, 0, 0, 0]])
+        )
+
     def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
         fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])
         self.assertEqual(DecodeCudaGraphRunner._max_dp_batch_size(fb), 11)
