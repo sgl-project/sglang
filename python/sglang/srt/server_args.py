@@ -58,7 +58,6 @@ from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_projection,
     resolving_view,
-    supports_mamba_cache_extra_buffer,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -1125,6 +1124,15 @@ class ServerArgs:
         "Shard dense MLP weights across the attention TP group under DP attention.",
         NS("parallel"),
     ] = False
+    enable_layernorm_sp: A[
+        bool,
+        "Enable Megatron-style sequence parallelism (arXiv:2205.05198) for the "
+        "LayerNorm/residual regions under pure tensor parallelism: the row-parallel "
+        "all-reduce becomes reduce-scatter + all-gather, so LayerNorm runs on "
+        "sequence-sharded activations with no extra communication volume. "
+        "Prefill only; Qwen3 dense; requires tp_size > 1 and NVLink/NVSwitch.",
+        NS("parallel"),
+    ] = False
     disable_attn_tp_gather: A[
         bool,
         "Disable scheduler-side attn_tp_gather (the upstream SP path "
@@ -1278,9 +1286,7 @@ class ServerArgs:
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
         NS("serving"),
-    ] = (
-        1024 * 1024
-    )
+    ] = 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -2326,7 +2332,7 @@ class ServerArgs:
     ] = 18
     speculative_ngram_capacity: A[
         int, "The cache capacity for ngram speculative decoding.", NS("spec")
-    ] = (10 * 1000 * 1000)
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
@@ -2390,8 +2396,8 @@ class ServerArgs:
     ] = "none"
     enable_w4a4_mxfp4_megamoe: A[
         bool,
-        "Enable the W4A4 MXFP4 MegaMoE path by setting DeepGEMM's "
-        "DG_USE_FP4_ACTS=1 and DG_USE_MXF4_KIND=1. Use with "
+        "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "
+        "mxf4xmxf4 MMA type. Use with "
         "--moe-a2a-backend megamoe.",
         NS("exec.moe"),
     ] = False
@@ -2414,8 +2420,10 @@ class ServerArgs:
         NS("exec.moe"),
     ] = "auto"
     flashinfer_mxfp4_moe_precision: A[
-        Literal["default", "bf16"],
-        "Choose the computation precision of flashinfer mxfp4 moe",
+        Literal["default", "bf16", "fp8"],
+        "Choose the computation precision of flashinfer mxfp4 moe. "
+        "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
+        "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
         NS("exec.moe"),
     ] = "default"
     deepep_mode: A[
@@ -3620,7 +3628,8 @@ class ServerArgs:
         Optional[str],
         Arg(
             help="Unix socket path for weight cache daemon (client mode)."
-            "If not set, uses /tmp/sglang_weight_cache_rank{global_rank}.sock",
+            "If not set, derives the path from SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE "
+            "using the caller's physical GPU UUID.",
         ),
         NS("model"),
     ] = None
@@ -3759,37 +3768,11 @@ class ServerArgs:
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
 
-    def pre_capture_activation_reserve_mb(self, gpu_mem: Optional[float]) -> float:
-        # Runtime activation working-set reserve for eager decode above the captured
-        # max_bs and transient prefill/logits; also covers fixed state caches.
-        cfg = resolving_view(self)
-        if cfg.disaggregation_mode == "decode":
-            running_requests = (
-                cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
-            )
-            activation_tokens = max(
-                running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
-            )
-        elif cfg.chunked_prefill_size > 0:
-            activation_tokens = max(cfg.chunked_prefill_size, 2048)
-        else:
-            activation_tokens = max(cfg.max_prefill_tokens, 2048)
-        reserved_mem = (
-            512 + activation_tokens * 1.5 + cfg.tp_size * cfg.pp_size / 8 * 1024
-        )
-        if gpu_mem is not None and gpu_mem > 60 * 1024:
-            reserved_mem = max(reserved_mem, 10 * 1024)
-        return reserved_mem
-
-    def _support_mamba_cache_extra_buffer(self, model_arch: str):
-
-        return supports_mamba_cache_extra_buffer(self, model_arch)
-
-        # ===== END TO BE REFACTORED ====
+    # ===== END TO BE REFACTORED ====
 
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
 
-    # The strided-layout Triton requirement is enforced via
+    # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
@@ -4137,32 +4120,6 @@ class ServerArgs:
 
         return cfg.startup_weight_load_mode == "overlap"
 
-    def ssl_verify(self):
-        """Return the value for the requests library's verify= parameter.
-
-        When SSL is configured:
-          - If a CA certificate file is provided, return its path so requests
-            validates the server certificate against that CA.
-          - Otherwise, return False to disable certificate verification
-            (suitable for self-signed certificates in development/testing).
-            A warning is logged once when this happens.
-        When SSL is not configured, return True to use the system's default
-        CA bundle.
-        """
-        if self.ssl_ca_certs:
-            return self.ssl_ca_certs
-        if self.ssl_certfile:
-            if not getattr(self, "_ssl_verify_warned", False):
-                logger.warning(
-                    "SSL is enabled but --ssl-ca-certs was not provided. "
-                    "Certificate verification is DISABLED for internal "
-                    "health checks. For production deployments, provide "
-                    "--ssl-ca-certs or use CA-signed certificates."
-                )
-                self._ssl_verify_warned = True
-            return False
-        return True
-
     def __setattr__(self, name, value):
         # Once resolution has finished the record is the READ-ONLY raw input
         # the config bags were projected from. Resolved config changes go to the bags via
@@ -4190,41 +4147,10 @@ class ServerArgs:
 
         check_server_args(self)
 
-    @property
-    def _parsed_modelexpress_config(self) -> dict:
-        cache = getattr(self, "_mx_config_cache", None)
-        if cache is not None:
-            return cache
-        if self.modelexpress_config is None:
-            result = {}
-        elif isinstance(self.modelexpress_config, str):
-            result = json.loads(self.modelexpress_config)
-        else:
-            result = self.modelexpress_config
-        self._mx_config_cache = result
-        return result
-
-    @property
-    def modelexpress_url(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("url")
-
-    @property
-    def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress."""
-        return self._parsed_modelexpress_config.get("transport", "nixl")
-
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
-
-    @property
-    def kv_event_block_size(self) -> int:
-        """Width KV events are emitted at: under DCP the radix tree pages at
-        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
-        """
-        cfg = resolving_view(self)
-        return cfg.page_size * self.dcp_size
 
 
 # --------------------------------------------------------------------------

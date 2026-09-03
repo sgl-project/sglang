@@ -1,7 +1,9 @@
 import copy
+import re
 import unittest
 import weakref
 from array import array
+from pathlib import Path
 
 import msgspec
 import numpy as np
@@ -41,6 +43,33 @@ register_cpu_ci(est_time=6, suite="base-c-test-cpu")
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
+    def test_rust_tokenized_generate_schema_stays_in_lockstep(self):
+        """Compare the Rust wire declaration with the imported Python schema."""
+        rust_path = (
+            Path(__file__).resolve().parents[4]
+            / "rust/sglang-server/src/message/io_struct.rs"
+        )
+        source = rust_path.read_text()
+        start = source.index("pub(super) TokenizedGenerateReqInput<'a> {")
+        end = source.index("\n    }\n}", start)
+        rust_fields = (
+            "rid",
+            "http_worker_ipc",
+            *re.findall(r"^\s*([a-z][a-z0-9_]*):", source[start:end], re.MULTILINE),
+        )
+        python_fields = TokenizedGenerateReqInput.__struct_fields__
+
+        self.assertEqual(python_fields[: len(rust_fields)], rust_fields)
+        self.assertTrue(
+            all(
+                default is not msgspec.NODEFAULT
+                for default in TokenizedGenerateReqInput.__struct_defaults__[
+                    len(rust_fields) :
+                ]
+            ),
+            "Rust may omit only a defaulted suffix of the Python wire schema",
+        )
+
     def _make_mm_inputs(self, device="cpu"):
         return MultimodalProcessorOutput(
             mm_items=[

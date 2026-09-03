@@ -530,6 +530,7 @@ class _FakeResolvedArgs:
     decode_attention_backend: A[str | None, Arg(help="dab"), NS("exec.kernel")] = None
     disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
     mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
+    speculative_algorithm: A[str | None, Arg(help="sa"), NS("spec")] = None
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
@@ -1200,6 +1201,9 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
     def test_activation_reserve_matches_the_member(self):
         from types import SimpleNamespace
 
+        from sglang.srt.arg_groups.overrides import (
+            pre_capture_activation_reserve_mb_of,
+        )
         from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
 
         graph = SimpleNamespace(decode=SimpleNamespace(max_bs=64))
@@ -1231,7 +1235,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
                     args = _FakeResolvedArgs(cuda_graph_config=graph, **case)
                     get_context().set_server_args(args)
                     self.assertEqual(
-                        ServerArgs.pre_capture_activation_reserve_mb(args, gpu_mem),
+                        pre_capture_activation_reserve_mb_of(args, gpu_mem),
                         pre_capture_activation_reserve_mb(gpu_mem),
                     )
 
@@ -1286,13 +1290,7 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
 
 
 class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
-    """The adaptive draft-token bound is memoized on the config path, so the
-    memo has to end with the publication it was computed under.
-
-    Without that, a process that republishes with the same adaptive-config path
-    -- the file having been rewritten in between -- keeps the previous bound and
-    under-allocates the draft-token buffers sized from it.
-    """
+    """The adaptive draft-token bound is snapshotted at each publication."""
 
     def _write_config(self, steps):
         path = os.path.join(tempfile.mkdtemp(prefix="adaptive_cfg_"), "adaptive.json")
@@ -1314,7 +1312,7 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
 
         with open(path, "w") as handle:
             json.dump({"1": {"candidate_steps": [4]}}, handle)
-        # Same path, new contents: the memo must not survive the republish.
+        # The new publication must not retain the previous capacity.
         get_context().set_server_args(
             _FakeResolvedArgs(
                 speculative_num_draft_tokens=3,

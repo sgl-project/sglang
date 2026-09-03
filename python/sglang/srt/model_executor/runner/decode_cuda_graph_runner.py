@@ -326,9 +326,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if (
-                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
-                ):
+                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -338,6 +336,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
@@ -368,8 +367,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.captured_req_width
+        self.max_num_token = (
+            max(self.capture_num_tokens)
+            if self.capture_num_tokens is not None
+            else self.max_bs * self.captured_req_width
+        )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -489,7 +491,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n" f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def _record_in_graph_metadata_prep_done(self):
@@ -1163,9 +1165,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(
-                self.backend, BreakableCudaGraphBackend
-            ), "Breakable CUDA graph is required for --debug-cuda-graph"
+            assert isinstance(self.backend, BreakableCudaGraphBackend), (
+                "Breakable CUDA graph is required for --debug-cuda-graph"
+            )
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
@@ -1525,7 +1527,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
-
                 capture_mode = (
                     CaptureHiddenMode.NULL
                     if self.model_runner.spec_algorithm.is_standalone()

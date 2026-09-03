@@ -228,7 +228,6 @@ class Qwen2_5_VLMLP(nn.Module):
 
 
 class Qwen2_5_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -306,7 +305,6 @@ class Qwen2_5_VisionBlock(nn.Module):
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -366,7 +364,6 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 
 
 class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen2_5_VLVisionConfig,
@@ -616,6 +613,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_layout = tuple(
+            value
+            for index, value in enumerate(cu_window_seqlens)
+            if index == 0 or value != cu_window_seqlens[index - 1]
+        )
         cu_window_seqlens = torch.tensor(
             cu_window_seqlens,
             device=x.device,
@@ -658,6 +660,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             ]
         )
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        full_layout = [0, 0]
+        total_tokens = 0
+        for temporal, height, width in grid_thw.tolist():
+            total_tokens += temporal * height * width
+            full_layout.append(total_tokens)
 
         return self.cuda_graph_runner.run(
             x=x,
@@ -665,6 +672,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             cu_seqlens=cu_seqlens,
             cu_window_seqlens=cu_window_seqlens,
             output_indices=reverse_indices,
+            attention_layout_key=(tuple(full_layout), cu_window_layout),
         )
 
 
@@ -786,7 +794,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if current_dim == expected_dim:
                 return pixel_values
             if current_dim != raw_patch_dim:
-
                 return pixel_values
 
         assert pixel_values.dim() == 2, pixel_values.dim()

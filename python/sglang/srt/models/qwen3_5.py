@@ -182,6 +182,7 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
 
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
         and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
     ):
         return
@@ -388,8 +389,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
-                and self.in_proj_qkvz.weight.dtype == torch.bfloat16
-                and self.in_proj_ba.weight.dtype == torch.bfloat16
+                and self.in_proj_qkvz._parameters.get("weight") is not None
+                and self.in_proj_ba._parameters.get("weight") is not None
+                and self.in_proj_qkvz._parameters["weight"].dtype == torch.bfloat16
+                and self.in_proj_ba._parameters["weight"].dtype == torch.bfloat16
                 and self.in_proj_qkvz.bias is None
                 and self.in_proj_ba.bias is None
                 and use_intel_amx_backend(self.in_proj_qkvz)
@@ -556,9 +559,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             cpu_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                        assert (
-                            sum(cpu_split_sizes) == target_size_sim
-                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        assert sum(cpu_split_sizes) == target_size_sim, (
+                            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        )
                         chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)
