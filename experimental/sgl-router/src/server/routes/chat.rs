@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
+use crate::policies::admission::{resolve_cache_candidates, resolve_prefill, CandidateRange};
 use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
-use crate::policies::{request_tokens_for, ExternalPrefixSignal, RequestTokens, SelectionContext};
+use crate::policies::{
+    request_tokens_for, ExternalPrefixSignal, PrefillProposal, ProposalKind, RequestTokens,
+    SelectionContext,
+};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -198,6 +202,13 @@ pub async fn chat_completions(
         _ => None,
     };
 
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    let request_input_tokens = prefill_load as u64;
+    let load_snapshot = ctx.engine_load.capture_snapshot(std::time::Instant::now());
+
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
@@ -210,15 +221,56 @@ pub async fn chat_completions(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
+    let session_id = ctx
+        .config
+        .model
+        .affinity
+        .as_ref()
+        .and_then(|config| headers.get(config.session_id_header.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let candidate_range = CandidateRange::global(&workers);
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref());
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
+        .with_session_id(session_id)
+        .with_candidate_range_id(candidate_range.id)
+        .with_input_tokens(request_input_tokens)
+        .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
+        .with_external_prefix(external_prefix.as_ref())
+        .with_load_snapshot(&load_snapshot);
+    let worker = match policy.propose_prefill(candidate_range.workers, &selection_ctx) {
+        Some(PrefillProposal::Pair(proposal)) if policy.uses_shared_prefill_admission() => {
+            let decision = resolve_prefill(
+                &candidate_range,
+                &proposal,
+                request_input_tokens,
+                &load_snapshot,
+            )
             .ok_or_else(|| ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
             })?;
+            policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
+            decision.selected
+        }
+        Some(PrefillProposal::Pair(proposal)) => proposal.primary,
+        Some(PrefillProposal::CacheCandidates(proposal)) => {
+            let decision =
+                resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot)
+                    .ok_or_else(|| ApiError::PolicySelectionFailed {
+                        model: model_str.clone(),
+                    })?;
+            policy.commit_prefill_selection(
+                &selection_ctx,
+                ProposalKind::CacheAffinity,
+                &decision.selected,
+            );
+            decision.selected
+        }
+        None => {
+            return Err(ApiError::PolicySelectionFailed {
+                model: model_str.clone(),
+            });
+        }
+    };
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -292,14 +344,6 @@ pub async fn chat_completions(
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
     let guard = worker.load_guard();
-    // Use the exact token count from the ingress tokenization when available;
-    // fall back to the byte-count heuristic for load-only policies that don't
-    // tokenize. The exact count makes the cache-aware load-imbalance fast-path
-    // accurate rather than off by the char/token ratio.
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| estimate_prefill_tokens(&body));
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);

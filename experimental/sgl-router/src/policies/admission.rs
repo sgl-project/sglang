@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Prefill / Decode 共享准入与候选比较。
+//! Shared admission and candidate comparison for Prefill and Decode.
 //!
-//! 这里的外部负载只来自 #34608 发布的 `LoadStat`：运行请求数、等待请求数、
-//! 已用 KV tokens 与 KV 容量。旧 LoadMonitor 的未缓存 token、最大并发、时延和
-//! Decode 子队列都不可由该 wire 推导，因此不会参与准入或 guard。
+//! Decisions use only fields published in `LoadStat`.
 
 use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
 use crate::policies::{CacheCandidate, CacheCandidateProposal, SelectionProposal};
@@ -14,10 +12,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Prefill policy 的候选域及其配置化排队预算。
-///
-/// `max_pending_prefill_tokens` 仍保留在 Bucket 契约中，但 Engine LoadStat
-/// 没有等待 token 数，不能与它进行单位一致的比较。
+/// A Prefill candidate range and its optional pending-token budget.
 pub struct CandidateRange<'a> {
     pub id: &'a str,
     pub workers: &'a [Arc<Worker>],
@@ -34,7 +29,7 @@ impl<'a> CandidateRange<'a> {
     }
 }
 
-/// Router 在 policy 前解析出的角色化候选域。
+/// A role-specific candidate domain resolved before policy evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingStage {
     Prefill,
@@ -104,7 +99,7 @@ pub enum DecisionReason {
     Primary,
     CacheCandidate,
     BackupPrimaryAdmission,
-    /// 两个 Decode 候选都通过容量准入时，由 #34608 负载比较选择 backup。
+    /// Both Decode candidates were admitted; the lower-pressure backup won.
     BackupLoadComparison,
     RangeFallback,
 }
@@ -119,8 +114,7 @@ pub struct FinalDecision {
     pub load_snapshot_version: u64,
 }
 
-/// 从有界 Cache 候选中选择最终 Worker。缓存收益仍以 token 数比较；当收益相同
-/// 时，仅以 #34608 的等待请求数、运行请求数和 KV 使用率打破平局。
+/// Resolves a bounded cache-candidate set, using pressure to break near ties.
 pub fn resolve_cache_candidates(
     proposal: &CacheCandidateProposal,
     request_input_tokens: u64,
@@ -257,7 +251,7 @@ fn is_proposal_worker_eligible(proposal: &SelectionProposal, candidate: &Arc<Wor
         .is_none_or(|workers| workers.iter().any(|worker| worker.id == candidate.id))
 }
 
-/// LoadStat 只在 `max_total_num_tokens > 0` 时提供可信容量上限。
+/// A zero LoadStat capacity is unknown and does not reject a candidate.
 fn has_kv_capacity(load: Option<&EngineWorkerLoad>, requested_tokens: u64) -> bool {
     let Some(load) = load else {
         return true;
@@ -304,8 +298,7 @@ fn compare_cache_candidates(
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 
-/// 请求内 O(1) 视图。仅在候选集合的所有 Worker 都拥有同一次捕获的外部
-/// 快照时比较外部数值；混合集保持本地 active-load 排序，从而保证传递性。
+/// Per-request lookup that uses engine pressure only for a complete fresh set.
 pub(crate) struct FreshLoadLookup<'a> {
     by_worker_id: HashMap<String, &'a EngineWorkerLoad>,
     local_active_by_worker_id: HashMap<String, usize>,
@@ -391,9 +384,7 @@ impl<'a> FreshLoadLookup<'a> {
         self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
     }
 
-    /// 为纯评分项提供与同一请求 admission 一致的队列深度：当候选集合完整
-    /// 覆盖在入口冻结的 Engine Load 快照中时，使用 `waiting + running`；否则
-    /// 整个集合一致回退到 Router 本地 active-load，避免部分新旧视图混排。
+    /// Returns engine queue depth for a complete fresh set, otherwise local load.
     pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
         self.comparable_get(&worker.id)
             .map(|load| {
@@ -473,7 +464,7 @@ fn decode_domain_fallback(
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
-/// Prefill 的真实外部比较顺序：等待请求、运行请求、KV 使用率。
+/// Compares Prefill pressure by waiting requests, running requests, and KV use.
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
@@ -501,7 +492,7 @@ fn prefill_pressure_key(load: &EngineWorkerLoad) -> (u64, u64, u64, u64) {
     )
 }
 
-/// Decode 比较也只使用 LoadStat。容量未知时不把 0 当作真实容量。
+/// Compares Decode pressure using only LoadStat values.
 pub(crate) fn compare_decode_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
