@@ -154,6 +154,9 @@ class TestUnifiedFp8QkNormRope(_StoreCase):
     def test_strided_kv_slice_matches_contiguous(self):
         """kv is a strided slice of qkv_a; aiter forwards kv.stride(0), so going
         back to assuming a packed row would corrupt silently instead of erroring
+
+        Covers both callers: the fused ring write (pools) and the caller-buffer
+        pair (k_nope/k_rope) that prefill and target-verify pass instead.
         """
         q_lora_rank = 1536  # DSV4-Pro; only its being != 0 matters here
         wide = torch.randn(
