@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -138,6 +139,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
+        alloc_num_token = self.max_bs * max(
+            self.captured_req_width, max_speculative_num_draft_tokens() or 0
+        )
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -151,13 +155,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             set_torch_compile_config()
 
         with torch.device(model_runner.device):
-            input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            input_ids = torch.zeros((alloc_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.ones(
-                (self.max_num_token,), dtype=self._cache_loc_dtype()
+                (alloc_num_token,), dtype=self._cache_loc_dtype()
             )
-            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
+            positions = torch.zeros((alloc_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, alloc_num_token), dtype=torch.int64)
 
             # Width and dtype both come from the draft `model_runner` so the
             # source stays consistent (the draft dtype matches the target dtype
@@ -170,7 +174,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             hidden_states = (
                 torch.zeros(
-                    (self.max_num_token, _hidden_size),
+                    (alloc_num_token, _hidden_size),
                     dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
@@ -243,7 +247,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.max_num_token, self.eagle_worker.dsa_index_topk),
+                (alloc_num_token, self.eagle_worker.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
@@ -272,9 +276,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         # The values depend on captured_req_width, while adaptive speculative
         # decoding owns multiple runners whose select_index buffers all have
-        # shape [max_bs]. Sharing by field name and shape would alias those
+        # shape [max_bs]. Sharing by field name would alias those
         # width-specific indices and can make a narrower graph gather OOB.
-        self.buffers.share_buffers(exclude={"select_index"})
+        self.buffers.share_buffers(exclude={"select_index", "next_token_logits_buffer"})
 
         self.backend = resolve_decode_backend(self)
 

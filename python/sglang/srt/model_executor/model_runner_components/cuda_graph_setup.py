@@ -173,11 +173,9 @@ def capture_cuda_graphs(
 
     # The eager (no-cuda-graph) phase runner, built AFTER the attention
     # backend so its __init__ can warm up kernels (run-once) and allocate the
-    # fixed-max static buffer — both before the cuda-graph runners, so that
-    # buffer is canonical in the shared pool and the cg runners coalesce onto
-    # it. Always built: it serves both the fully-disabled case (decode/prefill
-    # runners point at it) and the eager fallback when a cg runner can't run a
-    # batch.
+    # fixed-max static buffer before the cuda-graph runners. Always built: it
+    # serves both the fully-disabled case (decode/prefill runners point at it)
+    # and the eager fallback when a cg runner can't run a batch.
     eager_runner = EagerRunner(model_runner)
 
     if model_runner.is_draft_worker:

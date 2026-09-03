@@ -443,7 +443,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
         )
-        self.buffers.share_buffers()
+        self.buffers.share_buffers(exclude={"next_token_logits_buffer"})
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface, replacing
@@ -1051,8 +1051,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-
-        # wide pool, so they may alias a buffer seeded by an earlier runner (the
-        # eager registry fills them with 0). The capture-time attention-metadata
+        # wide pool, so they may alias a buffer seeded by an earlier runner with
+        # a different fill value. The capture-time attention-metadata
         # plan reads these as the per-request KV length, and the prefill wrapper
         # (DLLM_EXTEND) asserts kv_len >= qo_len, so restore the fill value the
         # captured graph needs before capturing.

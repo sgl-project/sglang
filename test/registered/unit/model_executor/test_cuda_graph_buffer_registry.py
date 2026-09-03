@@ -624,10 +624,10 @@ class TestPoolBackedAlloc(unittest.TestCase):
             r2.get_slot("ids").buffer.data_ptr(),
         )
 
-    def test_sharing_is_independent_of_registration_order(self):
+    def test_smaller_request_aliases_the_largest_registration(self):
         from sglang.srt.model_executor import input_buffers
 
-        def _ptrs(first_tokens, second_tokens):
+        def _buffers(first_tokens, second_tokens):
             input_buffers._forward_input_buffer_pool.clear()
             r1 = self._reg(max_num_tokens=first_tokens, share_pool=True)
             r1.register_slot(self._ids_slot("ids"))
@@ -636,18 +636,65 @@ class TestPoolBackedAlloc(unittest.TestCase):
             return r1.get_slot("ids").buffer, r2.get_slot("ids").buffer
 
         # Same size: shares in either order.
-        a, b = _ptrs(16, 16)
+        a, b = _buffers(16, 16)
         self.assertEqual(a.data_ptr(), b.data_ptr())
-        b2, a2 = _ptrs(16, 16)
+        b2, a2 = _buffers(16, 16)
         self.assertEqual(a2.data_ptr(), b2.data_ptr())
 
-        # Different sizes: never shares, regardless of which registers first
-        # (the old strictly-larger rule shared big-then-small but not
-        # small-then-big — that asymmetry is what this fix removes).
-        big_first, small_after = _ptrs(32, 16)
-        self.assertNotEqual(big_first.data_ptr(), small_after.data_ptr())
-        small_first, big_after = _ptrs(16, 32)
+        # Big then small: the small request is a prefix view of the big buffer.
+        big_first, small_after = _buffers(32, 16)
+        self.assertEqual(big_first.data_ptr(), small_after.data_ptr())
+        self.assertEqual(tuple(small_after.shape), (16,))
+        small_after.fill_(7)
+        self.assertTrue(torch.all(big_first[:16] == 7))
+        self.assertTrue(torch.all(big_first[16:] == 0))
+
+        # Small then big: the big request keeps its own storage (the small
+        # buffer, possibly already captured, is never repointed) and becomes
+        # canonical for later requests that fit.
+        small_first, big_after = _buffers(16, 32)
         self.assertNotEqual(small_first.data_ptr(), big_after.data_ptr())
+        r3 = self._reg(max_num_tokens=16, share_pool=True)
+        r3.register_slot(self._ids_slot("ids"))
+        self.assertEqual(r3.get_slot("ids").buffer.data_ptr(), big_after.data_ptr())
+        self.assertNotEqual(
+            r3.get_slot("ids").buffer.data_ptr(), small_first.data_ptr()
+        )
+
+    def test_share_input_buffer_aliases_row_prefixes_only(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        wide = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((16, 4), dtype=torch.int64)
+        )
+        narrow = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 4), dtype=torch.int64)
+        )
+        self.assertEqual(narrow.data_ptr(), wide.data_ptr())
+        self.assertEqual(tuple(narrow.shape), (8, 4))
+        self.assertEqual(narrow.stride(), torch.zeros((8, 4)).stride())
+
+        other_rows = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 3), dtype=torch.int64)
+        )
+        self.assertNotEqual(other_rows.data_ptr(), wide.data_ptr())
+        other_dtype = input_buffers.share_input_buffer(
+            "hidden_states", torch.zeros((8, 4), dtype=torch.int32)
+        )
+        self.assertNotEqual(other_dtype.data_ptr(), wide.data_ptr())
+        other_name = input_buffers.share_input_buffer(
+            "positions", torch.zeros((8, 4), dtype=torch.int64)
+        )
+        self.assertNotEqual(other_name.data_ptr(), wide.data_ptr())
+
+        mrope_wide = input_buffers.share_input_buffer(
+            "mrope_positions", torch.zeros((3, 16), dtype=torch.int64)
+        )
+        mrope_narrow = input_buffers.share_input_buffer(
+            "mrope_positions", torch.zeros((3, 8), dtype=torch.int64)
+        )
+        self.assertNotEqual(mrope_narrow.data_ptr(), mrope_wide.data_ptr())
 
     def test_forward_input_buffers_can_exclude_width_specific_fields(self):
         first = _PoolInputBuffers(

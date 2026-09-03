@@ -999,11 +999,10 @@ def build_eager_registry(
     is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
     pads, so the sentinel tail is never read.
 
-    ``share_pool=True`` so same-named / same-size slots coalesce through the
-    process-wide pool. The ``EagerRunner`` is built before the cuda-graph runners
-    (see ``ModelRunner.init_backends``), so its (largest) allocations are
-    canonical and the cg runners' matching slots (prefill's token-axis at
-    ``max_num_token``, decode's bs-axis at ``max_bs``) adopt them.
+    ``share_pool=False``: the eager forward copies the live ForwardBatch into
+    these slots, and the graph runners route capture forwards through it with
+    fields that are views of the pooled input buffers (the EAGLE draft
+    capture), so these slots must not alias that pool.
     """
     return build_decode_registry(
         device=device,
@@ -1020,6 +1019,6 @@ def build_eager_registry(
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
         dp_size=dp_size,
-        share_pool=True,
+        share_pool=False,
         source=None,
     )

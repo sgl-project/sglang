@@ -8,37 +8,47 @@ import torch
 
 from sglang.srt.utils import is_npu
 
-# Process-wide pool keyed by (name, numel, dtype, device); see share_input_buffer.
-_PoolKey = Tuple[str, int, torch.dtype, torch.device]
+# Process-wide pool keyed by (name, dtype, device, row shape); see share_input_buffer.
+_PoolKey = Tuple[str, torch.dtype, torch.device, Tuple[int, ...]]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
 
 
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
-    """Coalesce a buffer by ``(name, size, dtype, device)`` into the
+    """Coalesce a buffer by ``(name, dtype, device, shape[1:])`` into the
     process-wide input-buffer pool.
 
-    Distinct callers that request the same field ``name`` with the same
-    size/dtype/device share one physical allocation (and therefore one
-    ``data_ptr``): the first registrant's buffer becomes canonical and every
-    later identical request is returned as a view aliased onto it. Requests
-    that differ in size get their own allocation — they never reuse or displace
-    an existing entry — so the sharing *structure* is independent of
-    registration order and no already-captured buffer is ever repointed.
+    The pool keeps one canonical allocation per key: the registered buffer
+    with the most rows. A request with no more rows is returned as a prefix
+    of the canonical's rows (one ``data_ptr`` for every runner that fits), so
+    runners captured at different widths -- the draft / draft-extend /
+    target-verify runners of every adaptive speculative step -- share one
+    physical buffer per field. A request with more rows keeps its own storage
+    and becomes the new canonical; earlier registrants keep the tensors their
+    graphs were captured against, so no already-captured buffer is ever
+    repointed. Because a smaller request never allocates, the footprint depends
+    on registration order: the widest configuration should register first (the
+    adaptive controller builds its steps widest-first).
 
-    This pool is process-wide and governs *every* ``share_buffers()`` caller —
-    including graph runners not yet on the registry (the speculative draft /
-    draft-extend / frozen-kv-mtp / multi-layer-eagle runners), which register
-    identically-named ``input_ids`` / ``positions`` / ``out_cache_loc`` /
-    ``mrope_positions``. Cross-runner sharing is safe because those buffers are
-    filled immediately before each replay and the forwards that use them are
-    sequential / mutually exclusive.
+    This pool governs *every* ``share_buffers()`` caller. Cross-runner sharing
+    is safe because these are per-replay inputs: each runner fills the region
+    its graph reads immediately before every replay, and the forwards that use
+    them are sequential / mutually exclusive. A field whose init-time contents
+    must survive other runners (e.g. draft-extend ``select_index``) is excluded
+    via ``share_buffers(exclude=...)``.
     """
-    key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
+    if new_buffer.dim() == 0:
+        return new_buffer
+    key: _PoolKey = (
+        name,
+        new_buffer.dtype,
+        new_buffer.device,
+        tuple(new_buffer.shape[1:]),
+    )
     canonical = _forward_input_buffer_pool.get(key, None)
-    if canonical is None:
+    if canonical is None or canonical.shape[0] < new_buffer.shape[0]:
         _forward_input_buffer_pool[key] = new_buffer
         canonical = new_buffer
-    return canonical.as_strided(new_buffer.size(), new_buffer.stride())
+    return canonical[: new_buffer.shape[0]]
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba

@@ -86,8 +86,7 @@ class EagerRunner(BaseRunner):
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
-        # Built first so the cg runners coalesce onto its buffers via the shared
-        # input pool; size to the largest tokens/req across modes the worker hits.
+        # Size to the largest tokens/req across modes the worker hits.
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
