@@ -436,6 +436,105 @@ class TestFusedExperts:
         atol = rtol = precision[dtype]
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
+    # Both E2M1 zero codes, 0b0000 (+0.0) and 0b1000 (-0.0), in both nibbles.
+    @pytest.mark.parametrize("zero_byte", [0x00, 0x88, 0x08, 0x80])
+    # 0 and 255 are the ends of the E8M0 range; 127 is the identity scale.
+    @pytest.mark.parametrize("e8m0", [0, 1, 127, 200, 254, 255])
+    def test_mxfp4_moe_zero_codes_stay_zero(self, zero_byte, e8m0):
+        """A zero E2M1 code stays zero for every E8M0 exponent.
+
+        The unpack applies the block scale as an integer add on the bf16
+        exponent field, which is exact for every value in the E2M1 codebook
+        except the two zeros: 0x0000 and 0x8000 have no exponent to shift, so
+        adding to them produces a small finite number instead of zero. Both are
+        special-cased, and this is the invariant that special case exists for.
+
+        Worth pinning separately from test_mxfp4_moe: there the zero codes are a
+        small fraction of random weights and a broken special case would stay
+        inside the bf16 tolerance for the low exponents. Here every weight is a
+        zero, so the output is exactly zero or it is not.
+        """
+        M, N, K, E = 4, 64, 64, 2
+
+        a = torch.randn(M, K, dtype=dtype)
+        w1q = torch.full((E, 2 * N, K // 2), zero_byte, dtype=torch.uint8)
+        w1s = torch.full((E, 2 * N, K // 32), e8m0, dtype=torch.uint8)
+        w1_packed = kernel.convert_weight_packed(w1q)
+        w1s_packed = kernel.convert_scale_packed(w1s)
+        # w2 is ordinary: the zeros have to survive the first GEMM and the
+        # activation, and a nonzero w2 is what would expose it if they did not.
+        _, w2_packed, w2s_packed = make_mxfp4_weights(E, K, N, dtype=dtype)
+
+        topk_weight = torch.ones((M, 1), dtype=torch.float32)
+        topk_ids = torch.zeros((M, 1), dtype=torch.int32)
+
+        out = run_fused_experts(
+            a,
+            w1_packed,
+            w2_packed,
+            topk_weight,
+            topk_ids,
+            quant=CPUQuantMethod.MXFP4,
+            w1_scale=w1s_packed,
+            w2_scale=w2s_packed,
+            is_vnni=True,
+            inplace=False,
+        )
+
+        # silu(0) * 0 = 0, so the whole layer collapses to exactly zero. Not
+        # assert_close: any nonzero output here is a wrong unpack, not rounding.
+        assert torch.equal(out, torch.zeros_like(out)), (
+            f"zero code 0x{zero_byte:02x} with e8m0={e8m0} produced "
+            f"max |out| = {out.abs().max().item()}"
+        )
+
+    # Moderate exponents only: 6.0 * 2**(255-127) is not representable in bf16
+    # and the comparison would be inf against inf.
+    @pytest.mark.parametrize("e8m0", [120, 127, 134])
+    def test_mxfp4_moe_zero_codes_mixed_with_nonzero(self, e8m0):
+        """Zeros and non-zeros inside the same 32-element scale block.
+
+        test_mxfp4_moe_zero_codes_stay_zero sets every weight to a zero code, so
+        it passes even if the zero check is done once per block. This one mixes
+        both kinds inside every block, so the check has to be per lane. A single
+        shared exponent keeps the reference a plain power of two.
+        """
+        M, N, K, E = 4, 64, 64, 2
+
+        a = torch.randn(M, K, dtype=dtype) / 10
+        # Alternate a zero byte and a non-zero one along K, so every scale block
+        # holds both kinds.
+        pattern = torch.tensor([0x88, 0x21], dtype=torch.uint8).repeat(K // 4)
+        w1q = pattern.view(1, 1, -1).expand(E, 2 * N, K // 2).contiguous()
+        w1s = torch.full((E, 2 * N, K // 32), e8m0, dtype=torch.uint8)
+        w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
+        w1_packed = kernel.convert_weight_packed(w1q)
+        w1s_packed = kernel.convert_scale_packed(w1s)
+
+        w2dq, w2_packed, w2s_packed = make_mxfp4_weights(E, K, N, dtype=dtype)
+
+        topk_weight = torch.ones((M, 1), dtype=torch.float32)
+        topk_ids = torch.zeros((M, 1), dtype=torch.int32)
+
+        ref_out = native_fp8_fused_moe(
+            a, w1dq.float(), w2dq.float(), topk_weight, topk_ids, 1
+        )
+        out = run_fused_experts(
+            a,
+            w1_packed,
+            w2_packed,
+            topk_weight,
+            topk_ids,
+            quant=CPUQuantMethod.MXFP4,
+            w1_scale=w1s_packed,
+            w2_scale=w2s_packed,
+            is_vnni=True,
+            inplace=False,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
     @pytest.mark.parametrize("m", [1, 32])
     @pytest.mark.parametrize("n", [128, 64])
     @pytest.mark.parametrize("k", [128, 64])
