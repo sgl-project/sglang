@@ -4,8 +4,8 @@ A worker with ``control_port = 0`` or a wildcard advertise host comes up,
 offloads, gets indexed by the router and receives hints -- every fetch just
 fails to reach it, which presents as "P2P does not work on this branch".
 
-``get_timeout_s <= operation_timeout_ms`` is worse: it corrupts. See
-:class:`TimeoutOrderingValidationTest`.
+``get_timeout_s`` is the adapter's soft overdue threshold and must remain above
+the core operation deadline. See :class:`TimeoutOrderingValidationTest`.
 
 Needs no ``kvcr`` wheel: ``KVCRBackendConfig`` is a plain msgspec struct.
 
@@ -51,13 +51,10 @@ class RemoteHintEndpointValidationTest(unittest.TestCase):
 class TimeoutOrderingValidationTest(unittest.TestCase):
     """``get_timeout_s`` must outlast ``operation_timeout_ms``.
 
-    ``_drain_until`` abandons an op at ``get_timeout_s`` and cannot cancel it:
-    ``kvcr.abort()`` is a no-op stub and NIXL's cancellation releases the transfer
-    handle without fencing an in-flight DMA. HiCache then frees that op's host pages
-    and hands them to the next prefetch. Only the core giving up first keeps that
-    safe. Invert the order and an abandoned transfer writes into pages another
-    request owns -- KVCR block keys are token hashes with no content check, so it
-    surfaces as wrong generated text, not an error.
+    ``_drain_until`` retains page ownership until terminal even after this soft
+    threshold. Keeping it above the core deadline makes the warning mean that
+    KVCR's own timeout path also failed to retire the operation, rather than
+    reporting an operation that is still within its configured budget.
     """
 
     def test_get_timeout_below_operation_timeout_is_refused(self):

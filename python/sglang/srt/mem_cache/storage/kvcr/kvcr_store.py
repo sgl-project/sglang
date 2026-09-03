@@ -67,9 +67,9 @@ import socket
 import threading
 import time
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import msgspec
 import torch
@@ -146,10 +146,6 @@ _PUMP_JOIN_TIMEOUT_S = 1.0
 # way for an operator to tell "the router stopped hinting" from "the transfers
 # are failing", which need fixes in different repositories.
 _STATS_LOG_INTERVAL_S = 30.0
-
-# How many abandoned op handles to remember. Arbitrary; large enough to cover
-# the ops in flight when a stall starts, small enough to stay negligible.
-_ABANDONED_OP_HISTORY = 256
 
 # The only transport KVCR's ZMQ control channel can dial a peer over, and the
 # bind wildcards that are legal to bind but cannot be dialed. Loopback is *not*
@@ -282,10 +278,12 @@ def _fail_closed(on_error):
     it ``HiRadixCache`` never calls ``entry.release_host()`` and backed-up nodes
     pin host pages forever).
 
-    So a fault degrades to "this batch missed": HiCache recomputes, which is
-    always correct -- KV that was never delivered cannot be wrong KV. ``on_error``
-    builds that miss from the same arguments the method received, because a
-    caller reads the shape of the result, not just its truthiness.
+    So a fault degrades to "this batch missed": HiCache recomputes. That is safe
+    before an asynchronous operation is accepted, and after it reports terminal.
+    ``_submit_and_wait`` contains polling faults between those boundaries so this
+    guard can never return a live operation's framework-owned pages as a miss.
+    ``on_error`` builds the miss from the same arguments the method received,
+    because a caller reads the shape of the result, not just its truthiness.
 
     Deliberately not applied to ``close()`` or ``register_mem_pool_host()``:
     those run on the scheduler thread during setup and teardown, where an
@@ -520,26 +518,10 @@ class KVCRStore(HiCacheStorage):
         # Handles a _drain_until is currently blocked on. A completion for
         # anything else is dropped rather than stashed.
         #
-        # Tracking live waiters is what bounds this: the obvious alternative --
-        # a set of *abandoned* handles, pruned when the late result shows up --
-        # assumes every op eventually reports, and one class of them never does.
-        # kvcr.abort() is a no-op stub (core.py returns False with a TODO), so a
-        # timed-out op stays in flight; a remote deliver whose source went silent
-        # parks in KVCR's WAITING_TERMINAL state, which is only left by a
-        # write_done notification that a dead peer never sends. Measured against
-        # the real core: 6/6 hinted delivers at a dead source never reported.
-        # Keyed on abandoned handles, each of those leaves an entry behind for
-        # the life of the scheduler; keyed on live waiters, the set is bounded by
-        # concurrency and a never-reporting op costs nothing here.
+        # A waiter remains live until the core reports terminal. KVCR cannot yet
+        # abort/fence a remote write, so returning on a wall-clock deadline would
+        # let HiCache reuse a destination the NIC may still mutate.
         self._waiting_ops: Set[int] = set()
-        # Handles a _drain_until gave up on. Kept only so a completion that
-        # arrives afterwards can be reported as the hazard it is rather than
-        # dropped as an ordinary late tick (see _poll_once). Bounded by the
-        # deque, because the ops that never report would otherwise accumulate
-        # for the life of the scheduler -- the same reason _waiting_ops keys on
-        # live waiters. Old entries fall out and degrade to the previous
-        # behaviour, which is the right way to lose this signal.
-        self._abandoned_ops: Deque[int] = deque(maxlen=_ABANDONED_OP_HISTORY)
         # Serializes poll_completed() between the prefetch thread (_drain_until)
         # and the source pump. poll_completed() both drains a queue and advances
         # core state machines, so two callers must not interleave.
@@ -1096,20 +1078,7 @@ class KVCRStore(HiCacheStorage):
         with self._poll_lock:
             for done_handle, entries in kvcr.poll_completed():
                 if done_handle not in self._waiting_ops:
-                    if done_handle in self._abandoned_ops:
-                        # The op we gave up on was still live afterwards, so its
-                        # transfers were in flight while HiCache owned the pages
-                        # again. Nothing here can undo that; naming it is the
-                        # only way an operator learns the hazard fired at all.
-                        self._note("abandoned_op_reported_late")
-                        logger.warning(
-                            "KVCRStore: abandoned op %s reported after its "
-                            "deadline; its transfers outlived the host pages "
-                            "HiCache reclaimed. Raise get_timeout_s.",
-                            done_handle,
-                        )
-                    else:
-                        self._note("late_completions_dropped")
+                    self._note("late_completions_dropped")
                     continue
                 self._completed_ops[done_handle] = entries
 
@@ -1935,8 +1904,8 @@ class KVCRStore(HiCacheStorage):
         before anyone can drain its completion. Registering afterwards would
         race: a local-tier deposit can finish in microseconds while the source
         pump polls every 5 ms, so the pump would see a completion with no waiter,
-        drop it as late, and the caller would sit out the full ``get_timeout_s``
-        before reporting a miss on an op that actually succeeded.
+        drop it as late, and the caller would wait forever for an op that
+        actually succeeded.
 
         The handle comes back because it is the only join between our logs and
         KVCR's -- a failure here is usually diagnosed from the core's side.
@@ -1957,7 +1926,7 @@ class KVCRStore(HiCacheStorage):
             self._waiting_ops.add(op_handle)
 
     def _drain_until(self, op_handle: int, timeout_s: Optional[float] = None) -> Dict:
-        """Pump kvcr.poll_completed() until op_handle reports, or the deadline passes.
+        """Pump kvcr.poll_completed() until ``op_handle`` reports terminal.
 
         Blocking here is the contract, not a compromise: this runs on the HiCache
         controller's dedicated ``prefetch_io_aux_func`` daemon thread, and
@@ -1975,53 +1944,59 @@ class KVCRStore(HiCacheStorage):
         waiting on. Completions for other in-flight ops are stashed, never
         dropped.
 
-        Leaving deregisters this handle, whether the result arrived or the
-        deadline did. Those two exits are not equally safe and the difference is
-        not visible to the caller, so they are counted separately here.
-
-        A *reported* op is finished: the core has retired its transfers, and the
-        host pages HiCache frees on our return are nobody's target. An
-        *abandoned* op is not. ``kvcr.abort()`` is a no-op stub, so we cannot
-        cancel it, only agree to ignore whatever it reports -- or never reports.
-        ``get_timeout_s > operation_timeout_ms`` (enforced in
-        ``KVCRBackendConfig``) means both ends have passed their own deadline by
-        the time we give up, so no *new* descriptor is submitted after this
-        point; it does not fence a descriptor the NIC has already begun. Closing
-        that needs a per-op quiescence signal from KVCR, which is filed upstream.
-
-        Until it exists, an abandoned handle is remembered (bounded) so a result
-        that shows up afterwards is reported as such rather than dropped as an
-        ordinary late tick. That late report is the only observable the hazard
-        has: it says a transfer was still live after HiCache took its pages
-        back. Do not shorten this wait below the core's deadline.
+        ``timeout_s`` is a soft observability threshold, not an ownership
+        deadline. The adapter has no successful abort/quiescence result it can
+        use today, so returning before KVCR reports terminal would let HiCache
+        recycle a host page that an old transfer can still overwrite. An overdue
+        peer therefore stalls this one prefetch thread until the core reports. A
+        bounded fallback requires a KVCR terminal/quiescence contract or a
+        KVCR-owned staging destination; it cannot be implemented safely in this
+        adapter alone.
         """
         timeout = self._config.get_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout
         sleep_s = _DRAIN_POLL_MIN_S
-        abandoned = False
+        overdue = False
+        poll_faulted = False
         try:
             self._register_waiter(op_handle)
             while True:
                 # Always go through the stash: the source pump drains the same
                 # queue, so our own completion may well be observed by it rather
                 # than by the poll below.
-                self._poll_once(self._kvcr)
+                try:
+                    self._poll_once(self._kvcr)
+                except Exception:
+                    # Submission already handed the core ownership of the
+                    # transfer descriptors. A poll fault cannot prove that the
+                    # transfer is quiescent, so keep the waiter and its framework
+                    # pages alive. If the core recovers, a later poll (ours or the
+                    # source pump's) will still deliver the terminal result.
+                    if not poll_faulted:
+                        self._note("op_poll_fault_waiting_terminal")
+                        logger.warning(
+                            "KVCRStore: polling op %s failed after submission; "
+                            "retaining its host pages until the core reports "
+                            "terminal.",
+                            op_handle,
+                            exc_info=True,
+                        )
+                        poll_faulted = True
                 with self._poll_lock:
                     stashed = self._completed_ops.pop(op_handle, None)
                 if stashed is not None:
                     self._note_entry_statuses(stashed)
                     return {k: v.success for k, v in stashed.items()}
-                if time.monotonic() >= deadline:
-                    self._note("op_abandoned_on_timeout")
+                if not overdue and time.monotonic() >= deadline:
+                    self._note("op_overdue_waiting_terminal")
                     logger.warning(
                         "KVCRStore: op %s did not complete within %.1fs; "
-                        "abandoning it. Its host pages return to HiCache while "
-                        "the core still owns the op.",
+                        "retaining its host pages until the core reports "
+                        "terminal.",
                         op_handle,
                         timeout,
                     )
-                    abandoned = True
-                    return {}
+                    overdue = True
                 time.sleep(sleep_s)
                 sleep_s = min(sleep_s * 2, _DRAIN_POLL_MAX_S)
         finally:
@@ -2030,8 +2005,6 @@ class KVCRStore(HiCacheStorage):
                 # A completion can land between the last poll and here; drop it
                 # now rather than leave it for a pop that will never come.
                 self._completed_ops.pop(op_handle, None)
-                if abandoned:
-                    self._abandoned_ops.append(op_handle)
 
     # ------------------------------------------------------------------
     # v1 zero-copy interface (HiRadixCache path)

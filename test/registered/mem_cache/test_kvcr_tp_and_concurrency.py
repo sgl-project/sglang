@@ -78,6 +78,15 @@ else:  # pragma: no cover - wheel not installed on this tier
 _needs_kvcr = unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
 
 
+def _wait_until(predicate, timeout_s: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
 class TestKVCRImports(unittest.TestCase):
     """Fail loudly when an installed kvcr no longer satisfies this adapter."""
 
@@ -236,13 +245,19 @@ class FakeKVCR:
     def __init__(self) -> None:
         self._pending: List[Tuple[int, Dict]] = []
         self._lock = threading.Lock()
+        self.submitted = threading.Event()
         self.poll_calls = 0
         self.next_handle = 100
+        self.last_handle = None
+        self.last_destinations = None
 
     def deliver(self, destinations, request_id=None) -> int:
         with self._lock:
             self.next_handle += 1
-            return self.next_handle
+            self.last_handle = self.next_handle
+            self.last_destinations = destinations
+            self.submitted.set()
+            return self.last_handle
 
     def finish(self, op_handle: int, keys: List[str]) -> None:
         with self._lock:
@@ -254,6 +269,21 @@ class FakeKVCR:
             drained = self._pending
             self._pending = []
             return drained
+
+
+class RecoverablePollFaultKVCR(FakeKVCR):
+    """Accept an op, then fail polling until the test explicitly recovers it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poll_faulted = threading.Event()
+        self.poll_recovered = threading.Event()
+
+    def poll_completed(self):
+        if not self.poll_recovered.is_set():
+            self.poll_faulted.set()
+            raise RuntimeError("injected post-submit poll fault")
+        return super().poll_completed()
 
 
 @_needs_kvcr
@@ -1541,16 +1571,6 @@ class ConcurrentDrainTest(unittest.TestCase):
 
         self.assertEqual(result, {"seg-a": True})
 
-    def test_timeout_returns_empty_rather_than_raising(self):
-        """A late peer must degrade to a recompute, not kill the prefetch thread.
-
-        _drain_until runs on HiCache's prefetch daemon; an exception there takes
-        out storage prefetching for the whole engine.
-        """
-        result = self.store._drain_until(401, timeout_s=0.05)
-
-        self.assertFalse(result)
-
 
 @_needs_kvcr
 class CloseTest(unittest.TestCase):
@@ -1587,12 +1607,7 @@ class CloseTest(unittest.TestCase):
 
 @_needs_kvcr
 class RemoteFailureTest(unittest.TestCase):
-    """A remote source that is slow, gone, or lying must degrade to recompute.
-
-    All three are normal for a P2P cache. Raising out of ``batch_get_v2`` kills the
-    prefetch thread HiCache never restarts, taking down *local* L3 for the life of
-    the process; hanging stalls it just as permanently.
-    """
+    """A late remote source must not outlive its framework destination."""
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
@@ -1603,25 +1618,79 @@ class RemoteFailureTest(unittest.TestCase):
         """A PoolTransfer-alike whose host descriptors always resolve."""
         return SimpleNamespace(name=PoolName.KV, keys=keys)
 
-    def test_a_source_that_never_answers_reports_a_miss_rather_than_hanging(self):
-        """``kvcr.abort()`` cancels nothing, so ``_drain_until``'s deadline is all
-        that stands between a dead peer and a permanently wedged prefetch thread.
-        """
-        self.store._kvcr = FakeKVCR()  # finish() is never called
+    def test_remote_timeout_does_not_return_framework_page_before_terminal(self):
+        """The caller retains its page until a late native write is terminal."""
+        core = FakeKVCR()
+        self.store._kvcr = core
+        self.store._config = SimpleNamespace(get_timeout_s=0.05)
+        page = bytearray(b"before")
         self.store._host_descriptors = lambda transfer: (
-            {"seg-a": object()},
+            {"seg-a": page},
             [["seg-a"]],
         )
+        result = {}
 
-        started = time.monotonic()
-        results = self.store._deliver_transfer(
-            self._transfer(["page-a"]), request_id="req-1"
+        def deliver():
+            result["pages"] = self.store._deliver_transfer(
+                self._transfer(["page-a"]), request_id="req-1"
+            )
+
+        thread = threading.Thread(target=deliver)
+        thread.start()
+        self.assertTrue(core.submitted.wait(timeout=1.0))
+
+        self.assertTrue(
+            _wait_until(
+                lambda: self.store.stats().get("op_overdue_waiting_terminal", 0) == 1
+            )
         )
-        elapsed = time.monotonic() - started
+        self.assertTrue(thread.is_alive())
+        self.assertIn(core.last_handle, self.store._waiting_ops)
+        self.assertEqual(self.store.stats()["op_overdue_waiting_terminal"], 1)
 
-        self.assertEqual(results, [False])
-        # Bounded by the configured get timeout, not by the caller giving up.
-        self.assertLess(elapsed, self.store._config.get_timeout_s + 5.0)
+        # Model a DMA that lands after the wall-clock budget, then its terminal
+        # completion. HiCache must not be able to reuse the page between them.
+        core.last_destinations["seg-a"][:] = b"late!!"
+        core.finish(core.last_handle, ["seg-a"])
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["pages"], [True])
+        page[:] = b"reused"
+        self.assertEqual(page, b"reused")
+
+    def test_poll_fault_after_submit_retains_page_until_terminal(self):
+        """A post-submit polling fault cannot turn a live DMA into a miss."""
+        core = RecoverablePollFaultKVCR()
+        self.store._kvcr = core
+        self.store._config = SimpleNamespace(get_timeout_s=0.05)
+        page = bytearray(b"before")
+        self.store._host_descriptors = lambda transfer: (
+            {"seg-a": page},
+            [["seg-a"]],
+        )
+        result = {}
+
+        def deliver():
+            result["pages"] = self.store._deliver_transfer(
+                self._transfer(["page-a"]), request_id="req-1"
+            )
+
+        thread = threading.Thread(target=deliver)
+        thread.start()
+        self.assertTrue(core.submitted.wait(timeout=1.0))
+        self.assertTrue(core.poll_faulted.wait(timeout=1.0))
+
+        self.assertTrue(thread.is_alive())
+        self.assertIn(core.last_handle, self.store._waiting_ops)
+
+        core.last_destinations["seg-a"][:] = b"late!!"
+        core.finish(core.last_handle, ["seg-a"])
+        core.poll_recovered.set()
+        thread.join(timeout=1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["pages"], [True])
 
     def test_a_hint_covering_nothing_leaves_the_prefix_at_zero(self):
         """``batch_exists_v2`` is the gate: the controller allocates host memory
