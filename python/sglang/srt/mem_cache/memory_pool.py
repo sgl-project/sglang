@@ -1384,6 +1384,38 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
 
+    @property
+    def mamba_v2p_table(self) -> Optional[torch.Tensor]:
+        """The mamba virtual->physical slot table, or None when the ids this
+        pool hands out are already physical.
+
+        Exists so the replay fast path can fold the translate into its own
+        launch instead of excluding any pool that overrides
+        `translate_mamba_indices`.
+        """
+        return None
+
+    @property
+    def mamba_translate_is_fusable(self) -> bool:
+        """Whether `fused_replay_state_indices` can reproduce this pool's
+        `translate_mamba_indices` inside its own launch.
+
+        It can express exactly two shapes: the identity, and one gather through
+        `mamba_v2p_table`. Anything else has to run the unfused reference
+        chain, so the default answers for the identity by checking that the
+        method is still this class's -- a subclass that replaces it with
+        something the kernel cannot express is then excluded automatically,
+        rather than silently mis-served. A subclass whose translate IS one of
+        the two shapes says so by publishing `mamba_v2p_table` or by
+        overriding this.
+        """
+        if self.mamba_v2p_table is not None:
+            return True
+        return (
+            type(self).translate_mamba_indices
+            is HybridReqToTokenPool.translate_mamba_indices
+        )
+
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba-slot translate. Identity for a static pool
         (slots are physical); UnifiedHybridReqToTokenPool overrides it for the
