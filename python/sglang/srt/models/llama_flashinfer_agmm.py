@@ -283,7 +283,7 @@ class LlamaFlashInferAgmmTrueSP:
             or int(parallel.pp_size) != 1
         ):
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires TP4 or TP8, " "DP1, CP1, PP1"
+                "--enable-flashinfer-agmm-true-sp requires TP4 or TP8, DP1, CP1, PP1"
             )
         if not bool(get_exec().graph.disable_cuda_graph):
             raise RuntimeError(
@@ -291,8 +291,7 @@ class LlamaFlashInferAgmmTrueSP:
             )
         if not bool(get_schedule().disable_overlap_schedule):
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires "
-                "--disable-overlap-schedule"
+                "--enable-flashinfer-agmm-true-sp requires --disable-overlap-schedule"
             )
         if not bool(get_memory().disable_radix_cache):
             raise RuntimeError(
@@ -305,7 +304,7 @@ class LlamaFlashInferAgmmTrueSP:
             )
         if int(get_schedule().max_running_requests) != 1:
             raise RuntimeError(
-                "--enable-flashinfer-agmm-true-sp requires " "--max-running-requests 1"
+                "--enable-flashinfer-agmm-true-sp requires --max-running-requests 1"
             )
         if get_exec().kernel.attention_backend != "flashinfer":
             raise RuntimeError(
