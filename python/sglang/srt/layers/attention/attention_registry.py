@@ -206,6 +206,18 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    if get_parallel().dcp_enabled:
+        _, decode_backend = attention_backends_of(resolved_view(runner.server_args))
+        if decode_backend == "flashmla":
+            raise ValueError(
+                "flashmla cannot serve decode context parallelism: it builds its "
+                "decode block table straight off the DCP-widened req_to_token "
+                "with the global seq_lens, so the rows name widened pages rather "
+                "than this rank's physical ones and the kernel is told to read "
+                "the whole sequence out of one shard. Select cutedsl_mla, "
+                "tokenspeed_mla or trtllm_mla for decode; flashmla stays "
+                "available for prefill via --prefill-attention-backend."
+            )
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
