@@ -1251,7 +1251,7 @@ def handle_rerun_test(
 
     if include_changed_tests:
         changed = changed_test_files(pr)
-        if not changed:
+        if not changed and not test_specs:
             comment.create_reaction("confused")
             pr.create_issue_comment(
                 f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no test files "
