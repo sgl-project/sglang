@@ -572,6 +572,7 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = dataclasses.field(default_factory=dict)
+    flashinfer_megamoe_workspaces: dict = dataclasses.field(default_factory=dict)
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None

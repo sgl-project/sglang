@@ -280,6 +280,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
@@ -294,6 +295,7 @@ add_moe_runner_backend_choices = MOE_RUNNER_BACKEND_CHOICES.extend
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
@@ -2376,6 +2378,7 @@ class ServerArgs:
             "deepep_v2",
             "ascend_tp",
             "pplx",
+            "flashinfer_megamoe",
         ],
         Arg(
             help="Choose the backend for MoE A2A.",
@@ -2391,6 +2394,7 @@ class ServerArgs:
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
+                "flashinfer_megamoe",
             ],
             resolvable=True,
         ),
@@ -2428,6 +2432,11 @@ class ServerArgs:
         "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
         NS("exec.moe"),
     ] = "default"
+    flashinfer_megamoe_mxfp8_precision: A[
+        Literal["default", "bf16"],
+        "Choose the computation precision of FlashInfer MegaMOE MXFP8 experts.",
+        NS("exec.moe"),
+    ] = "default"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
@@ -2443,6 +2452,11 @@ class ServerArgs:
         "Select DeepEP dispatcher output dtype",
         NS("exec.moe"),
     ] = "auto"
+    flashinfer_a2a_dispatch_type: A[
+        Optional[Literal["auto", "bf16", "nvfp4", "mxfp8"]],
+        "Select FlashInfer A2A dispatcher activation dtype.",
+        NS("exec.moe"),
+    ] = None
     ep_num_redundant_experts: A[
         int,
         "Allocate this number of redundant experts in expert parallel.",

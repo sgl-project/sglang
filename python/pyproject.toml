@@ -55,6 +55,7 @@ dependencies = [
   "nvidia-cutlass-dsl[cu13]==4.6.2",
   "nvidia-mathdx==25.6.0",
   "nvidia-ml-py",
+  "nvshmem4py-cu13",
   "openai==2.6.1",
   "openai-harmony==0.0.4",
   "orjson",
