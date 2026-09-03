@@ -116,9 +116,9 @@ class WeightChecker:
             view = allocator.allocate(param)
             view.copy_(param.detach())
             snapshot_tensors[name] = view
-        assert len(snapshot_tensors) == len(
-            named_params
-        ), f"should not have duplicated tensor name"
+        assert len(snapshot_tensors) == len(named_params), (
+            f"should not have duplicated tensor name"
+        )
         # publish only after every copy succeeded, so a failed snapshot holds no arena
         self._snapshot_arena = allocator.arena
         self._snapshot_tensors = snapshot_tensors
@@ -230,9 +230,9 @@ def _check_tensors(
             # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
             continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
-        assert (
-            should_compare == actual_should_compare
-        ), f"{should_compare=} {actual_should_compare=}"
+        assert should_compare == actual_should_compare, (
+            f"{should_compare=} {actual_should_compare=}"
+        )
         name = expect_name
 
         try:
