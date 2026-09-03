@@ -1097,6 +1097,16 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
                 expected = base + max(lora, 0) * num_experts
                 self.assertEqual(virtual_ids[m, k].item(), expected)
 
+    def test_out_of_range_expert_cannot_alias_another_adapter(self):
+        slots = torch.arange(4, dtype=torch.int32, device=self.device)
+        ids = torch.tensor([[255, 256]], dtype=torch.int32, device=self.device).repeat(
+            4, 1
+        )
+        invalid, _, _ = _fused_virtual_topk_ids(ids, slots, 256, False, 4)
+        self.assertTrue(torch.all(invalid[:, 1] == -1))
+        valid, _, _ = _fused_virtual_topk_ids(ids, slots, 257, False, 4)
+        torch.testing.assert_close(valid[:, 1], slots * 257 + 256)
+
     def test_no_lora_token_has_no_virtual_expert(self):
         """A missing adapter never occupies a virtual expert, including slot zero."""
         topk_ids = torch.tensor([[3, 5]], dtype=torch.int32, device=self.device)
