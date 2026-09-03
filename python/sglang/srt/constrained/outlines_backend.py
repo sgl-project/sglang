@@ -28,6 +28,10 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     InvalidGrammarObject,
 )
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_outlines_json_schema,
+)
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 try:
@@ -165,11 +169,17 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
 
     def dispatch_json(self, key_string: str):
         try:
+            validate_outlines_json_schema(json.loads(key_string))
             regex = build_regex_from_object(
                 key_string,
                 whitespace_pattern=self.whitespace_pattern,
             )
-        except (NotImplementedError, json.decoder.JSONDecodeError, ValueError) as e:
+        except (
+            NotImplementedError,
+            UnsupportedJSONSchemaFeature,
+            json.decoder.JSONDecodeError,
+            ValueError,
+        ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._compile_regex(regex)
