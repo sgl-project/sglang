@@ -882,8 +882,9 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             model_device = local_torch_device
 
         encoder_tp_group = get_folding_tp_group(model_config)
-        with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
-            PRECISION_TO_TYPE[dtype]
+        with (
+            use_tensor_parallel_group(encoder_tp_group),
+            set_default_torch_dtype(PRECISION_TO_TYPE[dtype]),
         ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])

@@ -110,9 +110,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             return None
         section = self.mrope_section
         num_pairs = self.rotary_dim // 2
-        assert (
-            len(section) == 3 and sum(section) == num_pairs
-        ), f"mrope_section {section} must be three axes summing to {num_pairs}"
+        assert len(section) == 3 and sum(section) == num_pairs, (
+            f"mrope_section {section} must be three axes summing to {num_pairs}"
+        )
         if self.mrope_interleaved_glm:
             axes = []
             spent = [0, 0, 0]
@@ -179,9 +179,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
+        assert fused_set_kv_buffer_arg is None, (
+            "save kv cache is not supported for MRotaryEmbedding."
+        )
         assert positions.ndim == 1 or positions.ndim == 2
 
         cos_sin = self.cos_sin_cache[positions]
@@ -282,9 +282,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for npu implementation"
+        )
         if query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"

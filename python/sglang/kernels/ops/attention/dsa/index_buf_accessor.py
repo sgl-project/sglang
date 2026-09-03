@@ -309,9 +309,9 @@ def _set_k_and_s_triton(
     assert scale_dim == 1
     if _is_hip:
         if _use_aiter_preshuffle:
-            assert (
-                page_size % 16 == 0
-            ), f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            assert page_size % 16 == 0, (
+                f"HIP preshuffle requires page_size to be a multiple of 16, got {page_size}"
+            )
     elif _is_xpu:
         assert page_size in (
             64,

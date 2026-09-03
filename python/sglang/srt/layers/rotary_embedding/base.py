@@ -242,9 +242,9 @@ class RotaryEmbedding(BaseFusedOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for native implementation"
+        )
 
         if offsets is not None:
             positions = positions + offsets
@@ -284,9 +284,9 @@ class RotaryEmbedding(BaseFusedOp):
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for npu implementation"
+        )
         if (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
@@ -343,9 +343,9 @@ class RotaryEmbedding(BaseFusedOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for cpu implementation"
+        )
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
@@ -386,7 +386,6 @@ class RotaryEmbedding(BaseFusedOp):
                 fused_args=fused_set_kv_buffer_arg,
             )
         else:
-
             if fused_set_kv_buffer_arg is not None and _is_hip:
                 extra_args = fused_set_kv_buffer_arg
                 k_cache = fused_set_kv_buffer_arg["key_cache"]
@@ -419,9 +418,9 @@ class RotaryEmbedding(BaseFusedOp):
                     **extra_args,
                 )
             else:
-                assert (
-                    fused_set_kv_buffer_arg is None
-                ), "save kv cache is not supported for fallback_rotary_embedding."
+                assert fused_set_kv_buffer_arg is None, (
+                    "save kv cache is not supported for fallback_rotary_embedding."
+                )
                 self.cos_sin_cache = self.cos_sin_cache.to(
                     query.device, dtype=query.dtype
                 )
@@ -449,9 +448,9 @@ class RotaryEmbedding(BaseFusedOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        assert fused_set_kv_buffer_arg is None, (
+            "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        )
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
         # Fused_qk_rope only supports aligned head_size
