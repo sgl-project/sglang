@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -40,6 +41,13 @@ except ModuleNotFoundError:
 logger = init_logger(__name__)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# Diffusion image tokens make the output of a TP row-parallel projection much
+# larger than the token batches typically seen by the SRT custom all-reduce.
+# Qwen-Image at 1024x1024, for example, reduces 24 MiB tensors. Keep those on
+# the tuned CUDA kernel instead of falling back to NCCL at the default 16 MiB
+# workspace limit.
+_DIFFUSION_CUSTOM_AR_MAX_SIZE = 32 * 1024 * 1024
 
 
 _group_name_counter: dict[str, int] = {}
@@ -79,8 +87,7 @@ def _split_tensor_dict(
     tensor_list = []
     for key, value in tensor_dict.items():
         assert "%" not in key, (
-            "Avoid having '%' in key "
-            "as it is used as a separator for nested entries."
+            "Avoid having '%' in key as it is used as a separator for nested entries."
         )
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
@@ -121,6 +128,18 @@ def _update_nested_dict(nested_dict, flattened_key, value):
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream | None
+
+
+def new_device_group(ranks, backend=None):
+    """Create a process group for device collectives.
+
+    A single-rank group never runs one: every collective short-circuits on
+    world_size == 1. NCCL would still allocate its per-channel device buffers
+    for it, which costs ~390 MiB a group.
+    """
+    return torch.distributed.new_group(
+        ranks, backend="gloo" if len(ranks) == 1 else backend
+    )
 
 
 class GroupCoordinator:
@@ -169,9 +188,7 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            device_group = new_device_group(ranks, torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             with suppress_stdout():
@@ -228,14 +245,33 @@ class GroupCoordinator:
         self.use_custom_op_call = False
 
     def _init_srt_custom_allreduce(self) -> None:
-        from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
+        custom_allreduce_kwargs = {
+            "group": self.cpu_group,
+            "device": self.device,
+        }
+        if current_platform.is_cuda():
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+            from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+                CustomAllReduceV2,
+            )
 
-        self.srt_custom_allreduce = CustomAllreduce(
-            group=self.cpu_group,
-            device=self.device,
-        )
+            custom_allreduce_cls = dispatch_custom_allreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            if custom_allreduce_cls is CustomAllReduceV2:
+                custom_allreduce_kwargs["max_size"] = _DIFFUSION_CUSTOM_AR_MAX_SIZE
+        else:
+            # Preserve the existing ROCm and MUSA implementation selection.
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+
+            custom_allreduce_cls = CustomAllreduce
+
+        self.srt_custom_allreduce = custom_allreduce_cls(**custom_allreduce_kwargs)
 
     @property
     def first_rank(self):
@@ -363,9 +399,9 @@ class GroupCoordinator:
                 and not custom_ar.disabled
                 and custom_ar.should_custom_ar(input_)
             ):
-                if custom_ar._IS_CAPTURING:
-                    return custom_ar.custom_all_reduce(input_)
-                return custom_ar._all_reduce_impl(input_, registered=False)
+                output = custom_ar.custom_all_reduce(input_)
+                if output is not None:
+                    return output
             if (
                 current_platform.is_cpu()
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
@@ -388,9 +424,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -407,9 +443,7 @@ class GroupCoordinator:
         ):
             return torch.ops.sgl_kernel.shm_allgather(input_, dim)
         else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
-            )
+            all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
@@ -446,9 +480,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert (
-            -input_.dim() <= dim < input_.dim()
-        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
@@ -564,9 +598,9 @@ class GroupCoordinator:
 
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        assert (
-            src != self.rank
-        ), "Invalid source rank. Source rank is the same as the current rank."
+        assert src != self.rank, (
+            "Invalid source rank. Source rank is the same as the current rank."
+        )
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -586,9 +620,9 @@ class GroupCoordinator:
             object_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
-        assert (
-            rank_object == rank_size
-        ), "Received object sender rank does not match the size sender rank."
+        assert rank_object == rank_size, (
+            "Received object sender rank does not match the size sender rank."
+        )
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
@@ -617,9 +651,9 @@ class GroupCoordinator:
         rank = self.rank
         if rank == src_global_rank:
             metadata_list: List[Tuple[Any, Any]] = []
-            assert isinstance(
-                tensor_dict, dict
-            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            assert isinstance(tensor_dict, dict), (
+                f"Expecting a dictionary, got {type(tensor_dict)}"
+            )
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -701,9 +735,9 @@ class GroupCoordinator:
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
         metadata_list: List[Tuple[Any, Any]] = []
-        assert isinstance(
-            tensor_dict, dict
-        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        assert isinstance(tensor_dict, dict), (
+            f"Expecting a dictionary, got {type(tensor_dict)}"
+        )
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # `metadata_list` lives in CPU memory.
         # `send_object_list` has serialization & deserialization,
@@ -863,9 +897,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.device_groups = []
         if len(group_ranks[0]) > 2 or len(group_ranks[0]) == 1:
             for ranks in group_ranks:
-                device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
-                )
+                device_group = new_device_group(ranks, torch_distributed_backend)
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
                 with suppress_stdout():
@@ -927,9 +959,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         ] = None
         self.skip_device_group = None
         for ranks in group_ranks:
-            skip_device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
+            skip_device_group = new_device_group(ranks, torch_distributed_backend)
             if self.rank in ranks:
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
@@ -1162,14 +1192,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def get_pipeline_recv_data(
         self, idx: int = -1, name: str = "latent"
     ) -> torch.Tensor:
-        assert (
-            len(self.receiving_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_task first"
+        assert len(self.receiving_tasks) > 0, (
+            "No tasks to receive, call add_pipeline_recv_task first"
+        )
         receiving_task = self.receiving_tasks.pop(0)
         receiving_task[0].wait()
-        assert (
-            receiving_task[1] == name and receiving_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_task[1] == name and receiving_task[2] == idx, (
+            "Received tensor does not match the requested"
+        )
         return self.recv_buffer[name][idx]
 
     def _pipeline_irecv(self, tensor: torch.tensor):
@@ -1224,14 +1254,14 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_skip_tasks_queue.append(idx)
 
     def get_pipeline_recv_skip_data(self, idx: int = -1) -> torch.Tensor:
-        assert (
-            len(self.receiving_skip_tasks) > 0
-        ), "No tasks to receive, call add_pipeline_recv_skip_task first"
+        assert len(self.receiving_skip_tasks) > 0, (
+            "No tasks to receive, call add_pipeline_recv_skip_task first"
+        )
         receiving_skip_task = self.receiving_skip_tasks.pop(0)
         receiving_skip_task[0].wait()
-        assert (
-            receiving_skip_task[2] == idx
-        ), "Received tensor does not match the requested"
+        assert receiving_skip_task[2] == idx, (
+            "Received tensor does not match the requested"
+        )
         return self.skip_tensor_recv_buffer[idx]
 
     def recv_skip_next(self):

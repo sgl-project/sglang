@@ -17,7 +17,6 @@ flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
 
 class AMXAttentionBackend(AttentionBackend):
-
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -34,7 +33,6 @@ class AMXAttentionBackend(AttentionBackend):
 
 
 class AMXATTNImpl(AttentionImpl):
-
     def __init__(
         self,
         num_heads: int,

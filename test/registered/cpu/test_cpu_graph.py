@@ -21,11 +21,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=315, suite="base-b-tp-test-cpu")
 
 
 class TestCPUGraph(CustomTestCase):
-
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",

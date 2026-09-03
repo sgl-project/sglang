@@ -11,6 +11,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import json
+import re
 import tempfile
 import unittest
 import uuid
@@ -21,6 +22,7 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -37,11 +39,17 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.parser.jinja_template_utils import (
+    jinja_template_may_reorder_tool_results,
+)
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+# Every spec resolve_chat_encoding_spec can return; pinned by the guard below.
+_ALL_CHAT_ENCODING_SPECS = ("dsv4", "dsv32", "inkling", "kimi_k3")
 
 
 def _spec_result(index):
@@ -74,6 +82,24 @@ _DSV4_OFFICIAL_ENCODER = (
     '{"low": "", "high": "h", "max": "m"}\n'
     'DEFAULT_REASONING_EFFORT = "low"\n'
 )
+
+_TOOL_RESULT_REORDER_TEMPLATE = """
+{%- for assistant in messages
+    if assistant.role == 'assistant' and assistant.tool_calls -%}
+    {%- for tool_call in assistant.tool_calls -%}
+        {%- for result in messages
+            if result.role == 'tool' and result.tool_call_id == tool_call.id -%}
+            {%- for part in result.content -%}
+                {%- if part.type == 'text' -%}
+                    {{- part.text -}}
+                {%- else -%}
+                    {{- '<' + part.type + '>' -}}
+                {%- endif -%}
+            {%- endfor -%}
+        {%- endfor -%}
+    {%- endfor -%}
+{%- endfor -%}
+"""
 
 
 def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
@@ -158,6 +184,7 @@ class _MockTemplateManager:
         self.completion_template_name: Optional[str] = None
         self.reasoning_config = None
         self.force_reasoning = False
+        self.jinja_template_may_reorder_tool_results = False
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -186,6 +213,166 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _render_tool_results_in_call_order(messages, **kwargs):
+        """Block-level tool_call_id association, like the GLM chat templates."""
+        del kwargs
+        rendered = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            index += 1
+            tool_calls = message.get("tool_calls") or []
+            if message.get("role") != "assistant" or not tool_calls:
+                continue
+            run = []
+            while index < len(messages) and messages[index].get("role") == "tool":
+                run.append(messages[index])
+                index += 1
+            by_id = {result.get("tool_call_id"): result for result in run}
+            for tool_call in tool_calls:
+                result = by_id.get(tool_call.get("id"))
+                if result is None:
+                    continue
+                for part in result.get("content") or []:
+                    if part.get("type") == "text":
+                        rendered.append(part.get("text", ""))
+                    else:
+                        rendered.append(f"<{part.get('type')}>")
+        return "".join(rendered)
+
+    @staticmethod
+    def _tool_round(call_ids, result_ids, part_type="image_url"):
+        assistant = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": call_id, "function": {"name": call_id, "arguments": {}}}
+                for call_id in call_ids
+            ],
+        }
+        part_key = {"image_url": "image_url", "video_url": "video_url"}[part_type]
+        results = [
+            {
+                "role": "tool",
+                "tool_call_id": result_id,
+                "content": [{"type": part_type, part_key: {"url": result_id}}],
+            }
+            for result_id in result_ids
+        ]
+        return [assistant] + results
+
+    def test_canonicalize_tool_message_order_sorts_media_runs(self):
+        messages = self._tool_round(
+            ["call-a", "call-b"], ["call-b", "call-a"]
+        ) + self._tool_round(["call-c", "call-d"], ["call-d", "call-c"], "video_url")
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(
+            [
+                message["tool_call_id"]
+                for message in canonical
+                if message.get("role") == "tool"
+            ],
+            ["call-a", "call-b", "call-c", "call-d"],
+        )
+
+    def test_canonicalize_tool_message_order_keeps_unassociable_runs(self):
+        cases = {
+            "unknown_id": (["call-a", "call-b"], ["call-b", "call-z"]),
+            "duplicate_result_id": (["call-a", "call-b"], ["call-b", "call-b"]),
+            "missing_call_id": ([None, "call-b"], ["call-b", None]),
+        }
+        for name, (call_ids, result_ids) in cases.items():
+            with self.subTest(name=name):
+                messages = self._tool_round(call_ids, result_ids)
+                canonical = self.chat._canonicalize_tool_message_order(messages)
+                self.assertEqual(canonical, messages)
+
+    def test_canonicalize_tool_message_order_keeps_text_only_runs(self):
+        messages = self._tool_round(["call-a", "call-b"], ["call-b", "call-a"])
+        for message in messages[1:]:
+            message["content"] = [{"type": "text", "text": "done"}]
+
+        canonical = self.chat._canonicalize_tool_message_order(messages)
+
+        self.assertEqual(canonical, messages)
+
+    def test_jinja_path_recovers_tool_result_images_only_when_template_needs_it(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.template_manager.jinja_template_may_reorder_tool_results = (
+            jinja_template_may_reorder_tool_results(_TOOL_RESULT_REORDER_TEMPLATE)
+        )
+        self.assertTrue(self.template_manager.jinja_template_may_reorder_tool_results)
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            self._render_tool_results_in_call_order
+        )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-a",
+                            "type": "function",
+                            "function": {"name": "a", "arguments": {}},
+                        },
+                        {
+                            "id": "call-b",
+                            "type": "function",
+                            "function": {"name": "b", "arguments": {}},
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-b",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-b"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-a",
+                    "content": [{"type": "image_url", "image_url": {"url": "image-a"}}],
+                },
+            ],
+        )
+
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-a", "image-b"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+        rendered_messages = self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        self.assertEqual(
+            [m.get("tool_call_id") for m in rendered_messages if "tool_call_id" in m],
+            ["call-a", "call-b"],
+        )
+
+        # An already-ordered request must produce the exact same render input.
+        ordered_request = ChatCompletionRequest(
+            model="x",
+            messages=request.messages[:2] + request.messages[2:][::-1],
+        )
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        self.chat._apply_jinja_template(ordered_request, None, is_multimodal=True)
+        self.assertEqual(
+            rendered_messages, self.tm.tokenizer.apply_chat_template.call_args[0][0]
+        )
+
+        self.template_manager.jinja_template_may_reorder_tool_results = False
+        self.tm.tokenizer.apply_chat_template.reset_mock()
+        result = self.chat._apply_jinja_template(request, None, is_multimodal=True)
+        self.assertEqual(
+            [item.url for item in result.image_data], ["image-b", "image-a"]
+        )
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
@@ -1924,6 +2111,34 @@ class ServingChatTestCase(unittest.TestCase):
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
+    def test_custom_encoders_own_reasoning_history(self):
+        """Every custom encoding spec takes reasoning history natively.
+
+        The alternative splices a detector's markers into content, which an
+        encoder that frames its own channels turns into visible raw markers.
+        A new spec must not silently default to that path.
+        """
+        for spec in _ALL_CHAT_ENCODING_SPECS:
+            with self.subTest(chat_encoding_spec=spec):
+                self.chat.chat_encoding_spec = spec
+                self.assertTrue(self.chat.supports_native_reasoning_history())
+
+        # The HF chat-template path keeps the wrap-into-content behaviour.
+        self.chat.chat_encoding_spec = None
+        self.assertFalse(self.chat.supports_native_reasoning_history())
+
+    def test_all_chat_encoding_specs_are_enumerated(self):
+        """Guard the spec list this file asserts capabilities over."""
+        source = Path(chat_encoding.__file__).read_text()
+        returned = set(
+            re.findall(
+                r'^\s+return "(\w+)"$',
+                source[source.index("def resolve_chat_encoding_spec") :],
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(returned, set(_ALL_CHAT_ENCODING_SPECS))
+
     # ------------- dsv4 task + latest_reminder -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
@@ -2477,13 +2692,13 @@ class ServingChatTestCase(unittest.TestCase):
             "empty-delta logprobs chunk emitted without a parser; would break client chunk-shape assumptions",
         )
 
-    def test_non_streaming_cached_tokens_details_emits_sglext(self):
-        """Test that non-streaming chat responses emit cached token details in sglext."""
-
+    def test_non_streaming_extension_fields_emit_sglext_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
+            return_meta_info=False,
+            return_routed_experts=True,
             return_cached_tokens_details=True,
         )
         ret = [
@@ -2500,6 +2715,7 @@ class ServingChatTestCase(unittest.TestCase):
                         "storage": 1,
                         "storage_backend": "file",
                     },
+                    "routed_experts": "cm91dGUtYQ==",
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                 },
@@ -2509,6 +2725,7 @@ class ServingChatTestCase(unittest.TestCase):
         response = self.chat._build_chat_response(req, ret, 1234567890)
 
         self.assertIsNotNone(response.sglext)
+        self.assertEqual(response.sglext.routed_experts, "cm91dGUtYQ==")
         self.assertEqual(
             response.sglext.cached_tokens_details.model_dump(exclude_none=True),
             {
@@ -2518,6 +2735,105 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage_backend": "file",
             },
         )
+        self.assertIsNone(response.choices[0].meta_info)
+        dumped_response = response.model_dump()
+        self.assertIn("sglext", dumped_response)
+        self.assertNotIn("meta_info", dumped_response["choices"][0])
+
+    def test_non_streaming_meta_info_omits_response_level_routed_experts(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_meta_info=True,
+            return_routed_experts=True,
+        )
+        ret = [
+            {
+                "text": f"Response {index}",
+                "meta_info": {
+                    "id": "chatcmpl-meta-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": index,
+                    "routed_experts": routed_experts,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+            for index, routed_experts in enumerate(["cm91dGUtYQ==", "cm91dGUtYg=="])
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNone(
+            response.sglext,
+            "sglext is absent only when routed_experts is the sole extension",
+        )
+        self.assertEqual(
+            [choice.meta_info for choice in response.choices],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        dumped_response = response.model_dump()
+        self.assertNotIn("sglext", dumped_response)
+        self.assertEqual(
+            [choice["meta_info"] for choice in dumped_response["choices"]],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        serialized_response = json.dumps(dumped_response)
+        self.assertEqual(serialized_response.count('"routed_experts"'), 2)
+
+    def test_non_streaming_meta_info_preserves_cache_and_spec_in_sglext(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_meta_info=True,
+            return_routed_experts=True,
+            return_cached_tokens_details=True,
+            return_spec_tokens_details=True,
+        )
+        routed_experts = ["cm91dGUtYQ==", "cm91dGUtYg=="]
+        ret = [_spec_result(index) for index in range(2)]
+        for index, ret_item in enumerate(ret):
+            ret_item["meta_info"].update(
+                {
+                    "cached_tokens_details": {
+                        "device": 4 - index,
+                        "host": index,
+                    },
+                    "routed_experts": routed_experts[index],
+                }
+            )
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertIsNone(response.sglext.routed_experts)
+        self.assertEqual(
+            response.sglext.cached_tokens_details.model_dump(exclude_none=True),
+            {"device": 4, "host": 0},
+        )
+        self.assertEqual(
+            [item.spec_cap_length for item in response.sglext.spec_tokens_details],
+            [1.0, 2.0],
+        )
+        self.assertEqual(
+            [choice.meta_info for choice in response.choices],
+            [ret_item["meta_info"] for ret_item in ret],
+        )
+        dumped_response = response.model_dump()
+        self.assertIn("sglext", dumped_response)
+        self.assertIn("spec_tokens_details", dumped_response["sglext"])
+        self.assertNotIn("routed_experts", dumped_response["sglext"])
+        self.assertEqual(
+            dumped_response["sglext"]["cached_tokens_details"],
+            {"device": 4, "host": 0},
+        )
+        serialized_response = json.dumps(dumped_response)
+        self.assertEqual(serialized_response.count('"routed_experts"'), 2)
 
     def test_parallel_sampling_returns_spec_details_per_choice(self):
         req = ChatCompletionRequest(
@@ -3101,6 +3417,29 @@ class ServingChatTestCase(unittest.TestCase):
             chat_template_kwargs={"enable_thinking": True},
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_ling3_default_on(self):
+        """Ling3 public checkpoints default `thinking_option='on'` in the chat
+        template when `enable_thinking` is omitted, and the template detector
+        cannot infer that indirect assignment. The parser fallback must mirror
+        the template default: omitted kwargs enable reasoning, only an explicit
+        `enable_thinking=False` disables it. Regression: the detector shipped
+        with `explicit_enable_thinking`, which left `reasoning_content` null on
+        default requests while the model was in fact thinking."""
+        self._setup_fallback("ling3")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, True),  # no chat_template_kwargs → thinking (template default)
+            ({}, True),  # empty kwargs → thinking
+            ({"enable_thinking": True}, True),  # explicit on
+            ({"enable_thinking": False}, False),  # explicit off
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
 
     def test_fallback_no_detector_returns_false(self):
         self.chat.reasoning_parser = "qwen3"

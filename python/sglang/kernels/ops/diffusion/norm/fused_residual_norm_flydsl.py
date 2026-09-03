@@ -26,9 +26,16 @@ from flydsl._mlir.dialects import (
 )
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+
+try:
+    from flydsl.expr import buffer_ops
+except ImportError:
+    # flydsl 0.3.0 removed flydsl.expr.buffer_ops and pushed the buffer-resource
+    # layer down to its consumers; AITER carries the same module, same API.
+    from aiter.ops.flydsl.kernels import buffer_ops
 
 WARP_SIZE = 64
 _VEC = 8
@@ -44,9 +51,9 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
     VEC = _VEC
     NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
-    assert (
-        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
-    ), f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
+        f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    )
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -536,9 +543,9 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
     VEC = _VEC
     NUM_WAVES = _NUM_WAVES
     BLOCK = NUM_WAVES * WARP_SIZE
-    assert (
-        D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0
-    ), f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
+        f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    )
     NUM_ITERS = D // (BLOCK * VEC)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])

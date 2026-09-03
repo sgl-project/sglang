@@ -6,8 +6,8 @@ import tempfile
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionMessageContentAudioPart,
     ChatCompletionMessageContentAudioURL,
+    ChatCompletionMessageContentAudioURLPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentTextPart,
@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=7, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestConversationGetPrompt(CustomTestCase):
@@ -911,7 +911,7 @@ class TestGenerateChatConv(CustomTestCase):
                         ChatCompletionMessageContentTextPart(
                             type="text", text="Transcribe this"
                         ),
-                        ChatCompletionMessageContentAudioPart(
+                        ChatCompletionMessageContentAudioURLPart(
                             type="audio_url",
                             audio_url=ChatCompletionMessageContentAudioURL(
                                 url="http://example.com/audio.wav"
@@ -924,6 +924,31 @@ class TestGenerateChatConv(CustomTestCase):
         conv = generate_chat_conv(request, "chatml")
         self.assertEqual(len(conv.audio_data), 1)
         self.assertEqual(conv.audio_data[0], "http://example.com/audio.wav")
+
+    def test_user_message_with_inline_audio(self):
+        """Inline input_audio reaches the parser as a data URI.
+
+        Built from raw dicts so the content parts go through validation the way
+        a request body does, which is where the conversion happens; the parser
+        itself only knows about `audio_url`.
+        """
+        request = self._make_request(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe this"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "QUJD", "format": "wav"},
+                        },
+                    ],
+                }
+            ]
+        )
+        conv = generate_chat_conv(request, "chatml")
+        self.assertEqual(len(conv.audio_data), 1)
+        self.assertEqual(conv.audio_data[0], "data:audio/wav;base64,QUJD")
 
     def test_user_message_image_at_prefix(self):
         """Test image_token_at_prefix=True puts image token before text."""

@@ -43,6 +43,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -50,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, replace_submodule
@@ -92,19 +94,18 @@ class LoRAManager:
         self.attn_tp_size: int = get_parallel().attn_tp_size
         self.lora_added_tokens_size: Optional[int] = None
         self.enable_lora_overlap_loading: Optional[bool] = (
-            server_args.enable_lora_overlap_loading
+            get_lora().enable_lora_overlap_loading
         )
         self.pending_lora_load_events = {}
 
-        self.eviction_policy = server_args.lora_eviction_policy
+        self.eviction_policy = get_lora().lora_eviction_policy
         self.enable_dp_attention: bool = get_parallel().enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
-            server_args.experts_shared_outer_loras
+            get_lora().experts_shared_outer_loras
         )
-        self.lora_use_virtual_experts: bool = server_args.lora_use_virtual_experts
-        self.lora_strict_loading: bool = getattr(
-            server_args, "lora_strict_loading", False
-        )
+        self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
+        self.lora_strict_loading: bool = get_lora().lora_strict_loading
+        self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -241,12 +242,12 @@ class LoRAManager:
         Args:
             lora_ref (LoRARef): The LoRARef object containing the LoRA name, path, and ID.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             # load configs
@@ -336,9 +337,9 @@ class LoRAManager:
 
         adapter = self.configs.get(lora_ref.lora_id)
         lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert (
-            adapter is not None and lora_ref is not None
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        assert adapter is not None and lora_ref is not None, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -378,9 +379,9 @@ class LoRAManager:
         for lora_id in lora_ids:
             if lora_id is not None:
                 lora_ref = self.lora_refs.get(lora_id)
-                assert (
-                    lora_ref is not None
-                ), f"LoRA ID {lora_id} not found in lora_refs."
+                assert lora_ref is not None, (
+                    f"LoRA ID {lora_id} not found in lora_refs."
+                )
                 pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
@@ -569,7 +570,9 @@ class LoRAManager:
 
         assert lora_paths or (
             max_lora_rank is not None and target_modules is not None
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        ), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         self.init_lora_adapters(lora_paths)
         self.init_lora_shapes(
@@ -782,6 +785,12 @@ class LoRAManager:
         )
         lora_adapter.initialize_weights()
 
+        warn_if_adapter_targets_embeddings(
+            lora_name=lora_ref.lora_name,
+            embedding_layer_names=lora_adapter.embedding_layers.keys(),
+            speculative_algorithm=self.speculative_algorithm,
+        )
+
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_weights_from_tensors(
@@ -799,6 +808,12 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+
+        warn_if_adapter_targets_embeddings(
+            lora_name=lora_ref.lora_name,
+            embedding_layer_names=lora_adapter.embedding_layers.keys(),
+            speculative_algorithm=self.speculative_algorithm,
+        )
         self.loras[lora_ref.lora_id] = lora_adapter
 
     def load_lora_adapter_from_tensors(
@@ -825,12 +840,12 @@ class LoRAManager:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             new_adapter = LoRAConfig.from_dict(
@@ -1015,7 +1030,6 @@ class LoRAManager:
 
 def init_lora_cuda_graph_moe_buffers(
     *,
-    server_args: ServerArgs,
     model: torch.nn.Module,
     lora_manager: LoRAManager,
     dtype: torch.dtype,
@@ -1035,12 +1049,18 @@ def init_lora_cuda_graph_moe_buffers(
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
+    # With spec on, the decode graph captures TARGET_VERIFY batches of
+    # num_draft_tokens per request, and the buffers below are per-token, so
+    # they must be sized in tokens rather than requests.
+    max_tokens = max_bs * (get_spec().speculative_num_draft_tokens or 1)
     max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
-            lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)
+            lora_manager.init_cuda_graph_moe_buffers(
+                max_tokens, max_loras, dtype, module
+            )
             logger.info(
                 f"Pre-allocated shared MoE LoRA CUDA graph buffers "
-                f"(max_bs={max_bs}, max_loras={max_loras})"
+                f"(max_tokens={max_tokens}, max_loras={max_loras})"
             )
             break
