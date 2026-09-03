@@ -186,7 +186,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             name = "vision_model." + name[len("model.vision_tower.") :]
 
         if name.startswith("vision_model.encoder.layer"):
-
             name = name.replace(r".layer.", r".layers.")
             name = name.replace(r".attention.", r".attn.attn.")
             name = name.replace(r".projection_layer.", r".proj.")
