@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -789,86 +788,78 @@ def eagle_sample(
             else tree_speculative_sampling_target_only
         )
 
-        # These full-vocabulary matrices are consumed by the sampling kernel
-        # within this step. Returned tensors were allocated before the scope,
-        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
-        with borrow_graph_pool(user="EAGLE probability borrow"):
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, verify_input.draft_token_num, dim=0
-            )  # (bs * num_draft_tokens, 1)
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, verify_input.draft_token_num, dim=0
+        )  # (bs * num_draft_tokens, 1)
 
-            target_probs = F.softmax(
-                next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
-            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-            draft_probs = (
-                verify_input.draft_probs
-                if use_rejection_sampling
-                else torch.zeros_like(target_probs)
-            )
-            # Defense-in-depth behind the spec_hook startup allowlist: validate
-            # the actual kernel inputs before the Triton kernel.
-            if use_rejection_sampling and (
-                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-            ):
-                raise ValueError(
-                    "Rejection sampling requires a target-vocab draft proposal "
-                    "distribution; the current speculative algorithm/draft worker "
-                    "does not produce one (draft_probs missing or vocab-mismatched)."
-                )
-
-            coins, coins_for_final_sampling = _verify_coins(
-                sampling_info=sampling_info,
-                seq_lens=batch.seq_lens,
-                draft_token_num=verify_input.draft_token_num,
-                candidates=candidates,
-                device=device,
-            )
-            sampling_fn(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
-                candidates=candidates,
-                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-                retrive_index=verify_input.retrieve_index,
-                retrive_next_token=verify_input.retrieve_next_token,
-                retrive_next_sibling=verify_input.retrieve_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=get_spec().speculative_accept_threshold_single,
-                threshold_acc=get_spec().speculative_accept_threshold_acc,
-                deterministic=True,
-            )
-            del (
-                expanded_temperature,
+        target_probs = F.softmax(
+            next_token_logits / expanded_temperature, dim=-1
+        )  # (bs * num_draft_tokens, vocab_size)
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
                 target_probs,
-                draft_probs,
-                coins,
-                coins_for_final_sampling,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
             )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        draft_probs = (
+            verify_input.draft_probs
+            if use_rejection_sampling
+            else torch.zeros_like(target_probs)
+        )
+        # Defense-in-depth behind the spec_hook startup allowlist: validate
+        # the actual kernel inputs before the Triton kernel.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
+            raise ValueError(
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
+            )
+
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        sampling_fn(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=verify_input.retrieve_index,
+            retrive_next_token=verify_input.retrieve_next_token,
+            retrive_next_sibling=verify_input.retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+            deterministic=True,
+        )
+        del (
+            expanded_temperature,
+            target_probs,
+            draft_probs,
+            coins,
+            coins_for_final_sampling,
+        )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

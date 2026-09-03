@@ -273,9 +273,9 @@ class NVFP4KVQuantizeUtil:
             )
             return output_2d.reshape(b, m, -1)
         else:
-            assert (
-                get_platform().is_sm90
-            ), "NVFP4 KV cache dequantize requires SM100/SM120 or SM90 fallback GPU"
+            assert get_platform().is_sm90, (
+                "NVFP4 KV cache dequantize requires SM100/SM120 or SM90 fallback GPU"
+            )
             # Pure PyTorch fallback for SM90
             n = n_half * 2
             fp4_vals = torch.empty(
