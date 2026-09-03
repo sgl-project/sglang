@@ -72,7 +72,7 @@ class TestPipelineResidencyManagerInstall(unittest.TestCase):
         self.pipeline = object.__new__(_ConcreteComposedPipeline)
         self.pipeline.executor = _RecordingExecutor()
         self.pipeline._stage_name_mapping = {}
-        self.pipeline.stages = []
+        self.pipeline._stages = []
         self.pipeline.is_lora_set = lambda: False
         self.pipeline.is_lora_effective = lambda: False
 
