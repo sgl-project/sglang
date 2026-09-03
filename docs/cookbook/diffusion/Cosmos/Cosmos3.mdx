@@ -62,11 +62,14 @@ sglang serve \
   --num-gpus 1
 ```
 
-With `--performance-mode auto`, a Cosmos3 Nano checkpoint keeps its DiT and
-VAE resident when every selected GPU has at least 120 GiB available at
-startup. Below that threshold, auto mode retains the conservative DiT
-component-offload policy. This high-memory override is limited to Nano;
-Cosmos3 Super checkpoints keep their existing multi-GPU placement defaults.
+With `--performance-mode auto`, Cosmos3 Nano keeps its DiT and VAE resident
+when every selected GPU has at least 90 GiB available at startup. Other
+Cosmos3 checkpoints use a 120 GiB threshold. Below the applicable threshold,
+auto mode retains the conservative DiT component-offload policy. Cosmos3 runs
+one DiT per pipeline, so component offload above the threshold only pays to
+copy the weights out to host memory and back on every request. Serve
+`Cosmos3-Super` across multiple GPUs as shown below so each rank holds a shard
+of the weights.
 
 For `Cosmos3-Super`, split the model across multiple GPUs:
 
@@ -121,7 +124,7 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
     "guidance_scale": 6.0,
     "flow_shift": 3.0,
     "seed": 0,
-    "extra_args": {
+    "extra_body": {
       "use_resolution_template": false,
       "guardrails": true
     }
@@ -139,7 +142,7 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
     "n": 1,
     "guidance_scale": 1.0,
     "seed": 0,
-    "extra_args": {
+    "extra_body": {
       "use_resolution_template": false,
       "guardrails": true
     }
@@ -329,6 +332,37 @@ print(action["shape"], action["values"])
 
 Use `GET /v1/actions/metadata` to inspect the action modes, default horizon, padded action dimension, and accepted observation modalities. Msgpack requests and the `/v1/actions/realtime` websocket use the same action envelope.
 
+To batch policy observations inside one request, opt in with a bounded batch size:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Nano-Policy-DROID \
+  --num-gpus 1 \
+  --batching-max-size 4
+```
+
+Send one image per observation as a list or `[B, H, W, C]` uint8 array in `input.input_reference`, and either one prompt per image or one scalar prompt to broadcast across the batch. Batched prompts must currently tokenize to the same length because Cosmos3 GEN cross-attention does not mask padded text K/V. All items in one request share the domain, resolution, action horizon, and denoise settings. The standard action envelope returns one `data[i]` item per input, each with action shape `[H, D]`. For a compact msgpack response containing one `[B, H, D]` array, set `runtime.response_format="raw"` and read the top-level `actions` field.
+
+For JSON, `input_reference` can be a list of base64 image payloads. For msgpack, it can be a packed uint8 numpy array directly:
+
+```json JSON
+{
+  "input": {
+    "prompt": ["pick up the block", "close the drawer"],
+    "input_reference": [
+      {"b64_json": "<first-image-base64>"},
+      {"b64_json": "<second-image-base64>"}
+    ]
+  },
+  "parameters": {
+    "action_mode": "policy",
+    "domain_name": "droid_lerobot"
+  }
+}
+```
+
+The batch size cannot exceed `--batching-max-size`; this keeps one request from bypassing the server's configured memory limit. Batching applies to `action_mode="policy"` only. A request seed controls the random stream for the whole batch, so a batched result is deterministic for that request but is not expected to be bit-exact with separately seeded B=1 requests.
+
 `inverse_dynamics` also uses `/v1/actions/generations`; set `action_mode="inverse_dynamics"` and pass an observation video URL or server-local path as `input.observation.video`. Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
 
 `forward_dynamics` is intentionally different: it consumes an action array and predicts video, so it remains on `/v1/videos`. Action-producing modes submitted to `/v1/videos` return HTTP 400 with the canonical action endpoint in the error message.
@@ -357,7 +391,10 @@ Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fie
 - `action_view_point`: viewpoint used in the structured action caption.
 - `action_normalization`: dataset normalization mode, such as `quantile`, `meanstd`, or `minmax`.
 
-Put model-specific compatibility knobs in `extra_params` for video requests, or `extra_args` for image requests:
+Pass model-specific controls through `extra_body` with the OpenAI Python SDK.
+Raw JSON may keep them at the top level; multipart video requests should put
+them in the `extra_params` JSON object. The legacy image `extra_args` container
+remains accepted for compatibility, but new clients should use `extra_body`:
 
 - `use_duration_template`: whether to append SGLang's generated duration suffix to video prompts.
 - `use_resolution_template`: accepted for vLLM-Omni request compatibility.
