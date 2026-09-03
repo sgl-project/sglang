@@ -113,7 +113,6 @@ def _create_llguidance_tokenizer(
 
 
 class GuidanceGrammar(BaseGrammarObject):
-
     def __init__(
         self,
         llguidance_tokenizer: LLTokenizer,
@@ -226,7 +225,6 @@ class GuidanceGrammar(BaseGrammarObject):
 
 
 class GuidanceBackend(BaseGrammarBackend):
-
     def __init__(
         self,
         tokenizer,
