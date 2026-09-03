@@ -138,6 +138,12 @@ class FuzzyRadixCache(RadixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         self._reclaim_realization_slots(req)
+        # A request that consumed donor KV holds approximate content for its
+        # fuzzy span and everything computed after it. The exact tree must
+        # not adopt it: a later request sharing this request's token prefix
+        # would receive the donor's KV through a trusted exact match.
+        if req.kv.fuzzy_match_result is not None:
+            is_insert = False
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )

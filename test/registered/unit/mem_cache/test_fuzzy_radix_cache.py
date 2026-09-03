@@ -504,6 +504,7 @@ class TestDonorLifecycle(CustomTestCase):
         pool = _StubReqToTokenPool()
         pool.req_to_token[0, :3] = torch.tensor([70, 71, 72], dtype=torch.int64)
         cache, provider, allocator = _make_cache(req_to_token_pool=pool)
+        allocator._outstanding += 3  # the request's own slots, allocated by the scheduler
         donor = _seed_exact(
             cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
         ).last_device_node
@@ -536,6 +537,63 @@ class TestDonorLifecycle(CustomTestCase):
         self.assertTrue(any(t is realized for t in allocator.free_calls))
         self.assertEqual(allocator.outstanding_slots, 0)
 
+    def test_served_request_is_not_inserted_as_exact_content(self):
+        """A recipient that consumed donor KV carries approximate content
+        for its fuzzy span. Inserting its sequence into the exact tree let
+        the next request sharing its token prefix receive the donor's KV
+        through a trusted exact match (observed live: answers about one
+        service named another service's report). Served requests are not
+        inserted and not registered as donors; their slots beyond the exact
+        prefix are freed."""
+        pool = _StubReqToTokenPool()
+        pool.req_to_token[0, :3] = torch.tensor([70, 71, 72], dtype=torch.int64)
+        cache, provider, allocator = _make_cache(req_to_token_pool=pool)
+        allocator._outstanding += 3  # the request's own slots, allocated by the scheduler
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=2,
+            kv_indices=[10, 11],
+            cached_start_pos=2,
+            donor_last_node_id=donor.id,
+        )
+        req = _StubReq(
+            rid="recipient",
+            origin_input_ids=[90, 91],
+            output_ids=[92],
+            req_pool_idx=0,
+            committed_kv_len=3,
+        )
+        cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+        req.kv.cache_protected_len = 0  # the realizer narrows it to the exact prefix
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+
+        self.assertNotIn("recipient", provider.finished_rids)
+        again = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=None))
+        self.assertEqual(int(again.device_indices.numel()), 0)
+        self.assertEqual(allocator.outstanding_slots, 0)
+
+    def test_plain_request_is_still_inserted_and_registered(self):
+        pool = _StubReqToTokenPool()
+        pool.req_to_token[0, :3] = torch.tensor([70, 71, 72], dtype=torch.int64)
+        cache, provider, _allocator = _make_cache(req_to_token_pool=pool)
+        _allocator._outstanding += 3  # the request's own slots, allocated by the scheduler
+        cache._fuzzy_cache_enabled = True  # donor registration on (off by default in tests)
+        req = _StubReq(
+            rid="plain",
+            origin_input_ids=[90, 91],
+            output_ids=[92],
+            req_pool_idx=0,
+            committed_kv_len=3,
+        )
+        req.origin_input_ids = array("q", [90, 91])  # the scheduler's token arrays
+        req.output_ids = array("q", [92])
+        cache.cache_finished_req(req, kv_len_to_handle=req.kv_committed_len)
+        self.assertIn("plain", provider.finished_rids)
+        again = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=None))
+        self.assertGreater(int(again.device_indices.numel()), 0)
+
     def test_same_donor_refire_keeps_single_pin(self):
         """(bug regression) A queued request can run match_prefix on several
         scheduling rounds and hit the SAME donor each time. Each re-fire
@@ -545,6 +603,7 @@ class TestDonorLifecycle(CustomTestCase):
         pool = _StubReqToTokenPool()
         pool.req_to_token[0, :3] = torch.tensor([70, 71, 72], dtype=torch.int64)
         cache, provider, allocator = _make_cache(req_to_token_pool=pool)
+        allocator._outstanding += 3  # the request's own slots, allocated by the scheduler
         donor = _seed_exact(
             cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
         ).last_device_node
