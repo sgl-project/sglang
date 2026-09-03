@@ -9,12 +9,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
-from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,

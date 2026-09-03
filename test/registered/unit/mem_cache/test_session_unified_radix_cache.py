@@ -79,9 +79,9 @@ class TestSessionCacheOwnership(CustomTestCase):
         self.assertNotIn("SessionUnifiedRadixCacheMixin", unified_cache.read_text())
 
         for component in (
-            "full_component.py",
-            "swa_component.py",
-            "mamba_component.py",
+            "full.py",
+            "swa.py",
+            "mamba.py",
         ):
             self.assertIn(
                 "session_ref",
