@@ -34,6 +34,21 @@ class TestFusedMoeSwigluClamp(CustomTestCase):
         expected_up = torch.tensor([[-10.0, 10.0]])
         torch.testing.assert_close(output, F.silu(expected_gate) * expected_up)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    def test_matches_cpu_on_device_in_moe_dtype(self):
+        # The MoE runner only ever calls this on a device tensor, and on the
+        # bf16 intermediate cache rather than fp32, so cover that shape too.
+        reference = torch.randn(64, 2 * 96, dtype=torch.bfloat16) * 8.0
+        on_device = reference.clone().cuda()
+
+        _clamp_swiglu_inputs_(reference, limit=10.0)
+        _clamp_swiglu_inputs_(on_device, limit=10.0)
+
+        torch.testing.assert_close(on_device.cpu(), reference)
+        half = reference.shape[-1] // 2
+        self.assertLessEqual(reference[..., :half].max().item(), 10.0)
+        self.assertLessEqual(reference[..., half:].abs().max().item(), 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()
