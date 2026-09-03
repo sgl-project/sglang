@@ -1170,7 +1170,28 @@ class KimiK3ImageProcessor(
 
                 video = next(video_iter)
                 try:
-                    chunks = _split_k3_video(video, self.media_proc_cfg, source_index)
+                    # _split_k3_video decodes pixel frames synchronously
+                    # (video.get_frames_as_tensor/get_frames_at can take
+                    # seconds for a long video) with no internal await --
+                    # running it inline on the event loop thread would
+                    # starve every other coroutine on this worker for that
+                    # whole time, including the health-check endpoint's own
+                    # internal generate call (confirmed in production: a
+                    # sustained batch of concurrent long-video requests made
+                    # /health time out under its 5s HTTP timeout for three
+                    # consecutive 30s-interval probes, which is exactly this
+                    # gate's failure_threshold, and the router's circuit
+                    # breaker took the otherwise-healthy prefill worker out
+                    # of rotation). Reuse the existing IO thread pool (the
+                    # same one video loading already runs on) instead of
+                    # spinning up a dedicated executor.
+                    chunks = await asyncio.get_running_loop().run_in_executor(
+                        self.io_executor,
+                        _split_k3_video,
+                        video,
+                        self.media_proc_cfg,
+                        source_index,
+                    )
                     total_frames = len(video)
                     avg_fps = float(getattr(video, "avg_fps", 0) or 0)
                     sampled_frames = sum(len(item.frames) for item in chunks)

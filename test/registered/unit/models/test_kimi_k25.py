@@ -1612,6 +1612,15 @@ def test_kimi_k3_loads_mixed_media_and_preserves_source_order():
     processor.mm_tokens = SimpleNamespace(
         image_token="<|media_pad|>", image_token_id=99
     )
+    # This test bypasses __init__ (object.__new__), so the frame-weighted
+    # GPU-preprocess gate's own state -- and the IO thread pool
+    # _split_k3_video now runs on -- must be set up by hand; this test is
+    # about media-loading order, not about that gate's own behavior, so
+    # disable the gate (None budget) and use a real small thread pool.
+    processor._video_gpu_frame_budget = None
+    processor._video_gpu_inflight_frames = 0
+    processor._video_gpu_condition = asyncio.Condition()
+    processor.io_executor = ThreadPoolExecutor(max_workers=1)
     processor.media_proc_cfg = {
         "sample_fps": 4,
         "max_num_frames_each_video": None,
