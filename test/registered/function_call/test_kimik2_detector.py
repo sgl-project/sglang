@@ -899,13 +899,15 @@ class TestKimiK2EndToEnd(unittest.TestCase):
 
         # ``weird@id`` matches the broad ``[^\\s<|]+`` capture in
         # ``stream_tool_call_portion_regex`` but fails both the standard
-        # ``name:idx`` form and the bare-counter form, so
-        # ``_parse_tool_call_id`` returns ``(None, 0)``.
+        # ``name:idx`` form and the bare-counter form. Non-standard ids fall
+        # back to inferring the name from the arguments, so give it arguments
+        # that match no tool: ``_resolve_function_name`` returns ``None`` and
+        # the section is skipped.
         chunks = [
             "normal text before",
             "<|tool_calls_section_begin|>"
             "<|tool_call_begin|>weird@id"
-            '<|tool_call_argument_begin|>{"city"'
+            '<|tool_call_argument_begin|>{"unknown_key"'
             ': "London"}'
             "<|tool_call_end|>"
             "<|tool_calls_section_end|>",
@@ -1392,6 +1394,207 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "search")
+
+
+class TestKimiK2ClientStyleIdFallback(unittest.TestCase):
+    """Client-style tool_call_ids: ``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs.
+
+    The chat template renders history ``tool_call.id`` values verbatim, so a
+    client that rewrites the ``functions.{name}:{N}`` ids SGLang returned
+    teaches the model to emit the client's id style on its next call. The
+    call is well-formed; only the id is foreign. The detector must infer the
+    name from the arguments (as it already does for bare counters) instead of
+    dropping the call, which surfaced to the client as ``content=""``,
+    ``tool_calls=null``, ``finish_reason="stop"`` after a full reasoning block.
+    """
+
+    # Shapes observed in K2.6 server logs when the client rewrote history ids.
+    CLIENT_IDS = [
+        "call_3",
+        "call_7f3a9c2b1e4d5f6a7b8c9d0e",
+        "toolu_01AkmjoowNgNx2qNfJzc8z2F",
+        "0b3d1c2e-4f5a-6b7c-8d9e-0f1a2b3c4d5e",
+        "tooltoolu_01KPuJ9wUyn6EMNvM6D3vSWE",
+    ]
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool("ReadFile"),
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    @staticmethod
+    def _call(function_id, args):
+        return (
+            f"<|tool_call_begin|>{function_id}"
+            f"<|tool_call_argument_begin|>{args}"
+            "<|tool_call_end|>"
+        )
+
+    def _section(self, *calls):
+        return (
+            "<|tool_calls_section_begin|>"
+            + "".join(calls)
+            + "<|tool_calls_section_end|>"
+        )
+
+    # --- _parse_tool_call_id / _resolve_function_name ---
+
+    def test_parse_tool_call_id_infers_name_from_args(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                name, idx = self.detector._parse_tool_call_id(
+                    fid, self.tools, '{"city": "Tokyo"}'
+                )
+                self.assertEqual(name, "get_weather")
+                self.assertEqual(idx, 0)
+
+    def test_parse_tool_call_id_single_tool_needs_no_args(self):
+        name, _ = self.detector._parse_tool_call_id(
+            "call_3", [_make_tool("search")], None
+        )
+        self.assertEqual(name, "search")
+
+    def test_parse_tool_call_id_unresolvable_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "call_3", self.tools, '{"unknown_key": 1}'
+        )
+        self.assertIsNone(name)
+        self.assertEqual(idx, 0)
+        name, _ = self.detector._parse_tool_call_id("call_3", [], '{"city": "x"}')
+        self.assertIsNone(name)
+
+    def test_resolve_function_name_client_id(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                self.assertEqual(
+                    self.detector._resolve_function_name(
+                        fid, self.tools, '{"path": "/a.py"}'
+                    ),
+                    "ReadFile",
+                )
+
+    # --- non-streaming ---
+
+    def test_detect_and_parse_client_id(self):
+        for fid in self.CLIENT_IDS:
+            with self.subTest(function_id=fid):
+                detector = KimiK2FuncDetector()
+                text = self._section(self._call(fid, '{"path": "/a.py"}'))
+                result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "ReadFile")
+                self.assertEqual(result.calls[0].parameters, '{"path": "/a.py"}')
+                self.assertEqual(result.calls[0].tool_index, 0)
+                self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_client_id_multiple_calls(self):
+        text = self._section(
+            self._call("call_3", '{"path": "/a.py"}'),
+            self._call("call_4", '{"city": "Tokyo"}'),
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["ReadFile", "get_weather"])
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1])
+
+    def test_detect_and_parse_client_id_mixed_with_standard(self):
+        text = self._section(
+            self._call("toolu_01AkmjoowNgNx2qNfJzc8z2F", '{"city": "Tokyo"}'),
+            self._call("functions.ReadFile:7", '{"path": "/a.py"}'),
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual([c.name for c in result.calls], ["get_weather", "ReadFile"])
+        self.assertEqual([c.tool_index for c in result.calls], [0, 1])
+
+    def test_detect_and_parse_client_id_unresolvable_is_dropped(self):
+        text = self._section(self._call("call_3", '{"unknown_key": "value"}'))
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_client_id_reasoning_prefix_kept(self):
+        text = "Let me check.\n" + self._section(
+            self._call("call_3", '{"path": "/a.py"}')
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.normal_text, "Let me check.\n")
+        self.assertEqual(len(result.calls), 1)
+
+    # --- streaming ---
+
+    def test_streaming_client_id_multi_tool_resolves_at_end_marker(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>call_3<|tool_call_argument_begin|>",
+            '{"city": ',
+            '"Tokyo"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, normal = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"})
+        self.assertEqual(normal, "")
+
+    def test_streaming_client_id_single_tool_streams_before_end_marker(self):
+        single_tool = [_make_tool("search")]
+        first = self.detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>toolu_01AkmjoowNgNx2qNfJzc8z2F"
+            '<|tool_call_argument_begin|>{"path',
+            single_tool,
+        )
+        self.assertEqual(len(first.calls), 1)
+        self.assertEqual(first.calls[0].name, "search")
+        rest = self.detector.parse_streaming_increment(
+            '": "/x"}<|tool_call_end|><|tool_calls_section_end|>', single_tool
+        )
+        streamed = first.calls[0].parameters + "".join(c.parameters for c in rest.calls)
+        self.assertEqual(json.loads(streamed), {"path": "/x"})
+
+    def test_streaming_client_id_mixed_with_standard(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"path": "/a.py"}',
+            "<|tool_call_end|>",
+            "<|tool_call_begin|>functions.get_weather:4"
+            '<|tool_call_argument_begin|>{"city": "Paris"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(self.detector, chunks, self.tools)
+        self.assertEqual([tc["name"] for tc in tool_calls], ["ReadFile", "get_weather"])
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {"path": "/a.py"})
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Paris"})
+
+    def test_streaming_client_id_unresolvable_skips_only_that_section(self):
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"unknown_key": 1}',
+            "<|tool_call_end|>",
+            '<|tool_call_begin|>call_4<|tool_call_argument_begin|>{"city": "Paris"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, normal = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual([tc["name"] for tc in tool_calls], ["get_weather"])
+        self.assertNotIn("<|tool_call", normal)
 
 
 if __name__ == "__main__":

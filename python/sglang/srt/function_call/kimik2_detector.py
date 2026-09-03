@@ -53,6 +53,13 @@ class KimiK2Detector(BaseFormatDetector):
     <|tool_call_begin|>{counter}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
     ```
 
+    Format Structure (client-style id — model copies an id shape it saw in the
+    conversation history, e.g. ``call_3``, ``call_<hex>``, ``toolu_01...``):
+    ```
+    <|tool_call_begin|>{client_id}<|tool_call_argument_begin|>{json_args}<|tool_call_end|>
+    ```
+    In the last two cases the function name is inferred from the arguments.
+
     Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
     """
 
@@ -95,6 +102,8 @@ class KimiK2Detector(BaseFormatDetector):
 
         Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
         Bare counter:    "3" → call_index=3, infer name from arguments.
+        Anything else:   "call_3", "toolu_01..." → call_index=0, infer name
+                         from arguments (see ``_resolve_function_name``).
 
         The bare counter is a conversation-level auto-increment, NOT an index
         into the tools list. The function name is inferred by matching argument
@@ -104,15 +113,18 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name"), int(m.group("index"))
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            call_index = int(function_id)
-            name = self._infer_tool_name(tools, function_args)
-            if name:
-                return name, call_index
-            return None, call_index
-
-        logger.warning("Unexpected tool_call_id format: %s", function_id)
-        return None, 0
+        call_index = (
+            int(function_id)
+            if self.tool_call_id_counter_regex.match(function_id)
+            else 0
+        )
+        name = self._resolve_function_name(function_id, tools, function_args)
+        if name is None:
+            logger.warning(
+                "Could not resolve a tool name for tool_call_id %r; dropping the call",
+                function_id,
+            )
+        return name, call_index
 
     def _infer_tool_name(self, tools: List[Tool], function_args: str = None):
         """Infer function name when the model omits it (bare counter ID).
@@ -285,7 +297,8 @@ class KimiK2Detector(BaseFormatDetector):
                             # Wait for the end marker before deciding.
                             break
                         logger.warning(
-                            "Kimi-K2 unrecognized tool_call_id %r; skipping section.",
+                            "Kimi-K2 could not resolve a tool name for "
+                            "tool_call_id %r; skipping section.",
                             function_id,
                         )
                         self._buffer = buffer[end_idx + len(self.tool_call_end_token) :]
@@ -401,7 +414,16 @@ class KimiK2Detector(BaseFormatDetector):
     def _resolve_function_name(
         self, function_id: str, tools: List[Tool], function_args: str
     ) -> Optional[str]:
-        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown."""
+        """Map a Kimi-K2 tool_call_id to a tool name, or ``None`` if unknown.
+
+        Only the standard ``functions.{name}:{index}`` form carries the name.
+        Every other id shape falls back to inferring the name from the
+        arguments. Besides the bare counter, this covers client-style ids
+        (``call_3``, ``call_<hex>``, ``toolu_01...``, UUIDs): the chat template
+        renders history ``tool_call.id`` values verbatim, so when a client
+        rewrites the ids SGLang returned, the model copies that style on its
+        next call. The call itself is well-formed; only the id is foreign.
+        """
         if not function_id:
             return self._infer_tool_name(tools, function_args)
 
@@ -409,10 +431,12 @@ class KimiK2Detector(BaseFormatDetector):
         if m:
             return m.group("name")
 
-        if self.tool_call_id_counter_regex.match(function_id):
-            return self._infer_tool_name(tools, function_args)
-
-        return None
+        if not self.tool_call_id_counter_regex.match(function_id):
+            logger.debug(
+                "Non-standard tool_call_id %r; inferring tool name from arguments",
+                function_id,
+            )
+        return self._infer_tool_name(tools, function_args)
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
