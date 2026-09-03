@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -78,17 +79,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
 
 
 def _make_result():
-    return SimpleNamespace(
-        copy_done=None,
-        auxiliary_host_output=None,
-        routed_experts_output=None,
-        indexer_topk_output=None,
+    return GenerationBatchResult(
         logits_output=SimpleNamespace(hidden_states=None, customized_info=None),
         next_token_ids=[4],
-        can_run_cuda_graph=False,
-        num_correct_drafts=0,
-        num_block_accept_tokens=0,
-        num_cap_tokens=0,
         speculative_num_draft_tokens=0,
     )
 
