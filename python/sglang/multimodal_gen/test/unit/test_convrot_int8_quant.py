@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_cust
     convrot_int8_supported_capabilities,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
+    _REQUIRED_OPS,
     ConvRotInt8CustomKernelLinearMethod,
     apply_convrot_int8_gelu_input,
     apply_convrot_int8_shared_input,
@@ -31,7 +32,6 @@ _LOAD_SGL_KERNEL = (
 )
 
 QWEN_IMAGE_IGNORED_LAYERS = ["img_mod", "txt_mod", "txt_mlp.net.2"]
-_PREQUANT_OPS = ("convrot_int8_linear_prequant", "convrot_int8_linear_prequant_out")
 
 
 def _kernel_available() -> bool:
@@ -41,8 +41,7 @@ def _kernel_available() -> bool:
         import sgl_kernel  # noqa: F401
     except ImportError:
         return False
-    ops = _PREQUANT_OPS + ("convrot_int8_supported_sm_versions",)
-    if not all(hasattr(torch.ops.sgl_kernel, op) for op in ops):
+    if not all(hasattr(torch.ops.sgl_kernel, op) for op in _REQUIRED_OPS):
         return False
     return torch.cuda.get_device_capability() in convrot_int8_supported_capabilities()
 
@@ -171,7 +170,7 @@ def test_shared_input_helper_is_bitwise_three_layer_calls():
 
     assert convrot_int8_shares_input(layers)
     shared = apply_convrot_int8_shared_input(x=x, layers=layers)
-    for out, layer in zip(shared, layers):
+    for out, layer in zip(shared, layers, strict=True):
         assert torch.equal(out, layer(x)[0])
 
 
@@ -197,7 +196,7 @@ def test_shared_input_out_helper_is_bitwise_into_joint_buffer_slices():
         x=x, layers=layers, outs=[buf[:, seq_len_txt:] for buf in bufs]
     )
     for out, buf, layer in zip(
-        apply_convrot_int8_shared_input(x=x, layers=layers), bufs, layers
+        apply_convrot_int8_shared_input(x=x, layers=layers), bufs, layers, strict=True
     ):
         assert torch.equal(buf[:, seq_len_txt:], out)
         assert torch.equal(buf[:, seq_len_txt:], layer(x)[0])

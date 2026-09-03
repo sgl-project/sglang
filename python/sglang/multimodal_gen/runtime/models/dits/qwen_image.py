@@ -752,6 +752,8 @@ def _use_joint_qkv_buffers(
     return (
         (attn.separate_unquantized_qkv_proj or attn.separate_convrot_qkv_proj)
         and not masked
+        # The out= GEMMs below reject grad-tracking operands.
+        and not torch.is_grad_enabled()
         and hidden_states.shape[0] == 1
         and hidden_states.is_contiguous()
         and encoder_hidden_states.is_contiguous()

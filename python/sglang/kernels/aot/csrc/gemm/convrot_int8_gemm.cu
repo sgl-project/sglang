@@ -32,6 +32,7 @@ limitations under the License.
 #include <cutlass/numeric_types.h>
 #include <torch/all.h>
 
+#include <array>
 #include <cute/tensor.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
@@ -580,10 +581,15 @@ std::string supported_sm_versions_text() {
   return text;
 }
 
-// Cached: a process serves one device class.
+// Cached per device index: a process may drive GPUs of different generations, and
+// every linear asks for the SM of the device the caller's CUDA guard selected.
 int device_sm_version() {
-  static const int v = getSMVersion();
-  return v;
+  static std::array<int, 64> cache{};  // 0 = not queried yet
+  int device = 0;
+  CHECK_CUDA_SUCCESS(cudaGetDevice(&device));
+  if (device < 0 || device >= static_cast<int>(cache.size())) return getSMVersion();
+  if (cache[device] == 0) cache[device] = getSMVersion();
+  return cache[device];
 }
 
 void check_supported_device() {

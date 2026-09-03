@@ -486,8 +486,12 @@ GB200 with every layer quantized: 1.09x on one GPU and 1.09x on two GPUs with
 CFG parallelism; with the ignore list, 1.03x to 1.11x on one GPU depending on
 the host and 1.04x to 1.07x on two. The fused op itself runs 1.12x-1.66x faster than the cuBLAS BF16
 GEMM at the Qwen-Image shapes on H200 and 1.5x on the FFN up-projection on GB200.
-A follow-up change to the denoising loop widens these margins on 1, 2 and 4
-GPUs; its numbers are reported with that change.
+These numbers are for `convrot_int8_customkernel` alone, in the default eager
+execution of the current tree.
+
+A separate, later change to how the denoising loop is executed (not part of
+this feature) widens these margins on 1, 2 and 4 GPUs; its numbers are reported
+with that change.
 
 <Warning>
 `convrot_int8_customkernel` is approximate: same-seed outputs are visually

@@ -47,15 +47,23 @@ def benchmark(M, K, N, provider):
     x_q, x_scale = convrot_rotate_quantize_activation(x, group_size=GROUP_SIZE)
 
     if provider == "convrot_int8":
-        fn = lambda: convrot_int8_fused_linear(
-            x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
+
+        def fn():
+            return convrot_int8_fused_linear(
+                x, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
+            )
+
     elif provider == "convrot_int8_prequant":
-        fn = lambda: convrot_int8_linear_prequant(
-            x_q, x_scale, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
-        )
+
+        def fn():
+            return convrot_int8_linear_prequant(
+                x_q, x_scale, weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
+            )
+
     else:
-        fn = lambda: torch.addmm(bias, x, weight.t())
+
+        def fn():
+            return torch.addmm(bias, x, weight.t())
 
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
         fn, quantiles=[0.5, 0.2, 0.8]
