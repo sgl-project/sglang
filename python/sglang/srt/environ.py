@@ -1086,6 +1086,10 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # Persistent CuTe DSL AOT objects. Resolved lazily so it tracks
+    # SGLANG_CACHE_DIR; set to an empty string to keep compilation
+    # process-local. Must be trusted: cached objects are loaded into the process.
+    SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)

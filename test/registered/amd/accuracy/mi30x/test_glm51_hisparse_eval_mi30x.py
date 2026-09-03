@@ -80,8 +80,7 @@ class TestGLM51HiSparseEvalAMD(unittest.TestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (glm-5.1 hisparse mi30x)\n"
-                f'{metrics["score"]=:.3f}\n'
+                f'### test_gsm8k (glm-5.1 hisparse mi30x)\n{metrics["score"]=:.3f}\n'
             )
         self.assertGreater(metrics["score"], 0.93)
 
