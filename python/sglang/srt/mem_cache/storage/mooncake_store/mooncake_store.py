@@ -4,8 +4,10 @@ import logging
 import os
 import time
 import uuid
+import contextlib
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any, List, Optional, Tuple
 
 import requests
@@ -327,6 +329,81 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+
+    @cached_property
+    def _has_request_context_support(self) -> bool:
+        """Check if the installed MooncakeDistributedStore supports request context propagation.
+
+        Result is cached on first access since the installed Mooncake
+        version is fixed for the lifetime of the process.
+        """
+        return hasattr(type(self.store), "set_request_context")
+
+    def set_request_context(
+        self,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ):
+        """Set per-request context on the calling thread.
+
+        The context is propagated as an out-of-band attachment on subsequent
+        store RPC calls (put, get, batch operations, etc.) and logged by the
+        Mooncake master.  Fields left as None keep their previous value (or
+        remain empty on the first call).
+
+        Args:
+            request_id: Application-level correlation id.
+            trace_id: Distributed trace id.
+            span_id: Current span id.
+            parent_span_id: Parent span id.
+        """
+        if self.store is None:
+            return
+        if not self._has_request_context_support:
+            return
+        self.store.set_request_context(
+            request_id=request_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+        )
+
+    def clear_request_context(self):
+        """Clear the per-request context on the calling thread."""
+        if self.store is None:
+            return
+        if not self._has_request_context_support:
+            return
+        self.store.clear_request_context()
+
+    @contextlib.contextmanager
+    def request_context(
+        self,
+        request_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        span_id: Optional[str] = None,
+        parent_span_id: Optional[str] = None,
+    ):
+        """Context manager that sets request context for the duration of the block.
+
+        Usage::
+
+            with store.request_context(request_id="req-001", trace_id="trace-abc"):
+                store.put(key, value)
+            # context is automatically cleared after the block
+        """
+        self.set_request_context(
+            request_id=request_id,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+        )
+        try:
+            yield
+        finally:
+            self.clear_request_context()
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
