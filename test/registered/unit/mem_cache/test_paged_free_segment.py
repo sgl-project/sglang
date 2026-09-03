@@ -242,7 +242,9 @@ class TestBaseFallbackFreeSegments(unittest.TestCase):
             alloc.free_segments([(row[0:6], 0), (row[6:11], 6)])
         with self.assertRaises(AssertionError):
             alloc.free_segment(row[1:], start_pos=1)
-        self.assertEqual(alloc.freed[:1], [row[0:6]])
+        # Only the first, valid segment reached free().
+        self.assertEqual(len(alloc.freed), 1)
+        self.assertTrue(torch.equal(alloc.freed[0], row[0:6]))
 
 
 if __name__ == "__main__":
