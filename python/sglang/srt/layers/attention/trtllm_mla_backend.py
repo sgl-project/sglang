@@ -377,6 +377,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> None:
         parallel = get_parallel()
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
+        # None on a static pool, whose collapsed page is already physical.
+        v2p = self.kv_index_translator.full_v2p_table
         create_mla_kv_page_table_for_dcp[
             (
                 block_kv_indices.shape[0],
@@ -389,12 +391,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             req_pool_indices,
             local_seq_lens,
             block_kv_indices,
+            v2p,
             self.req_to_token.stride(0),
             block_kv_indices.stride(0),
+            self.kv_index_translator.full_page_multiplier,
             PHYSICAL_PAGE_SIZE=self.page_size,
             DCP_SIZE=parallel.dcp_size,
             DCP_RANK=parallel.dcp_rank,
             PAGES_PER_BLOCK=pages_per_block,
+            HAS_V2P=v2p is not None,
         )
 
     def _create_block_kv_indices(
@@ -776,6 +781,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._decode_kernel_loc = dst
         else:
             self._decode_kernel_loc = None
+
+    def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """The loc an unfused KV scatter must write at.
+
+        A captured decode on the unified pool must read the capture-stable
+        kernel-facing buffer `init_forward_metadata_out_graph` refilled, since
+        the translate rebinds `out_cache_loc` to a FRESH tensor the graph never
+        recorded. Everywhere else the batch's own loc is what the pool expects.
+        """
+        if self._decode_kernel_loc is not None:
+            return self._decode_kernel_loc
+        return forward_batch.out_cache_loc
 
     def _resolve_fused_write_loc(
         self, forward_batch: ForwardBatch
@@ -1198,6 +1215,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
+        # The unified pool declares `write_loc_is_dcp_resolved`, so its loc
+        # arrives with the DCP owner rule already applied; asking the kernel to
+        # apply it again would divide a kernel-facing id.
+        dcp_world_size = (
+            1 if self.kv_index_translator.is_translating else parallel.attn_dcp_size
+        )
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
             loc=loc,
@@ -1205,10 +1228,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cache_k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
-            # DCP cyclic KV sharding: virtual loc -> owner mask + loc//world
-            # (identity when attn_dcp_size == 1).
-            dcp_world_size=parallel.attn_dcp_size,
-            dcp_rank=parallel.attn_dcp_rank,
+            dcp_world_size=dcp_world_size,
+            dcp_rank=0 if dcp_world_size == 1 else parallel.attn_dcp_rank,
         )
 
     def _dummy_dcp_decode_for_autotune(
