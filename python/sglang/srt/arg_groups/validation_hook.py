@@ -51,13 +51,13 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         if not envs.SGLANG_ENABLE_PP_SPEC.get():
-            assert (
-                cfg.disable_overlap_schedule and cfg.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
+                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            )
         else:
-            assert (
-                cfg.disable_overlap_schedule
-            ), "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+            assert cfg.disable_overlap_schedule, (
+                "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+            )
             # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
             # tail-drafts; every other algorithm would be mis-rebuilt.
             assert (
@@ -71,19 +71,19 @@ def check_server_args(server_args: Any):
             # RelayPayload; the gated flow replaces that relay with its own
             # and does not carry those fields.
             assert cfg.disaggregation_mode == "null", (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with " "--disaggregation-mode"
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
             )
             # The PP relay slices spec results with the configured
             # num_draft_tokens; adaptive spec changes it at runtime.
             assert not cfg.speculative_adaptive, (
-                "SGLANG_ENABLE_PP_SPEC is not compatible with " "--speculative-adaptive"
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
             )
             # Every stage rebuilds the same verify input from the relayed
             # per-request state, so all stages must see the same batch.
             # DP attention partitions it per DP rank.
-            assert (
-                not cfg.enable_dp_attention
-            ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            assert not cfg.enable_dp_attention, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
         assert cfg.min_free_slots_delay is None, (
             "--min-free-slots-delay is not supported with pipeline "
             "parallelism: allocatable slots per microbatch are bounded by "
