@@ -1456,8 +1456,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,

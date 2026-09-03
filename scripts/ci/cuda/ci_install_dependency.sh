@@ -8,6 +8,9 @@ set -euxo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+# shellcheck source=scripts/ci/utils/git_clone_with_retry.sh
+source "${SCRIPT_DIR}/../utils/git_clone_with_retry.sh"
+
 # ---------------------------------------------------------------------------
 # Timing helper
 # ---------------------------------------------------------------------------
@@ -207,9 +210,7 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
-        https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
+    git_clone_with_retry https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}" "--branch v${gdrcopy_version}"
     (
         cd "${gdrcopy_root}/packages"
         CUDA=/usr/local/cuda ./build-deb-packages.sh
@@ -762,9 +763,8 @@ install_extra_deps() {
     fi
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-        # lmms-eval v0.5 pulls antlr4-python3-runtime==4.7.2, clobbering the
+        $PIP_CMD install "lmms_eval==0.5.0" $PIP_INSTALL_SUFFIX
+        # lmms_eval 0.5.0 pulls antlr4-python3-runtime==4.7.2, clobbering the
         # 4.9.3 that sgl-eval's latex2sympy2_extended needs (4.7.2 ImportError
         # at sgl-eval import). Pin it back so the nightly sgl-eval path works.
         $PIP_CMD install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
@@ -781,14 +781,6 @@ install_test_tools() {
     [ -e "${HOME}/.cache/sglang" ] && [ ! -d "${HOME}/.cache/sglang" ] && rm -f "${HOME}/.cache/sglang"
     mkdir -p "${HOME}/.cache/sglang/"
     mv python/kernels.lock "${HOME}/.cache/sglang/" || true
-
-    # Install human-eval (subshell keeps cd local)
-    $PIP_CMD install "setuptools==70.0.0" $PIP_INSTALL_SUFFIX
-    [ -d human-eval ] || git clone https://github.com/merrymercy/human-eval.git
-    (
-        cd human-eval
-        $PIP_CMD install -e . --no-build-isolation $PIP_INSTALL_SUFFIX
-    )
 
     mark_step_done "${FUNCNAME[0]}"
 }
