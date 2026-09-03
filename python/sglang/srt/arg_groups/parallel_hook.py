@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_symm_mem_nccl_guard,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -148,6 +149,8 @@ def handle_dcp_validation(server_args: Any):
             "authoritative fabric probe runs at model-runner init; use 'a2a' "
             "or 'ag_rs' on clusters without MNNVL."
         )
+    run_post_process_pass(server_args, _dcp_symm_mem_nccl_guard)
+
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
