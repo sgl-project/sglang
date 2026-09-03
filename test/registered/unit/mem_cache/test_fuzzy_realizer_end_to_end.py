@@ -117,6 +117,7 @@ class TestContiguousRealization(CustomTestCase):
                     segments=None,
                     cached_start_pos=100,
                     layer_zero_mask=None,
+                    quality_signals=None,
                 ),
                 fuzzy_realized_locs=realized_locs,
             ),
@@ -135,6 +136,84 @@ class TestContiguousRealization(CustomTestCase):
         self.assertEqual(req.kv.cache_protected_len, exact)
         self.assertIsNone(req.kv.fuzzy_realized_locs)
         self.assertEqual(req.kv.cache_fuzzy_matched_len, 0)
+
+
+class TestAlignedParaphraseRealization(CustomTestCase):
+    def test_verified_paraphrase_is_copied_with_zero_delta(self):
+        """A verified paraphrase served whole sits at the same positions as
+        the exact prefix boundary (delta 0). It is different content, so it
+        must still be copied into fresh request-owned slots instead of being
+        skipped as exact-tree content: skipping left the request reading the
+        donor's slots and inserting them into its own tree branch."""
+        torch.manual_seed(5)
+        n, exact = 8, 4
+        pool = _fake_pool()
+        req_to_token = torch.zeros(4, 64, dtype=torch.int64)
+        freed = []
+        realizer, cache = _realizer(pool, req_to_token, freed)
+
+        pos = torch.arange(exact, exact + n, dtype=torch.long)
+        donor_locs = torch.arange(0, n, dtype=torch.long)
+        realized_locs = torch.arange(64, 64 + n, dtype=torch.long)
+        k_raw = torch.randn(n, NUM_HEADS, HEAD_DIM)
+        v_ref = torch.randn(n, NUM_HEADS, HEAD_DIM)
+        for layer in range(NUM_LAYERS):
+            pool.k_buffer[layer][donor_locs] = _rotate_at(k_raw, pos, cache)
+            pool.v_buffer[layer][donor_locs] = v_ref
+
+        req_to_token[1, pos] = donor_locs
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                req_pool_idx=1,
+                cache_protected_len=exact + n,
+                cache_fuzzy_matched_len=n,
+                fuzzy_match_result=SimpleNamespace(
+                    segments=None,
+                    cached_start_pos=exact,
+                    layer_zero_mask=None,
+                    quality_signals=SimpleNamespace(confidence_tier="paraphrase_verified"),
+                ),
+                fuzzy_realized_locs=realized_locs,
+            ),
+            prefix_indices=torch.arange(0, exact + n, dtype=torch.long),
+        )
+
+        realizer.realize(fuzzy_reqs=[req])
+
+        for layer in range(NUM_LAYERS):
+            torch.testing.assert_close(
+                pool.k_buffer[layer][realized_locs], _rotate_at(k_raw, pos, cache), atol=1e-4, rtol=1e-4
+            )
+            torch.testing.assert_close(pool.v_buffer[layer][realized_locs], v_ref)
+        self.assertTrue(torch.equal(req_to_token[1, pos], realized_locs))
+        self.assertEqual(freed, [])
+        self.assertEqual(req.kv.cache_protected_len, exact)
+
+    def test_aligned_exact_tier_is_still_skipped(self):
+        n, exact = 8, 4
+        pool = _fake_pool()
+        req_to_token = torch.zeros(4, 64, dtype=torch.int64)
+        freed = []
+        realizer, _cache = _realizer(pool, req_to_token, freed)
+        realized_locs = torch.arange(64, 64 + n, dtype=torch.long)
+        req = SimpleNamespace(
+            kv=SimpleNamespace(
+                req_pool_idx=1,
+                cache_protected_len=exact + n,
+                cache_fuzzy_matched_len=n,
+                fuzzy_match_result=SimpleNamespace(
+                    segments=None,
+                    cached_start_pos=exact,
+                    layer_zero_mask=None,
+                    quality_signals=SimpleNamespace(confidence_tier="exact"),
+                ),
+                fuzzy_realized_locs=realized_locs,
+            ),
+            prefix_indices=torch.arange(0, exact + n, dtype=torch.long),
+        )
+        realizer.realize(fuzzy_reqs=[req])
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], realized_locs))
 
 
 class TestSegmentsRealization(CustomTestCase):

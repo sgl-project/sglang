@@ -53,6 +53,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_aligned_copy(fuzzy_result: FuzzyMatchResult) -> bool:
+    """Whether a position-aligned span must still be copied into fresh
+    slots: the provider verified different tokens (a paraphrase), so the
+    exact tree cannot own it."""
+    quality = fuzzy_result.quality_signals
+    return quality is not None and quality.confidence_tier == "paraphrase_verified"
+
+
 class FuzzyRadixCache(RadixCache):
     """RadixCache that falls back to provider-driven fuzzy matching.
 
@@ -248,10 +256,13 @@ class FuzzyRadixCache(RadixCache):
         # Position-aligned reuse (donor span already at the target positions)
         # would adopt donor-owned slots into the recipient's tree branch —
         # two nodes owning the same pool slots. Token- and position-aligned
-        # content is the exact radix tree's job; skip such matches.
+        # content is the exact radix tree's job; skip such matches. A
+        # verified paraphrase is token-different content served whole from
+        # the same positions: it is realized into fresh slots (delta 0).
         if (
             not fuzzy_result.segments
             and fuzzy_result.cached_start_pos == exact_matched_len
+            and not _is_aligned_copy(fuzzy_result)
         ):
             logger.debug(
                 "[FUZZY RADIX] dropping position-aligned fuzzy match for "

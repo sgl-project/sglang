@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
+    QualitySignals,
     FuzzyMatchProvider,
     FuzzyMatchResult,
 )
@@ -207,7 +208,16 @@ def _scripted_fuzzy_result(
     kv_indices: List[int],
     cached_start_pos: int,
     donor_last_node_id: Optional[int] = None,
+    confidence_tier: Optional[str] = None,
 ) -> FuzzyMatchResult:
+    quality = None
+    if confidence_tier is not None:
+        quality = QualitySignals(
+            cosine_similarity=0.95,
+            reuse_ratio=1.0,
+            confidence_tier=confidence_tier,
+            passed_quality_gate=True,
+        )
     return FuzzyMatchResult(
         cached_token_count=cached_token_count,
         prompt_token_count=cached_token_count,
@@ -215,6 +225,7 @@ def _scripted_fuzzy_result(
         position_offset=0,
         cached_start_pos=cached_start_pos,
         donor_last_node_id=donor_last_node_id,
+        quality_signals=quality,
     )
 
 
@@ -457,6 +468,29 @@ class TestRealizationEviction(CustomTestCase):
         self.assertEqual(donor.lock_ref, 1)
         self.assertIn(donor.id, cache._node_registry)
         self.assertNotIn(stale.id, cache._node_registry)
+        self.assertEqual(allocator.alloc_calls[-1], 2)
+
+
+class TestAlignedParaphraseAdmission(CustomTestCase):
+    def test_aligned_paraphrase_verified_result_is_realized_not_dropped(self):
+        """A segment-less span starting at the exact-matched length is dropped
+        as exact-tree content, except when the provider verified different
+        tokens there (paraphrase_verified): that span needs fresh slots."""
+        cache, provider, allocator = _make_cache()
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=2,
+            kv_indices=[10, 11],
+            cached_start_pos=0,
+            donor_last_node_id=donor.id,
+            confidence_tier="paraphrase_verified",
+        )
+        req = _StubReq(rid="aligned-para")
+        result = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+        self.assertEqual(result.fuzzy_matched_len, 2)
+        self.assertIsNotNone(req.kv.fuzzy_realized_locs)
         self.assertEqual(allocator.alloc_calls[-1], 2)
 
 

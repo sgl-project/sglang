@@ -112,6 +112,7 @@ class FuzzyKVRealizer:
                 segments=fuzzy_match_result.segments,
             )
         else:
+            quality = fuzzy_match_result.quality_signals
             self._realize_contiguous(
                 req=req,
                 req_idx=req_idx,
@@ -119,6 +120,10 @@ class FuzzyKVRealizer:
                 num_fuzzy=num_fuzzy,
                 cached_start_pos=fuzzy_match_result.cached_start_pos,
                 layer_zero_mask=fuzzy_match_result.layer_zero_mask,
+                aligned_copy=(
+                    quality is not None
+                    and quality.confidence_tier == "paraphrase_verified"
+                ),
             )
 
     def _realize_contiguous(
@@ -129,12 +134,14 @@ class FuzzyKVRealizer:
         num_fuzzy: int,
         cached_start_pos: int,
         layer_zero_mask: Optional[List[bool]],
+        aligned_copy: bool = False,
     ) -> None:
         exact_matched_len = prefix_len - num_fuzzy
 
         # match_prefix drops aligned matches before committing request
-        # state, so this is a defensive guard, not a live path.
-        if cached_start_pos == exact_matched_len:
+        # state unless the provider verified different tokens there (a
+        # paraphrase served whole), which is copied with a zero delta.
+        if cached_start_pos == exact_matched_len and not aligned_copy:
             self._free_realization_slots(req)
             return
 
