@@ -80,9 +80,14 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
 
 
-def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
+@pytest.mark.parametrize("uses_per_rank_shared_slots", [False, True])
+def test_hash_topk_empty_output_matches_zero_token_forward(
+    monkeypatch, uses_per_rank_shared_slots
+):
     monkeypatch.setattr(
-        hash_topk_module, "has_per_rank_fused_shared_slots", lambda *_args: True
+        hash_topk_module,
+        "has_per_rank_fused_shared_slots",
+        lambda *_args: uses_per_rank_shared_slots,
     )
 
     topk = HashTopK(
@@ -93,11 +98,19 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
         scoring_func="softmax",
     )
 
-    output = topk.empty_topk_output(torch.device("cpu"))
+    with hash_topk_module.envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
+        forward_output = topk(
+            hidden_states=torch.empty((0, 4)),
+            router_logits=torch.empty((0, 256)),
+            input_ids=torch.empty((0,), dtype=torch.int64),
+        )
+    empty_output = topk.empty_topk_output(torch.device("cpu"))
 
-    assert output.topk_ids.shape == (0, 7)
-    assert output.topk_weights.shape == (0, 7)
-    assert output.router_logits.shape == (0, 6)
+    expected_shapes = ((0, 7), (0, 7), (0, 256))
+    for output in (forward_output, empty_output):
+        assert output.topk_ids.shape == expected_shapes[0]
+        assert output.topk_weights.shape == expected_shapes[1]
+        assert output.router_logits.shape == expected_shapes[2]
 
 
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():
