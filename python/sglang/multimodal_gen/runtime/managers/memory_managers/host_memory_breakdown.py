@@ -112,6 +112,48 @@ def _mallinfo() -> dict[str, float]:
         return {}
 
 
+def _sample_anon_vma(start: int, end: int) -> str:
+    """A few bytes from the start and the middle of a mapping, as hex, plus a
+    guess at what they hold (zeros, bf16-looking, other)."""
+    import ctypes
+
+    out = []
+    for offset in (0, (end - start) // 2 & ~4095):
+        try:
+            raw = ctypes.string_at(start + offset, 32)
+        except Exception:
+            out.append("unreadable")
+            continue
+        if not any(raw):
+            kind = "zeros"
+        else:
+            # bf16 weights: high bytes cluster around 0x3c-0x40 / 0xbc-0xc0
+            highs = raw[1::2]
+            kind = (
+                "bf16-like"
+                if sum(1 for b in highs if 0x38 <= (b & 0x7F) <= 0x42) >= 10
+                else "other"
+            )
+        out.append(f"@{offset:#x}:{raw[:16].hex()}({kind})")
+    return " ".join(out)
+
+
+def _tensor_ptrs_inside(start: int, end: int) -> tuple[int, float]:
+    count = 0
+    total = 0.0
+    for obj in gc.get_objects():
+        if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
+            try:
+                ptr = obj.data_ptr()
+                nbytes = obj.numel() * obj.element_size()
+            except Exception:
+                continue
+            if start <= ptr < end:
+                count += 1
+                total += nbytes / GIB
+    return count, total
+
+
 def _smaps_rollup() -> dict[str, float]:
     totals: dict[str, float] = {}
     try:
@@ -224,10 +266,24 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
                 lines.append(f"  pinned host allocator: unavailable ({exc})")
         for start, end, anon, flags in _anon_vmas()[:16]:
             inside = any(a <= start < b for a, b in ranges)
+            count, held = _tensor_ptrs_inside(start, end)
             lines.append(
                 f"  anon vma {start:#x}-{end:#x}: {anon / GIB:.2f}GiB "
-                f"{'INSIDE cuda segment' if inside else 'outside cuda segments'} [{flags}]"
+                f"{'INSIDE cuda segment' if inside else 'outside cuda segments'} [{flags}] "
+                f"live cpu tensors inside={count} ({held:.2f}GiB) sample: {_sample_anon_vma(start, end)}"
             )
+        try:
+            config = torch.__config__.show()
+            lines.append(
+                "  torch build: "
+                + ", ".join(
+                    line.strip()
+                    for line in config.splitlines()
+                    if "MIMALLOC" in line or "ALLOC" in line.upper() and "USE_" in line
+                )[:300]
+            )
+        except Exception:
+            pass
         big = sorted(
             (
                 (int(segment.get("address", 0)), int(segment.get("total_size", 0)))
