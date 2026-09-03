@@ -197,9 +197,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert (
-        num_seqs * topk * max_context_len < 2**31
-    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    assert num_seqs * topk * max_context_len < 2**31, (
+        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    )
     return num_seqs * topk * max_context_len
 
 
@@ -1050,6 +1050,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        batch.spec_info.prepare_for_decode(batch)
+    elif batch.spec_algorithm.is_uno():
+        from sglang.srt.speculative.uno_info import UnoDraftInput
+
+        if not isinstance(batch.spec_info, UnoDraftInput):
+            raise RuntimeError("UNO decode preparation requires UnoDraftInput")
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

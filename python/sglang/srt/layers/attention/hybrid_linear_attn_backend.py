@@ -10,6 +10,7 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    fused_conv_window_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -50,6 +51,11 @@ _validate_mamba_replay_state_indices = (
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Per-slot accept lengths for the KDA fused-accept spec path; allocated only
+    # by KDAAttnBackend where `_can_fuse_accept_state` holds. None everywhere
+    # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
+    accept_lens_pool: Optional[torch.Tensor] = None
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -432,9 +438,9 @@ class MambaAttnBackendBase(AttentionBackend):
         return mask.cpu()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         draft_token_num = max_num_tokens // max_bs
         # Per-bs static write-cursor / force-flush buffers, captured by pointer +
         # refreshed in-place each replay; sized like state_indices_list. None when off.
@@ -489,9 +495,9 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert (
-            max_num_tokens % max_bs == 0
-        ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+        )
         for i in range(max_bs):
             self.state_indices_list.append(
                 torch.full(
@@ -622,9 +628,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # [-num_decodes:], which on the full max_bs buffer binds the stale tail.
         track_buf = None
         if mamba_track_indices is not None:
-            assert (
-                len(mamba_track_indices) >= bs
-            ), f"{len(mamba_track_indices)=} < {bs=}"
+            assert len(mamba_track_indices) >= bs, (
+                f"{len(mamba_track_indices)=} < {bs=}"
+            )
             track_buf = self.mamba_track_indices_buf[:bs]
             track_buf.copy_(self._translate_mamba_indices(mamba_track_indices[:bs]))
         # Refresh the static write cursor in-place (mirrors the eager
@@ -871,12 +877,14 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
         if model_runner.server_args.enable_mamba_extra_buffer():
-            assert (
-                self.conv_states_shape[-1] < self.mamba_chunk_size
-            ), f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            assert self.conv_states_shape[-1] < self.mamba_chunk_size, (
+                f"{self.conv_states_shape[-1]=} should be less than {self.mamba_chunk_size}"
+            )
             assert (
                 model_runner.server_args.mamba_track_interval >= self.mamba_chunk_size
-            ), f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            ), (
+                f"mamba_track_interval ({model_runner.server_args.mamba_track_interval}) must be >= mamba_chunk_size ({self.mamba_chunk_size})"
+            )
 
     def init_forward_metadata_out_graph(
         self,
@@ -904,9 +912,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             draft_token_num=draft_token_num,
         )
         # `forward` slices the track destinations from ([-num_decodes:])
-        assert (
-            self.forward_metadata.num_decodes == forward_batch.batch_size
-        ), f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
+        assert self.forward_metadata.num_decodes == forward_batch.batch_size, (
+            f"{self.forward_metadata.num_decodes=} != {forward_batch.batch_size=}"
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         metadata = self._forward_metadata(forward_batch)
@@ -991,6 +999,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+        self.kv_index_translator = full_attn_backend.kv_index_translator
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
@@ -1279,6 +1288,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 null_block_id=-1,
+            )
+            return
+
+        # KDA fused-accept: the next verify seeds itself in-kernel from the
+        # accepted checkpoint slot (recurrent_kda's num_accepted_tokens), so the
+        # SSM state never round-trips through `temporal` and only the conv
+        # windows still need the accept rollback. Recording this round's accept
+        # length is what selects that seed next round; chain layout only (see
+        # above), so accept_lens == last_correct_step_indices + 1. The pool
+        # exists only where KDAAttnBackend found the contract satisfied, which
+        # includes mamba radix tracking being off.
+        accept_lens_pool = self.linear_attn_backend.accept_lens_pool
+        if accept_lens_pool is not None:
+            assert mamba_track_indices is None, "fused-accept runs with radix off"
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                )
+            accept_lens_pool[state_indices_tensor.to(torch.int64)] = (
+                last_correct_step_indices.to(torch.int32) + 1
             )
             return
 

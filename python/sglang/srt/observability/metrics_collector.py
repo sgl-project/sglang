@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
+    get_context,
     get_disagg,
     get_observability,
     get_schedule,
@@ -210,7 +211,6 @@ def resolve_collector_class(role: str, default_cls: type) -> type:
 
     An unpublished ``observability`` namespace answers with the default.
     """
-    from sglang.srt.runtime_context import get_context, get_observability
 
     if not get_context().is_config_namespace_published("observability"):
         return default_cls
@@ -244,7 +244,6 @@ class SchedulerMetricsCollectorContext:
 
 
 class SchedulerMetricsCollector(_StatLoggerDIMixin):
-
     def __init__(
         self,
         labels: Dict[str, str],
