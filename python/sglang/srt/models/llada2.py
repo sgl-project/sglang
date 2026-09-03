@@ -1033,7 +1033,6 @@ class LLaDA2MoeModelLM(nn.Module):
                     tuple(first_experts.w2_weight_scale_inv.shape),
                 )
 
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         num_groups = getattr(config, "n_group", 0)

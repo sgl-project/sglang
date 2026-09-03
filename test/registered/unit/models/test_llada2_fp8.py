@@ -2,9 +2,19 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.model_loader.weight_utils import get_quant_config
+from transformers import PretrainedConfig
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.configs.model_config import ModelConfig  # noqa: E402
+from sglang.srt.layers.quantization.fp8 import Fp8Config  # noqa: E402
+from sglang.srt.model_loader.weight_utils import get_quant_config  # noqa: E402
+from sglang.srt.utils.common import LazyValue  # noqa: E402
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _experts_only_config(**overrides):
@@ -20,7 +30,7 @@ def _experts_only_config(**overrides):
     return config
 
 
-class TestLLaDA2Fp8(unittest.TestCase):
+class TestLLaDA2Fp8(CustomTestCase):
     def setUp(self):
         self.model_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.model_dir.cleanup)
@@ -35,7 +45,7 @@ class TestLLaDA2Fp8(unittest.TestCase):
     ):
         model_config = ModelConfig.__new__(ModelConfig)
         model_config.model_path = self.model_dir.name
-        model_config.hf_config = SimpleNamespace(
+        model_config.hf_config = PretrainedConfig(
             architectures=[architecture],
             quantization_config=quantization_config,
             compression_config=compression_config,
@@ -132,7 +142,8 @@ class TestLLaDA2Fp8(unittest.TestCase):
         model.model.layers = nn.ModuleList()
 
         model.load_weights([])
-        self.assertEqual(model.routed_experts_weights_of_layer, {})
+        self.assertIsInstance(model.routed_experts_weights_of_layer, LazyValue)
+        self.assertEqual(model.routed_experts_weights_of_layer.value, {})
 
         layer = nn.Module()
         layer.mlp = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)

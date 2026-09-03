@@ -90,8 +90,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             raise ValueError("LLaDA-Image sequence parallelism requires ring_degree=1")
         if server_args.ulysses_degree != server_args.sp_degree:
             raise ValueError(
-                "LLaDA-Image sequence parallelism requires "
-                "ulysses_degree == sp_degree"
+                "LLaDA-Image sequence parallelism requires ulysses_degree == sp_degree"
             )
         if server_args.sp_degree not in (1, 2):
             raise ValueError("LLaDA-Image currently supports only SP degrees 1 and 2")
@@ -127,8 +126,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
                 or server_args.is_arg_explicitly_set("cpu_offload_components")
             ):
                 raise ValueError(
-                    "LLaDA-Image requires its embedded text encoder to "
-                    "remain resident"
+                    "LLaDA-Image requires its embedded text encoder to remain resident"
                 )
             # Strip the encoder from auto-tuned offload selections the tuner
             # applies without knowing about the embedded worker.
@@ -150,8 +148,7 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
             )
             if server_args.residency_mode("text_encoder") != "resident":
                 raise ValueError(
-                    "LLaDA-Image requires its embedded text encoder to "
-                    "remain resident"
+                    "LLaDA-Image requires its embedded text encoder to remain resident"
                 )
 
         area_override = server_args.llada_image_max_pixel_area

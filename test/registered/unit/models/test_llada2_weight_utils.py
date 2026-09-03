@@ -3,9 +3,13 @@ import unittest
 import torch
 
 from sglang.srt.models.llada2_weight_utils import prepare_llada2_language_weights
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestLLaDA2WeightUtils(unittest.TestCase):
+class TestLLaDA2WeightUtils(CustomTestCase):
     def test_prepares_clean_language_checkpoint_layout(self):
         fused = torch.arange(24).reshape(2, 3, 4)
         lm_head = torch.randn(4, 3)

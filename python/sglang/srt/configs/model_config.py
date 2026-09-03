@@ -1258,8 +1258,7 @@ class ModelConfig:
         activation_method = llada_fp8_experts.get("activation_method", "")
         if fp8_format not in {"e4m3", "e4m3fn"}:
             raise ValueError(
-                "llada_fp8_experts.format must be e4m3/e4m3fn, "
-                f"but got {fp8_format!r}."
+                f"llada_fp8_experts.format must be e4m3/e4m3fn, but got {fp8_format!r}."
             )
         if weight_granularity != "per_expert_2d_block":
             raise ValueError(
@@ -1270,8 +1269,7 @@ class ModelConfig:
             activation_method
         ).startswith("dynamic"):
             raise ValueError(
-                "llada_fp8_experts requires dynamic per-token "
-                "activation quantization."
+                "llada_fp8_experts requires dynamic per-token activation quantization."
             )
         weight_block_size = llada_fp8_experts.get("weight_block_size")
         if (

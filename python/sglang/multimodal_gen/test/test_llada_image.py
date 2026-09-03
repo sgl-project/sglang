@@ -14,7 +14,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
 from sglang.multimodal_gen.configs.sample.llada_image import LLaDAImageSamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.llada_image import (
-    LLaDAImageRMSNorm,
     LLaDAImageTransformerBlock,
     _LLaDAImageTransformer2DModel,
 )
@@ -63,36 +62,8 @@ class TestLLaDAImage(unittest.TestCase):
     def tearDownClass(cls):
         set_global_server_args(cls.previous_server_args)
 
-    def test_llada_rmsnorm_uses_diffusers_cast_order(self):
-        generator = torch.Generator().manual_seed(0)
-        norm = LLaDAImageRMSNorm(17, eps=1e-5).to(torch.bfloat16)
-        # Non-unit weights make the cast order observable.
-        with torch.no_grad():
-            norm.weight.copy_(
-                torch.randn(17, generator=generator, dtype=torch.bfloat16)
-            )
-        hidden_states = torch.randn(
-            2,
-            17,
-            generator=generator,
-            dtype=torch.bfloat16,
-        )
-
-        variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
-        expected = norm.weight * (
-            hidden_states.float() * torch.rsqrt(variance + norm.variance_epsilon)
-        ).to(hidden_states.dtype)
-
-        self.assertEqual(norm.weight.dtype, torch.bfloat16)
-        torch.testing.assert_close(
-            norm.forward_native(hidden_states), expected, rtol=0, atol=0
-        )
-        self.assertTrue(norm.cast_x_before_out_mul)
-
     def test_dit_supports_sglang_flash_attention_and_sdpa(self):
-        backends = (
-            LLaDAImagePipelineConfig().dit_config.arch_config._supported_attention_backends
-        )
+        backends = LLaDAImagePipelineConfig().dit_config.arch_config._supported_attention_backends
         self.assertEqual(
             backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},

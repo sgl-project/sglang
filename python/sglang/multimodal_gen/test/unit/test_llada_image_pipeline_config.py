@@ -191,8 +191,9 @@ class TestLLaDAImagePipelineConfig(unittest.TestCase):
         ]
         for overrides, message in invalid_cases:
             args = defaults | overrides
-            with self.subTest(overrides=overrides), self.assertRaisesRegex(
-                ValueError, message
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 self.config.validate_server_args(SimpleNamespace(**args))
 
@@ -314,8 +315,9 @@ class TestLLaDAImagePipelineConfig(unittest.TestCase):
             (params(cfg_gate_step="0.5"), sp1, "must be between 0.0 and 1.0"),
         ]
         for sampling_params, server_args, message in invalid_cases:
-            with self.subTest(message=message), self.assertRaisesRegex(
-                ValueError, message
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 self.config.validate_request_sampling_params(
                     sampling_params, server_args

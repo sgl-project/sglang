@@ -1073,8 +1073,9 @@ def _register_configs():
         pipeline_config_cls=LLaDAImagePipelineConfig,
         hf_model_paths=["inclusionAI/LLaDA-Image"],
         model_detectors=[
-            lambda hf_id: "lladaimagepipeline" in hf_id.lower()
-            or "llada-image" in hf_id.lower()
+            lambda hf_id: (
+                "lladaimagepipeline" in hf_id.lower() or "llada-image" in hf_id.lower()
+            )
         ],
     )
     # Qwen-Image
