@@ -150,18 +150,20 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
         lambda config: SimpleNamespace(),
     )
 
-    with get_context().override_server_args(
-        model_path="dummy"
-    ), get_flags().moe.override(
-        runner_backend=MoeRunnerBackend.AUTO,
-        a2a_backend=MoeA2ABackend.NONE,
-    ), get_parallel().override(
-        moe_ep_size=1,
-        moe_ep_rank=0,
-        moe_tp_size=1,
-        moe_tp_rank=0,
-        tp_size=1,
-        tp_rank=0,
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.AUTO,
+            a2a_backend=MoeA2ABackend.NONE,
+        ),
+        get_parallel().override(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            tp_size=1,
+            tp_rank=0,
+        ),
     ):
         layer = FusedMoE(
             num_experts=2,
@@ -206,10 +208,9 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     monkeypatch.setattr(
         runner_module,
         "MoeRunner",
-        lambda selected_backend, config, lora_enabled: created_runners.append(
-            (selected_backend, config, lora_enabled)
-        )
-        or object(),
+        lambda selected_backend, config, lora_enabled: (
+            created_runners.append((selected_backend, config, lora_enabled)) or object()
+        ),
     )
 
     wrapper = FusedMoEWithLoRA(base_layer, lora_backend)
@@ -348,18 +349,20 @@ def test_fused_moe_layer_runner_is_none_when_method_builds_no_runner(
         lambda config: SimpleNamespace(),
     )
 
-    with get_context().override_server_args(
-        model_path="dummy"
-    ), get_flags().moe.override(
-        runner_backend=MoeRunnerBackend.AUTO,
-        a2a_backend=MoeA2ABackend.NONE,
-    ), get_parallel().override(
-        moe_ep_size=1,
-        moe_ep_rank=0,
-        moe_tp_size=1,
-        moe_tp_rank=0,
-        tp_size=1,
-        tp_rank=0,
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.AUTO,
+            a2a_backend=MoeA2ABackend.NONE,
+        ),
+        get_parallel().override(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            tp_size=1,
+            tp_rank=0,
+        ),
     ):
         layer = FusedMoE(
             num_experts=2,

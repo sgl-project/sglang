@@ -427,9 +427,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         hidden_size = config.hidden_size
         num_attention_heads = config.num_attention_heads
         head_dim = hidden_size // num_attention_heads
-        assert head_dim == sum(
-            config.axes_dims
-        ), f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
+        assert head_dim == sum(config.axes_dims), (
+            f"head_dim {head_dim} != sum(axes_dims) {sum(config.axes_dims)}"
+        )
         mlp_only_layers = tuple(config.mlp_only_layers)
 
         self.hidden_size = hidden_size

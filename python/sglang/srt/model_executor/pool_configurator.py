@@ -462,9 +462,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = get_schedule().swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -1014,9 +1014,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -1044,9 +1044,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 
