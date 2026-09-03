@@ -97,9 +97,9 @@ class IndexerKPool(MultiPlatformOp):
             f"index_topk ({self.index_topk}) must be divisible by "
             f"index_kpool ({self.index_kpool})"
         )
-        assert (
-            64 % self.index_kpool == 0
-        ), f"index_kpool ({self.index_kpool}) must divide page_size (64)"
+        assert 64 % self.index_kpool == 0, (
+            f"index_kpool ({self.index_kpool}) must divide page_size (64)"
+        )
 
         # Resolved the same way as the non-pooled indexer rather than branching on
         # is_hip() directly, so --dsa-paged-mqa-logits-backend reaches this path too.
@@ -970,9 +970,9 @@ class IndexerKPool(MultiPlatformOp):
         total_k_rows = plan.ragged_total_k_rows
 
         n_real = seq_lens_expanded.shape[0]
-        assert (
-            n_real <= total_q
-        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
+        assert n_real <= total_q, (
+            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
+        )
 
         if total_k_rows > 0:
             k_u8 = plan.ragged_k_u8
