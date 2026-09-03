@@ -67,11 +67,12 @@ class TestFreeSegment(unittest.TestCase):
         alloc.free_segment(row[:0], start_pos=0)
         self.assertEqual(len(alloc.free_pages), before)
 
-    def test_need_sort_routes_to_release_pages(self):
+    def test_need_sort_defers_released_pages(self):
         alloc = _make_allocator(need_sort=True)
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
         alloc.free_segment(row, start_pos=0)
-        self.assertEqual(len(alloc.release_pages), 2)
+        self.assertEqual(len(alloc.staged_pages), 1)
+        self.assertEqual(alloc.num_staged_pages, 2)
 
     def test_group_defers_until_group_end(self):
         alloc = _make_allocator()
@@ -108,8 +109,8 @@ class TestFreeSegment(unittest.TestCase):
         with self.assertRaises(AssertionError):
             alloc.free_group_end()
 
-    def test_group_end_debug_assert_covers_release_pages(self):
-        # need_sort routes frees into release_pages; the duplicate check must
+    def test_group_end_debug_assert_covers_staged_releases(self):
+        # need_sort stages frees in chunks; the duplicate check must
         # not go vacuous there (PD disaggregation runs with need_sort=True).
         alloc = _make_allocator(need_sort=True)
         alloc.debug_mode = True
