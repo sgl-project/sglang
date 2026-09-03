@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/cpu.py
 
+import gc
 import platform
 from functools import lru_cache
 from typing import Any
@@ -30,6 +31,14 @@ class CpuPlatform(Platform):
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("cpu")
+
+    @classmethod
+    def synchronize(cls) -> None:
+        torch.cpu.synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        gc.collect()
 
     @classmethod
     def get_torch_distributed_backend_str(cls) -> str:
