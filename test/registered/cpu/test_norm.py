@@ -477,8 +477,8 @@ class TestFusedQKGemmaRMSNorm:
 
 
 class TestFusedScaleShiftKernels:
-    @staticmethod
     def rmsnorm_ref(
+        self,
         x: torch.Tensor,
         weight: torch.Tensor,
         eps: float,

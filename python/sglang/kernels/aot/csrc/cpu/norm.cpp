@@ -563,9 +563,7 @@ struct ScaleShiftBroadcastParams {
   //
   // Frame-based 4D broadcast:
   //   tensor shape [B, F, 1, C]
-  //   offset = b * stride_b
-  //          + (l / frame_seqlen) * stride_f
-  //          + c * stride_c
+  //   offset = b * stride_b + (l / frame_seqlen) * stride_f + c * stride_c
 
   int64_t stride_b{0};
   int64_t stride_l{0};
@@ -582,6 +580,77 @@ struct ScaleShiftBroadcastParams {
     return b * stride_b + l * stride_l;
   }
 };
+
+ScaleShiftBroadcastParams make_scale_shift_broadcast_params(
+    const at::Tensor& tensor, int64_t batch_size, int64_t seq_len, int64_t hidden_size, const char* tensor_name) {
+  ScaleShiftBroadcastParams params;
+
+  // Scalar, regardless of whether its shape is [], [1], [1, 1], etc.
+  if (tensor.numel() == 1) {
+    return params;
+  }
+
+  TORCH_CHECK(
+      tensor.dim() >= 1 && tensor.dim() <= 4,
+      tensor_name,
+      " must be a scalar or a 1D/2D/3D/4D tensor, got ",
+      tensor.dim(),
+      "D.");
+
+  switch (tensor.dim()) {
+    case 1: {
+      // [C] or [1]
+      TORCH_CHECK(tensor.size(0) == hidden_size, tensor_name, " must match the hidden dimension.");
+      params.stride_c = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      break;
+    }
+
+    case 2: {
+      // [B, C], [1, C], [B, 1], [1, 1]
+      TORCH_CHECK(tensor.size(0) == 1 || tensor.size(0) == batch_size, tensor_name, " must match the batch dimension.");
+      TORCH_CHECK(
+          tensor.size(1) == 1 || tensor.size(1) == hidden_size, tensor_name, " must match the hidden dimension.");
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_c = tensor.size(1) == 1 ? 0 : tensor.stride(1);
+      break;
+    }
+
+    case 3: {
+      // Broadcastable to [B, L, C]
+      TORCH_CHECK(tensor.size(0) == 1 || tensor.size(0) == batch_size, tensor_name, " must match the batch dimension.");
+      TORCH_CHECK(tensor.size(1) == 1 || tensor.size(1) == seq_len, tensor_name, " must match the sequence dimension.");
+      TORCH_CHECK(
+          tensor.size(2) == 1 || tensor.size(2) == hidden_size, tensor_name, " must match the hidden dimension.");
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_l = tensor.size(1) == 1 ? 0 : tensor.stride(1);
+      params.stride_c = tensor.size(2) == 1 ? 0 : tensor.stride(2);
+      break;
+    }
+
+    case 4: {
+      TORCH_CHECK(tensor.size(0) == 1 || tensor.size(0) == batch_size, tensor_name, " must match the batch dimension.");
+      TORCH_CHECK(tensor.size(2) == 1, tensor_name, " must have a singleton sequence dimension.");
+      TORCH_CHECK(
+          tensor.size(3) == 1 || tensor.size(3) == hidden_size, tensor_name, " must match the hidden dimension.");
+      // [B, F, 1, C], used by frame-based diffusion models.
+      const int64_t num_frames = tensor.size(1);
+      TORCH_CHECK(seq_len % num_frames == 0, tensor_name, " frame dimension must divide the sequence length.");
+      params.frame_broadcast = true;
+      params.frame_seqlen = seq_len / num_frames;
+      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
+      params.stride_f = tensor.stride(1);
+      params.stride_c = tensor.size(3) == 1 ? 0 : tensor.stride(3);
+      break;
+    }
+
+    default:
+      TORCH_INTERNAL_ASSERT(false);
+  }
+  TORCH_CHECK(
+      params.stride_c == 0 || params.stride_c == 1, tensor_name, " hidden dimension must be contiguous or broadcast.");
+
+  return params;
+}
 
 template <typename scalar_t>
 float sum_squares(const scalar_t* __restrict__ input, int64_t size) {
@@ -744,6 +813,58 @@ void fused_qk_norm_apply_from_stats_kernel_impl(
   });
 }
 
+template <typename scalar_t, typename param_t>
+void fused_scale_shift_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const param_t* __restrict__ scale,
+    const param_t* __restrict__ shift,
+    int64_t batch_size,
+    int64_t seq_len,
+    int64_t hidden_size,
+    int64_t input_stride_b,
+    int64_t input_stride_l,
+    const ScaleShiftBroadcastParams& scale_params,
+    const ScaleShiftBroadcastParams& shift_params,
+    float scale_constant) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+
+  constexpr int64_t kVecSize = bVec::size();
+
+  const int64_t num_rows = batch_size * seq_len;
+
+  at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      const int64_t b = row / seq_len;
+      const int64_t l = row % seq_len;
+      const scalar_t* __restrict__ input_ptr = input + b * input_stride_b + l * input_stride_l;
+
+      const param_t* __restrict__ scale_ptr = scale + scale_params.row_offset(b, l);
+
+      const param_t* __restrict__ shift_ptr = shift + shift_params.row_offset(b, l);
+
+      // output is newly allocated and contiguous.
+      scalar_t* __restrict__ output_ptr = output + row * hidden_size;
+
+      int64_t d = 0;
+#pragma GCC unroll 4
+      for (; d <= hidden_size - kVecSize; d += kVecSize) {
+        auto [x0, x1] = load_float_vec2(input_ptr + d);
+        apply_scale_shift_vec(
+            x0, x1, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
+        convert_from_float_ext<scalar_t>(x0, x1).store(output_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        const float x = static_cast<float>(input_ptr[d]);
+        const float result = apply_scale_shift_scalar(
+            x, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
+        output_ptr[d] = static_cast<scalar_t>(result);
+      }
+    }
+  });
+}
+
 template <NormMode M, typename scalar_t, typename param_t>
 void fused_norm_scale_shift_kernel_impl(
     scalar_t* __restrict__ out,
@@ -766,10 +887,7 @@ void fused_norm_scale_shift_kernel_impl(
       const int64_t b = row / S;
       const int64_t s = row % S;
 
-      const int64_t input_offset = p.input_offset(
-          b,
-          /*h=*/0,
-          s);
+      const int64_t input_offset = p.input_offset(b, /*h=*/0, s);
 
       // out is newly allocated and contiguous.
       const int64_t output_offset = row * D;
@@ -848,73 +966,6 @@ void fused_scale_residual_norm_scale_shift_kernel_impl(
 }
 #undef LAUNCH_PARALLEL_LOOP
 #undef LAUNCH_PARALLEL_LOOP_HD
-ScaleShiftBroadcastParams make_scale_shift_broadcast_params(
-    const at::Tensor& tensor, int64_t batch_size, int64_t seq_len, int64_t hidden_size, const char* tensor_name) {
-  ScaleShiftBroadcastParams params;
-
-  // Scalar, regardless of whether its shape is [], [1], [1, 1], etc.
-  if (tensor.numel() == 1) {
-    return params;
-  }
-
-  TORCH_CHECK(
-      tensor.dim() >= 1 && tensor.dim() <= 4,
-      tensor_name,
-      " must be a scalar or a 1D/2D/3D/4D tensor, got ",
-      tensor.dim(),
-      "D.");
-
-  switch (tensor.dim()) {
-    case 1: {
-      // [C] or [1]
-      params.stride_c = tensor.size(0) == 1 ? 0 : tensor.stride(0);
-      break;
-    }
-
-    case 2: {
-      // [B, C], [1, C], [B, 1], [1, 1]
-      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
-      params.stride_c = tensor.size(1) == 1 ? 0 : tensor.stride(1);
-      break;
-    }
-
-    case 3: {
-      // Broadcastable to [B, L, C]
-      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
-      params.stride_l = tensor.size(1) == 1 ? 0 : tensor.stride(1);
-      params.stride_c = tensor.size(2) == 1 ? 0 : tensor.stride(2);
-      break;
-    }
-
-    case 4: {
-      // [B, F, 1, C], used by frame-based diffusion models.
-      const int64_t num_frames = tensor.size(1);
-      TORCH_CHECK(
-          seq_len % num_frames == 0,
-          tensor_name,
-          " frame dimension must divide sequence length, got seq_len=",
-          seq_len,
-          " and frames=",
-          num_frames,
-          ".");
-      params.frame_broadcast = true;
-      params.frame_seqlen = seq_len / num_frames;
-      params.stride_b = tensor.size(0) == 1 ? 0 : tensor.stride(0);
-      params.stride_f = tensor.stride(1);
-      params.stride_c = tensor.size(3) == 1 ? 0 : tensor.stride(3);
-      break;
-    }
-
-    default:
-      TORCH_INTERNAL_ASSERT(false);
-  }
-  TORCH_CHECK(
-      params.stride_c == 0 || params.stride_c == 1,
-      tensor_name,
-      " hidden dimension must be contiguous or broadcast, got stride ",
-      params.stride_c);
-  return params;
-}
 template <typename scale_t, typename shift_t>
 inline void apply_scale_shift_vec(
     at::vec::Vectorized<float>& x0,
@@ -964,58 +1015,6 @@ inline float apply_scale_shift_scalar(
   const float scale_value = static_cast<float>(scale[c * scale_stride_c]);
   const float shift_value = static_cast<float>(shift[c * shift_stride_c]);
   return x * (scale_constant + scale_value) + shift_value;
-}
-
-template <typename scalar_t, typename param_t>
-void fused_scale_shift_kernel_impl(
-    scalar_t* __restrict__ output,
-    const scalar_t* __restrict__ input,
-    const param_t* __restrict__ scale,
-    const param_t* __restrict__ shift,
-    int64_t batch_size,
-    int64_t seq_len,
-    int64_t hidden_size,
-    int64_t input_stride_b,
-    int64_t input_stride_l,
-    const ScaleShiftBroadcastParams& scale_params,
-    const ScaleShiftBroadcastParams& shift_params,
-    float scale_constant) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-
-  constexpr int64_t kVecSize = bVec::size();
-
-  const int64_t num_rows = batch_size * seq_len;
-
-  at::parallel_for(0, num_rows, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t row = begin; row < end; ++row) {
-      const int64_t b = row / seq_len;
-      const int64_t l = row % seq_len;
-      const scalar_t* __restrict__ input_ptr = input + b * input_stride_b + l * input_stride_l;
-
-      const param_t* __restrict__ scale_ptr = scale + scale_params.row_offset(b, l);
-
-      const param_t* __restrict__ shift_ptr = shift + shift_params.row_offset(b, l);
-
-      // output is newly allocated and contiguous.
-      scalar_t* __restrict__ output_ptr = output + row * hidden_size;
-
-      int64_t d = 0;
-#pragma GCC unroll 4
-      for (; d <= hidden_size - kVecSize; d += kVecSize) {
-        auto [x0, x1] = load_float_vec2(input_ptr + d);
-        apply_scale_shift_vec(
-            x0, x1, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
-        convert_from_float_ext<scalar_t>(x0, x1).store(output_ptr + d);
-      }
-#pragma GCC unroll 4
-      for (; d < hidden_size; ++d) {
-        const float x = static_cast<float>(input_ptr[d]);
-        const float result = apply_scale_shift_scalar(
-            x, scale_ptr, shift_ptr, scale_params.stride_c, shift_params.stride_c, d, scale_constant);
-        output_ptr[d] = static_cast<scalar_t>(result);
-      }
-    }
-  });
 }
 }  // anonymous namespace
 
