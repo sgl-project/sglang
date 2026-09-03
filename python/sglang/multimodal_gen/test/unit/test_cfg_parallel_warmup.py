@@ -519,6 +519,27 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             0,
         )
 
+    def test_breakable_cuda_graph_uses_explicit_warmup_num_frames(self):
+        pipeline_config = MagicMock()
+        pipeline_config.task_type = ModelTaskType.T2V
+        pipeline_config.adjust_num_frames.side_effect = lambda value: value
+        server_args = SimpleNamespace(
+            pipeline_config=pipeline_config,
+            enable_breakable_cuda_graph=True,
+            pipeline_class_name=None,
+            num_gpus=1,
+            warmup_num_frames=17,
+        )
+
+        num_frames = _resolve_warmup_num_frames(
+            server_args,
+            SamplingParams(num_frames=81),
+            server_based_warmup=True,
+        )
+
+        self.assertEqual(num_frames, 17)
+        pipeline_config.adjust_num_frames.assert_called_once_with(17)
+
     def test_server_based_warmup_uses_video_supported_resolution_budget(self):
         server_args = MagicMock()
         server_args.warmup_steps = 1

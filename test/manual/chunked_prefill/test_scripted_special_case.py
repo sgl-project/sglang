@@ -225,10 +225,10 @@ class TestSpecialCaseBasic(ScriptedTestCase):
         )
         for _ in range(DEFAULT_MAX_STEPS):
             if r.is_chunking:
-                assert len(r.req.prefix_indices) <= r.req.kv_committed_len, (
+                assert len(r.req.prefix_indices) <= r.req.kv.kv_committed_len, (
                     f"streaming-session chunked stash must stay bounded by "
                     f"kv_committed_len; prefix_indices_len={len(r.req.prefix_indices)}, "
-                    f"kv_committed_len={r.req.kv_committed_len}"
+                    f"kv_committed_len={r.req.kv.kv_committed_len}"
                 )
             if r.finished:
                 break
@@ -885,8 +885,8 @@ class TestSpecialCaseDynamicChunkingPP1(ScriptedTestCase):
 
     @staticmethod
     def _script_dynamic_chunking_forced_off_on_pp1(t: ScriptedContext):
-        assert t.scheduler.enable_dynamic_chunking is False, (
-            "pp_size==1 must force enable_dynamic_chunking off even when the "
+        assert t.scheduler.dynamic_chunk_sizer is None, (
+            "pp_size==1 must leave dynamic chunking off even when the "
             "server arg is True (the 'and ps.pp_size > 1' conjunct)"
         )
         r = t.start_req(

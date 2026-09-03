@@ -164,7 +164,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 is_multi_layer_eagle=True,
@@ -185,9 +185,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             "InklingForConditionalGenerationMTP",
         ]
         self.draft_tp_context = (
-            draft_tp_context
-            if get_parallel().config.enable_dp_attention
-            else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -964,8 +962,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
     @property
     def last_shared_read_runner(self):
-        # Multi-layer eagle has no draft forward, only draft extend.
-        return self._draft_worker.draft_runner
+        return self._draft_worker.draft_runner_list[-1]
 
     @property
     def spec_v2_attn_backends(self) -> tuple:

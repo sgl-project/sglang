@@ -24,7 +24,8 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: ubuntu-latest
     outputs:
-      nightly_version: ${{ steps.build.outputs.nightly_version }}
+      nightly_version: ${{ steps.wheel.outputs.wheel_version }}
+      wheel_filename: ${{ steps.wheel.outputs.wheel_filename }}
       commit_hash: ${{ steps.build.outputs.commit_hash }}
       build_date: ${{ steps.build.outputs.build_date }}
     steps:
@@ -41,7 +42,9 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          pip install build wheel setuptools setuptools-scm
+          pip install \
+            auditwheel build patchelf wheel "setuptools>=61.0" \
+            "setuptools-rust>=1.11" "setuptools-scm>=8.0" "torch==2.13.0"
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
@@ -66,7 +69,7 @@ jobs:
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           PATCH_RAW=$(echo "$VERSION" | cut -d. -f3)
           # Strip pre-release suffixes (rc0, post1, etc.) to get numeric patch
-          PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+          PATCH=${PATCH_RAW%%[^0-9]*}
           NEXT_PATCH=$((PATCH + 1))
           NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
 
@@ -77,24 +80,25 @@ jobs:
           export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
 
           # Build wheel
-          python3 -m build --wheel
-
-          # Extract version from built wheel filename
-          WHEEL_FILE=$(ls dist/*.whl)
-          NIGHTLY_VERSION=$(echo "$WHEEL_FILE" | sed 's/.*sglang-\(.*\)-py3.*/\1/')
+          python3 -m build --wheel --no-isolation
 
           # Get commit info
           COMMIT_HASH=$(git rev-parse --short HEAD)
           BUILD_DATE=$(date -u +%Y-%m-%d)
 
-          echo "Built wheel: $WHEEL_FILE"
-          echo "Nightly version: ${NIGHTLY_VERSION}"
           echo "Commit: ${COMMIT_HASH}"
           echo "Build date: ${BUILD_DATE}"
 
-          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
-          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
-          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+          {
+            echo "commit_hash=${COMMIT_HASH}"
+            echo "build_date=${BUILD_DATE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Repair and smoke-test wheel
+        id: wheel
+        run: |
+          python3 scripts/release/prepare_sglang_wheel.py python/dist \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -139,7 +143,7 @@ jobs:
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           prerelease: true
           body: |
-            Nightly build from commit ${{ github.sha }}
+            Nightly build from commit ${{ needs.build-nightly-wheel.outputs.commit_hash }}
             Build date: ${{ needs.build-nightly-wheel.outputs.build_date }}
             Version: ${{ needs.build-nightly-wheel.outputs.nightly_version }}
           files: |
@@ -147,7 +151,7 @@ jobs:
 
       - name: Clone wheel index repository
         run: |
-          git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+          git clone "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
           cd sgl-whl
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"
@@ -162,10 +166,10 @@ jobs:
       - name: Update wheel index
         run: |
           python3 scripts/update_nightly_whl_index.py \
-            --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
-            --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
-            --cuda-version ${{ matrix.cuda_version }} \
-            --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
+            --commit-hash "${{ needs.build-nightly-wheel.outputs.commit_hash }}" \
+            --nightly-version "${{ needs.build-nightly-wheel.outputs.nightly_version }}" \
+            --cuda-version "${{ matrix.cuda_version }}" \
+            --build-date "${{ needs.build-nightly-wheel.outputs.build_date }}"
 
       - name: Push wheel index
         run: |

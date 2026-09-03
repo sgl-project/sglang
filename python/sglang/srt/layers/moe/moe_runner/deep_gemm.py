@@ -20,6 +20,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -30,7 +31,11 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_parallel,
+)
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
@@ -52,6 +57,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import (
         DeepEPv2CombineInput,
         DeepEPv2DispatchOutput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatchOutput,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
@@ -161,6 +169,14 @@ def _should_use_masked_standard_layout(
     quant_info: DeepGemmMoeQuantInfo,
     hidden_states: torch.Tensor,
 ) -> bool:
+    # Preserve the Oakhaven WideEP escape hatch while adopting upstream's
+    # memory-budget-based auto policy. CUDA graph capture remains masked.
+    if (
+        envs.SGLANG_OPT_DG_COMPACT_EAGER.get()
+        and not get_flags().capture.disable_dispose_tensor
+    ):
+        return False
+
     mode = envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower()
     if mode not in ("auto", "masked", "compact"):
         raise ValueError(
@@ -257,7 +273,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = get_moe_a2a_backend().is_megamoe()
+        # SM120's contiguous GEMM only consumes standard-layout activations, so
+        # it opts out of swizzle regardless of the a2a backend.
+        self.use_swizzle = (
+            get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
+        )
 
     def run(
         self,
@@ -306,10 +326,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
+        trace_deepep_v2_contig = (
+            envs.SGLANG_DEEPEP_V2_TRACE_CONTIG.get()
+            and running_state.get("deepep_v2_expanded", False)
+        )
 
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         scale_block_size = 128
+
+        if all_tokens == 0:
+            if trace_deepep_v2_contig:
+                logger.warning("DeepEP v2 expanded contig runner empty return")
+            dispose_tensor(hidden_states)
+            dispose_tensor(hidden_states_scale)
+            return torch.empty(
+                (0, K), device=hidden_states_device, dtype=torch.bfloat16
+            )
 
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
@@ -340,6 +373,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        if trace_deepep_v2_contig:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 expanded contig gateup GEMM returned")
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -400,6 +436,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 del down_input
         elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
+            use_contig_swizzle = self.use_swizzle and not running_state.get(
+                "deepep_v2_disable_contig_swizzle", False
+            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -422,7 +461,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=self.use_swizzle,
+                swizzle=use_contig_swizzle,
             )
             del gateup_output
         else:
@@ -454,6 +493,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
             del down_input
+        if trace_deepep_v2_contig:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 expanded contig activation returned")
 
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
         # allocation is required, so the downstream all-reduce takes the low-latency
@@ -478,6 +520,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        if trace_deepep_v2_contig:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 expanded contig down GEMM returned")
 
         return down_output
 
@@ -568,6 +613,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_scale = quant_info.w2_scale
 
         hidden_states_device = running_state["hidden_states_device"]
+        trace_deepep_v2_masked = envs.SGLANG_DEEPEP_V2_TRACE_MASKED.get()
+        if trace_deepep_v2_masked:
+            logger.warning(
+                "DeepEP v2 masked runner enter: hidden=%s hidden_stride=%s "
+                "scale=%s scale_stride=%s masked_m=%s expected_m=%s",
+                tuple(hidden_states.shape),
+                hidden_states.stride(),
+                (
+                    None
+                    if hidden_states_scale is None
+                    else tuple(hidden_states_scale.shape)
+                ),
+                None if hidden_states_scale is None else hidden_states_scale.stride(),
+                masked_m.detach().cpu().tolist(),
+                expected_m,
+            )
 
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
@@ -632,6 +693,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a=recipe_a,
             recipe_b=recipe_b,
         )
+        if trace_deepep_v2_masked:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 masked runner gateup GEMM returned")
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -672,6 +736,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gemm1_clamp_limit=self.config.gemm1_clamp_limit,
                 num_real_tokens=num_real_tokens,
             )
+        if trace_deepep_v2_masked:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 masked runner activation returned")
         del gateup_output
 
         # Down activation is quantised locally at scale_block_size (never DeepEP-LL),
@@ -730,6 +797,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_b=recipe_b,
             **gemm_overlap_args_dict,
         )
+        if trace_deepep_v2_masked:
+            torch.cuda.synchronize()
+            logger.warning("DeepEP v2 masked runner down GEMM returned")
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
@@ -818,6 +888,7 @@ def pre_permute_standard_to_deep_gemm(
     quant_info: DeepGemmMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
+    expert_start: int = 0,
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
         ep_scatter,
@@ -830,6 +901,19 @@ def pre_permute_standard_to_deep_gemm(
         dispatch_output.topk_output,
     )
     topk_weights, topk_ids, _ = topk_output
+    # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
+    # Feeding it the shared masked/swizzled layout does not raise -- it silently
+    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
+    # refuse the combination rather than corrupt output.
+    assert deep_gemm_sm120.is_supported(), (
+        "--moe-runner-backend deep_gemm on consumer Blackwell (SM120) requires "
+        "the standard-layout MoE path, which is unavailable in this build."
+    )
+    sm120_input = deep_gemm_sm120.maybe_pre_permute(
+        hidden_states, topk_ids, topk_weights, quant_info, runner_config, running_state
+    )
+    if sm120_input is not None:
+        return sm120_input
 
     hidden_states_shape = hidden_states.shape
     hidden_states_dtype = hidden_states.dtype
@@ -838,7 +922,10 @@ def pre_permute_standard_to_deep_gemm(
 
     topk_weights, topk_ids = topk_weights, topk_ids
 
-    if _should_use_masked_standard_layout(runner_config, quant_info, hidden_states):
+    if (
+        deep_gemm_sm120.allows_masked_standard_layout()
+        and _should_use_masked_standard_layout(runner_config, quant_info, hidden_states)
+    ):
         output_dtype = (
             torch.bfloat16
             if quant_info.w13_weight.dtype == torch.bfloat16
@@ -853,6 +940,7 @@ def pre_permute_standard_to_deep_gemm(
                 quant_info.block_shape,
                 output_dtype=output_dtype,
                 use_mxfp8=quant_info.use_mxfp8,
+                expert_start=expert_start,
             )
         )
         # Use the global expert count because expected_m is a tuning hint, not
@@ -894,7 +982,7 @@ def pre_permute_standard_to_deep_gemm(
     all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
-        topk_ids, num_experts, 1
+        topk_ids, num_experts, 1, expert_start=expert_start
     )
     dispose_tensor(unused_masked_dst)
     valid_tokens_per_expert = tokens_per_expert
@@ -974,6 +1062,7 @@ def pre_permute_standard_to_deep_gemm(
         src2dst,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         quant_block_size=(quant_info.block_shape[1] if quant_info.block_shape else 128),
+        expert_start=expert_start,
     )
     if packed_input_source is not hidden_states:
         dispose_tensor(packed_input_source)
@@ -1003,6 +1092,48 @@ def pre_permute_standard_to_deep_gemm(
     )
 
 
+@register_pre_permute("flashinfer", "deep_gemm")
+def pre_permute_flashinfer_to_deep_gemm(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Feed one-sided A2A output into DeepGEMM with fused expert remapping."""
+
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    if dispatch_output.hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "FlashInfer A2A + DeepGEMM requires a BF16 dispatch payload, got "
+            f"{dispatch_output.hidden_states.dtype}."
+        )
+    if dispatch_output.hidden_states_scale is not None:
+        raise ValueError(
+            "FlashInfer A2A + DeepGEMM expects unquantized BF16 dispatch; "
+            "hidden_states_scale must be None."
+        )
+    if dispatch_output.topk_output.topk_ids.dtype != torch.int32:
+        raise TypeError(
+            "FlashInfer A2A expert IDs must be int32 before DeepGEMM, got "
+            f"{dispatch_output.topk_output.topk_ids.dtype}."
+        )
+
+    standard_output = StandardDispatchOutput(
+        hidden_states=dispatch_output.hidden_states,
+        hidden_states_scale=None,
+        topk_output=dispatch_output.topk_output,
+    )
+    expert_start = get_parallel().moe_ep_rank * runner_config.num_local_experts
+    return pre_permute_standard_to_deep_gemm(
+        standard_output,
+        quant_info,
+        runner_config,
+        running_state,
+        expert_start=expert_start,
+    )
+
+
 @register_post_permute("deep_gemm", "standard")
 def post_permute_deep_gemm_to_standard(
     runner_output: DeepGemmRunnerOutput,
@@ -1012,6 +1143,12 @@ def post_permute_deep_gemm_to_standard(
 ) -> StandardCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import post_reorder_deepgemm
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    sm120_output = deep_gemm_sm120.maybe_post_permute(
+        runner_output, runner_config, running_state
+    )
+    if sm120_output is not None:
+        return sm120_output
 
     hidden_states_shape = running_state["hidden_states_shape"]
     hidden_states_dtype = running_state["hidden_states_dtype"]
@@ -1045,6 +1182,30 @@ def post_permute_deep_gemm_to_standard(
     return StandardCombineInput(
         hidden_states=output,
     )
+
+
+@register_post_permute("deep_gemm", "flashinfer")
+def post_permute_deep_gemm_to_flashinfer(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+):
+    """Reuse DeepGEMM's weighted post-permute and hand BF16 to A2A combine."""
+
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferCombineInput,
+    )
+
+    standard_input = post_permute_deep_gemm_to_standard(
+        runner_output, quant_info, runner_config, running_state
+    )
+    if standard_input.hidden_states.dtype != torch.bfloat16:
+        raise TypeError(
+            "FlashInfer A2A + DeepGEMM combine payload must be BF16, got "
+            f"{standard_input.hidden_states.dtype}."
+        )
+    return FlashinferCombineInput(hidden_states=standard_input.hidden_states)
 
 
 @register_pre_permute("deepep_ll", "deep_gemm")

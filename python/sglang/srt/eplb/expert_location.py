@@ -28,6 +28,8 @@ import torch.nn.functional as F
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
+    get_parallel,
+    get_resources,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +40,6 @@ logger = logging.getLogger(__name__)
 
 def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
-    from sglang.srt.runtime_context import get_exec
 
     return (
         get_exec().moe.ep_join_mode != "scale" and not elastic_expanded_world_enabled()
@@ -185,8 +186,6 @@ class ExpertLocationMetadata:
             logical_count = logical_count.unsqueeze(0)
         logical_count = logical_count.to(get_device().device)
 
-        from sglang.srt.runtime_context import get_parallel
-
         common = ExpertLocationMetadata._init_common(model_config)
 
         if common is None:
@@ -195,7 +194,7 @@ class ExpertLocationMetadata:
         model_config_for_expert_location = common["model_config_for_expert_location"]
         num_physical_experts = common["num_physical_experts"]
         num_groups = model_config_for_expert_location.num_groups
-        num_nodes = 1 if use_flat_topology else get_parallel().config.nnodes
+        num_nodes = 1 if use_flat_topology else get_parallel().nnodes
 
         from sglang.srt.eplb import eplb_algorithms
 
@@ -224,7 +223,6 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(model_config: ModelConfig):
-        from sglang.srt.runtime_context import get_exec, get_parallel
 
         model_config_for_expert_location = (
             ModelConfigForExpertLocation.from_model_config(model_config)
@@ -238,15 +236,14 @@ class ExpertLocationMetadata:
             + get_exec().moe.ep_num_redundant_experts
         )
         # elastic-EP scale-up rewrites ep_size on the published config
-        ep_size = get_parallel().config.ep_size
+        ep_size = get_parallel().ep_size
         num_physical_experts = base_num_physical_experts
-        initial_ep_size = get_parallel().config.elastic_ep_initial_size
+        initial_ep_size = get_parallel().elastic_ep_initial_size
         if initial_ep_size is not None:
             if get_exec().moe.ep_join_mode == "scale":
                 ep_size = max(
                     ep_size,
-                    get_parallel().config.ep_join_rank_offset
-                    + get_parallel().config.tp_size,
+                    get_parallel().ep_join_rank_offset + get_parallel().tp_size,
                 )
             num_physical_experts, num_local_physical_experts = (
                 _compute_elastic_expert_layout(
@@ -274,7 +271,6 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
     ):
-        from sglang.srt.runtime_context import get_exec
 
         _, num_physical_experts = physical_to_logical_map.shape
 
@@ -482,13 +478,11 @@ def _normalize_layer_ids(
 
 
 def get_global_expert_location_metadata():
-    from sglang.srt.runtime_context import get_resources
 
     return get_resources().expert_location_metadata
 
 
 def set_global_expert_location_metadata(value, allow_overwrite=False):
-    from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
     if not allow_overwrite:
@@ -542,7 +536,6 @@ def _compute_logical_to_all_physical_map(
     ep_size: int,
     moe_ep_rank: int,
 ):
-    from sglang.srt.runtime_context import get_exec, get_parallel
 
     # This is rarely called, so we use for loops for maximum clarity
 
@@ -570,7 +563,7 @@ def _compute_logical_to_all_physical_map(
         num_local_gpu_physical_experts = num_physical_experts // ep_size
         prefer_same_node = _prefer_same_node_experts()
         num_gpus_per_node = (
-            get_parallel().config.ep_size // get_parallel().config.nnodes
+            get_parallel().ep_size // get_parallel().nnodes
             if prefer_same_node
             else None
         )
@@ -624,7 +617,6 @@ def compute_logical_to_rank_dispatch_physical_map(
     ep_rank: int,
     seed: int = 42,
 ):
-    from sglang.srt.runtime_context import get_parallel
 
     r = random.Random(seed)
 
@@ -634,9 +626,7 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_local_gpu_physical_experts = num_physical_experts // ep_size
     prefer_same_node = _prefer_same_node_experts()
     num_gpus_per_node = (
-        get_parallel().config.ep_size // get_parallel().config.nnodes
-        if prefer_same_node
-        else None
+        get_parallel().ep_size // get_parallel().nnodes if prefer_same_node else None
     )
     num_local_node_physical_experts = (
         num_local_gpu_physical_experts * num_gpus_per_node

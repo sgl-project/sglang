@@ -99,6 +99,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 "lingbot-world",
                 "lingbot-world-v2",
                 "fastwan21-t2v-1.3b",
+                "fasth3-t2va-vsa",
                 "wan22-t2v-nvfp4",
                 "krea2-turbo",
                 "krea2-raw",
@@ -257,6 +258,12 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             self.assertIn("--quality=high", high_cmd)
             self.assertNotIn("--enable-breakable-cuda-graph", high_cmd)
 
+            extra_high_cmd = module.build_sglang_cmd(
+                "longcat-image", quality="extra-high"
+            )
+            self.assertIn("--quality=extra-high", extra_high_cmd)
+            self.assertNotIn("--enable-breakable-cuda-graph", extra_high_cmd)
+
             bcg_cmd = module.build_sglang_cmd(
                 "longcat-image",
                 breakable_cuda_graph=True,
@@ -269,6 +276,14 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
             bucket_index = bcg_cmd.index("--bcg-text-buckets")
             self.assertEqual(
                 bcg_cmd[bucket_index + 1 : bucket_index + 3], ["256", "512"]
+            )
+
+            sana_video_bcg_cmd = module.build_sglang_cmd(
+                "sana-video", breakable_cuda_graph=True
+            )
+            self.assertEqual(
+                sana_video_bcg_cmd[sana_video_bcg_cmd.index("--warmup-num-frames") + 1],
+                "17",
             )
 
             for _, quality, breakable_cuda_graph in module.QUALITY_BCG_ABBA_MATRIX:
@@ -464,6 +479,41 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                 result["missing_artifacts"], ["perf dump", "generated output"]
             )
 
+    def test_mesh_artifacts_are_accepted_and_hashed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            def finish_run():
+                (output_dir / "hunyuan3d-shape_mesh-output.json").write_text(
+                    json.dumps({"total_duration_ms": 1000, "steps": []}),
+                    encoding="utf-8",
+                )
+                (output_dir / "hunyuan3d-shape-mesh-output.obj").write_bytes(
+                    b"v 0 0 0\n"
+                )
+                return 0
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(())
+                popen.return_value.wait.side_effect = finish_run
+                result = module._run_benchmark_once_impl(
+                    "hunyuan3d-shape",
+                    "mesh-output",
+                    output_dir,
+                    warmup=False,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertFalse(result["error"])
+            self.assertEqual(
+                result["output_artifacts"],
+                [str(output_dir / "hunyuan3d-shape-mesh-output.obj")],
+            )
+            self.assertEqual(len(result["output_sha256"]), 1)
+
     def test_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_root = Path(tmpdir)
@@ -485,6 +535,37 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                     output_dir,
                     warmup=False,
                     quality="high",
+                    breakable_cuda_graph=True,
+                    cuda_visible_devices="0",
+                )
+
+            self.assertTrue(result["error"])
+            self.assertEqual(
+                result["bcg_invalid_signals"],
+                [module.BCG_LATE_QUALITY_FUSION_SIGNAL],
+            )
+
+    def test_extra_high_bcg_rejects_quality_fusion_mounted_after_capture(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_root = Path(tmpdir)
+            module = _load_benchmark_module(temp_root)
+            output_dir = temp_root / "outputs"
+            output_dir.mkdir()
+
+            with patch.object(module.subprocess, "Popen") as popen:
+                popen.return_value.stdout = iter(
+                    (
+                        "[Diffusion BCG] captured 3 segment(s)\n",
+                        "Mounted Qwen fused added-QKV for quality=extra-high\n",
+                    )
+                )
+                popen.return_value.wait.return_value = 0
+                result = module._run_benchmark_once_impl(
+                    "longcat-image",
+                    "bcg-extra-high",
+                    output_dir,
+                    warmup=False,
+                    quality="extra-high",
                     breakable_cuda_graph=True,
                     cuda_visible_devices="0",
                 )
@@ -521,7 +602,7 @@ class TestDiffusionBenchmarkSkill(unittest.TestCase):
                     cleanup_model_cache=True,
                 )
 
-            self.assertEqual(len(results), 8)
+            self.assertEqual(len(results), 12)
             self.assertEqual(
                 [
                     (call[2]["quality"], call[2]["breakable_cuda_graph"])
