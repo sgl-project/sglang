@@ -1174,7 +1174,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         target_model_runner = self._target_worker.model_runner
         target_graph_runner = target_model_runner.decode_cuda_graph_runner
-        if target_graph_runner is not None:
+        if isinstance(target_graph_runner, DecodeCudaGraphRunner):
             assert (
                 target_graph_runner.speculative_num_draft_tokens == initial_steps + 1
             ), "target graphs were not captured for the initial adaptive state"
