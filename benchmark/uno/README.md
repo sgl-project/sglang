@@ -24,7 +24,7 @@ samples per problem, or 300 completions.
 ```bash
 export MODEL_PATH=Qwen/Qwen3-8B
 export TOKENIZER_PATH=Qwen/Qwen3-8B
-export UNO_LORA_PATH=/path/to/uno-adapter
+export UNO_LORA_PATH=s-sahoo/uno-qwen3-8B
 export DATA_ROOT=/path/to/math-eval-data
 export RESULT_ROOT=/path/to/math-eval-results
 

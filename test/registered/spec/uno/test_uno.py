@@ -27,10 +27,10 @@ register_cuda_ci(
     est_time=480,
     stage="base-b",
     runner_config="1-gpu-large",
-    disabled="The UNO draft LoRA checkpoint is not published yet.",
 )
 
 MODEL = "Qwen/Qwen3-8B"
+DEFAULT_UNO_LORA = "s-sahoo/uno-qwen3-8B"
 LORA_PATH_ENV = "SGLANG_TEST_UNO_LORA_PATH"
 MAX_NEW_TOKENS = 128
 # AR decode and UNO verification use different kernel shapes, so compare a
@@ -83,11 +83,7 @@ class TestUnoCudaGraph(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.adapter_path = os.environ.get(LORA_PATH_ENV)
-        if cls.adapter_path is None:
-            raise unittest.SkipTest(
-                f"Set {LORA_PATH_ENV} to the trained UNO draft LoRA checkpoint."
-            )
+        cls.adapter_path = os.environ.get(LORA_PATH_ENV, DEFAULT_UNO_LORA)
 
     def _server_args(self, config: _UnoConfig | None) -> list[str]:
         args = [
