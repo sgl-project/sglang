@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.distributed
 from tqdm import tqdm
 
-from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -23,6 +21,7 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
@@ -54,6 +53,7 @@ class DynamicChunkSizer:
         page_size: int,
         device: str,
         pp_group: GroupCoordinator,
+        world_group: GroupCoordinator,
         pp_rank: int,
     ):
         self.model_runner = model_runner
@@ -67,6 +67,7 @@ class DynamicChunkSizer:
         self.page_size = page_size
         self.device = device
         self.pp_group = pp_group
+        self.world_group = world_group
         self.pp_rank = pp_rank
         self.predictor = ChunkSizePredictor()
 
@@ -83,14 +84,12 @@ class DynamicChunkSizer:
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
                     "Dynamic chunking will be disabled."
                 )
-            # Broadcast even a failure (as None); the other PP ranks wait below.
-            samples = attn_cp_tp_broadcast_pyobj([samples])[0]
 
-        # Broadcast data to all ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            data_to_sync = [samples]
-            self.pp_group.broadcast_object_list(data_to_sync, src=0)
-            samples = data_to_sync[0]
+        # The samples are global, so one broadcast from global rank 0 (a PP0 rank)
+        # reaches every stage and attention rank; a failure travels as None.
+        samples = broadcast_pyobj(
+            [samples], self.world_group.rank, self.world_group.cpu_group, src=0
+        )[0]
 
         if samples is None:
             return False
