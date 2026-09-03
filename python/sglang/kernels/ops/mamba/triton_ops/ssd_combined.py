@@ -303,7 +303,9 @@ def mamba_chunk_scan_combined(
         assert return_varlen_states, (
             "return_track_states requires return_varlen_states (cu_seqlens mode)"
         )
-        return rest[1], rest[0]
+        # `states` rides along: a tracked position on the grid is read from it
+        # directly, which stays bit-exact against a recompute-free run.
+        return states, rest[0], rest[1]
     if return_intermediate_states:
         if return_varlen_states:
             varlen_states = rest[0]

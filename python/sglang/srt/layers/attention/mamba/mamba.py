@@ -461,6 +461,7 @@ class MambaMixer2(torch.nn.Module):
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal
         intermediate_states = None
+        track_states = None
 
         query_start_loc = metadata.query_start_loc
 
@@ -600,7 +601,7 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             # NOTE: final output is an in-place update of out tensor
-            intermediate_states, varlen_state = mamba_chunk_scan_combined(
+            intermediate_states, varlen_state, track_states = mamba_chunk_scan_combined(
                 hidden_states_p.view(
                     1, num_prefill_tokens, local_num_heads, self.head_dim
                 ),
@@ -765,7 +766,7 @@ class MambaMixer2(torch.nn.Module):
         if output is not None:
             output[:padded_num_tokens].copy_(mixer_out)
 
-        return mixer_out, intermediate_states
+        return mixer_out, intermediate_states, track_states
 
     @property
     def mamba_type(self) -> str:

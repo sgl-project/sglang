@@ -124,6 +124,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_dst = None
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
+        track_ssm_recompute_dst = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -256,6 +257,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_final_dst,
                         track_ssm_seq_idx,
                         track_ssm_end_locs,
+                        track_ssm_recompute_dst,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -276,6 +278,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_dst=track_ssm_final_dst,
             track_ssm_seq_idx=track_ssm_seq_idx,
             track_ssm_end_locs=track_ssm_end_locs,
+            track_ssm_recompute_dst=track_ssm_recompute_dst,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -379,18 +382,28 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = dst_masked[not_aligned]
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
+        track_ssm_recompute_dst = None
 
         if isinstance(self, Mamba2AttnBackend):
+            # `h` is one chunk grid over the whole flattened batch, so the wanted
+            # state is in it only when query_start_loc[i] is chunk-aligned.
             query_start_loc = torch.zeros_like(extend_seq_lens)
             query_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
             aligned_len = (
                 lens_masked[not_aligned] // state_chunk_size
             ) * state_chunk_size
-            track_ssm_seq_idx = torch.nonzero(mamba_track_mask, as_tuple=True)[0][
+            seq_idx_unaligned = torch.nonzero(mamba_track_mask, as_tuple=True)[0][
                 not_aligned
             ]
-            track_ssm_end_locs = query_start_loc[track_ssm_seq_idx] + aligned_len
-            track_ssm_h_src = torch.arange(track_ssm_seq_idx.numel())
+            end_locs = query_start_loc[seq_idx_unaligned] + aligned_len
+            on_grid = (end_locs % state_chunk_size) == 0
+
+            track_ssm_h_src = end_locs[on_grid] // state_chunk_size
+            track_ssm_h_dst = track_ssm_h_dst[on_grid]
+
+            track_ssm_seq_idx = seq_idx_unaligned[~on_grid]
+            track_ssm_end_locs = end_locs[~on_grid]
+            track_ssm_recompute_dst = dst_masked[not_aligned][~on_grid]
         else:
             num_h_states = (extend_seq_lens - 1) // state_chunk_size + 1
             track_ssm_src_offset = torch.zeros_like(num_h_states)
@@ -409,6 +422,7 @@ class MambaAttnBackendBase(AttentionBackend):
             to_device(track_ssm_final_dst),
             to_device(track_ssm_seq_idx),
             to_device(track_ssm_end_locs),
+            to_device(track_ssm_recompute_dst),
         )
 
     def init_forward_metadata_capture_cpu_graph(
@@ -867,6 +881,7 @@ class MambaAttnBackendBase(AttentionBackend):
         h: Optional[torch.Tensor],
         ssm_states: torch.Tensor,
         forward_metadata: ForwardMetadata,
+        track_states: Optional[torch.Tensor] = None,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`)."""
@@ -879,6 +894,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 ssm_states[forward_metadata.track_ssm_h_dst] = h[
                     forward_metadata.track_ssm_h_src
                 ].to(ssm_states.dtype, copy=False)
+            if (
+                forward_metadata.track_ssm_recompute_dst is not None
+                and forward_metadata.track_ssm_recompute_dst.numel() > 0
+            ):
+                assert track_states is not None
+                ssm_states[forward_metadata.track_ssm_recompute_dst] = (
+                    track_states.squeeze(0).to(ssm_states.dtype, copy=False)
+                )
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
@@ -961,7 +984,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        mixer_out, intermediate_states = mixer.forward(
+        mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
             layer_cache=layer_cache,
@@ -977,6 +1000,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     intermediate_states,
                     layer_cache.temporal,
                     self.forward_metadata,
+                    track_states=track_states,
                 )
 
             if self.forward_metadata.num_decodes > 0:

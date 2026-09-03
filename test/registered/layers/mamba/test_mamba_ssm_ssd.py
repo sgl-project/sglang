@@ -745,7 +745,7 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
     ]
     assert tracked, "case must exercise the unaligned path"
 
-    track_states, _ = run(
+    _, _, track_states = run(
         X,
         dt,
         B,
