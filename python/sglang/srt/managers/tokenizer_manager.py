@@ -180,6 +180,25 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _validate_watermark_request(sampling_params: SamplingParams) -> None:
+    watermark = sampling_params.watermark
+    if watermark is None:
+        return
+    features = get_exec().features
+    if not features.enable_watermark:
+        raise ValueError(
+            "request watermarking requires the server to enable --enable-watermark"
+        )
+    if (
+        watermark.context_window is not None
+        and watermark.context_window > features.watermark_context_window
+    ):
+        raise ValueError(
+            "request watermark context_window cannot exceed the server "
+            "--watermark-context-window"
+        )
+
+
 def _reject_missing_dispatched_encoder_embedding(request_obj, mm_inputs):
     """Do not silently turn a failed EPD request into local vision work."""
     disagg = get_disagg()
@@ -1352,7 +1371,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.preferred_sampling_params:
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
-            sampling_kwargs = obj.sampling_params
+            sampling_kwargs = dict(obj.sampling_params)
+        if isinstance(obj, GenerateReqInput) and obj.watermark is not None:
+            if sampling_kwargs.get("watermark") is not None:
+                raise ValueError(
+                    "watermark must be provided either at the request top level or "
+                    "inside sampling_params, not both"
+                )
+            sampling_kwargs["watermark"] = obj.watermark
         if isinstance(obj, GenerateReqInput) and obj.max_thinking_tokens is not None:
             sampling_kwargs = dict(sampling_kwargs)
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
@@ -1361,6 +1387,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        _validate_watermark_request(sampling_params)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

@@ -168,6 +168,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
             "sampling_seed": request.seed,
+            "watermark": request.watermark,
         }
 
         # Handle response_format constraints

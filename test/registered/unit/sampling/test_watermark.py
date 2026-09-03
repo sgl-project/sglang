@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.sampling.watermark import WatermarkState
+from sglang.srt.sampling.watermark import (
+    WatermarkState,
+    build_watermark_batch_config,
+    normalize_watermark_request,
+)
+from sglang.srt.utils.request_logger import _transform_data_for_logging
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -47,6 +52,55 @@ def test_repeated_context_and_greedy_bypass():
 
     assert torch.equal(repeated_logits, torch.zeros_like(repeated_logits))
     assert state.num_watermarked_contexts.tolist() == [1, 0]
+
+
+def test_per_request_config_resolution_and_redaction():
+    secret = "fedcba9876543210"
+    requests = [
+        SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                watermark=normalize_watermark_request(
+                    {"key": secret, "context_window": 2}
+                )
+            )
+        ),
+        SimpleNamespace(sampling_params=SimpleNamespace(watermark=None)),
+    ]
+
+    keys, context_windows, enabled = build_watermark_batch_config(
+        requests,
+        default_key="0123456789abcdef",
+        default_context_window=4,
+        device="cuda",
+    )
+
+    assert keys.tolist() == [0xFEDCBA9876543210 - (1 << 64), 0x0123456789ABCDEF]
+    assert context_windows.tolist() == [2, 4]
+    assert enabled.tolist() == [True, True]
+
+    keys, context_windows, enabled = build_watermark_batch_config(
+        requests,
+        default_key=None,
+        default_context_window=4,
+        device="cuda",
+    )
+    assert keys.tolist() == [0xFEDCBA9876543210 - (1 << 64), 0]
+    assert context_windows.tolist() == [2, 4]
+    assert enabled.tolist() == [True, False]
+    assert secret not in repr(requests[0].sampling_params.watermark)
+    logged = _transform_data_for_logging(
+        {
+            "sampling_params": {"watermark": {"key": secret, "context_window": 2}},
+            "watermark_key": secret,
+            "internal_states": [{"watermark_key": secret}],
+        }
+    )
+    assert logged["sampling_params"]["watermark"]["key"] == "<redacted>"
+    assert logged["watermark_key"] == "<redacted>"
+    assert logged["internal_states"][0]["watermark_key"] == "<redacted>"
+
+    with pytest.raises(ValueError, match="unknown fields"):
+        normalize_watermark_request({"key": secret, "provider": "textseal"})
 
 
 if __name__ == "__main__":
