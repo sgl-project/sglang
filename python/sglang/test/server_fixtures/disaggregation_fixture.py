@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -225,10 +226,17 @@ class PDDisaggregationServerBase(CustomTestCase):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+        # The LB holds no device state, and popen_with_error_check only stays
+        # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
+        if cls.process_lb:
+            try:
+                kill_process_tree(cls.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"Error killing process {cls.process_lb.pid}: {e}")
+        for process in [cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 

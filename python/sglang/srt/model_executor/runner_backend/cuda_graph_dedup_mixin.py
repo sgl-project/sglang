@@ -107,6 +107,7 @@ def kernel_node_payload(node):
     params = checkCudaErrors(cuda_drv.cuGraphKernelNodeGetParams(node))
     return (
         kernel_name(params),
+        (int(params.kern), int(params.func)),
         (int(params.gridDimX), int(params.gridDimY), int(params.gridDimZ)),
         (int(params.blockDimX), int(params.blockDimY), int(params.blockDimZ)),
         int(params.sharedMemBytes),

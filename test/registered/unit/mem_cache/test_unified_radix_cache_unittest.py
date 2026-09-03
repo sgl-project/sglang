@@ -8007,13 +8007,10 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, _ = build_fixture(self.cfg)
         seq = list(range(1, self.cfg.sliding_window_size + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=self._alloc(allocator, len(seq)),
-                swa_evicted_seqlen=len(seq),
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        # Window eviction already released the peers below the floor.
+        allocator.free_swa(evicted)
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=len(seq)))
         (leaf,) = _node_children(cache, cache.root_node_handle())
         lock_result = cache.inc_lock_ref(leaf) if lock_full else None
         try:
@@ -8045,11 +8042,9 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, _ = build_fixture(self.cfg)
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=sw
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        allocator.free_swa(evicted[:sw])
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         value = self._alloc(allocator, len(seq))
         full_available = allocator.full_attn_allocator.available_size()
         swa_available = allocator.swa_attn_allocator.available_size()
@@ -8073,11 +8068,9 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = list(range(1, 2 * sw + 1))
         key = RadixKey(array("q", seq))
-        cache.insert(
-            InsertParams(
-                key=key, value=self._alloc(allocator, len(seq)), swa_evicted_seqlen=sw
-            )
-        )
+        evicted = self._alloc(allocator, len(seq))
+        allocator.free_swa(evicted[:sw])
+        cache.insert(InsertParams(key=key, value=evicted, swa_evicted_seqlen=sw))
         (prefix_node,) = _node_children(cache, cache.root_node_handle())
         (window_node,) = _node_children(cache, prefix_node)
         self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
@@ -8107,6 +8100,8 @@ class TestResumableInsertWalkSWA(_InsertWalkSuite):
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
 
         value = self._alloc(allocator, len(seq))
+        # Window eviction already released the peers below the floor.
+        allocator.free_swa(value[:sw])
         with mock.patch.object(
             cache, "_apply_cache_action", wraps=cache._apply_cache_action
         ) as spy:
