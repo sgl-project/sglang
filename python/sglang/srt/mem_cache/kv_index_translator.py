@@ -57,12 +57,18 @@ from typing import Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashinfer_kv_indices_triton,
+)
+from sglang.kernels.ops.kvcache.kv_read_table import (
+    build_kv_read_table,
+    build_kv_read_table_packed,
+)
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -148,9 +154,11 @@ class KVIndexTranslator:
             self.defer_read_translate = False
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
+            # `translate_loc_from_full_to_swa` is abstract on `BaseSWAKVPool`,
+            # which is also what the backends' `_resolve_swa_kv_pool` keys on.
             self._swa_write_loc_from_full = (
                 token_to_kv_pool.translate_loc_from_full_to_swa
-                if isinstance(token_to_kv_pool, SWAKVPool)
+                if isinstance(token_to_kv_pool, BaseSWAKVPool)
                 else None
             )
 
@@ -161,31 +169,84 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
-    def make_capture_tables(
-        self, *, max_bs: int, max_context_len: int
-    ) -> Optional[KVReadTables]:
-        """Capture-stable destinations for a backend to own, or None when this
-        pool needs no translation and the backend will never fill any.
-
-        Zero-filled: entry 0 is the reserved padding slot in every id space, so
-        a captured graph replaying before its first refresh reads padding, not
-        garbage.
-        """
-        if not self.is_translating:
-            return None
-        max_pages = -(-max_context_len // self.page_size)
-
-        def _zeros():
-            return torch.zeros(
-                (max_bs, max_pages), dtype=torch.int32, device=self.device
-            )
-
-        return KVReadTables(
-            full=_zeros(),
-            sliding_window=_zeros() if self._swa_v2p_table is not None else None,
-        )
-
     # -- per-batch view --------------------------------------------------------
+
+    @property
+    def reads_are_translated(self) -> bool:
+        """Whether a read this translator fills comes out kernel-facing. False
+        on a non-unified pool, and under DCP, where the ids stay VIRTUAL for
+        ``translate_dcp_read_ids`` to finish."""
+        return self.is_translating and not self.defer_read_translate
+
+    def fill_packed_read_stream(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        indptr: torch.Tensor,
+        total_tokens: int,
+        out: torch.Tensor,
+        kv_start_idx: Optional[torch.Tensor] = None,
+        sliding_window: bool = False,
+    ) -> bool:
+        """Fill ``out``'s CSR rows with the ids a paged wrapper plans over, and
+        report whether they came out translated.
+
+        Non-unified: the historical gather straight from ``req_to_token``.
+        Unified: one fused gather-and-translate, so no caller needs a
+        ``[bs, max_pages]`` rectangle to repack from -- ``out`` holds one id per
+        resident token, a length the pool bounds.
+
+        ``sliding_window`` selects the swa sub-pool's own id space, built from
+        VIRTUAL ids and never chained through full-physical. A ``False`` return
+        means the ids are still VIRTUAL: the DCP path defers translation to
+        ``translate_dcp_read_ids``, and a static SWA pool maps the full ids
+        through its own full->swa table.
+        """
+        # `seq_lens` sizes the batch: a caller may hold a wider req_pool_indices
+        # (the padded graph buffer), and the extra lanes have no length to bound.
+        bs = int(seq_lens.numel())
+        assert req_pool_indices.numel() >= bs, (
+            f"fill_packed_read_stream: {req_pool_indices.numel()} req rows for "
+            f"{bs} lengths"
+        )
+        req_pool_indices = req_pool_indices[:bs]
+
+        if not self.reads_are_translated:
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                indptr,
+                kv_start_idx,
+                out,
+                self.req_to_token.stride(0),
+                ENTRY_PAGE_SIZE=1,
+            )
+            return False
+
+        if sliding_window:
+            assert self._swa_v2p_table is not None, (
+                "fill_packed_read_stream: sliding_window on a pool with no swa "
+                "sub-pool"
+            )
+        build_kv_read_table_packed(
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            v2p=self._swa_v2p_table if sliding_window else self._full_v2p_table,
+            indptr=indptr,
+            multiplier=(
+                self._swa_page_multiplier
+                if sliding_window
+                else self._full_page_multiplier
+            ),
+            page_size=self.page_size,
+            max_tokens=total_tokens,
+            out=out,
+            kv_start_idx=kv_start_idx,
+        )
+        return True
 
     def build_index_table(
         self,
@@ -273,18 +334,31 @@ class KVIndexTranslator:
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        sliding_window_out: Optional[torch.Tensor] = None,
     ) -> None:
         """`build_index_table(into=...)` for a caller that owns a bare block
-        table rather than a KVReadTables: trtllm_mla / flashmla consume that
+        table rather than a KVReadTables: the page-table consumers read that
         table directly, its rows already being the index table's rows.
+
+        `sliding_window_out` fills the swa twin in the same pass, for a hybrid
+        model whose kernels take two block tables.
         """
-        assert (
-            self.is_translating
-        ), "KVIndexTranslator.fill_read_table on a pool that needs no translation"
+        # `reads_are_translated`, not `is_translating`: under DCP the builder
+        # returns the passthrough view and writes nothing, so `is_translating`
+        # would let a caller keep a stale table and never hear about it.
+        assert self.reads_are_translated, (
+            "KVIndexTranslator.fill_read_table cannot fill a page table when "
+            "reads stay virtual (a non-unified pool, or DCP, where the caller "
+            "must select this rank's share itself)"
+        )
+        assert sliding_window_out is None or self._swa_v2p_table is not None, (
+            "KVIndexTranslator.fill_read_table: asked for a sliding-window "
+            "table on a pool with no swa sub-pool"
+        )
         self.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            into=KVReadTables(full=out, sliding_window=None),
+            into=KVReadTables(full=out, sliding_window=sliding_window_out),
         )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
