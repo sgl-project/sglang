@@ -479,7 +479,7 @@ def handle_elastic_ep(server_args: Any):
             f"'full' or 'disabled' (got {decode_backend!r})."
         )
         assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
-            "Elastic EP runtime scale-up requires prefill CUDA graph to be " "disabled."
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
         if decode_backend == Backend.FULL:
             assert cfg.device == "cuda", (
@@ -487,25 +487,23 @@ def handle_elastic_ep(server_args: Any):
                 f"(got device={cfg.device!r})."
             )
             assert cfg.speculative_algorithm is None, (
-                "Elastic EP CUDA graph recapture does not support "
-                "speculative decoding."
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
             )
             assert not cfg.is_embedding, (
-                "Elastic EP CUDA graph recapture does not support " "embedding models."
+                "Elastic EP CUDA graph recapture does not support embedding models."
             )
             assert cfg.dllm_algorithm is None, (
-                "Elastic EP CUDA graph recapture does not support " "diffusion models."
+                "Elastic EP CUDA graph recapture does not support diffusion models."
             )
             assert not cfg.encoder_only, (
-                "Elastic EP CUDA graph recapture does not support "
-                "encoder-only models."
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
             )
-            assert (
-                not cfg.forward_hooks
-            ), "Elastic EP CUDA graph recapture does not support forward hooks."
-            assert (
-                not cfg.enable_pdmux
-            ), "Elastic EP CUDA graph recapture does not support PDMux."
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
         assert resolved.enable_dp_attention, (
             "Elastic EP scale-up requires --enable-dp-attention; without it "
             "the TP group is not equivalent to WORLD and the post-scale "
