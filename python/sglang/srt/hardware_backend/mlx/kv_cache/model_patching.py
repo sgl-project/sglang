@@ -1,5 +1,6 @@
 """Model introspection and attention patching."""
 
+import inspect
 import logging
 from typing import Any
 
@@ -39,6 +40,29 @@ def find_attention_layers(model: Any) -> tuple[list[Any], list[str | None]]:
             return layer_list, attn_attrs
         raise ValueError(f"No attention attribute in layer type {type(layer_list[0])}")
     return layer_list, []
+
+
+def attention_has_extended_contract(
+    layer_list: list[Any], attn_attrs: list[str | None]
+) -> bool:
+    """Whether any attention module is called with more than ``(x, mask, cache)``
+    (e.g. Hunyuan threads a shared-KV tuple positionally)."""
+    for layer, attr in zip(layer_list, attn_attrs):
+        if attr is None:
+            continue
+        attn = getattr(layer, attr)
+        inner = attn._inner if isinstance(attn, MLXAttentionWrapper) else attn
+        try:
+            positional = [
+                p
+                for p in inspect.signature(inner.__call__).parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            ]
+        except (TypeError, ValueError):
+            continue
+        if len(positional) > 3:
+            return True
+    return False
 
 
 def patch_model_attention(model: Any) -> int:

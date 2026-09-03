@@ -229,10 +229,14 @@ class MLXAttentionWrapper(nn.Module):
             self, "_sink_kwargs", {} if sinks is None else {"sinks": sinks}
         )
 
-    def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, mask: Any = None, cache: Any = None, *args, **kwargs
+    ):
+        # Forward extra args the inner module takes (Hunyuan passes a shared-KV
+        # state positionally) so delegation matches its contract.
         ctx = get_context()
         if ctx is None:
-            return self._inner(x, mask=mask, cache=cache)
+            return self._inner(x, mask, cache, *args, **kwargs)
         return self._batched_decode(x, ctx)
 
     def _batched_decode(self, x: mx.array, ctx: BatchedDecodeContext) -> mx.array:

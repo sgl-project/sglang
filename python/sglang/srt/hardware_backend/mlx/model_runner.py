@@ -49,6 +49,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     MlxModelCacheLayout,
     PoolBackedAttentionKVCache,
     WindowedAttentionKVCache,
+    attention_has_extended_contract,
     clear_context,
     find_attention_layers,
     get_head_dim,
@@ -161,6 +162,7 @@ class MlxModelRunner:
     _enable_sampling = False
     _sanitize_nan = False
     _deterministic_seeding = False
+    _decode_delegates_to_model = False
 
     def __init__(
         self,
@@ -232,6 +234,18 @@ class MlxModelRunner:
             attn_attrs,
             # Per-layer sliding windows (container convention, e.g. gpt-oss).
             layer_window_sizes=get_layer_window_sizes(self.model),
+        )
+        # Extended-contract attention (e.g. Hunyuan) delegates decode.
+        self._decode_delegates_to_model = attention_has_extended_contract(
+            layer_list, attn_attrs
+        )
+        logger.info(
+            "MLX decode path: %s",
+            (
+                "native per-request (extended attention contract)"
+                if self._decode_delegates_to_model
+                else "batched shared-pool"
+            ),
         )
         if self._cache_layout.num_attention_layers == 0:
             raise RuntimeError("MLX model has no supported attention layers")
@@ -1573,6 +1587,10 @@ class MlxModelRunner:
             last_logits = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
+        elif self._decode_delegates_to_model:
+            last_logits = self._decode_with_native_cache(
+                caches, [batched_input[i : i + 1] for i in range(len(req_ids))]
+            )
         else:
             last_logits = self._decode_with_batched_attention(
                 caches, batched_input, list(req_ids)
@@ -1630,6 +1648,10 @@ class MlxModelRunner:
         if self._cache_layout.has_auxiliary_state:
             last_logits = self._decode_with_hybrid_batching(
                 caches, batched_input, prev.req_ids
+            )
+        elif self._decode_delegates_to_model:
+            last_logits = self._decode_with_native_cache(
+                caches, [batched_input[i : i + 1] for i in range(len(prev.req_ids))]
             )
         else:
             last_logits = self._decode_with_batched_attention(

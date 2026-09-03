@@ -34,6 +34,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.layout import MlxModelCacheLayout
 from sglang.srt.hardware_backend.mlx.kv_cache.model_patching import (
+    attention_has_extended_contract,
     find_attention_layers,
     get_num_layers,
     patch_model_attention,
@@ -43,6 +44,7 @@ __all__ = [
     "BatchedDecodeContext",
     "clear_context",
     "AttentionOffsetCache",
+    "attention_has_extended_contract",
     "ContiguousAttentionKVCache",
     "find_attention_layers",
     "get_attention_scale",
