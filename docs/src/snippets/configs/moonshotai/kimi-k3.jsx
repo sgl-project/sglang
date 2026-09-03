@@ -454,7 +454,7 @@ export const config = {
   --dataset-name {{DATASET}} \\
   --random-input-len {{ISL}} --random-output-len {{OSL}} --random-range-ratio 1.0 \\
   --num-prompts {{NUM_PROMPTS}} --max-concurrency {{MAX_CONCURRENCY}} \\
-  --flush-cache`,
+  --warmup-requests 64 --flush-cache`,
     // num_prompts = 5 × concurrency (measured floor 16).
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280, 1024: 5120 },
   },

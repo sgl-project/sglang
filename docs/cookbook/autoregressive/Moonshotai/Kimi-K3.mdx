@@ -81,6 +81,17 @@ import { KimiK3MambaRatioCalculator } from "/src/snippets/_kimi_k3_mamba_ratio_c
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+<Note>
+  B300 1×8 Unified speed numbers are measured on `v0.5.18 @ 71de97b2` with `--random-range-ratio 1.0`,
+  `--warmup-requests 64`, `--flush-cache`, at ISL 8192 / OSL 1024. DSPARK cells pin the acceptance
+  length via the serve env `SGLANG_SIMULATE_ACC_LEN=4.5` — they report what block size 7 delivers at
+  that acceptance, not a measured acceptance rate for this workload. Balanced DSPARK adds
+  `--max-running-requests 256`; without it speculation resets the cap to 48. At concurrency 256 every
+  Balanced cell is admission-bound (101 / 68 / 91 / 60 concurrent requests for MXFP4 NOSPEC / MXFP4
+  DSPARK / NVFP4 NOSPEC / NVFP4 DSPARK), so TTFT there is dominated by queueing and the cells are not
+  comparable to each other at that point.
+</Note>
+
 ### Mamba ratio calculator
 
 <KimiK3MambaRatioCalculator />
