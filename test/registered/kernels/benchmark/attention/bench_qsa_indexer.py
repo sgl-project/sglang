@@ -134,7 +134,9 @@ def eager_region(
     pool.set_qsa_rope_position_buffer(cache_loc, positions)
     key_groups = pool.get_qsa_key_state_buffer(0)[group_locs.long()]
     pooled = average_pool_qsa_keys(key_groups)
-    rope_positions = indexer._get_group_rope_positions(pool, group_locs[:, 0])
+    rope_positions = indexer._rope_from_matrix(
+        pool.get_qsa_rope_position_buffer(group_locs[:, 0])
+    )
     normalized = indexer.normalize_compressed_keys(pooled, rope_positions)
     pool.set_qsa_compressed_k_buffer(0, write_locs, normalized.contiguous())
     return q

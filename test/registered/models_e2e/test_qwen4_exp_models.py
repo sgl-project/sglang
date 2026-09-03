@@ -72,8 +72,8 @@ class TestQwen4ExpMTP(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
     """NEXTN MTP serving (3 steps, topk 1, 4 draft tokens)."""
 
     # GSM8K accept length measured at 3.02-3.03 (max 4.0 with 3 steps);
-    # 2.7 leaves noise margin while still failing on a real drop.
-    gsm8k_accept_length_thres = 2.7
+    # 2.9 leaves noise margin while still failing on a real drop.
+    gsm8k_accept_length_thres = 2.9
     speculative_args = [
         "--speculative-algorithm",
         "NEXTN",
