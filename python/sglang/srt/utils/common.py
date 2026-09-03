@@ -3462,9 +3462,8 @@ def parse_connector_type(url: str) -> str:
 
 
 def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
-    """Run a blocking call on a daemon thread and raise if it has not returned
-    within ``timeout_s``. The stuck call cannot be cancelled; the caller is
-    expected to abort process startup, which reaps the thread."""
+    """A call that overruns ``timeout_s`` cannot be cancelled: the caller must
+    abort process startup, which reaps the daemon thread still stuck in it."""
     result: list = []
     error: list = []
 
