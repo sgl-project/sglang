@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
@@ -63,6 +64,8 @@ from sglang.srt.mem_cache.unified_cache.components import (
     get_and_increase_time_counter,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    BufferBackupSnapshot,
+    BufferBackupState,
     DecSwaLockOnlyResult,
     DemoteResult,
     DriveHostEvictionResult,
@@ -518,6 +521,55 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """The hash values owned by this node, excluding its ancestors."""
         return self.node_by_id(node_id).hash_value or []
 
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or node is self.root_node
+            or not node.hash_value
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return None
+        parent = node.parent
+        assert parent is not None and node.key is not None
+        return BufferBackupSnapshot(
+            node_id=node.id,
+            parent_node_id=parent.id,
+            parent_is_root=parent is self.root_node,
+            parent_last_hash=parent.get_last_hash_value(),
+            hash_values=list(node.hash_value),
+            key=RadixKey(
+                array("q", node.key.raw_token_ids()),
+                extra_key=node.key.extra_key,
+                is_bigram=node.key.is_bigram,
+                cache_salt=node.key.cache_salt,
+            ),
+            prefix_keys=(
+                node.get_prefix_hash_values(parent) if pass_prefix_keys else None
+            ),
+        )
+
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        node = self._node_arena.get(node_id)
+        if (
+            node is None
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+            or len(node.key) != expected_key_length
+        ):
+            return None
+        parent = node.parent
+        if parent is None:
+            return None
+        return BufferBackupState(
+            parent_node_id=parent.id,
+            parent_is_root=parent is self.root_node,
+            parent_last_hash=parent.get_last_hash_value(),
+        )
+
     def backfill_missing_hash_values(self) -> int:
         """Hash every node that was built while storage was disabled.
 
@@ -542,6 +594,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches; the single root serves every namespace."""
         return self.root_node.id
+
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
@@ -667,7 +722,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    def _match_prefix_helper(
+        self, key: RadixKey
+    ) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -680,7 +737,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -721,14 +779,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < len(key) and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -741,9 +799,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            key_offset += prefix_len
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         return (
             value,
@@ -872,7 +930,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
         # Insert walks are single-flight; a live walk means re-entrancy.
-        assert self._ongoing_insert_walk_state is None, "concurrent insert walks"
+        if self._ongoing_insert_walk_state is not None:
+            raise RuntimeError("concurrent insert walks")
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -913,7 +972,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def resume_insert(self) -> InsertStepResult:
         """Continue the suspended insert after its step actions were executed."""
-        assert self._ongoing_insert_walk_state is not None, "no in-flight insert"
+        if self._ongoing_insert_walk_state is None:
+            raise RuntimeError("no in-flight insert")
         return self._advance_insert()
 
     def has_ongoing_insert(self) -> bool:
@@ -1014,9 +1074,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             dup_start = max(0, state.params.prev_prefix_len - state.total_prefix_length)
             if dup_start < consumed_from:
-                step_actions.append(
-                    FreeDeviceKV([value_slice[dup_start:consumed_from]])
+                # The duplicate slice may straddle this request's own eviction
+                # floor; below it only the full side is still ours to release.
+                dup = value_slice[dup_start:consumed_from]
+                abs_start = state.total_prefix_length + dup_start
+                swa_already_freed = min(
+                    max(state.params.swa_evicted_seqlen - abs_start, 0), dup.numel()
                 )
+                if swa_already_freed > 0:
+                    step_actions.append(FreeDeviceKVFullOnly([dup[:swa_already_freed]]))
+                if swa_already_freed < dup.numel():
+                    step_actions.append(FreeDeviceKV([dup[swa_already_freed:]]))
 
         if self._inc_hit_count_and_check(node, state.params.chunked):
             step_actions.append(self._build_backup_kv_action(node))

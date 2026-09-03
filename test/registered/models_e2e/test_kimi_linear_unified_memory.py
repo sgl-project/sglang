@@ -1,7 +1,7 @@
 """Kimi-Linear (MLA full attention + KDA linear attention) served from the
 unified memory pool.
 
-Under `--enable-unified-memory` the MLA full side is exposed as DENSE per-layer
+Under `--enable-unified-memory` the MLA full side is exposed as per-layer
 views and every loc the kernels see is a translated virtual id, so the whole
 read/write path differs from the static pool. The unit tests pin that pool in
 isolation; this is the end-to-end guard. `test_prefix_cache_branching` carries
@@ -57,8 +57,9 @@ class TestKimiLinearUnifiedMemory(
 
 class TestKimiLinearUnifiedMemoryFlashMLA(TestKimiLinearUnifiedMemory):
     """flashmla at its ps=64 snap: the canonical block-table route
-    (KVIndexTranslator.build_into into flashmla's padded tables) plus the ps=64
-    sub-pool sizing (64-token sink floor, dense-view tail pad) end to end.
+    (KVIndexTranslator.fill_read_table into flashmla's padded tables) plus the
+    ps=64 sub-pool sizing (64-token sink floor, per-layer-view tail pad) end to
+    end.
     Hopper-only, like the rest of this nightly suite."""
 
     other_args = TestKimiLinearUnifiedMemory.other_args + [
@@ -66,6 +67,34 @@ class TestKimiLinearUnifiedMemoryFlashMLA(TestKimiLinearUnifiedMemory):
         "flashmla",
         "--page-size",
         "64",
+    ]
+
+
+class TestKimiLinearUnifiedMemoryDCP(
+    GSM8KMixin, PrefixCacheBranchingMixin, DefaultServerBase
+):
+    """Unified memory + decode context parallelism.
+
+    `test_prefix_cache_branching` is the sharp one here: a radix hit replays
+    widened virtual locs whose pages may have moved under compaction, and each
+    rank must recover the same physical page from them while keeping a
+    different row inside it.
+    """
+
+    model = KIMI_LINEAR_MODEL
+    cache_chunk_size = 64
+    gsm8k_score_threshold = 0.88
+    other_args = [
+        "--trust-remote-code",
+        "--tp-size",
+        "2",
+        "--dcp-size",
+        "2",
+        "--attention-backend",
+        "flashinfer",
+        "--chunked-prefill-size",
+        "2048",
+        "--enable-unified-memory",
     ]
 
 

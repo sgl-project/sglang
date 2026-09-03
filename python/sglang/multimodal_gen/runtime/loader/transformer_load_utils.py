@@ -770,8 +770,7 @@ def resolve_transformer_quant_load_spec(
             )
         if server_args.nunchaku_config is not None:
             raise ValueError(
-                "Per-layer checkpoint quantization and Nunchaku are mutually "
-                "exclusive"
+                "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
     elif getattr(model_cls, "handles_checkpoint_quantization", False):
@@ -1062,6 +1061,9 @@ def _resolve_quant_config(
     if arch_config is None:
         arch_config = server_args.pipeline_config.dit_config.arch_config
     param_names_mapping_dict = arch_config.param_names_mapping
+    quant_param_names_mapping_dict = getattr(
+        arch_config, "quant_param_names_mapping", param_names_mapping_dict
+    )
     reverse_param_names_mapping_dict = arch_config.reverse_param_names_mapping
     quant_ignore_remap_dict = arch_config.quant_ignore_remap
 
@@ -1133,7 +1135,7 @@ def _resolve_quant_config(
             fallback_group_size = getattr(quant_config, "group_size", None)
         inferred_nvfp4_config = build_nvfp4_config_from_safetensors_list(
             safetensors_list,
-            param_names_mapping_dict,
+            quant_param_names_mapping_dict,
             reverse_param_names_mapping_dict,
             fallback_group_size,
         )

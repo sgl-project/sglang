@@ -129,6 +129,19 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+    def supports_mixed_chunk(self) -> bool:
+        """Whether mixed chunk prefill may stay enabled with this algorithm.
+
+        ngram cannot join as is: its overlap relay skips output_tokens_buf,
+        which the mixed input resolve reads.
+        """
+        return self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        )
+
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
@@ -280,9 +293,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
 
         cfg = resolving_view(server_args)
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
