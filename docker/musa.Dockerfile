@@ -94,28 +94,33 @@ RUN python -m pip install --upgrade pip "setuptools<82" wheel
 WORKDIR /workspace/sglang
 COPY . .
 
+# Pip does not prioritize --index-url over --extra-index-url for equal-version
+# candidates. Reinstall Triton from the MUSA index in this same layer.
 RUN cp python/pyproject_other.toml python/pyproject.toml \
     && python -m pip install -e "python[all_musa]" \
         --index-url "${MUSA_PIP_INDEX_URL}" \
         --extra-index-url "${PYPI_INDEX_URL}" \
         --trusted-host dl.mthreads.com \
         --no-build-isolation \
+    && python -m pip install --no-cache-dir --force-reinstall --no-deps \
+        --index-url "${MUSA_PIP_INDEX_URL}" \
+        --trusted-host dl.mthreads.com \
+        "triton==3.2.0" \
+    && python -c "import triton.backends.mtgpu" \
     && ! python -m pip freeze | grep -E '^(nvidia-|cuda-)'
 
 RUN cd python/sglang/kernels/aot \
     && cp pyproject_musa.toml pyproject.toml \
     && MTGPU_TARGET=mp_31 python setup_musa.py install
 
-RUN python - <<'PY'
-import torch
-
-assert getattr(torch.version, "musa", None), torch.__version__
-assert hasattr(torch, "musa")
-import torchada  # noqa: F401
-import triton
-import triton.backends.mtgpu  # noqa: F401
-import tilelang  # noqa: F401
-import sglang  # noqa: F401
-PY
+# Keep this check in a single shell command: the legacy Docker builder does not
+# reliably preserve Dockerfile heredocs and can turn the check into a silent
+# `python -` EOF success.
+RUN python -c \
+    "import torch; \
+assert getattr(torch.version, 'musa', None), torch.__version__; \
+assert hasattr(torch, 'musa'); \
+import torchada, triton, tilelang, sglang; \
+import triton.backends.mtgpu"
 
 CMD ["/bin/bash"]
