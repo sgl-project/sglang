@@ -269,9 +269,9 @@ def _per_token_group_quant_8bit_raw(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_hip:
@@ -585,9 +585,9 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert (
-        eps == 1e-10
-    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    assert eps == 1e-10, (
+        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    )
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
         f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
@@ -614,9 +614,9 @@ def sglang_per_token_group_quant_fp8(
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` cannot be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if (
@@ -676,9 +676,9 @@ def sglang_per_token_group_quant_fp8_row_padded(
     bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` must be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, (
+        "the last dimension of `x` must be divisible by `group_size`"
+    )
     assert x.is_contiguous(), "`x` is not contiguous"
 
     supported_group_sizes = (
@@ -726,9 +726,9 @@ def sglang_per_token_group_quant_fp8_ue8m0(
     group_size: int,
     eps: float = 1e-10,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert (
-        x.shape[-1] % group_size == 0
-    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    assert x.shape[-1] % group_size == 0, (
+        f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    )
     assert x.is_contiguous(), "x must be contiguous"
 
     *x_batch, x_q_mn, x_q_k = x.shape
@@ -1466,9 +1466,9 @@ def prepare_block_fp8_matmul_inputs(
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     elif As.dtype == torch.int:
-        assert (
-            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
-        ), f"{A.shape=} {As.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1], (
+            f"{A.shape=} {As.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -1484,9 +1484,9 @@ def prepare_block_fp8_matmul_inputs(
         assert triton.cdiv(K, block_k) == Bs.shape[1]
     elif Bs.dtype == torch.int:
         assert N == Bs.shape[0], f"{B.shape=} {Bs.shape=} {block_size=}"
-        assert (
-            triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
-        ), f"{B.shape=} {Bs.shape=} {block_size=}"
+        assert triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1], (
+            f"{B.shape=} {Bs.shape=} {block_size=}"
+        )
     else:
         raise NotImplementedError
 
@@ -1932,9 +1932,9 @@ if _is_hip:
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
             elif _has_vllm:
@@ -1973,9 +1973,9 @@ else:
                 )  # False for dynamic
         else:
             # Static scaling
-            assert (
-                scale.numel() == 1
-            ), f"Expected scalar scale, got numel={scale.numel()}"
+            assert scale.numel() == 1, (
+                f"Expected scalar scale, got numel={scale.numel()}"
+            )
             sgl_per_tensor_quant_fp8(
                 input, output, scale, is_static=True
             )  # True for static
@@ -2054,9 +2054,9 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert A.dim() == 2
     assert A.is_contiguous(), "`A` is not contiguous"
-    assert (
-        A.shape[-1] % group_size == 0
-    ), "the last dimension of `A` cannot be divisible by `group_size`"
+    assert A.shape[-1] % group_size == 0, (
+        "the last dimension of `A` cannot be divisible by `group_size`"
+    )
 
     a_q = torch.empty_like(A, device=A.device, dtype=fp8_dtype)
     M, K = A.shape[0], A.shape[1]
