@@ -62,6 +62,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[need_size:]
         return select_index
 
+    def free_page_ids(self, page_ids: torch.Tensor):
+        self.free(page_ids)
+
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return

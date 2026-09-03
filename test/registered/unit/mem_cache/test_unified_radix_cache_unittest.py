@@ -7548,8 +7548,8 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         _component_with_cache(ComponentType.FULL, cache).apply_component_action(
             FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
         )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free.assert_called_once_with(
-            indices
+        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
+            indices, start_pos=0
         )
 
     def test_apply_component_action_device_kv_swa_uses_free_swa(self):
@@ -7670,7 +7670,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.set_full_to_swa_mapping.assert_called_once_with(kept_full, swa_value)
         # the incoming full's stale mapping is cleared, then its slot freed (full-only)
         alloc.clear_full_to_swa_mapping.assert_called_once_with(incoming_full)
-        alloc.free_full.assert_called_once_with(incoming_full)
+        alloc.free_full_segment.assert_called_once_with(incoming_full, start_pos=0)
         # Never by indexing the tensor: the unified composite has no
         # `full_to_swa_index_mapping` to index into.
         alloc.full_to_swa_index_mapping.__setitem__.assert_not_called()

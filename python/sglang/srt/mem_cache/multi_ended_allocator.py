@@ -3661,6 +3661,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.free(free_index.detach().to(torch.int64))
         self.full_attn_allocator.clear_inverse_history()
 
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        # Virtual-id pool: the full side dedups by v2p and there is no mapping
+        # tensor for the parent's peer check to read.
+        self.free_full(free_index)
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
