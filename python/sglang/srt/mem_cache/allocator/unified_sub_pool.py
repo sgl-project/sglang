@@ -43,6 +43,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     bind_inplace,
     free_unbind_inplace,
+    write_loc_to_kernel_ids,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -990,33 +991,41 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         clamp to kernel-facing id 0, the page-0 sink. int64 out; a consumer whose
         kernel ABI wants int32 narrows where it fills that buffer.
         """
-        ps = self.pool_page_size
-        stride = ps * self.kernel_page_multiplier
         with record_function("MultiEndedAlloc.translate_kv_loc_for_kernel"):
-            pages = virt_tokens if ps == 1 else virt_tokens // ps
-            offsets = None if ps == 1 else virt_tokens % ps
-            if out is None:
-                phys = self.virtual_to_physical[pages]
-                ids = phys * stride if offsets is None else phys * stride + offsets
-                return ids.clamp_(min=0)
+            return self._translate_loc_fused(virt_tokens, dcp_size=1, out=out)
+
+    def _translate_loc_fused(
+        self,
+        loc: torch.Tensor,
+        *,
+        dcp_size: int,
+        dcp_rank: int = 0,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """One launch for the read and write conversions alike.
+
+        Eagerly this was ~6 torch ops, and ~12 with the DCP owner rule on top,
+        every one a launch on the forward's critical path outside any cuda
+        graph. See `write_loc_to_kernel_ids`.
+        """
+        if out is not None:
             assert out.dtype == torch.int64, (
                 f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
                 f"got {out.dtype}"
             )
-            assert out.shape == virt_tokens.shape, (
+            assert out.shape == loc.shape, (
                 f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
-                f"match virt_tokens shape {tuple(virt_tokens.shape)}"
+                f"match virt_tokens shape {tuple(loc.shape)}"
             )
-            if pages.dtype != torch.int64:
-                pages = pages.to(torch.int64)
-            if pages is virt_tokens:
-                out.copy_(torch.take(self.virtual_to_physical, pages))
-            else:
-                torch.take(self.virtual_to_physical, pages, out=out)
-            out.mul_(stride)
-            if offsets is not None:
-                out.add_(offsets)
-            return out.clamp_(min=0)
+        return write_loc_to_kernel_ids(
+            loc=loc,
+            v2p=self.virtual_to_physical,
+            page_size=self.pool_page_size,
+            stride=self.pool_page_size * self.kernel_page_multiplier,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            out=out,
+        )
 
     def translate_write_loc_for_kernel(
         self,
@@ -1032,16 +1041,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size if self.shards_under_dcp else 1
-        if dcp_size == 1:
-            return self.translate_kv_loc_for_kernel(widened_loc, out=out)
         with record_function("MultiEndedAlloc.translate_write_loc_for_kernel"):
-            owned = (widened_loc % dcp_size) == parallel.attn_dcp_rank
-            dense = self.translate_kv_loc_for_kernel(widened_loc // dcp_size)
-            dense = torch.where(owned, dense, torch.zeros_like(dense))
-            if out is not None:
-                out.copy_(dense)
-                return out
-            return dense
+            return self._translate_loc_fused(
+                widened_loc,
+                dcp_size=dcp_size,
+                dcp_rank=parallel.attn_dcp_rank,
+                out=out,
+            )
 
     # -- alloc --
 
