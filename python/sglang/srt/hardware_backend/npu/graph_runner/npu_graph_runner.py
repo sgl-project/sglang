@@ -44,10 +44,12 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -130,6 +132,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
+        )
+        parallel = get_parallel()
+        self.mla_dcp_graph = (
+            model_runner.model_config.attention_arch == AttentionArch.MLA
+            and parallel.dcp_enabled
+            and not model_runner.is_draft_worker
         )
 
     def _init_arch_map(self):
@@ -332,7 +340,21 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify():
+            if self.mla_dcp_graph:
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens_cpu = (
+                        forward_batch.seq_lens.cpu() + self.captured_req_width
+                    )
+                else:
+                    seq_lens_cpu = forward_batch.seq_lens.cpu()
+                parallel = get_parallel()
+                seq_lens_cpu = get_dcp_lens(
+                    seq_lens_cpu,
+                    parallel.dcp_size,
+                    parallel.dcp_rank,
+                )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            elif forward_batch.forward_mode.is_target_verify():
                 _attn = self._replay_attn_backend()
                 _meta = getattr(_attn, "forward_metadata", None)
                 _meta_list = getattr(_meta, "seq_lens_cpu_list", None)
