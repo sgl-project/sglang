@@ -494,6 +494,45 @@ class TestAlignedParaphraseAdmission(CustomTestCase):
         self.assertEqual(allocator.alloc_calls[-1], 2)
 
 
+class TestServedSlotsComeFromTheTree(CustomTestCase):
+    def test_provider_snapshot_is_replaced_by_the_donor_path(self):
+        """A provider's kv snapshot can name slots the donor shared with an
+        earlier prefix node that was evicted and reused since (observed live:
+        served spans starting inside another request's content). Served slots
+        are resolved from the pinned donor's tree path at the same positions,
+        so a stale snapshot never reaches the recipient."""
+        cache, provider, allocator = _make_cache()
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=2,
+            kv_indices=[70, 71],  # stale: not the donor's slots any more
+            cached_start_pos=2,
+            donor_last_node_id=donor.id,
+        )
+        req = _StubReq(rid="recipient")
+        result = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+        self.assertEqual(result.fuzzy_matched_len, 2)
+        self.assertEqual(result.device_indices.tolist()[-2:], [12, 13])
+
+    def test_span_beyond_the_donor_path_is_dropped(self):
+        cache, provider, allocator = _make_cache()
+        donor = _seed_exact(
+            cache, token_ids=[1, 2, 3, 4], values=[10, 11, 12, 13]
+        ).last_device_node
+        provider.result = _scripted_fuzzy_result(
+            cached_token_count=3,
+            kv_indices=[12, 13, 14],
+            cached_start_pos=2,  # positions 2..5 exceed the 4-token donor
+            donor_last_node_id=donor.id,
+        )
+        req = _StubReq(rid="too-long")
+        result = cache.match_prefix(MatchPrefixParams(key=_key([90, 91, 92]), req=req))
+        self.assertIsNone(result.fuzzy_matched_len)
+        self.assertEqual(donor.lock_ref, 0)
+
+
 class TestDonorLifecycle(CustomTestCase):
     def test_finished_request_unpins_donor_and_frees_realized_locs(self):
         """A fuzzy hit pins the donor node (lock_ref +1) for the recipient's

@@ -250,6 +250,29 @@ class FuzzyRadixCache(RadixCache):
             device=result.device_indices.device,
             dtype=result.device_indices.dtype,
         )
+        if donor_node is not None:
+            # The tree is the only owner of pool slots. A provider's snapshot
+            # can include slots the donor shared with earlier prefix nodes
+            # that were evicted and reused since, so served slots are taken
+            # from the donor's current tree path at the same positions.
+            resolved = self._resolve_from_donor_path(
+                donor_node,
+                start=fuzzy_result.cached_start_pos,
+                length=fuzzy_matched_len,
+                like=fuzzy_kv_indices,
+            )
+            if resolved is None:
+                logger.warning(
+                    "[FUZZY RADIX] dropping fuzzy match for rid=%s: donor path "
+                    "does not cover positions [%d, %d)",
+                    req.rid,
+                    fuzzy_result.cached_start_pos,
+                    fuzzy_result.cached_start_pos + fuzzy_matched_len,
+                )
+                return result
+            fuzzy_kv_indices = resolved
+            if fuzzy_result.segments:
+                self._resolve_segments_from_tree(fuzzy_result.segments, like=fuzzy_kv_indices)
         if len(fuzzy_kv_indices) != fuzzy_matched_len:
             logger.warning(
                 "[FUZZY RADIX] provider returned %d kv indices but "
@@ -379,6 +402,38 @@ class FuzzyRadixCache(RadixCache):
                 )
         except Exception:
             logger.exception("[FUZZY RADIX] donor registration failed: rid=%s", req.rid)
+
+    def _donor_path_slots(self, node: TreeNode) -> torch.Tensor:
+        """Pool slots for the donor's tokens [0, len(path)) from root to node."""
+        parts = []
+        while node is not None and node is not self.root_node:
+            parts.append(node.value)
+            node = node.parent
+        parts.reverse()
+        if not parts:
+            return torch.empty(0, dtype=torch.int64)
+        return torch.cat([p.to(torch.int64) for p in parts])
+
+    def _resolve_from_donor_path(
+        self, node: TreeNode, *, start: int, length: int, like: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        path = self._donor_path_slots(node)
+        if start < 0 or start + length > path.numel():
+            return None
+        return path[start : start + length].to(device=like.device, dtype=like.dtype)
+
+    def _resolve_segments_from_tree(self, segments, *, like: torch.Tensor) -> None:
+        for seg in segments:
+            if seg.donor_node_id is None or seg.donor_offset is None or seg.length is None:
+                continue
+            node = self._node_registry.get(seg.donor_node_id)
+            if node is None:
+                continue
+            resolved = self._resolve_from_donor_path(
+                node, start=seg.donor_offset, length=seg.length, like=like
+            )
+            if resolved is not None:
+                seg.donor_kv_indices = resolved
 
     def _reclaim_realization_slots(self, req: Req) -> None:
         """Free pre-allocated realization slots the forward pass never used."""
