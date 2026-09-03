@@ -79,12 +79,11 @@ class DynamicChunkSizer:
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
-                # Broadcast the failure as None; every PP rank must reach the
-                # collective below or the later stages block on it.
                 logger.warning(
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
                     "Dynamic chunking will be disabled."
                 )
+            # Broadcast even a failure (as None); the other PP ranks wait below.
             samples = attn_cp_tp_broadcast_pyobj([samples])[0]
 
         # Broadcast data to all ranks
