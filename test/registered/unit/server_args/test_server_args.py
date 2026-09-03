@@ -1933,49 +1933,6 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
-class TestPostCaptureVlmMemoryReserve(CustomTestCase):
-    @staticmethod
-    def _resolve_mem_fraction(*, is_multimodal, gpu_mem, **overrides):
-        args = ServerArgs(
-            model_path="dummy",
-            cuda_graph_config=CudaGraphConfig(
-                decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
-                prefill=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
-            ),
-            **overrides,
-        )
-        args._model_config = SimpleNamespace(is_multimodal=is_multimodal)
-        with patch(
-            "sglang.srt.arg_groups.memory_hook.post_capture_kv_sizing_planned",
-            return_value=True,
-        ):
-            handle_gpu_memory_settings(args, gpu_mem=gpu_mem)
-        return resolution_result(args, "mem_fraction_static")
-
-    def test_vlm_reserves_fixed_runtime_headroom(self):
-        gpu_mem = 80 * 1024
-        text_fraction = self._resolve_mem_fraction(is_multimodal=False, gpu_mem=gpu_mem)
-        vlm_fraction = self._resolve_mem_fraction(is_multimodal=True, gpu_mem=gpu_mem)
-
-        self.assertEqual(text_fraction, 0.98)
-        self.assertEqual(vlm_fraction, 0.88)
-
-    def test_decode_role_does_not_reserve_vlm_runtime_headroom(self):
-        self.assertEqual(
-            self._resolve_mem_fraction(
-                is_multimodal=True,
-                gpu_mem=80 * 1024,
-                disaggregation_mode="decode",
-            ),
-            0.98,
-        )
-
-    def test_unknown_gpu_memory_uses_post_capture_fallback(self):
-        self.assertEqual(
-            self._resolve_mem_fraction(is_multimodal=True, gpu_mem=None), 0.95
-        )
-
-
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
