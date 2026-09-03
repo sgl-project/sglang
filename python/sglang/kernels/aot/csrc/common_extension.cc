@@ -141,6 +141,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int group_size, Tensor(a!) out) -> Tensor(a!)");
   m.impl("convrot_int8_linear_prequant_out", torch::kCUDA, &convrot_int8_linear_prequant_out);
 
+  // No tensor argument to dispatch on: the schema carries its own kernel.
+  m.def("convrot_int8_supported_sm_versions() -> int[]", &convrot_int8_supported_sm_versions);
+
   m.def(
       "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");

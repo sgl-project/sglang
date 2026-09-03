@@ -17,13 +17,17 @@ limitations under the License.
 // group-wise Walsh-Hadamard rotation and per-row dynamic INT8 quantization;
 // weights are rotated and quantized offline with the same row-wise transform
 // (convrot_rotate_quantize_activation on the [N, K] weight). The GEMM is a
-// CUTLASS 3.x dense INT8 kernel (Sm90 WGMMA or Sm100 tcgen05) whose epilogue
-// applies the per-row (activation) x per-column (weight) dequant into BF16.
+// CUTLASS dense INT8 kernel whose epilogue applies the per-row (activation) x
+// per-column (weight) dequant into BF16: CUTLASS 3.x WGMMA on Sm90, tcgen05 on
+// Sm100, and the CUTLASS 2.x mma.sync path on the CC 12.x parts that have neither.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cutlass/cutlass.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/threadblock/epilogue_with_visitor.h>
+#include <cutlass/gemm/device/gemm.h>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
 #include <cutlass/numeric_types.h>
 #include <torch/all.h>
@@ -35,9 +39,15 @@ limitations under the License.
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/gemm/kernel/tile_scheduler.hpp>
 #include <cutlass/util/packed_stride.hpp>
+#include <iterator>
+#include <string>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
+#include "cutlass_extensions/epilogue/epilogue_per_row_per_col_scale.h"
+#include "cutlass_extensions/gemm/gemm_universal_base_compat.h"
+#include "cutlass_extensions/gemm/gemm_with_epilogue_visitor.h"
 #include "utils.h"
 
 // Named rather than anonymous: nvcc reports "reference to '_GLOBAL__N_...' is
@@ -388,21 +398,203 @@ using ConvRotSm90SmallMNarrowN =
 using ConvRotSm90SmallMWideN =
     ConvRotGemmSm90<Shape<_64, _128, _128>, Shape<_2, _1, _1>, cutlass::gemm::KernelTmaWarpSpecialized>;
 
+// CC 12.0 / 12.1 (RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark) have neither
+// WGMMA nor tcgen05, so the dequant GEMM runs on the CUTLASS 2.x mma.sync INT8
+// path sgl-kernel already uses for its sm89 int8_scaled_mm (int8_gemm_kernel.cu),
+// whose per-row x per-column epilogue visitor computes the same
+// bf16(x_scale[m] * w_scale[n] * acc + bias[n]).
+template <class ThreadblockShape, class WarpShape, int NumStages>
+void run_convrot_int8_gemm_mma_sync(
+    torch::Tensor& out,
+    const torch::Tensor& x_q,
+    const torch::Tensor& w_q,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& w_scale,
+    const c10::optional<torch::Tensor>& bias,
+    cudaStream_t stream) {
+  using ArchTag = cutlass::arch::Sm80;
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+  using OperatorClass = cutlass::arch::OpClassTensorOp;
+  using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<8>;
+  using DefaultGemmConf = cutlass::gemm::device::
+      DefaultGemmConfiguration<OperatorClass, ArchTag, ElementA, ElementB, ElementOutput, ElementCompute>;
+  using EpilogueOutputOp = typename DefaultGemmConf::EpilogueOutputOp;
+
+  using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemm<
+      ElementA,
+      LayoutA,
+      DefaultGemmConf::kAlignmentA,
+      ElementB,
+      LayoutB,
+      DefaultGemmConf::kAlignmentB,
+      ElementOutput,
+      LayoutC,
+      ElementAccumulator,
+      OperatorClass,
+      ArchTag,
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      EpilogueOutputOp,
+      ThreadblockSwizzle,
+      NumStages,
+      true,
+      typename DefaultGemmConf::Operator>::GemmKernel;
+
+  using AlphaColTileIterator = cutlass::epilogue::threadblock::PredicatedTileIterator<
+      cutlass::epilogue::threadblock::OutputTileOptimalThreadMap<
+          typename GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::Shape,
+          typename GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::Count,
+          GemmKernel_::Epilogue::OutputTileIterator::ThreadMap::kThreads,
+          GemmKernel_::Epilogue::OutputTileIterator::kElementsPerAccess,
+          cutlass::sizeof_bits<ElementOutput>::value>,
+      ElementCompute>;
+  using EpilogueVisitor = typename cutlass::epilogue::threadblock::EpilogueVisitorPerRowPerCol<
+      ThreadblockShape,
+      GemmKernel_::kThreadCount,
+      AlphaColTileIterator,
+      typename GemmKernel_::Epilogue::OutputTileIterator,
+      ElementAccumulator,
+      ElementCompute,
+      EpilogueOutputOp>;
+  using Epilogue = typename cutlass::epilogue::threadblock::
+      EpilogueWithVisitorFromExistingEpilogue<EpilogueVisitor, typename GemmKernel_::Epilogue>::Epilogue;
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmWithEpilogueVisitor<typename GemmKernel_::Mma, Epilogue, ThreadblockSwizzle>;
+  using Gemm = cutlass::gemm::device::GemmUniversalBaseCompat<GemmKernel>;
+
+  const int M = x_q.size(0), K = x_q.size(1), N = w_q.size(0);
+  // w_q is [N, K] row-major, i.e. B as K x N column-major with ldb = K; the bias
+  // TensorRef with stride 0 broadcasts one row.
+  ElementOutput* bias_ptr = bias.has_value() ? static_cast<ElementOutput*>(bias->data_ptr()) : nullptr;
+  typename EpilogueOutputOp::Params linear_scaling_params;
+  typename EpilogueVisitor::Arguments visitor_args{linear_scaling_params};
+  typename Gemm::Arguments args{
+      {M, N, K},
+      {static_cast<ElementA*>(x_q.data_ptr()), static_cast<int64_t>(K)},
+      {static_cast<ElementB*>(w_q.data_ptr()), static_cast<int64_t>(K)},
+      {static_cast<ElementCompute*>(w_scale.data_ptr()), 0},
+      {static_cast<ElementCompute*>(x_scale.data_ptr()), 0},
+      {bias_ptr, 0},
+      {static_cast<ElementOutput*>(out.data_ptr()), static_cast<int64_t>(N)},
+      visitor_args};
+
+  Gemm gemm_op;
+  auto workspace =
+      torch::empty({static_cast<int64_t>(gemm_op.get_workspace_size(args))}, x_q.options().dtype(torch::kUInt8));
+  const cutlass::Status status = gemm_op.can_implement(args);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess, "convrot_int8: can_implement failed: ", cutlassGetStatusString(status));
+  const cutlass::Status run_status = gemm_op(args, workspace.data_ptr(), stream);
+  TORCH_CHECK(
+      run_status == cutlass::Status::kSuccess, "convrot_int8: run failed: ", cutlassGetStatusString(run_status));
+}
+
+// Tile table of sm89_dispatch_shape (int8_gemm_kernel.cu): the 100 KB shared-memory
+// class the CC 12.x parts share with Ada.
+void dispatch_convrot_int8_gemm_mma_sync(
+    torch::Tensor& out,
+    const torch::Tensor& x_q,
+    const torch::Tensor& w_q,
+    const torch::Tensor& x_scale,
+    const torch::Tensor& w_scale,
+    const c10::optional<torch::Tensor>& bias,
+    cudaStream_t stream) {
+  using cutlass::gemm::GemmShape;
+  const int64_t M = x_q.size(0), N = w_q.size(0);
+  if (M <= 16) {
+    if (N <= 8192) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<16, 64, 128>, GemmShape<16, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else {
+      run_convrot_int8_gemm_mma_sync<GemmShape<16, 128, 128>, GemmShape<16, 64, 64>, 4>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    }
+  } else if (M <= 32) {
+    if (N <= 8192) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<32, 64, 128>, GemmShape<16, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else {
+      run_convrot_int8_gemm_mma_sync<GemmShape<32, 128, 128>, GemmShape<32, 64, 64>, 4>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    }
+  } else if (M <= 64) {
+    if (N <= 8192) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<64, 64, 128>, GemmShape<32, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else {
+      run_convrot_int8_gemm_mma_sync<GemmShape<64, 128, 128>, GemmShape<64, 64, 64>, 3>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    }
+  } else if (M <= 128) {
+    if (N <= 8192) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<64, 128, 128>, GemmShape<32, 64, 64>, 3>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else if (N <= 16384) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else {
+      run_convrot_int8_gemm_mma_sync<GemmShape<64, 64, 128>, GemmShape<32, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    }
+  } else if (M <= 256) {
+    if (N <= 4096) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<64, 128, 128>, GemmShape<64, 64, 64>, 3>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else if (N <= 8192) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else if (N <= 16384) {
+      run_convrot_int8_gemm_mma_sync<GemmShape<256, 128, 64>, GemmShape<64, 64, 64>, 3>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    } else {
+      run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(
+          out, x_q, w_q, x_scale, w_scale, bias, stream);
+    }
+  } else {
+    run_convrot_int8_gemm_mma_sync<GemmShape<128, 128, 64>, GemmShape<64, 64, 64>, 5>(
+        out, x_q, w_q, x_scale, w_scale, bias, stream);
+  }
+}
+
+// The one list of parts these ops run on, as exact CC (major * 10 + minor), not the
+// major: sm_90a and sm_100a carry the WGMMA / tcgen05 kernels (the sm_100f family
+// pass has the INT8 tcgen05 MMA compiled out, so a CC 10.3 part would trap in a
+// stub), CC 12.0 / 12.1 take the mma.sync path. Published to Python through
+// convrot_int8_supported_sm_versions, so the quantization method and the tests
+// read it from here instead of keeping their own copy.
+constexpr int kConvRotSupportedSmVersions[] = {90, 100, 120, 121};
+
+bool is_supported_sm_version(int sm) {
+  for (int v : kConvRotSupportedSmVersions) {
+    if (v == sm) return true;
+  }
+  return false;
+}
+
+std::string supported_sm_versions_text() {
+  std::string text;
+  for (int v : kConvRotSupportedSmVersions) {
+    text += (text.empty() ? "SM" : ", SM") + std::to_string(v);
+  }
+  return text;
+}
+
 // Cached: a process serves one device class.
 int device_sm_version() {
   static const int v = getSMVersion();
   return v;
 }
 
-bool is_sm90_device() {
-  return device_sm_version() == 90;
-}
-
-// Exact CC, not the major: only sm_90a and sm_100a carry runnable code; the sm_100f
-// family pass has the INT8 tcgen05 MMA compiled out, so a CC 10.3 part would trap in a stub.
 void check_supported_device() {
   const int sm = device_sm_version();
-  TORCH_CHECK(sm == 90 || sm == 100, "convrot_int8: requires an SM90 (CC 9.0) or SM100 (CC 10.0) GPU, got SM", sm);
+  TORCH_CHECK(
+      is_supported_sm_version(sm),
+      "convrot_int8: no kernel for SM",
+      sm,
+      " (supported: ",
+      supported_sm_versions_text(),
+      ")");
 }
 
 template <bool WithBias, class Types>
@@ -470,7 +662,12 @@ void dispatch_convrot_int8_gemm(
     const c10::optional<torch::Tensor>& bias,
     cudaStream_t stream) {
   const int64_t M = x_q.size(0), K = x_q.size(1), N = w_q.size(0);
-  if (is_sm90_device()) {
+  const int sm = device_sm_version();
+  if (sm >= 120) {
+    dispatch_convrot_int8_gemm_mma_sync(out, x_q, w_q, x_scale, w_scale, bias, stream);
+    return;
+  }
+  if (sm == 90) {
     if (M > 128) {
       run_convrot_int8_gemm<WithBias, ConvRotSm90LargeM>(out, x_q, w_q, x_scale, w_scale, bias, stream);
     } else if (N <= 4096) {
@@ -742,4 +939,11 @@ torch::Tensor convrot_int8_linear_prequant_out(
     int64_t group_size,
     torch::Tensor out) {
   return linear_prequant_impl(xq, xs, weight_q, weight_scale, bias, group_size, out);
+}
+
+/**
+ * \brief Compute capabilities (major * 10 + minor) the convrot_int8_* ops carry code for.
+ */
+std::vector<int64_t> convrot_int8_supported_sm_versions() {
+  return std::vector<int64_t>(std::begin(kConvRotSupportedSmVersions), std::end(kConvRotSupportedSmVersions));
 }

@@ -29,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_customkernel_config import (
     ConvRotInt8CustomKernelConfig,
+    check_convrot_int8_capability,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
@@ -42,10 +43,8 @@ __all__ = [
     "convrot_int8_shares_input",
 ]
 
-# The ops carry sm_90a and sm_100a code only.
-_SUPPORTED_CAPABILITIES = ((9, 0), (10, 0))
-
 _REQUIRED_OPS = (
+    "convrot_int8_supported_sm_versions",
     "convrot_rotate_quantize_activation",
     "convrot_int8_fused_linear",
     "convrot_int8_fused_linear_gelu_input",
@@ -57,12 +56,7 @@ _REQUIRED_OPS = (
 def _load_sgl_kernel() -> None:
     import sgl_kernel  # noqa: F401 -- registers torch.ops.sgl_kernel.*
 
-    capability = torch.cuda.get_device_capability()
-    if capability not in _SUPPORTED_CAPABILITIES:
-        raise RuntimeError(
-            "convrot_int8_customkernel requires a CC 9.0 or CC 10.0 GPU; found "
-            f"CC {capability[0]}.{capability[1]}"
-        )
+    # Ops first: the capability table is read from the kernel itself.
     for op_name in _REQUIRED_OPS:
         if not hasattr(torch.ops.sgl_kernel, op_name):
             raise RuntimeError(
@@ -70,6 +64,7 @@ def _load_sgl_kernel() -> None:
                 f"build that registers torch.ops.sgl_kernel.{op_name}; the "
                 "installed sgl_kernel does not."
             )
+    check_convrot_int8_capability(torch.cuda.get_device_capability())
 
 
 def _as_rows(x: torch.Tensor) -> torch.Tensor:

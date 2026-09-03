@@ -38,6 +38,42 @@ logger = init_logger(__name__)
 _SUPPORTED_GROUP_SIZES = (64, 128, 256, 512)
 
 
+# Parts the ops deliberately leave out, with the reason shown at load time. The
+# supported table itself lives in sgl-kernel (convrot_int8_supported_sm_versions);
+# nothing here duplicates it.
+REFUSED_CAPABILITY_REASONS: dict[tuple[int, int], str] = {
+    (10, 3): (
+        "Blackwell Ultra cuts INT8 tensor-core throughput to a fraction of its "
+        "BF16 rate, so W8A8 INT8 would be a slowdown there; use FP8 or NVFP4 "
+        "quantization on this GPU"
+    ),
+}
+
+
+def convrot_int8_supported_capabilities() -> frozenset[tuple[int, int]]:
+    """(major, minor) pairs the installed sgl_kernel carries convrot code for."""
+    import sgl_kernel  # noqa: F401 -- registers torch.ops.sgl_kernel.*
+
+    versions = torch.ops.sgl_kernel.convrot_int8_supported_sm_versions()
+    return frozenset((int(v) // 10, int(v) % 10) for v in versions)
+
+
+def check_convrot_int8_capability(capability: tuple[int, int]) -> None:
+    """Raise with the specific reason when `capability` is not in the kernel's table."""
+    supported = convrot_int8_supported_capabilities()
+    if capability in supported:
+        return
+    major, minor = capability
+    reason = REFUSED_CAPABILITY_REASONS.get(
+        capability, "the convrot_int8_* ops carry no code for it"
+    )
+    supported_text = ", ".join(f"{a}.{b}" for a, b in sorted(supported))
+    raise RuntimeError(
+        f"convrot_int8_customkernel does not support CC {major}.{minor}: {reason}. "
+        f"Supported compute capabilities: {supported_text}"
+    )
+
+
 class ConvRotInt8CustomKernelConfig(QuantizationConfig):
     """Online ConvRot INT8 for every divisible linear not listed as ignored."""
 
@@ -73,8 +109,9 @@ class ConvRotInt8CustomKernelConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # The ops carry sm_90a and sm_100a code only and reject any other CC
-        # at call time; this is the lowest one they accept.
+        # Lowest entry of sgl-kernel's supported table (see
+        # convrot_int8_supported_capabilities); the exact check runs at load
+        # time in check_convrot_int8_capability.
         return 90
 
     @classmethod

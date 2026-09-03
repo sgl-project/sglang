@@ -9,6 +9,11 @@ def awq_dequantize(
     return torch.ops.sgl_kernel.awq_dequantize.default(qweight, scales, qzeros)
 
 
+def convrot_int8_supported_sm_versions() -> list[int]:
+    """Compute capabilities (major * 10 + minor) the convrot_int8_* ops carry code for."""
+    return list(torch.ops.sgl_kernel.convrot_int8_supported_sm_versions.default())
+
+
 def convrot_rotate_quantize_activation(
     x: torch.Tensor, group_size: int = 256
 ) -> Tuple[torch.Tensor, torch.Tensor]:

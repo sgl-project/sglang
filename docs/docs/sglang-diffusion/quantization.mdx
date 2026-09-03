@@ -135,7 +135,7 @@ backend.
       <td><code>--component-quantizations.&lt;component&gt; convrot_int8_customkernel</code></td>
       <td>Qwen-Image (validated on H100, H200, GB200)</td>
       <td><code>sgl-kernel</code> (bundled)</td>
-      <td>Data-free INT8 ConvRot W8A8 at load time via the <code>convrot_int8_*</code> ops in <code>sgl-kernel</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires CC 9.0 or CC 10.0.</td>
+      <td>Data-free INT8 ConvRot W8A8 at load time via the <code>convrot_int8_*</code> ops in <code>sgl-kernel</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires CC 9.0, 10.0, 12.0 or 12.1.</td>
     </tr>
     <tr>
       <td><code>fp8</code> (offline quantization)</td>
@@ -452,8 +452,10 @@ thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
 
 ### ConvRot INT8 (sgl-kernel)
 
-`convrot_int8_customkernel` is online W8A8 INT8 for Hopper (SM90) and
-Blackwell (SM100) DiTs, built on the `convrot_int8_*` ops shipped in
+`convrot_int8_customkernel` is online W8A8 INT8 for DiTs on Hopper (CC 9.0),
+Blackwell data-center parts (CC 10.0) and Blackwell workstation and consumer
+parts (CC 12.0 and 12.1: RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark),
+built on the `convrot_int8_*` ops shipped in
 `sgl-kernel`; no extra package is needed. Every linear whose input dim is
 divisible by the Hadamard group size (256) is rotated and quantized per output
 channel after loading a stock BF16 checkpoint. Each forward call runs one fused
@@ -486,8 +488,11 @@ shapes on H200. A follow-up change to the denoising loop widens these margins on
 <Warning>
 `convrot_int8_customkernel` is approximate: same-seed outputs are visually
 equivalent to BF16 but not bit-exact, so it is not a consistency ground-truth
-mode. The ops accept CC 9.0 and CC 10.0 GPUs only; the method refuses to load
-on any other part.
+mode. The ops accept CC 9.0, 10.0, 12.0 and 12.1 GPUs; the method refuses to
+load on any other part and says why. CC 10.3 (B300, GB300) is refused on
+purpose: Blackwell Ultra cuts INT8 tensor-core throughput to a fraction of its
+BF16 rate, so use FP8 or NVFP4 there. On CC 12.x the dequant GEMM runs on the
+CUTLASS mma.sync kernels sgl-kernel already uses for its sm89 INT8 GEMM.
 </Warning>
 
 ### Skipping Layers

@@ -256,6 +256,7 @@ torch::Tensor convrot_int8_linear_prequant_out(
     const c10::optional<torch::Tensor>& bias,
     int64_t group_size,
     torch::Tensor out);
+std::vector<int64_t> convrot_int8_supported_sm_versions();
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,

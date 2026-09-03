@@ -10,13 +10,21 @@ from sgl_kernel import (
     convrot_int8_fused_linear_out,
     convrot_int8_linear_prequant,
     convrot_int8_linear_prequant_out,
+    convrot_int8_supported_sm_versions,
     convrot_rotate_quantize_activation,
 )
 
+
+def _device_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor in convrot_int8_supported_sm_versions()
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((9, 0), (10, 0)),
-    reason="convrot_int8 kernels are built for CC 9.0 and CC 10.0 only",
+    not _device_supported(),
+    reason="convrot_int8 kernels carry no code for this GPU (see convrot_int8_supported_sm_versions)",
 )
 
 GROUP_SIZE = 256
@@ -24,7 +32,7 @@ GROUP_SIZE = 256
 # Qwen-Image DiT linears at 1024x1024: text-stream rows (3, 20), image-stream
 # rows (2048, 4096); (K, N) = attention projections, FFN up, FFN down. Together
 # they hit every tile branch: SM90 small-M narrow/wide-N and large-M, SM100
-# default and wide-N.
+# default and wide-N, and the small/large-M rows of the CC 12.x mma.sync table.
 PRODUCTION_M = [3, 20, 2048, 4096]
 PRODUCTION_KN = [(3072, 3072), (3072, 12288), (12288, 3072)]
 
@@ -207,6 +215,16 @@ def test_rejects_invalid_arguments():
         convrot_int8_linear_prequant(
             x_q, x_scale[:-1], weight_q, weight_scale, bias=bias, group_size=GROUP_SIZE
         )
+
+
+def test_supported_sm_versions_is_the_published_table():
+    """The kernel is the single source of truth for the supported parts; the
+    quantization method and the harness read this list. Extending it is a
+    deliberate change, so pin it here."""
+    versions = convrot_int8_supported_sm_versions()
+    assert versions == [90, 100, 120, 121]
+    major, minor = torch.cuda.get_device_capability()
+    assert major * 10 + minor in versions
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_customkernel_config import (
     ConvRotInt8CustomKernelConfig,
+    convrot_int8_supported_capabilities,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_customkernel import (
     ConvRotInt8CustomKernelLinearMethod,
@@ -36,18 +37,19 @@ _PREQUANT_OPS = ("convrot_int8_linear_prequant", "convrot_int8_linear_prequant_o
 def _kernel_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0)):
-        return False
     try:
         import sgl_kernel  # noqa: F401
     except ImportError:
         return False
-    return all(hasattr(torch.ops.sgl_kernel, op) for op in _PREQUANT_OPS)
+    ops = _PREQUANT_OPS + ("convrot_int8_supported_sm_versions",)
+    if not all(hasattr(torch.ops.sgl_kernel, op) for op in ops):
+        return False
+    return torch.cuda.get_device_capability() in convrot_int8_supported_capabilities()
 
 
 requires_kernel = pytest.mark.skipif(
     not _kernel_available(),
-    reason="needs a CC 9.0 / 10.0 GPU and an sgl_kernel build with the convrot ops",
+    reason="needs a GPU in sgl-kernel's convrot table and a build with the convrot ops",
 )
 
 
