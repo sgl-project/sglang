@@ -2899,6 +2899,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (self.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     @property
+    def draft_virtual_id_space(self) -> int:
+        return self.size_full
+
+    @property
     def size_mamba(self) -> int:
         return self.mamba_allocator.max_slots - 1
 
@@ -3400,6 +3404,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
     # (set to the static caps). We do NOT report `max_slots - 1`: under unified
     # memory pool that ~= full_max + swa_max and would over-promise.
+
+    @property
+    def draft_virtual_id_space(self) -> int:
+        return self.full_attn_allocator.max_slots - 1
 
     def debug_print(self) -> str:
         return (

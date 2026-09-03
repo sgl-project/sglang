@@ -615,7 +615,7 @@ def swizzle_blockscale(scale: torch.Tensor):
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
