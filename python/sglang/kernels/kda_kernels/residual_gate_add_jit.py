@@ -34,11 +34,11 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "residual_gate_add",
-                "residual_gate_add::" f"ResidualGateAddKernel<{args}>::run",
+                f"residual_gate_add::ResidualGateAddKernel<{args}>::run",
             ),
             (
                 "residual_gate_add_transposed",
-                "residual_gate_add::" f"ResidualGateAddKernel<{args}>::run_transposed",
+                f"residual_gate_add::ResidualGateAddKernel<{args}>::run_transposed",
             ),
         ],
     )

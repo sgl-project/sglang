@@ -162,9 +162,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
-            assert (
-                need_size % self.page_size == 0
-            ), "The allocation size should be page-aligned"
+            assert need_size % self.page_size == 0, (
+                "The allocation size should be page-aligned"
+            )
 
         num_pages = need_size // self.page_size
         if num_pages > len(self.free_pages):

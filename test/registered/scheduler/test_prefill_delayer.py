@@ -126,9 +126,9 @@ def _run_negotiate_test(rank, test_cases):
             )
             # On a release after a real wait, seconds must be observed too.
             if case.expected_wait_forward_passes > 0:
-                assert (
-                    result.wait_seconds > 0.0
-                ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+                assert result.wait_seconds > 0.0, (
+                    f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+                )
 
         override.restore()
 
