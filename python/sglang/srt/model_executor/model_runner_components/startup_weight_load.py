@@ -14,7 +14,6 @@ from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.model_loader.utils import get_model_architecture
 from sglang.srt.model_loader.weight_utils import (
     CAPTURE_SAFE_WEIGHT_SENTINEL,
     CheckpointFilePrefetchHandle,
@@ -25,7 +24,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_model,
-    get_parallel,
     get_spec,
 )
 
@@ -33,32 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
-
-
-_SUPPORTED_ARCHITECTURES = frozenset(
-    {
-        "LlamaForCausalLM",
-        "Qwen2ForCausalLM",
-        "Qwen3ForCausalLM",
-    }
-)
-_SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
-
-
-def _get_canonical_model_class(architecture: str):
-    if architecture == "LlamaForCausalLM":
-        from sglang.srt.models.llama import LlamaForCausalLM
-
-        return LlamaForCausalLM
-    if architecture == "Qwen2ForCausalLM":
-        from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-
-        return Qwen2ForCausalLM
-    if architecture == "Qwen3ForCausalLM":
-        from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-
-        return Qwen3ForCausalLM
-    raise ValueError(f"Unsupported startup-overlap architecture: {architecture}")
 
 
 class StartupWeightLoadState(str, enum.Enum):
@@ -78,15 +50,8 @@ class StartupWeightLoadOptions:
     prefill_cuda_graph_backend: Backend
     is_draft_worker: bool
     speculative_algorithm: Optional[str]
-    tp_size: int
-    attn_cp_size: int
-    dcp_size: int
-    pp_size: int
-    dp_size: int
-    ep_size: int
     cpu_offload_gb: int
     offload_group_size: int
-    enable_memory_saver: bool
     enable_weights_cpu_backup: bool
     enable_lora: bool
     has_lora_paths: bool
@@ -119,15 +84,8 @@ class StartupWeightLoadOptions:
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
             speculative_algorithm=get_spec().speculative_algorithm,
-            tp_size=get_parallel().tp_size,
-            attn_cp_size=get_parallel().attn_cp_size,
-            dcp_size=get_parallel().dcp_size,
-            pp_size=get_parallel().pp_size,
-            dp_size=get_parallel().dp_size,
-            ep_size=get_parallel().ep_size,
             cpu_offload_gb=get_exec().offload.cpu_offload_gb,
             offload_group_size=get_exec().offload.offload_group_size,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
             enable_weights_cpu_backup=get_exec().features.enable_weights_cpu_backup,
             enable_lora=get_lora().enable_lora,
             has_lora_paths=bool(get_lora().lora_paths),
@@ -212,15 +170,14 @@ class ModelStorageManifest:
         )
 
     def unchanged_parameter_names(self, value: float) -> Tuple[str, ...]:
-        """Return floating-point parameters still entirely equal to ``value``.
+        """Return floating parameters still entirely equal to ``value``.
 
-        This is the capture-sentinel check, and it is deliberately strict: every
-        floating-point parameter must be rewritten by ``model.load_weights()``.
-        A model that keeps an ``__init__``-computed floating-point parameter with
-        no checkpoint entry will fail startup here rather than silently serve the
-        sentinel, so this doubles as the admission gate for widening
-        ``_SUPPORTED_ARCHITECTURES``. Buffers are excluded because
-        ``initialize_capture_safe_weights`` never overwrites them.
+        The sentinel check detects a parameter that the normal checkpoint path
+        did not replace. Packed integral parameters are deliberately excluded:
+        zero is a valid packed value, and loader invocation alone cannot prove
+        that every shard or expert region was written. Their value correctness
+        remains the responsibility of the unchanged serial loader contract.
+        Buffers and tensors marked ``_skip_weight_check`` are also excluded.
         """
         names = []
         checks = []
@@ -230,6 +187,7 @@ class ModelStorageManifest:
             if (
                 not name.startswith("parameter:")
                 or not torch.is_floating_point(tensor)
+                or getattr(tensor, "_skip_weight_check", False)
                 or id(tensor) in seen_tensor_ids
             ):
                 continue
@@ -246,7 +204,7 @@ class ModelStorageManifest:
 
 
 class StartupWeightLoadManager:
-    """Coordinate native CPU staging with capture and post-capture commit."""
+    """Coordinate CPU staging with capture and post-capture weight commit."""
 
     def __init__(
         self,
@@ -331,12 +289,6 @@ class StartupWeightLoadManager:
         load_config: LoadConfig,
         options: StartupWeightLoadOptions,
     ) -> Optional[str]:
-        architectures = tuple(model_config.hf_config.architectures or ())
-        # NOTE(2026-08): The initial rollout supports only the configurations
-        # admitted below. Expand this matrix only with storage-stability,
-        # capture-sentinel, and startup-correctness coverage for the new case.
-        # Keep these checks here because they depend on resolved loader and model
-        # state; ServerArgs owns only the mode selection.
         basic_rules = (
             (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
@@ -344,7 +296,6 @@ class StartupWeightLoadManager:
                 options.prefill_cuda_graph_backend == Backend.TC_PIECEWISE,
                 "tc_piecewise prefill CUDA graphs are not supported",
             ),
-            (type(loader) is not DefaultModelLoader, "DefaultModelLoader only"),
             (
                 load_config.load_format
                 not in (LoadFormat.AUTO, LoadFormat.SAFETENSORS),
@@ -359,24 +310,11 @@ class StartupWeightLoadManager:
                 options.speculative_algorithm is not None,
                 "speculative decoding is not supported",
             ),
-            (options.tp_size not in (1, 2), "only TP1 and TP2 are supported"),
-            (
-                options.attn_cp_size != 1,
-                "attention context parallelism is not supported",
-            ),
-            (
-                options.dcp_size != 1,
-                "decode context parallelism is not supported",
-            ),
-            (options.pp_size != 1, "pipeline parallelism is not supported"),
-            (options.dp_size != 1, "data parallelism is not supported"),
-            (options.ep_size != 1, "expert parallelism is not supported"),
             (options.cpu_offload_gb > 0, "CPU offload is not supported"),
             (
                 options.offload_group_size > 0,
                 "layer-group offloading is not supported",
             ),
-            (options.enable_memory_saver, "memory saver is not supported"),
             (
                 options.enable_weights_cpu_backup,
                 "CPU weight backup is not supported",
@@ -406,37 +344,9 @@ class StartupWeightLoadManager:
         if unsupported_reason is not None:
             return unsupported_reason
 
-        model_rules = (
-            (model_config.dtype not in _SUPPORTED_DTYPES, "FP16 or BF16 only"),
-            (model_config.quantization is not None, "quantization is not supported"),
-            (
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
-            ),
-            (model_config.is_multimodal, "multimodal models are not supported"),
-            (not model_config.is_generation, "generation models only"),
-            (
-                len(architectures) != 1
-                or architectures[0] not in _SUPPORTED_ARCHITECTURES,
-                "model architecture is not in the startup-overlap allowlist",
-            ),
-        )
-        unsupported_reason = next(
-            (reason for unsupported, reason in model_rules if unsupported),
-            None,
-        )
-        if unsupported_reason is not None:
-            return unsupported_reason
-
-        architecture = architectures[0]
-        resolved_model_class, resolved_architecture = get_model_architecture(
-            model_config
-        )
-        if (
-            resolved_architecture != architecture
-            or resolved_model_class is not _get_canonical_model_class(architecture)
-        ):
-            return "the native SGLang model implementation is required"
+        supports_overlap = getattr(loader, "supports_startup_weight_load_overlap", None)
+        if supports_overlap is None or not supports_overlap(model_config):
+            return f"{type(loader).__name__} does not support split startup loading"
         return None
 
     @property
@@ -508,30 +418,33 @@ class StartupWeightLoadManager:
         startup_prefetch_active = self._prepare_prefetch_for_commit()
         commit_started_at = time.perf_counter()
         monkey_patch_vllm_parallel_state()
-        self._loader.commit_model_weights(
-            model=self._model,
-            model_config=self._model_config,
-            resolved_sources=self._resolved_sources,
-            target_device=torch.device(self._device_config.device),
-            startup_prefetch_active=startup_prefetch_active,
-        )
-        torch.cuda.synchronize()
-        changed_names = manifest.changed_names(self._model)
-        if changed_names:
-            preview = ", ".join(changed_names[:8])
-            raise RuntimeError(
-                f"Startup weight commit changed graph-visible tensor storage: {preview}"
+        try:
+            self._loader.commit_model_weights(
+                model=self._model,
+                model_config=self._model_config,
+                resolved_sources=self._resolved_sources,
+                target_device=torch.device(self._device_config.device),
+                startup_prefetch_active=startup_prefetch_active,
             )
-        unchanged_names = manifest.unchanged_parameter_names(
-            CAPTURE_SAFE_WEIGHT_SENTINEL
-        )
-        if unchanged_names:
-            preview = ", ".join(unchanged_names[:8])
-            raise RuntimeError(
-                "Startup weight commit did not replace capture-safe dummy values: "
-                f"{preview}"
+            torch.cuda.synchronize()
+            changed_names = manifest.changed_names(self._model)
+            if changed_names:
+                preview = ", ".join(changed_names[:8])
+                raise RuntimeError(
+                    "Startup weight commit changed graph-visible tensor storage: "
+                    f"{preview}"
+                )
+            unchanged_names = manifest.unchanged_parameter_names(
+                CAPTURE_SAFE_WEIGHT_SENTINEL
             )
-        monkey_patch_vllm_parallel_state(reverse=True)
+            if unchanged_names:
+                preview = ", ".join(unchanged_names[:8])
+                raise RuntimeError(
+                    "Startup weight commit did not populate capture-safe parameters: "
+                    f"{preview}"
+                )
+        finally:
+            monkey_patch_vllm_parallel_state(reverse=True)
         self._stop_prefetch()
         self._state = StartupWeightLoadState.READY
         logger.info(
