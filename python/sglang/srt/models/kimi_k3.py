@@ -253,10 +253,11 @@ def _is_unquantized_mergeable(weights: list[torch.Tensor]) -> bool:
 
 
 def _merge_weights_as_views(
-    mods: list, pad_rows_to: int = 1
+    mods: list, pad_rows_to: int = 1, merged: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, list[int]]:
     """Cat module weights along dim 0; re-point each module's weight to a view
     of the merged buffer so the original storage is freed (net extra memory ~0).
+    Reuse an existing merged buffer during reload to preserve graph addresses.
 
     With pad_rows_to > 1 the merged buffer gets zero rows appended up to the
     next multiple, so every row of the fused GEMM output stays 16-byte aligned
@@ -266,7 +267,18 @@ def _merge_weights_as_views(
     pad = (-sum(sizes)) % pad_rows_to
     if pad:
         ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
-    merged = torch.cat(ws, dim=0).contiguous()
+    if merged is None:
+        merged = torch.cat(ws, dim=0).contiguous()
+    else:
+        # Keep the buffer address stable for graph replay after weight reloads
+        assert merged.shape == (sum(w.shape[0] for w in ws), ws[0].shape[1])
+        assert merged.dtype == ws[0].dtype and merged.device == ws[0].device
+        off = 0
+        for w in ws:
+            destination = merged[off : off + w.shape[0]]
+            if destination.data_ptr() != w.data_ptr():
+                destination.copy_(w)
+            off += w.shape[0]
     off = 0
     for m, n in zip(mods, sizes):
         m.weight.data = merged[off : off + n]
@@ -740,7 +752,9 @@ class KimiK3MoE(nn.Module):
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
             return
-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
+        self._front_w, self._front_sizes = _merge_weights_as_views(
+            mods, merged=self._front_w
+        )
         self._front_is_ep_pair = len(mods) == 2
         # Invalidate the cached properties.
         for prop in (
@@ -1327,11 +1341,17 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
+        shared_act = shared.act_fn(gate_up)
         _k3_bf16_gemm(
-            shared.act_fn(gate_up),
+            shared_act,
             shared.down_proj.weight,
             out=shared_output,
         )
+        down_proj = shared.down_proj
+        if getattr(down_proj, "lora_active", False):
+            # the base GEMM bypassed the wrapper; LoRA B must land in the same buffer the tail add reads
+            lora_output = down_proj.apply_lora(shared_output, shared_act)
+            assert lora_output.data_ptr() == shared_output.data_ptr()
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -1367,6 +1387,10 @@ class KimiK3MoE(nn.Module):
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
+        gate_up_proj = self.shared_experts.gate_up_proj
+        if getattr(gate_up_proj, "lora_active", False):
+            # the merged front GEMM read the base shared weight through the wrapper; add its delta
+            gate_up = gate_up_proj.apply_lora(gate_up.contiguous(), hidden_states)
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1822,7 +1846,7 @@ class KimiK3DeltaAttention(nn.Module):
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
-            self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_f_b_w = self.f_b_proj.weight.data
             return
         mods = [self.f_a_proj, self.b_proj]
         if self._bfa_uses_block_fp8:
@@ -1831,8 +1855,14 @@ class KimiK3DeltaAttention(nn.Module):
             pad = (-sum(sizes)) % 8
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = torch.cat(weights, dim=0).contiguous()
-            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            bfa_w = torch.cat(weights, dim=0).contiguous()
+            f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            if self._bfa_w is None:
+                self._bfa_w, self._bfa_f_b_w = bfa_w, f_b_w
+            else:
+                # Keep the buffer addresses stable for graph replay after weight reloads
+                self._bfa_w.copy_(bfa_w)
+                self._bfa_f_b_w.copy_(f_b_w)
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
@@ -1841,8 +1871,11 @@ class KimiK3DeltaAttention(nn.Module):
             # their scales.
             if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
                 return
-            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_w, sizes = _merge_weights_as_views(
+                mods, pad_rows_to=8, merged=self._bfa_w
+            )
+            # .data: a second Parameter registration hides f_b_proj.weight from named_parameters()
+            self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
@@ -1859,8 +1892,11 @@ class KimiK3DeltaAttention(nn.Module):
         # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
         # same pad (both widths are 4 short of a multiple of 8), so the tail
         # view is byte-identical to the wide-only merge.
+        previous = getattr(self, "_qkvgbfa_layer", None)
         merged, sizes = _merge_weights_as_views(
-            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=8
+            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj],
+            pad_rows_to=8,
+            merged=previous.weight if previous is not None else None,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
         self._bfa_w = merged[sizes[0] :]
@@ -2278,9 +2314,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
-            _orig_o_proj_forward = self.o_proj.forward
+            o_proj = self.o_proj
+            _orig_o_proj_forward = o_proj.forward
 
-            def _gated_o_proj_forward(x, *args, **kwargs):
+            def _apply_output_gate(x):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 if gate_input is not None and not isinstance(x, tuple):
@@ -2297,9 +2334,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
-                return _orig_o_proj_forward(x, *args, **kwargs)
+                return x
 
-            self.o_proj.forward = _gated_o_proj_forward
+            def _gated_o_proj_forward(x, *args, **kwargs):
+                return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
+
+            # RowParallelLinearWithLoRA bypasses forward and applies this transform itself
+            o_proj.lora_input_transform = _apply_output_gate
+            o_proj.forward = _gated_o_proj_forward
         if sp_moe:
             _route_sp_o_proj_output(self.o_proj)
 
@@ -3410,13 +3452,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
-            o_proj_weight = getattr(layer.self_attn.o_proj, "weight", None)
+            # under LoRA o_proj is a BaseLayerWithLoRA; params_dtype lives on the base layer
+            o_proj = layer.self_attn.o_proj
+            o_proj = getattr(o_proj, "base_layer", o_proj)
+            o_proj_weight = getattr(o_proj, "weight", None)
             if o_proj_weight is None:
-                o_proj_weight = layer.self_attn.o_proj.qweight
+                o_proj_weight = o_proj.qweight
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=getattr(layer.self_attn.o_proj, "params_dtype", None)
-                or o_proj_weight.dtype,
+                dtype=getattr(o_proj, "params_dtype", None) or o_proj_weight.dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")

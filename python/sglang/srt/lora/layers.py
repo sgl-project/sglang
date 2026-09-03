@@ -819,6 +819,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             splitted_input = split_tensor_along_last_dim(input_, num_partitions=tp_size)
             input_parallel = splitted_input[tp_rank].contiguous()
 
+        # K3 gates o_proj's input in a forward patch this path bypasses; apply it here
+        if hasattr(self.base_layer, "lora_input_transform"):
+            input_parallel = self.base_layer.lora_input_transform(input_parallel)
+
         lora_active = self.lora_active
         if lora_active:
             self.start_lora_a_overlap(input_parallel)
@@ -1023,9 +1027,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.intermediate_size_per_partition = (
             base_layer.intermediate_size_per_partition
         )
-        # Stock MoE LoRA buffers are split gate/up except for GPT-OSS-style weights.
+        # K3 sets gemm1_alpha (SiTU beta) but loads w1/w3 contiguously (gate_up_interleaved=False)
         self._uses_interleaved_gate_up = (
             base_layer.moe_runner_config.gemm1_alpha is not None
+            and base_layer.moe_runner_config.gate_up_interleaved
         )
 
         # Initialize triton_lora moe runner for batches with lora enabled
@@ -1079,17 +1084,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         if runner_backend.is_marlin():
-            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsFusedMoEMethod,
-            )
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                ModelOptNvFp4FusedMoEMethod,
-            )
-
-            assert isinstance(
-                base_layer.quant_method,
-                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
-            ), (
+            assert hasattr(base_layer.quant_method, "get_marlin_quant_info"), (
                 f"Marlin MoE backend requires a quant method exposing "
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )

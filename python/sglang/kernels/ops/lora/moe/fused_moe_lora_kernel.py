@@ -403,8 +403,11 @@ def _fused_moe_lora_expand(
         IS_PRIMARY=False,
         **expand_config,
     )
+    # the base output may be padded (Marlin), so its slices sit at output width / num_slices
+    slice_stride = output.shape[-1] // num_slices
     for i in range(num_slices):
-        output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
+        start = i * slice_stride + offset
+        output[:, :, start : start + N] += b_intermediate_cache1[i]
 
 
 @torch.inference_mode()
