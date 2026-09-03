@@ -24,7 +24,13 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    # deepep
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "35",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -95,11 +101,11 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ARGS = [
     "--disaggregation-bootstrap-port",
     8998,
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
     6,
     "--max-prefill-tokens",
-    70000,
+    80000,
     "--chunked-prefill-size",
     -1,
     "--max-running-requests",
