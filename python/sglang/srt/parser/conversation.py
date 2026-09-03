@@ -35,7 +35,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
+from sglang.srt.utils import (
+    GLM_MEDIA_CONFIG_KEYS,
+    ImageData,
+    VideoData,
+    read_system_prompt_from_file,
+)
 
 
 class SeparatorStyle(IntEnum):
@@ -681,7 +686,16 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        preprocess_kwargs = {
+                            key: value
+                            for key in GLM_MEDIA_CONFIG_KEYS
+                            if (value := getattr(content.video_url, key, None))
+                            is not None
+                        }
+                        conv.append_video(
+                            content.video_url.url,
+                            preprocess_kwargs=preprocess_kwargs or None,
+                        )
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)

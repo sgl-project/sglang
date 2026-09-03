@@ -454,8 +454,6 @@ class RotaryEmbedding(BaseFusedOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        self._match_cos_sin_cache_dtype(query)
-
         # Fused_qk_rope only supports aligned head_size
         if self.head_size in [128, 256, 512]:
             num_tokens = positions.size(0)
@@ -474,6 +472,7 @@ class RotaryEmbedding(BaseFusedOp):
             )
             return query, key
         else:
+            self._match_cos_sin_cache_dtype(query)
             # Use fallback kernel of 'rotary_embedding'.
             # The kernel requires 3D tensors (batch, num_heads, head_size);
             # add a num_heads=1 dim for 2D tensors (e.g. DSA indexer k_rope).
