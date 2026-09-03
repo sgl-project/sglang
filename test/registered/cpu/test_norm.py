@@ -382,8 +382,10 @@ class TestLayerNorm:
         atol = rtol = precision[input_dtype]
         torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
 
-        if input_dtype == torch.bfloat16 and weight_dtype == input_dtype and (
-            bias_dtype is None or bias_dtype == input_dtype
+        if (
+            input_dtype == torch.bfloat16
+            and weight_dtype == input_dtype
+            and (bias_dtype is None or bias_dtype == input_dtype)
         ):
             residual = torch.randn(shape, dtype=input_dtype)
             expected_residual = residual.clone()

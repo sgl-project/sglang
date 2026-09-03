@@ -1057,10 +1057,9 @@ class LayerNorm(BaseFusedOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         if _is_cpu_amx_available:
-            weight_data = self.weight.data
             bias_data = self.bias.data if self.use_bias else None
             return torch.ops.sgl_kernel.layernorm_cpu(
-                x, weight_data, bias_data, self.variance_epsilon
+                x, self.weight.data, bias_data, self.variance_epsilon
             )
         else:
             return self.forward_native(x)
