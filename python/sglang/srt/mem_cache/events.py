@@ -47,6 +47,19 @@ class KVCacheEventRecorder:
         self.page_size = page_size
         self._queue: list = []
 
+    @staticmethod
+    def _collect_session_ids(node: Any) -> Optional[list[str]]:
+        """Collect the union of session_ids from all component_data on a node."""
+        component_data = getattr(node, "component_data", None)
+        if not component_data:
+            return None
+        all_ids: set[str] = set()
+        for cd in component_data:
+            session_ids = getattr(cd, "session_ids", None)
+            if session_ids:
+                all_ids.update(session_ids)
+        return list(all_ids) if all_ids else None
+
     def enqueue(self, event) -> None:
         """Append an event, coalescing it with a compatible queue tail.
 
@@ -112,10 +125,13 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def record_store(self, node: Any, medium=None) -> None:
+    def record_store(self, node: Any, medium=None, session_id=None) -> None:
         # One BlockStored per ``page_size`` chunk.
         # ``medium`` defaults to StorageMedium.GPU but callers may override
         # for lower-tier insertions (e.g. StorageMedium.CPU for host/L2 cache).
+        # ``session_id`` may be passed from the insert path (before
+        # register_session_ref writes it onto ComponentData); other callers
+        # fall back to _collect_session_ids(node).
         if not self.enabled:
             return
         if medium is None:
@@ -123,6 +139,10 @@ class KVCacheEventRecorder:
 
         event_hash_values = self._node_event_hash_values(node)
         parent_block_hash = self._parent_block_hash(node)
+
+        session_ids = (
+            [session_id] if session_id is not None else self._collect_session_ids(node)
+        )
 
         page_index = 0
         logical_len = len(node.key)
@@ -147,6 +167,7 @@ class KVCacheEventRecorder:
                 "block_size": len(page_tokens),
                 "lora_id": None,
                 "medium": medium,
+                "session_ids": session_ids,
             }
             if node.key.cache_salt is None:
                 event = BlockStored(**event_args)
@@ -172,6 +193,8 @@ class KVCacheEventRecorder:
         # Hash values must match what was stored.
         event_hash_values = self._node_event_hash_values(node)
 
+        session_ids = self._collect_session_ids(node)
+
         block_hashes = []
         logical_len = len(node.key)
         page_index = 0
@@ -184,7 +207,13 @@ class KVCacheEventRecorder:
             page_index += 1
 
         if block_hashes:
-            self.enqueue(BlockRemoved(block_hashes=block_hashes, medium=medium))
+            self.enqueue(
+                BlockRemoved(
+                    block_hashes=block_hashes,
+                    medium=medium,
+                    session_ids=session_ids,
+                )
+            )
 
     def record_all_cleared(self) -> None:
         if not self.enabled:
