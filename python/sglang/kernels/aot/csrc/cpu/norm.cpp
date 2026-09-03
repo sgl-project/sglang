@@ -178,8 +178,7 @@ inline void store_32_from_float(scalar_t* __restrict__ output, __m512 value0, __
   } else {
     static_assert(std::is_same_v<scalar_t, at::Half>);
     _mm256_storeu_si256(
-        reinterpret_cast<__m256i*>(output),
-        _mm512_cvtps_ph(value0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        reinterpret_cast<__m256i*>(output), _mm512_cvtps_ph(value0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
     _mm256_storeu_si256(
         reinterpret_cast<__m256i*>(output + 16),
         _mm512_cvtps_ph(value1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
@@ -189,9 +188,9 @@ inline void store_32_from_float(scalar_t* __restrict__ output, __m512 value0, __
 template <NormMode M, typename input_t, typename weight_t, typename bias_t, int D>
 struct NormReduce {
   static inline void apply(
-  input_t* __restrict__ out,
-  const input_t* __restrict__ input,
-  const input_t* __restrict__ gate,
+      input_t* __restrict__ out,
+      const input_t* __restrict__ input,
+      const input_t* __restrict__ gate,
       const NormParams& params) {
     static_assert(D % 32 == 0);
     constexpr int COLS = D / 32;
@@ -676,8 +675,7 @@ inline void CHECK_INPUT_ND(const at::Tensor& tensor) {
 inline void CHECK_NORM_PARAMETER(const at::Tensor& tensor, int64_t hidden_size) {
   TORCH_CHECK(tensor.sizes() == at::IntArrayRef{hidden_size}, "Expected parameter shape [", hidden_size, "]");
   TORCH_CHECK(
-      tensor.scalar_type() == at::kHalf || tensor.scalar_type() == at::kBFloat16 ||
-          tensor.scalar_type() == at::kFloat,
+      tensor.scalar_type() == at::kHalf || tensor.scalar_type() == at::kBFloat16 || tensor.scalar_type() == at::kFloat,
       "Expected parameter dtype to be float16, bfloat16, or float32, got ",
       tensor.scalar_type());
   CHECK_INPUT(tensor);
