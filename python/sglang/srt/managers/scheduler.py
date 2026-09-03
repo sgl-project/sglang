@@ -4995,6 +4995,13 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            if req.session is not None:
+                # A popped queued request never reaches check_finished, so
+                # mark it finished here; otherwise the session's idle reaper
+                # and deferred close wait on it forever.
+                req.finished_reason = FINISH_ABORT("Aborted from the waiting queue.")
+                if req.session.streaming:
+                    req.session.abort_req()
             self.beam_coordinator.retire_group(req)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
