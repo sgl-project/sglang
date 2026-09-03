@@ -52,7 +52,6 @@ CONVS = [
 
 
 class TestRewardModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -87,9 +86,9 @@ class TestRewardModels(CustomTestCase):
         print(f"{hf_scores=}")
         print(f"{srt_scores=}")
 
-        assert torch.all(
-            abs(hf_scores - srt_scores) < tolerance
-        ), "reward scores are not all close"
+        assert torch.all(abs(hf_scores - srt_scores) < tolerance), (
+            "reward scores are not all close"
+        )
 
     def test_reward_scores(self):
         for model, tp_size, tolerance in MODELS:

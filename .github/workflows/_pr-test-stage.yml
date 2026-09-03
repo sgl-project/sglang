@@ -100,14 +100,12 @@ jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
-    # Temporarily skip the broken GB300 runner before GitHub tries to allocate it.
     # `runner_filter` is matched here rather than in each caller's job `if`: a
     # caller that declares its runners as a matrix cannot, since job-level `if`
     # sees github/needs/vars/inputs but not `matrix`. Callers that never declare
     # the input read back null and match every runner_config.
     if: |
       always() &&
-      inputs.runner_config != '4-gpu-gb300' &&
       (fromJson(inputs.caller_inputs).runner_filter == null ||
        fromJson(inputs.caller_inputs).runner_filter == '' ||
        fromJson(inputs.caller_inputs).runner_filter == 'all' ||

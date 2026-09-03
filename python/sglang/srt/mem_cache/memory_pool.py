@@ -294,9 +294,9 @@ class ReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(
-            reqs[i].kv.kv_allocated_len > 0 for i in reusing
-        ), "a reused row must carry allocated KV"
+        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
+            "a reused row must carry allocated KV"
+        )
 
         select_index = self.alloc_rows(len(reqs) - len(reusing))
         if select_index is None:
@@ -555,9 +555,9 @@ class MambaPool:
                 # mamba layers/slots share one contiguous byte buffer; conv and
                 # temporal are strided views into it (see mem_cache/layout/
                 # page_major.py). Only the standard CUDA Triton path is supported.
-                assert not _is_npu and not (
-                    _is_cpu and _cpu_has_amx_support
-                ), "envelope_layout mamba is only supported on the CUDA path"
+                assert not _is_npu and not (_is_cpu and _cpu_has_amx_support), (
+                    "envelope_layout mamba is only supported on the CUDA path"
+                )
                 max_slots = size + 1
                 entry_bytes = mamba_entry_bytes(
                     layer_num=num_mamba_layers,
@@ -1360,9 +1360,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 pass
             else:
                 mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                assert mid is not None, (
+                    f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty
@@ -1384,13 +1384,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mamba_ping_pong_track_buffers.append(
                     req.kv.mamba_ping_pong_track_buffer
                 )
-        assert len(select_index) == len(
-            mamba_indices
-        ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        assert len(select_index) == len(mamba_indices), (
+            "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        )
         if self.enable_mamba_extra_buffer:
-            assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
-            ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            assert len(select_index) == len(mamba_ping_pong_track_buffers), (
+                "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
+            )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -1534,7 +1534,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
                     1,
-                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                ], (
+                    f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                )
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -1854,7 +1856,9 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
 
         # Layout: NHD (default) | HND (SGLANG_USE_HND_KVCACHE) | vectorized_5d (ROCm AITER).
@@ -2886,9 +2890,9 @@ class MHATokenToKVPool(KVCache):
         if N == 0:
             return
 
-        assert (
-            self._kv_copy_config is not None
-        ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        assert self._kv_copy_config is not None, (
+            "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
+        )
 
         cfg = self._kv_copy_config
         cap = int(cfg.get("num_locs_upper", 256))
@@ -3675,9 +3679,9 @@ class HybridLinearKVPool(KVCache):
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
-                assert not is_float4_e2m1fn_x2(
-                    dtype
-                ), "FP4 is not supported on NPU yet."
+                assert not is_float4_e2m1fn_x2(dtype), (
+                    "FP4 is not supported on NPU yet."
+                )
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
@@ -4476,13 +4480,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
-                assert (
-                    self.page_size % 16 == 0
-                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                assert self.page_size % 16 == 0, (
+                    f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+                )
             else:
-                assert (
-                    self.page_size == 1
-                ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                assert self.page_size == 1, (
+                    f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
+                )
         else:
             assert self.page_size == 64
         self.index_key_cache = self._create_index_key_cache()

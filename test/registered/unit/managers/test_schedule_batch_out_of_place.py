@@ -145,6 +145,8 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
             return_logprob=False,
             forward_mode=ForwardMode.DECODE,
             out_cache_loc=torch.arange(6, 7, dtype=torch.int64),
+            # prepare_for_decode ran: the row already counts this step's token.
+            seq_lens_cpu=torch.tensor([6], dtype=torch.int64),
         )
 
         extend_prefix_before = extend_batch.prefix_lens
@@ -160,7 +162,7 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertTrue(
             torch.equal(extend_batch.out_cache_loc, torch.arange(7, dtype=torch.int64))
         )
-        # delta is -1 without overlap: 4 origin + 2 output - 1
+        # The decode tail's prefix is its row length minus this step's token.
         self.assertEqual(extend_batch.prefix_lens, [0, 0, 5])
         self.assertEqual(extend_batch.extend_lens, [3, 3, 1])
         self.assertEqual(extend_batch.extend_num_tokens, 7)
