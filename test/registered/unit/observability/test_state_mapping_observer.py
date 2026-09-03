@@ -58,6 +58,7 @@ class _Algorithm(Enum):
 
 
 class _DisaggregationMode(Enum):
+    PREFILL = "prefill"
     DECODE = "decode"
 
 
@@ -166,7 +167,12 @@ class FakeSpecWorker:
         return tuple(self._runners)
 
 
-def _make_scheduler():
+class NixlKVManager:
+    def __init__(self, kv_args):
+        self.kv_args = kv_args
+
+
+def _make_scheduler(mode=_DisaggregationMode.DECODE):
     req_pool = FakeReqPool()
     target_pool = FakeHybridPool()
     target_runner = FakeRunner(0, 24, req_pool, target_pool)
@@ -187,19 +193,22 @@ def _make_scheduler():
         state_conv_shard_groups=[[None, [32, 32, 64]], [], []],
         state_layer_ids=[[1, 2], [], []],
     )
-    return SimpleNamespace(
+    scheduler = SimpleNamespace(
         ps=FakeParallelState(),
         world_group=SimpleNamespace(rank=11, local_rank=3),
         req_to_token_pool=req_pool,
         token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: target_pool),
         tp_worker=SimpleNamespace(model_runner=target_runner),
         model_worker=FakeSpecWorker([draft_runner]),
-        disaggregation_mode=_DisaggregationMode.DECODE,
+        disaggregation_mode=mode,
         transfer_backend=_TransferBackend.NIXL,
-        disagg_decode_prealloc_queue=SimpleNamespace(
-            kv_manager=SimpleNamespace(kv_args=kv_args)
-        ),
     )
+    queue = SimpleNamespace(kv_manager=NixlKVManager(kv_args))
+    if mode is _DisaggregationMode.PREFILL:
+        scheduler.disagg_prefill_bootstrap_queue = queue
+    else:
+        scheduler.disagg_decode_prealloc_queue = queue
+    return scheduler
 
 
 def _make_batch(rid="glm53-state-proof-001"):
@@ -270,6 +279,13 @@ class TestStateMappingObserver(unittest.TestCase):
             observer.observe(_make_batch("ordinary-request"), "pre_forward")
             self.assertEqual(os.listdir(tmpdir), [])
 
+    def test_transfer_manager_follows_disaggregation_mode(self):
+        for mode in (_DisaggregationMode.PREFILL, _DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                contract = module._transfer_contract(_make_scheduler(mode))
+                self.assertTrue(contract["present"])
+                self.assertEqual(contract["manager_class"], "NixlKVManager")
+
     def test_matching_rid_records_concrete_pre_and_post_state(self):
         with tempfile.TemporaryDirectory() as tmpdir, self._env(tmpdir):
             observer = StateMappingObserver.from_scheduler(_make_scheduler())
@@ -307,6 +323,7 @@ class TestStateMappingObserver(unittest.TestCase):
             self.assertEqual(row["draft"]["runners"][0]["layers"], [24, 25])
             self.assertTrue(row["draft"]["shares_target_req_pool"])
             self.assertEqual(row["transfer"]["backend"], "nixl")
+            self.assertEqual(row["transfer"]["manager_class"], "NixlKVManager")
             self.assertEqual(row["transfer"]["engine_rank"], 3)
             self.assertEqual(row["transfer"]["pp_rank"], 1)
             self.assertEqual(row["transfer"]["kv_entry_count"], 2)
