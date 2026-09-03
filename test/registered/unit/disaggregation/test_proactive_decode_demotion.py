@@ -142,7 +142,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
     def test_server_args_defaults_and_validation(self):
         args = ServerArgs(model_path="dummy")
         args.resolve_once()
-        self.assertFalse(args.enable_proactive_decode_promotion)
+        self.assertFalse(args.enable_proactive_decode_demotion)
         self.assertEqual(args.proactive_decode_demotion_cache_usage, 0.70)
         self.assertEqual(args.proactive_safe_cpu_demote_cache_usage, 0.2)
         self.assertEqual(args.candidate_demotion_output_len_threthold, 2.0)

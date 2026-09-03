@@ -443,11 +443,11 @@ def validate_proactive_decode_demotion(server_args: Any):
             "--proactive-demotion-recovery-duration must be non-negative."
         )
     if (
-        cfg.enable_proactive_decode_promotion
+        cfg.enable_proactive_decode_demotion
         and cfg.disaggregation_mode != "decode"
     ):
         raise ValueError(
-            "--enable-proactive-decode-promotion requires "
+            "--enable-proactive-decode-demotion requires "
             "--disaggregation-mode decode."
         )
 

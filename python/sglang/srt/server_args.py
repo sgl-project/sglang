@@ -3221,7 +3221,7 @@ class ServerArgs:
         ),
         NS("disagg"),
     ] = None
-    enable_proactive_decode_promotion: A[
+    enable_proactive_decode_demotion: A[
         bool,
         "Enable scheduler-local proactive decode demotion of short-input, long-output requests under cache pressure.",
         NS("disagg"),

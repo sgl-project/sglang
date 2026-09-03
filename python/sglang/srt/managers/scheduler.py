@@ -1488,7 +1488,7 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
-            if get_disagg().enable_proactive_decode_promotion:
+            if get_disagg().enable_proactive_decode_demotion:
                 self.decode_metric_collector = DecodeMetricCollector()
                 # Fixed demotion CPU offload budget in tokens
                 self.remain_cpu_demote_tokens = int(
