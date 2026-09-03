@@ -415,6 +415,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
+    # The write loc before `KVIndexTranslator.rebind_write_loc` replaced it
+    # with kernel-facing ids. Kept so a backend can re-derive straight into its
+    # capture-stable buffer at metadata-init time; None on a static pool.
+    out_cache_loc_virtual: Optional[torch.Tensor] = None
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64

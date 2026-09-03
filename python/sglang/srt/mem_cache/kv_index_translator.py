@@ -438,13 +438,51 @@ class KVIndexTranslator:
         REBIND, never mutate: the translate returns a FRESH tensor, so the
         ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
         in-flight machinery that reads it.
+
+        The pre-translate tensor is kept on the batch for
+        `fill_capture_write_loc`, which re-derives from it straight into a
+        backend's capture-stable buffer. Holding a reference costs nothing --
+        the ScheduleBatch owns that tensor either way.
         """
         self._index_table_memo = None
         if not self.is_translating or forward_batch.out_cache_loc is None:
             return
+        forward_batch.out_cache_loc_virtual = forward_batch.out_cache_loc
         forward_batch.out_cache_loc = self._translate_write_full(
             forward_batch.out_cache_loc
         )
+
+    def fill_capture_write_loc(
+        self,
+        *,
+        out: torch.Tensor,
+        forward_batch,
+        width: Optional[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """Translate this batch's WRITE loc straight into ``out``, a backend's
+        capture-stable buffer, and return the live ``[:n]`` view.
+
+        Replaces the copy-and-zero a backend would otherwise do over the
+        already-translated loc: one launch fills the live prefix and clears the
+        tail that a shorter replay leaves behind. Returns None when this pool
+        needs no translation, so the caller keeps its own path.
+
+        Must run at metadata-init time, not earlier: `out` is reused every
+        step, and prep sits adjacent to the launch that reads it. A fill at
+        ForwardBatch construction would race a still-pending previous step
+        under overlap scheduling.
+        """
+        if not self.is_translating:
+            return None
+        virtual = getattr(forward_batch, "out_cache_loc_virtual", None)
+        if virtual is None:
+            # No rebind ran for this batch (no write loc at all).
+            return None
+        n = int(virtual.numel())
+        width = n if width is None else int(width)
+        buf = out[:width]
+        self._translate_write_full(virtual, out=buf, out_width=width)
+        return buf[:n]
 
     def sliding_window_write_loc_for(
         self, out_cache_loc: Optional[torch.Tensor]

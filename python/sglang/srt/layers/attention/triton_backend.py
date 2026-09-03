@@ -753,15 +753,15 @@ class TritonAttnBackend(AttentionBackend):
         The capture batch is runner-built with zeros, which is safe because
         slot 0 is the reserved sink in every id space.
         """
-        if not self.kv_index_translator.is_translating:
-            return None
-        out_cache_loc = forward_batch.out_cache_loc
-        n = out_cache_loc.shape[0]
-        # Zero the padded tail first: a smaller replay batch leaves [n:] holding
-        # stale ids that the captured store would write; send them to slot 0 (sink).
-        self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(out_cache_loc)
-        return self.cuda_graph_out_cache_loc_full_physical[:n]
+        # One launch: the live prefix is translated straight in and the padded
+        # tail cleared. A smaller replay batch would otherwise leave [n:]
+        # holding stale ids that the captured store writes; zeroing sends those
+        # rows to slot 0 (the sink).
+        return self.kv_index_translator.fill_capture_write_loc(
+            out=self.cuda_graph_out_cache_loc_full_physical,
+            forward_batch=forward_batch,
+            width=self.cuda_graph_out_cache_loc_full_physical.numel(),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""

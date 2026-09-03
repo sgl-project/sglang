@@ -212,7 +212,8 @@ def write_loc_to_kernel_id_kernel(
     loc_ptr,  # in:  [N] int64 — WIDENED virtual token ids
     v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
     out_ptr,  # out: [N] int64 — kernel-facing ids
-    N,  # runtime: element count
+    N,  # runtime: live element count
+    W,  # runtime: lanes to write; [N, W) get 0
     stride,  # runtime: pool_page_size * kernel_page_multiplier
     PAGE_SIZE: tl.constexpr,
     DCP_SIZE: tl.constexpr,
@@ -229,13 +230,19 @@ def write_loc_to_kernel_id_kernel(
     page -1, gathers the v2p sentinel row (-1), and clamps. Triton truncates
     toward zero instead, so the sign is tested explicitly rather than relying
     on the division.
+
+    Writing ``W > N`` lanes fills ``[N, W)`` with 0, the padding sink. That is
+    what lets a caller hand in a capture-stable buffer wider than this batch
+    and get the stale tail cleared in the same launch, instead of a separate
+    copy and zero_.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < W
     mask = offs < N
     loc = tl.load(loc_ptr + offs, mask=mask, other=0).to(tl.int64)
 
-    keep = loc >= 0
+    keep = mask & (loc >= 0)
     if DCP_SIZE > 1:
         keep = keep & ((loc % DCP_SIZE) == DCP_RANK)
         loc = loc // DCP_SIZE
@@ -245,7 +252,7 @@ def write_loc_to_kernel_id_kernel(
     # `keep` already excludes negatives, so the gather index is in range.
     phys = tl.load(v2p_ptr + tl.where(keep, page, 0), mask=mask, other=0).to(tl.int64)
     ids = tl.maximum(phys * stride + offset, 0)
-    tl.store(out_ptr + offs, tl.where(keep, ids, 0), mask=mask)
+    tl.store(out_ptr + offs, tl.where(keep, ids, 0), mask=in_range)
 
 
 def write_loc_to_kernel_ids(
@@ -257,6 +264,7 @@ def write_loc_to_kernel_ids(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     out: Optional[torch.Tensor] = None,
+    out_width: Optional[int] = None,
 ) -> torch.Tensor:
     """One launch for the whole write-loc conversion; see the kernel.
 
@@ -264,19 +272,38 @@ def write_loc_to_kernel_ids(
     gather against a fixed ``data_ptr``), else a fresh int64 tensor is
     returned. Cuda-graph safe: no ``.item()``, no host sync, no allocation on
     the ``out=`` path.
+
+    ``out_width`` writes that many lanes rather than ``loc.numel()``, zeroing
+    the ones past the batch. Pass the captured tier's width to have a stale
+    tail cleared here instead of by a follow-up ``zero_``.
     """
     N = int(loc.numel())
     if out is None:
         out = torch.empty_like(loc, dtype=torch.int64)
+    width = N if out_width is None else int(out_width)
     assert out.dtype == torch.int64, (
         f"write_loc_to_kernel_ids: out dtype must be int64 (matches v2p), "
         f"got {out.dtype}"
     )
-    assert out.shape == loc.shape, (
-        f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
-        f"loc shape {tuple(loc.shape)}"
-    )
-    if N == 0:
+    if out_width is None:
+        # Element-for-element: `out` mirrors `loc`, whatever its shape -- a 2-D
+        # page table is a legitimate destination.
+        assert out.shape == loc.shape, (
+            f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
+            f"loc shape {tuple(loc.shape)}"
+        )
+    else:
+        # Wide destination: a capture-stable buffer whose tail this call
+        # clears, so it must be packed, 1-D, and at least `width` long.
+        assert out.dim() == 1 and out.is_contiguous() and out.numel() >= width, (
+            f"write_loc_to_kernel_ids: out_width needs a packed 1-D out of at "
+            f"least {width}, got {tuple(out.shape)}"
+        )
+        assert width >= N, (
+            f"write_loc_to_kernel_ids: out_width {width} is under the batch's "
+            f"{N} locs, which would drop live rows"
+        )
+    if width == 0:
         return out
     if not loc.is_cuda:
         # Pure-torch reference; the allocator's unit tests run on CPU.
@@ -288,14 +315,17 @@ def write_loc_to_kernel_ids(
         page = torch.where(keep, torch.div(big, page_size, rounding_mode="floor"), 0)
         offset = big % page_size if page_size > 1 else 0
         ids = (v2p[page] * stride + offset).clamp_(min=0)
-        out.copy_(torch.where(keep, ids, torch.zeros_like(ids)))
+        out[:N].copy_(torch.where(keep, ids, torch.zeros_like(ids)))
+        if width > N:
+            out[N:width].zero_()
         return out
-    grid = (triton.cdiv(N, WRITE_LOC_BLOCK),)
+    grid = (triton.cdiv(width, WRITE_LOC_BLOCK),)
     write_loc_to_kernel_id_kernel[grid](
         loc,
         v2p,
         out,
         N,
+        width,
         stride,
         PAGE_SIZE=page_size,
         DCP_SIZE=dcp_size,
