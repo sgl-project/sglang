@@ -174,14 +174,21 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free(free_index)
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
-        """Free ``kv_row[start_pos : start_pos + n]`` of one request;
-        ``start_pos`` is page-aligned. Default: plain free()."""
-        assert start_pos % self.page_size == 0, f"unaligned segment start {start_pos}"
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request.
+
+        ``start_pos`` must be a multiple of the page size. The end may fall
+        mid-page; that last page is released whole. Default: plain free()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
         self.free(free_index)
 
     def free_segments(self, segments):
-        """Free ascending, page-disjoint ``(free_index, start_pos)`` segments
-        of one request's kv row."""
+        """Free several ``(free_index, start_pos)`` segments of one request's
+        kv row.
+
+        Segments ascend, each starts on a page boundary, and no page is touched
+        by two of them, so every page is released exactly once."""
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
@@ -189,7 +196,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             if n == 0:
                 continue
             assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
-                f"segments at {prev_end} and {start_pos} share a page"
+                f"segment at {start_pos} shares a page with the one ending at {prev_end}"
             )
             prev_end = start_pos + n
             self.free_segment(free_index, start_pos=start_pos)

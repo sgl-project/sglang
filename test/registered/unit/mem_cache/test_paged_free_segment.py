@@ -218,7 +218,8 @@ class _RecordingBaseAllocator(BaseTokenToKVPoolAllocator):
 
 class TestBaseFallbackFreeSegments(unittest.TestCase):
     def test_fallback_forwards_page_disjoint_segments(self):
-        # fallback allocators dedup per free() call at best
+        # the base fallback hands each segment to free() as-is: no dedup
+        # happens across segments, so the contract must already hold here
         alloc = _RecordingBaseAllocator()
         row = torch.arange(11)  # position i lives on page i // PAGE_SIZE
         alloc.free_segments([(row[0:6], 0), (row[8:11], 8)])
