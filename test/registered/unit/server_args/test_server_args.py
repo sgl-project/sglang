@@ -176,8 +176,15 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
 
+        kv_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_kv"]
+        )
+        self.assertEqual(kv_args.dsv4_prefill_backend, "flashmla_kv")
+
         with self.assertRaises(SystemExit):
-            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+            parser.parse_args(
+                base_args + ["--dsv4-prefill-backend", "not_a_prefill_backend"]
+            )
 
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
