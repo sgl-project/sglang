@@ -181,6 +181,29 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
     return max(1, min(16, cpu_count // max(1, num_gpus)))
 
 
+def _format_calibration_timing(records) -> str:
+    """One line of what the planner's duration model was fed by the last probe."""
+    successful = [record for record in records if record.succeeded]
+    if not successful:
+        return "calibration timing: no successful probe"
+    record = max(successful, key=lambda r: (r.workload_units(), r.total_duration_ms))
+    stages = ", ".join(
+        f"{name.replace('MiniMaxH3', '').replace('Stage', '')}={ms / 1000:.1f}s"
+        for name, ms in record.stage_duration_ms.items()
+        if ms >= 100
+    )
+    steps = ", ".join(f"{ms / 1000:.2f}" for ms in record.step_duration_ms)
+    iterations = ", ".join(
+        f"{name.replace('MiniMaxH3', '').replace('Stage', '')}={measured}->{target}"
+        for name, (measured, target) in record.stage_iterations.items()
+    )
+    return (
+        f"calibration timing ({record.width}x{record.height}x{record.num_frames}f, "
+        f"{record.num_inference_steps} steps): total={record.total_duration_ms / 1000:.1f}s; "
+        f"stages: {stages}; steps: [{steps}]; iterations: {iterations}"
+    )
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -1464,6 +1487,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
                 if self.is_output_rank:
                     logger.warning("Auto residency: %s; rolling back", cause)
+                    logger.warning(
+                        "Auto residency: %s", _format_calibration_timing(records)
+                    )
                 return self._rollback_everywhere(
                     cause=cause,
                     already_failed=False,
@@ -1525,6 +1551,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         plan = plan_auto_residency(reports=reports)
         summary = format_plan_summary(plan=plan, workload=workload, records=records)
+        if self.is_output_rank and records:
+            logger.info("Auto residency: %s", _format_calibration_timing(records))
         if plan.skip_reason is not None or not plan.changes:
             if self.is_output_rank:
                 logger.info("%s", summary)
