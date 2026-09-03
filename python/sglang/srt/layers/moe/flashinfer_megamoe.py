@@ -129,8 +129,8 @@ class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
             self.mega_forward = _select_megamoe_forward(self.mega)
 
 
-def _forward_megamoe_with_workspace_view(mega: Any, tensors: Any) -> torch.Tensor:
-    return mega.forward(tensors, return_workspace_view=True)
+def _forward_megamoe(mega: Any, tensors: Any) -> torch.Tensor:
+    return mega.forward(tensors, return_workspace_view=mega.supports_output_view)
 
 
 def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
@@ -140,9 +140,11 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
     import inspect
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
-        return _forward_megamoe_with_workspace_view
-    return _forward_megamoe_legacy
+    if "return_workspace_view" not in inspect.signature(mega.forward).parameters:
+        return _forward_megamoe_legacy
+    if not hasattr(mega, "supports_output_view"):
+        return _forward_megamoe_legacy
+    return _forward_megamoe
 
 
 def _resolve_max_tokens_per_rank() -> int:
@@ -440,6 +442,7 @@ def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            in_kernel_fc2_reduce=envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.get(),
         ),
         w13_scale=None,
         w2_scale=None,

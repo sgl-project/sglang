@@ -75,6 +75,9 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
 
+            def forward(self, tensors, return_workspace_view=False):
+                raise AssertionError("dummy forward function should not be called")
+
         def fake_preprocess(weights, **kwargs):
             preprocess_args.update(weights=weights, **kwargs)
             return transformed_weights
@@ -164,6 +167,9 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
 
+            def forward(self, tensors, return_workspace_view=False):
+                raise AssertionError("dummy forward function should not be called")
+
         def fake_preprocess(weights, **kwargs):
             preprocess_args.update(weights=weights, **kwargs)
             return transformed_weights
@@ -246,6 +252,9 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         class FakeConfig:
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
+
+            def forward(self, tensors, return_workspace_view=False):
+                raise AssertionError("dummy forward function should not be called")
 
         def fake_preprocess(weights, **kwargs):
             preprocess_args.update(weights=weights, **kwargs)
