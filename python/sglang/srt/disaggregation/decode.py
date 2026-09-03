@@ -1091,7 +1091,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         preallocated_reqs = []
         indices_to_remove = set()
 
-        # The all-waiting shortcut stops receiver polling, so enforce its timeout here.
+        # The receiver's own waiting timeout only starts in send_metadata(), i.e.
+        # after decode has allocated KV, so nothing bounds the wait *for* that
+        # allocation. Bound it here with the same timeout, from bootstrap done.
         prealloc_timeout = float(
             getattr(getattr(self, "kv_manager", None), "waiting_timeout", 0.0)
         )
