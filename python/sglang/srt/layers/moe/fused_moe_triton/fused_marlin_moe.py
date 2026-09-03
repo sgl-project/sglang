@@ -131,6 +131,61 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def is_mxfp4_marlin_weights(
+    num_bits: int,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w1_zeros: Optional[torch.Tensor],
+    w2_zeros: Optional[torch.Tensor],
+) -> bool:
+    return (
+        num_bits == 4
+        and w1_zeros is None
+        and w2_zeros is None
+        and w1_scale.dtype == torch.float8_e8m0fnu
+        and w2_scale.dtype == torch.float8_e8m0fnu
+    )
+
+
+def marlin_moe_use_atomic_add(
+    hidden_states: torch.Tensor, is_mxfp4_marlin: bool
+) -> bool:
+    # the E8M0 Marlin kernels have no atomic-add path
+    return (
+        hidden_states.dtype == torch.half
+        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+    ) and not is_mxfp4_marlin
+
+
+def gated_marlin_activation(
+    activation: str,
+    gemm1_alpha: Optional[float],
+    clamp_limit: Optional[float],
+    gate_up: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Apply the gated activation of a Marlin MoE layer to `gate_up` (`[..., 2N]`) into `output`."""
+    if activation == "silu" and gemm1_alpha is not None:
+        if clamp_limit is None:
+            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
+        swiglu_gpt_oss_sigmoid_alpha_contiguous(
+            output, gate_up, gemm1_alpha, clamp_limit
+        )
+    elif activation == "silu" and clamp_limit is not None:
+        swiglu_limit_func(output, gate_up, clamp_limit)
+    elif activation == "silu":
+        silu_and_mul(gate_up, output)
+    elif activation == "situ":
+        situ_and_mul(
+            output,
+            gate_up,
+            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
+            linear_beta=clamp_limit,
+        )
+    else:
+        raise ValueError(f"Unsupported gated activation: {activation=}")
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -201,12 +256,8 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
-    is_mxfp4_marlin = (
-        num_bits == 4
-        and w1_zeros is None
-        and w2_zeros is None
-        and w1_scale.dtype == torch.float8_e8m0fnu
-        and w2_scale.dtype == torch.float8_e8m0fnu
+    is_mxfp4_marlin = is_mxfp4_marlin_weights(
+        num_bits, w1_scale, w2_scale, w1_zeros, w2_zeros
     )
     is_nvfp4_marlin = (
         num_bits == 4
@@ -297,10 +348,7 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
-    use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+    use_atomic_add = marlin_moe_use_atomic_add(hidden_states, is_mxfp4_marlin)
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
@@ -331,29 +379,13 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if activation == "silu" and is_gated and gemm1_alpha is not None:
-        if clamp_limit is None:
-            raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
+    if is_gated:
+        gated_marlin_activation(
+            activation,
             gemm1_alpha,
             clamp_limit,
-        )
-    elif activation == "silu" and is_gated and clamp_limit is not None:
-        swiglu_limit_func(
-            intermediate_cache2,
             intermediate_cache1.view(-1, gemm1_n),
-            clamp_limit,
-        )
-    elif activation == "silu" and is_gated:
-        silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
-    elif activation == "situ" and is_gated:
-        situ_and_mul(
             intermediate_cache2,
-            intermediate_cache1.view(-1, gemm1_n),
-            situ_beta=gemm1_alpha if gemm1_alpha is not None else 4.0,
-            linear_beta=clamp_limit,
         )
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
