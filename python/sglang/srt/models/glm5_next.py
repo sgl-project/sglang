@@ -32,7 +32,6 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
-from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -1253,34 +1252,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.model.dflash_capture = True
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
-    def prepare_context_parallel_metadata_for_dcp(
-        self,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        seq_lens_sum: int,
-        kv_buffer_shape: torch.Size,
-        kv_cache_dtype,
-        kv_cache_device,
-        create_chunked_prefix_cache_kv_indices_fn,
-    ):
-        return prepare_decode_context_parallel_metadata(
-            seq_lens=seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_seq_lens=extend_seq_lens,
-            req_pool_indices=req_pool_indices,
-            req_to_token=req_to_token,
-            seq_lens_sum=seq_lens_sum,
-            kv_buffer_shape=kv_buffer_shape,
-            kv_cache_dtype=kv_cache_dtype,
-            kv_cache_device=kv_cache_device,
-            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
-        )
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
