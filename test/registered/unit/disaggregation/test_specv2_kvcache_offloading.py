@@ -132,7 +132,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_with_overallocation(self):
-        """With spec v2, overallocated slots [committed:allocated] must be freed."""
+        """With spec v2, the over-allocated slots go back with the row."""
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0,
@@ -143,13 +143,13 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(20, 28, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
-    def test_overallocation_with_page_alignment(self):
-        """With page_size > 1, start of overallocated range is ceil-aligned."""
+    def test_unaligned_committed_len_frees_the_whole_row(self):
+        """page_size > 1 with a mid-page committed length: one range, no
+        alignment arithmetic in the release path."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
@@ -161,26 +161,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # ceil_align(10, 4) = 12: page 2 goes with the committed tail.
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(12, 28, dtype=torch.int64)))
-
-    def test_overallocation_page_aligned_noop(self):
-        """When ceil_align(committed, page_size) >= allocated, no overalloc free."""
-        page_size = 4
-        manager, freed = _make_manager(pool_size=32, page_size=page_size)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=10,  # ceil_align(10, 4) = 12
-            kv_allocated_len=12,  # same as aligned start
-            origin_len=4,
-        )
-
-        manager._release_finished_req(req)
-
         self.assertEqual(len(freed), 1)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
 
     def test_prefix_indices_decremented(self):
         """protected_size_ is decremented by len(req.prefix_indices)."""
