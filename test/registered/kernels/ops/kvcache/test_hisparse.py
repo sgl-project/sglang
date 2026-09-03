@@ -444,7 +444,7 @@ def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
     )
     for slot in range(HOT_BUFFER_SIZE):
         device_buffer[slot].copy_(host_cache[slot].to(DEVICE))
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     top_k_tokens = torch.tensor([[miss_token]], dtype=torch.int32, device=DEVICE)
     out = torch.full_like(top_k_tokens, -1)
@@ -471,7 +471,7 @@ def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # The miss evicts the LRU head (slot 0, physical loc 0) and lands there.
     assert torch.equal(out.cpu(), torch.tensor([[0]], dtype=torch.int32))
@@ -683,7 +683,7 @@ def test_load_cache_to_device_buffer_dsv4_fused_copy_multi_miss() -> None:
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # Which slot each miss evicts is up to the LRU, so take the destinations
     # from the kernel; only require that they are distinct and in range.

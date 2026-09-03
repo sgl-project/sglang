@@ -14,15 +14,8 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils import (
-    get_device,
-    get_device_module,
-    is_cuda,
-    is_hip,
-    is_xpu,
-)
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import get_device, get_device_module, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -267,9 +260,6 @@ class TestHiSparseUnit(unittest.TestCase):
         host_indices = host_pool.alloc(fill_len)
         self.assertIsNotNone(host_indices, "Host alloc failed")
         host_indices = host_indices.to(device=DEVICE)
-        self.coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
-        self.coordinator.req_to_host_pool_allocated_len[req.req_pool_idx] = fill_len
-        host_indices = host_indices.to(device="cuda")
         self.coordinator.req_to_host_pool[req.kv.req_pool_idx, :fill_len] = host_indices
         self.coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = fill_len
         for lid in range(LAYER_NUM):
@@ -307,8 +297,7 @@ class TestHiSparseUnit(unittest.TestCase):
     def _make_batch_tensors(self, reqs, fill_lens):
         """Build (req_pool_indices [int64], seq_lens [int32]) on the active device."""
         rpi = torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64, device=DEVICE
-            [r.kv.req_pool_idx for r in reqs], dtype=torch.int64, device="cuda"
+            [r.kv.req_pool_idx for r in reqs], dtype=torch.int64, device=DEVICE
         )
         sls = torch.tensor(fill_lens, dtype=torch.int32, device=DEVICE)
         return rpi, sls

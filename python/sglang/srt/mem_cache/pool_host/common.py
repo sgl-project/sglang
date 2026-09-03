@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
-from sglang.srt.utils import is_xpu
 from sglang.srt.runtime_context import get_memory
 
 logger = logging.getLogger(__name__)
@@ -232,8 +231,6 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True.
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory and not is_xpu():
-        _cuda_host_register(buffer)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
     return buffer

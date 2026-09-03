@@ -12,6 +12,13 @@ if is_xpu():
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
     )
+
+    def copy_cache_planned_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse shared-index prefetch is unsupported on XPU: "
+            "copy_cache_planned_mla has no AOT sgl_kernel implementation."
+        )
+
 else:
     from sglang.kernels.ops.kvcache.hisparse import (
         copy_cache_planned_mla,
@@ -142,6 +149,12 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        if _is_xpu and self.skip_io:
+            raise ValueError(
+                "SGLANG_DEBUG_HISPARSE_SKIP_IO is unsupported on XPU: the AOT swap-in "
+                "ops do not accept skip_io, so timings would silently include the KV "
+                "copy."
+            )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -979,8 +992,9 @@ class HiSparseCoordinator:
             if record_plan
             else {}
         )
-        # skip_io is a JIT template flag; the AOT XPU ops do not take it.
-        debug_flags = {} if _is_xpu else dict(skip_io=self.skip_io)
+        # skip_io is a JIT template parameter baked in at compile time; the AOT
+        # XPU build has no equivalent.
+        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -998,7 +1012,7 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            **debug_flags,
+            **skip_io_kwargs,
             **plan,
         )
         return top_k_indices
