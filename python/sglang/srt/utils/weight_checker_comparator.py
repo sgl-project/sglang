@@ -146,7 +146,9 @@ class Mxfp4MarlinComparable(ComparableWeight):
     # (size_k, size_n) -> (nibble source index per (k, n), scale source index per (g, n))
     _layout_cache: dict = {}
 
-    def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor):
+    def __init__(self, w_q: torch.Tensor, w_s: torch.Tensor, is_shuffled: bool = False):
+        # the checker passes every quantized weight's AITER shuffle flag; Marlin never shuffles
+        assert not is_shuffled, "Marlin MXFP4 experts are never AITER-shuffled"
         assert w_q.dtype == torch.int32, (
             f"expected Marlin int32 weights, got {w_q.dtype}"
         )

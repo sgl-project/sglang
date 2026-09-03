@@ -166,6 +166,16 @@ class TestMxfp4MarlinComparable(CustomTestCase):
         self.assertFalse(result.equal)
         self.assertEqual(result.num_exceed, 0)
 
+    def test_accepts_the_checkers_shuffle_flag(self):
+        # _build_check_entries passes is_shuffled to every quantized comparable
+        Mxfp4MarlinComparable(
+            self.layer.w2_weight, self.layer.w2_weight_scale, is_shuffled=False
+        )
+        with self.assertRaises(AssertionError):
+            Mxfp4MarlinComparable(
+                self.layer.w2_weight, self.layer.w2_weight_scale, is_shuffled=True
+            )
+
     def test_chunking_matches_the_whole(self):
         comparable = self._comparable(self.layer, "w13")
         whole = comparable.dequantize()
