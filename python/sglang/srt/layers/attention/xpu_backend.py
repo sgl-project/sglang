@@ -629,15 +629,17 @@ class XPUAttentionBackend(AttentionBackend):
                     layer, metadata
                 )
                 o = self._forward_attn_flat_page_table(
-                    q=q,
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    layer=layer,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=metadata.max_seq_len_q,
+                    scale=layer.scaling,
+                    softcap=layer.logit_cap,
                     causal=causal,
+                    handle_empty_cache_rows=True,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if layer.is_cross_attention:
@@ -679,21 +681,27 @@ class XPUAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, lse_expand = self._cascade_expand_attn(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache,
-                    value_cache,
-                    self.forward_metadata_spec_decode_expand,
-                    layer.scaling,
-                    layer.logit_cap,
-                    window_size,
-                    sinks,
+                expand = self.forward_metadata_spec_decode_expand
+                o_expand, lse_expand, *_ = self._forward_attn_flat_page_table(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=expand.page_table,
+                    cache_seqlens=expand.cache_seqlens_int32,
+                    cu_seqlens_q=expand.cu_seqlens_q,
+                    max_seqlen_q=expand.max_seq_len_q,
+                    scale=layer.scaling,
+                    softcap=layer.logit_cap,
+                    window_size=window_size,
+                    sinks=sinks,
+                    return_softmax_lse=True,
                 )
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
                     o_expand,
-                    lse_expand,
+                    # lse_expand comes back as (Hq, total_q); merge_state wants (total_q, Hq).
+                    lse_expand.T.contiguous(),
                 )
             else:
                 o = result
@@ -802,52 +810,79 @@ class XPUAttentionBackend(AttentionBackend):
 
     def _forward_attn_flat_page_table(
         self,
-        *,
-        q,
-        key_cache,
-        value_cache,
-        layer,
-        page_table,
-        cache_seqlens,
-        cu_seqlens_q,
-        max_seqlen_q,
-        causal,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: Optional[torch.Tensor],
+        max_seqlen_q: int,
+        scale: float,
+        softcap: float,
+        causal: bool = False,
+        window_size: tuple[int, int] = (-1, -1),
+        sinks: Optional[torch.Tensor] = None,
+        return_softmax_lse: bool = False,
+        handle_empty_cache_rows: bool = False,
     ):
-        """MHA on XPU via flash_attn_with_kvcache with a page_size=1 (flat
-        token-slot) page table. sgl-kernel-xpu PR #454 detects a page_size==1
-        k_cache + page_table and gathers + runs varlen internally, so the backend
-        calls it like the FA (CUDA) path. Eager-only. A request with
-        cache_seqlens==0 attends to no keys and the kernel returns NaN for its
-        rows, so those rows are zeroed (an all-empty batch skips the launch).
+        """Attention against a ``page_table`` that indexes individual token
+        slots rather than ``self.page_size``-sized blocks. Serves cascade
+        tree-branch expand (target-verify / draft-decode) and encoder-decoder
+        cross-/self-attention.
         """
-        q_rows = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-        # If the maximum cache_seqlens is 0, there are no keys to attend to.
-        if int(cache_seqlens.max().item()) == 0:
-            return q_rows.new_zeros(
-                (q_rows.shape[0], q_rows.shape[1], value_cache.shape[-1])
-            )
-        # page_size=1 view of the KV pool: PR #454 detects if page size dim is 1
-        # i.e. k_cache.shape[1] == 1 and routes flash_attn_with_kvcache to varlen gather.
-        k_cache = key_cache.reshape(-1, 1, layer.tp_k_head_num, layer.head_dim)
-        v_cache = value_cache.reshape(-1, 1, layer.tp_v_head_num, layer.head_dim)
-        out = flash_attn_with_kvcache(
-            q=q_rows,
-            k_cache=k_cache,
-            v_cache=v_cache,
+        # page_size=1 attention has no sink-logit support today; drop-on-the-floor
+        # here would silently unsink the branch half of the merge.
+        assert sinks is None, (
+            "flat-page-table attention does not support attention sinks"
+        )
+
+        # Encoder-decoder batches can have requests with zero encoder/cache
+        # length; the kernel returns NaN for those rows rather than zeros.
+        # Cascade's expand rows are never empty, so cascade callers leave
+        # this off and skip the device-to-host sync below.
+        if handle_empty_cache_rows and int(cache_seqlens.max().item()) == 0:
+            out = q.new_zeros((q.shape[0], q.shape[1], value_cache.shape[-1]))
+            return (out, None) if return_softmax_lse else out
+
+        # key_cache/value_cache carry the backend's configured page_size, but
+        # page_table indexes individual tokens regardless of that page_size, so
+        # the cache must be re-viewed as page_size=1 to line up with it --
+        # otherwise each row's block id is read as page_table[row, 0], aliasing
+        # entry 0's block instead of the actual per-row token slots.
+        k_cache_unpaged = key_cache.reshape(
+            -1, 1, key_cache.shape[-2], key_cache.shape[-1]
+        )
+        v_cache_unpaged = value_cache.reshape(
+            -1, 1, value_cache.shape[-2], value_cache.shape[-1]
+        )
+
+        result = flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache_unpaged,
+            v_cache=v_cache_unpaged,
+            # Reads page_table[row, 0:cache_seqlens[row]] per row, so page_table
+            # must pack its valid entries first per row.
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k_new=None,
             max_seqlen_q=max_seqlen_q,
-            softmax_scale=layer.scaling,
+            softmax_scale=scale,
             causal=causal,
-            softcap=layer.logit_cap,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=return_softmax_lse,
         )
+
         # Mixed batch: requests with cache_seqlens==0 attend to no keys and come
-        # back as NaN, so zero their query rows (mapped via cu_seqlens_q).
-        if int(cache_seqlens.min().item()) == 0:
+        # back as NaN, so zero their query rows (mapped via cu_seqlens_q). `out`
+        # aliases result[0] when a tuple, so the in-place zero-fill below updates
+        # both.
+        if handle_empty_cache_rows and int(cache_seqlens.min().item()) == 0:
+            out = result[0] if return_softmax_lse else result
             seg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
             out[(cache_seqlens == 0).repeat_interleave(seg)] = 0
-        return out
+        return result
 
     def forward_decode(
         self,
@@ -959,15 +994,17 @@ class XPUAttentionBackend(AttentionBackend):
                     layer, metadata
                 )
                 o = self._forward_attn_flat_page_table(
-                    q=q,
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    layer=layer,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=1,
+                    scale=layer.scaling,
+                    softcap=layer.logit_cap,
                     causal=causal,
+                    handle_empty_cache_rows=True,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -1056,21 +1093,27 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
-                    o_expand, lse_expand = self._cascade_expand_attn(
-                        q_reshaped,
-                        key_cache,
-                        value_cache,
-                        self.forward_metadata_spec_decode_expand,
-                        layer.scaling,
-                        layer.logit_cap,
-                        window_size,
-                        sinks,
+                    expand = self.forward_metadata_spec_decode_expand
+                    o_expand, lse_expand, *_ = self._forward_attn_flat_page_table(
+                        q=q_reshaped,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        page_table=expand.page_table,
+                        cache_seqlens=expand.cache_seqlens_int32,
+                        cu_seqlens_q=expand.cu_seqlens_q,
+                        max_seqlen_q=expand.max_seq_len_q,
+                        scale=layer.scaling,
+                        softcap=layer.logit_cap,
+                        window_size=window_size,
+                        sinks=sinks,
+                        return_softmax_lse=True,
                     )
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
                         o_expand,
-                        lse_expand,
+                        # lse_expand comes back as (Hq, total_q); merge_state wants (total_q, Hq).
+                        lse_expand.T.contiguous(),
                     )
                 else:
                     o = result
@@ -1152,6 +1195,28 @@ class XPUAttentionBackend(AttentionBackend):
         else:
             self.encoder_metadata = {}
 
+    def _spec_query_kv_offsets(
+        self,
+        is_verify: bool,
+        is_draft_extend: bool,
+        is_draft_decode: bool,
+        spec_info,
+    ) -> tuple[int, int]:
+        """Per-request query-row count and how far the KV length must extend
+        past ``seq_lens`` for each spec mode.
+        """
+        if is_verify:
+            # Packs speculative_num_draft_tokens rows, attending past seq_lens
+            # over those draft positions.
+            return self.speculative_num_draft_tokens, self.speculative_num_draft_tokens
+        if is_draft_extend:
+            # seq_lens already includes the extend tokens (standard extend
+            # convention), so no KV offset is needed.
+            return spec_info.num_tokens_per_req, 0
+        if is_draft_decode:
+            return 1, self.speculative_step_id + 1
+        return 1, 0
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1176,33 +1241,13 @@ class XPUAttentionBackend(AttentionBackend):
         is_verify = forward_mode.is_target_verify()
         is_draft_decode = forward_mode.is_decode_or_idle() and spec_info is not None
         is_draft_extend = forward_mode.is_draft_extend_v2()
-        assert (
-            forward_mode.is_decode_or_idle() or is_verify or is_draft_extend
-        ), "XPUAttentionBackend XPU graph only supports decode / target-verify / draft-extend modes"
+        assert forward_mode.is_decode_or_idle() or is_verify or is_draft_extend, (
+            "XPUAttentionBackend XPU graph only supports decode / target-verify / draft-extend modes"
+        )
 
-        # Per-sequence query rows and the extra KV length beyond seq_lens:
-        #  * target-verify packs `speculative_num_draft_tokens` query rows per req
-        #    and attends over those draft positions (KV offset = num_draft_tokens);
-        #  * draft-extend (EAGLE v2) packs `num_tokens_per_req` query rows per req;
-        #    seq_lens already includes these tokens (KV offset = 0);
-        #  * draft-decode emits one query row and attends one step further
-        #    (KV offset = speculative_step_id + 1);
-        #  * plain decode is the identity (1 row, no offset).
-        if is_verify:
-            q_len_per_req = self.speculative_num_draft_tokens
-            kv_len_offset = self.speculative_num_draft_tokens
-        elif is_draft_extend:
-            # Draft extend: each req has num_tokens_per_req query tokens. Unlike
-            # target-verify, seq_lens already includes the extend tokens (standard
-            # extend convention), so no KV offset is applied.
-            q_len_per_req = spec_info.num_tokens_per_req
-            kv_len_offset = 0
-        elif is_draft_decode:
-            q_len_per_req = 1
-            kv_len_offset = self.speculative_step_id + 1
-        else:
-            q_len_per_req = 1
-            kv_len_offset = 0
+        q_len_per_req, kv_len_offset = self._spec_query_kv_offsets(
+            is_verify, is_draft_extend, is_draft_decode, spec_info
+        )
 
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
@@ -1247,9 +1292,6 @@ class XPUAttentionBackend(AttentionBackend):
             if seq_lens_cpu is not None
             else seq_lens.max().item()
         )
-        # For spec modes the effective KV length includes the extra draft tokens
-        # (verify) or the current draft step (draft-decode); draft-extend and
-        # plain decode add 0 (seq_lens already includes extend tokens).
         metadata.max_seq_len_k = max_len + kv_len_offset
 
         kv_seqlens = (seq_lens + kv_len_offset).to(torch.int32)
