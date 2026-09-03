@@ -269,9 +269,7 @@ class CompressorBackendMixin:
             if compressor.is_in_indexer:
                 page_size = token_to_kv_pool.get_index_k_page_size()
                 if use_hip_fp4:
-                    kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(
-                        layer_id
-                    )
+                    kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
                     kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(
                         layer_id
                     )
@@ -313,9 +311,7 @@ class CompressorBackendMixin:
                 bf16_store=bf16_store,
                 kv_scale_cache=kv_scale_cache,
                 rope_cache=(
-                    (compressor.fp4_cos, compressor.fp4_sin)
-                    if use_hip_fp4
-                    else None
+                    (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
                 ),
             )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
