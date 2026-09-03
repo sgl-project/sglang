@@ -136,17 +136,64 @@ impl PrefixIndex for FakePrefixIndex {
     }
 }
 
+struct TwoPrefixIndex {
+    best_address: String,
+    lower_ranked_address: String,
+}
+
+impl TwoPrefixIndex {
+    fn new(best_address: String, lower_ranked_address: String) -> Arc<Self> {
+        Arc::new(Self {
+            best_address,
+            lower_ranked_address,
+        })
+    }
+}
+
+#[tonic::async_trait]
+impl PrefixIndex for TwoPrefixIndex {
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+        let best_prefix_blocks = u32::try_from(hashes.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let lower_ranked_prefix_blocks = (best_prefix_blocks / 2).max(1);
+        Ok(PrefixOutcome::Matched {
+            matches: vec![
+                PrefixMatch {
+                    address: self.best_address.clone(),
+                    matched_prefix_blocks: best_prefix_blocks,
+                    worker_id: "best-index-worker".into(),
+                },
+                PrefixMatch {
+                    address: self.lower_ranked_address.clone(),
+                    matched_prefix_blocks: lower_ranked_prefix_blocks,
+                    worker_id: "lower-index-worker".into(),
+                },
+            ],
+            best_prefix_blocks,
+        })
+    }
+}
+
 fn build_cache_ctx(
     specs: Vec<WorkerSpec>,
     bucket_config: BucketConfig,
     prefix_index: Arc<dyn PrefixIndex>,
 ) -> Arc<AppContext> {
-    let mut context = build_app_context(
+    build_cache_ctx_with_affinity(
         specs,
         bucket_config,
-        PolicyKind::CacheAware,
-        Some(AffinityConfig::default()),
-    );
+        prefix_index,
+        AffinityConfig::default(),
+    )
+}
+
+fn build_cache_ctx_with_affinity(
+    specs: Vec<WorkerSpec>,
+    bucket_config: BucketConfig,
+    prefix_index: Arc<dyn PrefixIndex>,
+    affinity: AffinityConfig,
+) -> Arc<AppContext> {
+    let mut context =
+        build_app_context(specs, bucket_config, PolicyKind::CacheAware, Some(affinity));
     context.config.model.cache_aware = Some(CacheAwareConfig {
         kv_indexer_endpoint: Some(KvIndexerEndpointConfig {
             url: "http://fake-indexer".into(),
@@ -533,6 +580,62 @@ async fn cache_winner_uses_target_uncached_work_before_prompt_length_bucket() {
         index.calls.load(Ordering::Relaxed),
         1,
         "the async Indexer query must run once at ingress, not once per Bucket"
+    );
+}
+
+#[tokio::test]
+async fn cache_candidate_bucket_binding_happens_before_candidate_limit() {
+    let best = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let lower_ranked = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut best_bucket = bucket("p-best", BucketStage::Prefill, 10, "p-best");
+    best_bucket.min_extend_tokens = Some(32);
+    let mut lower_ranked_bucket = bucket("p-lower", BucketStage::Prefill, 20, "p-lower");
+    lower_ranked_bucket.min_extend_tokens = Some(32);
+    let bucket_config = BucketConfig {
+        buckets: vec![
+            best_bucket,
+            lower_ranked_bucket,
+            bucket("d-catch-all", BucketStage::Decode, 30, "d"),
+        ],
+        ttft_slo_policy: SloBucketPolicy::Disabled,
+        tps_slo_policy: SloBucketPolicy::Disabled,
+    };
+    let index: Arc<dyn PrefixIndex> =
+        TwoPrefixIndex::new(best.url.clone(), lower_ranked.url.clone());
+    let ctx = build_cache_ctx_with_affinity(
+        vec![
+            worker_spec("p-best", best.url.clone(), WorkerMode::Prefill),
+            worker_spec("p-lower", lower_ranked.url.clone(), WorkerMode::Prefill),
+            worker_spec("d", decode.url.clone(), WorkerMode::Decode),
+        ],
+        bucket_config,
+        index,
+        AffinityConfig {
+            cache_candidate_min_workers: 1,
+            cache_candidate_ratio: 0.0,
+            cache_candidate_max_workers: 1,
+            ..AffinityConfig::default()
+        },
+    );
+
+    let content = "cached bucket candidate ".repeat(256);
+    let response = build_router(Arc::clone(&ctx))
+        .oneshot(chat_request_with_content(&content, None, Some(8), None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    wait_for_prefill(&lower_ranked).await;
+    assert!(
+        best.captured.lock().unwrap().last_body.is_none(),
+        "the top Indexer hit is Bucket-incompatible and must not consume K=1"
+    );
+    assert!(
+        ctx.metrics.render().contains(
+            r#"sgl_router_policy_decisions_total{policy="cache_aware",reason="cache_candidate"} 1"#
+        ),
+        "the compatible lower-ranked cache holder must remain a cache candidate"
     );
 }
 

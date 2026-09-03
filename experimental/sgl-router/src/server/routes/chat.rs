@@ -28,6 +28,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -75,9 +76,7 @@ fn prefill_policy_reason(
             (ProposalKind::SessionAffinity, DecisionReason::RangeFallback) => {
                 "session_range_fallback"
             }
-            (_, DecisionReason::CapacityFallbackPowerOfTwo) => {
-                "capacity_fallback_power_of_two"
-            }
+            (_, DecisionReason::CapacityFallbackPowerOfTwo) => "capacity_fallback_power_of_two",
             (_, DecisionReason::RangeFallback) => "range_fallback",
             (_, _) if !affinity_lookup_enabled => "range_fallback",
             (_, _) if !has_session_id => "no_session",
@@ -367,200 +366,215 @@ pub async fn chat_completions(
     let use_global_affinity_probe = ctx.bucket_selector.is_enabled()
         && policy.is_bucket_affinity_policy()
         && session_affinity_mode != SessionAffinityMode::Bucket;
-    let select_prefill_in_domain = |domain: &CandidateDomain,
-                                    affinity_lookup_enabled: bool,
-                                    affinity_assignment_enabled: bool|
-     -> Option<Arc<Worker>> {
-        let candidate_range = domain.prefill_range()?;
-        let mut selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-            .with_session_id(session_id)
-            .with_candidate_range_id(candidate_range.id)
-            .with_input_tokens(request_input_tokens)
-            .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-            .with_external_prefix(external_prefix.as_ref());
-        if let Some(snapshot) = load_snapshot.as_ref() {
-            selection_ctx = selection_ctx.with_load_snapshot(snapshot);
-        }
-        let selection_ctx = if !affinity_lookup_enabled {
-            selection_ctx.without_affinity_lookup()
-        } else if !affinity_assignment_enabled {
-            selection_ctx.without_affinity_assignment()
-        } else {
-            selection_ctx
-        };
-        let PrefillProposal::Pair(proposal) =
-            policy.propose_prefill(candidate_range.workers, &selection_ctx)?
-        else {
-            // Domain retries are ordinary pair proposals.
-            return None;
-        };
-        if policy.uses_shared_prefill_admission() {
-            let snapshot = load_snapshot
-                .as_ref()
-                .expect("shared prefill admission requires a load snapshot");
-            let decision = resolve_prefill(
-                &candidate_range,
-                &proposal,
-                request_input_tokens,
-                snapshot,
-            )?;
-            let reason = prefill_policy_reason(
-                ctx.config.model.policy,
-                proposal.kind,
-                decision.reason,
-                session_id.is_some_and(|value| !value.is_empty()),
-                affinity_lookup_enabled,
-            );
-            policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
-            ctx.metrics
-                .record_policy_decision(&ctx.config.model.policy.to_string(), reason);
-            tracing::debug!(
-                model = %model_str,
-                policy = ?proposal.kind,
-                range = %decision.candidate_range_id,
-                primary = %decision.primary.url,
-                backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
-                selected = %decision.selected.url,
-                reason = ?decision.reason,
-                load_snapshot_version = decision.load_snapshot_version,
-                "prefill policy decision",
-            );
-            Some(decision.selected)
-        } else {
-            tracing::debug!(
-                model = %model_str,
-                policy = ?proposal.kind,
-                range = %candidate_range.id,
-                selected = %proposal.primary.url,
-                "prefill policy decision without shared admission",
-            );
-            Some(proposal.primary)
-        }
-    };
-
-    // Cache-Aware resolves one bounded global candidate set and returns a final winner.
-    let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
-        .then(|| {
-            let snapshot = load_snapshot.as_ref()?;
-            let global_range = CandidateRange::global(&workers);
-            let cache_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-                .with_session_id(session_id)
-                .with_candidate_range_id(global_range.id)
-                .with_input_tokens(request_input_tokens)
-                .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-                .with_external_prefix(external_prefix.as_ref())
-                .with_load_snapshot(snapshot);
-            let PrefillProposal::CacheCandidates(mut proposal) =
-                policy.propose_prefill(global_range.workers, &cache_ctx)?
+    let worker = {
+        let selection_failure_reason = Cell::new(PolicySelectionFailureReason::ProposalEmpty);
+        let select_prefill_in_domain = |domain: &CandidateDomain,
+                                        affinity_lookup_enabled: bool,
+                                        affinity_assignment_enabled: bool|
+         -> Option<Arc<Worker>> {
+            let candidate_range = domain.prefill_range()?;
+            let mut selection_ctx =
+                SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                    .with_session_id(session_id)
+                    .with_candidate_range_id(candidate_range.id)
+                    .with_input_tokens(request_input_tokens)
+                    .with_request_tokens(
+                        request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                    )
+                    .with_external_prefix(external_prefix.as_ref());
+            if let Some(snapshot) = load_snapshot.as_ref() {
+                selection_ctx = selection_ctx.with_load_snapshot(snapshot);
+            }
+            let selection_ctx = if !affinity_lookup_enabled {
+                selection_ctx.without_affinity_lookup()
+            } else if !affinity_assignment_enabled {
+                selection_ctx.without_affinity_assignment()
+            } else {
+                selection_ctx
+            };
+            let Some(PrefillProposal::Pair(proposal)) =
+                policy.propose_prefill(candidate_range.workers, &selection_ctx)
             else {
+                // Domain retries are ordinary pair proposals.
                 return None;
             };
-            proposal.candidates = proposal
-                .candidates
-                .into_iter()
-                .filter_map(|candidate| {
-                    ctx.bucket_selector
-                        .bind_prefill_cache_candidate(candidate, prefill_bucket_request)
-                })
-                .collect();
-            let bounded_candidate_count = proposal.candidates.len();
-            let cache_decision =
-                resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
-            ctx.metrics
-                .record_cache_admission_evaluations(cache_decision.admission_evaluated_candidates);
-            ctx.metrics
-                .record_cache_admission_rejections(cache_decision.admission_rejected_candidates);
-            ctx.metrics.record_cache_pressure_guard(
-                cache_decision.pressure_guard_compared_pairs,
-                cache_decision.pressure_guard_overrides,
-            );
-            ctx.metrics
-                .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
-            let decision = cache_decision.decision?;
-            let selected_candidate = proposal
-                .candidates
-                .iter()
-                .find(|candidate| candidate.worker.id == decision.selected.id)?;
-            tracing::debug!(
-                model = %model_str,
-                policy = ?ProposalKind::CacheAffinity,
-                range = %decision.candidate_range_id,
-                selected = %decision.selected.url,
-                cache_candidates = bounded_candidate_count,
-                input_tokens = request_input_tokens,
-                matched_prefix_tokens = selected_candidate.matched_prefix_tokens,
-                uncached_tokens = selected_candidate.uncached_tokens,
-                reason = ?decision.reason,
-                load_snapshot_version = decision.load_snapshot_version,
-                prefill_pressure_source = cache_decision.prefill_pressure_source,
-                "cache candidate winner",
-            );
-            ctx.metrics
-                .record_policy_decision("cache_aware", "cache_candidate");
-            Some(decision.selected)
-        })
-        .flatten();
-
-    let global_affinity_probe = use_global_affinity_probe
-        .then(|| {
-            let snapshot = load_snapshot.as_ref()?;
-            let global_range = CandidateRange::global(&workers);
-            let probe_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
-                .with_session_id(session_id)
-                .with_candidate_range_id(global_range.id)
-                .with_input_tokens(request_input_tokens)
-                .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-                .with_external_prefix(external_prefix.as_ref())
-                .with_load_snapshot(snapshot)
-                .without_affinity_assignment();
-            policy.propose(global_range.workers, &probe_ctx)
-        })
-        .flatten();
-    // A new or stale session may create its first assignment in the target Bucket.
-    let global_affinity_missed = global_affinity_probe
-        .as_ref()
-        .is_some_and(|proposal| !matches!(proposal.kind, ProposalKind::SessionAffinity));
-    let global_affinity_worker = global_affinity_probe
-        .and_then(|proposal| {
-            matches!(proposal.kind, ProposalKind::SessionAffinity).then_some(proposal.primary)
-        })
-        .and_then(|primary| {
-            ctx.bucket_selector
-                .prefill_affinity_domain(&workers, &primary, prefill_bucket_request)
-        })
-        // Rebuild the backup inside the primary's own Bucket.
-        .and_then(|domain| select_prefill_in_domain(&domain, true, false));
-    let worker = cache_winner
-        .or_else(|| {
-            // Materialize normal domains only when Cache-Aware has no winner.
-            let prefill_domains = ctx
-                .bucket_selector
-                .prefill_domains(&workers, prefill_bucket_request);
-            if ctx.config.model.policy == PolicyKind::CacheAware {
-                // Cache miss or failure retries ordered domains with ordinary P2.
-                return prefill_domains
-                    .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, false, false));
+            if policy.uses_shared_prefill_admission() {
+                let snapshot = load_snapshot
+                    .as_ref()
+                    .expect("shared prefill admission requires a load snapshot");
+                let Some(decision) =
+                    resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
+                else {
+                    selection_failure_reason
+                        .set(PolicySelectionFailureReason::PrefillAdmissionExhausted);
+                    return None;
+                };
+                let reason = prefill_policy_reason(
+                    ctx.config.model.policy,
+                    proposal.kind,
+                    decision.reason,
+                    session_id.is_some_and(|value| !value.is_empty()),
+                    affinity_lookup_enabled,
+                );
+                policy.commit_prefill_selection(&selection_ctx, proposal.kind, &decision.selected);
+                ctx.metrics
+                    .record_policy_decision(&ctx.config.model.policy.to_string(), reason);
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?proposal.kind,
+                    range = %decision.candidate_range_id,
+                    primary = %decision.primary.url,
+                    backup = ?decision.backup.as_ref().map(|worker| worker.url.as_str()),
+                    selected = %decision.selected.url,
+                    reason = ?decision.reason,
+                    load_snapshot_version = decision.load_snapshot_version,
+                    "prefill policy decision",
+                );
+                Some(decision.selected)
+            } else {
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?proposal.kind,
+                    range = %candidate_range.id,
+                    selected = %proposal.primary.url,
+                    "prefill policy decision without shared admission",
+                );
+                Some(proposal.primary)
             }
-            global_affinity_worker.or_else(|| match session_affinity_mode {
-                SessionAffinityMode::GlobalPreserve if global_affinity_missed => prefill_domains
+        };
+
+        // Cache-Aware resolves one bounded global candidate set and returns a final winner.
+        let cache_winner = (ctx.config.model.policy == PolicyKind::CacheAware)
+            .then(|| {
+                let snapshot = load_snapshot.as_ref()?;
+                let global_range = CandidateRange::global(&workers);
+                let cache_ctx =
+                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                        .with_session_id(session_id)
+                        .with_candidate_range_id(global_range.id)
+                        .with_input_tokens(request_input_tokens)
+                        .with_request_tokens(
+                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                        )
+                        .with_external_prefix(external_prefix.as_ref())
+                        .with_load_snapshot(snapshot)
+                        .with_prefill_cache_bucket(&ctx.bucket_selector, prefill_bucket_request);
+                let PrefillProposal::CacheCandidates(proposal) =
+                    policy.propose_prefill(global_range.workers, &cache_ctx)?
+                else {
+                    return None;
+                };
+                let bounded_candidate_count = proposal.candidates.len();
+                let cache_decision =
+                    resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
+                ctx.metrics.record_cache_admission_evaluations(
+                    cache_decision.admission_evaluated_candidates,
+                );
+                ctx.metrics.record_cache_admission_rejections(
+                    cache_decision.admission_rejected_candidates,
+                );
+                ctx.metrics.record_cache_pressure_guard(
+                    cache_decision.pressure_guard_compared_pairs,
+                    cache_decision.pressure_guard_overrides,
+                );
+                ctx.metrics
+                    .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
+                let Some(decision) = cache_decision.decision else {
+                    selection_failure_reason
+                        .set(PolicySelectionFailureReason::CacheCandidatesExhausted);
+                    return None;
+                };
+                let selected_candidate = proposal
+                    .candidates
                     .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, true, true)),
-                SessionAffinityMode::GlobalPreserve => prefill_domains
-                    .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, false, false)),
-                SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => prefill_domains
-                    .iter()
-                    .find_map(|domain| select_prefill_in_domain(domain, true, true)),
+                    .find(|candidate| candidate.worker.id == decision.selected.id)?;
+                tracing::debug!(
+                    model = %model_str,
+                    policy = ?ProposalKind::CacheAffinity,
+                    range = %decision.candidate_range_id,
+                    selected = %decision.selected.url,
+                    cache_candidates = bounded_candidate_count,
+                    input_tokens = request_input_tokens,
+                    matched_prefix_tokens = selected_candidate.matched_prefix_tokens,
+                    uncached_tokens = selected_candidate.uncached_tokens,
+                    reason = ?decision.reason,
+                    load_snapshot_version = decision.load_snapshot_version,
+                    prefill_pressure_source = cache_decision.prefill_pressure_source,
+                    "cache candidate winner",
+                );
+                ctx.metrics
+                    .record_policy_decision("cache_aware", "cache_candidate");
+                Some(decision.selected)
             })
-        })
-        .ok_or_else(|| {
-            policy_selection_failed(
-                &ctx,
-                &model_str,
-                PolicySelectionFailureReason::ProposalEmpty,
-            )
-        })?;
+            .flatten();
+
+        let global_affinity_probe = use_global_affinity_probe
+            .then(|| {
+                let snapshot = load_snapshot.as_ref()?;
+                let global_range = CandidateRange::global(&workers);
+                let probe_ctx =
+                    SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+                        .with_session_id(session_id)
+                        .with_candidate_range_id(global_range.id)
+                        .with_input_tokens(request_input_tokens)
+                        .with_request_tokens(
+                            request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+                        )
+                        .with_external_prefix(external_prefix.as_ref())
+                        .with_load_snapshot(snapshot)
+                        .without_affinity_assignment();
+                policy.propose(global_range.workers, &probe_ctx)
+            })
+            .flatten();
+        // A new or stale session may create its first assignment in the target Bucket.
+        let global_affinity_missed = global_affinity_probe
+            .as_ref()
+            .is_some_and(|proposal| !matches!(proposal.kind, ProposalKind::SessionAffinity));
+        let global_affinity_worker = global_affinity_probe
+            .and_then(|proposal| {
+                matches!(proposal.kind, ProposalKind::SessionAffinity).then_some(proposal.primary)
+            })
+            .and_then(|primary| {
+                ctx.bucket_selector.prefill_affinity_domain(
+                    &workers,
+                    &primary,
+                    prefill_bucket_request,
+                )
+            })
+            // Rebuild the backup inside the primary's own Bucket.
+            .and_then(|domain| select_prefill_in_domain(&domain, true, false));
+        cache_winner
+            .or_else(|| {
+                // Materialize normal domains only when Cache-Aware has no winner.
+                let prefill_domains = ctx
+                    .bucket_selector
+                    .prefill_domains(&workers, prefill_bucket_request);
+                if ctx.config.model.policy == PolicyKind::CacheAware {
+                    // Cache miss or failure retries ordered domains with ordinary P2.
+                    return prefill_domains
+                        .iter()
+                        .find_map(|domain| select_prefill_in_domain(domain, false, false));
+                }
+                global_affinity_worker.or_else(|| match session_affinity_mode {
+                    SessionAffinityMode::GlobalPreserve if global_affinity_missed => {
+                        prefill_domains
+                            .iter()
+                            .find_map(|domain| select_prefill_in_domain(domain, true, true))
+                    }
+                    SessionAffinityMode::GlobalPreserve => prefill_domains
+                        .iter()
+                        .find_map(|domain| select_prefill_in_domain(domain, false, false)),
+                    SessionAffinityMode::Bucket | SessionAffinityMode::GlobalRebind => {
+                        prefill_domains
+                            .iter()
+                            .find_map(|domain| select_prefill_in_domain(domain, true, true))
+                    }
+                })
+            })
+            .ok_or_else(|| {
+                policy_selection_failed(&ctx, &model_str, selection_failure_reason.get())
+            })?
+    };
 
     // Decode selection starts after Final P.
     //
@@ -601,12 +615,8 @@ pub async fn chat_completions(
                     .with_prefill_url(&worker.url);
                 let decode_policy = build_decode_policy(ctx.config.model.decode_policy);
                 let decode_proposal = decode_policy.propose(decode_domain, &decode_ctx)?;
-                let decode_decision = resolve_decode(
-                    decode_domain,
-                    &decode_proposal,
-                    request_kv_tokens,
-                    snapshot,
-                )?;
+                let decode_decision =
+                    resolve_decode(decode_domain, &decode_proposal, request_kv_tokens, snapshot)?;
                 tracing::debug!(
                     model = %model_str,
                     policy = ?ctx.config.model.decode_policy,
