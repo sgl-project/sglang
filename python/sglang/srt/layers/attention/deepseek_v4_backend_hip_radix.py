@@ -47,6 +47,11 @@ from sglang.srt.utils import ceil_align
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        FP4DecodeWorkspace,
+        FP4KWriteMetadata,
+        FP4PrefillWorkspace,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -353,6 +358,18 @@ class DSV4Metadata:
 
     c4_compress_metadata: Optional[FusedCompressMetadata] = None
     c128_compress_metadata: Optional[FusedCompressMetadata] = None
+    # FP4 indexer buffers that captured kernels bind by address. Deliberately
+    # absent from copy_: the addresses must stay pinned across replays, and the
+    # workspace builders refresh their contents instead.
+    fp4_decode_workspace: Optional[FP4DecodeWorkspace] = field(default=None, repr=False)
+    fp4_prefill_workspace: Optional[FP4PrefillWorkspace] = field(
+        default=None, repr=False
+    )
+    # Derived by the first C4 layer of a forward and reused by the rest.
+    fp4_k_write_metadata: Optional[FP4KWriteMetadata] = field(default=None, repr=False)
+    # AITER's rope kernels require int64 positions while the core metadata keeps
+    # them int32, so widen once per forward instead of once per C4 layer.
+    fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -655,6 +672,8 @@ class DeepseekV4HipRadixBackend(
         ragged_layout=None,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
+        # Verify tokens may cross into the next page beyond the accepted prefix.
+        max_seq_len += self.target_verify_num_draft_tokens
         extend_start_loc = None
         if ragged_layout is not None:
             verify_lens_dev = ragged_layout.verify_lens.to(
@@ -760,6 +779,10 @@ class DeepseekV4HipRadixBackend(
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
+        if self.topk > 0 and self.speculative_num_steps > 1:
+            # Each EAGLE draft step appends one token while ForwardBatch keeps
+            # the accepted-prefix lengths unchanged across the captured loop.
+            seq_lens = seq_lens + self.speculative_step_id + 1
 
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
@@ -859,6 +882,83 @@ class DeepseekV4HipRadixBackend(
                     torch.int32
                 )
             )
+
+        if self._fp4_workspaces_enabled(metadata):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_k_write_metadata,
+            )
+
+            metadata.fp4_k_write_metadata = prepare_fp4_k_write_metadata(
+                metadata.c4_compress_metadata,
+                metadata.core_attn_metadata.c4_out_loc,
+                self.MAX_SEQ_LEN_FOR_CAPTURE,
+            )
+            metadata.fp4_q_positions = metadata.core_attn_metadata.positions.to(
+                torch.int64
+            )
+
+        # Decode's schedule builder is capture-safe because the workspace pins
+        # the scratch it reads, so it can stay next to the metadata it consumes.
+        # Prefill/target-verify cannot; see _refresh_fp4_prefill_workspace.
+        if self._fp4_workspaces_enabled(metadata) and (
+            forward_batch.forward_mode.is_decode()
+        ):
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                prepare_fp4_decode_workspace,
+            )
+
+            indexer_metadata = metadata.indexer_metadata
+            metadata.fp4_decode_workspace = prepare_fp4_decode_workspace(
+                indexer_metadata.page_table,
+                indexer_metadata.c4_seq_lens,
+            )
+
+    def _fp4_workspaces_enabled(self, metadata) -> bool:
+        return (
+            self.enable_deepseek_v4_fp4_indexer
+            # Draft-step backends drive the NextN layer, which is built with
+            # compress_ratio_override=0 and so owns no C4 indexer. Their
+            # workspaces would be built, scheduled, and never read.
+            and self.speculative_num_steps == 0
+            and isinstance(metadata, DSV4Metadata)
+            and metadata.indexer_metadata is not None
+            and metadata.c4_compress_metadata is not None
+        )
+
+    def _refresh_fp4_prefill_workspace(self, forward_batch: ForwardBatch) -> None:
+        """Rebuild the FP4 prefill schedule outside CUDA-graph capture.
+
+        AITER's prefill scheduler frees the scratch that its schedule kernel
+        reads, so recording the build into a graph would leave every replay
+        reading recycled graph-pool memory. Only the pinned buffers it fills
+        (cta_info / logits / guarded page table) may be read from the graph.
+        """
+        metadata = self.forward_metadata
+        if not self._fp4_workspaces_enabled(metadata):
+            return
+        if forward_batch.forward_mode not in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+            ForwardMode.TARGET_VERIFY,
+        ):
+            return
+        if (
+            get_parallel().attn_cp_size != 1
+            or getattr(forward_batch, "tbo_children", None)
+            or getattr(forward_batch, "tbo_parent_token_range", None) is not None
+        ):
+            return
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            prepare_fp4_prefill_workspace,
+        )
+
+        indexer_metadata = metadata.indexer_metadata
+        metadata.fp4_prefill_workspace = prepare_fp4_prefill_workspace(
+            indexer_metadata.page_table,
+            indexer_metadata.c4_seq_lens,
+            workspace=metadata.fp4_prefill_workspace,
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -984,6 +1084,7 @@ class DeepseekV4HipRadixBackend(
         self.replay_cuda_graph_metadata_from(
             bs=graph_key, temp_metadata=temp_metadata, bucket=bucket
         )
+        self._refresh_fp4_prefill_workspace(forward_batch)
 
         if in_capture:
             metadata = self.forward_metadata
@@ -1065,6 +1166,7 @@ class DeepseekV4HipRadixBackend(
 
         self.forward_metadata = metadata
         self.init_forward_metadata_in_graph(forward_batch)
+        self._refresh_fp4_prefill_workspace(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.cuda_graph_metadata_of_bucket_and_bs: Dict[
@@ -1767,14 +1869,32 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     ):
         from types import SimpleNamespace
 
+        actual_forward_mode = getattr(
+            forward_batch, "actual_forward_mode", forward_batch.forward_mode
+        )
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        step_out_cache_locs = None
+        # C4/C128 write locations are baked into each child backend's metadata,
+        # so every speculative step must consume its own cache-location row.
+        if (
+            actual_forward_mode != ForwardMode.IDLE
+            and out_cache_loc is not None
+            and self.topk > 0
+            and self.speculative_num_steps > 1
+        ):
+            step_out_cache_locs = per_step_draft_out_cache_loc(
+                out_cache_loc,
+                forward_batch.batch_size,
+                self.topk,
+                self.speculative_num_steps,
+            )
+
         inner_fb = SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
             # Propagate the real runtime mode so inner backends can detect IDLE
             # and apply their idle substitution.
-            actual_forward_mode=getattr(
-                forward_batch, "actual_forward_mode", forward_batch.forward_mode
-            ),
+            actual_forward_mode=actual_forward_mode,
             input_ids=getattr(forward_batch, "input_ids", None),
             positions=getattr(forward_batch, "positions", None),
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1782,23 +1902,37 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
             encoder_lens=None,
-            out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            out_cache_loc=out_cache_loc,
             spec_info=forward_batch.spec_info,
         )
         if in_capture:
             for i in range(self.speculative_num_steps):
+                if step_out_cache_locs is not None:
+                    inner_fb.out_cache_loc = step_out_cache_locs[i]
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
         else:
             if self.speculative_num_steps == 1:
                 return
+            if step_out_cache_locs is not None:
+                inner_fb.out_cache_loc = step_out_cache_locs[0]
             self.attn_backends[0].init_forward_metadata_out_graph(inner_fb)
             temp_metadata = self.attn_backends[0].forward_metadata
+            if step_out_cache_locs is not None:
+                assert isinstance(temp_metadata, DSV4RawDecodeMetadata)
             for i in range(1, self.speculative_num_steps - 1):
+                if step_out_cache_locs is None:
+                    step_metadata = temp_metadata
+                else:
+                    step_metadata = DSV4RawDecodeMetadata(
+                        req_pool_indices=temp_metadata.req_pool_indices,
+                        seq_lens=temp_metadata.seq_lens,
+                        out_cache_loc=step_out_cache_locs[i],
+                    )
                 self.attn_backends[i].replay_cuda_graph_metadata_from(
                     bs=forward_batch.batch_size,
-                    temp_metadata=temp_metadata,
+                    temp_metadata=step_metadata,
                     bucket=_GraphBucket.DECODE_OR_IDLE,
                 )
 
