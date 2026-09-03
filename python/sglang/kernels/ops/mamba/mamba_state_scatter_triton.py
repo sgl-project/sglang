@@ -673,6 +673,59 @@ def fused_conv_window_scatter_multi(
     )
 
 
+def _scatter_with_mask_cpu(dst, src, dst_indices_raw, step_indices_raw) -> None:
+    """Torch equivalent of the fused scatter kernels, including their silent
+    out-of-range skips: ``dst[:, dst_idx] = src[:, request, step]``."""
+    steps = step_indices_raw.to(torch.int64)
+    dst_idx = dst_indices_raw.to(torch.int64)
+    req = torch.arange(steps.shape[0], device=steps.device)
+    valid = (
+        (steps >= 0)
+        & (steps < src.shape[2])
+        & (dst_idx >= 0)
+        & (dst_idx < dst.shape[1])
+        & (req < src.shape[1])
+    )
+    if not bool(valid.any()):
+        return
+    dst[:, dst_idx[valid]] = src[:, req[valid], steps[valid]]
+
+
+def _scatter_mamba_states_after_mtp_verify_cpu(
+    mamba_caches,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: torch.Tensor | None,
+    mamba_steps_to_track: torch.Tensor | None,
+) -> None:
+    ssm_states = mamba_caches.temporal
+    if ssm_states.numel() > 0:
+        _scatter_with_mask_cpu(
+            ssm_states,
+            mamba_caches.intermediate_ssm,
+            state_indices_tensor,
+            last_correct_step_indices,
+        )
+        if mamba_track_indices is not None:
+            _scatter_with_mask_cpu(
+                ssm_states,
+                mamba_caches.intermediate_ssm,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+
+    for conv_states, window in zip(
+        mamba_caches.conv, mamba_caches.intermediate_conv_window
+    ):
+        _scatter_with_mask_cpu(
+            conv_states, window, state_indices_tensor, last_correct_step_indices
+        )
+        if mamba_track_indices is not None:
+            _scatter_with_mask_cpu(
+                conv_states, window, mamba_track_indices, mamba_steps_to_track
+            )
+
+
 def scatter_mamba_states_after_mtp_verify(
     mamba_caches,
     state_indices_tensor: torch.Tensor,
@@ -684,6 +737,18 @@ def scatter_mamba_states_after_mtp_verify(
     persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
+
+    if ssm_states.device.type == "cpu":
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+        _scatter_mamba_states_after_mtp_verify_cpu(
+            mamba_caches,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+        return
 
     if ssm_states.numel() > 0:
         fused_mamba_state_scatter_with_mask(
