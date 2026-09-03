@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.multimodal_gen.configs.models.encoders.clip import CLIPVisionConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -135,7 +136,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
 
 class TestImageEncoderNativeLoading(unittest.TestCase):
     def test_bnb4_uses_shared_transformers_path_and_image_precision(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["CLIPVisionModelWithProjection"],
             quantization_config={
@@ -193,7 +194,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
 
     def test_explicit_offload_is_rejected_before_transformers_load(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},
@@ -236,7 +237,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             def to(self, *args, **kwargs):
                 raise AssertionError("quantized component must not be moved again")
 
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},

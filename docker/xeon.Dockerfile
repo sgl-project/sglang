@@ -43,8 +43,7 @@ RUN source /opt/.venv/bin/activate && \
     cd sglang/kernels/aot && \
     cp pyproject_cpu.toml pyproject.toml && \
     uv pip install . && \
-    source /sgl-workspace/sglang/scripts/ci/utils/sgl_eval_ref.sh && \
-    uv pip install "$SGL_EVAL_SPEC"
+    uv pip install "sgl-eval==0.1.0"
 
 ENV SGLANG_USE_CPU_ENGINE=1
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4:/usr/lib/x86_64-linux-gnu/libtbbmalloc.so:/opt/.venv/lib/libiomp5.so
