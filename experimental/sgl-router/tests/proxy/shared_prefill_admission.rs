@@ -289,24 +289,30 @@ async fn chat_commits_the_admitted_prefill_backup() {
         })
     })
     .await;
+    let now = Instant::now();
+    let native_load = |total_prefill_uncached_tokens, total_prefill_busy_us| LoadStat {
+        num_running_reqs: 1,
+        num_waiting_reqs: 0,
+        num_tokens: 100,
+        max_total_num_tokens: 100,
+        native_cache: Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 0,
+            num_total_tokens: 100,
+            max_running_requests: 16,
+            total_prefill_uncached_tokens,
+            total_prefill_busy_us,
+        }),
+    };
     fixture.ctx.engine_load.set(
         &fixture.workers[0].url,
         0,
-        LoadStat {
-            num_running_reqs: 1,
-            num_waiting_reqs: 0,
-            num_tokens: 100,
-            max_total_num_tokens: 100,
-            native_cache: Some(NativeCacheRankLoad {
-                num_waiting_uncached_tokens: 0,
-                num_total_tokens: 100,
-                max_running_requests: 16,
-                total_prefill_uncached_tokens: 1,
-                total_prefill_busy_us: 1,
-            }),
-        },
-        Instant::now(),
+        native_load(1, 1),
+        now - Duration::from_secs(1),
     );
+    fixture
+        .ctx
+        .engine_load
+        .set(&fixture.workers[0].url, 0, native_load(2, 2), now);
 
     assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
     assert!(fixture.backends[0]
