@@ -1073,13 +1073,6 @@ class MambaPool:
         self.reset_replayssm_cursors(dst_indices)
 
     def get_cpu_copy(self, indices):
-        if self.replayssm_predecay_kda:
-            wp = self.replayssm_write_pos[indices]
-            base = self.replayssm_cache_base[indices]
-            assert bool((wp == 0).all().item()) and bool((base == 0).all().item()), (
-                "CPU checkpoint transfer requires a fully flushed KDA ReplaySSM "
-                "pre-decay ring."
-            )
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1096,18 +1089,36 @@ class MambaPool:
                 self.replayssm_cache_base[indices].to("cpu", non_blocking=True),
                 None,
             )
+            rings_cpu = tuple(
+                tensor[:, indices].to("cpu", non_blocking=True)
+                for tensor in (
+                    self.mamba_cache.replayssm_d,
+                    self.mamba_cache.replayssm_k,
+                    self.mamba_cache.replayssm_g,
+                )
+            )
             current_platform.synchronize()
-            return conv_cpu, temporal_cpu, cursors_cpu
+            return conv_cpu, temporal_cpu, cursors_cpu, rings_cpu
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # Accept historical 3-tuples, but only physical KDA cursors are restored.
-        cursors_cpu = None
-        if len(mamba_cache_cpu) == 3:
+        # Accept the legacy 2-tuple, the cursor-aware 3-tuple, and the bounded-KDA
+        # 4-tuple carrying pending ring records. Request-keyed GDN scratch is not
+        # restored with a physical checkpoint slot.
+        rings_cpu = None
+        if len(mamba_cache_cpu) == 4:
+            conv_cpu, temporal_cpu, cursors_cpu, rings_cpu = mamba_cache_cpu
+        elif len(mamba_cache_cpu) == 3:
             conv_cpu, temporal_cpu, cursors_cpu = mamba_cache_cpu
-        else:
+        elif len(mamba_cache_cpu) == 2:
             conv_cpu, temporal_cpu = mamba_cache_cpu
+            cursors_cpu = None
+        else:
+            raise ValueError(
+                "Mamba CPU state must contain 2, 3, or 4 tuple elements, "
+                f"got {len(mamba_cache_cpu)}."
+            )
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
@@ -1115,13 +1126,24 @@ class MambaPool:
             self.mamba_cache.temporal.device, non_blocking=True
         )
         if cursors_cpu is not None and self.replayssm_predecay_kda:
-            wp_cpu, cb_cpu, fl_cpu = cursors_cpu
+            wp_cpu, cb_cpu, _ = cursors_cpu
             self.replayssm_write_pos[indices] = wp_cpu.to(
                 self.replayssm_write_pos.device, non_blocking=True
             )
             self.replayssm_cache_base[indices] = cb_cpu.to(
                 self.replayssm_cache_base.device, non_blocking=True
             )
+            if rings_cpu is not None:
+                for tensor, tensor_cpu in zip(
+                    (
+                        self.mamba_cache.replayssm_d,
+                        self.mamba_cache.replayssm_k,
+                        self.mamba_cache.replayssm_g,
+                    ),
+                    rings_cpu,
+                    strict=True,
+                ):
+                    tensor[:, indices] = tensor_cpu.to(tensor.device, non_blocking=True)
         elif self.replayssm_predecay_kda:
             self.reset_replayssm_cursors(indices)
         current_platform.synchronize()

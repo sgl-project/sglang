@@ -750,7 +750,7 @@ def fused_recurrent_linear_replayssm_decode(
         raise ValueError(f"`force_flush` must have length B={B}.")
     if circular_replay and cache_base.shape != (B,):
         raise ValueError(
-            f"`cache_base` must have shape {(B,)} " f"(got {tuple(cache_base.shape)})."
+            f"`cache_base` must have shape {(B,)} (got {tuple(cache_base.shape)})."
         )
     if predecayed_k_cache:
         if not is_kda or not prefix_gate_cache or not circular_replay:

@@ -955,6 +955,7 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]
+        is_target_verify = forward_mode.is_target_verify()
 
         if is_target_verify and self.topk > 1:
             if (
