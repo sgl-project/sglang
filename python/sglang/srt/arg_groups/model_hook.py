@@ -60,6 +60,7 @@ def handle_model_specific_adjustments(server_args: Any):
 
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
+        dsa_has_index_topk_sharing,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -181,19 +182,37 @@ def handle_model_specific_adjustments(server_args: Any):
             # The "dsa" attention fill moved to the override registry
             # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-            index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-            index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-            if cfg.enable_two_batch_overlap and (
-                index_topk_freq > 1
-                or (index_topk_pattern is not None and "S" in index_topk_pattern)
-            ):
-                raise ValueError(
-                    "--enable-two-batch-overlap is not supported with DSA "
-                    "index-topk sharing (index_topk_freq > 1 or an "
-                    "index_topk_pattern containing shared layers): the TBO op "
-                    "path does not propagate topk indices across layers, so "
-                    "shared layers would run sparse attention without indices."
-                )
+            if cfg.enable_two_batch_overlap:
+                if cfg.enable_hisparse:
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with "
+                        "--enable-hisparse for DSA models: the two TBO "
+                        "sub-batches cannot safely share HiSparse's mutable "
+                        "prefetch buffers and events."
+                    )
+                if cfg.enable_return_indexer_topk:
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with "
+                        "--enable-return-indexer-topk for DSA models: both "
+                        "TBO sub-batches currently write the same capture "
+                        "buffer rows."
+                    )
+
+            if cfg.enable_two_batch_overlap and dsa_has_index_topk_sharing(hf_config):
+                # DP attention keeps tokens attention-local across layers, so
+                # the per-sub-batch carry needs no resharding. CP reshard, the
+                # PP merged-indices handoff, and spec seed capture would each
+                # consume indices of the unsplit batch and stay rejected.
+                if (
+                    cfg.pp_size > 1
+                    or cfg.enable_prefill_cp
+                    or cfg.speculative_algorithm is not None
+                ):
+                    raise ValueError(
+                        "--enable-two-batch-overlap with DSA index-topk "
+                        "sharing is not supported with pipeline parallelism, "
+                        "--enable-prefill-cp, or speculative decoding."
+                    )
 
             if (
                 not get_platform().is_npu and not get_platform().is_xpu
