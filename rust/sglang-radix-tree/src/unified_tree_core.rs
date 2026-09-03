@@ -312,6 +312,7 @@ pub enum PoolName {
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
+    DeepseekV4C4IndexerScale,
     DeepseekV4C128,
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
@@ -1539,13 +1540,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
             let dup_start = state.prev_prefix_len.saturating_sub(cursor);
             if dup_start < consumed_from {
-                state
-                    .pending_actions
-                    .push(CacheAction::FreeDeviceKV(vec![value_slice.narrow(
-                        0,
-                        dup_start as i64,
-                        (consumed_from - dup_start) as i64,
-                    )]));
+                // The duplicate slice may straddle this request's own eviction
+                // floor; below it only the full side is still ours to release.
+                let dup_len = consumed_from - dup_start;
+                let swa_already_freed = state
+                    .swa_evicted_seqlen
+                    .saturating_sub(cursor + dup_start)
+                    .min(dup_len);
+                if swa_already_freed > 0 {
+                    state
+                        .pending_actions
+                        .push(CacheAction::FreeDeviceKVFullOnly(vec![value_slice.narrow(
+                            0,
+                            dup_start as i64,
+                            swa_already_freed as i64,
+                        )]));
+                }
+                if swa_already_freed < dup_len {
+                    state.pending_actions.push(CacheAction::FreeDeviceKV(vec![
+                        value_slice.narrow(
+                            0,
+                            (dup_start + swa_already_freed) as i64,
+                            (dup_len - swa_already_freed) as i64,
+                        ),
+                    ]));
+                }
             }
         }
 
