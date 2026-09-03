@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
+    is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
 from sglang.utils import is_in_ci
@@ -419,11 +420,11 @@ def handle_environment_variables(server_args: Any):
                 "All operations will run eagerly through the graph capture/replay path."
             )
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120
+        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100 or SM120 GPUs with "
-            "DeepGEMM FP4 indexer support."
+            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can run
     # it, mirroring the forward scale split: the ue8m0 path
@@ -910,3 +911,32 @@ def handle_multimodal_feature_transport(server_args: Any):
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"
     )
+
+
+_ssl_verify_warned = False
+
+
+def ssl_verify_of(cfg: Any):
+    """What to pass as the requests library's ``verify=``.
+
+    A CA file means validate against it. SSL configured without one means
+    verification off -- self-signed certificates in development -- and that is
+    worth saying out loud, once. No SSL means the system CA bundle.
+
+    The warning is once per process: the message is about how this process was
+    configured, and a second engine repeating it says nothing new.
+    """
+    global _ssl_verify_warned
+    if cfg.ssl_ca_certs:
+        return cfg.ssl_ca_certs
+    if cfg.ssl_certfile:
+        if not _ssl_verify_warned:
+            logger.warning(
+                "SSL is enabled but --ssl-ca-certs was not provided. Certificate "
+                "verification is DISABLED for internal health checks. For "
+                "production deployments, provide --ssl-ca-certs or use CA-signed "
+                "certificates."
+            )
+            _ssl_verify_warned = True
+        return False
+    return True

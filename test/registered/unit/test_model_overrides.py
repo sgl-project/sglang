@@ -15,8 +15,11 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
+from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
+from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
     register_model_override,
@@ -119,15 +122,30 @@ class TestDSparkCheckpointConfig(CustomTestCase):
         self.assertTrue(get_dspark_sample_from_anchor(SimpleNamespace()))
 
 
+def _hf(quant_method=None, **kw):
+    """An hf config that states its own quantization.
+
+    `get_quantization_config(hf_config)` just reads
+    `hf_config.quantization_config["quant_method"]`, so a test says what the
+    checkpoint is by handing over a config that says it -- rather than stubbing
+    the reader in one module and hoping that is the module doing the reading.
+    """
+    if quant_method is not None:
+        kw["quantization_config"] = {"quant_method": quant_method}
+    return SimpleNamespace(**kw)
+
+
 class _IsolatedRegistry(CustomTestCase):
     """Run each test against empty registries (they are process-global)."""
 
     def setUp(self):
         super().setUp()
+        # The registries live in `model_override_base`; that is the one address
+        # to isolate, because the registrars and the collector both use it.
         self._patches = [
-            patch.dict(overrides_module.MODEL_OVERRIDES, clear=True),
-            patch.dict(overrides_module._MODEL_OVERRIDE_FNS, clear=True),
-            patch.object(overrides_module, "_PREDICATE_OVERRIDE_FNS", []),
+            patch.dict(base_module.MODEL_OVERRIDES, clear=True),
+            patch.dict(base_module._MODEL_OVERRIDE_FNS, clear=True),
+            patch.object(base_module, "_PREDICATE_OVERRIDE_FNS", []),
         ]
         for p in self._patches:
             p.start()
@@ -140,7 +158,7 @@ class _IsolatedRegistry(CustomTestCase):
 
 class TestModelOverrideRegistry(_IsolatedRegistry):
     def test_const_then_callables_in_registration_order(self):
-        overrides_module.MODEL_OVERRIDES["FakeForCausalLM"] = {"a": 1}
+        base_module.MODEL_OVERRIDES["FakeForCausalLM"] = {"a": 1}
 
         @register_model_override("FakeForCausalLM")
         def _first(server_args, hf_config):
@@ -453,7 +471,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         with override_platform(is_blackwell=False):
-            overrides = overrides_module._minicpm_sala_overrides(args, config)
+            overrides = minicpm_module._minicpm_sala_overrides(args, config)
 
         self.assertTrue(overrides["disable_radix_cache"])
         self.assertEqual(overrides["attention_backend"], "minicpm_flashattn")
@@ -657,10 +675,120 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self._publish(nvfp4)
         self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
 
+    # ---- Command-A-Plus (Cohere2Moe) MoE runner gate ----
+
+    _NVFP4_QUANT = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"targets": ["Linear"]}},
+    }
+    _FP8_QUANT = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {"group_0": {"format": "float-quantized"}},
+    }
+
+    def test_cohere2_moe_runner_gate(self):
+        """FP8 must stay on auto. flashinfer_trtllm rejects its quant info at
+        the first forward, so a wrong answer here crashes mid-serving."""
+        with override_platform(is_sm100=True):
+            nvfp4 = self._construct(
+                "Cohere2MoeForCausalLM",
+                "cohere2_moe",
+                config_extra={"quantization_config": self._NVFP4_QUANT},
+            )
+            fp8 = self._construct(
+                "Cohere2MoeForCausalLM",
+                "cohere2_moe",
+                config_extra={"quantization_config": self._FP8_QUANT},
+            )
+            bf16 = self._construct("Cohere2MoeForCausalLM", "cohere2_moe")
+            explicit = self._construct(
+                "Cohere2MoeForCausalLM",
+                "cohere2_moe",
+                config_extra={"quantization_config": self._NVFP4_QUANT},
+                moe_runner_backend="triton",
+            )
+
+        b = "moe_runner_backend"
+        self.assertEqual(self._resolved(nvfp4, b), "flashinfer_trtllm")
+        self.assertEqual(self._resolved(bf16, b), "flashinfer_trtllm")
+        self.assertEqual(self._resolved(fp8, b), "auto")
+        self.assertEqual(self._resolved(explicit, b), "triton")
+        self.assertIn(
+            (
+                "_cohere2_moe_runner_overrides",
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            ),
+            nvfp4._resolved_overrides,
+        )
+
+        # Non-SM10X keeps the existing auto behavior.
+        with override_platform(is_sm100=False):
+            non_sm10x = self._construct(
+                "Cohere2MoeForCausalLM",
+                "cohere2_moe",
+                config_extra={"quantization_config": self._NVFP4_QUANT},
+            )
+        self.assertEqual(self._resolved(non_sm10x, b), "auto")
+
+        self._publish(nvfp4)
+        self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm")
+
+        # The vision wrapper carries a text_config that holds no
+        # quantization_config of its own, so the format is read at the top level.
+        from sglang.srt.arg_groups.model_overrides.cohere2_moe import (
+            _is_nvfp4_pack_quantized,
+        )
+
+        self.assertTrue(
+            _is_nvfp4_pack_quantized(
+                SimpleNamespace(
+                    text_config=SimpleNamespace(),
+                    quantization_config=self._NVFP4_QUANT,
+                )
+            )
+        )
+
+    def test_cohere2_moe_runner_gate_fails_closed(self):
+        """A quantized checkpoint we cannot positively read as NVFP4 stays on
+        auto. Treating an unreadable config as BF16 would force the runner."""
+        from sglang.srt.arg_groups.model_overrides.cohere2_moe import (
+            _cohere2_moe_runner_overrides,
+        )
+
+        def _args(quantization):
+            # A fixture-supplied `_model_config` is what `model_config_of`
+            # hands back, so this needs no checkpoint on disk.
+            return SimpleNamespace(
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(quantization=quantization),
+            )
+
+        with override_platform(is_sm100=True):
+            # quantization_config the walk cannot read (an object, or absent
+            # because it lives in a standalone hf_quant_config.json).
+            for hf_config in (
+                SimpleNamespace(quantization_config=object()),
+                SimpleNamespace(),
+            ):
+                self.assertEqual(
+                    _cohere2_moe_runner_overrides(
+                        _args("compressed-tensors"), hf_config
+                    ),
+                    {},
+                )
+
+            # Genuinely unquantized -> trtllm-gen.
+            self.assertEqual(
+                _cohere2_moe_runner_overrides(_args(None), SimpleNamespace()),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
-        from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
+        from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
 
         def _args(**kw):
             defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
@@ -677,7 +805,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_mimo_v2_sm100_fp8_pins_flashinfer_trtllm_moe(self):
         """Blackwell FP8 must not be left on the triton fused-MoE runner."""
-        from sglang.srt.arg_groups.overrides import _mimo_v2_overrides
+        from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
 
         def _args(**kw):
             defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
@@ -685,23 +813,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return SimpleNamespace(**defaults)
 
         with override_platform(is_sm100=True):
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="fp8"
-            ):
-                self.assertEqual(
-                    _mimo_v2_overrides(_args(), None),
-                    {"moe_runner_backend": "flashinfer_trtllm"},
-                )
-                # An explicit user choice is never overwritten.
-                self.assertEqual(
-                    _mimo_v2_overrides(_args(moe_runner_backend="triton"), None), {}
-                )
+            self.assertEqual(
+                _mimo_v2_overrides(_args(), _hf("fp8")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            # An explicit user choice is never overwritten.
+            self.assertEqual(
+                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")), {}
+            )
             # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
             # pinned to flashinfer_trtllm.
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="mxfp4"
-            ):
-                self.assertEqual(_mimo_v2_overrides(_args(), None), {})
+            self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
@@ -748,7 +870,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_nemotron_h_w4a16_moe_uses_marlin_on_sm100(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(
             quantized_layers={
@@ -778,7 +902,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_nemotron_h_nvfp4_moe_keeps_flashinfer_trtllm_on_sm100(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(
             quantized_layers={
@@ -808,7 +934,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         cases = {
             True: {
@@ -836,7 +964,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         self.assertEqual(overrides[key], value)
 
     def test_nemotron_h_sm100_speculative_draft_backend_matrix(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         for algorithm in ("EAGLE", "NEXTN", "DSPARK"):
             with self.subTest(algorithm=algorithm):
@@ -864,7 +994,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
     def test_nemotron_h_sm100_speculation_preserves_explicit_cache_and_draft(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
         server_args.speculative_algorithm = "DSPARK"
@@ -884,7 +1016,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
     def test_nemotron_h_sm100_topk_tree_falls_back_to_triton(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
         server_args.speculative_algorithm = "EAGLE"
@@ -902,7 +1036,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("mamba_radix_cache_strategy", overrides)
 
     def test_nemotron_h_target_only_sm120_defers_to_generic_attention_default(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
 
@@ -915,7 +1051,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_nemotron_h_target_only_sm100_uses_trtllm_mha(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
 
@@ -929,7 +1067,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_nemotron_h_explicit_split_attention_backend_wins(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(quantized_layers={})
         server_args.speculative_algorithm = "DFLASH"
@@ -945,7 +1085,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertNotIn("speculative_draft_attention_backend", overrides)
 
     def test_nemotron_h_w4a16_moe_rejects_a2a_backend(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(
             quantized_layers={
@@ -961,7 +1103,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _nemotron_h_overrides(server_args, hf_config)
 
     def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         server_args, hf_config = self._nemotron_h_args(
             quantized_layers={
@@ -1021,7 +1165,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
 
     def test_exaone_without_pattern_declares_nothing(self):
-        from sglang.srt.arg_groups.overrides import _exaone_overrides
+        from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
 
         self.assertEqual(
             _exaone_overrides(None, SimpleNamespace(sliding_window_pattern=None)),
@@ -1049,7 +1193,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
     def test_gpt_oss_xpu_dtype_validation_reads_pristine(self):
-        from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
+        from sglang.srt.arg_groups.model_overrides.gpt_oss import _gpt_oss_overrides
 
         with override_platform(is_xpu=True):
             with self.assertRaises(NotImplementedError):
@@ -1427,7 +1571,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_deepseek_v4_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_v4_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
+            _deepseek_v4_overrides,
+        )
         from sglang.srt.server_args import ServerArgs
 
         hf = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
@@ -1540,7 +1686,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_nemotron_h_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
 
         def _hf(quant_algo="NVFP4", *, include_quantization_config=True):
             hf = SimpleNamespace(
@@ -1892,7 +2040,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _cutedsl_prefill_backend_fill(_view())
 
     def test_moss_vl_overrides_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import _moss_vl_overrides
+        from sglang.srt.arg_groups.model_overrides.moss_vl import _moss_vl_overrides
 
         def _args(**kw):
             defaults = dict(
@@ -2183,7 +2331,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
-        from sglang.srt.arg_groups.overrides import _qwen3_5_hybrid_overrides
+        from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
+            _qwen3_5_hybrid_overrides,
+        )
 
         def _args(default_backend, **kw):
             defaults = dict(
@@ -2201,7 +2351,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return args
 
         with override_platform(is_sm100=True), patch.object(
-            overrides_module,
+            qwen3_5_module,
             "get_default_attn_backend",
             lambda server_args, **_: server_args.default_backend_for_test,
         ):
@@ -2246,7 +2396,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_qwen3_5_hybrid_overrides(_args("fa3"), None), {})
 
     def test_qwen3vl_page_size(self):
-        from sglang.srt.arg_groups.overrides import _qwen3vl_overrides
+        from sglang.srt.arg_groups.model_overrides.qwen3_vl import _qwen3vl_overrides
 
         with override_platform(is_hip=True):
             with patch("sglang.srt.environ.envs.SGLANG_USE_AITER_UNIFIED_ATTN") as e:
@@ -2319,7 +2469,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_m3_fp8_attn_gemm_resolution(self):
-        from sglang.srt.arg_groups.overrides import _minimax_m3_overrides
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         def _args(**kw):
@@ -2364,9 +2516,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return ns
 
         hf = SimpleNamespace()
-        with override_platform(is_hip=False), override_platform(
-            is_sm100=True
-        ), patch.object(overrides_module, "get_quantization_config", return_value=None):
+        # `hf` carries no `quantization_config`, which is what an unquantized
+        # checkpoint looks like -- no stub needed to say so.
+        with override_platform(is_hip=False), override_platform(is_sm100=True):
             # fp8_e4m3 KV: SM100 backend default flips to trtllm_mha (the only
             # dense backend with the fp8-q GEMM path); page snaps to 128
             ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
@@ -2378,7 +2530,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["page_size"], 128)
             # e5m2 KV: stays on fa4 + the widening Triton path, and warns
             with self.assertLogs(
-                "sglang.srt.arg_groups.overrides", level="WARNING"
+                "sglang.srt.arg_groups.model_overrides.minimax_m3", level="WARNING"
             ) as logs:
                 ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e5m2"), hf)
             self.assertEqual(ov["attention_backend"], "fa4")
@@ -2505,13 +2657,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_monolith_attention_families_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
+        from sglang.srt.arg_groups.model_overrides.falcon_h1 import (
             _falcon_h1_jet_overrides,
-            _gemma4_overrides,
-            _glm4_moe_overrides,
+        )
+        from sglang.srt.arg_groups.model_overrides.gemma4 import _gemma4_overrides
+        from sglang.srt.arg_groups.model_overrides.glm4_moe import _glm4_moe_overrides
+        from sglang.srt.arg_groups.model_overrides.granitemoehybrid import (
             _granite_moe_hybrid_overrides,
-            _lfm2_overrides,
-            _llama4_overrides,
+        )
+        from sglang.srt.arg_groups.model_overrides.lfm2 import _lfm2_overrides
+        from sglang.srt.arg_groups.model_overrides.llama4 import _llama4_overrides
+        from sglang.srt.arg_groups.model_overrides.minicpmv import (
             _minicpm_v4_6_overrides,
         )
 
@@ -2673,7 +2829,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_family_order_safe_declarations(self):
-        from sglang.srt.arg_groups.overrides import _deepseek_family_overrides
+        from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+            _deepseek_family_overrides,
+        )
 
         def _args(**kw):
             defaults = dict(
@@ -2768,27 +2926,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 
     def test_qwen3_moe_family_quant_absorption(self):
-        from sglang.srt.arg_groups.overrides import _qwen3_moe_family_overrides
+        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
+            _qwen3_moe_family_overrides,
+        )
 
         with override_platform(is_sm100=True):
-            with patch.object(
-                overrides_module, "get_quantization_config", return_value="fp8"
-            ):
-                self.assertEqual(
-                    _qwen3_moe_family_overrides(
-                        SimpleNamespace(
-                            quantization=None,
-                            _quantization_explicitly_unset=False,
-                            moe_a2a_backend="none",
-                            moe_runner_backend="auto",
-                        ),
-                        SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+            self.assertEqual(
+                _qwen3_moe_family_overrides(
+                    SimpleNamespace(
+                        quantization=None,
+                        _quantization_explicitly_unset=False,
+                        moe_a2a_backend="none",
+                        moe_runner_backend="auto",
                     ),
-                    {
-                        "quantization": "fp8",
-                        "moe_runner_backend": "flashinfer_trtllm",
-                    },
-                )
+                    _hf("fp8", architectures=["Qwen3MoeForCausalLM"]),
+                ),
+                {
+                    "quantization": "fp8",
+                    "moe_runner_backend": "flashinfer_trtllm",
+                },
+            )
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
