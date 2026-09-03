@@ -165,7 +165,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # Page zero is the padding sink and is never owned by a request.
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return last_locs
@@ -476,7 +479,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        self.hisparse_attn_allocator.free(
+            buffer_indices[buffer_indices >= self.hisparse_page_size]
+        )
 
     def get_last_loc_compressed(self, last_locs: torch.Tensor):
         return (last_locs - 3) // self.compress_ratio

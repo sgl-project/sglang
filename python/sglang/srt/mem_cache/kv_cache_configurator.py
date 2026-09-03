@@ -511,6 +511,18 @@ class KVCacheConfigurator:
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # HiSparse's target allocator hands out logical IDs from its
+                # host-expanded address space. Draft KV is direct-indexed by
+                # those shared IDs, so its GPU pool must span the same space.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                page = max(int(self.pool_page_size or 1), 1)
+                draft_virtual_id_space = (
+                    (draft_virtual_id_space + page - 1) // page * page
+                )
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
@@ -1494,7 +1506,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 

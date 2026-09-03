@@ -3321,6 +3321,11 @@ class Scheduler(
         )
         batch.input_ids = None
 
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = self.future_map.make_staged_spec_input(
+                batch.req_pool_indices
+            )
+
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
