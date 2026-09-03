@@ -226,15 +226,12 @@ class SchedulerOutputStreamer:
         return True
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
-        if req.finished() and self.ps.attn_tp_rank == 0:
-            if get_observability().enable_request_time_stats_logging:
-                req.log_time_stats()
-
-            if get_observability().low_cache_hit_rate_log_threshold > 0:
-                req.log_low_cache_hit(
-                    get_observability().low_cache_hit_rate_log_threshold,
-                    get_observability().low_cache_hit_rate_log_min_input_len,
-                )
+        if (
+            req.finished()
+            and self.ps.attn_tp_rank == 0
+            and get_observability().enable_request_time_stats_logging
+        ):
+            req.log_time_stats()
 
     def _stream_output_embedding(self, reqs: List[Req]):
         rids = []

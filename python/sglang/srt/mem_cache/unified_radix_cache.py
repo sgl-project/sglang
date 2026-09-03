@@ -1704,15 +1704,15 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length < self.prefetch_threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
-            log_hicache_event(
-                event="prefetch",
-                tier="l3_to_l2",
-                result="skipped",
-                reason="below_threshold",
-                rid=req_id,
-                tokens=prefetch_length,
-                extra=f"threshold={self.prefetch_threshold}",
-            )
+                log_hicache_event(
+                    event="prefetch",
+                    tier="l3_to_l2",
+                    result="skipped",
+                    reason="below_threshold",
+                    rid=req_id,
+                    tokens=prefetch_length,
+                    extra=f"threshold={self.prefetch_threshold}",
+                )
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1

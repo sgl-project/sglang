@@ -2026,6 +2026,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "declined_rate_limited",
             "revoked_insufficient",
             "revoked_full_miss",
+            "l3_demand_requests",
             "l1l2_miss_tokens",
             "l3_miss_tokens",
             "aux_alloc_failed",

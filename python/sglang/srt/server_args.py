@@ -1697,16 +1697,6 @@ class ServerArgs:
     enable_request_time_stats_logging: A[
         bool, "Enable per request time stats logging", NS("observability")
     ] = False
-    low_cache_hit_rate_log_threshold: A[
-        float,
-        "Log a warning for finished generation requests whose cache hit rate (cached_input_len / input_len) is below this threshold. 0.0 disables",
-        NS("observability"),
-    ] = 0.0
-    low_cache_hit_rate_log_min_input_len: A[
-        int,
-        "Only log low cache hit rate for requests with at least this many input tokens, to avoid noise from tiny prompts that naturally have no cache hit. Only effective when low_cache_hit_rate_log_threshold > 0.",
-        NS("observability"),
-    ] = 64
     kv_events_config: A[
         Optional[str],
         "Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",

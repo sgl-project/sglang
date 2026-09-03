@@ -1163,7 +1163,6 @@ class Req(ReqDllmMixin):
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
-        self.has_log_low_cache_hit: bool = False
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -1830,50 +1829,23 @@ class Req(ReqDllmMixin):
             if self.bootstrap_room is not None
             else ""
         )
+        input_len = len(self.origin_input_ids)
+        hit_rate = self.cached_tokens / input_len
         prefix = (
             f"ReqTimeStats("
             f"rid={self.rid}{bootstrap_info}, "
             f"input_len={len(self.origin_input_ids)}, "
-            f"cached_input_len={self.cached_tokens}, "
-            f"output_len={len(self.output_ids)}, "
-            f"attempts={self.prefill_attempt_count}, "
-            f"type={self.time_stats.disagg_mode_str()})"
-        )
-        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
-        self.has_log_time_stats = True
-
-    def log_low_cache_hit(self, threshold: float, min_input_len: int):
-        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
-        if self.has_log_low_cache_hit:
-            return
-        # Aborted requests reset origin_input_ids to a 1-token stub, so the hit
-        # rate would be meaningless; skip them.
-        if isinstance(self.finished_reason, FINISH_ABORT):
-            return
-        input_len = len(self.origin_input_ids)
-        # Guard input_len == 0 explicitly so a caller-configured
-        # --low-cache-hit-rate-log-min-input-len 0 cannot trigger div-by-zero,
-        # then apply the minimum-input-length floor for noise filtering.
-        if input_len == 0 or input_len < min_input_len:
-            return
-        hit_rate = self.cached_tokens / input_len
-        if hit_rate >= threshold:
-            # threshold <= 0.0 -> hit_rate >= threshold always true -> disabled.
-            return
-        prefix = (
-            f"LowCacheHitRate("
-            f"rid={self.rid}, "
-            f"input_len={input_len}, "
             f"cached_input_len={self.cached_tokens}, "
             f"hit_rate={hit_rate:.3f}, "
             f"device={self.cached_tokens_device}, "
             f"host={self.cached_tokens_host}, "
             f"storage={self.cached_tokens_storage}, "
             f"output_len={len(self.output_ids)}, "
+            f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"
         )
-        logger.warning(prefix)
-        self.has_log_low_cache_hit = True
+        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        self.has_log_time_stats = True
 
     def set_finish_with_abort(self, error_msg: str):
         if get_parallel().tp_rank == 0:
