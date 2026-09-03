@@ -201,7 +201,6 @@ class DeepEPv2Buffer:
             prefer_overlap_with_compute=False,
             **extra_kwargs,
         )
-        # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
         logger.info(
@@ -246,7 +245,6 @@ class _DeepEPv2Impl:
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
-        # Read once so a mid-run env change cannot desync dispatch and combine.
         self._prefill_expand_enabled = envs.SGLANG_DEEPEP_V2_PREFILL_DO_EXPAND.get()
 
     def _destroy_handle(self) -> None:
@@ -308,8 +306,6 @@ class _DeepEPv2Impl:
         topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids.to(torch.int64)
         self._validate_common(hidden_states, topk_ids)
-        # Decode: expand+masked slab. Prefill: expanded non-masked when the env
-        # flag is set (skips ep_scatter), else non-expand; never masked.
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
         use_expand_layout = is_decode or self._prefill_expand_enabled
@@ -318,7 +314,6 @@ class _DeepEPv2Impl:
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
         if self._pad_empty_combine:
             hidden_states = hidden_states.new_zeros((1, hidden_states.shape[-1]))
-            # Dummy routes need distinct expert ids; zero weights null the result.
             topk_ids = torch.arange(
                 topk_ids.shape[-1], dtype=topk_ids.dtype, device=topk_ids.device
             ).unsqueeze(0)
@@ -326,9 +321,6 @@ class _DeepEPv2Impl:
 
         _ensure_fp8_quant_available()
         if use_expand_layout:
-            # Expanded layout (decode masked, or prefill do_expand): quantize
-            # column-major only under ue8m0. Non-ue8m0 stays row-major so the
-            # contiguous/masked GEMM runs its own tma_align on the recv scale.
             _ue8m0 = self.scale_format.ue8m0
             dispatch_x = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -344,7 +336,6 @@ class _DeepEPv2Impl:
             )
             use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
-        # This collective argument must not depend on a rank-local batch.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
         # Masked dispatch stays asynchronous for CUDA graph capture.
         do_cpu_sync_val = True
