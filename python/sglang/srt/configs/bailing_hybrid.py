@@ -210,6 +210,7 @@ class BailingHybridConfig(PretrainedConfig):
                 num_heads=self.num_attention_heads,
                 head_dim=self.head_dim,
                 conv_kernel_size=self.short_conv_kernel_size,
+                gate_lower_bound=self.kda_lower_bound,
             )
 
             return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
