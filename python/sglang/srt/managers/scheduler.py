@@ -1265,6 +1265,7 @@ class Scheduler(
             page_size=self.page_size,
             device=self.device,
             pp_group=self.pp_group,
+            world_group=self.world_group,
             pp_rank=self.ps.pp_rank,
         )
         if sizer.profile_and_fit():
