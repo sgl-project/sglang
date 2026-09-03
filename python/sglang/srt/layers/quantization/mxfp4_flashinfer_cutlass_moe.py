@@ -135,18 +135,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self._use_flashinfer_megamoe:
-            # create_weights() deliberately kept checkpoint E8M0 scales in
-            # their native dtype. Do not call the borrowed Fp8 method here:
-            # SGLang's existing DeepGEMM MegaMoE branch would transform both
-            # weights and scales before the FlashInfer adapter can take them.
-            for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-                scale = getattr(layer, name)
-                if scale.dtype != torch.float8_e8m0fnu:
-                    raise TypeError(
-                        f"{name} must remain native E8M0 for FlashInfer MegaMoE, "
-                        f"got {scale.dtype}."
-                    )
-
+            # Leave checkpoint weights and scales to FlashInfer's preprocessor.
             from sglang.srt.layers.moe.flashinfer_mega_moe import (
                 finalize_flashinfer_megamoe_weights,
             )
@@ -155,7 +144,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
                 layer,
                 max_num_tokens=get_exec().moe.flashinfer_megamoe_max_num_tokens,
             )
-            layer._dsv4_mxfp4_backend = "flashinfer_megamoe_sm120"
             return
 
         # Preserve the base FP4 post-load handling.

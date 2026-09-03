@@ -378,7 +378,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-        self.use_flashinfer_megamoe = get_moe_runner_backend().is_flashinfer_megamoe()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
@@ -642,18 +641,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
             layer._mxfp4_backend = "marlin"
-            return
-
-        if self.use_flashinfer_megamoe:
-            from sglang.srt.layers.moe.flashinfer_mega_moe import (
-                finalize_flashinfer_megamoe_weights,
-            )
-
-            finalize_flashinfer_megamoe_weights(
-                layer,
-                max_num_tokens=get_exec().moe.flashinfer_megamoe_max_num_tokens,
-            )
-            layer._mxfp4_backend = "flashinfer_megamoe"
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
@@ -1459,10 +1446,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "trtllm_sm100",
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        elif moe_runner_backend.is_flashinfer_megamoe():
-            # FlashInfer MegaMoE owns dispatch, both GEMMs and combine, so it
-            # bypasses the ordinary per-expert MoeRunner.
-            self.runner = None
         else:
             raise NotImplementedError(
                 f"Mxfp4MoEMethod has no MoeRunner for backend={moe_runner_backend} "
