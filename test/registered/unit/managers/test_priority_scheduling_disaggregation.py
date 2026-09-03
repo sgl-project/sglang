@@ -2,15 +2,18 @@ import json
 import sys
 import threading
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.common.conn import KVTransferError  # noqa: E402
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
+    _resolve_kv_failure,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
@@ -39,6 +42,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler.ipc_channels = MagicMock()
+        scheduler.output_streamer = MagicMock()
         return scheduler
 
     def _new_req(self, priority=None):
@@ -49,6 +53,12 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req.weight_version_events = []
         req.time_stats = MagicMock()
         req.time_stats.trace_ctx = MagicMock()
+        req.to_finish = None
+        req.finished_reason = None
+        req.return_logprob = False
+        req.bootstrap_room = 17
+        req.bootstrap_host = "127.0.0.1"
+        req.disagg_kv_sender = None
         return req
 
     def test_prefill_mode_assigns_default_priority_before_bootstrap_queue(self):
@@ -88,6 +98,94 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_called_once()
         req.time_stats.trace_ctx.abort.assert_called_once()
+
+    def test_prefill_aborted_request_notifies_decode_without_queueing(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_req()
+        req.to_finish = FINISH_ABORT(
+            "Input is too long", HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+        sender = MagicMock()
+        sender.kv_mgr = MagicMock()
+
+        def create_sender(request, _num_kv_heads):
+            request.disagg_kv_sender = sender
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
+            create_sender
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.assert_called_once_with(
+            req, 8
+        )
+        sender.kv_mgr.record_failure.assert_called_once_with(
+            17, "Input is too long", HTTPStatus.BAD_REQUEST
+        )
+        sender.abort.assert_called_once_with()
+        sender.kv_mgr.try_notify_decode_failure_and_clear.assert_called_once_with(17)
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.to_finish)
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+    def test_decode_aborted_request_skips_preallocation(self):
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        req = self._new_req()
+        req.to_finish = FINISH_ABORT(
+            "Input is too long", HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(req.to_finish)
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+    def test_prefill_abort_response_survives_decode_notification_failure(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_req()
+        req.to_finish = FINISH_ABORT("Input is too long")
+        sender = MagicMock()
+        sender.kv_mgr.try_notify_decode_failure_and_clear.side_effect = RuntimeError(
+            "decode unavailable"
+        )
+
+        def create_sender(request, _num_kv_heads):
+            request.disagg_kv_sender = sender
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
+            create_sender
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
+
+    def test_prefill_abort_supports_fake_backend_without_failure_records(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        req = self._new_req()
+        req.to_finish = FINISH_ABORT("Input is too long")
+        sender = MagicMock()
+        sender.kv_mgr = SimpleNamespace()
+
+        def create_sender(request, _num_kv_heads):
+            request.disagg_kv_sender = sender
+            return True
+
+        scheduler.disagg_prefill_bootstrap_queue.create_sender.side_effect = (
+            create_sender
+        )
+
+        scheduler._add_request_to_queue(req)
+
+        sender.abort.assert_called_once_with()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 class TestDecodePreallocQueuePriority(unittest.TestCase):
@@ -220,6 +318,35 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
+
+
+class TestDecodeFailurePropagation(unittest.TestCase):
+    def test_prefill_failure_preserves_reason_and_http_status(self):
+        receiver = MagicMock()
+        receiver.failure_exception.side_effect = KVTransferError(
+            17,
+            "Input is too long",
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+        message, is_propagated, status_code = _resolve_kv_failure(
+            receiver, "Decode transfer failed"
+        )
+
+        self.assertEqual(message, "Input is too long")
+        self.assertFalse(is_propagated)
+        self.assertEqual(status_code, HTTPStatus.BAD_REQUEST)
+
+    def test_untyped_transfer_failure_remains_internal_server_error(self):
+        receiver = MagicMock()
+        receiver.failure_exception.side_effect = RuntimeError("network down")
+
+        message, _, status_code = _resolve_kv_failure(
+            receiver, "Decode transfer failed"
+        )
+
+        self.assertIn("network down", message)
+        self.assertEqual(status_code, HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
