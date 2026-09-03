@@ -16,6 +16,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
 try:
@@ -29,6 +30,17 @@ except Exception as e:  # triton is not installed on every CPU runner
     _conv_multi_build_meta = None
     build_conv_slot_descriptor = None
     _IMPORT_ERROR = e
+
+
+def _accelerator_or_none():
+    """The local accelerator, or None: ``get_device()`` raises on a CPU-only host."""
+    try:
+        return get_device()
+    except RuntimeError:
+        return None
+
+
+ACCEL = _accelerator_or_none()
 
 # A base address from the issue report; the top bit is set.
 _HIGH_BASE = 0xFFFF85ABD4E00000
@@ -123,6 +135,27 @@ class TestPtrTableCallSites(CustomTestCase):
             self.assertTrue(
                 torch.equal(getattr(desc, field), getattr(real_desc, field)), field
             )
+
+
+@unittest.skipUnless(ACCEL is not None, "needs an accelerator")
+class TestPtrTableOnDeviceMemory(CustomTestCase):
+    """A backend that cannot build ``uint64`` on-device, or ``view`` it back to
+    ``int64``, breaks every call site while the CPU cases above stay green."""
+
+    def test_device_table_round_trips_high_address(self):
+        t = _spoof(torch.zeros(1024, device=ACCEL, dtype=torch.bfloat16), 0)
+        table = make_ptr_table([t.data_ptr()], device=ACCEL)
+        self.assertEqual(table.dtype, torch.int64)
+        self.assertEqual(table.device.type, torch.device(ACCEL).type)
+        self.assertEqual(table.view(torch.uint64).cpu().tolist(), [t.data_ptr()])
+
+    def test_real_device_pointer_round_trips(self):
+        ptrs = [
+            torch.zeros(1024, device=ACCEL, dtype=torch.bfloat16).data_ptr()
+            for _ in range(2)
+        ]
+        table = make_ptr_table(ptrs, device=ACCEL)
+        self.assertEqual(table.view(torch.uint64).cpu().tolist(), ptrs)
 
 
 if __name__ == "__main__":
