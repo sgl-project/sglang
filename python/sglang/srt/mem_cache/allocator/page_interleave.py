@@ -110,8 +110,8 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             torch.empty((0,), dtype=torch.int64, device=self.device)
             for _ in range(self.shard_size)
         ]
-        self.is_not_in_free_group = True
-        self.free_group = []
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group = None
         # free_segment() routes back to free(), so this stays empty; the paged
         # base's free_group_end() reads it unconditionally.
         self.free_page_reps_group = []
@@ -321,7 +321,7 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        if not self.is_not_in_free_group:
+        if self.free_group is not None:
             # Match the base allocator's ownership contract: callers may
             # overwrite req_to_token views before free_group_end consumes the
             # deferred indices.
@@ -371,25 +371,26 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
 
     def resize(self, config) -> None:
         raise NotImplementedError(
-            "post-capture KV resizing is not supported under logical-page "
-            "KV sharding"
+            "post-capture KV resizing is not supported under logical-page KV sharding"
         )
 
-    def debug_all_free_pages(self) -> torch.Tensor:
+    def get_all_free_pages(self) -> torch.Tensor:
         """All free logical page ids across classes (free + release) — for
         the scheduler invariant checker's use-after-free / double-free sweep
-        (page unit = the physical page = self.page_size)."""
+        (page unit = the physical page = self.page_size). The paged base
+        reads the flat lists this allocator neutralizes, so the classed
+        census is the override."""
         return torch.cat(self.class_free_pages + self.class_release_pages)
 
     def debug_check_classes(self):
         for r in range(self.shard_size):
             merged = torch.cat((self.class_free_pages[r], self.class_release_pages[r]))
-            assert bool(
-                (merged % self.shard_size == r).all()
-            ), f"page of another owner leaked into class {r}"
-            assert len(torch.unique(merged)) == len(
-                merged
-            ), f"double free: duplicate pages in class {r}"
+            assert bool((merged % self.shard_size == r).all()), (
+                f"page of another owner leaked into class {r}"
+            )
+            assert len(torch.unique(merged)) == len(merged), (
+                f"double free: duplicate pages in class {r}"
+            )
 
 
 def page_interleave_shard_size(allocator: BaseTokenToKVPoolAllocator) -> int:
