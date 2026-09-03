@@ -93,16 +93,25 @@ class TestGlm5NextPerLayerDims(unittest.TestCase):
             self.assertEqual(self.dims("b_proj", layer), (HIDDEN, KDA_HEADS))
             self.assertEqual(self.dims("f_a_proj", layer), (HIDDEN, KDA_HEAD_DIM))
             self.assertEqual(self.dims("g_a_proj", layer), (HIDDEN, KDA_HEAD_DIM))
-            self.assertEqual(self.dims("f_b_proj", layer), (KDA_HEAD_DIM, self.kda_proj))
-            self.assertEqual(self.dims("g_b_proj", layer), (KDA_HEAD_DIM, self.kda_proj))
+            self.assertEqual(
+                self.dims("f_b_proj", layer), (KDA_HEAD_DIM, self.kda_proj)
+            )
+            self.assertEqual(
+                self.dims("g_b_proj", layer), (KDA_HEAD_DIM, self.kda_proj)
+            )
 
     def test_dsa_projections(self):
         for layer in (1, 3):
             # o_proj follows the MLA value geometry on DSA layers, the KDA geometry elsewhere
             self.assertEqual(self.dims("o_proj", layer), (N_HEADS * V_HEAD, HIDDEN))
-            self.assertEqual(self.dims("fused_qkv_a_proj_with_mqa", layer), (HIDDEN, Q_LORA + KV_LORA))
+            self.assertEqual(
+                self.dims("fused_qkv_a_proj_with_mqa", layer),
+                (HIDDEN, Q_LORA + KV_LORA),
+            )
             self.assertEqual(self.dims("q_b_proj", layer), (Q_LORA, N_HEADS * QK_NOPE))
-            self.assertEqual(self.dims("kv_b_proj", layer), (KV_LORA, N_HEADS * (QK_NOPE + V_HEAD)))
+            self.assertEqual(
+                self.dims("kv_b_proj", layer), (KV_LORA, N_HEADS * (QK_NOPE + V_HEAD))
+            )
         self.assertNotEqual(self.dims("o_proj", 0), self.dims("o_proj", 1))
 
     def test_mlp_dense_vs_moe(self):
@@ -112,14 +121,18 @@ class TestGlm5NextPerLayerDims(unittest.TestCase):
         for layer in (1, 2, 3):
             self.assertEqual(self.dims("gate_up_proj", layer), (HIDDEN, 2 * shared))
             self.assertEqual(self.dims("down_proj", layer), (shared, HIDDEN))
-            self.assertEqual(self.dims("gate_up_proj_moe", layer), (HIDDEN, 2 * MOE_INTER))
+            self.assertEqual(
+                self.dims("gate_up_proj_moe", layer), (HIDDEN, 2 * MOE_INTER)
+            )
             self.assertEqual(self.dims("down_proj_moe", layer), (MOE_INTER, HIDDEN))
 
     def test_generic_fallback_for_kda_gates(self):
         # models without the per-layer hook still get the KDA gate geometry from linear_attn_config
         cfg = self.model.config
         self.assertEqual(get_default_hidden_dim("b_proj", cfg, 0), (HIDDEN, KDA_HEADS))
-        self.assertEqual(get_default_hidden_dim("f_b_proj", cfg, 0), (KDA_HEAD_DIM, self.kda_proj))
+        self.assertEqual(
+            get_default_hidden_dim("f_b_proj", cfg, 0), (KDA_HEAD_DIM, self.kda_proj)
+        )
 
 
 class TestKdaGateRegistration(unittest.TestCase):
@@ -140,7 +153,15 @@ class TestKdaGateRegistration(unittest.TestCase):
             self.assertIn(name, ATTN_TP_LORA_MODULE_NAMES)
 
     def test_supported_modules_declared(self):
-        for name in ("qkv_proj", "o_proj", "fused_qkv_a_proj_with_mqa", "q_b_proj", "kv_b_proj", "gate_up_proj", "down_proj"):
+        for name in (
+            "qkv_proj",
+            "o_proj",
+            "fused_qkv_a_proj_with_mqa",
+            "q_b_proj",
+            "kv_b_proj",
+            "gate_up_proj",
+            "down_proj",
+        ):
             self.assertIn(name, Glm5NextForConditionalGeneration.supported_lora_modules)
         for name in KDA_GATE_LORA_NAMES:
             self.assertIn(name, Glm5NextForConditionalGeneration.supported_lora_modules)
