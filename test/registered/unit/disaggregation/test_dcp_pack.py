@@ -12,7 +12,6 @@ from sglang.srt.disaggregation.common.dcp_pack import (
     try_pack_dcp_src,
 )
 from sglang.srt.disaggregation.common.utils import (
-    build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
 )
@@ -37,14 +36,14 @@ class TestPackedDcpGrouping(CustomTestCase):
             num_kv_tokens=256,
         )
         raw_src, _ = group_concurrent_contiguous(
-            plan.src_token_indices, plan.dst_token_indices
+            plan.target_src_token_indices, plan.target_dst_token_indices
         )
         self.assertEqual(len(raw_src), 64)
         self.assertTrue(all(len(group) == 1 for group in raw_src))
 
-        packed_src = np.arange(plan.dst_token_indices.size, dtype=np.int64)
+        packed_src = np.arange(plan.target_dst_token_indices.size, dtype=np.int64)
         packed_groups, _ = group_concurrent_contiguous(
-            packed_src, plan.dst_token_indices
+            packed_src, plan.target_dst_token_indices
         )
         self.assertEqual(len(packed_groups), 1)
         self.assertEqual(len(packed_groups[0]), 64)
@@ -58,25 +57,9 @@ class TestReplicatedDcpPlan(CustomTestCase):
         src_pages = np.array([5, 2, 11, 4], dtype=np.int32)
         dst_pages = np.array([7], dtype=np.int32)
 
-        replicated = build_dcp_replicated_token_transfer_plan(
-            src_pages,
-            dst_pages,
-            physical_page_size=page_size,
-            dcp_size=dcp_size,
-            num_kv_tokens=256,
-        )
         offsets = np.arange(256, dtype=np.int64)
-        np.testing.assert_array_equal(
-            replicated.src_token_indices,
-            src_pages.astype(np.int64)[offsets // page_size] * page_size
-            + offsets % page_size,
-        )
-        np.testing.assert_array_equal(
-            replicated.dst_token_indices, 7 * virtual_page_size + offsets
-        )
-
         for dcp_rank in range(dcp_size):
-            strided = build_dcp_token_transfer_plan(
+            plan = build_dcp_token_transfer_plan(
                 src_pages,
                 dst_pages,
                 physical_page_size=page_size,
@@ -84,13 +67,21 @@ class TestReplicatedDcpPlan(CustomTestCase):
                 dcp_rank=dcp_rank,
                 num_kv_tokens=256,
             )
-            owned = replicated.dst_token_indices % dcp_size == dcp_rank
             np.testing.assert_array_equal(
-                replicated.dst_token_indices[owned] // dcp_size,
-                strided.dst_token_indices,
+                plan.draft_src_token_indices,
+                src_pages.astype(np.int64)[offsets // page_size] * page_size
+                + offsets % page_size,
             )
             np.testing.assert_array_equal(
-                replicated.src_token_indices[owned], strided.src_token_indices
+                plan.draft_dst_token_indices, 7 * virtual_page_size + offsets
+            )
+            owned = plan.draft_dst_token_indices % dcp_size == dcp_rank
+            np.testing.assert_array_equal(
+                plan.draft_dst_token_indices[owned] // dcp_size,
+                plan.target_dst_token_indices,
+            )
+            np.testing.assert_array_equal(
+                plan.draft_src_token_indices[owned], plan.target_src_token_indices
             )
 
     def test_second_chunk_continues_the_delta_space(self):
@@ -99,18 +90,19 @@ class TestReplicatedDcpPlan(CustomTestCase):
         virtual_page_size = page_size * dcp_size
         src_pages = np.array([9, 3], dtype=np.int32)
         dst_pages = np.array([4, 6], dtype=np.int32)
-        plan = build_dcp_replicated_token_transfer_plan(
+        plan = build_dcp_token_transfer_plan(
             src_pages,
             dst_pages,
             physical_page_size=page_size,
             dcp_size=dcp_size,
+            dcp_rank=0,
             src_page_offset=2,
             decode_prefix_len=virtual_page_size,
             num_kv_tokens=128,
         )
         relative = 2 * page_size + np.arange(128, dtype=np.int64)
         np.testing.assert_array_equal(
-            plan.dst_token_indices,
+            plan.draft_dst_token_indices,
             np.where(relative < virtual_page_size, 4, 6) * virtual_page_size
             + relative % virtual_page_size,
         )

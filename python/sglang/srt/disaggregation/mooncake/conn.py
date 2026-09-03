@@ -37,7 +37,6 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
-    build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -952,24 +951,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
         )
-        draft_plan = None
-        if num_draft > 0:
-            draft_plan = build_dcp_replicated_token_transfer_plan(
-                prefill_kv_indices,
-                dst_kv_indices,
-                physical_page_size=physical_page_size,
-                dcp_size=dst_dcp_size,
-                src_page_offset=src_page_offset,
-                decode_prefix_len=decode_prefix_len,
-                num_kv_tokens=num_kv_tokens,
-            )
-        if plan.src_token_indices.size == 0 and (
-            draft_plan is None or draft_plan.src_token_indices.size == 0
-        ):
+        if plan.empty():
             return 0
 
         target_src_kv_ptrs = src_kv_ptrs[:num_target]
-        src_token_indices = plan.src_token_indices
+        src_token_indices = plan.target_src_token_indices
         if pack_buffer is not None and src_token_indices.size:
             from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
 
@@ -986,7 +972,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if src_token_indices.size:
             target_groups = group_concurrent_contiguous(
                 src_token_indices,
-                plan.dst_token_indices,
+                plan.target_dst_token_indices,
             )
             layers_params += [
                 (
@@ -997,10 +983,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for entry in range(num_target)
             ]
-        if draft_plan is not None and draft_plan.src_token_indices.size:
+        if num_draft > 0 and plan.draft_src_token_indices.size:
             draft_groups = group_concurrent_contiguous(
-                draft_plan.src_token_indices,
-                draft_plan.dst_token_indices,
+                plan.draft_src_token_indices,
+                plan.draft_dst_token_indices,
             )
             layers_params += [
                 (

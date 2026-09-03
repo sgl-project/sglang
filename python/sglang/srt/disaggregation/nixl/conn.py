@@ -34,7 +34,6 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
-    build_dcp_replicated_token_transfer_plan,
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
@@ -1248,26 +1247,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                     decode_prefix_len=req.decode_prefix_len or 0,
                                     num_kv_tokens=kv_chunk.num_kv_tokens,
                                 )
-                                draft_plan = None
-                                if self.kv_args.num_draft_entries > 0:
-                                    draft_plan = (
-                                        build_dcp_replicated_token_transfer_plan(
-                                            src_prefill_kv_indices,
-                                            chunked_dst_kv_indice,
-                                            physical_page_size=self.kv_args.page_size,
-                                            dcp_size=dst_info.dst_dcp_size,
-                                            src_page_offset=(
-                                                kv_chunk.index_slice.start or 0
-                                            ),
-                                            decode_prefix_len=req.decode_prefix_len
-                                            or 0,
-                                            num_kv_tokens=kv_chunk.num_kv_tokens,
-                                        )
-                                    )
                                 packed_src = self._pack_dcp_rank_once(
                                     pack_buffer,
                                     dst_info,
-                                    plan.src_token_indices,
+                                    plan.target_src_token_indices,
                                     packed_source_by_dcp_rank,
                                 )
                                 handles.extend(
@@ -1277,7 +1260,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                         plan,
                                         notif,
                                         packed_src,
-                                        draft_plan=draft_plan,
                                     )
                                 )
                             elif (
@@ -1735,7 +1717,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         plan,
         notif: str,
         packed_src,
-        draft_plan=None,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -1751,9 +1732,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ]
 
         parts = []
-        if plan.src_token_indices.size:
+        if plan.target_src_token_indices.size:
             src_kv_ptrs = self.kv_args.kv_data_ptrs[:num_target]
-            src_token_indices = plan.src_token_indices
+            src_token_indices = plan.target_src_token_indices
             if packed_src is not None:
                 src_kv_ptrs, src_token_indices = packed_src
             parts.append(
@@ -1762,21 +1743,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_kv_ptrs[:num_target],
                     token_item_lens[:num_target],
                     src_token_indices,
-                    plan.dst_token_indices,
+                    plan.target_dst_token_indices,
                 )
             )
-        if (
-            num_draft > 0
-            and draft_plan is not None
-            and draft_plan.src_token_indices.size
-        ):
+        if num_draft > 0 and plan.draft_src_token_indices.size:
             parts.append(
                 (
                     self.kv_args.kv_data_ptrs[num_target:],
                     dst_kv_ptrs[num_target:],
                     token_item_lens[num_target:],
-                    draft_plan.src_token_indices,
-                    draft_plan.dst_token_indices,
+                    plan.draft_src_token_indices,
+                    plan.draft_dst_token_indices,
                 )
             )
 

@@ -137,58 +137,16 @@ def group_concurrent_contiguous(
 
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
-    src_token_indices: npt.NDArray[np.int64]
-    dst_token_indices: npt.NDArray[np.int64]
+    target_src_token_indices: npt.NDArray[np.int64]
+    target_dst_token_indices: npt.NDArray[np.int64]
+    draft_src_token_indices: npt.NDArray[np.int64]
+    draft_dst_token_indices: npt.NDArray[np.int64]
 
-
-def _validate_dcp_plan_inputs(
-    src_page_indices: npt.NDArray[np.int32],
-    dst_page_indices: npt.NDArray[np.int32],
-    *,
-    physical_page_size: int,
-    dcp_size: int,
-    decode_prefix_len: int,
-    num_kv_tokens: Optional[int],
-) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], int]:
-    virtual_page_size = physical_page_size * dcp_size
-    if decode_prefix_len % virtual_page_size != 0:
-        raise ValueError(
-            "PD DCP transfer requires decode_prefix_len to align to the virtual "
-            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+    def empty(self) -> bool:
+        return (
+            self.target_src_token_indices.size == 0
+            and self.draft_src_token_indices.size == 0
         )
-
-    src_pages = np.asarray(src_page_indices, dtype=np.int64)
-    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
-    source_capacity = src_pages.size * physical_page_size
-    if num_kv_tokens is None:
-        num_kv_tokens = source_capacity
-    if not 0 <= num_kv_tokens <= source_capacity:
-        raise ValueError(
-            "num_kv_tokens must fit in the provided source pages, "
-            f"got tokens={num_kv_tokens}, capacity={source_capacity}"
-        )
-    return src_pages, dst_pages, num_kv_tokens
-
-
-def _dcp_dst_page_ordinals(
-    dst_pages: npt.NDArray[np.int64],
-    dst_local_offsets: npt.NDArray[np.int64],
-    page_size: int,
-    *,
-    src_page_offset: int,
-    context: str,
-) -> npt.NDArray[np.int64]:
-    dst_page_ordinals = dst_local_offsets // page_size
-    if dst_page_ordinals.size and (
-        dst_pages.size == 0 or int(dst_page_ordinals.max()) >= dst_pages.size
-    ):
-        required_pages = int(dst_page_ordinals.max()) + 1
-        raise ValueError(
-            "Insufficient destination DCP pages: "
-            f"required={required_pages}, provided={dst_pages.size}, "
-            f"src_page_offset={src_page_offset}, {context}"
-        )
-    return dst_page_ordinals
 
 
 def build_dcp_token_transfer_plan(
@@ -202,83 +160,38 @@ def build_dcp_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
 ) -> DCPTokenTransferPlan:
-    src_pages, dst_pages, num_kv_tokens = _validate_dcp_plan_inputs(
-        src_page_indices,
-        dst_page_indices,
-        physical_page_size=physical_page_size,
-        dcp_size=dcp_size,
-        decode_prefix_len=decode_prefix_len,
-        num_kv_tokens=num_kv_tokens,
-    )
-    if src_pages.size == 0:
-        empty = np.empty((0,), dtype=np.int64)
-        return DCPTokenTransferPlan(empty, empty.copy())
-
-    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
-    first_owned_offset = (dcp_rank - chunk_start) % dcp_size
-    owned_offsets = np.arange(
-        first_owned_offset, num_kv_tokens, dcp_size, dtype=np.int64
-    )
-    src_token_indices = (
-        src_pages[owned_offsets // physical_page_size] * physical_page_size
-        + owned_offsets % physical_page_size
-    )
-
-    relative_positions = src_page_offset * physical_page_size + owned_offsets
-    dst_local_offsets = relative_positions // dcp_size
-    dst_page_ordinals = _dcp_dst_page_ordinals(
-        dst_pages,
-        dst_local_offsets,
-        physical_page_size,
-        src_page_offset=src_page_offset,
-        context=f"dcp_rank={dcp_rank}",
-    )
-    dst_token_indices = (
-        dst_pages[dst_page_ordinals] * physical_page_size
-        + dst_local_offsets % physical_page_size
-    )
-    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
-
-
-def build_dcp_replicated_token_transfer_plan(
-    src_page_indices: npt.NDArray[np.int32],
-    dst_page_indices: npt.NDArray[np.int32],
-    *,
-    physical_page_size: int,
-    dcp_size: int,
-    src_page_offset: int = 0,
-    decode_prefix_len: int = 0,
-    num_kv_tokens: Optional[int] = None,
-) -> DCPTokenTransferPlan:
-    src_pages, dst_pages, num_kv_tokens = _validate_dcp_plan_inputs(
-        src_page_indices,
-        dst_page_indices,
-        physical_page_size=physical_page_size,
-        dcp_size=dcp_size,
-        decode_prefix_len=decode_prefix_len,
-        num_kv_tokens=num_kv_tokens,
-    )
-    if src_pages.size == 0 or num_kv_tokens == 0:
-        empty = np.empty((0,), dtype=np.int64)
-        return DCPTokenTransferPlan(empty, empty.copy())
-
-    offsets = np.arange(num_kv_tokens, dtype=np.int64)
-    src_token_indices = (
-        src_pages[offsets // physical_page_size] * physical_page_size
-        + offsets % physical_page_size
-    )
-
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
     virtual_page_size = physical_page_size * dcp_size
-    relative_positions = src_page_offset * physical_page_size + offsets
-    dst_page_ordinals = _dcp_dst_page_ordinals(
-        dst_pages,
-        relative_positions,
-        virtual_page_size,
-        src_page_offset=src_page_offset,
-        context="replicated draft rows",
+    if decode_prefix_len % virtual_page_size != 0:
+        raise ValueError(
+            "PD DCP transfer requires decode_prefix_len to align to the virtual "
+            f"DCP page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+    if num_kv_tokens is None:
+        num_kv_tokens = src_pages.size * physical_page_size
+    if num_kv_tokens == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return DCPTokenTransferPlan(empty, empty.copy(), empty.copy(), empty.copy())
+
+    def rows(offsets, dst_page_size, dst_local):
+        return (
+            src_pages[offsets // physical_page_size] * physical_page_size
+            + offsets % physical_page_size,
+            dst_pages[dst_local // dst_page_size] * dst_page_size
+            + dst_local % dst_page_size,
+        )
+
+    draft_offsets = np.arange(num_kv_tokens, dtype=np.int64)
+    draft_local = src_page_offset * physical_page_size + draft_offsets
+    chunk_start = decode_prefix_len + src_page_offset * physical_page_size
+    target_offsets = np.arange(
+        (dcp_rank - chunk_start) % dcp_size,
+        num_kv_tokens,
+        dcp_size,
+        dtype=np.int64,
     )
-    dst_token_indices = (
-        dst_pages[dst_page_ordinals] * virtual_page_size
-        + relative_positions % virtual_page_size
-    )
-    return DCPTokenTransferPlan(src_token_indices, dst_token_indices)
+    target_local = (src_page_offset * physical_page_size + target_offsets) // dcp_size
+    target_src, target_dst = rows(target_offsets, physical_page_size, target_local)
+    draft_src, draft_dst = rows(draft_offsets, virtual_page_size, draft_local)
+    return DCPTokenTransferPlan(target_src, target_dst, draft_src, draft_dst)
