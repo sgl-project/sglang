@@ -87,6 +87,16 @@ def gen_prompt(tokenizer, token_num):
 def get_available_multimodal_text_tokens(tokenizer, image_pad_id):
     """Get valid token ids for synthetic multimodal text prompts."""
     excluded_token_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    # Media placeholders are not always registered as special tokens. MiniMax-M3, for
+    # example, keeps `]<]video[>[` in the added vocabulary only, so it stays sampleable
+    # here and `tokenizer.decode` renders it verbatim into the prompt text. The server
+    # resolves that text to a video modality, finds no video attached to the request,
+    # and rejects it with HTTP 400 "No data iterator found for token". Excluding the
+    # added vocabulary covers image, video and audio placeholders for any model, rather
+    # than only the image id the callers are able to pass in.
+    get_added_vocab = getattr(tokenizer, "get_added_vocab", None)
+    if callable(get_added_vocab):
+        excluded_token_ids.update((get_added_vocab() or {}).values())
     if image_pad_id is not None:
         excluded_token_ids.add(image_pad_id)
     return [
