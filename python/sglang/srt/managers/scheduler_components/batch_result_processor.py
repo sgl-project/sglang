@@ -912,11 +912,14 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
-        self.metrics_reporter.num_generated_tokens += len(batch.reqs)
+        batch_size = batch.batch_size()
+        num_generated_tokens = result.get_num_generated_tokens(batch_size)
+        self.metrics_reporter.num_generated_tokens += num_generated_tokens
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(),
+                batch_size,
                 result.num_correct_drafts,
+                num_accept_tokens=num_generated_tokens,
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
@@ -1021,7 +1024,7 @@ class SchedulerBatchResultProcessor:
         self.metrics_reporter.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_correct_drafts=result.num_correct_drafts,
+            num_generated_tokens=num_generated_tokens,
         )
 
     def _normalize_decode_outputs(

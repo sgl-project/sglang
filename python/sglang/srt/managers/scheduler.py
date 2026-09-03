@@ -4445,7 +4445,7 @@ class Scheduler(
                 self.decode_moment_totals,
                 batch_size,
                 step_us,
-                batch_size + result.num_correct_drafts,
+                result.get_num_generated_tokens(batch_size),
             )
 
     def maybe_send_health_check_signal(self):

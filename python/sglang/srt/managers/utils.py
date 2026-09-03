@@ -123,6 +123,9 @@ class GenerationBatchResult:
         this rank/split (a non-last PP rank or a non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
+    def get_num_generated_tokens(self, batch_size: int) -> int:
+        return self.num_correct_drafts + batch_size * self.num_non_draft_tokens_per_req
+
     @torch.profiler.record_function("copy_result_to_cpu")
     def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
         """Copy tensors to CPU in overlap scheduling.
