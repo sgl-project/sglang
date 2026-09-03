@@ -1966,7 +1966,6 @@ def run_benchmark(args_: argparse.Namespace):
     global args
     args = normalize_benchmark_args(args_)
 
-
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
 
