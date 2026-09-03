@@ -544,6 +544,8 @@ class TransformersBase(nn.Module):
             "model.score.": "classifier.",
             "model.classifier.": "classifier.",
             "transformer.": "model.",
+            "gpt_neox.": "model.",
+            "embed_out.": "lm_head.",
             "model.": "model.",
             "lm_head.": "lm_head.",
             "score.": "classifier.",
@@ -581,7 +583,9 @@ class TransformersBase(nn.Module):
         self.skip_substrs: list[str] = []
         self.ignore_unexpected_prefixes: list[str] = []
         self.ignore_unexpected_suffixes: list[str] = []
-        self.skip_substrs.extend([".attn.bias", ".attn.masked_bias", ".masked_bias"])
+        self.skip_substrs.extend(
+            [".attn.bias", ".attn.masked_bias", ".attention.bias", ".masked_bias"]
+        )
         self.ignore_unexpected_prefixes.extend(["classifier.", "score."])
 
         if self.quant_config is not None:
@@ -1073,9 +1077,9 @@ class TransformersBase(nn.Module):
             )
 
         if get_embedding:
-            assert (
-                self.pooler is not None
-            ), "pooling is not enabled for this model class"
+            assert self.pooler is not None, (
+                "pooling is not enabled for this model class"
+            )
             return self.pooler(hidden_states, forward_batch)
 
         assert self.logits_processor is not None and self.lm_head is not None
@@ -1096,7 +1100,6 @@ class TransformersBase(nn.Module):
 
 
 class CausalMixin:
-
     def __init__(self, *args, prefix: str = "", **kwargs):
         super().__init__(*args, prefix=prefix, **kwargs)
 
@@ -1124,7 +1127,6 @@ class CausalMixin:
 
 
 class EmbeddingMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ignore_unexpected_prefixes.append("lm_head.")
@@ -1137,7 +1139,6 @@ class EmbeddingMixin:
 
 
 class MoEMixin:
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
