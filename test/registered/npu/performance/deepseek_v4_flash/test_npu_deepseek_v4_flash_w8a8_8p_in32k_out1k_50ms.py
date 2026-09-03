@@ -35,13 +35,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
-    # dsv4
-    "IS_DEEPSEEK_V4": "1",
-    "SGLANG_DEBUG_LAYER_NORM": "1",
-    "SGLANG_DEBUG_FWD_INPUT": "1",
-    "USE_FUSED_HC_PRE_ASCENDC": "1",
-    "SGLANG_DSV4_NPU_FUSED_COMPRESSOR": "1",
-    "SGLANG_DSV4_NPU_FUSED_COMPRESSOR_PREFILL": "0",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -56,11 +49,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_NPU_PROFILING": "0",
-    "SGLANG_DEBUG_MTP_VERIFY": "0",
-    "SGLANG_DEBUG_MTP_VERIFY_LIMIT": "8",
-    "SGLANG_DEBUG_MTP_VERIFY_ROWS": "4",
-    "SGLANG_DISABLE_DRAFT_EXTEND_GRAPH": "1",
 }
 
 # Server launch arguments for DSV4-Flash W8A8 single-node 8p PD-mix.
@@ -134,7 +122,7 @@ class TestNPUDeepSeekV4FlashW8A88PIn32kOut1k50ms(TestNpuPerformanceTestCaseBase)
     num_prompts = 64
     max_concurrency = 64
     random_range_ratio = 1
-    warmup_requests = 0
+    warmup_requests = 16
     request_rate = float("inf")
     seed = 1
     tpot = 50

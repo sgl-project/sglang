@@ -79,6 +79,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     # MTP
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_NPU_USE_MULTI_STREAM": "1",
 }
 
 # Prefill node launch arguments for DSV4-Flash PD-Sep.
@@ -107,7 +108,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ARGS = [
     "--max-prefill-tokens",
     80000,
     "--chunked-prefill-size",
-    -1,
+    131072,
     "--max-running-requests",
     112,
     "--dp-size",
@@ -151,7 +152,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     1,
     "--disable-radix-cache",
     "--chunked-prefill-size",
-    32768,
+    -1,
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
@@ -180,7 +181,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     36,
     40,
     48,
-    56,
     # MTP (EAGLE) configuration.
     "--speculative-algorithm",
     "EAGLE",
@@ -218,7 +218,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn8kOut1k50ms(
     num_prompts = 2400
     max_concurrency = 800
     random_range_ratio = 1
-    warmup_requests = 0
+    warmup_requests = 16
     request_rate = float("inf")
     seed = 1
     tpot = 50
