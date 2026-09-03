@@ -77,9 +77,9 @@ class DumpLoader:
         step = dumper._state.step
         conditions = dict(name=name, step=step, **kwargs)
         row = find_row(self._df, conditions=conditions)
-        assert (
-            row is not None
-        ), f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
+        assert row is not None, (
+            f"DumpLoader cannot find row given query {name=} {kwargs=} {self._directory=}"
+        )
 
         path = self._directory / row["filename"]
         output = torch.load(path, weights_only=False)

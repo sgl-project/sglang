@@ -88,7 +88,7 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
         return
     try:
         parallel = get_parallel()
-        rank = f"dp={parallel.attn_dp_rank} " f"tp={parallel.tp_rank}"
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
     except Exception:
         rank = "rank=unknown"
     details = " ".join(f"{key}={value}" for key, value in fields.items())
