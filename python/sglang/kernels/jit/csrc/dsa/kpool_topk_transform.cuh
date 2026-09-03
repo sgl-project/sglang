@@ -5,13 +5,14 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <sgl_kernel/dsa/legacy_radix_topk.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_fp16.h>
 
 namespace sglang {
 namespace {
@@ -37,175 +38,12 @@ struct FastTopKParams {
   int64_t input_stride;
 };
 
-__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
-  __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-  return static_cast<uint8_t>(key >> 8);
-}
-
-__device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
-  uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-
 template <int K>
 __device__ void
 fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
-  // We assume length > K here, or it will crash
-  int topk = K;
-  constexpr auto BLOCK_SIZE = 1024;
-  constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
-
-  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
-  alignas(128) __shared__ int s_counter;
-  alignas(128) __shared__ int s_threshold_bin_id;
-  alignas(128) __shared__ int s_num_input[2];
-
-  auto& s_histogram = s_histogram_buf[0];
-  extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
-
-  const int tx = threadIdx.x;
-
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  ::sglang::device::legacy_radix_topk::select<kThreadsPerBlock, K, static_cast<int>(kSmem / (2 * sizeof(int)))>(
+      input, index, row_start, length, K);
   __syncthreads();
-
-  for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
-  }
-  __syncthreads();
-
-  const auto run_cumsum = [&] {
-#pragma unroll 8
-    for (int i = 0; i < 8; ++i) {
-      static_assert(1 << 8 == RADIX);
-      if (C10_LIKELY(tx < RADIX)) {
-        const auto j = 1 << i;
-        const auto k = i & 1;
-        auto value = s_histogram_buf[k][tx];
-        if (tx < RADIX - j) {
-          value += s_histogram_buf[k][tx + j];
-        }
-        s_histogram_buf[k ^ 1][tx] = value;
-      }
-      __syncthreads();
-    }
-  };
-
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
-  }
-  __syncthreads();
-
-  const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
-
-  if (topk == 0) {
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      }
-    }
-    __syncthreads();
-    return;
-  } else {
-    __syncthreads();
-    if (tx < RADIX + 1) {
-      s_histogram[tx] = 0;
-    }
-    __syncthreads();
-
-    for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
-      if (bin > threshold_bin) {
-        const auto pos = ::atomicAdd(&s_counter, 1);
-        index[pos] = idx;
-      } else if (bin == threshold_bin) {
-        const auto pos = ::atomicAdd(&s_num_input[0], 1);
-        if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-          s_input_idx[0][pos] = idx;
-          const auto bin = convert_to_uint32(raw_input);
-          const auto sub_bin = (bin >> 24) & 0xFF;
-          ::atomicAdd(&s_histogram[sub_bin], 1);
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-#pragma unroll 4
-  for (int round = 0; round < 4; ++round) {
-    __shared__ int s_last_remain;
-    const auto r_idx = round % 2;
-
-    const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
-
-    run_cumsum();
-    if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-      s_threshold_bin_id = tx;
-      s_num_input[r_idx ^ 1] = 0;
-      s_last_remain = topk - s_histogram[tx + 1];
-    }
-    __syncthreads();
-
-    const auto threshold_bin = s_threshold_bin_id;
-    topk -= s_histogram[threshold_bin + 1];
-
-    if (topk == 0) {
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        }
-      }
-      __syncthreads();
-      break;
-    } else {
-      __syncthreads();
-      if (tx < RADIX + 1) {
-        s_histogram[tx] = 0;
-      }
-      __syncthreads();
-      for (int i = tx; i < num_input; i += BLOCK_SIZE) {
-        const auto idx = s_input_idx[r_idx][i];
-        const auto raw_input = input[idx + row_start];
-        const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(raw_input) >> offset) & 0xFF;
-        if (bin > threshold_bin) {
-          const auto pos = ::atomicAdd(&s_counter, 1);
-          index[pos] = idx;
-        } else if (bin == threshold_bin) {
-          if (round == 3) {
-            const auto pos = ::atomicAdd(&s_last_remain, -1);
-            if (pos > 0) {
-              index[K - pos] = idx;
-            }
-          } else {
-            const auto pos = ::atomicAdd(&s_num_input[r_idx ^ 1], 1);
-            if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
-              s_input_idx[r_idx ^ 1][pos] = idx;
-              const auto bin = convert_to_uint32(raw_input);
-              const auto sub_bin = (bin >> (offset - 8)) & 0xFF;
-              ::atomicAdd(&s_histogram[sub_bin], 1);
-            }
-          }
-        }
-      }
-      __syncthreads();
-    }
-  }
 }
 
 __device__ __forceinline__ int32_t transform_kpool_token(
@@ -274,6 +112,12 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
       const auto group_rank = col / pool_size;
       const auto group_id = s_indices[group_rank];
       const auto slot = col % pool_size;
+      if (group_id < 0) {
+        // Unfilled selection slot from a degenerate path: emit a pad
+        // column rather than dereference an invalid group id.
+        dst[col] = -1;
+        continue;
+      }
       const auto raw_token = group_id * pool_size + slot;
       dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
     } else if (append_tail && col < history_len + tail_count) {
