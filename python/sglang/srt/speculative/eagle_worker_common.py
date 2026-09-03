@@ -26,6 +26,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    get_simulated_accept_token_id,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -584,7 +585,13 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    ) = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        grammar_mask,
+        simulate_acc_token_id=get_simulated_accept_token_id(target_worker),
+    )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
