@@ -341,7 +341,6 @@ def _fused_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
-
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,

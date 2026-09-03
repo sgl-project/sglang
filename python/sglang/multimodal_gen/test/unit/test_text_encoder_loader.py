@@ -166,18 +166,22 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         }
 
         loader = TextEncoderLoader()
-        with mock.patch.object(
-            TextEncoderLoader,
-            "resolve_native_transformers_model_class",
-            return_value=transformers_model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
+        with (
+            mock.patch.object(
+                TextEncoderLoader,
+                "resolve_native_transformers_model_class",
+                return_value=transformers_model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
         ):
             encoder = loader.load_native(
                 "/model/text_encoder",
@@ -719,9 +723,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "CLIPTextModel",
             "ThirdPartyTextEncoder",
         ):
-            with self.subTest(architecture=architecture), self.assertRaisesRegex(
-                NativeComponentLoaderRequired,
-                "delegates serialized quant_method='bitsandbytes' checkpoint",
+            with (
+                self.subTest(architecture=architecture),
+                self.assertRaisesRegex(
+                    NativeComponentLoaderRequired,
+                    "delegates serialized quant_method='bitsandbytes' checkpoint",
+                ),
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
