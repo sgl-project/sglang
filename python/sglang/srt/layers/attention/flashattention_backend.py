@@ -127,6 +127,26 @@ class FlashAttentionMetadata:
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
 
 
+def fa_descale_batch_size(
+    cu_seqlens_q: Optional[torch.Tensor], fallback_batch_size: int
+) -> int:
+    """Batch size that FA validates ``k_descale`` / ``v_descale`` against.
+
+    FA requires ``k_descale.shape == (batch_size, num_heads_k)`` where
+    ``batch_size`` is the one implied by the ``cu_seqlens_q`` handed to that same
+    call, i.e. ``cu_seqlens_q.numel() - 1``. That is not always the logical
+    ``forward_batch.batch_size``: several paths build ``cu_seqlens_q`` from a
+    per-request segment list rather than from the batch row count, and some grow
+    ``batch_size`` after the metadata was built.
+
+    ``cu_seqlens_q`` is ``None`` on the non-varlen paths, where the logical batch
+    size is the right answer.
+    """
+    if cu_seqlens_q is None:
+        return fallback_batch_size
+    return cu_seqlens_q.numel() - 1
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -1446,6 +1466,21 @@ class FlashAttentionBackend(AttentionBackend):
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
+
+        if fa_k_descale is not None:
+            # prepare_paged_mha_query() sized the descale from
+            # forward_batch.batch_size before it was known which cu_seqlens_q this
+            # call would use. Re-derive it from the tensor that is actually passed
+            # to FA below, otherwise the kernel rejects the descale with
+            # "k_descale must have shape (batch_size, num_heads_k)".
+            descale_shape = (
+                fa_descale_batch_size(cu_seqlens_q, forward_batch.batch_size),
+                layer.tp_k_head_num,
+            )
+            fa_k_descale = layer.k_scale.expand(descale_shape)
+            fa_v_descale = layer.v_scale.expand(descale_shape)
+            kwargs["k_descale"] = fa_k_descale
+            kwargs["v_descale"] = fa_v_descale
 
         # Use Flash Attention for prefill
         if not self.use_mla:
