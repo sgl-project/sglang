@@ -55,9 +55,9 @@ def test_predecay_fresh_slot_resets_independent_cursor_fields():
     shape = KimiLinearStateShape.create(
         tp_world_size=1,
         num_heads=4,
-        head_dim=8,
+        head_dim=16,
         num_k_heads=4,
-        head_k_dim=8,
+        head_k_dim=16,
         gate_lower_bound=-5.0,
     )
     cache_params = KimiLinearCacheParams(
@@ -97,6 +97,80 @@ def test_predecay_fresh_slot_resets_independent_cursor_fields():
     pool.mamba_pool.clear_slots(torch.tensor([slot], device="cuda"))
     assert pool.mamba_pool.replayssm_write_pos[slot].item() == 0
     assert pool.mamba_pool.replayssm_cache_base[slot].item() == 0
+
+    slot_indices = torch.tensor([slot], device="cuda")
+    state = pool.mamba_pool.mamba_cache
+    state.replayssm_d[:, slot_indices].zero_()
+    state.replayssm_k[:, slot_indices].zero_()
+    state.replayssm_g[:, slot_indices].zero_()
+    state.replayssm_d[:, slot_indices, :, 1].fill_(0.01)
+    state.replayssm_d[:, slot_indices, :, 2].fill_(0.02)
+    state.replayssm_k[:, slot_indices, :, 1].fill_(0.03)
+    state.replayssm_k[:, slot_indices, :, 2].fill_(0.04)
+    state.replayssm_g[:, slot_indices, :, 1].fill_(-0.1)
+    state.replayssm_g[:, slot_indices, :, 2].fill_(-0.2)
+    pool.mamba_pool.replayssm_write_pos[slot] = 2
+    pool.mamba_pool.replayssm_cache_base[slot] = 1
+    cpu_copy = pool.mamba_pool.get_cpu_copy(slot_indices)
+    assert len(cpu_copy) == 4
+
+    slot_int = int(slot.item())
+    dst_slot = 2 if slot_int == 1 else 1
+    dst_indices = torch.tensor([dst_slot], device="cuda")
+    state.replayssm_d[:, dst_indices].fill_(9.0)
+    state.replayssm_k[:, dst_indices].fill_(9.0)
+    state.replayssm_g[:, dst_indices].fill_(9.0)
+    pool.mamba_pool.reset_replayssm_cursors(dst_indices)
+    pool.mamba_pool.load_cpu_copy(cpu_copy, dst_indices)
+
+    assert torch.equal(
+        state.replayssm_d[:, dst_indices], state.replayssm_d[:, slot_indices]
+    )
+    assert torch.equal(
+        state.replayssm_k[:, dst_indices], state.replayssm_k[:, slot_indices]
+    )
+    assert torch.equal(
+        state.replayssm_g[:, dst_indices], state.replayssm_g[:, slot_indices]
+    )
+    assert pool.mamba_pool.replayssm_write_pos[dst_slot].item() == 2
+    assert pool.mamba_pool.replayssm_cache_base[dst_slot].item() == 1
+
+    def replay_view(idx):
+        index = slice(idx, idx + 1)
+        return {
+            "state": state.temporal[0, index],
+            "d": state.replayssm_d[0, index],
+            "k": state.replayssm_k[0, index],
+            "g": state.replayssm_g[0, index],
+            "base": pool.mamba_pool.replayssm_cache_base[index],
+        }
+
+    mixed, a, b = _inputs(1, 4, 16, torch.bfloat16, 42)
+    write_pos = torch.tensor([2], device="cuda", dtype=torch.int32)
+    force_flush = torch.zeros_like(write_pos)
+    a_log = torch.zeros(4, device="cuda")
+    dt_bias = torch.zeros(4, 16, device="cuda")
+    source_out = _decode(
+        replay_view(slot_int),
+        mixed,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        write_pos,
+        force_flush,
+    )
+    restored_out = _decode(
+        replay_view(dst_slot),
+        mixed,
+        a,
+        b,
+        a_log,
+        dt_bias,
+        write_pos,
+        force_flush,
+    )
+    torch.testing.assert_close(restored_out, source_out, atol=0, rtol=0)
 
 
 def test_predecay_accepts_page_major_slot_stride():
