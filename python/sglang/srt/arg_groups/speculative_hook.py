@@ -327,6 +327,171 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_uno(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("UNO only supports CUDA.")
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "UNO reuses the target model and does not accept "
+            "--speculative-draft-model-path."
+        )
+    if cfg.uno_lora_path is None:
+        raise ValueError("UNO requires --uno-lora-path.")
+    if cfg.enable_deterministic_inference:
+        raise ValueError(
+            "UNO does not support --enable-deterministic-inference because its "
+            "sampling path does not use per-request seeds."
+        )
+    if cfg.enable_strict_thinking:
+        raise ValueError(
+            "UNO does not support --enable-strict-thinking because it requires "
+            "grammar decoding."
+        )
+
+    verify_width = cfg.speculative_num_draft_tokens
+    if verify_width is None or int(verify_width) < 1:
+        raise ValueError(
+            "UNO requires --speculative-num-draft-tokens to be a positive "
+            "integer denoting the linear width or tree verify width Q."
+        )
+    verify_width = int(verify_width)
+    declare_resolution(
+        server_args,
+        "_handle_uno",
+        speculative_num_draft_tokens=verify_width,
+    )
+
+    candidate_top_k = (
+        1 if cfg.speculative_eagle_topk is None else int(cfg.speculative_eagle_topk)
+    )
+    if candidate_top_k < 1:
+        raise ValueError(
+            "UNO requires --speculative-eagle-topk to be at least 1, "
+            f"got {candidate_top_k}."
+        )
+
+    if candidate_top_k > 1:
+        if cfg.speculative_num_steps is None:
+            raise ValueError(
+                "UNO tree mode requires --speculative-num-steps so its draft "
+                "width F can be derived as speculative_num_steps + 1."
+            )
+        speculative_num_steps = int(cfg.speculative_num_steps)
+        if speculative_num_steps < 1:
+            raise ValueError(
+                "UNO tree mode requires --speculative-num-steps to be positive, "
+                f"got {speculative_num_steps}."
+            )
+
+        draft_width = speculative_num_steps + 1
+        if verify_width < draft_width:
+            raise ValueError(
+                f"UNO tree mode requires Q >= F; got Q={verify_width}, F={draft_width}."
+            )
+        if verify_width > 128:
+            raise ValueError(
+                "UNO tree mode currently supports at most Q=128 verify nodes, "
+                f"got Q={verify_width}."
+            )
+        frontier_slots = verify_width * candidate_top_k
+        if frontier_slots > 2048:
+            raise ValueError(
+                "UNO tree mode currently supports Q*K <= 2048; got "
+                f"Q*K={verify_width}*{candidate_top_k}={frontier_slots}."
+            )
+
+        tree_capacity = 1
+        nodes_at_depth = 1
+        for _ in range(speculative_num_steps):
+            nodes_at_depth *= candidate_top_k
+            tree_capacity += nodes_at_depth
+            if tree_capacity >= verify_width:
+                break
+        if verify_width > tree_capacity:
+            raise ValueError(
+                "UNO tree mode cannot build the requested Q from F and K: "
+                f"Q={verify_width} exceeds capacity={tree_capacity} for "
+                f"F={draft_width}, K={candidate_top_k}."
+            )
+
+        parent_width = candidate_top_k * max(speculative_num_steps - 1, 0) + 1
+        if verify_width - 1 > parent_width:
+            raise ValueError(
+                "UNO tree mode cannot represent the requested Q in EAGLE's "
+                "parent-list ABI: "
+                f"Q-1={verify_width - 1} exceeds "
+                f"K*(F-2)+1={parent_width} for "
+                f"F={draft_width}, K={candidate_top_k}."
+            )
+
+        if cfg.enable_pdmux:
+            raise ValueError("UNO tree mode does not yet support PDMux.")
+        if cfg.enable_two_batch_overlap:
+            raise ValueError("UNO tree mode does not yet support two-batch overlap.")
+        if (
+            cfg.speculative_accept_threshold_single != 1.0
+            or cfg.speculative_accept_threshold_acc != 1.0
+        ):
+            raise ValueError(
+                "UNO tree mode reuses EAGLE target-only sampling and requires "
+                "both speculative accept thresholds to be 1.0."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            speculative_num_steps=speculative_num_steps,
+            speculative_eagle_topk=candidate_top_k,
+        )
+    else:
+        for field in ("speculative_num_steps", "speculative_eagle_topk"):
+            old_value = getattr(cfg, field)
+            if old_value not in (None, 1):
+                logger.warning("UNO uses %s=1; overriding %s.", field, old_value)
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+        )
+
+    if (cfg.tp_size, cfg.pp_size) != (1, 1):
+        raise ValueError("UNO requires TP=PP=1.")
+    if cfg.enable_dp_attention or cfg.attn_cp_size != 1:
+        raise ValueError("UNO does not support DP attention or context parallelism.")
+    if cfg.enable_lora or cfg.lora_paths:
+        raise ValueError("UNO does not support public Multi-LoRA serving.")
+    declare_resolution(
+        server_args,
+        "_handle_uno",
+        enable_lora_overlap_loading=False,
+        lora_strict_loading=True,
+    )
+
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "UNO manages its own stochastic verification and does not use "
+            "--speculative-use-rejection-sampling."
+        )
+    if cfg.enable_mixed_chunk:
+        declare_resolution(
+            server_args,
+            "_handle_uno",
+            enable_mixed_chunk=False,
+        )
+        logger.warning(
+            "Mixed chunked prefill is disabled for UNO speculative decoding."
+        )
+
+    prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
+    if (prefill_backend, decode_backend) != ("fa3", "fa3"):
+        raise ValueError(
+            "UNO requires FA3 for both prefill and decode attention; "
+            f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
+        )
+
+
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,

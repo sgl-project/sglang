@@ -32,6 +32,37 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
         self.assertTrue(parser_cls.call_args.kwargs["force_reasoning"])
 
+    def test_k2_nested_effort_selects_streaming_reasoning_delimiter(self):
+        serving = make_serving()
+        serving.reasoning_parser = "k2_horizon"
+        serving.tool_call_parser = None
+        request = ResponsesRequest(
+            model="IFM/K2-Horizon-7B",
+            input="hi",
+            reasoning={"effort": "medium"},
+            stream=True,
+            store=False,
+        )
+
+        events = StreamFixture(serving, request, require_reasoning=True).run(
+            [engine_chunk("work</ifm|think_fast>\nanswer", 4, finish=True)]
+        )
+        types = event_types(events)
+        payloads = event_payloads(events)
+        reasoning = "".join(
+            payload["delta"]
+            for event_type, payload in zip(types, payloads)
+            if event_type == "response.reasoning_text.delta"
+        )
+        answer = "".join(
+            payload["delta"]
+            for event_type, payload in zip(types, payloads)
+            if event_type == "response.output_text.delta"
+        )
+
+        self.assertEqual(reasoning, "work")
+        self.assertEqual(answer, "\nanswer")
+
     def test_emits_typed_sse_events_in_order(self):
         serving = make_serving()
         serving.reasoning_parser = None
