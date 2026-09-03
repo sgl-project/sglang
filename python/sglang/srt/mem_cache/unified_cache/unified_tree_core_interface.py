@@ -369,6 +369,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
+
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
