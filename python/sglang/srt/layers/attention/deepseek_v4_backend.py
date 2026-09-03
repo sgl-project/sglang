@@ -1778,7 +1778,7 @@ class DeepseekV4AttnBackend(
             )
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not get_platform().is_sm120
                 and cp_sparse_supported
                 and not force_kvcache_prefill
                 and (
