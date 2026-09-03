@@ -61,15 +61,7 @@ jobs:
 
       - name: Overlay in-tree sglang test helpers onto image site-packages
         run: |
-          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
-          # changes to python/sglang/test/** don't reach the running container
-          # until the next image build (up to 24h after merge). Overlay the
-          # checkout's copy onto site-packages so this run always exercises the
-          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
-          # days, and scheduled nightlies all behave identically. When the
-          # image eventually bakes in the same file, this becomes a no-op.
-          # Auto-discovers the site-packages path so a Python version bump in
-          # the base image doesn't silently invalidate the overlay.
+          # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
           docker exec ci_sglang_xpu cp \
@@ -176,15 +168,7 @@ jobs:
 
       - name: Overlay in-tree sglang test helpers onto image site-packages
         run: |
-          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
-          # changes to python/sglang/test/** don't reach the running container
-          # until the next image build (up to 24h after merge). Overlay the
-          # checkout's copy onto site-packages so this run always exercises the
-          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
-          # days, and scheduled nightlies all behave identically. When the
-          # image eventually bakes in the same file, this becomes a no-op.
-          # Auto-discovers the site-packages path so a Python version bump in
-          # the base image doesn't silently invalidate the overlay.
+          # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
           docker exec ci_sglang_xpu cp \
@@ -280,15 +264,7 @@ jobs:
 
       - name: Overlay in-tree sglang test helpers onto image site-packages
         run: |
-          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
-          # changes to python/sglang/test/** don't reach the running container
-          # until the next image build (up to 24h after merge). Overlay the
-          # checkout's copy onto site-packages so this run always exercises the
-          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
-          # days, and scheduled nightlies all behave identically. When the
-          # image eventually bakes in the same file, this becomes a no-op.
-          # Auto-discovers the site-packages path so a Python version bump in
-          # the base image doesn't silently invalidate the overlay.
+          # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
           docker exec ci_sglang_xpu cp \
@@ -384,15 +360,7 @@ jobs:
 
       - name: Overlay in-tree sglang test helpers onto image site-packages
         run: |
-          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
-          # changes to python/sglang/test/** don't reach the running container
-          # until the next image build (up to 24h after merge). Overlay the
-          # checkout's copy onto site-packages so this run always exercises the
-          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
-          # days, and scheduled nightlies all behave identically. When the
-          # image eventually bakes in the same file, this becomes a no-op.
-          # Auto-discovers the site-packages path so a Python version bump in
-          # the base image doesn't silently invalidate the overlay.
+          # Bridges the up-to-24h window between merge and nightly image rebuild.
           dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
                  "import sglang, os; print(os.path.dirname(sglang.__file__))")
           docker exec ci_sglang_xpu cp \

@@ -418,13 +418,7 @@ def run_unittest_files(
         if not file_passed:
             success = False
 
-        # Flush the file's fallback record now, before the outer loop decides
-        # whether to keep going or fail-fast. If the runner process is killed
-        # partway through the suite (SIGKILL from the runner, XPU driver
-        # wedge, OOM), the end-of-function append block below never executes;
-        # emitting per-file here preserves whatever completed so far. Rich
-        # `kind="model"` rows written by write_results_to_github_step_summary
-        # still supersede these file rows at render time in the dashboard.
+        # Flush per-file so a SIGKILL mid-suite still surfaces completed files.
         metrics_path = os.environ.get("SGLANG_TEST_METRICS_FILE")
         if metrics_path and filename in file_elapsed:
             try:
