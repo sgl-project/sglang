@@ -1,7 +1,8 @@
 # SubBlock sparse attention — training-free block sparsity for the MiniMax-H3 DiT
 
 Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
-FlashAttention kernel on SM90 or FlashInfer's `bsa_attn_blk64_fwd` on SM100.
+FlashAttention kernel on SM90 or FlashInfer's architecture-specific blk64
+kernels on SM100 and SM120.
 Nothing is trained and no weights change: a cheap estimator runs before
 attention and hands the selected kernel a `q2k_block_index`.
 
@@ -18,13 +19,17 @@ sglang serve --model-path MiniMaxAI/MiniMax-H3 --model-variant fl2va \
                                "min_seq_len": 4096}'
 ```
 
-**`text_encoder=fa` is not optional.** `--attention-backend` applies to every
-component, and the Qwen3-VL text encoder admits only `fa` / `torch_sdpa` /
-`sage_attn_3`; without the override it raises and the server never starts. Put
-the override on the *encoder*, not the DiT — `transformer=subblock_sparse_attn`
-appears to work and silently does nothing, because H3 resolves the DiT backend
-lazily on the first forward, outside the component-loading context that the
-override applies to.
+**The text-encoder override is not optional.** `--attention-backend` applies to
+every component, and the Qwen3-VL text encoder admits only `fa`, `torch_sdpa`,
+or `sage_attn_3`; without the override it raises and the server never starts.
+Put the override on the *encoder*, not the DiT —
+`transformer=subblock_sparse_attn` appears to work and silently does nothing,
+because H3 resolves the DiT backend lazily on the first forward, outside the
+component-loading context that the override applies to.
+
+On SM120, use `text_encoder=torch_sdpa` instead. The CUDA platform selects
+Torch SDPA for dense attention on SM12.x, and component-specific backend
+requests are validated strictly.
 
 `--attention-backend-config` is optional and overrides only the keys it names,
 so `'{"sparsity": 0.85}'` alone trades quality for another 6%. Inline JSON gets
@@ -38,7 +43,7 @@ are listed below.
 
 | | |
 | --- | --- |
-| GPU | **compute capability 9.0 or 10.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` kernel. Other capabilities, including 10.3 (B300 / GB300) and 12.x (RTX PRO 6000, RTX 50xx), are rejected. |
+| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` kernel; SM120 devices use FlashInfer's `bsa_attn_sm120_blk64_fwd` CuTe-DSL kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
 | dtype | bfloat16 |
 | head_dim | 128 |
 | attention | non-causal, one contiguous sequence per call |
@@ -48,10 +53,11 @@ refiner, sequences under `min_seq_len`, non-bf16 activations, head_dim != 128 �
 falls back to dense for that call, so no layer has to be excluded by hand.
 
 **On an unsupported GPU it is not a fallback, it is an error at startup.** The
-resolver accepts exactly compute capability 9.0 or 10.0 before loading either
-kernel, so a B300 or an SM12x GPU fails at launch rather than after ten dense
-denoise steps. The exact 10.0 check is required because FlashInfer's kernel is
-built for `sm_100a` and has no forward-compatible 10.3 cubin.
+resolver accepts exactly compute capability 9.0, 10.0, or 12.0 before loading
+the selected kernel, so a B300 or another unsupported capability fails at
+launch rather than after ten dense denoise steps. The exact 10.0 check is
+required because FlashInfer's kernel is built for `sm_100a` and has no
+forward-compatible 10.3 cubin.
 
 ## How the score works
 

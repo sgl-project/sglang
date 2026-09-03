@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -266,6 +268,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # promotion without giving up the rest of the auto performance policy.
     "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY"
+    ),
+    # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
+    # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
+    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # serving schedule, so this is an escape hatch, not a deployment knob.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
+    ),
+    # Experimental: compute the online AdaLN rebuild projections once in fp32
+    # (TF32 off) before the bf16 store. Not bit-comparable to resident
+    # adaln_proj weights; keep off until an e2e trajectory gate clears it.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
     ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
