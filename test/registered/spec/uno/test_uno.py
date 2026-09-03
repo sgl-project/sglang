@@ -3,8 +3,9 @@
 The test runs both modes on the same prompts. Linear UNO alternates
 LoRA-draft and clean-target variants in one graph runner. Tree UNO uses a
 private LoRA-draft runner before native EAGLE tree verification. Besides the
-generation contract, the comparison guards that tree search improves TPF over
-the linear proposal on a small, fixed GSM8K sample.
+generation contract, short greedy comparisons guard lossless output parity
+with autoregressive decoding, and the stochastic comparison guards that tree
+search improves TPF over the linear proposal on a small, fixed GSM8K sample.
 """
 
 import os
@@ -32,6 +33,9 @@ register_cuda_ci(
 MODEL = "Qwen/Qwen3-8B"
 LORA_PATH_ENV = "SGLANG_TEST_UNO_LORA_PATH"
 MAX_NEW_TOKENS = 128
+# AR decode and UNO verification use different kernel shapes, so compare a
+# bounded greedy prefix instead of requiring full-sequence bitwise identity.
+PARITY_TOKENS = 32
 # One LoRA draft forward plus one clean verification forward. The draft's
 # clean-root token is useful output and therefore remains in the numerator.
 FORWARDS_PER_UNO_CYCLE = 2
@@ -86,18 +90,27 @@ class TestUnoCudaGraph(CustomTestCase):
                 f"Set {LORA_PATH_ENV} to the trained UNO draft LoRA checkpoint."
             )
 
-    def _run_config(self, config: _UnoConfig) -> float:
-        process = None
-        try:
-            process = popen_launch_server(
-                MODEL,
-                self.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=[
-                    "--dtype",
-                    "bfloat16",
-                    "--attention-backend",
-                    "fa3",
+    def _server_args(self, config: _UnoConfig | None) -> list[str]:
+        args = [
+            "--dtype",
+            "bfloat16",
+            "--attention-backend",
+            "fa3",
+            "--max-running-requests",
+            str(len(PROMPTS)),
+            "--cuda-graph-max-bs-decode",
+            str(len(PROMPTS)),
+            "--mem-fraction-static",
+            "0.7",
+            "--page-size",
+            "1",
+            "--disable-radix-cache",
+            "--random-seed",
+            "17",
+        ]
+        if config is not None:
+            args.extend(
+                [
                     "--speculative-algorithm",
                     "UNO",
                     "--uno-lora-path",
@@ -108,23 +121,80 @@ class TestUnoCudaGraph(CustomTestCase):
                     str(config.speculative_eagle_topk),
                     "--speculative-num-draft-tokens",
                     str(config.speculative_num_draft_tokens),
-                    "--max-running-requests",
-                    str(len(PROMPTS)),
-                    "--cuda-graph-max-bs-decode",
-                    str(len(PROMPTS)),
-                    "--mem-fraction-static",
-                    "0.7",
-                    "--page-size",
-                    "1",
-                    "--disable-radix-cache",
-                    "--random-seed",
-                    "17",
-                ],
+                ]
             )
-            return self._run_generation_contract(config)
+        return args
+
+    def _run_ar_reference(self) -> list[list[int]]:
+        process = None
+        try:
+            process = popen_launch_server(
+                MODEL,
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=self._server_args(None),
+            )
+            return self._run_greedy_output_ids()
         finally:
             if process is not None:
                 kill_process_tree(process.pid)
+
+    def _run_config(self, config: _UnoConfig) -> tuple[float, list[list[int]]]:
+        process = None
+        try:
+            process = popen_launch_server(
+                MODEL,
+                self.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=self._server_args(config),
+            )
+            tpf = self._run_generation_contract(config)
+            return tpf, self._run_greedy_output_ids()
+        finally:
+            if process is not None:
+                kill_process_tree(process.pid)
+
+    def _run_greedy_output_ids(self) -> list[list[int]]:
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": PROMPTS,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": PARITY_TOKENS,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        results = response.json()
+        self.assertEqual(len(results), len(PROMPTS))
+        output_ids = []
+        for prompt, result in zip(PROMPTS, results):
+            self.assertIn("output_ids", result, result)
+            self.assertEqual(
+                len(result["output_ids"]),
+                PARITY_TOKENS,
+                f"Wrong greedy output length for prompt {prompt!r}",
+            )
+            output_ids.append(result["output_ids"])
+        return output_ids
+
+    def _assert_ar_parity(
+        self,
+        mode: str,
+        actual: list[list[int]],
+        expected: list[list[int]],
+    ) -> None:
+        for prompt, actual_ids, expected_ids in zip(PROMPTS, actual, expected):
+            self.assertEqual(
+                actual_ids,
+                expected_ids,
+                f"{mode} UNO diverged from AR within the first "
+                f"{PARITY_TOKENS} tokens for prompt {prompt!r}",
+            )
 
     def _run_generation_contract(self, config: _UnoConfig) -> float:
         server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
@@ -178,9 +248,15 @@ class TestUnoCudaGraph(CustomTestCase):
         )
         return tpf
 
-    def test_tree_tpf_exceeds_linear_tpf(self):
-        linear_tpf = self._run_config(LINEAR_CONFIG)
-        tree_tpf = self._run_config(TREE_CONFIG)
+    def test_ar_parity_and_tree_tpf_exceeds_linear(self):
+        ar_output_ids = self._run_ar_reference()
+
+        linear_tpf, linear_output_ids = self._run_config(LINEAR_CONFIG)
+        self._assert_ar_parity("Linear", linear_output_ids, ar_output_ids)
+
+        tree_tpf, tree_output_ids = self._run_config(TREE_CONFIG)
+        self._assert_ar_parity("Tree", tree_output_ids, ar_output_ids)
+
         print(f"UNO GSM8K sample: {linear_tpf=:.3f}, {tree_tpf=:.3f}")
         self.assertGreater(
             tree_tpf,
