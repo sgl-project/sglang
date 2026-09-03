@@ -100,7 +100,7 @@ def _apply_warmup_sampling_overrides(
     unknown = value.keys() - field_names
     if unknown:
         raise ValueError(
-            "invalid --warmup-sampling-params fields: " f"{', '.join(sorted(unknown))}"
+            f"invalid --warmup-sampling-params fields: {', '.join(sorted(unknown))}"
         )
     updated = copy(defaults)
     for name, field_value in value.items():

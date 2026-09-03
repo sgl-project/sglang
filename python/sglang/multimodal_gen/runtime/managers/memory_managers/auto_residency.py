@@ -3120,9 +3120,7 @@ def _format_residency_change(candidate: ResidencyTarget) -> str:
             f"{candidate.target_layerwise_resident_layers}, pinned layers="
             f"{pin_counts}"
         )
-    return (
-        f"{candidate.component_name}: {candidate.residency_mode} -> " f"{target_mode}"
-    )
+    return f"{candidate.component_name}: {candidate.residency_mode} -> {target_mode}"
 
 
 def _format_candidate_summary(candidate: ResidencyTarget) -> str:
