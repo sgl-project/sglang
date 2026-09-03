@@ -1209,6 +1209,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "IFM",
+                    "pages": [
+                      "cookbook/autoregressive/IFM/K2-Horizon"
+                    ]
+                  },
+                  {
                     "group": "Kimi (Moonshot AI)",
                     "pages": [
                       "cookbook/autoregressive/Moonshotai/Kimi-K3",

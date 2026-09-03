@@ -44,8 +44,6 @@ class NewTokenRatioTracker:
 
         new_estimate_ratio = (
             total_decoded_tokens + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(reqs)
-        ) / (
-            total_max_new_tokens + 1
-        )  # avoid zero division
+        ) / (total_max_new_tokens + 1)  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
         return new_estimate_ratio

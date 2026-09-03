@@ -243,7 +243,6 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
-
     def __init__(
         self,
         size: int,
@@ -570,7 +569,6 @@ class DeepSeekV4UnifiedKVPool:
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
-
     def __init__(
         self,
         max_num_reqs: int,
@@ -740,8 +738,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             c4_kv_pool_type = kv_pool_cls
             if enable_hisparse:
                 assert not self.uniform_fp8, (
-                    "enable_hisparse is not supported with "
-                    "--dsv4-attn-backend trtllm."
+                    "enable_hisparse is not supported with --dsv4-attn-backend trtllm."
                 )
                 c4_kv_pool_type = HiSparseC4DevicePool
             self.c4_kv_pool = self._make_kv_pool(
@@ -1106,9 +1103,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_attention_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         compress_state_pool = self.compress_state_pools[layer_id]
-        assert (
-            compress_state_pool is not None
-        ), "Only c4/c128 layers have attention states."
+        assert compress_state_pool is not None, (
+            "Only c4/c128 layers have attention states."
+        )
         return compress_state_pool
 
     def get_online_c128_mtp_state_slot_offset(self) -> int:
@@ -1177,9 +1174,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_indexer_compress_states(self, layer_id: int) -> CompressStatePool:
         self.wait_layer_transfer(layer_id)
         indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
-        assert (
-            indexer_compress_state_pool is not None
-        ), "Only c4 layers have indexer states."
+        assert indexer_compress_state_pool is not None, (
+            "Only c4 layers have indexer states."
+        )
         return indexer_compress_state_pool
 
     def _swa_local_layer_id(self, layer_id: int) -> int:

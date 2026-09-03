@@ -137,18 +137,18 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported
 
-        assert (
-            cfg.device == "cuda" and is_sm100_supported()
-        ), "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        assert cfg.device == "cuda" and is_sm100_supported(), (
+            "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
+        )
         # "auto" is declared-but-unmaterialized here; the resolution pipeline
         # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
         assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3"), (
             "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
             f"got {cfg.kv_cache_dtype}."
         )
-        assert (
-            not cfg.enable_hisparse
-        ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        assert not cfg.enable_hisparse, (
+            "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        )
         assert not (
             cfg.attn_cp_size > 1
             or cfg.dcp_size > 1
@@ -178,11 +178,13 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert cfg.speculative_algorithm in (
             "EAGLE",
             "DSPARK",
-        ), f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        ), (
+            f"Only EAGLE and DSPARK speculative algorithms are supported for {model_arch}"
+        )
         if cfg.speculative_algorithm == "EAGLE":
-            assert (
-                cfg.speculative_eagle_topk == 1
-            ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            assert cfg.speculative_eagle_topk == 1, (
+                f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
+            )
 
 
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
@@ -193,7 +195,7 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
 
     if cfg.cp_strategy != "interleave":
         raise ValueError(
-            "DeepSeekV4 only supports interleave CP strategy, " f"got {cfg.cp_strategy}"
+            f"DeepSeekV4 only supports interleave CP strategy, got {cfg.cp_strategy}"
         )
 
     declare_resolution(
@@ -226,12 +228,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         "validate_deepseek_v4_cp",
         attn_cp_size=cfg.tp_size // cfg.dp_size,
     )
-    assert (
-        cfg.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
-    assert (
-        cfg.tp_size <= 8
-    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    assert cfg.dp_size == 1, (
+        "For round-robin split mode, dp attention is not supported."
+    )
+    assert cfg.tp_size <= 8, (
+        "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    )
     supported_a2a_backends = ("none", "deepep", "megamoe", "mori")
     if cfg.moe_a2a_backend not in supported_a2a_backends:
         raise ValueError(

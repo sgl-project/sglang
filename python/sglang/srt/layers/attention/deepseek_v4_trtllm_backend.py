@@ -166,9 +166,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             topk=topk,
             speculative_num_steps=speculative_num_steps,
         )
-        assert (
-            self.token_to_kv_pool.uniform_fp8
-        ), "the trtllm backend requires the uniform-FP8 DSv4 KV pool."
+        assert self.token_to_kv_pool.uniform_fp8, (
+            "the trtllm backend requires the uniform-FP8 DSv4 KV pool."
+        )
         assert not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get(), (
             "--dsv4-attn-backend trtllm does not support "
             "SGLANG_OPT_USE_ONLINE_COMPRESS yet."
@@ -353,9 +353,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         if compress_ratio == 4:
             assert extra_indices is not None and extra_topk_lengths is not None
             width = extra_indices.shape[-1]
-            assert (
-                SWA_WINDOW + width == sparse_indices.shape[1]
-            ), f"{width=} {sparse_indices.shape=}"
+            assert SWA_WINDOW + width == sparse_indices.shape[1], (
+                f"{width=} {sparse_indices.shape=}"
+            )
             sparse_indices[:, SWA_WINDOW:].copy_(extra_indices)
             # Lens include the fixed 128 SWA slots; SWA validity itself is
             # derived from seq_lens inside the kernel.

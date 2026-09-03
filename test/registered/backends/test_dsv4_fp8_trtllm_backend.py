@@ -80,8 +80,7 @@ _FILLER_SENTENCES = [
     "noting repairs from three distinct centuries. ",
 ]
 _LONG_PROMPT_QUESTION = (
-    "\n\nIn one short sentence, what kind of activity do the paragraphs "
-    "above describe?"
+    "\n\nIn one short sentence, what kind of activity do the paragraphs above describe?"
 )
 
 
