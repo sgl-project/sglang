@@ -249,18 +249,16 @@ class DecodeKVCacheOffloadManager:
 
         # Prefill-aligned slots are freed only here, at request finish; freeing
         # them mid-decode races with concurrent admission over live slots.
-        prefill_len = self._prefill_offloaded_len(req)
-        ranges = []
-        if prefill_len > 0:
-            ranges.append((0, prefill_len))
-        # The incremental part of the request (DSA-aware)
-        ranges.append((prefill_len, kv_committed_len))
+        ranges = [(0, kv_committed_len)]
 
         # Over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this contributes nothing.
+        # Aligned to the allocator page (DCP widens it past the schedule page)
+        # so the tail never shares a page with the committed range above.
         start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
-        if self.page_size > 1:
-            start_p = ceil_align(start_p, self.page_size)
+        allocator_page_size = self.token_to_kv_pool_allocator.page_size
+        if allocator_page_size > 1:
+            start_p = ceil_align(start_p, allocator_page_size)
         if start_p < end_p:
             ranges.append((start_p, end_p))
         self.tree_cache.free_kv_row(req.kv, ranges)

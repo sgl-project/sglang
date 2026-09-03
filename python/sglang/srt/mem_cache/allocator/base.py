@@ -175,24 +175,28 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
-        page-aligned copy); subclasses may use ``start_pos`` to skip the
-        data-dependent dedup. Default: plain free()."""
+        page-aligned copy). ``start_pos`` is page-aligned; the end may sit
+        mid-page and that trailing page is released whole. Subclasses use
+        ``start_pos`` to skip the data-dependent dedup. Default: plain free()."""
+        assert start_pos % self.page_size == 0, (
+            f"free_segment start {start_pos} is not aligned to page_size "
+            f"{self.page_size}"
+        )
         self.free(free_index)
 
     def free_segments(self, segments):
-        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
-        request's kv row; a boundary page shared by consecutive segments is
-        emitted once (the later segment's head is trimmed)."""
+        """Free ascending ``(free_index, start_pos)`` segments of one request's
+        kv row. Every start is page-aligned and no two segments touch the same
+        page, so each page is released by exactly one segment."""
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
             n = free_index.numel()
             if n == 0:
                 continue
-            seg_end = start_pos + n
-            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
-                boundary = (start_pos // ps + 1) * ps
-                free_index = free_index[boundary - start_pos :]
-                start_pos = boundary
-            prev_end = seg_end
+            assert prev_end is None or start_pos // ps > (prev_end - 1) // ps, (
+                f"segment at {start_pos} shares a page with the previous "
+                f"segment ending at {prev_end} (page_size {ps})"
+            )
+            prev_end = start_pos + n
             self.free_segment(free_index, start_pos=start_pos)
