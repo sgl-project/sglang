@@ -538,6 +538,9 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def supports_fast_match_prefix(self) -> bool:
+        return self.tree_core.supports_fast_match_prefix()
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 
