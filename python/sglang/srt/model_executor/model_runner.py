@@ -83,7 +83,6 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1338,80 +1337,9 @@ class ModelRunner:
         """Load a new lora adapter from disk or huggingface."""
         return self.lora_manager.load_lora_adapter(lora_ref)
 
-    def load_lora_adapter_from_tensors(
-        self,
-        lora_ref: LoRARef,
-        tensors,
-        config_dict,
-        added_tokens_config=None,
-        upsert: bool = False,
-    ):
-        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
-        result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref,
-            tensors,
-            config_dict,
-            added_tokens_config,
-            upsert=upsert,
-        )
-        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
-        return result
-
-    def load_lora_adapter_from_distributed(
-        self,
-        lora_ref: LoRARef,
-        names,
-        dtypes,
-        shapes,
-        config_dict,
-        group_name,
-        added_tokens_config=None,
-        upsert: bool = False,
-    ):
-        """Load a new lora adapter whose weights are broadcast over the
-        `_model_update_group` process group (no CUDA IPC).
-        """
-        # v0.5.16 moved the update-group registry onto the WeightUpdater component.
-        update_groups = self.weight_updater._model_update_group
-        assert group_name in update_groups, (
-            f"Group {group_name} not in {list(update_groups.keys())}. "
-            "Please call `init_weights_update_group` first."
-        )
-
-        logger.info(f"LoRA adapter loading from distributed starts: {lora_ref}.")
-        try:
-            tensors = {}
-            handles = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=update_groups[group_name],
-                        async_op=True,
-                    )
-                )
-                tensors[name] = weight
-            for handle in handles:
-                handle.wait()
-        except Exception as e:
-            error_msg = f"Failed to receive LoRA adapter weights from distributed: {e}."
-            logger.error(error_msg)
-            return LoRAUpdateOutput(success=False, error_message=error_msg)
-
-        result = self.lora_manager.load_lora_adapter_from_tensors(
-            lora_ref,
-            tensors,
-            config_dict,
-            added_tokens_config,
-            upsert=upsert,
-        )
-        logger.info(f"LoRA adapter loading from distributed completes: {lora_ref}.")
-        return result
+    def register_lora_adapter(self, lora_ref: LoRARef, config_dict):
+        logger.info(f"LoRA adapter registration: {lora_ref}.")
+        return self.lora_manager.register_lora_adapter(lora_ref, config_dict)
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""

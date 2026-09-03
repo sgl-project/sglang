@@ -39,8 +39,8 @@ class LoRARef(msgspec.Struct, frozen=True, array_like=True):
     lora_path: Optional[str] = None
     pinned: Optional[bool] = None
     # False for adapters whose weights arrived over the wire (lora_path
-    # "__distributed__" / "__tensor__"): there is no disk artifact to reload
-    # from, so they must never be LRU-evicted nor implicitly reloaded.
+    # "__stream__"): there is no disk artifact to reload from, so they must
+    # never be LRU-evicted nor implicitly reloaded.
     # Trailing field with a default keeps the array_like wire format
     # compatible with refs encoded before this field existed.
     reloadable: bool = True

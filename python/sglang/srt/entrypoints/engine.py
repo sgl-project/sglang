@@ -74,13 +74,12 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
-    LoadLoRAAdapterFromDistributedReqInput,
-    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqType,
+    RegisterLoRAAdapterReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     ReturnHiddenStatesMode,
@@ -1411,21 +1410,37 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
-    def begin_weight_update(self, selector: str = "all"):
+    def begin_weight_update(self, selector: str = "all", sync_base: bool = True):
         """Open a weight-update session: unpack in-place-quantized weights on the
         selected runners so update_weights_from_{distributed,tensor} can load into
-        them. Must be closed with end_weight_update()."""
-        obj = BeginWeightUpdateReqInput(selector=selector)
+        them. sync_base=False declares an adapter-only session (no unpack; base
+        tensors rejected). Must be closed with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector, sync_base=sync_base)
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
         )
 
-    def end_weight_update(self):
-        """Close the session opened by begin_weight_update() and finalize quantized
-        weights into kernel layout."""
-        obj = EndWeightUpdateReqInput()
+    def end_weight_update(self, expected_lora_checksums: Optional[Dict] = None):
+        """Close the session opened by begin_weight_update(): finalize quantized
+        weights into kernel layout (sync_base sessions) and apply the streamed
+        LoRA stash (optionally checksum-verified)."""
+        obj = EndWeightUpdateReqInput(expected_lora_checksums=expected_lora_checksums)
         return self.loop.run_until_complete(
             self.tokenizer_manager.end_weight_update(obj, None)
+        )
+
+    def register_lora_adapter(
+        self, lora_name: str, config_dict: Dict, pinned: bool = False
+    ):
+        """Create-or-refresh a LoRA adapter's identity and config. Weights are
+        untouched by the caller (new adapters start zeroed); the bytes arrive as
+        '{lora_name}:{hf_key}'-prefixed tensors in the update_weights_from_*
+        stream and are applied at end_weight_update."""
+        obj = RegisterLoRAAdapterReqInput(
+            lora_name=lora_name, config_dict=config_dict, pinned=pinned
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.register_lora_adapter(obj, None)
         )
 
     def update_weights_from_distributed(
@@ -1531,54 +1546,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 MultiprocessingSerializer.serialize(tensors)
                 for _ in range(self.server_args.tp_size)
             ]
-
-    def load_lora_adapter_from_tensors(
-        self,
-        lora_name: str,
-        tensors: Union[Dict[str, torch.Tensor], List[SerializedTensorPayload]],
-        config_dict: Dict,
-        load_format: Optional[str] = None,
-    ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
-        lora_req = LoadLoRAAdapterFromTensorsReqInput(
-            lora_name=lora_name,
-            config_dict=config_dict,
-            serialized_named_tensors=serialized_named_tensors,
-            load_format=load_format,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
-        )
-
-    def load_lora_adapter_from_distributed(
-        self,
-        lora_name: str,
-        config_dict: Dict,
-        names: list[str],
-        dtypes: list[str],
-        shapes: list[list[int]],
-        group_name: str = "weight_update_group",
-        pinned: bool = False,
-        added_tokens_config: Optional[Dict] = None,
-    ):
-        """Load a new LoRA adapter whose weights are broadcast over
-        a process group. The weight-update group must already be
-        initialized via `init_weights_update_group`."""
-        lora_req = LoadLoRAAdapterFromDistributedReqInput(
-            lora_name=lora_name,
-            config_dict=config_dict,
-            names=names,
-            dtypes=dtypes,
-            shapes=shapes,
-            group_name=group_name,
-            pinned=pinned,
-            added_tokens_config=added_tokens_config,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter_from_distributed(lora_req, None)
-        )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""

@@ -655,6 +655,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
+        self._weight_update_session_open = False
+        self._weight_update_pending_version: Optional[str] = None
 
     def init_lora(self):
         # LoRA

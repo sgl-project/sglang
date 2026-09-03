@@ -906,11 +906,42 @@ class LoRAManager:
         )
         return lora_adapter
 
+    def register_lora_adapter(
+        self, lora_ref: LoRARef, config_dict: Dict
+    ) -> LoRAUpdateOutput:
+        """Create-or-refresh an adapter's identity and config; re-registration
+        re-zeroes — a slot's new tenant must not serve its predecessor's weights."""
+        return self.load_lora_adapter_from_tensors(
+            lora_ref, tensors={}, config_dict=config_dict, upsert=True
+        )
+
+    def require_registered(self, lora_name: str) -> LoRARef:
+        for ref in self.lora_refs.values():
+            if ref.lora_name == lora_name:
+                return ref
+        raise ValueError(
+            f"streamed weights for unregistered LoRA adapter {lora_name!r}; "
+            "call /register_lora_adapter before streaming its tensors"
+        )
+
+    def apply_streamed_adapter(
+        self, lora_name: str, tensors: Dict[str, torch.Tensor]
+    ) -> LoRAUpdateOutput:
+        """Apply a complete streamed tensor set to a registered adapter, reusing
+        the config stored at registration."""
+        try:
+            lora_ref = self.require_registered(lora_name)
+        except ValueError as e:
+            return self.create_lora_update_result(success=False, error_message=str(e))
+        return self.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict=None, upsert=True
+        )
+
     def load_lora_adapter_from_tensors(
         self,
         lora_ref: LoRARef,
         tensors: Dict[str, torch.Tensor],
-        config_dict: Dict,
+        config_dict: Optional[Dict],
         added_tokens_config: Optional[Dict] = None,
         upsert: bool = False,
     ) -> LoRAUpdateOutput:
@@ -953,11 +984,18 @@ class LoRAManager:
         # request must not leave a live adapter with new metadata over old
         # weights (or leak unreachable entries on a fresh insert).
         try:
-            new_config = LoRAConfig.from_dict(
-                config_dict,
-                added_tokens_config,
-                base_vocab_size=self.base_hf_config.vocab_size,
-            )
+            if config_dict is None:
+                # Streamed apply: reuse the config stored at registration.
+                assert (
+                    old_config is not None
+                ), f"config_dict=None requires a registered adapter (got {lora_ref})"
+                new_config = old_config
+            else:
+                new_config = LoRAConfig.from_dict(
+                    config_dict,
+                    added_tokens_config,
+                    base_vocab_size=self.base_hf_config.vocab_size,
+                )
             self.validate_new_adapter(
                 new_config, lora_ref, is_update=is_update, old_ref=old_ref
             )

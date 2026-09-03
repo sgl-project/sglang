@@ -46,10 +46,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromDistributedReqInput,
-    LoadLoRAAdapterFromDistributedReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -59,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     PullWeightsReqInput,
     PullWeightsReqOutput,
+    RegisterLoRAAdapterReqInput,
+    RegisterLoRAAdapterReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -479,18 +477,27 @@ class TokenizerControlMixin:
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        return await self._weight_update_session_call(
+        success, message = await self._weight_update_session_call(
             self.begin_weight_update_communicator, obj
         )
+        if success:
+            self._weight_update_session_open = True
+            self._weight_update_pending_version = None
+        return success, message
 
     async def end_weight_update(
         self: TokenizerManager,
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        return await self._weight_update_session_call(
+        success, message = await self._weight_update_session_call(
             self.end_weight_update_communicator, obj
         )
+        self._weight_update_session_open = False
+        if success:
+            self._update_weight_version_if_provided(self._weight_update_pending_version)
+        self._weight_update_pending_version = None
+        return success, message
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -724,10 +731,7 @@ class TokenizerControlMixin:
                 error_message=str(e),
             )
 
-    def _validate_lora_upsert_supported(
-        self: TokenizerManager,
-        obj: LoadLoRAAdapterFromDistributedReqInput,
-    ) -> None:
+    def _validate_lora_upsert_supported(self: TokenizerManager) -> None:
         """Upsert resolves lora_name -> lora_id through this process's registry.
 
         With multiple tokenizer workers each HTTP worker process holds its own
@@ -735,18 +739,19 @@ class TokenizerControlMixin:
         a worker that never served the original load would mint a fresh id and
         die on the backend duplicate check. Fail loudly instead.
         """
-        if obj.upsert and self.server_args.tokenizer_worker_num > 1:
+        if self.server_args.tokenizer_worker_num > 1:
             raise ValueError(
                 "LoRA upsert is not supported with tokenizer_worker_num > 1: "
                 "each HTTP worker resolves lora_name against its own registry, "
                 "making upsert nondeterministic across workers."
             )
 
-    async def load_lora_adapter_from_tensors(
+    async def register_lora_adapter(
         self: TokenizerManager,
-        obj: LoadLoRAAdapterFromTensorsReqInput,
+        obj: RegisterLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
-    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+    ) -> RegisterLoRAAdapterReqOutput:
+        """Create-or-refresh an adapter's identity and config (control plane)."""
         self.auto_create_handle_loop()
 
         try:
@@ -754,118 +759,45 @@ class TokenizerControlMixin:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
-
             assert (
                 get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
-            if obj.upsert:
-                # In-place refresh is only wired up on the from_distributed
-                # route (the disaggregated RL weight-sync path). Reject
-                # explicitly instead of dying later on the duplicate check
-                # with a fresh uuid.
+            if ":" in obj.lora_name:
                 raise ValueError(
-                    "upsert is not supported on the from_tensors route; use "
-                    "/load_lora_adapter_from_distributed to refresh an adapter in place."
+                    f"LoRA adapter name '{obj.lora_name}' must not contain ':': the "
+                    "character separates the adapter name from the tensor key in "
+                    "streamed weight updates."
                 )
-            logger.info(
-                "Start load Lora adapter from tensors. Lora name=%s",
-                obj.lora_name,
-            )
-
-            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
-                obj.serialized_named_tensors
-            )
-
             async with self.lora_update_lock:
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path="__tensor__",
-                    pinned=obj.pinned,
-                    reloadable=False,
+                self._validate_lora_upsert_supported()
+                new_adapter, reused = await self.lora_registry.register_or_reuse(
+                    LoRARef(
+                        lora_name=obj.lora_name,
+                        lora_path="__stream__",
+                        pinned=obj.pinned,
+                        reloadable=False,
+                    ),
+                    upsert=True,
                 )
+                # No path to reload a streamed adapter from: eviction would lose the
+                # only engine-side copy, so the cap rejects new names instead.
+                if (
+                    not reused
+                    and self.server_args.max_loaded_loras is not None
+                    and self.lora_registry.num_registered_loras
+                    >= self.server_args.max_loaded_loras
+                ):
+                    raise ValueError(
+                        f"Cannot register streamed LoRA adapter '{obj.lora_name}': "
+                        f"{self.lora_registry.num_registered_loras} adapters already "
+                        f"registered (--max-loaded-loras="
+                        f"{self.server_args.max_loaded_loras}). Streamed adapters are "
+                        "never evicted; unload one or raise the cap."
+                    )
                 obj.lora_id = new_adapter.lora_id
                 result = _merge_lora_update_results(
                     await self.update_lora_adapter_communicator(obj)
                 )
-
-                if result.success:
-                    await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
-                if self.server_args.max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
-
-                return result
-        except ValueError as e:
-            return LoadLoRAAdapterFromTensorsReqOutput(
-                success=False,
-                error_message=str(e),
-            )
-
-    async def load_lora_adapter_from_distributed(
-        self: TokenizerManager,
-        obj: LoadLoRAAdapterFromDistributedReqInput,
-        _: Optional[fastapi.Request] = None,
-    ) -> LoadLoRAAdapterFromDistributedReqOutput:
-        self.auto_create_handle_loop()
-
-        try:
-            if not self.server_args.enable_lora:
-                raise ValueError(
-                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
-                )
-
-            assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
-            logger.info(
-                "Start load Lora adapter from distributed. Lora name=%s, group=%s",
-                obj.lora_name,
-                obj.group_name,
-            )
-
-            async with self.lora_update_lock:
-                self._validate_lora_upsert_supported(obj)
-                # With upsert, a same-name adapter keeps its lora_id so the
-                # backend refreshes it in place instead of failing the
-                # duplicate check; otherwise this resolves to a fresh ref.
-                new_adapter, reused = await self.lora_registry.register_or_reuse(
-                    LoRARef(
-                        lora_name=obj.lora_name,
-                        lora_path="__distributed__",
-                        pinned=obj.pinned,
-                        reloadable=False,
-                    ),
-                    upsert=obj.upsert,
-                )
-                obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
 
                 if result.success:
                     if reused:
@@ -873,39 +805,9 @@ class TokenizerControlMixin:
                     else:
                         await self.lora_registry.register(new_adapter)
                     self.lora_ref_cache[obj.lora_name] = new_adapter
-                if self.server_args.max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > self.server_args.max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {self.server_args.max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
-
                 return result
         except ValueError as e:
-            return LoadLoRAAdapterFromDistributedReqOutput(
+            return RegisterLoRAAdapterReqOutput(
                 success=False,
                 error_message=str(e),
             )
@@ -1113,8 +1015,13 @@ class TokenizerControlMixin:
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
     ) -> None:
-        """Update weight version if provided."""
-        if weight_version is not None:
-            self.record_config_updates(
-                "tokenizer.weight_version", weight_version=weight_version
-            )
+        """Update weight version if provided; inside a weight-update session the
+        version is held until end_weight_update commits."""
+        if weight_version is None:
+            return
+        if self._weight_update_session_open:
+            self._weight_update_pending_version = weight_version
+            return
+        self.record_config_updates(
+            "tokenizer.weight_version", weight_version=weight_version
+        )

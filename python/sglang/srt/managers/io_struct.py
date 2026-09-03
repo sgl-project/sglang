@@ -2030,6 +2030,10 @@ class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
     selected runners so fresh weights can be loaded into them."""
 
     selector: Literal["target", "draft", "all"] = "all"
+    # Session scope: False = no base bytes will land this session (adapter-only
+    # sync), so the quant unpack/repack round-trip is skipped and a base-named
+    # tensor arriving in-session is an error.
+    sync_base: bool = True
 
 
 class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2038,7 +2042,13 @@ class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
 
 
 class EndWeightUpdateReqInput(BaseReq, kw_only=True):
-    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+    """Close the weight-update session opened by BeginWeightUpdateReqInput:
+    re-finalize base weights (sync_base sessions only) and apply the streamed
+    LoRA stash accumulated by update_weights_from_* during the session."""
+
+    # {lora_name: {hf_key: sha256}}; when set, each stashed adapter is verified
+    # (set equality + per-tensor checksum) before it is applied.
+    expected_lora_checksums: Optional[Dict[str, Dict[str, str]]] = None
 
 
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
@@ -2347,50 +2357,28 @@ class UnloadLoRAAdapterReqInput(BaseReq, kw_only=True):
         )
 
 
-class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
+class RegisterLoRAAdapterReqInput(BaseReq, kw_only=True):
+    """Create-or-refresh an adapter's identity and config (control plane).
+
+    Weights are untouched by the caller: a new adapter starts zeroed, and
+    re-registering an existing name re-zeroes it — a slot's new tenant must
+    not serve its predecessor's weights. The weight bytes arrive later as
+    ``{lora_name}:{hf_key}``-prefixed tensors in the ordinary
+    update_weights_from_* stream and are applied at end_weight_update."""
+
     lora_name: str
-    # The PEFT adapter_config.json, already JSON — a tighter type would only add
-    # decode strictness with no benefit.
+    # The PEFT adapter_config.json fields (r, lora_alpha, target_modules, ...).
     config_dict: Dict[str, Any]
-    # One serialized copy of the adapter tensors per TP rank; each rank
-    # deserializes only its own copy. Same normalization conventions as
-    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
-    serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
+    # Unpinned: the pool refills a registered adapter lazily from its CPU copy,
+    # and pinning every slot would trip the anti-starvation check.
     pinned: bool = False
-    added_tokens_config: Optional[Dict[str, int]] = None
     lora_id: Optional[str] = None
-    load_format: Optional[str] = None
-    # If already loaded, refresh weights in place instead of failing.
-    upsert: bool = False
-    expected_checksums: Optional[Dict[str, str]] = None
 
     def to_ref(self) -> LoRARef:
         return LoRARef(
             lora_id=self.lora_id,
             lora_name=self.lora_name,
-            lora_path="__tensor__",
-            pinned=self.pinned,
-        )
-
-
-class LoadLoRAAdapterFromDistributedReqInput(BaseReq, kw_only=True):
-    lora_name: str
-    config_dict: Dict[str, Any]
-    names: List[str]
-    dtypes: List[str]
-    shapes: List[List[int]]
-    group_name: str = "weight_update_group"
-    pinned: bool = False
-    added_tokens_config: Optional[Dict[str, Any]] = None
-    lora_id: Optional[str] = None
-    # If already loaded, refresh weights in place instead of failing.
-    upsert: bool = False
-
-    def to_ref(self) -> LoRARef:
-        return LoRARef(
-            lora_id=self.lora_id,
-            lora_name=self.lora_name,
-            lora_path="__distributed__",
+            lora_path="__stream__",
             pinned=self.pinned,
         )
 
@@ -2401,9 +2389,9 @@ class LoRAUpdateOutput(BaseReq, kw_only=True):
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
-    LoadLoRAAdapterFromTensorsReqOutput
-) = LoadLoRAAdapterFromDistributedReqOutput = LoRAUpdateOutput
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = RegisterLoRAAdapterReqOutput = (
+    LoRAUpdateOutput
+)
 
 
 class BlockReqType(Enum):
