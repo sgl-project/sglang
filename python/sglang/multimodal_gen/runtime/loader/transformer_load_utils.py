@@ -37,9 +37,11 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import (
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
 )
-from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
     filter_duplicate_precision_variant_safetensors,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (

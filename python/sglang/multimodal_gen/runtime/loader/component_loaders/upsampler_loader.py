@@ -10,6 +10,9 @@ from safetensors.torch import load_file as safetensors_load_file
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PlainStateDictComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import (
+    filter_duplicate_precision_variant_safetensors,
+)
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
 )
@@ -60,6 +63,7 @@ def _find_safetensors_file(path: str) -> str:
 
     if os.path.isdir(path):
         files = sorted(glob.glob(os.path.join(path, "*.safetensors")))
+        files = filter_duplicate_precision_variant_safetensors(files)
         if len(files) == 1:
             return files[0]
         elif len(files) > 1:
@@ -76,6 +80,7 @@ def _find_safetensors_file(path: str) -> str:
         maybe_downloaded = maybe_download_model(path)
         if os.path.isdir(maybe_downloaded):
             files = sorted(glob.glob(os.path.join(maybe_downloaded, "*.safetensors")))
+            files = filter_duplicate_precision_variant_safetensors(files)
             if len(files) == 1:
                 return files[0]
             elif len(files) > 1:

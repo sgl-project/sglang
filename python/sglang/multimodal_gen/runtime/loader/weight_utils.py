@@ -7,7 +7,6 @@
 import hashlib
 import json
 import os
-import re
 import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
@@ -32,10 +31,6 @@ from sglang.multimodal_gen.runtime.loader.weight_readers.runai_streamer import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-_PRECISION_VARIANT_SUFFIX_RE = re.compile(
-    r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
-)
 
 
 def _disable_runai_streamer_rank_discovery_collective() -> None:
@@ -156,48 +151,6 @@ def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[s
         f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)
     ]
     return hf_weights_files
-
-
-def filter_duplicate_precision_variant_safetensors(
-    safetensors_list: list[str],
-) -> list[str]:
-    """Drop precision-specific duplicates when a canonical file is present.
-
-    Diffusers checkpoints sometimes ship both `foo.safetensors` and
-    `foo.fp16.safetensors` (and their sharded variants) in the same directory.
-    Loading both is unsafe because duplicate parameter names race and whichever
-    tensor arrives last wins, leading to non-deterministic behavior
-
-    If a canonical unsuffixed (non bf16|fp32) file exists, prefer it and drop the precision
-    variant from the same family. Precision-only families are left untouched.
-    """
-    canonical_paths = set(safetensors_list)
-    filtered: list[str] = []
-    removed: list[str] = []
-
-    for path in safetensors_list:
-        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
-        if match is None:
-            filtered.append(path)
-            continue
-
-        canonical_path = (
-            f"{match.group('stem')}{match.group('shard') or ''}{match.group('ext')}"
-        )
-        if canonical_path in canonical_paths:
-            removed.append(path)
-            continue
-
-        filtered.append(path)
-
-    if removed:
-        logger.info(
-            "Filtered %d duplicate precision variant file(s): %s",
-            len(removed),
-            removed,
-        )
-
-    return filtered
 
 
 # explicitly use pure text format, with a newline at the end

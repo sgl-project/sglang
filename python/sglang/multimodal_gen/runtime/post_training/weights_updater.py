@@ -49,6 +49,7 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
+    filter_duplicate_precision_variant_safetensors,
     get_param_names_mapping,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -141,6 +142,9 @@ def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
 def _get_weights_iter(weights_dir: str):
     """Return a (name, tensor) iterator over safetensors in weights_dir."""
     safetensors_files = _list_safetensors_files(weights_dir)
+    safetensors_files = filter_duplicate_precision_variant_safetensors(
+        safetensors_files
+    )
     if not safetensors_files:
         raise FileNotFoundError(f"No safetensors files found in {weights_dir}")
     return safetensors_weights_iterator(safetensors_files)

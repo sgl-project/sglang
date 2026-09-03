@@ -28,6 +28,13 @@ _QUANTIZED_DTYPES = {
     torch.int8,
 }
 
+_PRECISION_VARIANT_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)\.(?:fp16|bf16|fp32)(?:-\d+-of-\d+)?\.safetensors$"
+)
+_CANONICAL_SAFETENSORS_SUFFIX_RE = re.compile(
+    r"^(?P<stem>.+?)(?:-\d+-of-\d+)?\.safetensors$"
+)
+
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
@@ -249,12 +256,50 @@ def _try_redownload_missing_shards(model_path: str, missing: list[str]) -> bool:
         return False
 
 
+def filter_duplicate_precision_variant_safetensors(
+    safetensors_files: list[str],
+) -> list[str]:
+    """Prefer canonical files over precision-suffixed copies in each family."""
+    canonical_stems: set[str] = set()
+    for path in safetensors_files:
+        if _PRECISION_VARIANT_SUFFIX_RE.match(path) is not None:
+            continue
+        if match := _CANONICAL_SAFETENSORS_SUFFIX_RE.match(path):
+            canonical_stems.add(match.group("stem"))
+
+    filtered: list[str] = []
+    removed: list[str] = []
+
+    for path in safetensors_files:
+        match = _PRECISION_VARIANT_SUFFIX_RE.match(path)
+        if match is None:
+            filtered.append(path)
+            continue
+
+        if match.group("stem") in canonical_stems:
+            removed.append(path)
+        else:
+            filtered.append(path)
+
+    if removed:
+        logger.info(
+            "Filtered %d duplicate precision variant file(s): %s",
+            len(removed),
+            removed,
+        )
+    return filtered
+
+
 def checkpoint_bytes(model_path: str) -> int:
-    """On-disk size of every safetensors under a path, readable before any is."""
+    """On-disk size of the selected safetensors checkpoint files."""
+    if os.path.isfile(model_path):
+        return os.path.getsize(model_path)
+
+    paths = sorted(
+        glob.glob(os.path.join(str(model_path), "**", "*.safetensors"), recursive=True)
+    )
     total = 0
-    for path in glob.glob(
-        os.path.join(str(model_path), "**", "*.safetensors"), recursive=True
-    ):
+    for path in filter_duplicate_precision_variant_safetensors(paths):
         try:
             total += os.path.getsize(path)
         except OSError:
@@ -345,6 +390,9 @@ def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
             )
         return state_dict
 
+    safetensors_files = filter_duplicate_precision_variant_safetensors(
+        safetensors_files
+    )
     if not safetensors_files:
         raise ValueError(f"No safetensors files found in {model_path}")
     if len(safetensors_files) != 1:

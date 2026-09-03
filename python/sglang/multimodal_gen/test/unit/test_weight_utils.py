@@ -4,14 +4,67 @@
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import torch
+from safetensors.torch import save_file as safetensors_save_file
+
+from sglang.multimodal_gen.runtime.loader.utils import (
+    checkpoint_bytes,
+    filter_duplicate_precision_variant_safetensors,
+    load_safetensors_state_dict,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
     get_lock,
 )
 
 _DIST_STREAMER_MOD = "runai_model_streamer.distributed_streamer.distributed_streamer"
+
+
+class TestPrecisionVariantSelection(unittest.TestCase):
+    def test_prefers_canonical_family_across_shard_layouts(self):
+        files = [
+            "/tmp/model.safetensors",
+            "/tmp/model.fp16-00001-of-00002.safetensors",
+            "/tmp/model.fp16-00002-of-00002.safetensors",
+            "/tmp/other.bf16.safetensors",
+        ]
+
+        self.assertEqual(
+            filter_duplicate_precision_variant_safetensors(files),
+            ["/tmp/model.safetensors", "/tmp/other.bf16.safetensors"],
+        )
+
+    def test_shared_state_dict_loader_uses_canonical_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            canonical = model_dir / "model.safetensors"
+            variant = model_dir / "model.fp16.safetensors"
+            safetensors_save_file({"weight": torch.tensor([1.0])}, canonical)
+            safetensors_save_file({"weight": torch.tensor([2.0])}, variant)
+
+            state_dict = load_safetensors_state_dict(str(model_dir))
+
+        self.assertTrue(torch.equal(state_dict["weight"], torch.tensor([1.0])))
+
+    def test_checkpoint_bytes_counts_only_selected_family(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            canonical = model_dir / "model.safetensors"
+            variant = model_dir / "model.fp16.safetensors"
+            canonical.write_bytes(b"a" * 17)
+            variant.write_bytes(b"b" * 11)
+
+            self.assertEqual(checkpoint_bytes(str(model_dir)), 17)
+
+    def test_checkpoint_bytes_supports_explicit_file(self):
+        with tempfile.NamedTemporaryFile() as checkpoint:
+            checkpoint.write(b"checkpoint")
+            checkpoint.flush()
+
+            self.assertEqual(checkpoint_bytes(checkpoint.name), 10)
 
 
 class TestDisableRunaiStreamerRankDiscoveryCollective(unittest.TestCase):

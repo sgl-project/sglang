@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
     checkpoint_bytes,
+    filter_duplicate_precision_variant_safetensors,
     keep_checkpoint_mapped,
     set_default_torch_dtype,
     skip_init_modules,
@@ -575,6 +576,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 server_args,
                 component_name,
                 vae_precision,
+            )
+            safetensors_list = filter_duplicate_precision_variant_safetensors(
+                safetensors_list
             )
 
         assert (

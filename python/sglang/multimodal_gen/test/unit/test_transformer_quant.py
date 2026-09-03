@@ -104,13 +104,11 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
+    filter_duplicate_precision_variant_safetensors,
     get_param_names_mapping,
     hf_to_custom_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    filter_duplicate_precision_variant_safetensors,
-)
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.models.dits.flux_2 import (
     Flux2Transformer2DModel,
