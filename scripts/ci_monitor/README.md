@@ -10,7 +10,7 @@ Scripts used by [.github/workflows/ci-failure-monitor.yml](../../.github/workflo
    - `runner-health --state-file F`: per-pool online / offline counts for the primary CUDA labels (`N-gpu-h100|h200|h20|5090|b200|b300|gb200|gb300|a10`). Posts only on degraded / recovered transitions plus an hourly reminder while degraded; state is carried between runs via `actions/cache`. Needs an admin PAT to list runners.
    - `queue-digest --hours 6`: per-pool queue time p50 / p90 / max over the window, plus currently queued jobs.
 
-   All subcommands accept `--dry-run` to print the card JSON instead of posting. Unit tests: `python -m unittest test_lark_notify` (run from this directory).
+   All subcommands accept `--dry-run` to print the card JSON instead of posting.
 
 ## Installation
 

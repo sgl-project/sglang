@@ -1,29 +1,10 @@
 #!/usr/bin/env python3
 """
-Post CUDA CI health notifications to a Lark group via an incoming webhook.
+Post CUDA CI health cards to a Lark group via an incoming webhook.
 
-Used by .github/workflows/ci-lark-notify.yml. Only CUDA runner pools are
-considered; other backends are ignored.
-
-Subcommands:
-    ci-status      Summarize one finished scheduled run (nightly / weekly /
-                   scheduled pr-test). The first attempt lists its failed
-                   jobs; a rerun (attempt N > 1) is compared against attempt
-                   N-1 of the same run: fixed by rerun / still failing.
-    runner-health  Per-label online / offline counts. Posts only on state
-                   transitions (degraded / recovered) plus an hourly reminder
-                   while degraded. Needs a state file that persists between
-                   invocations.
-    queue-digest   Per-label queue time percentiles over a time window.
-
-Usage:
-    export GITHUB_TOKEN=...   # admin PAT required for runner-health
-    export LARK_WEBHOOK=https://open.larksuite.com/open-apis/bot/v2/hook/...
-    python lark_notify.py ci-status --run-id 123456 [--dry-run]
-    python lark_notify.py runner-health --state-file /tmp/state.json
-    python lark_notify.py queue-digest --hours 6
-
---dry-run prints the card JSON instead of posting it.
+Used by .github/workflows/ci-lark-notify.yml; see scripts/ci_monitor/README.md.
+Needs GITHUB_TOKEN (an admin PAT for runner-health) and LARK_WEBHOOK, or
+--dry-run to print the card JSON instead of posting.
 """
 
 import argparse
@@ -42,9 +23,8 @@ from typing import Any, Optional
 DEFAULT_REPO = "sgl-project/sglang"
 GITHUB_API = "https://api.github.com"
 
-# Primary CUDA pool labels. Alias labels (1-gpu-runner, 1-gpu-large,
-# 8-gpu-h200-deepep, 4-gpu-b200-kernel, ...) are excluded so every runner is
-# counted under exactly one label.
+# Primary pool labels only; aliases (1-gpu-runner, 8-gpu-h200-deepep, ...) are
+# excluded so every runner is counted under exactly one label.
 CUDA_LABEL_RE = re.compile(r"^\d+-gpu-(h100|h200|h20|5090|b200|b300|gb200|gb300|a10)$")
 
 # Workflows whose jobs run on the CUDA pools; used for queue-digest.
@@ -115,10 +95,10 @@ class GitHub:
         return self.get(f"repos/{self.repo}/actions/runs/{run_id}")
 
     def run_jobs(self, run_id: int) -> list:
-        """Jobs of the latest attempt (jobs not rerun keep their earlier result)."""
         return self.paginate(
             f"repos/{self.repo}/actions/runs/{run_id}/jobs",
             "jobs",
+            # latest attempt per job; jobs not rerun keep their earlier result
             {"filter": "latest"},
         )
 
@@ -147,7 +127,6 @@ class GitHub:
 
 
 def build_card(title: str, color: str, body_md: str, buttons: list) -> dict:
-    """Lark interactive card. color: red | orange | green | blue | grey."""
     elements: list = [{"tag": "div", "text": {"tag": "lark_md", "content": body_md}}]
     if buttons:
         elements.append(
@@ -238,7 +217,6 @@ def list_jobs_md(jobs: list, limit: int = MAX_LISTED_JOBS) -> str:
 
 
 def compress_runner_names(names: list) -> str:
-    """5090-d-runner-0, 5090-d-runner-1 -> 5090-d-runner-{0,1}."""
     groups: dict = {}
     for n in sorted(names):
         m = re.match(r"^(.*?)(\d+)$", n)
@@ -278,7 +256,6 @@ def failed_job_names(jobs: list) -> dict:
 
 
 def diff_attempts(current: dict, previous: dict) -> dict:
-    """Compare failures of a rerun against the previous attempt of the same run."""
     return {
         "fixed": [j for n, j in previous.items() if n not in current],
         "still": [j for n, j in current.items() if n in previous],
@@ -287,7 +264,6 @@ def diff_attempts(current: dict, previous: dict) -> dict:
 
 
 def render_ci_status(run: dict, jobs: list, prev_failed: Optional[dict]) -> dict:
-    """prev_failed is None for a first attempt; the previous attempt's failures for a rerun."""
     name = run["name"]
     attempt = run.get("run_attempt", 1)
     conclusion = run.get("conclusion") or "unknown"
@@ -318,6 +294,7 @@ def render_ci_status(run: dict, jobs: list, prev_failed: Optional[dict]) -> dict
         color = "green"
 
     lines = [commit_line]
+    # None: first attempt, nothing to compare against
     if prev_failed is None:
         if failed:
             lines.append(f"**Failed jobs ({len(failed)})**")
@@ -399,8 +376,7 @@ def is_degraded(pool: dict, threshold: float) -> bool:
 def plan_health_events(
     pools: dict, state: dict, now: datetime, threshold: float, remind_hours: float
 ) -> tuple:
-    """Return (events, new_state). events: list of (kind, label, pool, since)."""
-    events = []
+    events = []  # (kind, label, pool, since)
     new_state: dict = {}
     for label, pool in sorted(pools.items()):
         prev = state.get(label)

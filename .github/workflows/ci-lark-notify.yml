@@ -1,12 +1,6 @@
 name: CI Lark Notify
 
-# CUDA CI health notifications to a Lark group (scripts/ci_monitor/lark_notify.py):
-#   - ci-status:     one card per finished scheduled run of the Nvidia nightly /
-#                    weekly / scheduled pr-test. First attempt lists failed jobs;
-#                    a rerun posts a new card compared with the previous attempt.
-#   - runner-health: every 15 min; posts only when a CUDA runner pool crosses the
-#                    degraded threshold or recovers (state kept in actions/cache).
-#   - queue-digest:  every 6 h; per-pool queue time percentiles.
+# Lark cards for CUDA CI health; see scripts/ci_monitor/README.md.
 
 on:
   workflow_run:
