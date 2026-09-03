@@ -717,4 +717,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens_sum = raw_seq_lens_sum
             forward_batch.out_cache_loc = raw_out_cache_loc
 
-        return out
+        parent_list, top_scores_index, draft_tokens, draft_probs = out
+        if draft_probs is not None:
+            # Draft and target graphs share a memory pool. The target verify
+            # replay can overwrite draft graph outputs, but rejection sampling
+            # consumes q only after that replay, so preserve it outside the pool.
+            draft_probs = draft_probs.clone()
+
+        return parent_list, top_scores_index, draft_tokens, draft_probs
