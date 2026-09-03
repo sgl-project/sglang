@@ -38,6 +38,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3458,6 +3459,31 @@ def parse_connector_type(url: str) -> str:
         return ""
 
     return m.group(1)
+
+
+def run_with_deadline(fn: Callable[[], Any], *, timeout_s: float, what: str) -> Any:
+    """Run a blocking call on a daemon thread and raise if it has not returned
+    within ``timeout_s``. The stuck call cannot be cancelled; the caller is
+    expected to abort process startup, which reaps the thread."""
+    result: list = []
+    error: list = []
+
+    def _target():
+        try:
+            result.append(fn())
+        except BaseException as e:
+            error.append(e)
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise RuntimeError(
+            f"{what} did not return within {timeout_s}s on {socket.gethostname()}"
+        )
+    if error:
+        raise error[0]
+    return result[0]
 
 
 def retry(
