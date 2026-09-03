@@ -1477,9 +1477,8 @@ class MQALayer(MqaAttentionBase):
                 swa_page_size, bf16_store = 1, not fp8_2buff
                 if fp8_2buff:
                     swa_rope_cache = token_to_kv_pool.get_unified_kv_rope(self.layer_id)
-                    # aiter reads kv with a fixed row stride, unlike the Triton
-                    # kernel this replaces; kv is still a strided slice of qkv_a.
-                    kv = kv.contiguous()
+                    # kv stays the strided slice of qkv_a -- the group-quant
+                    # kernel takes the row stride as an argument.
             else:
                 swa_cache = token_to_kv_pool.get_swa_raw_buffer(self.layer_id)
                 swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)

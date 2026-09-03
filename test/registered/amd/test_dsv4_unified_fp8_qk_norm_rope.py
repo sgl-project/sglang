@@ -151,6 +151,38 @@ class TestUnifiedFp8QkNormRope(_StoreCase):
         self.assertTrue(torch.equal(pool_bytes, dense_bytes))
         self.assertTrue(torch.equal(rope_pool[rows], k_rope[:, 0]))
 
+    def test_strided_kv_slice_matches_contiguous(self):
+        """kv is a strided slice of qkv_a; aiter forwards kv.stride(0), so going
+        back to assuming a packed row would corrupt silently instead of erroring
+        """
+        q_lora_rank = 1536  # DSV4-Pro; only its being != 0 matters here
+        wide = torch.randn(
+            self.T, q_lora_rank + HEAD_DIM, device=DEVICE, dtype=torch.bfloat16
+        )
+        strided = wide[..., q_lora_rank:]
+        self.assertFalse(strided.is_contiguous())
+        self.assertEqual(strided.stride(-1), 1)
+
+        runs = []
+        for kv in (strided, strided.contiguous()):
+            self.kv = kv
+            nope_pool, rope_pool = _pools(2 * RING_STRIDE)
+            k_nope = torch.zeros(
+                self.T,
+                1,
+                DSV4_FP8_NOPE_ROW_BYTES,
+                dtype=torch.float8_e4m3fn,
+                device=DEVICE,
+            )
+            k_rope = torch.zeros(
+                self.T, 1, ROPE_DIM, dtype=torch.bfloat16, device=DEVICE
+            )
+            packed = self._call(nope_pool, rope_pool, k_nope, k_rope)
+            runs.append((nope_pool, rope_pool, k_nope, k_rope, packed))
+
+        for got, want in zip(*runs):
+            self.assertTrue(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))
+
     def test_scale_bytes_are_duplicated_e8m0(self):
         """the asm reader reads each tile scale twice, so the 14 B must be 7 equal pairs"""
         nope_pool, rope_pool = _pools(2 * RING_STRIDE)

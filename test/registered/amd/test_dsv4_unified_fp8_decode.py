@@ -242,16 +242,27 @@ class TestUnifiedFp8Decode(CustomTestCase):
         self.assertTrue(bool(out.isfinite().all()))
 
     @_needs_gfx950
-    def test_empty_segment_is_masked_to_zero(self):
-        """Guard for a case the builders do not reach today.
+    def test_empty_segment_comes_back_nonfinite(self):
+        """Guard for a shape the builders do not reach today.
 
-        On an empty segment the asm kernel divides by an all-sink denominator and
-        leaves every element of the row NaN. Nothing emits empty segments while
-        padded seq_lens are filled with 1 (see the test above), so this pins the
-        guard against that fill value changing.
+        Padded seq_lens are always filled with 1 (see
+        test_cuda_graph_pad_reads_only_the_reserved_ring_row), so an empty segment
+        can only come from a builder change -- and it comes back NaN, not zero,
+        since the asm kernel divides by an all-sink denominator.
         """
         got, want = self._run([32, 0, 32], num_heads=16)
-        self.assertTrue(torch.equal(got[1], torch.zeros_like(got[1])))
+        self.assertTrue(bool(torch.isnan(got[1]).any()))
+        for t in (0, 2):
+            self._assert_close(got[t], want[t])
+
+    @_needs_gfx950
+    def test_split_tail_override_matches_reference(self):
+        """past 40 tokens runtime overrides the split count, moving the kernel onto
+        a different stage-2 merge partition -- must still match the reference
+        """
+        lengths = [200, 64] * 24  # 48 tokens, both layer flavours' segment lengths
+        self.assertGreater(len(lengths), 40)
+        got, want = self._run(lengths, num_heads=16)
         self._assert_close(got, want)
 
     @_needs_gfx950
