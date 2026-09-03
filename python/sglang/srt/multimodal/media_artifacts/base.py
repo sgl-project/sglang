@@ -147,7 +147,7 @@ class MediaArtifactCacheMixin:
         """
         if modality != Modality.IMAGE:
             raise NotImplementedError(
-                f"{modality.name.lower()} artifact decoding " "requires a model adapter"
+                f"{modality.name.lower()} artifact decoding requires a model adapter"
             )
         data = snapshot.data
         if isinstance(data, torch.Tensor):
@@ -171,7 +171,7 @@ class MediaArtifactCacheMixin:
         """
         if modality != Modality.IMAGE:
             raise NotImplementedError(
-                f"{modality.name.lower()} artifact identity " "requires a model adapter"
+                f"{modality.name.lower()} artifact identity requires a model adapter"
             )
         return snapshot_media(source)
 

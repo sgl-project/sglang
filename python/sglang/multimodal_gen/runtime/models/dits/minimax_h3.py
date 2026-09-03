@@ -129,9 +129,12 @@ def _diffusers_h3_checkpoint(
             continue
 
         merge_dim = 1 if target_name.endswith((".qweight", ".qzeros", ".scales")) else 0
-        yield target_name, torch.cat(
-            [pending[target_name][index] for index in range(merge_count)],
-            dim=merge_dim,
+        yield (
+            target_name,
+            torch.cat(
+                [pending[target_name][index] for index in range(merge_count)],
+                dim=merge_dim,
+            ),
         )
         del pending[target_name]
 
@@ -1945,8 +1948,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         ):
             if value % tp_size:
                 raise ValueError(
-                    f"MiniMax H3 {name}={value} must be divisible by "
-                    f"TP size {tp_size}."
+                    f"MiniMax H3 {name}={value} must be divisible by TP size {tp_size}."
                 )
 
     @staticmethod
@@ -2005,8 +2007,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             adaln_cache_path is not None or adaln_weight_files is not None
         ):
             raise ValueError(
-                "MiniMax H3 pruned curve checkpoints cannot use a separate "
-                "AdaLN cache"
+                "MiniMax H3 pruned curve checkpoints cannot use a separate AdaLN cache"
             )
         self._adaln_precomputed = (
             adaln_cache_path is not None or adaln_weight_files is not None

@@ -280,7 +280,6 @@ class StorageAttachment:
 
         existing_collector = cache.storage_metrics_collector
         if existing_collector is None:
-
             storage_cls = resolve_collector_class(
                 STAT_LOGGER_ROLE_STORAGE,
                 StorageMetricsCollector,
