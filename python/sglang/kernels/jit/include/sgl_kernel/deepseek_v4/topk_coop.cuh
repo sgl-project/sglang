@@ -144,7 +144,8 @@ SGL_DEVICE void scan_hist(CoopSmem* smem, uint32_t need) {
   if (lane == 0) smem->warp_sum[warp] = inclusive;
   __syncthreads();
   uint32_t higher_warps = 0;
-  for (uint32_t w = warp + 1; w < kNumWarps; ++w) higher_warps += smem->warp_sum[w];
+  for (uint32_t w = warp + 1; w < kNumWarps; ++w)
+    higher_warps += smem->warp_sum[w];
   uint32_t run = inclusive + higher_warps - owned;  // bins owned by threads above tx
 #pragma unroll
   for (int i = static_cast<int>(kBinsPerThread) - 1; i >= 0; --i) {
@@ -205,7 +206,8 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
   const uint32_t parity = p.ws->parity;
   Counters* cnt = &p.ws->cnt[parity];
 
-  for (uint32_t b = tx; b < kHist0; b += kBlockSize) smem.hist[b] = 0;
+  for (uint32_t b = tx; b < kHist0; b += kBlockSize)
+    smem.hist[b] = 0;
   __syncthreads();
   for_each_score(p.scores, seq_len, g, G, [&](float val, uint32_t) {
     atomicAdd(&smem.hist[impl::extract_exact_bin(val) >> 20], 1);
@@ -219,7 +221,8 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
   uint32_t level = 0, band_shift = 20, band_prefix = 0, need = p.topk;
   for (;;) {
     const uint32_t num_bins = level == 0 ? kHist0 : kHistRefine;
-    for (uint32_t b = tx; b < num_bins; b += kBlockSize) smem.hist[b] = p.ws->hist[level][b];
+    for (uint32_t b = tx; b < num_bins; b += kBlockSize)
+      smem.hist[b] = p.ws->hist[level][b];
     __syncthreads();
     if (level == 0) {
       scan_hist<kHist0 / kBlockSize>(&smem, need);
@@ -233,7 +236,8 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
     need -= smem.above;
     band_shift -= 10;
     ++level;
-    for (uint32_t b = tx; b < kHistRefine; b += kBlockSize) smem.hist[b] = 0;
+    for (uint32_t b = tx; b < kHistRefine; b += kBlockSize)
+      smem.hist[b] = 0;
     __syncthreads();
     for_each_score(p.scores, seq_len, g, G, [&](float val, uint32_t) {
       const uint32_t key = impl::extract_exact_bin(val);
@@ -253,10 +257,12 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
     const uint32_t banded = band_shift ? (key >> band_shift) : key;
     if (banded > band_prefix) {
       const uint32_t pos = atomicAdd(&cnt->win, 1);
-      if (pos < p.topk) [[likely]] p.out[pos] = static_cast<int32_t>(idx);
+      if (pos < p.topk) [[likely]]
+        p.out[pos] = static_cast<int32_t>(idx);
     } else if (banded == band_prefix) {
       const uint32_t slot = atomicAdd(&cnt->tie, 1);
-      if (slot < kMaxNumTie) [[likely]] p.ws->ties[slot] = {val, idx};
+      if (slot < kMaxNumTie) [[likely]]
+        p.ws->ties[slot] = {val, idx};
     }
   });
   grid.sync();
@@ -281,7 +287,8 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
   }
 
   const uint32_t tie_count = min(cnt->tie, kMaxNumTie);
-  for (uint32_t t = tx; t < tie_count; t += kBlockSize) smem.ties[t] = p.ws->ties[t];
+  for (uint32_t t = tx; t < tie_count; t += kBlockSize)
+    smem.ties[t] = p.ws->ties[t];
   __syncthreads();
   if (tx == 0) p.ws->parity = 1u - parity;
   impl::TopKConfig::handle_tie(smem.ties, problem, above_count, tie_count, p.topk - above_count, &smem.tie_handle);
@@ -293,9 +300,11 @@ __global__ __launch_bounds__(kBlockSize) void coop_topk_kernel(const __grid_cons
   }
   if (G == 1) {
     if constexpr (kTransform) {
-      for (uint32_t t = tx; t < above_count; t += kBlockSize) problem.transform_output(t, p.out[t]);
+      for (uint32_t t = tx; t < above_count; t += kBlockSize)
+        problem.transform_output(t, p.out[t]);
     }
-    for (uint32_t i = tx; i < kNumLevels * kHist0; i += kBlockSize) hist[i] = 0;
+    for (uint32_t i = tx; i < kNumLevels * kHist0; i += kBlockSize)
+      hist[i] = 0;
     if (tx < kCounterWords) {
       reinterpret_cast<uint32_t*>(&p.ws->cnt[0])[tx] = 0;
       reinterpret_cast<uint32_t*>(&p.ws->cnt[1])[tx] = 0;

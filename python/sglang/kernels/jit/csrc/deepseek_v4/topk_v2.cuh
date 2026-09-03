@@ -578,11 +578,7 @@ struct TopKKernel {
       // Below kClusterFloorSmall a batch-1 row can reach topk_main_kernel, which
       // carries no handoff guard, and both kernels would write the same row.
       RuntimeCheck(
-          coop_floor >= kClusterFloorSmall,
-          "coop top-k floor must be >= ",
-          kClusterFloorSmall,
-          ", got ",
-          coop_floor);
+          coop_floor >= kClusterFloorSmall, "coop top-k floor must be >= ", kClusterFloorSmall, ", got ", coop_floor);
       RuntimeCheck(coop_workspace.has_value(), "coop top-k requires a workspace tensor");
       auto W = SymbolicSize{"coop_workspace"};
       TensorMatcher({W})  // coop_workspace: opaque persistent cross-block state
