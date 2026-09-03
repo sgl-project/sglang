@@ -221,10 +221,16 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     built = {}
+    built_sampler = object()
+
+    def build_sampler(**kwargs):
+        built.update(kwargs)
+        return built_sampler
+
     monkeypatch.setattr(
         worker_mod,
         "_SelectorDraftSampler",
-        lambda **kwargs: built.setdefault("sampler", object()),
+        build_sampler,
     )
     monkeypatch.setattr(
         worker_mod,
@@ -245,13 +251,15 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         ps=SimpleNamespace(tp_rank=0),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
+        _selector_sampling_enabled=True,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
     )
 
     sampler = worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker)
-    assert sampler is built["sampler"]
+    assert sampler is built_sampler
+    assert built["sampling_enabled"] is True
     assert worker.draft_model.lm_head is quant_head
 
     # A packed head without an applicable quant method must stay eager.
@@ -263,16 +271,16 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
-def test_worker_warns_once_when_npu_selector_sampling_falls_back(monkeypatch):
+def test_worker_warns_once_when_selector_sampling_is_disabled(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     warnings = []
-    monkeypatch.setattr(worker_mod, "_is_npu", True)
     monkeypatch.setattr(
         worker_mod.logger, "warning", lambda *args: warnings.append(args)
     )
     worker = SimpleNamespace(
         selector=object(),
+        _selector_sampling_enabled=False,
         _warned_sampling_fallback=False,
         ps=SimpleNamespace(tp_rank=0),
     )
@@ -285,16 +293,15 @@ def test_worker_warns_once_when_npu_selector_sampling_falls_back(monkeypatch):
     assert len(warnings) == 1
     assert "sampling distribution will not be preserved" in warnings[0][0]
 
-    monkeypatch.setattr(worker_mod, "_is_npu", False)
+    worker._selector_sampling_enabled = True
     worker._warned_sampling_fallback = False
     worker_mod.DFlashWorkerV2._validate_phase1_sampling_support(worker, batch)
     assert len(warnings) == 1
 
 
-def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
+def test_disabled_selector_sampling_forces_greedy_draft():
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
-    monkeypatch.setattr(worker_mod, "_is_npu", True)
     sampling_info = SimpleNamespace(
         temperatures=torch.tensor([[0.7]]),
         top_ks=torch.tensor([[8]]),
@@ -304,16 +311,15 @@ def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
     sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
     sampler.temperatures = torch.zeros(1)
     sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
+    sampler.sampling_enabled = False
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     torch.testing.assert_close(sampler.temperatures, torch.ones(1))
     assert sampler.greedy_mask.tolist() == [True]
 
-    monkeypatch.setattr(worker_mod, "_is_npu", False)
+    sampler.sampling_enabled = True
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     torch.testing.assert_close(sampler.temperatures, torch.tensor([0.7]))
     assert sampler.greedy_mask.tolist() == [False]
-    monkeypatch.setattr(worker_mod, "_is_npu", True)
-
     observed = {}
 
     def sample_path(**kwargs):
@@ -336,6 +342,7 @@ def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
         draft_model=draft_model,
         selector=selector,
         block_size=2,
+        _selector_sampling_enabled=False,
         _selector_sample=None,
     )
     draft_logits_output = SimpleNamespace(hidden_states=torch.zeros((2, 4)))
@@ -354,10 +361,9 @@ def test_npu_selector_draft_forces_greedy_sampling(monkeypatch):
     assert worker._selector_sample is None
 
 
-def test_npu_selector_accept_uses_greedy_fallback_after_refactor(monkeypatch):
+def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch):
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
-    monkeypatch.setattr(worker_mod, "_is_npu", True)
     monkeypatch.setattr(
         worker_mod, "is_dflash_sampling_verify_available", lambda: False
     )
@@ -369,9 +375,9 @@ def test_npu_selector_accept_uses_greedy_fallback_after_refactor(monkeypatch):
 
     sync_sites = []
     worker = SimpleNamespace(
-        _selector_sample=(object(), object()),
+        _selector_sample=None,
         _selector_sampling_accept=lambda **kwargs: pytest.fail(
-            "NPU must not run selector sampling verification"
+            "selector sampling must not run without a staged sample"
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,

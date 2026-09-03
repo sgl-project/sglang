@@ -217,16 +217,19 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
 
 
 class _SelectorDraftSampler:
-    """Selector decode folded into the draft cuda graph, greedy and T>0 alike.
+    """Selector decode folded into the draft cuda graph.
 
-    One captured graph serves both: it always walks the sampling path, and a static
-    greedy_mask selects the argmax per row.
+    On sampling-enabled backends, one captured graph serves both: it always walks
+    the sampling path, and a static greedy_mask selects the argmax per row.
     """
 
-    def __init__(self, *, draft_model, block_size, max_bs, device):
+    def __init__(
+        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool
+    ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
+        self.sampling_enabled = sampling_enabled
         max_bs, gamma, top_k = int(max_bs), self.block_size - 1, self.selector.top_k
         self.out = torch.empty((max_bs * gamma,), dtype=torch.int64, device=device)
         # Written by the host before replay, or read after it; the addresses are
@@ -244,7 +247,7 @@ class _SelectorDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
         graph replay that consumes them."""
-        if sampling_info is None or _is_npu:
+        if sampling_info is None or not self.sampling_enabled:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
@@ -325,6 +328,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
+        # Ascend keeps selector proposal aligned with its greedy-only verify path.
+        self._selector_sampling_enabled = not _is_npu
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -639,14 +644,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model.lm_head = lm_head
             if self.ps.tp_rank == 0:
                 logger.info(
-                    "DFLASH selector decode (greedy + sampling) folded into the "
-                    "draft cuda graph."
+                    "DFLASH selector decode folded into the draft cuda graph "
+                    "(sampling_enabled=%s).",
+                    self._selector_sampling_enabled,
                 )
             return _SelectorDraftSampler(
                 draft_model=self.draft_model,
                 block_size=self.block_size,
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
+                sampling_enabled=self._selector_sampling_enabled,
             )
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
@@ -1106,12 +1113,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)
-            if sampling_info is None or _is_npu
+            if sampling_info is None or not self._selector_sampling_enabled
             else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
         )
         greedy_mask = (
             torch.ones(bs, dtype=torch.bool, device=device)
-            if _is_npu
+            if not self._selector_sampling_enabled
             else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
         )
         tokens, q_rows = self.selector.sample_path(
@@ -1121,7 +1128,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures=temperatures,
             greedy_mask=greedy_mask,
         )
-        if not _is_all_greedy(sampling_info) and not _is_npu:
+        if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
 
@@ -1761,9 +1768,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         new_seq_lens = None
         target_predict = None
-        # Selector sampling verification builds dense vocabulary-wide buffers.
-        # Keep Ascend on the greedy verification path used by the proposal side.
-        if self._selector_sample is not None and not _is_npu:
+        if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -1840,7 +1845,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return
 
         if self.selector is not None:
-            if not _is_npu:
+            if self._selector_sampling_enabled:
                 return
             if not self._warned_sampling_fallback and self.ps.tp_rank == 0:
                 logger.warning(
@@ -2155,7 +2160,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
-                and not _is_npu
+                and self._selector_sampling_enabled
             ):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
