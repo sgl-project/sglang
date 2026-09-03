@@ -4350,6 +4350,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     # GDN (GatedDeltaNet) projections
     "in_proj_qkvz",
     "in_proj_ba",
+    "out_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"
