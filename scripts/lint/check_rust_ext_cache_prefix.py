@@ -13,8 +13,8 @@ the half that check cannot see: which prefix a consumer stage will look up.
 import pathlib
 import re
 import sys
+from typing import NamedTuple
 
-import msgspec
 import yaml
 
 BUILD_WORKFLOW = ".github/workflows/_pr-test-rust-ext-build.yml"
@@ -61,7 +61,10 @@ class _Unparsable(Exception):
     """A YAML file this check has to read does not parse."""
 
 
-class _Producer(msgspec.Struct, frozen=True):
+# NamedTuple, not msgspec.Struct: lint.yml installs pre-commit and nothing else,
+# so a `language: system` hook may import the stdlib and PyYAML (a pre-commit
+# dependency) only - sglang's own deps are not there.
+class _Producer(NamedTuple):
     """One caller of the build workflow: what it saves under, and from where."""
 
     file: str
@@ -71,7 +74,7 @@ class _Producer(msgspec.Struct, frozen=True):
     collect_runs_on: str
 
 
-class _StageCaller(msgspec.Struct, frozen=True):
+class _StageCaller(NamedTuple):
     """One test stage on one pool. `runner_config` is None when it is an
     expression this check cannot resolve to a pool."""
 
