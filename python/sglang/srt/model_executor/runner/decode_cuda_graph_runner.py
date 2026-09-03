@@ -70,7 +70,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import share_graph_state_buffer
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -109,7 +108,6 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_spec,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
@@ -377,14 +375,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.alloc_num_token = max(
-            self.max_num_token,
-            self.max_bs
-            * model_runner.decode_num_tokens_per_req(
-                num_draft_tokens=max_speculative_num_draft_tokens()
-            ),
-        )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.alloc_num_token)
+        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -425,7 +416,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
-            max_num_token=self.alloc_num_token,
+            max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
                 self.model_runner.model_config.vocab_size, rows=self.max_num_token
@@ -461,7 +452,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffer_registry: CudaGraphBufferRegistry = build_decode_registry(
             device=self.device,
             max_bs=self.max_bs,
-            max_num_token=self.alloc_num_token,
+            max_num_token=self.max_num_token,
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
@@ -1282,23 +1273,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
 
     def _stage_hidden_states(self, out) -> None:
-        """Copy the graph's hidden-state output into one static buffer shared by
-        every captured shape (and, under adaptive speculative decoding, every
-        state), so the per-shape activations are released to the graph pool.
-        Same lifetime contract as the shared logits buffer: consumed before the
-        next replay."""
-        hidden_states = getattr(out, "hidden_states", None)
-        if hidden_states is None or hidden_states.dim() != 2:
+        """Copy the graph's hidden-state output into the process-wide static
+        buffer so per-shape (and per adaptive-state) activations are released."""
+        if (
+            not isinstance(out, LogitsProcessorOutput)
+            or out.hidden_states is None
+            or out.hidden_states.dim() != 2
+            or self.model_runner.server_args.enable_return_hidden_states
+        ):
             return
+        hidden_states = out.hidden_states
         if self._hidden_states_out is None:
-            self._hidden_states_out = share_graph_state_buffer(
-                self.attn_backend.cuda_graph_state_namespace,
-                "hidden_states_out",
-                torch.empty(
-                    (self.alloc_num_token, hidden_states.shape[1]),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                ),
+            self._hidden_states_out = (
+                self.model_runner.graph_shared_output.get_hidden_states_buffer(
+                    hidden_states.shape[1], hidden_states.dtype, rows=self.max_num_token
+                )
             )
         staged = self._hidden_states_out[: hidden_states.shape[0]]
         staged.copy_(hidden_states)

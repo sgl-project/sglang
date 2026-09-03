@@ -27,12 +27,9 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     more rows keeps its own storage and becomes the new canonical; earlier
     registrants keep the tensors their graphs were captured against, so no
     already-captured buffer is ever repointed. Because a smaller request never
-    allocates, the footprint depends on registration order: the speculative
-    graph runners size their width-scaled token buffers at the widest
-    candidate width so the initially captured state is already the widest
-    (the draft-decode ``out_cache_loc`` and the verify ``custom_mask`` stay
-    per-width; both are KB-scale), and the adaptive controller builds the
-    remaining steps by descending batch size.
+    allocates, the footprint depends on registration order: the adaptive
+    worker captures the largest-footprint candidate (batch size, then steps)
+    first and builds the remaining states in that same order.
 
     This pool governs *every* ``share_buffers()`` caller. Cross-runner sharing
     is safe because these are per-replay inputs: each runner fills the region
@@ -59,18 +56,53 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
 def share_graph_state_buffer(
     namespace: Optional[str], name: str, buffer: torch.Tensor
 ) -> torch.Tensor:
-    """Pool an attention backend's cuda-graph state buffer under ``namespace``.
-
-    ``None`` keeps the buffer private (the non-adaptive default). Adaptive
-    speculative decoding gives every backend of one role -- target verify,
-    draft extend, draft-decode step ``i`` -- the same namespace, so the
-    per-state backends alias one allocation per field under the row-prefix
-    rule of ``share_input_buffer``. Same contract: the owning replay rewrites
-    what it reads, and the states never run concurrently.
-    """
+    """Pool an attention backend's cuda-graph state buffer under ``namespace``;
+    ``None`` keeps it private (the non-adaptive default)."""
     if namespace is None:
         return buffer
     return share_input_buffer(f"{namespace}.{name}", buffer)
+
+
+def alloc_graph_state_buffer(
+    namespace: Optional[str],
+    name: str,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    device,
+    fill_value: float = 0,
+) -> torch.Tensor:
+    """Pool-first variant of ``share_graph_state_buffer``: allocate only when no
+    canonical with enough rows exists."""
+    device = torch.device(device)
+    if namespace is not None:
+        key: _PoolKey = (f"{namespace}.{name}", dtype, device, tuple(shape[1:]))
+        canonical = _forward_input_buffer_pool.get(key, None)
+        if canonical is not None and canonical.shape[0] >= shape[0]:
+            return canonical[: shape[0]]
+    buffer = torch.full(shape, fill_value, dtype=dtype, device=device)
+    return share_graph_state_buffer(namespace, name, buffer)
+
+
+def alloc_graph_state_grid(
+    namespace: Optional[str],
+    name: str,
+    rows: int,
+    cols: int,
+    dtype: torch.dtype,
+    device,
+) -> torch.Tensor:
+    """Pool a 2-D ``(rows, cols)`` grid whose rows are consumed independently
+    (the per-step draft kv_indices): a request that fits inside the canonical
+    grid gets the strided corner view ``canonical[:rows, :cols]``."""
+    device = torch.device(device)
+    if namespace is None:
+        return torch.zeros((rows, cols), dtype=dtype, device=device)
+    key = (f"{namespace}.{name}", dtype, device, "grid")
+    canonical = _forward_input_buffer_pool.get(key, None)
+    if canonical is None or canonical.shape[0] < rows or canonical.shape[1] < cols:
+        canonical = torch.zeros((rows, cols), dtype=dtype, device=device)
+        _forward_input_buffer_pool[key] = canonical
+    return canonical[:rows, :cols]
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba

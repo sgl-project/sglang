@@ -1,9 +1,13 @@
+import json
+import tempfile
 import unittest
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    adaptive_build_order,
 )
+from sglang.srt.speculative.adaptive_spec_params import resolve_initial_capture_spec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -152,6 +156,46 @@ class TestAdaptiveController(unittest.TestCase):
             ValueError, "Missing adaptive runtime state for steps=1"
         ):
             controller.activate_step_by_batch(batch_size=8)
+
+
+class TestInitialCaptureSpec(unittest.TestCase):
+    def _write_config(self, cfg: dict) -> str:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(cfg, handle)
+        handle.close()
+        self.addCleanup(lambda: __import__("os").unlink(handle.name))
+        return handle.name
+
+    def test_single_slot_captures_the_widest_step_at_every_batch_size(self):
+        cfg_path = self._write_config({"1": {"candidate_steps": [1, 3, 7]}})
+        steps, pruned_bs = resolve_initial_capture_spec(
+            initial_steps=3, cfg_path=cfg_path, cuda_graph_bs=[1, 2, 4, 8]
+        )
+        self.assertEqual(steps, 7)
+        self.assertEqual(pruned_bs, [1, 2, 4, 8])
+
+    def test_bs_aware_config_captures_the_largest_footprint_first(self):
+        cfg_path = self._write_config(
+            {"1": {"candidate_steps": [1, 3, 7]}, "8": {"candidate_steps": [0, 1]}}
+        )
+        steps, pruned_bs = resolve_initial_capture_spec(
+            initial_steps=3, cfg_path=cfg_path, cuda_graph_bs=[1, 2, 4, 8, 16, 32]
+        )
+        self.assertEqual(steps, 1)
+        self.assertEqual(pruned_bs, [1, 2, 4, 8, 16, 32])
+
+    def test_without_cuda_graph_the_widest_step_is_first(self):
+        cfg_path = self._write_config({"1": {"candidate_steps": [1, 3, 7]}})
+        steps, pruned_bs = resolve_initial_capture_spec(
+            initial_steps=3, cfg_path=cfg_path, cuda_graph_bs=None
+        )
+        self.assertEqual((steps, pruned_bs), (7, None))
+
+    def test_controller_build_order_matches_module_order(self):
+        policy = _FakePolicy()
+        policy.set_cuda_graph_bs([1, 2, 4])
+        controller = AdaptiveController(_FakeWorker(), policy)
+        self.assertEqual(controller._build_order(), adaptive_build_order(policy))
 
 
 if __name__ == "__main__":

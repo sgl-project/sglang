@@ -66,6 +66,16 @@ class AdaptiveSpecPolicy(Protocol):
     def cuda_graph_bs_for_step(self, step: int) -> list[int] | None: ...
 
 
+def adaptive_build_order(policy: AdaptiveSpecPolicy) -> list[int]:
+    """Candidate steps by descending graph footprint (captured batch size,
+    then steps); the state built first owns the pooled graph buffers."""
+
+    def graph_footprint(steps: int) -> tuple[int, int]:
+        return (max(policy.cuda_graph_bs_for_step(steps) or [0]), steps)
+
+    return sorted(policy.candidate_steps, key=graph_footprint, reverse=True)
+
+
 class AdaptiveController:
     """Facade that owns adaptive decision-making and runtime state switching.
 
@@ -103,9 +113,8 @@ class AdaptiveController:
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps.
 
-        The remaining states are built by descending captured batch size so
-        the narrower ones alias the widest graph-input buffers in the shared
-        input pool.
+        The remaining states are built in ``adaptive_build_order`` so the
+        narrower ones alias the pooled graph buffers of the first state.
         """
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
@@ -125,10 +134,7 @@ class AdaptiveController:
         self._activate(self.worker.speculative_num_steps)
 
     def _build_order(self) -> list[int]:
-        def graph_input_footprint(steps: int) -> tuple[int, int]:
-            return (max(self.params.cuda_graph_bs_for_step(steps) or [0]), steps)
-
-        return sorted(self.candidate_steps, key=graph_input_footprint, reverse=True)
+        return adaptive_build_order(self.params)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = self.params.get_steps_for_batch(batch_size)

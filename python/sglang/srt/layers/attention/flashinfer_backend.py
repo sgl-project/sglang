@@ -18,7 +18,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import cached_property, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
@@ -42,7 +42,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.input_buffers import share_graph_state_buffer
+from sglang.srt.model_executor.input_buffers import alloc_graph_state_grid
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -51,7 +51,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
-    resolve_max_speculative_num_steps,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
@@ -478,13 +477,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # due to TMA descriptor initialization issues on SM100 GPUs.
             if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
                 fmha_backend = "cutlass"
-        self._eager_fmha_backend = fmha_backend
-        self._eager_prefill_backend = self.prefill_backend
-        self._eager_decode_backend = self.decode_backend
-        self._prefill_wrapper_ragged = None
-        self._prefill_wrappers_paged = None
-        self._prefill_wrappers_verify = None
-        self._decode_wrappers = None
+        self._fmha_backend = fmha_backend
 
         # Create indices updater
         if not skip_prefill:
@@ -1013,20 +1006,18 @@ class FlashInferAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
-            cuda_graph_kv_indices = self.share_cuda_graph_state(
+            cuda_graph_kv_indices = self.alloc_cuda_graph_state(
                 "kv_indices",
-                torch.zeros(
-                    (max_num_tokens * self.max_context_len,),
-                    dtype=torch.int32,
-                    device="cuda",
-                ),
+                (max_num_tokens * self.max_context_len,),
+                torch.int32,
+                "cuda",
             )
         else:
             cuda_graph_kv_indices = kv_indices_buf
 
         self.cuda_graph_kv_indices = [cuda_graph_kv_indices] + [
-            self.share_cuda_graph_state(
-                f"kv_indices_{i}", cuda_graph_kv_indices.clone()
+            self.alloc_cuda_graph_state(
+                f"kv_indices_{i}", cuda_graph_kv_indices.shape, torch.int32, "cuda"
             )
             for i in range(1, self.num_wrappers)
         ]
@@ -1034,9 +1025,8 @@ class FlashInferAttnBackend(AttentionBackend):
         # SWA write-target buffer; refilled and bound onto forward_metadata in
         # init_forward_metadata_out_graph before each replay.
         self.cuda_graph_swa_out_cache_loc = (
-            self.share_cuda_graph_state(
-                "swa_out_cache_loc",
-                torch.zeros(max_num_tokens, dtype=torch.int64, device="cuda"),
+            self.alloc_cuda_graph_state(
+                "swa_out_cache_loc", max_num_tokens, torch.int64, "cuda"
             )
             if self.use_sliding_window_kv_pool
             else None
@@ -1049,50 +1039,40 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.cuda_graph_kv_indices[i][0] = 0
 
         if not self.skip_prefill:
-            self.cuda_graph_custom_mask = self.share_cuda_graph_state(
+            self.cuda_graph_custom_mask = self.alloc_cuda_graph_state(
                 "custom_mask",
-                torch.zeros(
-                    (max_num_tokens * self.max_context_len),
-                    dtype=torch.uint8,
-                    device="cuda",
-                ),
+                max_num_tokens * self.max_context_len,
+                torch.uint8,
+                "cuda",
             )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
-    @property
+    @cached_property
     def prefill_wrapper_ragged(self) -> BatchPrefillWithRaggedKVCacheWrapper:
-        if self._prefill_wrapper_ragged is None:
-            self._prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer, "NHD", backend=self._eager_fmha_backend
-            )
-        return self._prefill_wrapper_ragged
+        return BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=self._fmha_backend
+        )
 
-    @property
+    @cached_property
     def prefill_wrappers_paged(self) -> List[BatchPrefillWithPagedKVCacheWrapper]:
-        if self._prefill_wrappers_paged is None:
-            self._prefill_wrappers_paged = self._create_eager_prefill_wrappers()
-        return self._prefill_wrappers_paged
+        return self._create_eager_prefill_wrappers()
 
-    @property
+    @cached_property
     def prefill_wrappers_verify(self) -> List[BatchPrefillWithPagedKVCacheWrapper]:
-        if self._prefill_wrappers_verify is None:
-            self._prefill_wrappers_verify = self._create_eager_prefill_wrappers()
-        return self._prefill_wrappers_verify
+        return self._create_eager_prefill_wrappers()
 
-    @property
+    @cached_property
     def decode_wrappers(self) -> List[BatchDecodeWithPagedKVCacheWrapper]:
-        if self._decode_wrappers is None:
-            self._decode_wrappers = [
-                BatchDecodeWithPagedKVCacheWrapper(
-                    self.workspace_buffer,
-                    "NHD",
-                    backend=self._eager_decode_backend,
-                    use_tensor_cores=self.decode_use_tensor_cores,
-                )
-                for _ in range(self.num_wrappers)
-            ]
-        return self._decode_wrappers
+        return [
+            BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_tensor_cores=self.decode_use_tensor_cores,
+            )
+            for _ in range(self.num_wrappers)
+        ]
 
     def _create_eager_prefill_wrappers(
         self,
@@ -1103,7 +1083,7 @@ class FlashInferAttnBackend(AttentionBackend):
             BatchPrefillWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
-                backend=self._eager_prefill_backend,
+                backend=self.prefill_backend,
             )
             for _ in range(self.num_wrappers)
         ]
@@ -2339,6 +2319,8 @@ class FlashInferMultiStepDraftBackend:
     draft decoding steps.
     """
 
+    cuda_graph_state_namespace: Optional[str] = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2412,7 +2394,7 @@ class FlashInferMultiStepDraftBackend:
             self.kv_indptr,
             forward_batch.positions,
             self.pool_len,
-            kv_indices_buffer.shape[1],
+            kv_indices_buffer.stride(0),
             self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
@@ -2465,19 +2447,13 @@ class FlashInferMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             max_bs, self.topk, self.max_context_len
         )
-        self.cuda_graph_kv_indices = share_graph_state_buffer(
-            getattr(self, "cuda_graph_state_namespace", None),
+        self.cuda_graph_kv_indices = alloc_graph_state_grid(
+            self.cuda_graph_state_namespace,
             "kv_indices",
-            torch.zeros(
-                (
-                    max(
-                        self.speculative_num_steps, resolve_max_speculative_num_steps()
-                    ),
-                    kv_indices_width,
-                ),
-                dtype=torch.int32,
-                device="cuda",
-            ),
+            self.speculative_num_steps,
+            kv_indices_width,
+            torch.int32,
+            "cuda",
         )
 
         for i in range(self.speculative_num_steps - 1):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections import defaultdict
@@ -49,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.adaptive_spec_params import initial_capture_override
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -242,12 +244,14 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
+        with _initial_spec_capture_override(model_runner):
+            if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
+                decode = capture_decode_graph(model_runner=model_runner)
+            elif (
+                current_platform.is_out_of_tree()
+                and current_platform.support_cuda_graph()
+            ):
+                decode = capture_decode_graph(model_runner=model_runner)
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -276,6 +280,21 @@ def capture_cuda_graphs(
         model_runner.canary_manager.mark_init_finished()
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+def _initial_spec_capture_override(model_runner: ModelRunner):
+    spec = get_spec()
+    if not spec.speculative_adaptive or model_runner.is_draft_worker:
+        return contextlib.nullcontext()
+    return initial_capture_override(
+        initial_steps=spec.speculative_num_steps,
+        cfg_path=spec.speculative_adaptive_config,
+        cuda_graph_bs=(
+            None
+            if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            else get_exec().graph.cuda_graph_bs_decode
+        ),
+    )
 
 
 def capture_prefill_graph(

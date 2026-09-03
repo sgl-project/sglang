@@ -140,7 +140,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     attn_backend.decode_attention_backend_str = resolved.decode
 
     _share_adaptive_target_graph_state(
-        model_runner=model_runner, attn_backend=attn_backend
+        is_draft_worker=model_runner.is_draft_worker, attn_backend=attn_backend
     )
     return AttentionBackends(
         attn_backend=attn_backend,
@@ -162,7 +162,7 @@ def get_attention_backend(
         init_new_workspace=init_new_workspace,
     )
     _share_adaptive_target_graph_state(
-        model_runner=model_runner, attn_backend=attn_backend
+        is_draft_worker=model_runner.is_draft_worker, attn_backend=attn_backend
     )
     return attn_backend
 
@@ -248,13 +248,9 @@ def _build_resolved_backend(
 
 
 def _share_adaptive_target_graph_state(
-    *, model_runner: ModelRunner, attn_backend: AttentionBackend
+    *, is_draft_worker: bool, attn_backend: AttentionBackend
 ) -> None:
-    if (
-        get_spec().speculative_adaptive
-        and not model_runner.is_draft_worker
-        and not get_disagg().enable_pdmux
-    ):
+    if get_spec().speculative_adaptive and not is_draft_worker:
         attn_backend.cuda_graph_state_namespace = "adaptive.target"
 
 

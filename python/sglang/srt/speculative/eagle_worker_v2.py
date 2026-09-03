@@ -60,7 +60,10 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
-from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative.adaptive_spec_params import (
+    AdaptiveSpeculativeParams,
+    resolve_initial_capture_spec,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -195,6 +198,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        self.cuda_graph_runner = None
+        self.cuda_graph_runner_for_draft_extend = None
 
     def alloc_memory_pool(
         self,
@@ -357,9 +362,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _share_cuda_graph_state_across_adaptive_states(self):
         if self.draft_attn_backend is not None:
             self.draft_attn_backend.cuda_graph_state_namespace = "adaptive.draft_decode"
-            for i, step_backend in enumerate(
-                getattr(self.draft_attn_backend, "attn_backends", ())
-            ):
+            for i, step_backend in enumerate(self.draft_attn_backend.attn_backends):
                 step_backend.cuda_graph_state_namespace = (
                     f"adaptive.draft_decode.step{i}"
                 )
@@ -1075,6 +1078,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    _active_state: Optional[SpecRuntimeState] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1151,9 +1156,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        super().init_cuda_graphs()
-        # Build adaptive runtime states after target and draft backends exist.
-        if self.adaptive_controller is not None:
+        if self.adaptive_controller is None:
+            super().init_cuda_graphs()
+            return
+        # The state captured first owns the pooled graph buffers, so the initial
+        # capture is the largest-footprint candidate on both sides (the target
+        # graphs were captured under the same override in capture_cuda_graphs).
+        cuda_graph_bs = (
+            None
+            if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+            else get_exec().graph.cuda_graph_bs_decode
+        )
+        initial_steps, initial_bs = resolve_initial_capture_spec(
+            initial_steps=self.speculative_num_steps,
+            cfg_path=get_spec().speculative_adaptive_config,
+            cuda_graph_bs=cuda_graph_bs,
+        )
+        target_model_runner = self._target_worker.model_runner
+        target_graph_runner = target_model_runner.decode_cuda_graph_runner
+        if target_graph_runner is not None:
+            assert (
+                target_graph_runner.speculative_num_draft_tokens == initial_steps + 1
+            ), "target graphs were not captured for the initial adaptive state"
+        with self._override_worker_state(
+            initial_steps, initial_steps + 1, cuda_graph_bs=initial_bs
+        ):
             with (
                 self._draft_worker.draft_tp_context(
                     self._draft_worker.draft_runner.tp_group
@@ -1161,25 +1188,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
+                self._draft_worker.init_attention_backend()
+            super().init_cuda_graphs()
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=initial_steps,
+                    speculative_num_draft_tokens=initial_steps + 1,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=target_model_runner.attn_backend,
+                    target_graph_runner=target_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
                 )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
+        with (
+            self._draft_worker.draft_tp_context(
+                self._draft_worker.draft_runner.tp_group
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.adaptive_controller.init_states(cuda_graph_bs=cuda_graph_bs)
 
     def forward_batch_generation(
         self,
@@ -1462,7 +1492,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""
-        if self.speculative_num_steps == state.speculative_num_steps:
+        if state is self._active_state:
             return
 
         log_info_on_rank0(
@@ -1506,6 +1536,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_steps=state.speculative_num_steps,
             speculative_num_draft_tokens=state.speculative_num_draft_tokens,
         )
+        self._active_state = state
 
     @contextlib.contextmanager
     def _override_worker_state(

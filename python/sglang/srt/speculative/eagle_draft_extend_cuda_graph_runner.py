@@ -39,7 +39,6 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_spec,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -139,12 +138,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
-        self.alloc_num_token = self.max_bs * resolve_num_tokens_per_req(
-            phase="draft_extend", num_draft_tokens=max_speculative_num_draft_tokens()
-        )
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
-            self.max_bs, self.alloc_num_token
+            self.max_bs, self.max_num_token
         )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -155,13 +151,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             set_torch_compile_config()
 
         with torch.device(model_runner.device):
-            input_ids = torch.zeros((self.alloc_num_token,), dtype=torch.int64)
+            input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             out_cache_loc = torch.ones(
-                (self.alloc_num_token,), dtype=self._cache_loc_dtype()
+                (self.max_num_token,), dtype=self._cache_loc_dtype()
             )
-            positions = torch.zeros((self.alloc_num_token,), dtype=torch.int64)
-            mrope_positions = torch.zeros((3, self.alloc_num_token), dtype=torch.int64)
+            positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
             # Width and dtype both come from the draft `model_runner` so the
             # source stays consistent (the draft dtype matches the target dtype
@@ -174,7 +170,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
             hidden_states = (
                 torch.zeros(
-                    (self.alloc_num_token, _hidden_size),
+                    (self.max_num_token, _hidden_size),
                     dtype=_hidden_dtype,
                 )
                 if _hidden_size is not None
@@ -247,7 +243,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         dsa_seed_topk_capture = (
             torch.full(
-                (self.alloc_num_token, self.eagle_worker.dsa_index_topk),
+                (self.max_num_token, self.eagle_worker.dsa_index_topk),
                 -1,
                 dtype=torch.int32,
                 device=model_runner.device,
