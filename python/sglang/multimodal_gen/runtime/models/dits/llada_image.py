@@ -2418,7 +2418,9 @@ class LLaDAImageTransformer2DModel(_LLaDAImageTransformer2DModel):
 
     def __init__(self, config, hf_config: dict, quant_config=None):
         init_kwargs = {
-            key: value for key, value in hf_config.items() if not key.startswith("_")
+            key: value
+            for key, value in hf_config.items()
+            if not key.startswith("_") and key != "quantization_config"
         }
         super().__init__(quant_config=quant_config, **init_kwargs)
         self.sgl_config = config

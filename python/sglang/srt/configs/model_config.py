@@ -1240,6 +1240,56 @@ class ModelConfig:
         else:
             return self.get_num_kv_heads(tensor_parallel_size)
 
+    def _parse_llada_fp8_experts_config(self) -> Optional[dict]:
+        if _hf_arch(self.hf_config) != "LLaDA2MoeModelLM":
+            return None
+
+        llada_fp8_experts = _hf_attr(self.hf_config, "llada_fp8_experts")
+        if llada_fp8_experts is None:
+            return None
+        if not isinstance(llada_fp8_experts, dict):
+            llada_fp8_experts = llada_fp8_experts.to_dict()
+        if not llada_fp8_experts.get("enabled", False):
+            return None
+
+        fp8_format = llada_fp8_experts.get("format")
+        weight_granularity = llada_fp8_experts.get("weight_granularity")
+        activation_granularity = llada_fp8_experts.get("activation_granularity")
+        activation_method = llada_fp8_experts.get("activation_method", "")
+        if fp8_format not in {"e4m3", "e4m3fn"}:
+            raise ValueError(
+                "llada_fp8_experts.format must be e4m3/e4m3fn, "
+                f"but got {fp8_format!r}."
+            )
+        if weight_granularity != "per_expert_2d_block":
+            raise ValueError(
+                "llada_fp8_experts.weight_granularity must be "
+                f"'per_expert_2d_block', but got {weight_granularity!r}."
+            )
+        if activation_granularity != "per_token" or not str(
+            activation_method
+        ).startswith("dynamic"):
+            raise ValueError(
+                "llada_fp8_experts requires dynamic per-token "
+                "activation quantization."
+            )
+        weight_block_size = llada_fp8_experts.get("weight_block_size")
+        if (
+            not isinstance(weight_block_size, (list, tuple))
+            or len(weight_block_size) != 2
+            or any(not isinstance(size, int) or size <= 0 for size in weight_block_size)
+        ):
+            raise ValueError(
+                "llada_fp8_experts.weight_block_size must contain "
+                f"two positive integers, but got {weight_block_size!r}."
+            )
+        return {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": list(weight_block_size),
+            "llada_experts_only": True,
+        }
+
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = _quant_config_to_dict(
@@ -1292,8 +1342,8 @@ class ModelConfig:
                             max_delay=5.0,
                         )
                         if not file_exists:
-                            # File doesn't exist on hub, no need to try downloading
-                            return quant_cfg  # None
+                            # File doesn't exist on hub, no need to try downloading.
+                            return self._parse_llada_fp8_experts_config()
 
                     # Download (online mode) or read from cache (offline mode)
                     if envs.SGLANG_USE_MODELSCOPE.get():
@@ -1336,6 +1386,8 @@ class ModelConfig:
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+        if quant_cfg is None:
+            quant_cfg = self._parse_llada_fp8_experts_config()
         return quant_cfg
 
     def _find_quant_modelslim_config(self):

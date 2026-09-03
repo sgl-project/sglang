@@ -88,6 +88,14 @@ class TestLLaDAImage(unittest.TestCase):
             mapping("layers.0.feed_forward.w3.weight"),
             ("layers.0.feed_forward.w13.weight", 1, 2),
         )
+        self.assertEqual(
+            mapping("layers.0.attention.to_q.weight_scale"),
+            ("layers.0.attention.to_qkv.weight_scale", None, None),
+        )
+        self.assertEqual(
+            mapping("layers.0.feed_forward.w1.weight_scale"),
+            ("layers.0.feed_forward.w13.weight_scale", None, None),
+        )
 
     def test_prompt_format_matches_official_pipeline(self):
         self.assertEqual(

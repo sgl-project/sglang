@@ -900,8 +900,15 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        validate_llada_fp8_experts = bool(
+            getattr(self.quant_config, "llada_experts_only", False)
+        )
+        loaded_expert_weight_count = 0
+        loaded_expert_scale_count = 0
         for name, loaded_weight in prepare_llada2_language_weights(
-            weights, num_experts=self.config.num_experts
+            weights,
+            num_experts=self.config.num_experts,
+            expand_expert_scales=validate_llada_fp8_experts,
         ):
             if (
                 ("v_head" in name)
@@ -958,6 +965,11 @@ class LLaDA2MoeModelLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    if validate_llada_fp8_experts:
+                        if name.endswith("weight_scale_inv"):
+                            loaded_expert_scale_count += 1
+                        elif name.endswith("weight"):
+                            loaded_expert_weight_count += 1
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -983,6 +995,44 @@ class LLaDA2MoeModelLM(nn.Module):
                     and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
                 }
             )
+        if validate_llada_fp8_experts:
+            sparse_layers = [
+                layer
+                for layer in self.model.layers
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.mlp, LLaDA2MoeSparseMoeBlock)
+            ]
+            expected_tensor_count = len(sparse_layers) * self.config.num_experts * 3
+            if loaded_expert_weight_count != expected_tensor_count:
+                raise ValueError(
+                    "Incomplete LLaDA FP8 expert weights: loaded "
+                    f"{loaded_expert_weight_count}, expected {expected_tensor_count}."
+                )
+            if loaded_expert_scale_count != expected_tensor_count:
+                scale_param_names = [
+                    name
+                    for name in params_dict
+                    if "mlp.experts" in name and "scale" in name
+                ]
+                raise ValueError(
+                    "Incomplete LLaDA FP8 expert scales: loaded "
+                    f"{loaded_expert_scale_count}, expected {expected_tensor_count}; "
+                    f"registered scale parameters sample={scale_param_names[:8]}."
+                )
+
+            if sparse_layers:
+                first_experts = sparse_layers[0].mlp.experts
+                logger.info(
+                    "Loaded LLaDA experts-only FP8: w13=%s/%s, w2=%s/%s, "
+                    "w13_scale=%s, w2_scale=%s",
+                    tuple(first_experts.w13_weight.shape),
+                    first_experts.w13_weight.dtype,
+                    tuple(first_experts.w2_weight.shape),
+                    first_experts.w2_weight.dtype,
+                    tuple(first_experts.w13_weight_scale_inv.shape),
+                    tuple(first_experts.w2_weight_scale_inv.shape),
+                )
+
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
