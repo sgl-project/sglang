@@ -719,7 +719,7 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                 else temporary_module_dtype(
                     self,
                     torch.float32,
-                    enabled=True,
+                    enabled=next(self.parameters()).dtype != torch.float32,
                 )
             )
             with autocast_ctx:

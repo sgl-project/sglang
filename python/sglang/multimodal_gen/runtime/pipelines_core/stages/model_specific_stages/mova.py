@@ -705,7 +705,10 @@ class MOVADenoisingStage(PipelineStage):
             else temporary_modules_dtype(
                 [visual_dit, self.audio_dit],
                 dtype=torch.float32,
-                enabled=True,
+                enabled=[
+                    next(m.parameters()).dtype != torch.float32
+                    for m in [visual_dit, self.audio_dit]
+                ],
             )
         )
         with autocast_ctx:
@@ -1018,7 +1021,7 @@ class MOVADecodingStage(PipelineStage):
                 else temporary_module_dtype(
                     self.audio_vae,
                     torch.float32,
-                    enabled=True,
+                    enabled=next(self.audio_vae.parameters()).dtype != torch.float32,
                 )
             )
             with autocast_ctx:
