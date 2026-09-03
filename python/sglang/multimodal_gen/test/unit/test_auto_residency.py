@@ -73,6 +73,18 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _discrete_host_for_planner_tests(monkeypatch):
+    # These expectations describe a discrete GPU (pageable copies cost 3x, pins
+    # have a budget). On a shared host/device pool the planner prices things
+    # differently (see test_shared_memory_pool), so pin the platform here.
+    monkeypatch.setattr(
+        type(current_platform),
+        "device_shares_host_memory",
+        classmethod(lambda cls: False),
+    )
+
+
 def _record(
     *,
     width=832,
