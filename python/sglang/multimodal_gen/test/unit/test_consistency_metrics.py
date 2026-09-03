@@ -263,8 +263,10 @@ def test_remote_platform_video_gt_prefers_platform_sglang_before_default_officia
     monkeypatch.setattr(
         test_utils,
         "_remote_file_exists",
-        lambda url: url.startswith(sglang_platform_prefix)
-        or url.startswith(official_default_prefix),
+        lambda url: (
+            url.startswith(sglang_platform_prefix)
+            or url.startswith(official_default_prefix)
+        ),
     )
 
     files = test_utils._find_remote_consistency_gt_files(

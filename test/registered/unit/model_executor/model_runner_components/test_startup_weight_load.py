@@ -41,7 +41,13 @@ from sglang.srt.model_loader.weight_utils import (
     initialize_capture_safe_weights,
     restore_optional_checkpoint_parameter_values,
 )
-from sglang.srt.runtime_context import get_context, get_exec, publish, reset_context
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_context,
+    get_exec,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -1172,7 +1178,7 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         )
         self.assertEqual(
             (options.prefill_attention_backend, options.decode_attention_backend),
-            server_args.get_attention_backends(),
+            attention_backends(),
         )
         self.assertEqual(options.dsa_prefill_backend, server_args.dsa_prefill_backend)
         self.assertEqual(options.dsa_decode_backend, server_args.dsa_decode_backend)

@@ -171,12 +171,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
