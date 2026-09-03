@@ -54,16 +54,28 @@ def _make_inputs(M, K, N, with_bias, seed=0):
     return x, weight, weight_q, weight_scale, bias
 
 
-def _sylvester_hadamard(n, device):
-    h = torch.ones(1, 1, device=device, dtype=torch.float32)
-    while h.shape[0] < n:
-        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
-    return h / math.sqrt(n)
+def _regular_hadamard(n, device):
+    """kron(H2?, H4, H4, ...) / sqrt(n): 4-point stages from the lowest index digit up,
+    one 2-point stage on the top bit when log2(n) is odd. Every row sums to +1 (up to
+    the 2-point factor), unlike the Sylvester transform whose first row is all ones."""
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        device=device,
+        dtype=torch.float64,
+    )
+    h2 = torch.tensor([[1, 1], [1, -1]], device=device, dtype=torch.float64)
+    bits = int(math.log2(n))
+    h = torch.ones(1, 1, device=device, dtype=torch.float64)
+    for _ in range(bits // 2):
+        h = torch.kron(h4, h)  # the lowest digit is the rightmost Kronecker factor
+    if bits % 2:
+        h = torch.kron(h2, h)
+    return (h / math.sqrt(n)).float()
 
 
 def _reference_rotate_quantize(x, group_size):
     M, K = x.shape
-    h = _sylvester_hadamard(group_size, x.device)
+    h = _regular_hadamard(group_size, x.device)
     rotated = (x.float().view(M, K // group_size, group_size) @ h).view(M, K)
     amax = rotated.abs().amax(dim=1)
     scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
@@ -74,8 +86,9 @@ def _reference_rotate_quantize(x, group_size):
 @pytest.mark.parametrize("group_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("M", [3, 2048])
 def test_rotate_quantize_matches_hadamard_reference(M, group_size):
-    """The in-kernel butterfly must be the orthonormal Sylvester-ordered WHT the
-    weight side was quantized with, not merely some consistent orthogonal map."""
+    """The in-kernel stages must be the orthonormal regular Hadamard (Kronecker
+    power of the 4x4) the weight side was quantized with, not merely some
+    consistent orthogonal map."""
     x, *_ = _make_inputs(M, 3072, 8, with_bias=False)
     x_q, x_scale = convrot_rotate_quantize_activation(x, group_size=group_size)
     ref_q, ref_scale = _reference_rotate_quantize(x, group_size=group_size)

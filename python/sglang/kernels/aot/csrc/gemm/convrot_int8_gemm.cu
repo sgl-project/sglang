@@ -60,10 +60,9 @@ using namespace cute;
 
 // ---------------------------- Rotate + quantize ----------------------------
 // One block per row. Each warp owns whole GroupSize-wide groups and holds a
-// group as (reg_slot * 32 + lane): every butterfly distance below 32 is a lane
-// shuffle and every distance from 32 up is a same-thread register swap, so the
-// transform itself needs no block barrier; the only barrier combines the
-// per-warp abs-max partials.
+// group as (reg_slot * 32 + lane): index bits below 5 are lane shuffles and bits
+// from 5 up are same-thread register slots, so the transform itself needs no
+// block barrier; the only barrier combines the per-warp abs-max partials.
 // 512 threads: at small M the per-CTA round count (num_groups / warps) is the
 // wall time, not occupancy. Measured; smem is still the occupancy limit at
 // K = 12288.
@@ -118,29 +117,89 @@ __global__ void convrot_rotate_quantize_activation_kernel(
       }
     }
 
-    // Distances 1..16 touch only lane bits: intra-warp shuffle butterfly.
+    // Regular (non-Sylvester) Hadamard, the Kronecker power of
+    //   H4 = [[1,1,1,-1], [1,1,-1,1], [1,-1,1,1], [-1,1,1,1]]:
+    // one 4-point stage per base-4 digit of the in-group index, y_d = S - 2 x_{d^3}
+    // with S the sum of the four elements that differ only in that digit. Every row
+    // of the product sums to +1, so a group's mean stays spread over the
+    // coefficients. The Sylvester transform (row 0 all ones) concentrates it into
+    // one coefficient at sqrt(GroupSize) x; that coefficient becomes the row absmax
+    // and coarsens the INT8 step for the whole row, measured 1.3-1.9x more error on
+    // GELU outputs and other non-zero-mean inputs. Same matrix as comfy-kitchen's
+    // ConvRot path. Index bits: 0-4 lane, 5+ register slot; digit (bits 4,5)
+    // straddles both. Group sizes with an odd bit count finish with one 2-point
+    // stage on the top register bit.
+    auto h4_mix = [](float v0, float v1, float v2, float v3, int d) -> float {
+      // vals indexed by digit value; the sum is formed in a fixed order so the four
+      // threads/slots of a quartet produce bitwise the same S.
+      float vals[4];
+      vals[d] = v0;
+      vals[d ^ 1] = v1;
+      vals[d ^ 2] = v2;
+      vals[d ^ 3] = v3;
+      const float S = (vals[0] + vals[1]) + (vals[2] + vals[3]);
+      return S - 2.f * vals[d ^ 3];
+    };
+
+    // Digits 0 and 1: lane bits (0,1) and (2,3).
     CUTLASS_PRAGMA_UNROLL
-    for (int half = 1; half < 32; half <<= 1) {
+    for (int shift = 0; shift < 4; shift += 2) {
+      const int s1 = 1 << shift;
+      const int d = (lane >> shift) & 3;
       CUTLASS_PRAGMA_UNROLL
       for (int k = 0; k < kElemsPerThread; k++) {
         const float mine = reg[k];
-        const float partner = __shfl_xor_sync(kFullMask, mine, half);
-        reg[k] = (lane & half) ? (partner - mine) : (mine + partner);
+        const float p1 = __shfl_xor_sync(kFullMask, mine, s1);
+        const float p2 = __shfl_xor_sync(kFullMask, mine, 2 * s1);
+        const float p3 = __shfl_xor_sync(kFullMask, mine, 3 * s1);
+        reg[k] = h4_mix(mine, p1, p2, p3, d);
       }
     }
 
-    // Distances >= 32 touch only register-slot bits: in-thread swaps.
-    CUTLASS_PRAGMA_UNROLL
-    for (int half = 32; half < GroupSize; half <<= 1) {
-      const int kh = half / 32;
+    // Digit 2: lane bit 4 (partner one shuffle away) and register bit 0 (partner
+    // one slot away).
+    {
+      const int lane_bit = (lane >> 4) & 1;
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < kElemsPerThread; k += 2) {
+        const float a = reg[k];
+        const float b = reg[k + 1];
+        const float a16 = __shfl_xor_sync(kFullMask, a, 16);
+        const float b16 = __shfl_xor_sync(kFullMask, b, 16);
+        // slot k holds digit value lane_bit, slot k+1 holds lane_bit | 2.
+        reg[k] = h4_mix(a, a16, b, b16, lane_bit);
+        reg[k + 1] = h4_mix(b, b16, a, a16, lane_bit | 2);
+      }
+    }
+
+    // Digit 3: register bits 1 and 2 (GroupSize >= 256).
+    if constexpr (kElemsPerThread >= 8) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int k = 0; k < kElemsPerThread; k += 8) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int lo = 0; lo < 2; lo++) {
+          const float v0 = reg[k + lo];
+          const float v1 = reg[k + lo + 2];
+          const float v2 = reg[k + lo + 4];
+          const float v3 = reg[k + lo + 6];
+          reg[k + lo] = h4_mix(v0, v1, v2, v3, 0);
+          reg[k + lo + 2] = h4_mix(v1, v0, v3, v2, 1);
+          reg[k + lo + 4] = h4_mix(v2, v3, v0, v1, 2);
+          reg[k + lo + 6] = h4_mix(v3, v2, v1, v0, 3);
+        }
+      }
+    }
+
+    // Leftover top bit (GroupSize 128: register bit 1; 512: register bit 3): 2-point stage.
+    if constexpr (kElemsPerThread == 4 || kElemsPerThread == 16) {
+      constexpr int kTop = kElemsPerThread / 2;
       CUTLASS_PRAGMA_UNROLL
       for (int k = 0; k < kElemsPerThread; k++) {
-        const int partner_k = k ^ kh;
-        if (partner_k > k) {
+        if ((k & kTop) == 0) {
           const float a = reg[k];
-          const float b = reg[partner_k];
+          const float b = reg[k + kTop];
           reg[k] = a + b;
-          reg[partner_k] = a - b;
+          reg[k + kTop] = a - b;
         }
       }
     }
