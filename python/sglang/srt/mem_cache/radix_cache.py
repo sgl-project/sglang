@@ -180,10 +180,18 @@ class RadixKey:
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
+        return self.match_at(other, offset=0, page_size=page_size)
+
+    def match_at(self, other: RadixKey, offset: int, page_size: int = 1) -> int:
+        """Match without slicing while preserving bigram boundaries and limit semantics."""
         self._check_compatible(other)
+        if self.is_bigram != other.is_bigram:
+            raise ValueError("RadixKey operations require matching bigram modes")
+        if offset < 0 or offset > len(other):
+            raise IndexError(f"RadixKey offset out of range: {offset}")
         t0, t1 = self.token_ids, other.token_ids
         assert type(t0) is type(t1), (type(t0), type(t1))
-        n = min(len(t0), len(t1))
+        n = min(self._raw_len(), other._raw_len() - offset)
 
         # Exponential search for the first diverging token: gallop in doubling
         # windows (one C-level slice compare each), then binary-search the window
@@ -193,10 +201,10 @@ class RadixKey:
         step = 1
         while lo < n:
             hi = lo + step if lo + step < n else n
-            if t0[lo:hi] != t1[lo:hi]:
+            if t0[lo:hi] != t1[offset + lo : offset + hi]:
                 while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if t0[lo:mid] == t1[lo:mid]:
+                    if t0[lo:mid] == t1[offset + lo : offset + mid]:
                         lo = mid
                     else:
                         hi = mid
@@ -206,24 +214,37 @@ class RadixKey:
             step *= 2
 
         if self.is_bigram:
-            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other) - offset))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
-        matched_tokens = min(matched_tokens, len(self), len(other))
+        matched_tokens = min(matched_tokens, len(self), len(other) - offset)
         if page_size == 1:
             return matched_tokens
         return (matched_tokens // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
+        return self.child_key_at(offset=0, page_size=page_size)
+
+    def child_key_at(self, offset: int, page_size: int = 1):
+        """Hashable child key at ``offset`` without slicing token storage."""
+        if offset < 0 or offset + page_size > len(self):
+            raise IndexError(
+                f"RadixKey child range out of bounds: offset={offset}, "
+                f"page_size={page_size}, len={len(self)}"
+            )
         t = self.token_ids
         if self.is_bigram:
             if page_size == 1:
-                plain = (t[0], t[1])
+                plain = (t[offset], t[offset + 1])
             else:
-                plain = tuple((t[j], t[j + 1]) for j in range(page_size))
+                plain = tuple(
+                    (t[j], t[j + 1]) for j in range(offset, offset + page_size)
+                )
         else:
-            plain = t[0] if page_size == 1 else tuple(t[:page_size])
+            plain = (
+                t[offset] if page_size == 1 else tuple(t[offset : offset + page_size])
+            )
         if self.cache_salt is not None:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
@@ -236,7 +257,6 @@ class RadixKey:
 
 
 class TreeNode:
-
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
@@ -553,9 +573,9 @@ class RadixCache(BasePrefixCache):
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(
-            radix_key
-        ), f"{len(new_indices)=}, {len(radix_key)=}"
+        assert len(new_indices) == len(radix_key), (
+            f"{len(new_indices)=}, {len(radix_key)=}"
+        )
 
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
@@ -650,9 +670,9 @@ class RadixCache(BasePrefixCache):
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
-                assert (
-                    node is self.root_node
-                ), "This request holds the node from another tree"
+                assert node is self.root_node, (
+                    "This request holds the node from another tree"
+                )
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -804,9 +824,9 @@ class RadixCache(BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == child.key.child_key(
-                    self.page_size
-                ), f"{key=}, {child.key.child_key(self.page_size)=}"
+                assert key == child.key.child_key(self.page_size), (
+                    f"{key=}, {child.key.child_key(self.page_size)=}"
+                )
 
     def _delete_leaf(self, node):
         key = node.key.child_key(self.page_size)

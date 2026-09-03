@@ -39,7 +39,6 @@ def _make_req(origin_input_ids=None, output_ids=None):
 
 # Serialization round-trip
 class TestCustomLogitProcessorSerialization(CustomTestCase):
-
     def test_to_str_produces_valid_json(self):
         """Test that to_str() produces valid JSON with a 'callable' field."""
         s = DisallowedTokensLogitsProcessor.to_str()
