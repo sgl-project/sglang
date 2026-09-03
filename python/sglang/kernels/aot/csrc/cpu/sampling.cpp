@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "common.h"
+
 namespace {
 inline uint32_t rotl32(uint32_t x, int r) {
   return (x << r) | (x >> (32 - r));
