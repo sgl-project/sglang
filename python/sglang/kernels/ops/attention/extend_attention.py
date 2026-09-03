@@ -2022,9 +2022,9 @@ def dense_prefill_attention_fwd(
     """
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk, f"q/k head dims must match, got {Lq} vs {Lk}"
-    assert (
-        k.shape[0] == v.shape[0]
-    ), f"k/v token counts must match, got {k.shape[0]} vs {v.shape[0]}"
+    assert k.shape[0] == v.shape[0], (
+        f"k/v token counts must match, got {k.shape[0]} vs {v.shape[0]}"
+    )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size = qo_indptr.shape[0] - 1
@@ -2036,9 +2036,9 @@ def dense_prefill_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
-    assert (
-        BLOCK_DMODEL + BLOCK_DPE >= Lq
-    ), f"tile {BLOCK_DMODEL}+{BLOCK_DPE} cannot cover head dim {Lq}"
+    assert BLOCK_DMODEL + BLOCK_DPE >= Lq, (
+        f"tile {BLOCK_DMODEL}+{BLOCK_DPE} cannot cover head dim {Lq}"
+    )
 
     # Both sides of every tl.dot must share a dtype, so a mixed bf16-q/fp8-k
     # pair does not compile. That pair is reachable: on gfx95 with MXFP4
@@ -2051,9 +2051,9 @@ def dense_prefill_attention_fwd(
     if fp8 in (q.dtype, k.dtype, v.dtype):
         q, k, v = q.to(fp8), k.to(fp8), v.to(fp8)
     else:
-        assert (
-            q.dtype == k.dtype == v.dtype
-        ), f"q/k/v dtypes must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+        assert q.dtype == k.dtype == v.dtype, (
+            f"q/k/v dtypes must match, got {q.dtype}/{k.dtype}/{v.dtype}"
+        )
     use_fp8 = q.dtype == fp8
     fp8_max = torch.finfo(fp8).max if use_fp8 else 1.0
 
