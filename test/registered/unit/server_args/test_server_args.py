@@ -1618,6 +1618,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
             speculative_num_draft_tokens=4,
             speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
             speculative_ngram_external_sam_budget=4,
+            speculative_ngram_global_tree_mode="disabled",
         )
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
@@ -1642,6 +1643,13 @@ class TestNgramExternalSamArgs(CustomTestCase):
         handle_speculative_decoding(args)
         self.assertEqual(
             args.speculative_ngram_global_tree_mode, "path_probability"
+        )
+
+    def test_global_tree_mode_defaults_to_specificity_path_probability(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(
+            args.speculative_ngram_global_tree_mode,
+            "specificity_path_probability",
         )
 
     def test_global_tree_mode_cli_round_trip(self):

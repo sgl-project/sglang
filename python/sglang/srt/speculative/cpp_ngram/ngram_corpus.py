@@ -22,7 +22,7 @@ class NgramCorpus:
         capacity=1000000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
-        global_tree_mode="disabled",
+        global_tree_mode="specificity_path_probability",
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(

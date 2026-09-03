@@ -58,7 +58,7 @@ def get_ngram_corpus_cls():
             match_type: str,
             external_sam_budget: int = 0,
             external_corpus_max_tokens: int = 10000000,
-            global_tree_mode: str = "disabled",
+            global_tree_mode: str = "specificity_path_probability",
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:

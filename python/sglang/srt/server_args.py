@@ -2337,11 +2337,11 @@ class ServerArgs:
             "path_probability",
             "specificity_path_probability",
         ],
-        "Experimental global Trie/SAM proposal allocation mode. The disabled "
-        "default preserves fixed source budgets and the configured BFS/PROB path; "
-        "enabled modes use source-local occurrence probabilities.",
+        "Global Trie/SAM proposal allocation mode. The default ranks paths by "
+        "source-local occurrence probability weighted by match specificity; "
+        "disabled preserves fixed source budgets and the configured BFS/PROB path.",
         NS("spec"),
-    ] = "disabled"
+    ] = "specificity_path_probability"
     speculative_ngram_max_trie_depth: A[
         int, "The max trie depth for ngram speculative decoding.", NS("spec")
     ] = 18
