@@ -764,8 +764,16 @@ sglang serve \
   --num-gpus 4 \
   --attention-backend hybrid_window_attn_h3 \
   --performance-mode speed \
+  --warmup-num-frames 345 \
+  --warmup-resolutions 1344x768 \
   --port 30010
 ```
+
+`--warmup-num-frames` / `--warmup-resolutions` make the startup warmup run
+at the clip length and canvas you will serve (here the 14.375 s paper
+workload). Without them H3 warms up on a 5-second clip, and the first
+forward of the first longer request pays allocator growth and kernel setup
+in every DiT block (2 to 3 s on this workload, for base H3 as well).
 
 Requests use the same asynchronous video endpoint as the base model, with
 `task: "t2va"`, `conditions: []`, and a target such as

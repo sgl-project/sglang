@@ -477,6 +477,10 @@ MODELS = {
             "--attention-backend=hybrid_window_attn_h3",
             "--enable-torch-compile=false",
             "--warmup-steps=2",
+            # warm up at the served clip shape: H3's first forward at a new
+            # length otherwise pays allocator growth in every block
+            "--warmup-num-frames=345",
+            "--warmup-resolutions=1344x768",
         ],
         "force_eager": True,
     },
@@ -503,6 +507,8 @@ MODELS = {
             "--quantization=fp8",
             "--enable-torch-compile=false",
             "--warmup-steps=2",
+            "--warmup-num-frames=345",
+            "--warmup-resolutions=1344x768",
         ],
         "force_eager": True,
     },
