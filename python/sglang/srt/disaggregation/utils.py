@@ -936,9 +936,13 @@ def build_kv_layer_ids(
     """
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        # Bucket-organized main KV; the pool reports one id per section entry.
+        layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+        layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    else:
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1122,8 +1126,14 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            layer_ids = (
+                token_to_kv_pool.get_state_layer_ids()
+                if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool)
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens,
+                layer_ids=layer_ids,
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
@@ -1169,6 +1179,12 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_c128_layer_ids()
+                            if is_npu()
+                            and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool)
+                            else None
+                        ),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1236,6 +1252,7 @@ def setup_state_kv_args(
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
+                layer_ids=token_to_kv_pool.get_c128_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same

@@ -86,11 +86,24 @@ class AscendTransferEngine(MooncakeTransferEngine):
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:
             ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
+        except Exception as exc:
             # Mark register as failed
             ret_value = -1
+            logger.warning(
+                "Ascend batch_register_memory raised: %d ptrs, %d bytes: %s",
+                len(ptrs),
+                sum(lengths),
+                exc,
+            )
         if ret_value != 0:
-            logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+            # A rejected range only surfaces later as an SMMU terminate on the
+            # first DMA touching it, so this must be loud, not debug.
+            logger.error(
+                "Ascend memory registration FAILED: ret=%d, %d ptrs, %d bytes",
+                ret_value,
+                len(ptrs),
+                sum(lengths),
+            )
 
     @staticmethod
     def _get_transfer_protocol():

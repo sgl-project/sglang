@@ -30,6 +30,17 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.runtime_context import get_schedule
 
 
+def bucket_layer_ids(
+    compression_ratios: List[int], stage_start: int, stage_end: int, ratio: int
+) -> List[int]:
+    """Global ids of the stage layers compressed at ``ratio``, in buffer order."""
+    return [
+        layer_id
+        for layer_id in range(stage_start, stage_end)
+        if compression_ratios[layer_id] == ratio
+    ]
+
+
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU bf16 variant of the full / SWA / c4 / c128 single-KV pool.
 
@@ -399,6 +410,35 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf.data_ptr() for buf in buffers],
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
+        )
+
+    # ---- PD transfer layer ids ---------------------------------------------
+    # Each reports one global layer id per entry of the matching buf-infos
+    # list, letting the transfer layer pair prefill/decode entries by id
+    # (build_transfer_entry_pairs) instead of positional slicing.
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Ids for ``get_contiguous_buf_infos``: three same-length sections
+        (c4 KV, index K, index scale), so each c4 id appears once per section."""
+        return self._c4_layer_ids() * 3
+
+    def get_state_layer_ids(self) -> List[int]:
+        """Ids for ``get_state_buf_infos``: per-layer SWA KV, then c4
+        attention and c4 indexer states."""
+        return (
+            list(range(self._stage_start, self._stage_end))
+            + self._c4_layer_ids() * 2
+        )
+
+    def get_c128_layer_ids(self) -> List[int]:
+        """Ids for ``get_c128_kv_buf_infos`` / ``get_c128_state_buf_infos``."""
+        return bucket_layer_ids(
+            self.compression_ratios, self._stage_start, self._stage_end, 128
+        )
+
+    def _c4_layer_ids(self) -> List[int]:
+        return bucket_layer_ids(
+            self.compression_ratios, self._stage_start, self._stage_end, 4
         )
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:

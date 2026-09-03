@@ -1,6 +1,7 @@
 import concurrent.futures
 import enum
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -15,6 +16,12 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_transfer_entry_pairs,
+)
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -34,6 +41,13 @@ class AscendKVManager(MooncakeKVManager):
         return (
             super()._requires_exact_state_index_match(st)
             or st in _DSV4_KVCACHE_STATE_TYPES
+        )
+
+    def _is_layer_split_kv_transfer(self) -> bool:
+        """Layer split registers only owned layers, so the positional
+        pp_size == 1 send path cannot be used."""
+        return self.disaggregation_mode == DisaggregationMode.PREFILL and (
+            get_parallel().enable_dsa_cache_layer_split
         )
 
     def init_engine(self):
@@ -59,8 +73,50 @@ class AscendKVManager(MooncakeKVManager):
         ):
             ptrs.extend(component_ptrs)
             lens.extend(component_lens)
+        logger.info(
+            "LSREG: pid=%d mode=%s layer_split=%d registering %d ranges, %d bytes",
+            os.getpid(),
+            self.disaggregation_mode,
+            int(self._is_layer_split_kv_transfer()),
+            len(ptrs),
+            sum(lens),
+        )
+        if envs.SGLANG_DSV4_VERIFY_PROBE.get() and ptrs:
+            # Full table (sorted) so a failing transfer block can be matched
+            # against the registered ranges on this rank.
+            table = sorted(zip(ptrs, lens))
+            logger.info(
+                "LSREG-FULL: pid=%d %s",
+                os.getpid(),
+                " ".join(f"{p:x}+{n:x}" for p, n in table),
+            )
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def _transfer_data(self, mooncake_session_id, transfer_blocks):
+        if not transfer_blocks:
+            return 0
+        src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        ret = self.engine.batch_transfer_sync(
+            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+        )
+        if ret != 0 and envs.SGLANG_DSV4_VERIFY_PROBE.get():
+            # The rejected batch is the ground truth behind an SMMU terminate:
+            # dump its address span to match against both peers' LSREG-FULL.
+            logger.error(
+                "LSXFER-FAIL: session=%s ret=%d blocks=%d "
+                "src=[%#x,%#x) dst=[%#x,%#x) first=%s last=%s",
+                mooncake_session_id,
+                ret,
+                len(transfer_blocks),
+                min(b[0] for b in transfer_blocks),
+                max(b[0] + b[2] for b in transfer_blocks),
+                min(b[1] for b in transfer_blocks),
+                max(b[1] + b[2] for b in transfer_blocks),
+                transfer_blocks[0],
+                transfer_blocks[-1],
+            )
+        return ret
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
@@ -80,6 +136,29 @@ class AscendKVManager(MooncakeKVManager):
 
             if state_type == AscendStateType.DSV4_C128:
                 dst = dst_kv_ptrs[c128_start:c128_end]
+                return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+            # NPU main KV layout [C4 KV, index K, index scale]; slice each dst
+            # section to the owned range (the trailing draft buffers pair
+            # positionally).
+            if state_type is None and self._is_layer_split_kv_transfer():
+                assert (
+                    end_layer is not None
+                ), "prefill_end_layer must be set for layer-split KV transfer"
+                owned_c4 = c4_end - c4_start
+                # Only the last CP rank ships the draft cache, so the src draft
+                # tail may be shorter than (or absent from) the dst tail.
+                n_draft_src = len(src_kv_ptrs) - 3 * owned_c4
+                n_draft_dst = len(dst_kv_ptrs) - 3 * c4_full
+                assert 0 <= n_draft_src <= n_draft_dst, (
+                    "Layer-split KV entry mismatch: src has "
+                    f"{len(src_kv_ptrs)} entries ({n_draft_src} draft), dst has "
+                    f"{len(dst_kv_ptrs)} ({n_draft_dst} draft)."
+                )
+                dst = []
+                for offset in (0, c4_full, 2 * c4_full):
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
+                dst.extend(dst_kv_ptrs[3 * c4_full : 3 * c4_full + n_draft_src])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             # NPU main KV layout: [C4 KV, index K, index scale].
@@ -145,19 +224,61 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        if self.pp_size > 1 or self._is_layer_split_kv_transfer():
             if self.is_mla_backend:
-                src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
-                    self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
-                )
-                layers_params = [
-                    (
-                        src_kv_ptrs[layer_id],
-                        sliced_dst_kv_ptrs[layer_id],
-                        self.kv_args.kv_item_lens[layer_id],
+                layers_params = None
+                if self.kv_args.kv_layer_ids or dst_layer_ids:
+                    # Pair (buffer section, global layer id) entries. Layer
+                    # split registers only owned layers, so a positional
+                    # fallback would ship bytes into the wrong decode layers;
+                    # there it is a hard error.
+                    pairs = build_transfer_entry_pairs(
+                        self.kv_args.kv_layer_ids,
+                        dst_layer_ids or [],
+                        len(self.kv_args.kv_data_ptrs),
+                        len(dst_kv_ptrs),
+                        allow_positional_fallback=not self._is_layer_split_kv_transfer(),
                     )
-                    for layer_id in range(layers_current_pp_stage)
-                ]
+                    layers_params = [
+                        (
+                            self.kv_args.kv_data_ptrs[src],
+                            dst_kv_ptrs[dst],
+                            self.kv_args.kv_item_lens[src],
+                        )
+                        for src, dst in pairs
+                    ]
+                    if envs.SGLANG_DSV4_VERIFY_PROBE.get():
+                        import collections
+
+                        lens = collections.Counter(
+                            item_len for _, _, item_len in layers_params
+                        )
+                        logger.info(
+                            "LSSEND: pid=%d pages=%d src_entries=%d dst_entries=%d "
+                            "pairs=%d item_lens=%s dst_item_len=%s bytes=%d",
+                            os.getpid(),
+                            len(prefill_kv_indices),
+                            len(self.kv_args.kv_data_ptrs),
+                            len(dst_kv_ptrs),
+                            len(pairs),
+                            dict(lens),
+                            dst_kv_item_len,
+                            sum(l * len(prefill_kv_indices) for l in lens.elements()),
+                        )
+                if layers_params is None:
+                    src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
+                        self.get_mla_kv_ptrs_with_pp(
+                            self.kv_args.kv_data_ptrs, dst_kv_ptrs
+                        )
+                    )
+                    layers_params = [
+                        (
+                            src_kv_ptrs[layer_id],
+                            sliced_dst_kv_ptrs[layer_id],
+                            self.kv_args.kv_item_lens[layer_id],
+                        )
+                        for layer_id in range(layers_current_pp_stage)
+                    ]
             else:
                 (
                     src_k_ptrs,

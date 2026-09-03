@@ -523,6 +523,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
+            if envs.SGLANG_DEBUG_RADIX_CACHE.get():
+                logger.info(
+                    "RADIX match(session): key_len=%d hit=%d",
+                    len(params.key),
+                    len(result.device_indices),
+                )
             return result
         if self.disable:
             return self.tree_core.empty_match_result
@@ -536,6 +542,13 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
+        if envs.SGLANG_DEBUG_RADIX_CACHE.get():
+            logger.info(
+                "RADIX match: key_len=%d hit=%d full_hit=%d",
+                len(params.key),
+                len(result.device_indices),
+                result.full_kv_hit_length,
+            )
         return result
 
     def is_chunk_cache(self) -> bool:
@@ -554,6 +567,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if envs.SGLANG_DEBUG_RADIX_CACHE.get():
+                        logger.info(
+                            "RADIX insert: key_len=%d prev_prefix=%d inserted=%d",
+                            len(params.key or ()),
+                            params.prev_prefix_len,
+                            step.result.prefix_len,
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -925,6 +945,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        _dbg = envs.SGLANG_DEBUG_RADIX_CACHE.get()
+        if _dbg:
+            logger.info(
+                "RADIX cache_unfinished: rid=%s chunked=%s fill=%d disable=%s",
+                req.rid,
+                chunked,
+                len(req.get_fill_ids()),
+                self.disable,
+            )
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
@@ -975,6 +1004,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
+            if _dbg:
+                logger.info(
+                    "RADIX cache_unfinished early-return: effective=%d", effective_cache_len
+                )
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(

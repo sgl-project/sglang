@@ -467,6 +467,21 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Log every unified-radix match/insert (key lengths and hit length).
+    SGLANG_DEBUG_RADIX_CACHE = EnvBool(False)
+    # DSV4 NPU layer-split probe: LS_DEBUG logs every owner read with pre/post
+    # checksums and NaN counts; LS_SYNC device-syncs around them so the probe
+    # reads are ground truth across streams.
+    SGLANG_DSV4_LS_DEBUG = EnvBool(False)
+    SGLANG_DSV4_LS_SYNC = EnvBool(False)
+    # DSV4 decode verify-buffer probe: dump per-step invariants of the verify
+    # positions fill (shapes, seq-lens, gather bounds) to localize the aicore
+    # fault on that path; also logs decode request admissions.
+    SGLANG_DSV4_VERIFY_PROBE = EnvBool(False)
+    # DSV4 layer-split: owner reads stage <=N-byte chunks through a fresh
+    # staging tensor and a chunked all-gather; broadcast corrupts payload
+    # bytes on the ZBAL-interposed torch.distributed of this stack.
+    SGLANG_DSV4_LS_CHUNK_BYTES = EnvInt(1024 * 1024)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)

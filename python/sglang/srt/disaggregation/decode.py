@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -2661,6 +2662,18 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
+        if envs.SGLANG_DSV4_VERIFY_PROBE.get():
+            for req in can_run_list:
+                logger.info(
+                    "DECODE admit: pid=%d rid=%s room=%s seq_len=%s "
+                    "kv_committed=%s prefix=%d",
+                    os.getpid(),
+                    req.rid,
+                    getattr(req, "bootstrap_room", None),
+                    getattr(req, "seq_len", None),
+                    getattr(req.kv, "kv_committed_len", None),
+                    len(req.prefix_indices),
+                )
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 

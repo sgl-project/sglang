@@ -704,6 +704,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
                 ]
+                if envs.SGLANG_DSV4_VERIFY_PROBE.get():
+                    logger.info(
+                        "LSSEND-STATE: pid=%d state_type=%s pairs=%d "
+                        "src_entries=%d dst_entries=%d first_pair=%s",
+                        os.getpid(),
+                        state_type,
+                        len(layers_params),
+                        len(src_data_ptrs),
+                        len(dst_data_ptrs),
+                        layers_params[0] if layers_params else None,
+                    )
             else:
                 src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(
@@ -1451,6 +1462,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        # State components must pair by layer id like the main
+                        # KV: a layer-split prefill registers a subset, so
+                        # positional slicing lands ring bytes in KV buffers
+                        # and the slot-id offset runs past the buffer (SMMU
+                        # terminate).
+                        src_layer_ids=src_state_layer_ids or None,
+                        dst_layer_ids=dst_state_layer_ids or None,
                     )
                     or rc
                 )

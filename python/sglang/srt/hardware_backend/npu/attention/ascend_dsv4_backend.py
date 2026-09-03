@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
@@ -18,11 +19,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-<<<<<<< HEAD
-=======
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
->>>>>>> 2fdfe9ff76 (dsv4(npu): support prefill context parallelism with interleave and zigzag (#23))
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
@@ -2084,11 +2081,32 @@ class DeepseekV4AscendAttnBackend(
 
         if indices.numel() == 0:
             return
+        if envs.SGLANG_DSV4_VERIFY_PROBE.get():
+            oob = int(indices.max().item()) >= positions.numel()
+            logger.info(
+                "VERIFYFILL pre: rank=%d ratio=%d pos_numel=%d n_draft=%d "
+                "req_num=%d dst_numel=%d idx_numel=%d idx_max=%d oob=%s "
+                "seq_numel=%d seq_min=%d seq_max=%d",
+                os.getpid(),
+                ratio,
+                positions.numel(),
+                n_draft,
+                request_num,
+                dst.numel(),
+                indices.numel(),
+                int(indices.max().item()),
+                oob,
+                seq_lens_cpu.numel(),
+                int(seq_lens_cpu.min().item()),
+                int(seq_lens_cpu.max().item()),
+            )
         # This tiny H2D copy runs on the verify metadata path. Keep it blocking:
         # on NPU, a non-blocking copy from a short-lived pinned CPU tensor can
         # surface later as an unrelated CopyKernel stream failure.
         indices = indices[: dst.numel()].to(device=positions.device)
         dst[: indices.numel()].copy_(torch.gather(positions, 0, indices))
+        if envs.SGLANG_DSV4_VERIFY_PROBE.get():
+            logger.info("VERIFYFILL post: pid=%d ratio=%d", os.getpid(), ratio)
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info, cuda_graph_bs: Optional[int]
