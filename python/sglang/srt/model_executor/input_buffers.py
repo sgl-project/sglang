@@ -28,9 +28,11 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     registrants keep the tensors their graphs were captured against, so no
     already-captured buffer is ever repointed. Because a smaller request never
     allocates, the footprint depends on registration order: the speculative
-    graph runners size their width-scaled buffers at the widest candidate
-    width so the initially captured state is already the widest, and the
-    adaptive controller builds the remaining steps by descending batch size.
+    graph runners size their width-scaled token buffers at the widest
+    candidate width so the initially captured state is already the widest
+    (the draft-decode ``out_cache_loc`` and the verify ``custom_mask`` stay
+    per-width; both are KB-scale), and the adaptive controller builds the
+    remaining steps by descending batch size.
 
     This pool governs *every* ``share_buffers()`` caller. Cross-runner sharing
     is safe because these are per-replay inputs: each runner fills the region

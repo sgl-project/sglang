@@ -116,7 +116,11 @@ def resolve_num_tokens_per_req(
     if phase == "draft_decode":
         return spec.speculative_eagle_topk
     if phase == "draft_extend":
-        return spec.speculative_num_draft_tokens
+        return (
+            spec.speculative_num_draft_tokens
+            if num_draft_tokens is None
+            else num_draft_tokens
+        )
     if phase == "target_verify":
         if num_draft_tokens is None:
             num_draft_tokens = spec.speculative_num_draft_tokens

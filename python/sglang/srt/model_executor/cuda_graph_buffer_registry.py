@@ -306,8 +306,7 @@ class CudaGraphBufferRegistry:
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
         # Coalesce allocated slot buffers through the global pool; only applies
-        # when allocating (bind/source bypasses the pool). A namespace keeps a
-        # registry's slots from aliasing same-named slots outside it.
+        # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
         self.pool_namespace = pool_namespace
         self._slots: Dict[str, GraphSlot] = {}
