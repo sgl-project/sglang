@@ -277,6 +277,22 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         self.swiglu_limit = self.config.swiglu_limit
         self.use_swizzle = get_moe_a2a_backend().is_megamoe()
 
+        if self.config.gemm1_alpha is not None and self.config.activation != "situ":
+            # oai-swiglu (MiniMax-M3 / gpt-oss). Validated once here so every
+            # runner branch below can assume the activation is well formed
+            # instead of silently degrading to plain silu_and_mul.
+            # SiTU (Kimi-K3) also sets gemm1_alpha/gemm1_clamp_limit (reused as
+            # situ_beta/situ_linear_beta) and validates them in its own runner
+            # branches, so it is excluded from this oai-swiglu-only check.
+            assert (
+                self.config.gemm1_clamp_limit is not None
+            ), "gemm1_alpha requires gemm1_clamp_limit"
+            assert self.swiglu_limit is None, (
+                "swiglu_limit (DeepSeek V4) and gemm1_alpha (oai-swiglu) are "
+                "mutually exclusive"
+            )
+            assert not self.use_swizzle, "swizzle is not supported with gemm1_alpha"
+
     def run(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -402,6 +418,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
+            sglang_per_token_group_quant_fp8,
         )
 
         hidden_states = runner_input.hidden_states
@@ -510,6 +527,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
+        elif self.config.gemm1_alpha is not None:
+            # oai-swiglu: see _apply_oai_swiglu for why the kernels below cannot
+            # be used. This is the DeepEP-normal (prefill) path, so getting it
+            # wrong poisons the prompt representation and the KV cache.
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
+            )
+            del gateup_output
+
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
         elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
@@ -538,10 +575,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del gateup_output
         else:
-            from sglang.kernels.ops.quantization.fp8_kernel import (
-                sglang_per_token_group_quant_fp8,
-            )
-
             if self.swiglu_limit is not None:
                 gateup_output = _apply_swiglu_limit(
                     gateup_output, swiglu_limit=self.swiglu_limit
@@ -647,24 +680,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         dispose_tensor(hidden_states)
 
-        if self.swiglu_limit is not None:
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
-            )
-
         # Act: (M, N) -> (M, N/2)
-        if not _is_musa:
-            down_input = torch.empty(
-                (
-                    all_tokens,
-                    N // 2,
-                ),
-                device=gateup_output.device,
-                dtype=torch.bfloat16,
+        if self.config.gemm1_alpha is not None:
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
             )
-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         else:
-            down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+
+            if not _is_musa:
+                down_input = torch.empty(
+                    (
+                        all_tokens,
+                        N // 2,
+                    ),
+                    device=gateup_output.device,
+                    dtype=torch.bfloat16,
+                )
+                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            else:
+                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
         del gateup_output
 
         # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
@@ -737,20 +778,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.swiglu_limit is not None:
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
+        if self.config.gemm1_alpha is not None:
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
             )
+        else:
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
 
-        down_input = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
-        )
-        _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            down_input = torch.empty(
+                (
+                    all_tokens,
+                    N // 2,
+                ),
+                device=gateup_output.device,
+                dtype=torch.bfloat16,
+            )
+            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_input_int8, down_input_scale = sglang_per_token_quant_fp8(down_input)
@@ -813,20 +862,28 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        if self.swiglu_limit is not None:
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
+        if self.config.gemm1_alpha is not None:
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
             )
+        else:
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
 
-        down_input = torch.empty(
-            (
-                all_tokens,
-                N // 2,
-            ),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
-        )
-        _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            down_input = torch.empty(
+                (
+                    all_tokens,
+                    N // 2,
+                ),
+                device=gateup_output.device,
+                dtype=torch.bfloat16,
+            )
+            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_input_int8, down_input_scale = per_token_quant_int8(down_input)
@@ -858,6 +915,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         from sglang.kernels.ops.elementwise.silu_mul_quant import (
             silu_and_mul_post_quant_mxfp4,
         )
+        from sglang.srt.layers.quantization.ppu_mxfp4_utils import downcast_to_mxfp4
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -920,6 +978,21 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale=down_input_scale,
             )
             down_input_scale = down_input_scale.t()
+        elif self.config.gemm1_alpha is not None:
+            # gpt-oss: the fused silu+mul+mxfp4 kernel has no alpha/clamp-limit
+            # variant, so run the activation separately and then quantize.
+            # downcast_to_mxfp4 emits the same preprocessed scale layout (uint16
+            # packed, transposed-contiguous) as the fused kernel, which is what
+            # grouped_gemm_nt_f4f4bf16_nopad expects.
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
+            )
+
+            down_input_fp4, down_input_scale = downcast_to_mxfp4(down_input, axis=1)
+            del down_input
         else:
             down_input_fp4, down_input_scale = silu_and_mul_post_quant_mxfp4(
                 gateup_output, swiglu_limit=self.swiglu_limit
@@ -1035,20 +1108,31 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         dispose_tensor(hidden_states)
 
-        if self.swiglu_limit is not None:
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
+        if self.config.gemm1_alpha is not None and self.config.activation != "situ":
+            # oai-swiglu (MiniMax-M3 / gpt-oss). SiTU (Kimi-K3) also sets
+            # gemm1_alpha (reused as situ_beta), so it is excluded here and
+            # served by the situ branch in the else arm below.
+            down_input = _apply_oai_swiglu(
+                gateup_output,
+                gemm1_alpha=self.config.gemm1_alpha,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit,
+                gate_up_interleaved=self.config.gate_up_interleaved,
             )
-
-        down_input = torch.empty(
-            (all_tokens, N // 2),
-            device=gateup_output.device,
-            dtype=torch.bfloat16,
-        )
-        if self.config.activation == "situ":
-            self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
         else:
-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+
+            down_input = torch.empty(
+                (all_tokens, N // 2),
+                device=gateup_output.device,
+                dtype=torch.bfloat16,
+            )
+            if self.config.activation == "situ":
+                self._apply_situ_and_mul(gateup_output.view(-1, N), down_input)
+            else:
+                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
         del gateup_output
 
         down_output = torch.empty(
@@ -1312,7 +1396,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         # Act
-        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        silu_and_mul_masked_fwd(
+            gateup_output,
+            down_input,
+            masked_m,
+            gemm1_alpha=self.config.gemm1_alpha or 0.0,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
+        )
         del gateup_output
 
         # GroupGemm-1
@@ -1442,6 +1532,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             use_int8=hidden_states.dtype == torch.int8,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             swiglu_limit=swiglu_limit_arg,
+            gemm1_alpha=self.config.gemm1_alpha or 0.0,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
         )
         del gateup_output
 
@@ -1569,6 +1661,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             use_int8=hidden_states.dtype == torch.int8,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             swiglu_limit=swiglu_limit_arg,
+            gemm1_alpha=self.config.gemm1_alpha or 0.0,
+            gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
         )
         del gateup_output
 
@@ -1620,6 +1714,17 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             silu_and_mul_masked_post_quant_mxfp4,
         )
         from sglang.srt.layers import deep_gemm_wrapper
+
+        assert self.config.gemm1_alpha is None or self.config.activation == "situ", (
+            "oai-swiglu (MiniMax-M3 / gpt-oss) is not supported on the masked "
+            "mxfp4 path: silu_and_mul_masked_post_quant_mxfp4 has no "
+            "alpha/clamp-limit variant, and neither the Triton alpha branch "
+            "nor downcast_to_mxfp4 produces the e2m1 + [E, S//2, T] scale "
+            "layout that grouped_gemm_nt_f4f4bf16_masked expects. Use "
+            "--deepep-mode normal, or disable the deep_gemm MoE runner. "
+            "(SiTU / Kimi-K3 is exempt: it reuses gemm1_alpha as situ_beta and "
+            "is served by the dedicated situ branch further below.)"
+        )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
@@ -1782,7 +1887,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 gateup_output, down_input, masked_m, expected_m=expected_m
             )
         else:
-            silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+            silu_and_mul_masked_fwd(
+                gateup_output,
+                down_input,
+                masked_m,
+                gemm1_alpha=self.config.gemm1_alpha or 0.0,
+                gemm1_clamp_limit=self.config.gemm1_clamp_limit or 0.0,
+            )
         del gateup_output
 
         # GroupGemm-1
@@ -2499,3 +2610,45 @@ def _apply_swiglu_limit(
     out = torch.cat([gate, up], dim=-1)
     assert out.shape == (num_tokens, hidden_size_x2)
     return out
+
+
+def _apply_oai_swiglu(
+    gateup_output: torch.Tensor,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: float,
+    gate_up_interleaved: bool,
+) -> torch.Tensor:
+    """oai-swiglu activation used by MiniMax-M3 and gpt-oss.
+
+        gate = clamp(g, max=L)
+        up   = clamp(u, min=-L, max=L)
+        out  = gate * sigmoid(gate * alpha) * (up + 1)
+
+    Neither the JIT silu+mul(+quant) kernels nor _legacy_silu_and_mul carries
+    alpha / L, so falling through to them silently computes plain silu(g)*u and
+    corrupts every MoE output. Each runner branch must route through here
+    whenever config.gemm1_alpha is set.
+
+    Computed in fp32 to match the masked Triton kernel that serves the same
+    activation on the standard / DeepEP-LL paths. Plain torch ops rather than
+    the @torch.compile'd triton_utils twin, because prefill token counts vary
+    and would retrigger compilation.
+    """
+    assert gateup_output.dtype == torch.bfloat16, (
+        f"expected bf16 gateup_output, got {gateup_output.dtype}; the fp32 "
+        "upcast below must copy, otherwise the in-place clamps would corrupt it"
+    )
+
+    if gate_up_interleaved:
+        # gpt-oss packs w13 row-interleaved: [g0, u0, g1, u1, ...]
+        gate = gateup_output[..., ::2].float()
+        up = gateup_output[..., 1::2].float()
+    else:
+        # MiniMax-M3 uses two contiguous halves: [gate; up]
+        N = gateup_output.shape[-1]
+        gate = gateup_output[..., : N // 2].float()
+        up = gateup_output[..., N // 2 :].float()
+
+    gate = gate.clamp_(max=gemm1_clamp_limit)
+    up = up.clamp_(min=-gemm1_clamp_limit, max=gemm1_clamp_limit)
+    return (gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)).to(torch.bfloat16)
