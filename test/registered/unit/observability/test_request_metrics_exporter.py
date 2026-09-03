@@ -78,12 +78,12 @@ def setUpModule():
 
     if stub_modules:
         if "sglang.srt.managers.io_struct" in stub_modules:
-            stub_modules["sglang.srt.managers.io_struct"].GenerateReqInput = (
-                _GenerateReqInput
-            )
-            stub_modules["sglang.srt.managers.io_struct"].EmbeddingReqInput = (
-                _EmbeddingReqInput
-            )
+            stub_modules[
+                "sglang.srt.managers.io_struct"
+            ].GenerateReqInput = _GenerateReqInput
+            stub_modules[
+                "sglang.srt.managers.io_struct"
+            ].EmbeddingReqInput = _EmbeddingReqInput
         if "sglang.srt.server_args" in stub_modules:
             stub_modules["sglang.srt.server_args"].ServerArgs = _ServerArgs
 
