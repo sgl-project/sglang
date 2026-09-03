@@ -185,11 +185,33 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # 128-reg fix is only needed at >=12 warps). mma.sync is warp-local, so
 # the (3,1,1)->(1,4,1) atom swap is a pure reschedule with identical
 # fp32 math and epilogue coverage.
+# PERF pass 8: the M=48 small-N rows (N=4096) are still 0.89/0.92
+# (K=4096) and 0.73 (K=11008). The failing configs are the two extremes:
+# (48,64) has only 64 CTAs / 6 warps (38% SM util), and (48,32) has 128
+# CTAs / 4 warps (~2.9 warps/SM, a quarter of one SM issue group). The
+# measured winner pattern -- (48,128) on N=11008, 1.26x -- shows the
+# large-K M=48 rows want the 12-warp fat B stream. (48,96) ports that
+# pattern to small N: tile (48,96,128) with atom_layout (3,4,1) = 12 MMA
+# warps keeps the exact pass-5 per-warp footprint (MMA_M=1, MMA_N=3, a
+# 16x24 fp32 accumulator = 24 regs, LIGHTER than (48,128)'s 16x32) while
+# each CTA streams 96 B columns per k-step (1.5x (48,64), 3x (48,32)).
+# On N=4096 the grid is 43 CTAs x 12 warps = 516 warps (~3.0/SM, same as
+# (48,32)'s 512 but with a 3x fatter per-CTA DRAM stream, 4-deep TMA
+# pipeline, and the pass-4 tile_k=128 wide boxes); on N=6144 it is 64
+# CTAs = 768 warps. Large-K (K>=8192) small-N rows move to it for the
+# same reason (48,128) won on N=11008: the fat stream beats 128 thin
+# CTAs whose 4-warp TMA issue rate could not fill the pipe. smem: the
+# 36KB stage x5 = 180KB + 9KB epi + 1KB mbar = 190KB <= 227KB, and the
+# 128-reg/thread fix already applies at 12 warps (384*128 + 32*40 =
+# 50K regs < 64K/SM). Gated to n%96==0 (4096, 6144) in
+# _tile_key_for_shape so the big-N winner (48,11008,4096) keeps
+# (48,128); N=8192 is unreachable (n>=8192 routes first).
 _TILE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, int, int], tuple, int]] = {
     (16, 64): ((16, 64, 64), (1, 2, 1), 2),
     (16, 128): ((16, 128, 64), (1, 4, 1), 4),
     (32, 64): ((32, 64, 64), (1, 4, 1), 4),
     (48, 64): ((48, 64, 128), (3, 2, 1), 6),
+    (48, 96): ((48, 96, 128), (3, 4, 1), 12),
     (48, 32): ((48, 32, 64), (1, 4, 1), 4),
     (48, 128): ((48, 128, 64), (3, 4, 1), 12),
 }
@@ -223,6 +245,14 @@ def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
     # thin CTAs win. n>=8192 puts the crossover between the measured
     # N=6144 (48,64) and N=11008 (48,128) rows. Large K with small N goes
     # to (48,32) (128 CTAs on N=4096); everything else keeps (48,64).
+    # Small N (4096/6144) goes to (48,96): 43/64 CTAs x 12 warps with the
+    # (48,128)-class fat B stream and unchanged per-warp fragments (see
+    # PERF pass 8 above). It covers both the K=4096 rows (targeting
+    # 0.89/0.92) and the large-K down-proj rows (48,4096,11008)=0.73 /
+    # (48,4096,12288), which previously fell to the 4-warp (48,32). The
+    # n>=8192 check stays first, so the (48,11008,4096)=1.26x winner
+    # keeps (48,128); (48,32) remains for K>=8192 with N not 96-divisible
+    # and as the K%128!=0 tile_k=64 fallback.
     # The k>=8192 / n<=6144 rows additionally get 2-way split-K: 128 thin
     # (48,32) CTAs leaves 42/170 SMs idle, and each CTA's K-duplicated B
     # stream is too long to hide, so halving the K range per CTA and
@@ -234,6 +264,8 @@ def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
     if m > 32:
         if n >= 8192 and n % 128 == 0:
             return (48, 128)
+        if n % 96 == 0:
+            return (48, 96)
         if k >= 8192:
             return (48, 32)
         return (48, 64)
@@ -244,7 +276,13 @@ def use_bf16_gemm_sm120(m: int, n: int, k: int) -> bool:
     """Return True when the SM120 BF16 kernel covers this decode shape."""
     if m < 1 or m > 48:
         return False
-    if n % 64 != 0 or k % 64 != 0:
+    # The epilogue has no M/N predication (full-tile TMA store + bias
+    # indexed by the in-tile n coordinate), so N must be tile_n-divisible
+    # -- every M<=32 bucket has tile_n >= 64, and the M>32 tiles are
+    # (48,96) and (48,128) -- while M stays safe because M <= 48 <=
+    # tile_m. K needs 64 only: run_bf16_gemm_sm120 falls back to the
+    # tile_k=64 bucket when K % 128 != 0 for M > 32.
+    if n % 128 != 0 or k % 64 != 0:
         return False
     if m > 32 and k % 128 != 0:
         # Every M in (32, 48] bucket has tile_m=48, and the k-tile count is
