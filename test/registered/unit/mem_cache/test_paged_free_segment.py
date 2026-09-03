@@ -192,9 +192,8 @@ class TestFreeSegments(unittest.TestCase):
         self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
 
     def test_segments_sharing_a_page_are_rejected(self):
-        # [0, 6) and [8, 11): page 1 holds the first tail and nothing else, but
-        # a second segment starting inside page 1 ([0, 5) + [5, 8)) or an
-        # unaligned start ([0, 5) + [7, 11)) would release page 1 twice.
+        # A second segment that starts inside the page the first one ended in,
+        # or at a mid-page position, would release that page twice.
         for spans in ([(0, 5), (5, 8)], [(0, 5), (7, 11)], [(0, 6), (4, 11)]):
             with self.assertRaises(AssertionError):
                 self._freed_by_segments(11, spans)

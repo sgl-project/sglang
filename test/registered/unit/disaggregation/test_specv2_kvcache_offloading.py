@@ -163,9 +163,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Committed [0:10]; overallocated start_p = ceil_align(10, 4) = 12,
-        # end_p = 28 => [12:28]. Page 2 ([8:12)) is released by the committed
-        # range's partial tail, never by the overallocated one.
+        # Committed [0:10]; overallocated start_p = ceil_align(10, 4) = 12 =>
+        # [12:28]. Page 2 ([8:12)) belongs to the committed range's partial tail.
         self.assertEqual(len(freed), 2)
         self.assertTrue(torch.equal(freed[0], torch.arange(0, 10, dtype=torch.int64)))
         self.assertTrue(torch.equal(freed[1], torch.arange(12, 28, dtype=torch.int64)))
