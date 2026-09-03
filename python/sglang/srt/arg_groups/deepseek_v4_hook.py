@@ -158,6 +158,21 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
+        # The trtllm backend stores KV in a 512-byte uniform-FP8 layout while
+        # FlashMLA uses the 584-byte packed layout; the PD handshake only
+        # compares kv_cache_dtype, so mismatched prefill/decode backends would
+        # pass the check and transfer garbage. Reject until the handshake
+        # carries a layout identifier and the path is tested.
+        assert cfg.disaggregation_mode == "null", (
+            "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
+            "(uniform-FP8 KV layout is not part of the PD handshake)."
+        )
+        # The trtllm-gen semaphore buffer is sized from the prefill chunk
+        # bound; with chunking disabled a single long request has no bound.
+        assert cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0, (
+            "--dsv4-attn-backend trtllm requires chunked prefill "
+            "(--chunked-prefill-size > 0)."
+        )
         logger.info(
             "DeepSeek V4 attention: trtllm backend enabled "
             "(uniform-FP8 KV pool, decode + sparse prefill)."

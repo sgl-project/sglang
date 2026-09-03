@@ -629,7 +629,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
             trtllm._check_trtllm_query_rows(64)
-            with self.assertRaisesRegex(AssertionError, "exceeds the persistent"):
+            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):

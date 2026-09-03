@@ -56,7 +56,11 @@ _trtllm_semaphore_rows: int = 0
 
 
 def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
-    """Bound query rows across prefill chunks and speculative decode batches."""
+    """Bound query rows across prefill chunks and speculative decode batches.
+
+    The DSv4 hook rejects the backend when chunked prefill is disabled, so the
+    prefill chunk bound is always finite here.
+    """
     schedule = get_schedule()
     rows = max(
         schedule.max_prefill_tokens or 0,
@@ -111,13 +115,15 @@ def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
 
 
 def _check_trtllm_query_rows(num_rows: int) -> None:
-    assert num_rows <= _trtllm_semaphore_rows, (
-        f"trtllm-gen launch with {num_rows} query rows exceeds the persistent "
-        f"semaphore capacity of {_trtllm_semaphore_rows} rows derived from "
-        "--chunked-prefill-size / --max-prefill-tokens / --max-running-requests; "
-        "lower --chunked-prefill-size (chunking must stay enabled) or raise the "
-        "capacity."
-    )
+    # A plain exception, not assert: an over-capacity launch scribbles past
+    # the semaphore buffer, so this must fire even under python -O.
+    if num_rows > _trtllm_semaphore_rows:
+        raise RuntimeError(
+            f"trtllm-gen launch with {num_rows} query rows exceeds the persistent "
+            f"semaphore capacity of {_trtllm_semaphore_rows} rows derived from "
+            "--chunked-prefill-size / --max-prefill-tokens / "
+            "--max-running-requests; lower --chunked-prefill-size."
+        )
 
 
 class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
