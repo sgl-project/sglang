@@ -3234,13 +3234,15 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
-            o_proj_weight = getattr(layer.self_attn.o_proj, "weight", None)
+            # o_proj is wrapped by BaseLayerWithLoRA under LoRA; the dtype lives on the base layer.
+            o_proj = layer.self_attn.o_proj
+            o_proj = getattr(o_proj, "base_layer", o_proj)
+            o_proj_weight = getattr(o_proj, "weight", None)
             if o_proj_weight is None:
-                o_proj_weight = layer.self_attn.o_proj.qweight
+                o_proj_weight = o_proj.qweight
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=getattr(layer.self_attn.o_proj, "params_dtype", None)
-                or o_proj_weight.dtype,
+                dtype=getattr(o_proj, "params_dtype", None) or o_proj_weight.dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
