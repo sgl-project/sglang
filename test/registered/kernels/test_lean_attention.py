@@ -209,9 +209,9 @@ def _run_pair_paged(
     kv_group_num = H_Q // H_KV
     sm = 1.0 / (D**0.5)
     tot = B * S
-    assert (
-        tot % page_size == 0
-    ), "test setup: total tokens must be a multiple of page_size"
+    assert tot % page_size == 0, (
+        "test setup: total tokens must be a multiple of page_size"
+    )
     # Unified memory exposes dense 3-D KV views even when the allocator uses pages.
     k = torch.randn(tot, H_KV, D, dtype=dt, device=dev)
     v = torch.randn(tot, H_KV, D_V, dtype=dt, device=dev)

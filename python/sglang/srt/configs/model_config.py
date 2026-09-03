@@ -1658,7 +1658,6 @@ class ModelConfig:
             # of an NVFP4/mixed checkpoint) must not be overridden back to the
             # source format
             if self.quantization not in REQUANTIZATION_METHODS:
-
                 # Detect which checkpoint is it
                 if not preserve_online_draft_quantization:
                     for _, method in QUANTIZATION_METHODS.items():
@@ -2309,12 +2308,14 @@ def get_hybrid_layer_ids(
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)
-        assert len(local_layer_id_set) == len(
-            local_layer_ids
-        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        assert len(local_layer_id_set) == len(local_layer_ids), (
+            f"Inkling local_layer_ids must be unique: {local_layer_ids}"
+        )
         assert all(
             0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
-        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        ), (
+            f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
+        )
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i in local_layer_id_set
         ]

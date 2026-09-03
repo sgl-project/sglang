@@ -148,7 +148,16 @@ def install_two_stream_overrides() -> None:
     :func:`get_original_row_forward`, :func:`get_original_moe_lora_func` so the
     new versions can fall back when their per-batch gate says single-stream.
     """
-    global _INSTALLED, _ORIGINAL_QKV_FORWARD, _ORIGINAL_ROW_FORWARD, _ORIGINAL_MERGED_FORWARD, _ORIGINAL_COLUMN_FORWARD, _ORIGINAL_REPLICATED_FORWARD, _ORIGINAL_MOE_LORA_FUNC, _ORIGINAL_FP4_MOE_LORA_FUNC, _ORIGINAL_BF16_MOE_LORA_FUNC
+    global \
+        _INSTALLED, \
+        _ORIGINAL_QKV_FORWARD, \
+        _ORIGINAL_ROW_FORWARD, \
+        _ORIGINAL_MERGED_FORWARD, \
+        _ORIGINAL_COLUMN_FORWARD, \
+        _ORIGINAL_REPLICATED_FORWARD, \
+        _ORIGINAL_MOE_LORA_FUNC, \
+        _ORIGINAL_FP4_MOE_LORA_FUNC, \
+        _ORIGINAL_BF16_MOE_LORA_FUNC
 
     if _INSTALLED:
         return

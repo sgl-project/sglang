@@ -55,7 +55,6 @@ def _init_npu_conv_state(
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
-
     def __init__(
         self,
         size: int,
@@ -525,7 +524,6 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
-
     def __init__(
         self,
         size: int,

@@ -53,7 +53,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig

@@ -1045,18 +1045,18 @@ def kda_gate_chunk_cumsum(
         Cumulative-summed gated tensor of shape [B, T, H, K].
     """
     if cu_seqlens is not None:
-        assert (
-            g.shape[0] == 1
-        ), "Only batch size 1 is supported when cu_seqlens are provided"
+        assert g.shape[0] == 1, (
+            "Only batch size 1 is supported when cu_seqlens are provided"
+        )
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (
-        chunk_size.bit_length() - 1
-    ), "chunk_size must be a power of 2"
+    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
+        "chunk_size must be a power of 2"
+    )
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
 
