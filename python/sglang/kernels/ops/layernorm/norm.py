@@ -8,6 +8,7 @@ import torch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_pre_ampere_cuda,
     load_jit,
     make_cpp_args,
 )
@@ -99,6 +100,11 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 @torch.compiler.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
+    if is_pre_ampere_cuda():
+        logger.info(
+            "Skipping JIT QK-Norm on pre-Ampere GPU; using torch/AOT fallback"
+        )
+        return False
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
