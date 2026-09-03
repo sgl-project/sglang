@@ -12,7 +12,8 @@ use std::num::NonZeroU32;
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig,
-    CircuitBreakerConfig, Config, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
+    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind,
+    FusedTerm,
     K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig,
     StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
@@ -53,6 +54,12 @@ pub struct Cli {
     /// Routing policy.
     #[arg(long, value_enum, default_value = "round_robin")]
     pub policy: PolicyKind,
+    /// PD 请求的 Decode worker 选择策略。
+    #[arg(long, value_enum, default_value = "power_of_two")]
+    pub decode_policy: DecodePolicyKind,
+    /// 静态 P/D Bucket JSON 配置；省略时使用全局候选域。
+    #[arg(long)]
+    pub bucket_config: Option<String>,
 
     // ---- circuit breaker (opt-in via --cb-threshold) ----
     /// Consecutive upstream failures before the circuit breaker opens.
@@ -218,6 +225,11 @@ impl Cli {
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
         let discovery = self.build_discovery()?;
+        let bucket_config = self
+            .bucket_config
+            .as_deref()
+            .map(load_bucket_config)
+            .transpose()?;
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -536,6 +548,8 @@ impl Cli {
                 tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
                 id: self.model_id,
                 policy: self.policy,
+                decode_policy: self.decode_policy,
+                bucket_config,
                 circuit_breaker,
                 cache_aware,
                 sticky,
@@ -611,6 +625,13 @@ impl Cli {
         };
         Ok(backend)
     }
+}
+
+fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| anyhow!("--bucket-config cannot read {path:?}: {error}"))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| anyhow!("--bucket-config {path:?} is not valid JSON: {error}"))
 }
 
 /// Join space/repeated `key=value` selector terms into the single
@@ -1799,6 +1820,68 @@ mod tests {
         assert!(
             missing_indexer.contains("--kv-indexer-endpoint"),
             "got: {missing_indexer}"
+        );
+    }
+
+    #[test]
+    fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
+        let default_config = cfg_of("--policy power_of_two").unwrap();
+        assert_eq!(
+            default_config.model.decode_policy,
+            DecodePolicyKind::PowerOfTwo
+        );
+
+        let legacy_config = cfg_of("--decode-policy legacy_host_affinity").unwrap();
+        assert_eq!(
+            legacy_config.model.decode_policy,
+            DecodePolicyKind::LegacyHostAffinity
+        );
+    }
+
+    #[test]
+    fn bucket_config_json_is_loaded_and_validated_at_startup() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+                "ttft_slo_policy": "slo_first",
+                "tps_slo_policy": "best_effort",
+                "buckets": [
+                    {
+                        "id": "p-fast",
+                        "stage": "prefill",
+                        "rank": 10,
+                        "worker_ids": ["http://worker:30000"],
+                        "max_extend_tokens": 4096,
+                        "max_context_tokens": 8192,
+                        "ttft_p95_at_capacity_ms": 120
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap().to_string();
+        let config = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://worker:30000",
+            "--bucket-config",
+            &path,
+        ]))
+        .unwrap();
+
+        let buckets = config
+            .model
+            .bucket_config
+            .expect("Bucket config must be retained");
+        assert_eq!(buckets.buckets.len(), 1);
+        assert_eq!(buckets.buckets[0].id, "p-fast");
+        assert_eq!(
+            buckets.ttft_slo_policy,
+            crate::config::SloBucketPolicy::SloFirst
+        );
+        assert_eq!(
+            buckets.tps_slo_policy,
+            crate::config::SloBucketPolicy::BestEffort
         );
     }
 }
