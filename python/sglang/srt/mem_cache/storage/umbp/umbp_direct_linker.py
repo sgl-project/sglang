@@ -543,11 +543,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         pending = self._pending
         rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
+        self._pending = {}
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
         self._load_queue.put((counter_index, rids, plans, ready_event))
-        self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
 
