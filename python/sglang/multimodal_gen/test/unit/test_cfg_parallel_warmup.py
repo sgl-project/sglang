@@ -119,7 +119,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         )
         server_args = SimpleNamespace(
             warmup_sampling_params=(
-                '{"width":832,"height":480,"num_frames":9,' '"num_inference_steps":4}'
+                '{"width":832,"height":480,"num_frames":9,"num_inference_steps":4}'
             )
         )
 
