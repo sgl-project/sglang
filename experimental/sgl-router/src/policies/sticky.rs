@@ -216,6 +216,10 @@ impl Policy for StickyPolicy {
     fn needs_load_snapshot(&self) -> bool {
         self.fallback.needs_load_snapshot()
     }
+
+    fn needs_dispatch_timestamps(&self) -> bool {
+        self.fallback.needs_dispatch_timestamps()
+    }
 }
 
 impl std::fmt::Debug for StickyPolicy {
@@ -241,6 +245,14 @@ mod tests {
             Arc::new(crate::policies::power_of_two::PowerOfTwoChoicesPolicy::new()),
         );
         assert!(policy.needs_load_snapshot());
+        assert!(!policy.needs_dispatch_timestamps());
+
+        let load_policy = StickyPolicy::new(
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            Arc::new(crate::policies::load_based::LoadBasedPolicy::new()),
+        );
+        assert!(load_policy.needs_dispatch_timestamps());
     }
     use crate::policies::round_robin::RoundRobinPolicy;
 

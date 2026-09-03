@@ -3,15 +3,15 @@
 
 //! Decode policy 的最小可观察契约。
 //!
-//! 这些测试只覆盖 #34608 实际发布的 running/waiting/KV/local active-load 输入；
-//! 不把未发布的 transfer、decode queue 或 retraction 指标伪造成可用数据。
+//! Decode admission/guard 读取 complete fresh ZMQ native-monitor 样本；短帧
+//! 会回退本地负载，不能伪造成 monitor-backed 压力选择。
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::admission::{resolve_decode, CandidateDomain, DecisionReason};
 use sgl_router::policies::decode::{
     DecodePolicy, DecodePowerOfTwoPolicy, DecodeSelectionContext, LegacyHostAffinityDecodePolicy,
 };
-use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+use sgl_router::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
 use sgl_router::policies::SelectionProposal;
 use sgl_router::workers::Worker;
 use std::collections::HashMap;
@@ -30,18 +30,23 @@ fn worker(id: &str) -> Arc<Worker> {
 }
 
 fn snapshot(entries: &[(&Arc<Worker>, u64, u64, u64, u64)]) -> EngineLoadSnapshot {
-    EngineLoadSnapshot::from_workers(
+    EngineLoadSnapshot::from_native_cache_workers(
         7,
         entries
             .iter()
             .map(|(worker, running, waiting, used, capacity)| {
                 (
                     worker.url.clone(),
-                    EngineWorkerLoad {
+                    NativeCacheWorkerLoad {
                         num_running_reqs: *running,
                         num_waiting_reqs: *waiting,
-                        num_tokens: *used,
+                        num_waiting_uncached_tokens: *waiting,
+                        num_used_tokens: *used,
+                        num_total_tokens: *used,
                         max_total_num_tokens: *capacity,
+                        max_running_requests: 64,
+                        prefill_throughput_tokens_per_s: None,
+                        estimated_prefill_queue_ms: None,
                         captured_at: Instant::now(),
                     },
                 )
@@ -124,5 +129,5 @@ fn decode_guard_can_escape_a_primary_to_lower_dynamic_pressure_backup() {
         resolve_decode(&domain, &proposal, 64, &loads).expect("both candidates are admitted");
 
     assert_eq!(decision.selected.id, backup.id);
-    assert_eq!(decision.reason, DecisionReason::BackupLoadComparison);
+    assert_eq!(decision.reason, DecisionReason::BackupPressureGuard);
 }

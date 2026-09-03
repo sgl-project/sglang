@@ -300,6 +300,10 @@ impl Policy for CacheAwareZmqPolicy {
         true
     }
 
+    fn needs_dispatch_timestamps(&self) -> bool {
+        true
+    }
+
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         if workers.is_empty() {
             return None;
@@ -534,6 +538,7 @@ mod tests {
             num_waiting_reqs: waiting,
             num_tokens: 0,
             max_total_num_tokens: 0,
+            native_cache: None,
         }
     }
 

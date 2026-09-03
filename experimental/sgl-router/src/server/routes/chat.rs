@@ -68,11 +68,14 @@ fn prefill_policy_reason(
             (ProposalKind::SessionAffinity, DecisionReason::BackupPrimaryAdmission) => {
                 "session_admission_backup"
             }
-            (ProposalKind::SessionAffinity, DecisionReason::BackupLoadComparison) => {
-                "session_load_backup"
+            (ProposalKind::SessionAffinity, DecisionReason::BackupPressureGuard) => {
+                "session_pressure_backup"
             }
             (ProposalKind::SessionAffinity, DecisionReason::RangeFallback) => {
                 "session_range_fallback"
+            }
+            (_, DecisionReason::CapacityFallbackPowerOfTwo) => {
+                "capacity_fallback_power_of_two"
             }
             (_, DecisionReason::RangeFallback) => "range_fallback",
             (_, _) if !affinity_lookup_enabled => "range_fallback",
@@ -85,15 +88,19 @@ fn prefill_policy_reason(
             | (ProposalKind::CacheAffinity, DecisionReason::Primary) => "cache_candidate",
             (_, DecisionReason::Primary) => "no_cache_candidate",
             (_, DecisionReason::BackupPrimaryAdmission) => "no_cache_candidate_admission_backup",
-            (_, DecisionReason::BackupLoadComparison) => "no_cache_candidate_load_backup",
+            (_, DecisionReason::BackupPressureGuard) => "no_cache_candidate_pressure_backup",
             (_, DecisionReason::RangeFallback) => "no_cache_candidate_range_fallback",
+            (_, DecisionReason::CapacityFallbackPowerOfTwo) => {
+                "no_cache_candidate_capacity_fallback_power_of_two"
+            }
         },
         _ => match decision {
             DecisionReason::Primary => "primary",
             DecisionReason::CacheCandidate => "cache_candidate",
             DecisionReason::BackupPrimaryAdmission => "admission_backup",
-            DecisionReason::BackupLoadComparison => "load_backup",
+            DecisionReason::BackupPressureGuard => "pressure_backup",
             DecisionReason::RangeFallback => "range_fallback",
+            DecisionReason::CapacityFallbackPowerOfTwo => "capacity_fallback_power_of_two",
         },
     }
 }
@@ -306,6 +313,7 @@ pub async fn chat_completions(
             .any(|worker| worker.mode() == WorkerMode::Prefill);
     let load_snapshot =
         needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
+    let needs_dispatch_timestamps = policy.needs_dispatch_timestamps();
     let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
         (
             parse_optional_positive_u64_header(&headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
@@ -456,7 +464,19 @@ pub async fn chat_completions(
                 })
                 .collect();
             let bounded_candidate_count = proposal.candidates.len();
-            let decision = resolve_cache_candidates(&proposal, request_input_tokens, snapshot)?;
+            let cache_decision =
+                resolve_cache_candidates(&proposal, request_input_tokens, snapshot);
+            ctx.metrics
+                .record_cache_admission_evaluations(cache_decision.admission_evaluated_candidates);
+            ctx.metrics
+                .record_cache_admission_rejections(cache_decision.admission_rejected_candidates);
+            ctx.metrics.record_cache_pressure_guard(
+                cache_decision.pressure_guard_compared_pairs,
+                cache_decision.pressure_guard_overrides,
+            );
+            ctx.metrics
+                .record_cache_monitor_decision(cache_decision.prefill_pressure_source);
+            let decision = cache_decision.decision?;
             let selected_candidate = proposal
                 .candidates
                 .iter()
@@ -472,6 +492,7 @@ pub async fn chat_completions(
                 uncached_tokens = selected_candidate.uncached_tokens,
                 reason = ?decision.reason,
                 load_snapshot_version = decision.load_snapshot_version,
+                prefill_pressure_source = cache_decision.prefill_pressure_source,
                 "cache candidate winner",
             );
             ctx.metrics
@@ -640,7 +661,7 @@ pub async fn chat_completions(
     // PD mode the pair moves into the spawned prefill task so prefill
     // load is tracked for the full duration of the KV transfer; in plain
     // mode the pair stays in this handler. Decode load is tracked on Final D.
-    let guard = if needs_load_snapshot {
+    let guard = if needs_dispatch_timestamps {
         worker.timestamped_load_guard()
     } else {
         worker.load_guard()
@@ -1461,11 +1482,11 @@ mod tests {
             prefill_policy_reason(
                 PolicyKind::SessionAware,
                 ProposalKind::SessionAffinity,
-                DecisionReason::BackupLoadComparison,
+                DecisionReason::BackupPressureGuard,
                 true,
                 true,
             ),
-            "session_load_backup"
+            "session_pressure_backup"
         );
     }
 
