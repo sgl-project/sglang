@@ -45,6 +45,10 @@ class TreeCacheBuildContext:
     tp_group: Any
     full_tokens_per_layer: Optional[int] = None
     is_dsa: bool = False
+    # PD decode receives the prompt-end recurrent state from prefill. In that
+    # mode the radix tree must not constrain an independently reusable token-KV
+    # prefix to the last locally cached Mamba/KDA checkpoint.
+    remote_mamba_state_authoritative: bool = False
 
 
 RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
@@ -164,8 +168,15 @@ def _create_unified_radix_cache(
     tree_components = [ComponentType.FULL]
     if ctx.is_hybrid_swa:
         tree_components.append(ComponentType.SWA)
-    if ctx.is_hybrid_ssm:
+    if ctx.is_hybrid_ssm and not ctx.remote_mamba_state_authoritative:
         tree_components.append(ComponentType.MAMBA)
+
+    if ctx.remote_mamba_state_authoritative:
+        logger.info(
+            "PD decode radix cache uses per-token FULL/MLA KV only; the "
+            "prompt-end Mamba/KDA/conv state received from prefill is "
+            "authoritative."
+        )
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
@@ -179,7 +190,7 @@ def _create_unified_radix_cache(
         }
 
     params.tree_components = tuple(tree_components)
-    if use_mlx() and ctx.is_hybrid_ssm:
+    if use_mlx() and ctx.is_hybrid_ssm and not ctx.remote_mamba_state_authoritative:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,
         )
