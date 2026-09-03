@@ -61,9 +61,9 @@ def _assert_entries_close(
     """Compare two streams of (name, should_compare, ComparableWeight)."""
     actual_list: List[CheckEntry] = list(actual)
     expected_list: List[CheckEntry] = list(expected)
-    assert len(actual_list) == len(
-        expected_list
-    ), f"length mismatch: actual={len(actual_list)} expected={len(expected_list)}"
+    assert len(actual_list) == len(expected_list), (
+        f"length mismatch: actual={len(actual_list)} expected={len(expected_list)}"
+    )
     for i, ((a_name, a_flag, a_ref), (e_name, e_flag, e_ref)) in enumerate(
         zip(actual_list, expected_list)
     ):
@@ -198,7 +198,6 @@ class _FakeModelRunner:
 
 
 class TestRandomLike(CustomTestCase):
-
     def test_floating_point_preserves_dtype_shape_device(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             t = torch.zeros(8, 4, dtype=dtype)
@@ -257,7 +256,6 @@ class TestRandomLike(CustomTestCase):
 
 
 class TestPostprocessTensors(CustomTestCase):
-
     # --- non-quant / non-skip ---
 
     def test_no_quant_yields_raw_with_should_compare_true(self):
@@ -378,7 +376,6 @@ class TestPostprocessTensors(CustomTestCase):
 
 
 class TestCheckTensors(CustomTestCase):
-
     def test_passes_when_all_equal(self):
         t = torch.ones(2, 2)
         expect = [
@@ -454,7 +451,6 @@ def _quantize_block_fp8(weight: torch.Tensor, scale_margin: float):
 
 
 class TestCheckTensorsAllowQuantError(CustomTestCase):
-
     def setUp(self):
         torch.manual_seed(0)
         weight = torch.randn(256, 256, device="cuda") * 0.02
@@ -508,7 +504,6 @@ class TestCheckTensorsAllowQuantError(CustomTestCase):
 
 
 class TestBuildQuantizedSet(CustomTestCase):
-
     def test_fp8_block_module_pairs_weight_and_scale(self):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
@@ -560,7 +555,6 @@ class _WeightCheckerTestBase(CustomTestCase):
 
 
 class TestSnapshot(_WeightCheckerTestBase):
-
     def test_captures_params_and_buffers(self):
         self.checker._snapshot()
         keys = set(self.checker._snapshot_tensors.keys())
@@ -588,7 +582,6 @@ class TestSnapshot(_WeightCheckerTestBase):
 
 
 class TestResetTensors(_WeightCheckerTestBase):
-
     def test_changes_normal_params_in_place(self):
         before_w = self.model.w.clone()
         before_w_ptr = self.model.w.data_ptr()
@@ -626,7 +619,6 @@ class TestResetTensors(_WeightCheckerTestBase):
 
 
 class TestCompare(_WeightCheckerTestBase):
-
     def test_without_snapshot_raises(self):
         with self.assertRaises(AssertionError):
             self.checker._compare()
@@ -665,7 +657,6 @@ class TestCompare(_WeightCheckerTestBase):
 
 
 class TestHandle(_WeightCheckerTestBase):
-
     def test_routes_to_actions(self):
         with (
             patch.object(self.checker, "_snapshot") as m_snap,
@@ -707,7 +698,6 @@ class TestHandle(_WeightCheckerTestBase):
 
 
 class TestIsNonPersistentBufferName(CustomTestCase):
-
     def test_matches_cos_sin_cache_substring(self):
         self.assertTrue(
             _is_non_persistent_buffer_name("model.rotary_emb.cos_sin_cache")
@@ -730,7 +720,6 @@ class TestIsNonPersistentBufferName(CustomTestCase):
 
 
 class TestHashTensor(CustomTestCase):
-
     def test_stable_for_same_input(self):
         t = torch.arange(64, dtype=torch.float32).cuda()
         self.assertEqual(_hash_tensor(t), _hash_tensor(t.clone()))
@@ -759,7 +748,6 @@ class TestHashTensor(CustomTestCase):
 
 
 class _ChecksumTestBase(CustomTestCase):
-
     def setUp(self):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
@@ -778,7 +766,6 @@ class _ChecksumTestBase(CustomTestCase):
 
 
 class TestComputeChecksum(_ChecksumTestBase):
-
     def test_returns_dict_with_expected_top_level_keys(self):
         out = self.checker._compute_checksum()
         self.assertEqual(
