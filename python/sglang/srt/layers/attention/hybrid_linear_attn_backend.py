@@ -1130,6 +1130,15 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.batch_size == 0:
+            # DP-attention keeps hybrid models in TARGET_VERIFY on idle ranks so
+            # they can still participate in the MoE collectives. Their attention
+            # layers short-circuit on an empty hidden-state tensor, so planning
+            # either child backend is both unnecessary and invalid for backends
+            # (notably DSA) that reduce over the request-length vector.
+            for attn_backend in self.attn_backend_list:
+                attn_backend.forward_metadata = None
+            return
         if forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
             # linear/mamba metadata (it requires query_start_loc).

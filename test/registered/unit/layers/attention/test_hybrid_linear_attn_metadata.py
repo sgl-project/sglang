@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -68,6 +69,29 @@ def _target_verify_batch(
 
 
 class TestHybridLinearAttentionMetadata(CustomTestCase):
+    def test_empty_dp_rank_skips_child_metadata_planning(self):
+        class _MetadataBackend:
+            def __init__(self):
+                self.forward_metadata = object()
+                self.calls = 0
+
+            def init_forward_metadata(self, _forward_batch):
+                self.calls += 1
+
+        full_attn = _MetadataBackend()
+        linear_attn = _MetadataBackend()
+        backend = object.__new__(HybridLinearAttnBackend)
+        backend.attn_backend_list = [full_attn, linear_attn]
+
+        backend.init_forward_metadata(
+            SimpleNamespace(batch_size=0, forward_mode=ForwardMode.TARGET_VERIFY)
+        )
+
+        self.assertEqual(full_attn.calls, 0)
+        self.assertEqual(linear_attn.calls, 0)
+        self.assertIsNone(full_attn.forward_metadata)
+        self.assertIsNone(linear_attn.forward_metadata)
+
     def test_eager_target_verify_collapses_mlp_sync_padding_rows(self):
         # Adaptive MTP N=4 is physically padded to attn-TP=8. The recurrent
         # backend keeps two request rows for collective shape compatibility,
