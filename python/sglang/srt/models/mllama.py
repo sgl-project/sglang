@@ -85,7 +85,6 @@ class ColumnParallelConv2dPatch(torch.nn.Module):
 
 
 class MllamaPrecomputedAspectRatioEmbedding(nn.Module):
-
     def __init__(self, config: config_mllama.MllamaVisionConfig, is_gated: bool = True):
         super().__init__()
         self.max_num_tiles = config.max_num_tiles
@@ -870,7 +869,6 @@ class MllamaForConditionalGeneration(nn.Module):
         # pixel_values: shape (bs, num_image, num_tiles, 3, image_res, image_res)
         max_num_images = max_num_tiles = bs = 0
         for i, mm_input in enumerate(forward_batch.mm_inputs):
-
             if not forward_batch.encoder_cached[i] and mm_input is not None:
                 pixel_values = torch.cat(
                     [item.feature for item in mm_input.mm_items], dim=0

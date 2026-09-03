@@ -2582,7 +2582,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",

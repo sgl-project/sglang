@@ -239,8 +239,8 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
         manager.strategy_for = lambda _component_name, _module: ResidentStrategy()
         self.assertTrue(manager._should_keep_single_dit("transformer", module))
 
-        manager.strategy_for = (
-            lambda _component_name, _module: ComponentOffloadStrategy(
+        manager.strategy_for = lambda _component_name, _module: (
+            ComponentOffloadStrategy(
                 component_name="transformer", pin_budget=HostPinBudget()
             )
         )
