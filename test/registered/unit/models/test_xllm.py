@@ -300,8 +300,9 @@ def test_native_dense_xllm_rejects_unimplemented_attention_features(
     config = XllmConfig(num_values=0, num_experts=192, **config_override)
     monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.bfloat16)
 
-    with get_context().override_server_args(**_native_runtime_config()), pytest.raises(
-        ValueError, match=error
+    with (
+        get_context().override_server_args(**_native_runtime_config()),
+        pytest.raises(ValueError, match=error),
     ):
         _validate_mova_config(config, quant_config=None)
 
@@ -310,9 +311,12 @@ def test_native_xllm_rejects_two_batch_overlap(monkeypatch):
     config = XllmConfig(num_values=0, num_experts=192)
     monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.bfloat16)
 
-    with get_context().override_server_args(
-        **_native_runtime_config(enable_two_batch_overlap=True)
-    ), pytest.raises(ValueError, match="does not yet support.*two-batch-overlap"):
+    with (
+        get_context().override_server_args(
+            **_native_runtime_config(enable_two_batch_overlap=True)
+        ),
+        pytest.raises(ValueError, match="does not yet support.*two-batch-overlap"),
+    ):
         _validate_mova_config(config, quant_config=None)
 
 
@@ -329,9 +333,12 @@ def test_native_xllm_rejects_unmapped_expert_modes(monkeypatch, runtime_override
     config = XllmConfig(num_values=0, num_experts=192)
     monkeypatch.setattr(torch, "get_default_dtype", lambda: torch.bfloat16)
 
-    with get_context().override_server_args(
-        **_native_runtime_config(**runtime_override)
-    ), pytest.raises(ValueError, match="does not yet support EPLB"):
+    with (
+        get_context().override_server_args(
+            **_native_runtime_config(**runtime_override)
+        ),
+        pytest.raises(ValueError, match="does not yet support EPLB"),
+    ):
         _validate_mova_config(config, quant_config=None)
 
 

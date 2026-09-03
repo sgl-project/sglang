@@ -493,8 +493,7 @@ def _normalize_k2_horizon_config(config: PretrainedConfig) -> None:
             range(config.num_hidden_layers)
         ):
             raise ValueError(
-                "Dense K2Horizon native loading requires every layer in "
-                "mlp_only_layers"
+                "Dense K2Horizon native loading requires every layer in mlp_only_layers"
             )
         _set_k2_horizon_alias(
             config,
@@ -680,8 +679,7 @@ def _validate_mova_config(
         # loading them with different attention math.
         if getattr(config, "query_key_norm", False):
             raise ValueError(
-                "Native dense xLLM attention does not support query/key "
-                "normalization"
+                "Native dense xLLM attention does not support query/key normalization"
             )
         if getattr(config, "sliding_window", None) is not None or getattr(
             config, "use_sliding_window", False

@@ -124,8 +124,9 @@ class TestSamplingParamsVerify(CustomTestCase):
             list(range(MAX_REQUEST_REASONING_END_TOKEN_IDS + 1)),
         ]
         for value in invalid_values:
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError, "request reasoning end token IDs"
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request reasoning end token IDs"),
             ):
                 self._make(
                     custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
