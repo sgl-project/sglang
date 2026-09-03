@@ -154,7 +154,7 @@ def handle_flashinfer_a2a_dispatch_type(server_args: Any):
     if dispatch_type == "mxfp8":
         if cfg.quantization != "mxfp8":
             raise ValueError(
-                "--flashinfer-a2a-dispatch-type mxfp8 requires " "--quantization mxfp8."
+                "--flashinfer-a2a-dispatch-type mxfp8 requires --quantization mxfp8."
             )
         if cfg.moe_runner_backend != "flashinfer_trtllm_routed":
             raise ValueError(
@@ -258,22 +258,22 @@ def handle_a2a_moe(server_args: Any):
         "auto",
     ):
         raise ValueError(
-            "--flashinfer-a2a-dispatch-type requires " "--moe-a2a-backend flashinfer."
+            "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
         )
 
     if a2a_backend == "flashinfer_megamoe":
         validate_flashinfer_megamoe_model(server_args)
         validate_flashinfer_megamoe_envs()
-        assert (
-            cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size
-        ), "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+        assert cfg.enable_dp_attention and cfg.dp_size == cfg.tp_size, (
+            "FlashInfer MegaMOE is only supported with dp_size == tp_size and --enable-dp-attention"
+        )
         if resolved_view(server_args).moe_runner_backend == "auto":
             declare_resolution(
                 server_args, "_handle_a2a_moe", moe_runner_backend="flashinfer_megamoe"
             )
-        assert (
-            resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe"
-        ), "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+        assert resolved_view(server_args).moe_runner_backend == "flashinfer_megamoe", (
+            "FlashInfer MegaMOE a2a backend requires --moe-runner-backend flashinfer_megamoe"
+        )
         if not is_sm100_supported():
             raise ValueError(
                 "FlashInfer MegaMOE currently requires an SM100-family "
@@ -444,8 +444,7 @@ def handle_a2a_moe(server_args: Any):
                 "nvfp4",
             ):
                 raise ValueError(
-                    "CuTe DSL NVFP4 W4A16 requires "
-                    "--flashinfer-a2a-dispatch-type bf16."
+                    "CuTe DSL NVFP4 W4A16 requires --flashinfer-a2a-dispatch-type bf16."
                 )
             handle_flashinfer_a2a_dispatch_type(server_args)
         assert resolved_view(server_args).moe_runner_backend in [

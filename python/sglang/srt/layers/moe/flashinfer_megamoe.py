@@ -602,9 +602,9 @@ def run_flashinfer_megamoe(
 
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-    assert isinstance(
-        quant_info, FlashInferMegaMoeQuantInfo
-    ), f"Unexpected quant_info type for flashinfer_megamoe: {type(quant_info)}"
+    assert isinstance(quant_info, FlashInferMegaMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_megamoe: {type(quant_info)}"
+    )
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
