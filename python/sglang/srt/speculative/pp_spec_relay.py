@@ -49,8 +49,7 @@ class PPSpecRelayInput(SpecInput):
 
     def __repr__(self) -> str:
         return (
-            f"PPSpecRelayInput(bs={len(self.rids)}, "
-            f"drafted={self.parents is not None})"
+            f"PPSpecRelayInput(bs={len(self.rids)}, drafted={self.parents is not None})"
         )
 
     @classmethod

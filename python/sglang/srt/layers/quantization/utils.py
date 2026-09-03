@@ -453,9 +453,9 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert (
-        quant_type.is_integer()
-    ), "Floating point quantization may work but has not been tested"
+    assert quant_type.is_integer(), (
+        "Floating point quantization may work but has not been tested"
+    )
     assert not zero_points or group_size is not None, (
         "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
@@ -555,12 +555,12 @@ def gptq_quantize_weights(
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert (
-        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
-    ), f"Unsupported gptq type = {quant_type}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
+    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, (
+        f"Unsupported gptq type = {quant_type}"
+    )
+    assert group_size in SUPPORTED_GROUP_SIZES + [size_k], (
+        f"Unsupported groupsize = {group_size}"
+    )
 
     w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
 
@@ -568,10 +568,10 @@ def gptq_quantize_weights(
     g_idx = torch.empty(0, dtype=torch.int, device=w.device)
     rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
     if act_order:
-        assert (
-            group_size < size_k
-        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k
+        assert group_size < size_k, (
+            "For act_order, groupsize = {} must be less than size_k = {}".format(
+                group_size, size_k
+            )
         )
 
         w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
@@ -674,18 +674,14 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, gemm1_rows, hidden_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )  # packed fp4
     gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, hidden_size, intermediate_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)  # fp8 scaling factors
 
     # Pre-allocate output tensors so per-expert shuffles write directly into
     # contiguous slices instead of building lists + torch.stack().  This avoids
