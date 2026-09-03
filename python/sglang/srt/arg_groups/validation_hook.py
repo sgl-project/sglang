@@ -227,29 +227,14 @@ def check_server_args(server_args: Any):
         )
 
     if cfg.enable_watermark:
+        from sglang.srt.sampling.watermark import parse_watermark_key
+
         if cfg.device != "cuda":
             raise ValueError(
                 "--enable-watermark requires --device cuda, " f"got {cfg.device!r}"
             )
-        if cfg.watermark_key is None:
-            raise ValueError("--enable-watermark requires --watermark-key")
-        watermark_key = (
-            cfg.watermark_key[2:]
-            if cfg.watermark_key.lower().startswith("0x")
-            else cfg.watermark_key
-        )
-        if not 1 <= len(watermark_key) <= 16:
-            raise ValueError(
-                "--watermark-key must contain 1 to 16 hex digits, "
-                f"got {cfg.watermark_key!r}"
-            )
-        if any(
-            character not in "0123456789abcdefABCDEF" for character in watermark_key
-        ):
-            raise ValueError(
-                "--watermark-key must contain only hex digits, "
-                f"got {cfg.watermark_key!r}"
-            )
+        if cfg.watermark_key is not None:
+            parse_watermark_key(cfg.watermark_key)
         if cfg.watermark_context_window < 1:
             raise ValueError(
                 "--watermark-context-window must be at least 1, "

@@ -745,6 +745,7 @@ def eagle_sample(
             positions=verify_input.positions,
             draft_token_num=verify_input.draft_token_num,
             full_mask=watermark_full_mask,
+            context_windows=watermark_state.context_windows(sampling_info),
         )
         watermark_context_hashes, watermark_selected = (
             watermark_state.force_speculative(

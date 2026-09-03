@@ -165,6 +165,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.sampling.watermark import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -826,17 +827,19 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     return msgspec_to_builtins(
-        {
-            **server_args.resolved_dict(),
-            **_global_state.scheduler_info,
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
-        }
+        redact_watermark_secrets(
+            {
+                **server_args.resolved_dict(),
+                **_global_state.scheduler_info,
+                "startup_time": _global_state.tokenizer_manager.startup_time,
+                "internal_states": internal_states,
+                "version": __version__,
+                # Structured KV-event publisher descriptor for KV-aware routers.
+                # `None` when publishing is disabled or misconfigured; see
+                # `runtime_context.describe_kv_events_publisher` for the contract.
+                "kv_events": describe_kv_events_publisher(server_args),
+            }
+        )
     )
 
 

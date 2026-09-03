@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
+import msgspec
 import torch
-
-from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -13,6 +12,105 @@ if TYPE_CHECKING:
 
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
+
+
+def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "<redacted>"
+                if key == "watermark_key" or (in_watermark_config and key == "key")
+                else redact_watermark_secrets(
+                    item,
+                    in_watermark_config=in_watermark_config or key == "watermark",
+                )
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            redact_watermark_secrets(item, in_watermark_config=in_watermark_config)
+            for item in value
+        ]
+    return value
+
+
+class WatermarkRequestConfig(msgspec.Struct, frozen=True, kw_only=True):
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    def __repr__(self) -> str:
+        return (
+            "WatermarkRequestConfig(key=<redacted>, "
+            f"context_window={self.context_window!r})"
+        )
+
+
+def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
+    if value is None:
+        return None
+    if isinstance(value, WatermarkRequestConfig):
+        key = value.key
+        context_window = value.context_window
+    else:
+        if not isinstance(value, dict):
+            raise ValueError("watermark must be an object")
+        unknown = sorted(set(value) - {"key", "context_window"})
+        if unknown:
+            raise ValueError(f"watermark contains unknown fields: {unknown!r}")
+        key = value.get("key")
+        context_window = value.get("context_window")
+    if key is not None:
+        parse_watermark_key(key)
+    if context_window is not None and (
+        isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window < 1
+    ):
+        raise ValueError("watermark context_window must be a positive integer")
+    return WatermarkRequestConfig(key=key, context_window=context_window)
+
+
+def parse_watermark_key(value: Any) -> int:
+    if not isinstance(value, str):
+        raise ValueError("watermark key must be a hex string")
+    digits = value[2:] if value.lower().startswith("0x") else value
+    if not 1 <= len(digits) <= 16:
+        raise ValueError("watermark key must contain 1 to 16 hex digits")
+    if any(character not in "0123456789abcdefABCDEF" for character in digits):
+        raise ValueError("watermark key must contain only hex digits")
+    key = int(digits, 16)
+    return key if key < (1 << 63) else key - (1 << 64)
+
+
+def build_watermark_batch_config(
+    requests: Sequence[Any],
+    *,
+    default_key: Optional[str],
+    default_context_window: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    keys = []
+    context_windows = []
+    enabled = []
+    for request in requests:
+        config = request.sampling_params.watermark
+        key = (
+            config.key if config is not None and config.key is not None else default_key
+        )
+        context_window = (
+            config.context_window
+            if config is not None and config.context_window is not None
+            else default_context_window
+        )
+        keys.append(parse_watermark_key(key) if key is not None else 0)
+        context_windows.append(context_window)
+        enabled.append(key is not None)
+    return (
+        torch.tensor(keys, dtype=torch.int64, device=device),
+        torch.tensor(context_windows, dtype=torch.int32, device=device),
+        torch.tensor(enabled, dtype=torch.bool, device=device),
+    )
 
 
 def _rotl32(value: torch.Tensor, shift: int) -> torch.Tensor:
@@ -49,6 +147,38 @@ def _hash_contexts(
     return _fmix32(state ^ (lengths * 4))
 
 
+def _watermark_hash32_torch(
+    keys: torch.Tensor, context_hashes: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    state = torch.zeros(
+        (keys.shape[0], token_ids.shape[0]),
+        dtype=torch.int64,
+        device=keys.device,
+    )
+    keys = keys.view(-1, 1)
+    state = _murmur3_mix(state, keys & _MASK32)
+    state = _murmur3_mix(state, (keys >> 32) & _MASK32)
+    state = _murmur3_mix(state, context_hashes.view(-1, 1) & _MASK32)
+    state = _murmur3_mix(state, token_ids.view(1, -1) & _MASK32)
+    return _fmix32(state ^ 16)
+
+
+def select_watermark_tokens_torch(
+    probabilities: torch.Tensor,
+    context_hashes: torch.Tensor,
+    keys: torch.Tensor,
+) -> torch.Tensor:
+    token_ids = torch.arange(probabilities.shape[-1], device=probabilities.device)
+    hashed = _watermark_hash32_torch(keys, context_hashes, token_ids)
+    uniform = (hashed.to(torch.float32) + 0.5) / _UINT32_SCALE
+    scores = torch.where(
+        probabilities > 0,
+        uniform.log() / probabilities.to(torch.float32),
+        -torch.inf,
+    )
+    return scores.argmax(dim=-1)
+
+
 def _truncate_probabilities(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -78,24 +208,42 @@ def force_watermark_tokens(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     min_ps: torch.Tensor,
-    key: int,
+    keys: torch.Tensor,
 ) -> None:
     probabilities = _truncate_probabilities(
         logits, temperatures, top_ks, top_ps, min_ps
     )
-    seeds = torch.full((logits.shape[0],), key, dtype=torch.int64, device=logits.device)
-    token_ids = torch.arange(logits.shape[-1], device=logits.device)
-    hashed = murmur_hash32(seeds, context_hashes, token_ids)
-    uniform = (hashed.to(torch.float64) + 0.5) / _UINT32_SCALE
-    scores = torch.where(
-        probabilities > 0,
-        uniform.log() / probabilities.to(torch.float64),
-        -torch.inf,
-    )
-    selected = scores.argmax(dim=-1)
     rows = eligible.nonzero(as_tuple=True)[0]
+    if rows.numel() == 0:
+        return
+    candidate_probabilities = probabilities[rows].to(torch.float32).contiguous()
+    candidate_context_hashes = context_hashes[rows].contiguous()
+    candidate_keys = keys[rows].contiguous()
+    if candidate_probabilities.is_cuda:
+        try:
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                select_watermark_tokens_triton,
+            )
+        except ImportError:
+            selected = select_watermark_tokens_torch(
+                candidate_probabilities,
+                candidate_context_hashes,
+                candidate_keys,
+            )
+        else:
+            selected = select_watermark_tokens_triton(
+                candidate_probabilities,
+                candidate_context_hashes,
+                candidate_keys,
+            )
+    else:
+        selected = select_watermark_tokens_torch(
+            candidate_probabilities,
+            candidate_context_hashes,
+            candidate_keys,
+        )
     logits[rows] = -torch.inf
-    logits[rows, selected[rows]] = 0.0
+    logits[rows, selected] = 0.0
 
 
 class WatermarkState:
@@ -105,11 +253,10 @@ class WatermarkState:
         max_num_reqs: int,
         context_window: int,
         max_contexts_per_req: int,
-        key: str,
+        key: Optional[str],
         device: str,
     ) -> None:
-        key_value = int(key, 16)
-        self.key = key_value if key_value < (1 << 63) else key_value - (1 << 64)
+        self.default_key = parse_watermark_key(key) if key is not None else None
         self.context_window = context_window
         self.token_ids = torch.zeros(
             (max_num_reqs, context_window), dtype=torch.int32, device=device
@@ -212,7 +359,9 @@ class WatermarkState:
         self.num_watermarked_contexts[pool_indices] = 0
 
     def contexts_tail(
-        self, req_pool_indices: torch.Tensor
+        self,
+        req_pool_indices: torch.Tensor,
+        context_windows: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         pool_indices = req_pool_indices.to(torch.int64)
         lengths = self.lengths[pool_indices]
@@ -223,7 +372,53 @@ class WatermarkState:
             starts.view(-1, 1) + offsets.view(1, -1)
         ) % self.context_window
         contexts = self.token_ids[pool_indices].gather(1, gather_indices)
-        return contexts, lengths
+        if context_windows is None:
+            return contexts, lengths
+
+        context_lengths = torch.minimum(lengths, context_windows.to(torch.int32))
+        source_starts = lengths - context_lengths
+        output_positions = torch.arange(
+            self.context_window, device=self.token_ids.device
+        ).view(1, -1)
+        suffix_indices = (source_starts.view(-1, 1) + output_positions).clamp(
+            max=self.context_window - 1
+        )
+        contexts = contexts.gather(1, suffix_indices.to(torch.int64))
+        contexts = torch.where(
+            output_positions < context_lengths.view(-1, 1), contexts, 0
+        )
+        return contexts, context_lengths
+
+    def _watermark_batch_config(
+        self, sampling_info: SamplingBatchInfo
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = sampling_info.top_ks.shape[0]
+        keys = getattr(sampling_info, "watermark_keys", None)
+        context_windows = getattr(sampling_info, "watermark_context_windows", None)
+        enabled = getattr(sampling_info, "watermark_enabled", None)
+        if keys is not None and context_windows is not None and enabled is not None:
+            return keys, context_windows, enabled
+
+        key = self.default_key if self.default_key is not None else 0
+        device = sampling_info.top_ks.device
+        return (
+            torch.full((batch_size,), key, dtype=torch.int64, device=device),
+            torch.full(
+                (batch_size,),
+                self.context_window,
+                dtype=torch.int32,
+                device=device,
+            ),
+            torch.full(
+                (batch_size,),
+                self.default_key is not None,
+                dtype=torch.bool,
+                device=device,
+            ),
+        )
+
+    def context_windows(self, sampling_info: SamplingBatchInfo) -> torch.Tensor:
+        return self._watermark_batch_config(sampling_info)[1]
 
     def _new_context_mask(
         self,
@@ -268,6 +463,7 @@ class WatermarkState:
         positions: torch.Tensor,
         draft_token_num: int,
         full_mask: bool,
+        context_windows: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = req_pool_indices.shape[0]
         draft_tokens = (
@@ -301,7 +497,9 @@ class WatermarkState:
                 batch_size, draft_token_num, draft_token_num
             )
 
-        base_contexts, base_lengths = self.contexts_tail(req_pool_indices)
+        base_contexts, base_lengths = self.contexts_tail(
+            req_pool_indices, context_windows
+        )
         base_contexts = base_contexts.unsqueeze(1).expand(-1, draft_token_num, -1)
         base_valid = (
             torch.arange(self.context_window, device=positions.device).view(1, 1, -1)
@@ -314,7 +512,10 @@ class WatermarkState:
         candidate_valid = torch.cat((base_valid, tree_mask[:, :, 1:].bool()), dim=-1)
         ranks = candidate_valid.cumsum(dim=-1)
         total_lengths = candidate_valid.sum(dim=-1)
-        context_lengths = total_lengths.clamp(max=self.context_window).to(torch.int32)
+        context_lengths = torch.minimum(
+            total_lengths,
+            context_windows.view(-1, 1).expand(-1, draft_token_num),
+        ).to(torch.int32)
         output_positions = torch.arange(
             self.context_window, device=positions.device
         ).view(1, 1, -1)
@@ -344,8 +545,13 @@ class WatermarkState:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         context_hashes = _hash_contexts(contexts, context_lengths)
         expanded_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
+        keys, _, watermark_enabled = self._watermark_batch_config(sampling_info)
+        keys = keys.repeat_interleave(draft_token_num)
+        watermark_enabled = watermark_enabled.repeat_interleave(draft_token_num)
         top_ks = sampling_info.top_ks.repeat_interleave(draft_token_num, dim=0)
-        eligible = (top_ks <= 1).logical_not() & (context_lengths > 0)
+        eligible = (
+            watermark_enabled & (top_ks <= 1).logical_not() & (context_lengths > 0)
+        )
         selected = self._new_context_mask(
             expanded_req_pool_indices, context_hashes, eligible
         )
@@ -373,7 +579,7 @@ class WatermarkState:
             top_ks=top_ks,
             top_ps=sampling_info.top_ps.repeat_interleave(draft_token_num, dim=0),
             min_ps=sampling_info.min_ps.repeat_interleave(draft_token_num, dim=0),
-            key=self.key,
+            keys=keys,
         )
         return context_hashes, selected
 
@@ -410,9 +616,18 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> None:
-        contexts, context_lengths = self.contexts_tail(req_pool_indices)
+        keys, context_windows, watermark_enabled = self._watermark_batch_config(
+            sampling_info
+        )
+        contexts, context_lengths = self.contexts_tail(
+            req_pool_indices, context_windows
+        )
         context_hashes = _hash_contexts(contexts, context_lengths)
-        eligible = (sampling_info.top_ks <= 1).logical_not() & (context_lengths > 0)
+        eligible = (
+            watermark_enabled
+            & (sampling_info.top_ks <= 1).logical_not()
+            & (context_lengths > 0)
+        )
         selected = self._new_context_mask(req_pool_indices, context_hashes, eligible)
         force_watermark_tokens(
             logits=logits,
@@ -422,7 +637,7 @@ class WatermarkState:
             top_ks=sampling_info.top_ks,
             top_ps=sampling_info.top_ps,
             min_ps=sampling_info.min_ps,
-            key=self.key,
+            keys=keys,
         )
         self._record_contexts(req_pool_indices, context_hashes, selected)
 
