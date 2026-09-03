@@ -4,13 +4,15 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from torch import nn
+
+from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
 from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
 )
 from sglang.srt.models.glm5_next_nextn import Glm5NextModelNextN
 from sglang.test.ci.ci_register import register_cpu_ci
-from torch import nn
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -127,6 +129,14 @@ def test_glm5_nextn_preserves_modelopt_quantization_for_routed_experts():
     quant_config = MagicMock()
 
     assert model._resolve_modelopt_nextn_quant_config(quant_config) is quant_config
+
+
+def test_glm5_nextn_exposes_logical_draft_layer_range(monkeypatch):
+    monkeypatch.setattr(DeepseekModelNextN, "__init__", lambda *args, **kwargs: None)
+    model = Glm5NextModelNextN(SimpleNamespace(num_hidden_layers=45))
+
+    assert model.start_layer == 45
+    assert model.end_layer == 46
 
 
 if __name__ == "__main__":

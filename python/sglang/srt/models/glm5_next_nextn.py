@@ -16,6 +16,9 @@ import logging
 from copy import copy
 
 import torch
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.deepseek_nextn import (
     DeepseekModelNextN,
@@ -26,13 +29,23 @@ from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
 )
 from sglang.srt.models.utils import WeightsMapper
-from torch import nn
-from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
 
 class Glm5NextModelNextN(DeepseekModelNextN):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        # Keep the draft KV pool on the same logical layer-numbering origin as
+        # GLM's published MTP decoder (the layer after the target stack).
+        self.start_layer = config.num_hidden_layers
+        self.end_layer = self.start_layer + 1
+        super().__init__(config, quant_config, prefix)
+
     def _resolve_modelopt_nextn_quant_config(
         self, quant_config: QuantizationConfig
     ) -> QuantizationConfig:
