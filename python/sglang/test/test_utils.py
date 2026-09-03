@@ -2024,7 +2024,15 @@ def _collect_busy_gpu_reports(pynvml, gpu_indices: List[int]) -> List[str]:
     reports = []
     for index in gpu_indices:
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
-        used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        try:
+            used_bytes = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+        except pynvml.NVMLError:
+            # Unified-memory parts (GB10 / DGX Spark, Jetson Thor) report
+            # NVML_ERROR_NOT_SUPPORTED for the memory query, the same way
+            # nvidia-smi shows N/A for them. We cannot tell whether the
+            # device is busy, so do not treat it as busy: otherwise every
+            # test class errors in setUpClass on these machines.
+            continue
         if used_bytes < _GPU_IDLE_USED_MEMORY_THRESHOLD:
             continue
         try:
