@@ -11,7 +11,7 @@ use sgl_router::config::{
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::LoadStat;
+use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
@@ -128,6 +128,7 @@ impl Policy for CacheCandidatesPolicy {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 0,
+            ..Default::default()
         }))
     }
 
@@ -147,6 +148,8 @@ fn config(policy: PolicyKind) -> Config {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy,
+            decode_policy: Default::default(),
+            bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -294,6 +297,13 @@ async fn chat_commits_the_admitted_prefill_backup() {
             num_waiting_reqs: 0,
             num_tokens: 100,
             max_total_num_tokens: 100,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: 0,
+                num_total_tokens: 100,
+                max_running_requests: 16,
+                total_prefill_uncached_tokens: 1,
+                total_prefill_busy_us: 1,
+            }),
         },
         Instant::now(),
     );
@@ -339,6 +349,13 @@ async fn capacity_exhaustion_does_not_return_503() {
                 num_waiting_reqs: 0,
                 num_tokens: 100,
                 max_total_num_tokens: 100,
+                native_cache: Some(NativeCacheRankLoad {
+                    num_waiting_uncached_tokens: 0,
+                    num_total_tokens: 100,
+                    max_running_requests: 16,
+                    total_prefill_uncached_tokens: 1,
+                    total_prefill_busy_us: 1,
+                }),
             },
             Instant::now(),
         );
@@ -415,6 +432,13 @@ async fn chat_records_cache_candidates_exhausted() {
             num_waiting_reqs: 0,
             num_tokens: 100,
             max_total_num_tokens: 100,
+            native_cache: Some(NativeCacheRankLoad {
+                num_waiting_uncached_tokens: 0,
+                num_total_tokens: 100,
+                max_running_requests: 16,
+                total_prefill_uncached_tokens: 1,
+                total_prefill_busy_us: 1,
+            }),
         },
         Instant::now(),
     );

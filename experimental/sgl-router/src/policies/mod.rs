@@ -299,6 +299,10 @@ impl<'a> SelectionContext<'a> {
         self.load_snapshot
     }
 
+    pub fn prefill_cache_bucket(&self) -> Option<(&BucketSelector, BucketRequest)> {
+        self.prefill_cache_bucket
+    }
+
     pub fn affinity_lookup_enabled(&self) -> bool {
         self.affinity_lookup_enabled
     }
