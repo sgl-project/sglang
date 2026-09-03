@@ -61,6 +61,19 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
+        ensure = getattr(kv, "lazy_ensure", None)
+        if ensure is not None:
+            try:
+                ensure(int(select_index.max().item()) + 1)
+            except (
+                Exception
+            ) as ex:  # no physical memory: hand the slots back, report "full"
+                self.free_pages = torch.cat((select_index, self.free_pages))
+                __import__("logging").getLogger(__name__).warning(
+                    "KV lazy backing: commit failed, allocation refused (%s)", ex
+                )
+                return None
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -72,6 +85,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
+            if (
+                self.available_size() >= self.size
+            ):  # pool idle: slot order + give memory back
+                kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
+                release = getattr(kv, "lazy_release", None)
+                if release is not None:
+                    self.clear()
+                    release()
         else:
             self.free_group.append(self._copy_for_free_group(free_index))
 
