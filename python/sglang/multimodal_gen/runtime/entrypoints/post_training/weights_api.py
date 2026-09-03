@@ -11,12 +11,14 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.srt.utils.auth import AuthLevel, auth_level
 from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter()
 
 
 @router.post("/update_weights_from_disk")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_disk(request: Request):
     """Update model weights from disk inplace without restarting the server."""
     body = await request.json()
@@ -58,6 +60,7 @@ async def update_weights_from_disk(request: Request):
 
 
 @router.post("/update_weights_from_tensor")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_tensor(request: Request):
     """Update model weights from serialized tensor payloads."""
     body = await request.json()
@@ -94,6 +97,7 @@ async def update_weights_from_tensor(request: Request):
 
 
 @router.post("/update_weights_from_tensor_checker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_tensor_checker(request: Request):
     """Verify live module weights against expected SHA-256 values."""
     body = await request.json()
@@ -140,6 +144,7 @@ async def update_weights_from_tensor_checker(request: Request):
 
 
 @router.post("/get_weights_checksum")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_weights_checksum(request: Request):
     """Return SHA-256 checksum of each requested module's weights."""
     body = await request.json()
@@ -156,6 +161,7 @@ async def get_weights_checksum(request: Request):
 
 
 @router.post("/release_memory_occupation")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def release_memory_occupation():
     """Release GPU memory occupation (sleep the engine)."""
     try:
@@ -180,6 +186,7 @@ async def release_memory_occupation():
 
 
 @router.post("/resume_memory_occupation")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def resume_memory_occupation():
     """Resume GPU memory occupation (wake the engine)."""
     try:
