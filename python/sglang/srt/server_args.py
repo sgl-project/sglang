@@ -1286,9 +1286,7 @@ class ServerArgs:
         "Initial connection-level HTTP/2 receive window in bytes (1024 to "
         "2^31 - 1). Only applies with --enable-http2.",
         NS("serving"),
-    ] = (
-        1024 * 1024
-    )
+    ] = 1024 * 1024
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -2069,7 +2067,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        NS("spec"),
+    ] = None
+    uno_lora_path: A[
+        Optional[str],
+        "Path to the UNO draft LoRA checkpoint.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2334,7 +2337,7 @@ class ServerArgs:
     ] = 18
     speculative_ngram_capacity: A[
         int, "The cache capacity for ngram speculative decoding.", NS("spec")
-    ] = (10 * 1000 * 1000)
+    ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
         "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
@@ -2817,6 +2820,23 @@ class ServerArgs:
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
         NS("memory"),
     ] = 4
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
