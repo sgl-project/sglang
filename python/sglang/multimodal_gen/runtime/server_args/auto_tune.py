@@ -144,6 +144,28 @@ def fixed_loading_residency_components(
     return fixed
 
 
+# torch's CPU allocator (mimalloc since 2.13) keeps freed pages in its arenas
+# and backs them with transparent huge pages, so the fused-weight copies the
+# loader frees once a component is promoted stayed resident: 18.2 GiB of
+# anonymous memory on a GB10 after the DiT went resident, 5.0 GiB with these.
+# Read at process start, so they are set for the workers to inherit; a torch
+# without mimalloc ignores them.
+SHARED_POOL_CPU_ALLOCATOR_DEFAULTS = {
+    "MIMALLOC_PURGE_DELAY": "0",
+    "MIMALLOC_ALLOW_LARGE_OS_PAGES": "0",
+}
+
+
+def apply_shared_pool_cpu_allocator_defaults(environ) -> list[str]:
+    """Set the CPU allocator defaults not already chosen; return the names set."""
+    applied = []
+    for name, value in SHARED_POOL_CPU_ALLOCATOR_DEFAULTS.items():
+        if name not in environ:
+            environ[name] = value
+            applied.append(name)
+    return applied
+
+
 class ServerArgsAutoTuner:
     """Auto-tunes the server-arg for the given performance-mode, based on practical deployment experience with different model architectures"""
 
@@ -562,6 +584,14 @@ class ServerArgsAutoTuner:
                 "expandable_segments:True so the allocator's reserve does not "
                 "crowd out the page cache."
             )
+        if current_platform.device_shares_host_memory():
+            applied = apply_shared_pool_cpu_allocator_defaults(os.environ)
+            if applied:
+                logger.info(
+                    "Host and device share one memory pool: %s so the CPU "
+                    "allocator returns freed weight copies to the pool.",
+                    " ".join(f"{name}={os.environ[name]}" for name in applied),
+                )
         if current_platform.device_shares_host_memory():
             try:
                 import psutil
