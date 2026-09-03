@@ -3,6 +3,7 @@
 
 pub mod active_load;
 pub mod admission;
+pub mod buckets;
 pub mod cache_aware;
 pub mod cache_aware_zmq;
 pub mod decode;
@@ -19,6 +20,7 @@ pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
+use crate::policies::buckets::{BucketRequest, BucketSelector};
 use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
@@ -155,6 +157,7 @@ pub struct SelectionContext<'a> {
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
     load_snapshot: Option<&'a EngineLoadSnapshot>,
+    prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
 }
@@ -171,6 +174,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -191,6 +195,7 @@ impl<'a> SelectionContext<'a> {
             request_tokens: None,
             external_prefix: None,
             load_snapshot: None,
+            prefill_cache_bucket: None,
             affinity_lookup_enabled: true,
             affinity_assignment_enabled: true,
         }
@@ -231,6 +236,17 @@ impl<'a> SelectionContext<'a> {
     /// Attaches the Engine Load snapshot captured at request start.
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
+        self
+    }
+
+    /// Cache-Aware uses this binding before Top-K truncation so an
+    /// incompatible cache holder cannot displace a lower-ranked usable one.
+    pub fn with_prefill_cache_bucket(
+        mut self,
+        selector: &'a BucketSelector,
+        request: BucketRequest,
+    ) -> Self {
+        self.prefill_cache_bucket = Some((selector, request));
         self
     }
 
@@ -427,7 +443,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         self.uses_shared_prefill_admission()
     }
 
-    /// Whether this policy resolves an affinity primary within the candidate range.
+    /// Whether this policy resolves an affinity primary within its candidate range.
     fn is_bucket_affinity_policy(&self) -> bool {
         false
     }
