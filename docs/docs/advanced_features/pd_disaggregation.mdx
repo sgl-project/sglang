@@ -678,7 +678,7 @@ do
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head \
         --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 22 24 26 28 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
-        --prefill-round-robin-balance --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
+        --disable-shared-experts-fusion --dtype bfloat16 --tokenizer-worker-num 4 \
        	--load-balance-method round_robin
         NODE_RANK=$i
         break
