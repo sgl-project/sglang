@@ -1104,6 +1104,7 @@ def _maybe_prepare_hybrid_h3_metadata(
 
     config = server_args.attention_backend_config or {}
     kernel = str(config.get("vdn_window_kernel", "decomposed"))
+    max_gather_rows = int(config.get("vdn_max_gather_rows", 200_000))
     layout = vdn_h3_layout_from_packed(
         packed, latent_t=ctx.latent_t, latent_h=ctx.latent_h, latent_w=ctx.latent_w
     )
@@ -1130,6 +1131,7 @@ def _maybe_prepare_hybrid_h3_metadata(
         device=device,
         kernel=kernel,
         rope_cache_full=rope_cache_full,
+        max_gather_rows=max_gather_rows,
     )
     logger.info(
         "VDN-H3 hybrid attention: kernel=%s frames=%d tokens/frame=%d text=%d "

@@ -128,24 +128,14 @@ class _DecomposedPlan:
     [globals | window frames | anchor-column frames] keys in one varlen call.
     """
 
-    __slots__ = (
-        "dense_q",
-        "win_q",
-        "win_q_slice",
-        "kv_gather",
-        "cu_q",
-        "cu_k",
-        "max_q",
-        "max_k",
-        "has_windows",
-        "gathered_rows",
-    )
+    __slots__ = ("dense_q", "passes", "has_windows", "gathered_rows")
 
     def __init__(
         self,
         layout: VDNH3Layout,
         hybrid: VDNHybridAttentionArchConfig,
         device: torch.device,
+        max_gather_rows: int = 200_000,
     ) -> None:
         used = layout.used
         num_frames = layout.num_frames
@@ -187,7 +177,12 @@ class _DecomposedPlan:
             else:
                 groups.append([f])
 
-        q_idx, kv_idx, q_lens, k_lens = [], [], [], []
+        # One varlen call per PASS; a pass holds consecutive chunk groups whose
+        # gathered K/V rows stay under ``max_gather_rows`` (the gathered K and
+        # V of the whole window are ~10 GB at the paper workload; passes bound
+        # that transient without changing the arithmetic -- every query's
+        # softmax still spans exactly its kept set in one call).
+        per_group = []
         for frames in groups:
             lo, hi = bounds[frames[0]]
             kv_frames = sorted(set(range(lo, hi + 1)) | dense_cols)
@@ -195,42 +190,59 @@ class _DecomposedPlan:
             ki = cat_ranges(
                 merge(global_ranges + [layout.frame_rows(f) for f in kv_frames])
             )
-            q_idx.append(qi)
-            kv_idx.append(ki)
-            q_lens.append(int(qi.numel()))
-            k_lens.append(int(ki.numel()))
+            per_group.append((frames, qi, ki))
 
-        self.has_windows = bool(groups)
-        # Under anchors="both" the window queries are exactly frames 1..F-2,
-        # one contiguous row range: slice instead of gathering/scattering
-        # ~1.4 GB of q and out per block.
-        self.win_q_slice = None
-        if self.has_windows:
-            flat = [f for frames in groups for f in frames]
-            if flat == list(range(flat[0], flat[0] + len(flat))):
-                self.win_q_slice = (
-                    layout.frame_rows(flat[0])[0],
-                    layout.frame_rows(flat[-1])[1],
-                )
-            self.win_q = torch.cat(q_idx)
-            self.kv_gather = torch.cat(kv_idx)
+        passes: list[dict] = []
+        current: list[tuple] = []
+        current_rows = 0
+
+        def flush() -> None:
+            if not current:
+                return
+            q_idx = [g[1] for g in current]
+            kv_idx = [g[2] for g in current]
+            q_lens = [int(t.numel()) for t in q_idx]
+            k_lens = [int(t.numel()) for t in kv_idx]
+            flat = [f for g in current for f in g[0]]
             zero = torch.zeros(1, dtype=torch.long)
-            self.cu_q = torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
-                device, torch.int32
+            passes.append(
+                dict(
+                    win_q=torch.cat(q_idx),
+                    # contiguous frames -> slice instead of gather/scatter
+                    win_q_slice=(
+                        (
+                            layout.frame_rows(flat[0])[0],
+                            layout.frame_rows(flat[-1])[1],
+                        )
+                        if flat == list(range(flat[0], flat[0] + len(flat)))
+                        else None
+                    ),
+                    kv_gather=torch.cat(kv_idx),
+                    cu_q=torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
+                        device, torch.int32
+                    ),
+                    cu_k=torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
+                        device, torch.int32
+                    ),
+                    max_q=max(q_lens),
+                    max_k=max(k_lens),
+                )
             )
-            self.cu_k = torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
-                device, torch.int32
-            )
-            self.max_q, self.max_k = max(q_lens), max(k_lens)
-            self.gathered_rows = int(self.kv_gather.numel())
-        else:
-            self.win_q = torch.empty(0, dtype=torch.long, device=device)
-            self.kv_gather = self.win_q
-            self.cu_q = self.cu_k = None
-            self.max_q = self.max_k = 0
-            self.gathered_rows = 0
 
-        covered = int(self.dense_q.numel()) + int(self.win_q.numel())
+        for frames, qi, ki in per_group:
+            rows = int(ki.numel())
+            if current and current_rows + rows > max_gather_rows:
+                flush()
+                current, current_rows = [], 0
+            current.append((frames, qi, ki))
+            current_rows += rows
+        flush()
+
+        self.passes = passes
+        self.has_windows = bool(passes)
+        self.gathered_rows = sum(int(p["kv_gather"].numel()) for p in passes)
+        win_rows = sum(int(p["win_q"].numel()) for p in passes)
+        covered = int(self.dense_q.numel()) + win_rows
         if covered != used:
             raise ValueError(
                 f"window decomposition covers {covered} of {used} packed rows"
@@ -268,6 +280,7 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         kernel: str = "decomposed",
         rope_cache_full: tuple[torch.Tensor, torch.Tensor] | None = None,
         current_timestep: int = 0,
+        max_gather_rows: int = 200_000,
         **kwargs: dict[str, Any],
     ) -> HybridWindowAttentionH3Metadata:
         if kernel not in HYBRID_WINDOW_H3_KERNELS:
@@ -279,7 +292,9 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         tiles = None
         if not full_cover:
             if kernel == "decomposed":
-                decomposed = _DecomposedPlan(layout, hybrid, device)
+                decomposed = _DecomposedPlan(
+                    layout, hybrid, device, max_gather_rows=max_gather_rows
+                )
             else:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels import (
                     build_window_tile_plan,
@@ -493,33 +508,36 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 max_k=used,
                 scale=self.softmax_scale,
             )
-        if plan.has_windows:
-            if plan.win_q_slice is not None:
-                start, stop = plan.win_q_slice
+        for p in plan.passes:
+            kw = key[p["kv_gather"]]
+            vw = value[p["kv_gather"]]
+            if p["win_q_slice"] is not None:
+                start, stop = p["win_q_slice"]
                 q_win = query[start:stop]
                 if not q_win.is_contiguous():
                     q_win = q_win.contiguous()
                 out[start:stop] = _fa_varlen(
                     q_win,
-                    key[plan.kv_gather],
-                    value[plan.kv_gather],
-                    cu_q=plan.cu_q,
-                    cu_k=plan.cu_k,
-                    max_q=plan.max_q,
-                    max_k=plan.max_k,
+                    kw,
+                    vw,
+                    cu_q=p["cu_q"],
+                    cu_k=p["cu_k"],
+                    max_q=p["max_q"],
+                    max_k=p["max_k"],
                     scale=self.softmax_scale,
                 )
             else:
-                out[plan.win_q] = _fa_varlen(
-                    query[plan.win_q],
-                    key[plan.kv_gather],
-                    value[plan.kv_gather],
-                    cu_q=plan.cu_q,
-                    cu_k=plan.cu_k,
-                    max_q=plan.max_q,
-                    max_k=plan.max_k,
+                out[p["win_q"]] = _fa_varlen(
+                    query[p["win_q"]],
+                    kw,
+                    vw,
+                    cu_q=p["cu_q"],
+                    cu_k=p["cu_k"],
+                    max_q=p["max_q"],
+                    max_k=p["max_k"],
                     scale=self.softmax_scale,
                 )
+            del kw, vw
         return out
 
 

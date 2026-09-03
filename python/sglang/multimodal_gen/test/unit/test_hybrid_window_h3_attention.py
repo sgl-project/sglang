@@ -206,6 +206,25 @@ def test_full_cover_matches_dense(kernel: str) -> None:
 
 
 @requires_cuda
+def test_decomposed_passes_are_arithmetic_neutral() -> None:
+    """Bounding the gathered K/V rows per pass splits the window into several
+    varlen calls without changing any query's kept set."""
+    device = torch.device("cuda")
+    layout, (q, k, v) = _qkv(device, seed=9)
+    one = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout, hybrid=_hybrid(), device=device
+    )
+    many = HybridWindowAttentionH3MetadataBuilder().build(
+        layout=layout, hybrid=_hybrid(), device=device, max_gather_rows=1
+    )
+    assert len(one.decomposed.passes) == 1 and len(many.decomposed.passes) > 1
+    impl = _impl()
+    a = _run(impl, one, layout, q, k, v).clone()
+    b = _run(impl, many, layout, q, k, v)
+    assert torch.equal(a, b)
+
+
+@requires_cuda
 def test_softmax_gate_scales_output_per_head() -> None:
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device, seed=3)
