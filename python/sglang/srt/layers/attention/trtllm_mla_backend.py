@@ -1290,9 +1290,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Save KV cache if requested (the fused fp8 path already wrote it)
         query = fused_fp8_query
         if query is None and save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             if self._decode_kernel_loc is not None:
                 if merge_query and self._fused_set_kv_concat_q:
                     # Fused: KV scatter + [q_nope | q_rope] concat in one
@@ -1494,9 +1494,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Save KV cache if requested
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            assert k is not None and k_rope is not None, (
+                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            )
             if self._decode_kernel_loc is not None:
                 self.token_to_kv_pool.set_mla_kv_buffer(
                     layer, self._decode_kernel_loc, k, k_rope
