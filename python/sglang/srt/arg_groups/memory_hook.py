@@ -364,9 +364,7 @@ def adjust_mem_fraction_for_vlm(server_args: Any, model_config, gpu_mem=None):
         declare_resolution(
             server_args,
             "adjust_mem_fraction_for_vlm",
-            mem_fraction_static=round(
-                cfg.mem_fraction_static - 8 * 1024 / gpu_mem, 3
-            ),
+            mem_fraction_static=round(cfg.mem_fraction_static - 8 * 1024 / gpu_mem, 3),
         )
         return
 
