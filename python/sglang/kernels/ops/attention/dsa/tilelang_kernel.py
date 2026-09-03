@@ -310,13 +310,16 @@ def sparse_attention_fwd_kernel_v1(
     D = dim
     D_tail = tail_dim
 
-    if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+    heads_per_block = 32 if threads == 128 else 64
+    if head_kv > heads_per_block:
+        assert head_kv % heads_per_block == 0, (
+            f"head_kv should be a multiple of {heads_per_block}"
+        )
+        REPLICATE_H = head_kv // heads_per_block
     else:
         REPLICATE_H = 1
 
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    H_per_block = padded_H if REPLICATE_H == 1 else heads_per_block
 
     @T.prim_func
     def main(
@@ -336,7 +339,6 @@ def sparse_attention_fwd_kernel_v1(
             KV_shared = T.alloc_shared([BI, D], dtype)
             if has_tail:
                 K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
-            O_shared = T.alloc_shared([H_per_block, D], dtype)
             mask = T.alloc_fragment([BI], "bool")
 
             acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
@@ -357,7 +359,9 @@ def sparse_attention_fwd_kernel_v1(
             q_i = s_i
             max_kv_i = q_i
 
-            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H0 = g_i * padded_H + (
+                0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * heads_per_block
+            )
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
@@ -423,7 +427,6 @@ def sparse_attention_fwd_kernel_v1(
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
 
-            T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
     return main
@@ -1393,7 +1396,24 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # Workstation/consumer Blackwell (SM 12.x) exposes a much smaller
+        # opt-in shared-memory budget than datacenter Blackwell.  The default
+        # 64-row, 2-stage tile requires over 200 KiB and cannot launch there.
+        small_blackwell_tile = (
+            torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
+        )
+        kernel = kernel_factory(
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            block_I=32 if small_blackwell_tile else 64,
+            # CUDA 13.3 adds enough bookkeeping to put the one-stage kernel
+            # just over SM12's 99 KiB opt-in ceiling (103424 vs 101376 B).
+            num_stages=0 if small_blackwell_tile else 2,
+            threads=128 if small_blackwell_tile else 256,
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
