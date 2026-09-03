@@ -41,6 +41,7 @@ from sglang.srt.layers.rotary_embedding import Ernie4_5_VLRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
@@ -282,7 +283,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = get_is_capture_mode()
 
         if visual_token_mask is not None and not capturing:
             all_visual = visual_token_mask.all()
