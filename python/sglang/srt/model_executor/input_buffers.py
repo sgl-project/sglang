@@ -22,12 +22,15 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     of the canonical's rows (one ``data_ptr`` for every runner that fits), so
     runners captured at different widths -- the draft / draft-extend /
     target-verify runners of every adaptive speculative step -- share one
-    physical buffer per field. A request with more rows keeps its own storage
-    and becomes the new canonical; earlier registrants keep the tensors their
-    graphs were captured against, so no already-captured buffer is ever
-    repointed. Because a smaller request never allocates, the footprint depends
-    on registration order: the widest configuration should register first (the
-    adaptive controller builds its steps widest-first).
+    physical buffer per field whose leading dim is the size axis (a ``(3, N)``
+    ``mrope_positions`` only coalesces with an equal ``N``). A request with
+    more rows keeps its own storage and becomes the new canonical; earlier
+    registrants keep the tensors their graphs were captured against, so no
+    already-captured buffer is ever repointed. Because a smaller request never
+    allocates, the footprint depends on registration order: the speculative
+    graph runners size their width-scaled buffers at the widest candidate
+    width so the initially captured state is already the widest, and the
+    adaptive controller builds the remaining steps by descending batch size.
 
     This pool governs *every* ``share_buffers()`` caller. Cross-runner sharing
     is safe because these are per-replay inputs: each runner fills the region

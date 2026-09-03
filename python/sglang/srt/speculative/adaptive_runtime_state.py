@@ -103,8 +103,9 @@ class AdaptiveController:
     def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps.
 
-        States are built widest-first so the narrower steps alias the widest
-        step's graph-input buffers in the shared input pool.
+        The remaining states are built by descending captured batch size so
+        the narrower ones alias the widest graph-input buffers in the shared
+        input pool.
         """
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
@@ -124,9 +125,8 @@ class AdaptiveController:
         self._activate(self.worker.speculative_num_steps)
 
     def _build_order(self) -> list[int]:
-        def graph_input_footprint(steps: int) -> tuple[int, int, int]:
-            max_bs = max(self.params.cuda_graph_bs_for_step(steps) or [0])
-            return (max_bs * (steps + 1), max_bs, steps)
+        def graph_input_footprint(steps: int) -> tuple[int, int]:
+            return (max(self.params.cuda_graph_bs_for_step(steps) or [0]), steps)
 
         return sorted(self.candidate_steps, key=graph_input_footprint, reverse=True)
 

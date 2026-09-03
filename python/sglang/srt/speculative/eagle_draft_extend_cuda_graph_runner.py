@@ -290,6 +290,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
+    def capture(self) -> None:
+        for buffer in (
+            self.buffers.extend_seq_lens,
+            self.buffers.num_correct_drafts,
+            self.buffers.num_accept_tokens,
+        ):
+            buffer.fill_(self.captured_req_width)
+        super().capture()
+
     def _replay_graph(self, shape_key, forward_batch):
         return self.backend.replay(shape_key, forward_batch)
 
@@ -513,8 +522,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         if bs * self.captured_req_width != num_tokens:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
-            buffers.out_cache_loc.zero_()
-            buffers.positions.zero_()
+            buffers.out_cache_loc[: self.max_num_token].zero_()
+            buffers.positions[: self.max_num_token].zero_()
             # Pair with seq_lens fill: padded rows must point at reserved
             # req_pool slot 0 (req_to_token[0, :] is all zeros from init).
             buffers.req_pool_indices.zero_()

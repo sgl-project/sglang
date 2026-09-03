@@ -108,6 +108,7 @@ from sglang.srt.runtime_context import (
     get_flags,
     get_parallel,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
@@ -375,6 +376,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else self.max_bs * self.captured_req_width
         )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.alloc_num_token = max(
+            self.max_num_token,
+            self.max_bs
+            * model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=max_speculative_num_draft_tokens()
+            ),
+        )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -415,7 +423,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
-            max_num_token=self.max_num_token,
+            max_num_token=self.alloc_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
             next_token_logits_buffer=self.model_runner.graph_shared_output.get_logits_buffer(
                 self.model_runner.model_config.vocab_size, rows=self.max_num_token
@@ -451,7 +459,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.buffer_registry: CudaGraphBufferRegistry = build_decode_registry(
             device=self.device,
             max_bs=self.max_bs,
-            max_num_token=self.max_num_token,
+            max_num_token=self.alloc_num_token,
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,

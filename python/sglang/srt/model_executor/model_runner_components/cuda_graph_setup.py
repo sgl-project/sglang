@@ -228,9 +228,8 @@ def capture_cuda_graphs(
             available_memory_gb,
         )
 
-    # cuda-graph capture: prefill before decode, so both coalesce onto the
-    # eager buffer allocated above. (capture_prefill_graph routes prefill
-    # to the eager runner when the prefill graph is disabled.)
+    # cuda-graph capture: prefill before decode. (capture_prefill_graph routes
+    # prefill to the eager runner when the prefill graph is disabled.)
     prefill = capture_prefill_graph(
         model_runner=model_runner, eager_runner=eager_runner
     )
