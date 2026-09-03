@@ -123,9 +123,9 @@ class TestSWAHalfWindowChunk(ScriptedTestCase):
         r = t.start_req(prompt_len=2 * _SWA_WINDOW, max_new_tokens=4)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
-        assert (
-            r.chunks_done >= 4
-        ), f"expected >=4 chunks for 2*window / (window/2), got {r.chunks_done}"
+        assert r.chunks_done >= 4, (
+            f"expected >=4 chunks for 2*window / (window/2), got {r.chunks_done}"
+        )
         assert len(r.req.output_ids) == 4
 
 
@@ -171,9 +171,9 @@ class TestSWARadix(ScriptedTestCase):
         )
         yield from run_until_finished(r2, max_steps=800)
         assert r2.finished
-        assert (
-            r2.req.cached_tokens > 0
-        ), f"r2 must hit the radix prefix, got cached_tokens={r2.req.cached_tokens}"
+        assert r2.req.cached_tokens > 0, (
+            f"r2 must hit the radix prefix, got cached_tokens={r2.req.cached_tokens}"
+        )
 
 
 if __name__ == "__main__":

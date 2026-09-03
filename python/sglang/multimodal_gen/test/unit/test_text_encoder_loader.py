@@ -150,6 +150,7 @@ class TestTextEncoderClassResolution(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(text_encoder_precisions=["bf16"]),
             explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
@@ -165,18 +166,22 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         }
 
         loader = TextEncoderLoader()
-        with mock.patch.object(
-            TextEncoderLoader,
-            "resolve_native_transformers_model_class",
-            return_value=transformers_model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
+        with (
+            mock.patch.object(
+                TextEncoderLoader,
+                "resolve_native_transformers_model_class",
+                return_value=transformers_model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
         ):
             encoder = loader.load_native(
                 "/model/text_encoder",
@@ -718,9 +723,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "CLIPTextModel",
             "ThirdPartyTextEncoder",
         ):
-            with self.subTest(architecture=architecture), self.assertRaisesRegex(
-                NativeComponentLoaderRequired,
-                "delegates serialized quant_method='bitsandbytes' checkpoint",
+            with (
+                self.subTest(architecture=architecture),
+                self.assertRaisesRegex(
+                    NativeComponentLoaderRequired,
+                    "delegates serialized quant_method='bitsandbytes' checkpoint",
+                ),
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
@@ -791,12 +799,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_model_managed_quantization_bypasses_generic_lifecycle(self):
+    def test_model_quantization_backend_bypasses_generic_lifecycle(self):
         model_config = SimpleNamespace(quant_config=None)
         with mock.patch.object(
             TextEncoder,
-            "manages_checkpoint_quantization",
-            True,
+            "checkpoint_quantization_backend",
+            "model",
         ):
             _configure_encoder_quantization(
                 model_config,
