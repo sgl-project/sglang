@@ -192,6 +192,9 @@ def build_replay_fb_view(
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+        # The pre-translate loc, which the unified pool's backends re-derive
+        # from straight into their capture-stable buffer. None on a static pool.
+        out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
