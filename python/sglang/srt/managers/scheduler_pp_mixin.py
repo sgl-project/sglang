@@ -18,8 +18,6 @@ from sglang.srt.disaggregation.pp_admission import (
     PPAdmissionMessage,
     PPAdmissionState,
     PPAdmissionVerdict,
-    prepare_forward_message,
-    publication_for_stage,
     route_aborts_to_failed,
 )
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
@@ -264,23 +262,6 @@ class SchedulerPPMixin:
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
-                if _PP_ADMIT_FLOW:
-                    # Apply before batch construction on every rank.
-                    self.pp_retry_deferred_bootstrap()
-                    message = PPAdmissionMessage.from_payload(bootstrapped_rids)
-                    if message is not None:
-                        applied = self._pp_admit_flow_admit(message.verdict)
-                        published = publication_for_stage(
-                            self.pp_group.is_first_rank,
-                            message.verdict,
-                            applied,
-                        )
-                        bootstrapped_rids = prepare_forward_message(
-                            message,
-                            published,
-                            self.pp_admission_state.local_failures,
-                        ).to_payload()
-                        bmbs[mb_id] = bootstrapped_rids
 
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
                 self._pp_commit_comm_work(send_transfer_work)
@@ -345,16 +326,9 @@ class SchedulerPPMixin:
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
                     )
-                    if _PP_ADMIT_FLOW:
-                        self._pp_admit_flow_apply_uniform_failures(
-                            next_consensus_bootstrapped_rids
-                        )
-                    else:
-                        next_consensus_bootstrapped_rids = (
-                            self.process_bootstrapped_queue(
-                                next_consensus_bootstrapped_rids
-                            )
-                        )
+                    next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
+                        next_consensus_bootstrapped_rids
+                    )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
                 if tmbs[next_mb_id] is not None:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
@@ -867,7 +841,27 @@ class SchedulerPPMixin:
 
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
-        if self.pp_group.is_first_rank:
+        if _PP_ADMIT_FLOW:
+            if self.pp_group.is_first_rank:
+                candidate_rids = None
+                prior_bad_rids = []
+            else:
+                message = PPAdmissionMessage.from_payload(
+                    self._pp_recv_pyobj_from_prev_stage()
+                )
+                assert message is not None
+                candidate_rids = list(message.verdict.admitted)
+                prior_bad_rids = list(message.verdict.failed)
+
+            good_bootstrapped_rids, local_bad_rids = (
+                self.disagg_prefill_bootstrap_queue.prepare_bootstrapped_rids(
+                    candidate_rids
+                )
+            )
+            bad_bootstrapped_rids = list(
+                dict.fromkeys((*prior_bad_rids, *local_bad_rids))
+            )
+        elif self.pp_group.is_first_rank:
             # First rank, pop the bootstrap reqs from the bootstrap queue
             good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
                 self.disagg_prefill_bootstrap_queue.queue,
@@ -875,13 +869,6 @@ class SchedulerPPMixin:
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
             )
-        elif _PP_ADMIT_FLOW:
-            # Forward PP0's verdict verbatim; local readiness is handled later.
-            message = PPAdmissionMessage.from_payload(
-                self._pp_recv_pyobj_from_prev_stage()
-            )
-            assert message is not None
-            return message.to_payload()
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()

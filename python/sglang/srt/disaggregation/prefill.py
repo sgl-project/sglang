@@ -39,7 +39,6 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.pp_admission import (
     PPAdmissionVerdict,
     map_authoritative_polls,
-    merge_deferred_send,
 )
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -338,6 +337,33 @@ class PrefillBootstrapQueue:
         assert req.metadata_buffer_index is not None
         return True
 
+    def prepare_bootstrapped_rids(
+        self, candidate_rids: Optional[List[str]] = None
+    ) -> tuple[List[str], List[str]]:
+        """Reserve local metadata before a PP admission verdict is committed."""
+        req_by_rid = {req.rid: req for req in self.queue}
+        ordered_rids = (
+            [req.rid for req in self.queue]
+            if candidate_rids is None
+            else candidate_rids
+        )
+        reqs = [req_by_rid[rid] for rid in ordered_rids if rid in req_by_rid]
+        if not reqs:
+            return [], []
+
+        polls = poll_and_all_reduce_attn_cp_tp_group(
+            [req.disagg_kv_sender for req in reqs],
+            self.scheduler.attn_cp_cpu_group,
+            self.scheduler.attn_tp_cpu_group,
+        )
+        prepared, failed = [], []
+        for req, poll in zip(reqs, polls):
+            if poll == KVPoll.Failed:
+                failed.append(req.rid)
+            elif poll == KVPoll.WaitingForInput and self.ensure_metadata_buffer(req):
+                prepared.append(req.rid)
+        return prepared, failed
+
     def finalize_bootstrap(self, req: Req) -> bool:
         """Initialize the sender after bootstrap completes.
         Returns False if no metadata buffer is available (non-terminal)."""
@@ -438,7 +464,11 @@ class PrefillBootstrapQueue:
                 admitted_poll=KVPoll.WaitingForInput,
                 failed_poll=KVPoll.Failed,
             )
-            uncovered = [i for i, poll in enumerate(polls) if poll is None]
+            uncovered = (
+                []
+                if _PP_ADMIT_FLOW
+                else [i for i, poll in enumerate(polls) if poll is None]
+            )
             if uncovered:
                 local_polls = poll_and_all_reduce_attn_cp_tp_group(
                     [self.queue[i].disagg_kv_sender for i in uncovered],
@@ -493,20 +523,15 @@ class PrefillBootstrapQueue:
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
                     req.prefill_attempt_count += 1
-                elif _PP_ADMIT_FLOW and self.pp_size > 1 and self.pp_rank != 0:
-                    # This is PP0's verdict. Allocate in the same order on every
-                    # rank, but defer sender init until the local handshake lands.
-                    if not self.ensure_metadata_buffer(req):
-                        self.scheduler.pp_admission_state.defer_verdict(req.rid)
-                        logger.debug(
-                            "Deferring PP admission for rid=%s on pp_rank=%d "
-                            "until a metadata buffer is available",
-                            req.rid,
-                            self.pp_rank,
-                        )
-                        continue
-                    if not self._pp_admit_flow_try_finalize(req):
-                        self.scheduler._pp_defer_bootstrap(req)
+                elif _PP_ADMIT_FLOW and self.pp_size > 1:
+                    assert req.metadata_buffer_index >= 0, (
+                        f"PP admission committed rid={req.rid} without a "
+                        f"metadata reservation on pp_rank={self.pp_rank}"
+                    )
+                    assert self.finalize_bootstrap(req), (
+                        f"PP admission could not finalize rid={req.rid} "
+                        f"on pp_rank={self.pp_rank}"
+                    )
                 elif not self.finalize_bootstrap(req):
                     continue
                 bootstrapped_reqs.append(req)
@@ -1268,17 +1293,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        if _PP_ADMIT_FLOW and req.pending_bootstrap:
-            self.disagg_prefill_bootstrap_queue._pp_admit_flow_try_finalize(req)
-        if _PP_ADMIT_FLOW and req.pending_bootstrap:
-            req.pp_deferred_send = merge_deferred_send(
-                req.pp_deferred_send, last_chunk, end_idx
-            )
-            logger.debug(
-                "Deferring KV send for rid=%s until local bootstrap completes",
-                req.rid,
-            )
-            return
+        if _PP_ADMIT_FLOW:
+            assert (
+                not req.pending_bootstrap
+            ), f"PP admission attempted KV send before commit for rid={req.rid}"
 
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx

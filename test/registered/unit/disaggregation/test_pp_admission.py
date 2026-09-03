@@ -3,12 +3,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.disaggregation import prefill as prefill_module
+from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.pp_admission import (
     PPAdmissionMessage,
     PPAdmissionState,
     PPAdmissionVerdict,
     map_authoritative_polls,
-    merge_deferred_send,
     prepare_forward_message,
     publication_for_stage,
     route_aborts_to_failed,
@@ -20,6 +22,60 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestPPAdmission(unittest.TestCase):
+    def test_commit_rejects_request_without_metadata_reservation(self):
+        req = SimpleNamespace(
+            rid="request",
+            metadata_buffer_index=-1,
+            time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+        )
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = [req]
+        queue.pp_size = 8
+        queue.pp_rank = 3
+
+        with patch.object(prefill_module, "_PP_ADMIT_FLOW", True):
+            with self.assertRaisesRegex(
+                AssertionError, "without a metadata reservation"
+            ):
+                queue.pop_bootstrapped(
+                    return_failed_reqs=True,
+                    pp_good_rids=["request"],
+                    pp_bad_rids=[],
+                )
+
+    def test_prepare_reserves_capacity_and_never_overcommits(self):
+        reqs = [
+            SimpleNamespace(
+                rid="a", metadata_buffer_index=-1, disagg_kv_sender=object()
+            ),
+            SimpleNamespace(
+                rid="b", metadata_buffer_index=-1, disagg_kv_sender=object()
+            ),
+        ]
+        slots = [7]
+        allocator = SimpleNamespace(
+            available_size=lambda: len(slots),
+            alloc=lambda: slots.pop(),
+        )
+        queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
+        queue.queue = reqs
+        queue.scheduler = SimpleNamespace(
+            attn_cp_cpu_group=object(), attn_tp_cpu_group=object()
+        )
+        queue.req_to_metadata_buffer_idx_allocator = allocator
+
+        with patch.object(
+            prefill_module,
+            "poll_and_all_reduce_attn_cp_tp_group",
+            return_value=[KVPoll.WaitingForInput, KVPoll.WaitingForInput],
+        ):
+            prepared, failed = queue.prepare_bootstrapped_rids()
+
+        self.assertEqual(prepared, ["a"])
+        self.assertEqual(failed, [])
+        self.assertEqual(reqs[0].metadata_buffer_index, 7)
+        self.assertEqual(reqs[1].metadata_buffer_index, -1)
+
     def test_first_stage_verdict_is_authoritative(self):
         verdict = PPAdmissionVerdict(("ready",), ("failed",))
 
@@ -32,39 +88,6 @@ class TestPPAdmission(unittest.TestCase):
             ),
             ["admitted", None, "failed"],
         )
-
-    def test_local_sender_initialization_can_be_deferred(self):
-        state = PPAdmissionState(step=7)
-        req = SimpleNamespace(pp_defer_body=None)
-
-        state.defer_bootstrap(req)
-        state.defer_bootstrap(req)
-
-        self.assertEqual(req.pp_defer_body, 7)
-        self.assertEqual(state.deferred_bootstrap, [req])
-
-    def test_metadata_buffer_defer_is_reoffered_until_applied(self):
-        state = PPAdmissionState()
-        state.defer_verdict("deferred")
-        intended = PPAdmissionVerdict(("new",), ())
-
-        offered = intended.with_deferred(state.deferred_rids)
-        self.assertEqual(offered.admitted, ("new", "deferred"))
-
-        state.clear_applied(PPAdmissionVerdict(("deferred",), ()))
-        self.assertNotIn("deferred", state.deferred_rids)
-
-    def test_failed_verdict_overrides_deferred_admission(self):
-        verdict = PPAdmissionVerdict((), ("aborted",))
-
-        self.assertEqual(verdict.with_deferred(["aborted"]).admitted, ())
-
-    def test_last_chunk_discards_stale_end_idx(self):
-        pending = merge_deferred_send(None, last_chunk=False, end_idx=128)
-        pending = merge_deferred_send(pending, last_chunk=True, end_idx=256)
-        pending = merge_deferred_send(pending, last_chunk=False, end_idx=384)
-
-        self.assertEqual(pending, (True, None))
 
     def test_first_stage_publishes_applied_verdict(self):
         intended = PPAdmissionVerdict(("a", "b"), ())
