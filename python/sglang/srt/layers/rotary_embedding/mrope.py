@@ -610,6 +610,32 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
 
         return self.forward_native(positions, query, key)
 
+    def forward_xpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor = None,
+    ):
+        assert key is not None
+        assert positions.ndim in (1, 2)
+        self._match_cos_sin_cache_dtype(query)
+
+        if positions.ndim == 2:
+            assert self.mrope_section is not None
+            triton_ernie45_rope_fused_inplace(
+                q=query,
+                k=key,
+                cos_sin_cache=self.cos_sin_cache,
+                positions=positions,
+                mrope_section=self.mrope_section,
+                head_size=self.head_size,
+                rotary_dim=self.rotary_dim,
+                is_neox_style=self.is_neox_style,
+            )
+            return query, key
+
+        return self.forward_native(positions, query, key)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -618,4 +644,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        if _is_xpu:
+            return self.forward_xpu(positions, query, key)
         return self.forward_cuda(positions, query, key)

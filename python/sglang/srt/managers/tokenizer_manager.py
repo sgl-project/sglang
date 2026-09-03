@@ -818,7 +818,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     state = self.rid_to_state[obj.rid]
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    self._send_one_request(tokenized_obj)
+                    await self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
@@ -1554,15 +1554,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
-    def _send_one_request(
+    async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         prepared_mm_items = []
         dispatched = False
         try:
-            prepared_mm_items = self.cuda_vmm_feature_transport.prepare_for_dispatch(
-                (tokenized_obj.mm_inputs,)
+            prepared_mm_items = (
+                await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
+                    (tokenized_obj.mm_inputs,)
+                )
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
@@ -1576,7 +1578,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
 
-    def _send_batch_request(
+    async def _send_batch_request(
         self,
         tokenized_objs: List[
             Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
@@ -1586,8 +1588,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         prepared_mm_items = []
         dispatched = False
         try:
-            prepared_mm_items = self.cuda_vmm_feature_transport.prepare_for_dispatch(
-                tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+            prepared_mm_items = (
+                await self.cuda_vmm_feature_transport.prepare_for_dispatch_async(
+                    tokenized_obj.mm_inputs for tokenized_obj in tokenized_objs
+                )
             )
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
@@ -1823,7 +1827,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                self._send_batch_request(tokenized_objs)
+                await self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
@@ -1848,7 +1852,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state = self.rid_to_state[tmp_obj.rid]
                         if tmp_obj.return_prompt_token_ids:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
-                        self._send_one_request(tokenized_obj)
+                        await self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -1881,7 +1885,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
-                self._send_one_request(tokenized_obj)
+                await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1901,7 +1905,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.time_stats = state.time_stats
                     if tmp_obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
-                    self._send_one_request(tokenized_obj)
+                    await self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
