@@ -70,30 +70,39 @@ class DynamicChunkSizer:
         self.pp_rank = pp_rank
         self.predictor = ChunkSizePredictor()
 
-    def profile_and_fit(self) -> None:
-        """PP0 profiles synthetic prefills; every rank fits the same samples."""
-        seq_lens: List[int] = []
-        latencies: List[float] = []
+    def profile_and_fit(self) -> bool:
+        """PP0 profiles synthetic prefills and every rank fits the same samples;
+        returns whether the predictor is ready."""
+        try:
+            seq_lens: List[int] = []
+            latencies: List[float] = []
 
-        if self.pp_group.is_first_rank:
-            seq_lens, latencies = self._profile_prefill_latency()
+            if self.pp_group.is_first_rank:
+                seq_lens, latencies = self._profile_prefill_latency()
 
-            seq_lens, latencies = attn_cp_tp_broadcast_pyobj([seq_lens, latencies])
+                seq_lens, latencies = attn_cp_tp_broadcast_pyobj([seq_lens, latencies])
 
-        # Broadcast data to all ranks
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            data_to_sync = [seq_lens, latencies]
-            self.pp_group.broadcast_object_list(data_to_sync, src=0)
-            seq_lens, latencies = data_to_sync
+            # Broadcast data to all ranks
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                data_to_sync = [seq_lens, latencies]
+                self.pp_group.broadcast_object_list(data_to_sync, src=0)
+                seq_lens, latencies = data_to_sync
 
-        # Quadratic model: f(l) = al^2 + bl + c
-        self.predictor.fit(seq_lens, latencies)
-        self.predictor.set_target_latency(self.chunked_prefill_size)
-        self.predictor.is_ready = True
-        logger.info(
-            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-            f"Target latency: {self.predictor.target_latency:.2f}ms"
-        )
+            # Quadratic model: f(l) = al^2 + bl + c
+            self.predictor.fit(seq_lens, latencies)
+            self.predictor.set_target_latency(self.chunked_prefill_size)
+            self.predictor.is_ready = True
+            logger.info(
+                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
+                f"Target latency: {self.predictor.target_latency:.2f}ms"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
+                "Dynamic chunking will be disabled."
+            )
+            return False
+        return True
 
     def predict(self, history_len: int) -> Optional[int]:
         """Chunk size for the next prefill step, or None to keep the static size."""

@@ -1267,15 +1267,8 @@ class Scheduler(
             pp_group=self.pp_group,
             pp_rank=self.ps.pp_rank,
         )
-        try:
-            sizer.profile_and_fit()
-        except Exception as e:
-            logger.warning(
-                f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
-                "Dynamic chunking will be disabled."
-            )
-            return
-        self.dynamic_chunk_sizer = sizer
+        if sizer.profile_and_fit():
+            self.dynamic_chunk_sizer = sizer
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
