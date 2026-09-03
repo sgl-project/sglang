@@ -288,10 +288,13 @@ jobs:
           with open(snap_path) as f:
               snapshot = json.load(f)
 
-          # Only look at nightly-test-intel jobs
+          # Only look at nightly-test-intel jobs. The snapshot's key is
+          # "workflow" (matches the workflow filename); an earlier version of
+          # this filter used "workflow_path", which is never populated by the
+          # snapshot writer, so every nightly row was silently dropped.
           nightly = [
               j for j in snapshot.get("jobs", [])
-              if j.get("workflow_path", "").endswith("nightly-test-intel.yml")
+              if (j.get("workflow") or "").endswith("nightly-test-intel.yml")
           ]
 
           # status_summary style counts, per job name
