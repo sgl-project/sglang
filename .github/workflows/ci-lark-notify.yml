@@ -1,0 +1,125 @@
+name: CI Lark Notify
+
+# Lark cards for CUDA CI health; see scripts/ci_monitor/README.md.
+
+on:
+  workflow_run:
+    workflows: ["Nightly Test (Nvidia)", "Weekly Test (Nvidia)", "PR Test Base"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '*/15 * * * *'   # runner-health
+    - cron: '30 */6 * * *'   # queue-digest
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'Which report to run'
+        required: true
+        type: choice
+        options: [ci-status, runner-health, queue-digest]
+      run_id:
+        description: 'Workflow run id (ci-status only)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Print the card instead of posting it'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  PYTHONUNBUFFERED: 1
+  DRY_RUN_FLAG: ${{ inputs.dry_run && '--dry-run' || '' }}
+
+jobs:
+  ci-status:
+    if: >-
+      github.repository == 'sgl-project/sglang' && (
+        (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') ||
+        (github.event_name == 'workflow_dispatch' && inputs.task == 'ci-status')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci_monitor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Post CI status card
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG ci-status \
+            --run-id "$RUN_ID" \
+            ${{ github.event_name == 'workflow_dispatch' && '--any-event' || '' }}
+
+  runner-health:
+    if: >-
+      github.repository == 'sgl-project/sglang' && (
+        (github.event_name == 'schedule' && github.event.schedule == '*/15 * * * *') ||
+        (github.event_name == 'workflow_dispatch' && inputs.task == 'runner-health')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Serialize so the state file is never written by two runs at once.
+    concurrency:
+      group: ci-lark-notify-runner-health
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci_monitor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Key never matches (run_id is unique) so restore-keys picks the most
+      # recent state and the save step writes a fresh entry every run.
+      - name: Restore runner-health state
+        uses: actions/cache/restore@v4
+        with:
+          path: runner-health-state.json
+          key: lark-runner-health-${{ github.run_id }}
+          restore-keys: lark-runner-health-
+      - name: Check runner pools
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_RUNNER_ADMIN }}
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+        run: |
+          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG runner-health \
+            --state-file runner-health-state.json
+      - name: Save runner-health state
+        if: ${{ !inputs.dry_run }}
+        uses: actions/cache/save@v4
+        with:
+          path: runner-health-state.json
+          key: lark-runner-health-${{ github.run_id }}
+
+  queue-digest:
+    if: >-
+      github.repository == 'sgl-project/sglang' && (
+        (github.event_name == 'schedule' && github.event.schedule == '30 */6 * * *') ||
+        (github.event_name == 'workflow_dispatch' && inputs.task == 'queue-digest')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci_monitor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Post queue digest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+        run: |
+          python scripts/ci_monitor/lark_notify.py $DRY_RUN_FLAG queue-digest --hours 6
