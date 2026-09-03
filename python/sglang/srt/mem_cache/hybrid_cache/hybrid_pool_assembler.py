@@ -536,6 +536,58 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
     ]
 
 
+def _dsv4_rope_sibling(
+    kvcache: Any, ratio: int
+) -> Optional[tuple[PoolName, list, int]]:
+    """
+    ``(name, device_buffers, item_bytes)`` for the bf16 rope half of an fp8
+    two-pool unified_kv row; None for every other layout, which keeps the whole
+    row in one buffer.
+    """
+    if not getattr(kvcache, "_unified_kv", False):
+        return None
+    region = kvcache.unified_rope_region_buffers(ratio)
+    if region is None:
+        return None
+    buffers, item_bytes = region
+    name = (
+        PoolName.DEEPSEEK_V4_C4_ROPE if ratio == 4 else PoolName.DEEPSEEK_V4_C128_ROPE
+    )
+    return name, buffers, item_bytes
+
+
+def _build_dsv4_rope_entry(
+    kvcache: Any,
+    ratio: int,
+    *,
+    device_pool: Any,
+    layer_mapping: dict[int, int],
+    num_host_pages: int,
+    page_size: int,
+    transfer_layer_num: int,
+) -> Optional[PoolEntry]:
+    sibling = _dsv4_rope_sibling(kvcache, ratio)
+    if sibling is None:
+        return None
+    name, device_buffers, item_bytes = sibling
+    return build_pool_entry(
+        name=name,
+        host_pool=DeepSeekV4PagedHostPool(
+            pool_name=str(name),
+            device_buffers=device_buffers,
+            item_bytes=item_bytes,
+            num_host_pages=num_host_pages,
+            slot_page_size=page_size,
+            layout=get_memory().hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            page_aligned_only=True,
+        ),
+        device_pool=device_pool,
+        layer_mapping=layer_mapping,
+        transfer_layer_num=transfer_layer_num,
+    )
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -647,6 +699,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=is_unified_kv,
         )
         entries.append(
             build_pool_entry(
@@ -676,6 +729,19 @@ def build_deepseek_v4_hicache_stack(
                     transfer_layer_num=transfer_layer_num,
                 )
             )
+
+        # Build c4 rope buffer when using unified fp8 kv
+        c4_rope_entry = _build_dsv4_rope_entry(
+            kvcache,
+            4,
+            device_pool=kvcache.c4_kv_pool,
+            layer_mapping=c4_layer_mapping,
+            num_host_pages=num_host_pages,
+            page_size=page_size,
+            transfer_layer_num=transfer_layer_num,
+        )
+        if c4_rope_entry is not None:
+            entries.append(c4_rope_entry)
 
         if not is_unified_kv:
             c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -731,6 +797,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            page_aligned_only=is_unified_kv,
         )
         # C128 state pool is intentionally not registered with hicache.
         # page_size=256 % 128 == 0, so state pool is not consumed on load.
@@ -745,6 +812,18 @@ def build_deepseek_v4_hicache_stack(
                 ),
             ]
         )
+        # Build c128 rope buffer when using unified fp8 kv
+        c128_rope_entry = _build_dsv4_rope_entry(
+            kvcache,
+            128,
+            device_pool=kvcache.c128_kv_pool,
+            layer_mapping=c128_layer_mapping,
+            num_host_pages=num_host_pages,
+            page_size=page_size,
+            transfer_layer_num=transfer_layer_num,
+        )
+        if c128_rope_entry is not None:
+            entries.append(c128_rope_entry)
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
@@ -1339,9 +1418,11 @@ class _DeepSeekV4Strategy(StackStrategy):
             )
             for name, src in (
                 (PoolName.DEEPSEEK_V4_C4, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C4_ROPE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C128, PoolName.KV),
+                (PoolName.DEEPSEEK_V4_C128_ROPE, PoolName.KV),
                 (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),

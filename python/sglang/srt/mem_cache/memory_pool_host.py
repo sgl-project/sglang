@@ -190,9 +190,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.pool_name = pool_name
         self.layer_num = len(device_buffers)
         self.item_bytes = item_bytes
-        # A page row of the FP4 indexer buffers is a grouped slot layout rather
-        # than a flat token array, so the token-granular copy used for fused
-        # DSv4 C4 rows does not apply and only whole pages may move.
+        # The token-granular copy below addresses the fused DSv4 C4 row. Neither
+        # the FP4 indexer, whose page rows group their slots, nor unified_kv,
+        # whose page row is a flat run of tokens, has that layout, so those may
+        # only move whole pages.
         self.page_aligned_only = page_aligned_only
         self.num_host_pages = num_host_pages
         self.slot_page_size = slot_page_size

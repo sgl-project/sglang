@@ -898,36 +898,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             item_lens.append(row_bytes)
         return data_ptrs, data_lens, item_lens
 
-    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+    def _unified_page_views(
+        self, buffers: List[torch.Tensor], ratio: int
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         In unified_kv, swa/c4/c128 share one buffer with one slot per row. But the
         HiCache host pool transfers a whole page per indexed row, so we reshape the
         compressed region into the layout it expects: skip the SWA segment, reshape to
         one row per page, then cast to uint8.
-        """
-        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
-        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
-        if self._unified_kv_fp8:
-            # item_bytes below prices kv_buffer alone, so the rope pool would never
-            # be offloaded and a fetched page would carry stale rope -- wrong output,
-            # no crash.
-            # TODO(danli103): give rope its own host pool, the way C4_INDEXER
-            # already parallels C4.
-            raise NotImplementedError(
-                "HiCache offload is not supported with "
-                "SGLANG_DSV4_UNIFIED_KV_FP8=1 (the host pool assumes a single "
-                "unified pool; the rope pool would never be offloaded)."
-            )
 
+        Bf16 kv layout: [rows, 1024B]
+        Fp8 kv layout:  [rows, 512B], [rows, 128B], one for fp8 nope, one for bf16 rope
+        """
         swa_pages = self.unified_kv_pool.swa_pages
-        head_dim = self.unified_kv_pool.head_dim
         rows_per_page = self.page_size // ratio
         stage_ratios = self.compression_ratios[self._stage_start : self._stage_end]
         local_layer_ids = [i for i, r in enumerate(stage_ratios) if r == ratio]
 
         views: List[torch.Tensor] = []
         for local_layer_id in local_layer_ids:
-            buf = self.unified_kv_pool.kv_buffer[local_layer_id]
+            buf = buffers[local_layer_id]
             compress_rows = buf.shape[0] - swa_pages
             assert compress_rows % rows_per_page == 0, (
                 f"compressed rows {compress_rows} not a multiple of "
@@ -936,15 +926,38 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             num_pages = compress_rows // rows_per_page
             page_view = (
                 buf.narrow(0, swa_pages, compress_rows)
-                .reshape(num_pages, rows_per_page * head_dim)
+                .reshape(num_pages, rows_per_page * buf.shape[1])
                 .view(torch.uint8)
             )
             views.append(page_view)
 
-        item_bytes = (
-            rows_per_page * head_dim * self.unified_kv_pool.kv_buffer[0].element_size()
-        )
+        item_bytes = rows_per_page * buffers[0].shape[1] * buffers[0].element_size()
         return views, item_bytes
+
+    def unified_region_buffers(self, ratio: int) -> Tuple[List[torch.Tensor], int]:
+        """
+        Main compressed region of one stage: bf16 latents, or fp8 nope.
+        """
+        assert self._unified_kv, "unified_region_buffers requires unified_kv layout"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+        return self._unified_page_views(self.unified_kv_pool.kv_buffer, ratio)
+
+    def unified_rope_region_buffers(
+        self, ratio: int
+    ) -> Optional[Tuple[List[torch.Tensor], int]]:
+        """
+        The bf16 rope half of an fp8 two-pool row, or None when there isn't one.
+
+        A row index addresses both pools, so this mirrors exactly the rows
+        ``unified_region_buffers`` does and only the row width differs. It needs
+        its own host pool: offloading the nope half alone leaves whatever rope the
+        row held before, which is wrong output rather than a crash.
+        """
+        if not self._unified_kv_fp8:
+            return None
+        assert self._unified_kv, "unified_rope_region_buffers requires unified_kv"
+        assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
+        return self._unified_page_views(self.unified_kv_pool.kv_buffer_rope, ratio)
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
