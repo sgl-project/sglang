@@ -417,12 +417,10 @@ def build_dispatcher_quant_config(
 ) -> dict:
     """Describe a MoE layer's numerics to its dispatcher.
 
-    The wire format follows the activation dtype the MoE kernel consumes, which
-    depends on all four of these. ``quant_type`` is the ``AiterQuantType`` the
-    layer will hand AITER; it is what separates the two fp8 activation formats,
-    whose scale layouts differ. ``weight_dtype`` is semantic, not storage: MXFP4
-    is stored as uint8 but reported as float4_e2m1fn_x2. Consumers must tolerate
-    every key but ``weight_dtype`` being absent.
+    ``quant_type`` is the ``AiterQuantType`` the layer will hand AITER; it is
+    what separates the two fp8 activation formats. ``weight_dtype`` is semantic,
+    not storage: MXFP4 is stored as uint8 but reported as float4_e2m1fn_x2.
+    Consumers must tolerate every key but ``weight_dtype`` being absent.
     """
     runner_config = getattr(layer, "moe_runner_config", None)
     return {

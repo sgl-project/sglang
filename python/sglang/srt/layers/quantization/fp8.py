@@ -2716,11 +2716,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._cutlass_buffers_ready = True
 
     def _aiter_moe_quant_type(self):
-        """The quant_type this method hands AITER.
-
-        Also what the dispatcher needs: it separates the two fp8 activation
-        formats, which share a payload but not a scale layout.
-        """
+        """The quant_type this method hands AITER, which the dispatcher also
+        needs: it separates the two fp8 activation formats."""
         from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 
         if not self.block_quant:

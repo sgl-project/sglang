@@ -72,10 +72,9 @@ def _should_record_expert_distribution() -> bool:
 def _aiter_supports_mxfp8_dispatch() -> bool:
     """Can this aiter both emit and consume mxfp8 activations?
 
-    The two halves ship in different aiter commits (ROCm/aiter#4954 is the
-    receive side) and builds with only the first exist, where the fp8
-    activations reach a bf16-only quantizer and abort. aiter exposes no
-    capability flag, hence the probes.
+    The halves ship in different commits (ROCm/aiter#4954 is the receive side),
+    and on a build with only the first the activations reach a bf16-only
+    quantizer and abort. No capability flag exists, hence the probes.
     """
     try:
         import inspect
@@ -558,10 +557,8 @@ class _MoriEPDispatcherImplBase:
 
         self.dispatch_dtype = self._resolve_dispatch_dtype(quant_config)
 
-        # Combine has no receiver format to match (bf16 in, bf16 out), so it is
-        # keyed off the weight dtype rather than the dispatch format: an MXFP4
-        # layer that fell back to bf16 dispatch still wants the cheaper combine.
-        # Values unchanged.
+        # Combine has no receiver format to match (bf16 in, bf16 out), so it
+        # stays keyed off the weight dtype. Values unchanged.
         if weight_dtype == torch.float4_e2m1fn_x2:
             self.combine_dtype = CombineDtype.fp8
         else:
@@ -583,24 +580,21 @@ class _MoriEPDispatcherImplBase:
             activation=quant_config.get("activation", "silu"),
             swiglu_limit=quant_config.get("swiglu_limit"),
         )
-        actionable = choice.actionable
+        chosen = {
+            AiterDispatchFormat.FP8: DispatchDtype.fp8,
+            AiterDispatchFormat.MXFP8: DispatchDtype.mxfp8,
+            AiterDispatchFormat.MXFP4: DispatchDtype.fp4,
+            AiterDispatchFormat.BF16: DispatchDtype.bf16,
+        }[choice.format]
+        why, actionable = choice.reason, choice.actionable
 
-        if choice.format == AiterDispatchFormat.MXFP8:
-            if _aiter_supports_mxfp8_dispatch():
-                chosen, why = DispatchDtype.mxfp8, choice.reason
-            else:
-                chosen, why, actionable = (
-                    DispatchDtype.bf16,
-                    "MoE consumes mxfp8 (a8w4) but this aiter cannot emit or "
-                    "consume it (needs ROCm/aiter#4954)",
-                    True,
-                )
-        elif choice.format == AiterDispatchFormat.MXFP4:
-            chosen, why = DispatchDtype.fp4, choice.reason
-        elif choice.format == AiterDispatchFormat.FP8:
-            chosen, why = DispatchDtype.fp8, choice.reason
-        else:
-            chosen, why = DispatchDtype.bf16, choice.reason
+        if chosen is DispatchDtype.mxfp8 and not _aiter_supports_mxfp8_dispatch():
+            chosen, why, actionable = (
+                DispatchDtype.bf16,
+                "MoE consumes mxfp8 (a8w4) but this aiter cannot emit or consume "
+                "it (needs ROCm/aiter#4954)",
+                True,
+            )
 
         log = logger.warning_once if actionable else logger.info_once
         log(f"[MORI] auto dispatch_dtype={chosen.name}: {why}")
