@@ -1313,6 +1313,43 @@ class HybridPoolManifestTest(unittest.TestCase):
         self.assertEqual(core.submit_hint.call_args.kwargs["request_id"], request_id)
         core.discard_hint.assert_called_once_with(request_id)
 
+    def test_hinted_hybrid_get_logs_the_pool_to_native_op_mapping(self):
+        self._collect()
+        page_keys = ["p0", "p1"]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4,
+            keys=page_keys,
+            host_indices=torch.tensor([0, 1, 2, 3], dtype=torch.int64),
+        )
+        delivered = {}
+
+        def deliver(destinations, request_id=None):
+            delivered.update(destinations)
+            self.assertEqual(request_id, "req-7")
+            return 77
+
+        self.store._kvcr = SimpleNamespace(deliver=deliver)
+        self.store._config = SimpleNamespace(enable_telemetry=True)
+
+        def submit_and_complete(submit):
+            handle = submit()
+            first_page = set(
+                self.store._page_segment_keys(page_keys[0], PoolName.DEEPSEEK_V4_C4)
+            )
+            return handle, {key: key in first_page for key in delivered}
+
+        self.store._submit_and_wait = submit_and_complete
+        with self.assertLogs(kvcr_store.logger, level="INFO") as captured:
+            result = self.store._deliver_transfer(transfer, request_id="req-7")
+
+        self.assertEqual(result, [True, False])
+        self.assertIn(
+            "KVCRStore hinted transfer op=77 request=req-7 "
+            "pool=deepseek_v4_c4 result=partial pages=1/2 "
+            "components=2/4 bytes=16/32",
+            "\n".join(captured.output),
+        )
+
     def test_short_local_query_result_is_a_miss(self):
         self.store._kvcr = SimpleNamespace(query=lambda keys: [(QueryStatus.HIT, None)])
 

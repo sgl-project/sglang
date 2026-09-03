@@ -1769,7 +1769,7 @@ class KVCRStore(HiCacheStorage):
             if not destinations:
                 return [False] * len(keys)
 
-        _, result_map = self._submit_and_wait(
+        op_handle, result_map = self._submit_and_wait(
             lambda: self._kvcr.deliver(destinations, request_id=request_id)
         )
 
@@ -1786,6 +1786,37 @@ class KVCRStore(HiCacheStorage):
             # same event as a local-tier miss on an unhinted request.
             self._note("hinted_pages_requested", len(results))
             self._note("hinted_pages_loaded", loaded)
+            if getattr(self._config, "enable_telemetry", False):
+                completed_components = [
+                    key for key in destinations if result_map.get(key, False)
+                ]
+                requested_bytes = sum(
+                    int(descriptor.size) for descriptor in destinations.values()
+                )
+                completed_bytes = sum(
+                    int(destinations[key].size) for key in completed_components
+                )
+                result = (
+                    "success"
+                    if loaded == len(results)
+                    else "partial"
+                    if completed_components
+                    else "failed"
+                )
+                logger.info(
+                    "KVCRStore hinted transfer op=%s request=%s pool=%s "
+                    "result=%s pages=%d/%d components=%d/%d bytes=%d/%d",
+                    op_handle,
+                    request_id,
+                    transfer.name,
+                    result,
+                    loaded,
+                    len(results),
+                    len(completed_components),
+                    len(destinations),
+                    completed_bytes,
+                    requested_bytes,
+                )
         return results
 
     @_fail_closed(_no_prefix)
