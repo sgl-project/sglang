@@ -463,6 +463,89 @@ def test_branch_matches_eager_reference_algorithm() -> None:
     assert diff < 3e-2 * max(scale, 1.0), f"branch vs reference max diff {diff} (scale {scale})"
 
 
+@requires_cuda
+def test_fused_branch_kernels_match_eager_chain() -> None:
+    """Each fused Triton stage against the eager spelling it replaces (one
+    rounding instead of one per op: ~1 bf16 ulp), and the whole branch with
+    fused kernels vs the eager chain."""
+    from sglang.kernels.ops.diffusion import (
+        vdn_frame_stats_prep,
+        vdn_linear_epilogue,
+        vdn_silu_l2norm,
+        vdn_temporal_conv_act,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
+
+    device = torch.device("cuda")
+    g = torch.Generator(device="cpu").manual_seed(4)
+    F_, S_, H_, D_ = 6, 24, 3, 32
+    x = torch.randn(F_, S_, H_ * D_, generator=g).to(device, torch.bfloat16)
+    w = (torch.randn(H_ * D_, 5, generator=g) * 0.4).to(device, torch.bfloat16)
+    got = vdn_temporal_conv_act(x, w, H_, D_, True)
+    ref = vdn._activate(vdn._temporal_shift(x, w).reshape(-1, H_, D_), True)
+    assert (got.float() - ref.float()).abs().max().item() < 2e-2
+
+    tokens = torch.randn(F_ * S_, 3 * H_ * D_, generator=g).to(device, torch.bfloat16)
+    strided = tokens[:, : H_ * D_].view(F_ * S_, H_, D_)  # a q view of a fused qkv
+    got = vdn_silu_l2norm(strided, True)
+    ref = vdn._activate(strided, True)
+    assert got.is_contiguous() and (got.float() - ref.float()).abs().max().item() < 2e-2
+    got_v = vdn_silu_l2norm(strided, False)
+    assert torch.allclose(got_v.float(), torch.nn.functional.silu(strided.float()), atol=2e-2)
+
+    key = torch.randn(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
+    value = torch.randn(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
+    beta = torch.rand(F_ * S_, H_, generator=g).to(device, torch.bfloat16)
+    k16, k32, kb32, vb = vdn_frame_stats_prep(key, value, beta, F_, S_)
+    kf = key.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
+    vf = value.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
+    bf = beta.view(F_, S_, H_).permute(0, 2, 1)
+    assert torch.equal(k16, kf.contiguous())
+    assert torch.equal(k32, kf.float().contiguous())
+    assert torch.equal(kb32, (kf.float() * bf.unsqueeze(-1).float()).contiguous())
+    assert torch.equal(vb, (vf * bf.unsqueeze(-1).to(vf.dtype)).contiguous())
+
+    readout = torch.randn(F_, H_, S_, D_, generator=g).to(device, torch.bfloat16)
+    weight = (1 + 0.1 * torch.randn(D_, generator=g)).to(device, torch.bfloat16)
+    gate = torch.rand(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
+    got = vdn_linear_epilogue(readout, weight, gate, 1e-6)
+    ref = vdn.linear_epilogue(readout, weight, gate, 1e-6)
+    # one rounding vs one per op: within one bf16 ulp of the reference scale
+    assert (got.float() - ref.float()).abs().max().item() <= 2e-2 * max(
+        1.0, ref.float().abs().max().item()
+    )
+
+    # whole branch: fused vs eager
+    hidden, heads, head_dim = 64, 4, 32
+    num_frames, fh, fw = 7, 4, 6
+    tpf = fh * fw
+    hybrid = VDNHybridAttentionArchConfig(chunk=2, radius=1, anchor_frames="both", linear_head_dim=head_dim)
+    branch = _branch(hybrid, heads, hidden, head_dim, seed=0).to(device)
+    layout = VDNH3Layout(
+        seq_len=256, used=10 + num_frames * tpf, text_len=10, video_start=10,
+        num_frames=num_frames, tokens_per_frame=tpf, frame_height=fh, frame_width=fw,
+    )
+    V = num_frames * tpf
+    q, k, v = (torch.randn(V, heads, head_dim, generator=g).to(device, torch.bfloat16) for _ in range(3))
+    tk, tv = (torch.randn(10, heads, head_dim, generator=g).to(device, torch.bfloat16) for _ in range(2))
+    xx = torch.randn(V, hidden, generator=g).to(device, torch.bfloat16)
+    tx = torch.randn(10, hidden, generator=g).to(device, torch.bfloat16)
+    args = dict(
+        q_raw=q, k_raw=k, v_raw=v, beta=branch.beta(xx), gate=branch.gate(xx),
+        frame_mean=xx.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32), layout=layout,
+        text_k_raw=tk, text_v_raw=tv, text_beta=branch.beta(tx),
+    )
+    vdn.set_fused_kernels_enabled(True)
+    fused = branch(**args)
+    vdn.set_fused_kernels_enabled(False)
+    try:
+        eager = branch(**args)
+    finally:
+        vdn.set_fused_kernels_enabled(True)
+    diff = (fused.float() - eager.float()).abs().max().item()
+    assert diff < 3e-2 * max(eager.abs().max().item(), 1.0), diff
+
+
 # --------------------------------------------------------------------------
 # the overlay materializer's prefuse (fetched like the runtime fetches it)
 # --------------------------------------------------------------------------

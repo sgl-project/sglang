@@ -39,6 +39,12 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     VDNHybridAttentionArchConfig,
 )
+from sglang.kernels.ops.diffusion import (
+    vdn_frame_stats_prep,
+    vdn_linear_epilogue,
+    vdn_silu_l2norm,
+    vdn_temporal_conv_act,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_rank,
     get_tp_world_size,
@@ -372,31 +378,61 @@ def linear_features(
     """[N, H, d] raw projection -> [N, H, d] branch features:
     [short conv ->] SiLU [-> L2 norm for q, k]."""
     l2norm = proj != "v"
+    fused = tokens.is_cuda and _use_fused_kernels()
     if conv is not None and proj in conv.targets:
         if frame_size is None or num_frames is None:
             raise ValueError("the short conv needs the (frames, height, width) grid")
         heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
         x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size, heads=heads)
+        if fused:
+            # one kernel: 5 taps + SiLU + L2 norm, the conv output never hits HBM
+            return vdn_temporal_conv_act(x, w_tm, heads_n, head_dim, l2norm)
         out = _temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim)
         return _activate(out, l2norm)
+    if fused:
+        return vdn_silu_l2norm(tokens, l2norm)
     return _activate(tokens, l2norm)
 
 
+_FUSED_KERNELS_ENABLED = True
+
+
+def _use_fused_kernels() -> bool:
+    return _FUSED_KERNELS_ENABLED
+
+
+def set_fused_kernels_enabled(enabled: bool) -> None:
+    """Test/debug switch between the fused Triton stages and the eager chain."""
+    global _FUSED_KERNELS_ENABLED
+    _FUSED_KERNELS_ENABLED = bool(enabled)
+
+
 def frame_statistics(
-    kf: torch.Tensor, vf: torch.Tensor, beta: torch.Tensor, *, a_fp32: bool
+    kf: torch.Tensor,
+    vf: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    a_fp32: bool,
+    prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """kf, vf [F, H, S, d]; beta [F, H, S] -> A [F, H, dk, dk] fp32 (symmetric),
     B [F, H, dv, dk] fp32.
 
     A is the matrix the scan inverts; computed in fp32 (bf16 breaks the
     conditioning of I + A on real, strongly correlated frame tokens). B enters
-    the state linearly, so bf16 tensor cores are fine.
+    the state linearly, so bf16 tensor cores are fine. ``prepared`` carries
+    the four GEMM operands from ``vdn_frame_stats_prep`` (one fused pass).
     """
-    kf = kf.contiguous()
-    vf_b = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+    if prepared is not None:
+        kf, kf32, scaled32, vf_b = prepared
+    else:
+        kf = kf.contiguous()
+        vf_b = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+        kf32 = scaled32 = None
     if a_fp32:
-        kf32 = kf.float()
-        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
+        if kf32 is None:
+            kf32 = kf.float()
+            scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
         # TF32 (10 mantissa bits) keeps I + A well conditioned where bf16
         # does not, and runs the GEMM on tensor cores; scoped to this matmul.
         prev = torch.backends.cuda.matmul.allow_tf32
@@ -707,7 +743,17 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
         # 2. per-frame statistics
-        A, B = frame_statistics(key_by_frame, value_by_frame, beta_by_frame, a_fp32=self.hybrid.a_fp32)
+        fused = q_raw.is_cuda and _use_fused_kernels()
+        prepared = (
+            vdn_frame_stats_prep(key, value, beta, num_frames, per_frame)
+            if fused and self.hybrid.a_fp32
+            else None
+        )
+        A, B = frame_statistics(
+            key_by_frame, value_by_frame, beta_by_frame,
+            a_fp32=self.hybrid.a_fp32, prepared=prepared,
+        )
+        del prepared
         alpha = self.alpha(frame_mean, heads=heads)
         # 3. scans
         transitions, injections = delta_factor_apply(
@@ -723,6 +769,8 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         del prefix, suffix
         # 5. readout
         readout = torch.matmul(query_by_frame, linear_state.transpose(-1, -2))
+        if fused:
+            return vdn_linear_epilogue(readout, self.norm.weight, gate, self.norm.eps)
         return linear_epilogue(readout, self.norm.weight, gate, self.norm.eps)
 
 
