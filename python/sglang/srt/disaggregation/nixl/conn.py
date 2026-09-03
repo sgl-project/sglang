@@ -683,9 +683,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             parts.append(out)
         return np.concatenate(parts) if parts else np.empty((0, 3), dtype=np.uint64)
 
-    def _prep_xfer_dlist(
-        self, peer_name: str, stride_descs: np.ndarray, mem_kind: str
-    ):
+    def _prep_xfer_dlist(self, peer_name: str, stride_descs: np.ndarray, mem_kind: str):
         """Prepare a NIXL dlist handle from Nx5 runs.
 
         Tries the strided API first and falls back to expanding one descriptor
@@ -740,9 +738,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             # One run per region: n slots of xfer_len bytes, item_len apart.
             runs.append((base_ptr, xfer_len, device_id, item_len, n))
 
-        return self._prep_xfer_dlist(
-            peer_name, self._pack_stride_descs(runs), mem_kind
-        )
+        return self._prep_xfer_dlist(peer_name, self._pack_stride_descs(runs), mem_kind)
 
     def _init_equal_tp_prep_handle(
         self,
