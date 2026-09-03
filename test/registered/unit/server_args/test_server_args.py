@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
@@ -1355,6 +1356,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
         *,
         is_fp4_experts=False,
         nvfp4_moe_meta=None,
+        dtype=None,
     ):
         server_args = ServerArgs(
             model_path="dummy",
@@ -1369,6 +1371,7 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             hf_config=SimpleNamespace(architectures=[architecture]),
             is_fp4_experts=is_fp4_experts,
             nvfp4_moe_meta=nvfp4_moe_meta,
+            dtype=dtype,
         )
         return server_args
 
@@ -1411,6 +1414,10 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
     def test_megamoe_rejects_standard_fp8(self):
         with self.assertRaisesRegex(ValueError, "Standard FP8 MoE checkpoints"):
             handle_a2a_moe(self._make_args(quantization="fp8"))
+
+    @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=True)
+    def test_megamoe_accepts_unquantized_bf16(self, _):
+        handle_a2a_moe(self._make_args(quantization=None, dtype=torch.bfloat16))
 
     @patch("sglang.srt.arg_groups.moe_hook.is_sm100_supported", return_value=False)
     def test_megamoe_requires_sm100_for_all_quantization_formats(self, _):
