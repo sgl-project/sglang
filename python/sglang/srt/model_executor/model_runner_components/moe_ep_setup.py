@@ -92,8 +92,6 @@ def prebuild_deepep_v2_buffers(
     if not get_moe_a2a_backend().is_deepep_v2():
         return
 
-    # Chunk slice is the per-rank upper bound only for prefill; chunked_prefill_size
-    # is per-DP and then scattered across attn-TP ranks.
     min_tokens_per_rank = None
     if (
         disaggregation_mode == "prefill"
