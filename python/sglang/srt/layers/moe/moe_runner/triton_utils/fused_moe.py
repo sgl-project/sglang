@@ -699,9 +699,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert (
-                _is_cuda or _is_hip or _is_xpu
-            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            assert _is_cuda or _is_hip or _is_xpu, (
+                "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            )
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -709,9 +709,9 @@ def _fused_moe_kernel_sequence(
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
             else:
-                assert (
-                    _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                assert _is_cuda or _is_xpu, (
+                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
@@ -997,9 +997,9 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert (
-            hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), "Hidden size mismatch"
+        assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
+            "Hidden size mismatch"
+        )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"

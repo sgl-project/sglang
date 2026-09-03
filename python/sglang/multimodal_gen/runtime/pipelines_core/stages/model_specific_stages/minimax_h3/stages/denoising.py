@@ -5,7 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -39,7 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -731,6 +734,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
+                model=model,
+                packed=packed,
+                ctx=ctx,
+                server_args=server_args,
+                device=device,
+            )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
@@ -770,6 +780,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self._forward_dit,
                         batch=batch,
                         attn_metadata=attn_metadata,
+                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
                     ),
                     positive=positive,
                     initial_video_rows=initial_video,
@@ -823,6 +834,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         *,
         batch: Req,
         attn_metadata: CubeSparseAttentionMetadata | None = None,
+        build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -832,7 +844,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=attn_metadata,
+            attn_metadata=(
+                build_vsa_h3_step_metadata(step_index)
+                if build_vsa_h3_step_metadata is not None
+                else attn_metadata
+            ),
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
@@ -962,6 +978,73 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         raw_indices = ctx.keyframe.get("semantic_frame_indices")
         ctx.keyframe_frame_indices = [int(v) for v in raw_indices]
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
+
+
+def _maybe_prepare_vsa_h3_step_metadata(
+    *,
+    model: Any,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Per-step VSA-H3 metadata builder over the request-static packed layout,
+    or None off the VSA path."""
+    model._resolve_attention_backend_once()
+    if (
+        model._resolved_attention_backend
+        is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+    ):
+        return None
+    if ctx.is_ref2va:
+        raise NotImplementedError(
+            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
+            "reference-block layout is not tiled yet. Use --attention-backend "
+            "fa for ref2va."
+        )
+
+    config = server_args.attention_backend_config or {}
+    tile_size = int(config.get("vsa_tile_size", 64))
+    if tile_size != 64:
+        raise ValueError(
+            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
+            f"geometry; got vsa_tile_size={tile_size}."
+        )
+    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    if not 0.0 <= sparsity < 1.0:
+        raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
+    mode = str(config.get("vsa_mode", "exempt"))
+    if mode not in ("exempt", "compete"):
+        raise ValueError(f"vsa_mode must be 'exempt' or 'compete', got {mode!r}")
+    dense_first_n_steps = int(config.get("vsa_dense_first_n_steps", 0))
+    dense_layers = tuple(int(layer) for layer in config.get("vsa_dense_layers", ()))
+
+    text_len = int(packed["text_pos"].numel())
+    video_rows = int(packed["update_mask"].sum())
+    cond_rows = int(packed["img_pos"].numel()) - video_rows
+    audio_rows = int(packed["audio_pos"].numel())
+    patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+        VideoSparseAttentionH3MetadataBuilder,
+    )
+
+    builder = VideoSparseAttentionH3MetadataBuilder()
+
+    def build(step_index: int):
+        return builder.build(
+            current_timestep=step_index,
+            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            patch_size=patch_size,
+            VSA_sparsity=sparsity,
+            prefix_segments=(text_len, cond_rows, audio_rows),
+            device=device,
+            exempt=mode == "exempt",
+            dense_layers=dense_layers,
+            dense_first_n_steps=dense_first_n_steps,
+        )
+
+    return build
 
 
 def _build_packed_layout(
