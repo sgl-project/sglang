@@ -10,6 +10,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 )
 
 
+class _ConcreteComposedPipeline(ComposedPipelineBase):
+    def create_pipeline_stages(self, server_args):
+        return None
+
+
 class _RecordingExecutor:
     """Records the residency manager visible when an execute entry point runs.
 
@@ -64,7 +69,7 @@ class TestPipelineResidencyManagerInstall(unittest.TestCase):
     """
 
     def setUp(self):
-        self.pipeline = object.__new__(ComposedPipelineBase)
+        self.pipeline = object.__new__(_ConcreteComposedPipeline)
         self.pipeline.executor = _RecordingExecutor()
         self.pipeline._stage_name_mapping = {}
         self.pipeline.stages = []
