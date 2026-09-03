@@ -785,8 +785,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             )
             input_parallel = splitted_input[tp_rank].contiguous()
 
-        # Models that gate o_proj's input by patching its forward (Kimi K3) expose
-        # the gate here, since this path bypasses base_layer.forward.
+        # K3 gates o_proj's input in a forward patch this path bypasses; apply it here
         if hasattr(self.base_layer, "lora_input_transform"):
             input_parallel = self.base_layer.lora_input_transform(input_parallel)
 

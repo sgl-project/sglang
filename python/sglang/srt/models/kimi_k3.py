@@ -1712,8 +1712,7 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            # Alias the storage, not the Parameter: registering it here would shadow
-            # f_b_proj.weight in named_parameters() and weight updates would skip it.
+            # .data: a second Parameter registration hides f_b_proj.weight from named_parameters()
             self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
@@ -2019,8 +2018,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             def _gated_o_proj_forward(x, *args, **kwargs):
                 return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
 
-            # The LoRA wrapper calls quant_method.apply on the base layer and never
-            # sees this forward; it must gate (and join the gate stream) itself.
+            # RowParallelLinearWithLoRA bypasses forward and applies this transform itself
             o_proj.lora_input_transform = _apply_output_gate
             o_proj.forward = _gated_o_proj_forward
 
@@ -3131,7 +3129,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
-            # o_proj is wrapped by BaseLayerWithLoRA under LoRA; the dtype lives on the base layer.
+            # under LoRA o_proj is a BaseLayerWithLoRA; params_dtype lives on the base layer
             o_proj = layer.self_attn.o_proj
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
