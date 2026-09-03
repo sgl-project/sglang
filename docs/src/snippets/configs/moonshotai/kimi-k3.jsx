@@ -1013,8 +1013,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "low-latency" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       // No --enable-symm-mem: it makes the fused all-reduce auto-probe skip.
       flags: [
@@ -1031,8 +1030,7 @@ export const config = {
     {
       match: { hw: "b300", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
