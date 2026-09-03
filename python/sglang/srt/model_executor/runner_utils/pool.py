@@ -58,9 +58,11 @@ def set_graph_pool_borrow_runs(runs: list[tuple[int, int]]) -> None:
     borrowing.
     """
     global _borrow_static_runs
-    _borrow_static_runs = sorted(runs, key=lambda run: run[1], reverse=True)[
+    static_runs = sorted(runs, key=lambda run: run[1], reverse=True)[
         : BumpArenaStub.MAX_EXTENTS
     ]
+    _teardown_borrow_pool()
+    _borrow_static_runs = static_runs
     logger.info(
         "Graph pool borrow runs pinned: runs=%d free=%d",
         len(_borrow_static_runs),

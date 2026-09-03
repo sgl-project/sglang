@@ -5,7 +5,15 @@ import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from time import perf_counter
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -150,11 +158,16 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 def detach_host_resident_tables(
     model: torch.nn.Module,
 ) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
-    """Swap large vocab tables for placeholders so a `.to(device)` skips them."""
+    """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
         weight = module.weight
-        detached.append((module, weight.data))
+        # Most loaders leave the table on the host, but model-owned loading
+        # paths may already have placed it on the accelerator.  The input hook
+        # below always sends indices to the host, so retaining accelerator data
+        # here would restore a CUDA weight and create a CPU-index/CUDA-weight
+        # mismatch in the embedding gather.
+        detached.append((module, weight.data.to("cpu")))
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
     return detached
 
@@ -1130,11 +1143,16 @@ class LayerwiseOffloadManager:
             self._courier_inflight.discard(layer_idx)
             self.prefetch_layer(layer_idx, non_blocking=False)
             return
+        compute_stream = torch.get_device_module().current_stream()
+        compute_stream.wait_event(event)
         with torch.inference_mode(False), torch.no_grad():
             for name, gpu_tensor in tensors.items():
+                # wait_event orders the copy; record_stream keeps its storage
+                # live until the consuming kernels finish.
+                if gpu_tensor.device.type != "cpu":
+                    gpu_tensor.record_stream(compute_stream)
                 target = self.get_target_with_name(name)
                 target.data = self._wrap_for_target(target, gpu_tensor)
-        torch.get_device_module().current_stream().wait_event(event)
         self._courier_inflight.discard(layer_idx)
         self._gpu_layers.add(layer_idx)
 
@@ -1522,6 +1540,9 @@ class LayerwiseOffloadableModuleMixin:
         holds = sum(p.numel() * p.element_size() for _, p in resident)
         if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
+            # Restore any parameters still bound to placeholders first so we
+            # do not leave weights as (1,) tensors after clearing the copies.
+            self.restore_non_layer_weights()
             self._parked_non_layer_weights.clear()
             return
 
@@ -2192,3 +2213,99 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
+
+
+class LayerwiseUsageTracker:
+    """Temporary per-layer call counters for one calibration request.
+
+    Managers cannot provide this information when layerwise offload has not
+    been configured yet or was disabled by a resident placement. Observe the
+    declared layer groups directly and remove every hook before returning, so
+    ordinary serving requests pay no counter or hook-dispatch cost.
+    """
+
+    def __init__(
+        self,
+        modules: Mapping[str, object],
+        *,
+        stage_name_provider: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._handles: list[Any] = []
+        self._counts: dict[str, dict[str, list[int]]] = {}
+        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
+        self._stage_name_provider = stage_name_provider
+        for component_name, module in modules.items():
+            if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                continue
+            named_modules = dict(module.named_modules())
+            component_counts: dict[str, list[int]] = {}
+            for layer_name in module.layer_names:
+                layers = named_modules.get(layer_name)
+                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    continue
+                counts = [0] * len(layers)
+                if not counts:
+                    continue
+                component_counts[layer_name] = counts
+                for layer_index, layer in enumerate(layers):
+
+                    def record_use(
+                        _module,
+                        _inputs,
+                        *,
+                        target_counts=counts,
+                        target_index=layer_index,
+                        target_component_name=component_name,
+                        target_layer_name=layer_name,
+                        target_layer_count=len(layers),
+                    ) -> None:
+                        target_counts[target_index] += 1
+                        if self._stage_name_provider is None:
+                            return
+                        stage_name = self._stage_name_provider()
+                        if stage_name is None:
+                            return
+                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
+                        component_stage_counts = stage_counts.setdefault(
+                            target_component_name, {}
+                        )
+                        layer_stage_counts = component_stage_counts.setdefault(
+                            target_layer_name, [0] * target_layer_count
+                        )
+                        layer_stage_counts[target_index] += 1
+
+                    self._handles.append(layer.register_forward_pre_hook(record_use))
+            if component_counts:
+                self._counts[component_name] = component_counts
+
+    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
+        counts, _ = self.finish_with_stages()
+        return counts
+
+    def finish_with_stages(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, tuple[int, ...]]],
+        dict[str, dict[str, dict[str, tuple[int, ...]]]],
+    ]:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        counts = {
+            component_name: {
+                layer_name: tuple(counts)
+                for layer_name, counts in component_counts.items()
+            }
+            for component_name, component_counts in self._counts.items()
+        }
+        counts_by_stage = {
+            stage_name: {
+                component_name: {
+                    layer_name: tuple(counts)
+                    for layer_name, counts in component_counts.items()
+                }
+                for component_name, component_counts in stage_counts.items()
+            }
+            for stage_name, stage_counts in self._counts_by_stage.items()
+        }
+        return counts, counts_by_stage

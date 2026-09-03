@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
@@ -222,7 +222,7 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         num_tokens = 3
         padded_num_tokens = 5
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=num_tokens,
+            global_num_token_non_padded_cpu=num_tokens,
             out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
             positions=torch.arange(padded_num_tokens, device=self.device),
         )
