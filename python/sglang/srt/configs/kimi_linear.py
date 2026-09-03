@@ -175,6 +175,7 @@ class KimiLinearConfig(PretrainedConfig):
             num_heads=self.linear_attn_config["num_heads"],
             head_dim=self.linear_attn_config["head_dim"],
             conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"],
+            gate_lower_bound=self.linear_attn_config.get("gate_lower_bound"),
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)

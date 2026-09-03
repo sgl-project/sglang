@@ -37,9 +37,14 @@ RL = 8
 LAYERS = [0, 1]
 
 
-def _kda_params():
+def _kda_params(gate_lower_bound=None):
     shape = KimiLinearStateShape.create(
-        tp_world_size=1, num_heads=4, head_dim=8, num_k_heads=4, head_k_dim=8
+        tp_world_size=1,
+        num_heads=4,
+        head_dim=8,
+        num_k_heads=4,
+        head_k_dim=8,
+        gate_lower_bound=gate_lower_bound,
     )
     return KimiLinearCacheParams(shape=shape, dtype=DTYPE, layers=LAYERS)
 
@@ -94,6 +99,27 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             _pp_local_per_request_bytes(4096, [0, 1, 3, 4], 5, 8),
             0,
         )
+
+    def test_ordinary_decode_ring(self):
+        # d 1024 + k 1024 in fp32, plus per-K g 1024 = 3072 bytes/layer,
+        # plus one int32 write cursor per slot.
+        self.assertEqual(
+            _kda_params().replayssm_decode_ring_bytes_per_req(record_len=RL),
+            3072 * len(LAYERS) + 4,
+        )
+        # Safe-gate pre-decay keeps d/k in BF16: 512 + 512 + 1024 = 2048,
+        # plus int32 write_pos and cache_base.
+        self.assertEqual(
+            _kda_params(-5.0).replayssm_decode_ring_bytes_per_req(
+                record_len=RL, predecay_kda=True
+            ),
+            2048 * len(LAYERS) + 8,
+        )
+
+    def test_predecay_capability(self):
+        self.assertTrue(_kda_params(-5.0).supports_kda_replayssm_predecay(16))
+        self.assertFalse(_kda_params().supports_kda_replayssm_predecay(16))
+        self.assertFalse(_kda_params(-5.0).supports_kda_replayssm_predecay(32))
 
 
 if __name__ == "__main__":

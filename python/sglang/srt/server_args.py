@@ -2689,16 +2689,20 @@ class ServerArgs:
         bool,
         "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
         "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
-        "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
-        "but its per-K gate ring is larger and ReplaySSM is typically slower "
-        "than packed KDA decode; benchmark before enabling it. Requires the "
+        "at batch >= 64). Bounded safe-gate KDA with matching Q/V head counts "
+        "uses an optimized pre-decayed ring on CUDA Triton when Radix Cache is "
+        "disabled; other KDA configurations retain the existing implementation "
+        "or native packed decode. Benchmark the target model before enabling it. "
+        "Requires the "
         "Triton linear-attn decode backend, or Helion for KDA, and "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
     linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps.",
+        "Ring-buffer capacity L for ReplaySSM linear-attn decode. The recurrent "
+        "state is materialized periodically; the bounded KDA circular path keeps "
+        "the current token as the first entry of the next window.",
         NS("exec.mamba"),
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via

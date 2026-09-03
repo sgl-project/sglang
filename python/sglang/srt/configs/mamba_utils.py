@@ -13,6 +13,7 @@
 """Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
 
 import logging
+import math
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -150,6 +151,30 @@ class BaseLinearStateParams(ABC):
             )
         return per_layer * len(self.layers)
 
+    def replayssm_decode_ring_bytes_per_req(
+        self, record_len: int, *, predecay_kda: bool = False
+    ) -> int:
+        """Per-slot bytes of the ordinary-decode ReplaySSM ring."""
+        hv, v_dim, k_dim = self.shape.temporal
+        h_k = self.shape.num_k_heads_per_tp
+        ring_dtype = (
+            self.dtype.conv
+            if predecay_kda and self.dtype.conv != torch.float16
+            else self.dtype.temporal
+        )
+        ring_b = ring_dtype.itemsize
+        fp32_b = torch.float32.itemsize
+        per_layer = (
+            hv * record_len * v_dim * ring_b
+            + h_k * record_len * k_dim * ring_b
+            + hv * record_len * (k_dim if self.is_kda else 1) * fp32_b
+        )
+        cursor_bytes = torch.int32.itemsize * (2 if predecay_kda else 1)
+        return per_layer * len(self.layers) + cursor_bytes
+
+    def supports_kda_replayssm_predecay(self, record_len: int) -> bool:
+        return False
+
     @property
     def is_kda(self) -> bool:
         """KDA per-K-channel gate vs GDN/Mamba2 per-head scalar gate. Selects
@@ -260,6 +285,7 @@ class KimiLinearStateShape:
     head_k_dim: int
     conv_kernel: int
     num_spec: int
+    gate_lower_bound: Optional[float] = None
     # Full q/k/v dimensions. Each block is TP-sharded independently.
     conv_shard_groups: Optional[List[int]] = None
     # Number of key heads after TP sharding (== runtime ``H`` the KDA packed
@@ -277,6 +303,7 @@ class KimiLinearStateShape:
         head_k_dim: Optional[int] = None,
         conv_kernel_size: int = 4,
         num_spec: int = 0,
+        gate_lower_bound: Optional[float] = None,
     ) -> "KimiLinearStateShape":
         if num_k_heads is None:
             num_k_heads = num_heads
@@ -309,6 +336,7 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
+            gate_lower_bound=gate_lower_bound,
             conv_shard_groups=[proj_size, proj_k_size, proj_k_size],
             num_k_heads_per_tp=num_k_heads_per_tp,
         )
@@ -321,3 +349,16 @@ class KimiLinearCacheParams(BaseLinearStateParams):
     @property
     def is_kda(self) -> bool:
         return True
+
+    def supports_kda_replayssm_predecay(self, record_len: int) -> bool:
+        lower_bound = self.shape.gate_lower_bound
+        local_value_heads = self.shape.temporal[0]
+        return (
+            self.shape.num_k_heads_per_tp == local_value_heads
+            and 2 <= record_len <= 16
+            and lower_bound is not None
+            and math.isfinite(lower_bound)
+            and lower_bound < 0
+            and (record_len - 1) * abs(lower_bound) <= 80
+            and self.dtype.temporal == torch.float32
+        )

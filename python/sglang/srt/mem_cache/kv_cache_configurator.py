@@ -108,6 +108,35 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 _is_hip = is_hip()
 
 
+def _resolve_linear_replayssm_decode(cache_params, model_config):
+    requested = get_exec().mamba.enable_linear_replayssm
+    supported_model = (
+        hybrid_gdn_config(model_config) is not None
+        or kimi_linear_config(model_config) is not None
+    )
+    replay_len = get_exec().mamba.linear_replayssm_cache_len
+    decode_backend = (
+        get_exec().mamba.linear_attn_decode_backend
+        or get_exec().mamba.linear_attn_backend
+    )
+    predecay_kda = bool(
+        requested
+        and supported_model
+        and current_platform.is_cuda()
+        and get_memory().disable_radix_cache
+        and decode_backend == "triton"
+        and cache_params.supports_kda_replayssm_predecay(replay_len)
+    )
+    bounded_kda = bool(
+        cache_params.is_kda
+        and getattr(cache_params.shape, "gate_lower_bound", None) is not None
+    )
+    ring_active = bool(
+        requested and supported_model and (not bounded_kda or predecay_kda)
+    )
+    return ring_active, predecay_kda, bounded_kda, supported_model
+
+
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -1071,6 +1100,33 @@ class KVCacheConfigurator:
                 "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
                 "(kimi_linear) model; got a non-KDA model."
             )
+        cache_params = self.mambaish_config.mamba2_cache_params
+        (
+            enable_linear_replayssm_decode_ring,
+            enable_kda_replayssm_predecay,
+            bounded_kda,
+            supported_model,
+        ) = _resolve_linear_replayssm_decode(
+            cache_params,
+            self.model_config,
+        )
+        if (
+            get_exec().mamba.enable_linear_replayssm
+            and not enable_linear_replayssm_decode_ring
+        ):
+            if not supported_model:
+                reason = "the model backend does not consume the ReplaySSM ring"
+            elif bounded_kda and not get_memory().disable_radix_cache:
+                reason = (
+                    "bounded KDA pre-decay currently requires --disable-radix-cache"
+                )
+            elif bounded_kda and not current_platform.is_cuda():
+                reason = "bounded KDA pre-decay currently requires NVIDIA CUDA"
+            else:
+                reason = "the bounded KDA shape, dtype, or backend is unsupported"
+            logger.warning(
+                "ReplaySSM is inactive because %s; keeping native decode.", reason
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1078,7 +1134,7 @@ class KVCacheConfigurator:
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            cache_params=self.mambaish_config.mamba2_cache_params,
+            cache_params=cache_params,
             mamba_layer_ids=(
                 [
                     i
@@ -1099,7 +1155,8 @@ class KVCacheConfigurator:
             speculative_eagle_topk=get_spec().speculative_eagle_topk,
             enable_overlap_schedule=not get_schedule().disable_overlap_schedule,
             start_layer=self.layer_info.start_layer,
-            enable_linear_replayssm=get_exec().mamba.enable_linear_replayssm,
+            enable_linear_replayssm=enable_linear_replayssm_decode_ring,
+            enable_kda_replayssm_predecay=enable_kda_replayssm_predecay,
             linear_replayssm_cache_len=get_exec().mamba.linear_replayssm_cache_len,
             mamba_envelope_layout=get_memory().enable_page_major_kv_layout,
             # ReplaySSM spec-verify is for linear-attn models (GDN fold or KDA
@@ -2258,11 +2315,27 @@ class KVCacheConfigurator:
         # freed ~9GB turns into higher max_running.
         # The ring is allocated per slot but is not part of mamba_cache_per_req;
         # the solve must charge it too or num_slots is over-provisioned.
-        replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
+        cache_params = config.mamba2_cache_params
+        replay_len = get_exec().mamba.linear_replayssm_cache_len
+        replayssm_decode_active, predecay_kda, _, _ = _resolve_linear_replayssm_decode(
+            cache_params,
+            self.model_config,
+        )
+        replayssm_spec_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None
             or kimi_linear_config(self.model_config) is not None
         )
-        if replayssm_active:
+        # Only spec ReplaySSM replaces speculative intermediate-state buffers.
+        # Ordinary decode ReplaySSM owns a ring but does not alter MTP rollback
+        # allocation, so keep this predicate spec-only below.
+        replayssm_active = replayssm_spec_active
+        if replayssm_decode_active:
+            record_len = replay_len
+            replayssm_ring_per_req = cache_params.replayssm_decode_ring_bytes_per_req(
+                record_len=record_len,
+                predecay_kda=predecay_kda,
+            )
+        elif replayssm_spec_active:
             # GDN sizes the fold window to the draft maximum; the KDA ring
             # stays --linear-replayssm-cache-len long (mirrors MambaPool).
             max_draft_tokens = max_speculative_num_draft_tokens()

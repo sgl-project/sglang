@@ -548,6 +548,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_write_pos = getattr(
             self.forward_metadata, "replayssm_write_pos", None
         )
+        replayssm_cache_base = getattr(
+            self.forward_metadata, "replayssm_cache_base", None
+        )
         replayssm_force_flush = getattr(
             self.forward_metadata, "replayssm_force_flush", None
         )
@@ -744,6 +747,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
+                replayssm_cache_base=replayssm_cache_base,
                 replayssm_force_flush=replayssm_force_flush,
             )
             self._track_mamba_state_decode(
