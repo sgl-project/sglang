@@ -1,4 +1,4 @@
-"""``RustServer._partition_cores`` (managers/rust_server.py): the pool cores must
+"""``rust_server.config._partition_cores``: the pool cores must
 be a *bounded* slice of this rank's allowed cores, not the whole remainder —
 sibling TP ranks share the NUMA node, so an unbounded mask lets MM preprocessing
 bursts preempt a sibling's CUDA-launch thread (measured: ~20 ms of ViT wall time
@@ -12,14 +12,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.rust_server import RustServer  # noqa: E402
+from sglang.srt.rust_server.config import _partition_cores  # noqa: E402
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def partition(node_cores, **kwargs):
     with patch("os.sched_getaffinity", return_value=set(node_cores), create=True):
-        return RustServer._partition_cores(**kwargs)
+        return _partition_cores(**kwargs)
 
 
 class TestPartitionCores(CustomTestCase):

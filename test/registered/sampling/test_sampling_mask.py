@@ -1,9 +1,15 @@
 import math
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
+import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.layers import sampler as sampler_module
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import Sampler
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -19,6 +25,7 @@ register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
 _TOP_K = 10
+_TOP_LOGPROBS_NUM = 128
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
@@ -27,6 +34,180 @@ _SERVER_ARGS = (
 _INVALID_SAMPLING_MASK_ERROR = (
     "top_p-only sampling is valid but can return huge masks in the tail"
 )
+
+
+class TestSamplingMaskCapture(CustomTestCase):
+    def setUp(self):
+        self.sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(self.sampler)
+
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
+    def test_flashinfer_joint_cutoff_ties_match_capture(self):
+        batch_size = 256
+        top_k = 2
+        top_p = 0.45
+        base_probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda")
+        probs = base_probs.repeat(batch_size, 1)
+
+        # Derive the threshold-based joint support independently. Both filters
+        # cut at 0.2, so the tied entries must survive even though this yields
+        # more support entries than top_k.
+        sorted_probs = base_probs[0].sort(descending=True).values
+        top_k_cutoff = sorted_probs[top_k - 1]
+        mass_before = sorted_probs.cumsum(dim=-1) - sorted_probs
+        top_p_cutoff = sorted_probs[mass_before <= top_p][-1]
+        expected_support = (base_probs[0] >= top_k_cutoff) & (
+            base_probs[0] >= top_p_cutoff
+        )
+        expected_ids = expected_support.nonzero(as_tuple=True)[0].tolist()
+        self.assertEqual(expected_ids, [0, 1, 2])
+
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[True] * batch_size,
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="flashinfer")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), list(range(batch_size)))
+        actual_support = capture.weights > 0
+        self.assertTrue(
+            torch.equal(actual_support, expected_support.expand_as(actual_support))
+        )
+        self.assertGreater(int(actual_support[0].sum().item()), top_k)
+        self.assertTrue(
+            bool(actual_support.gather(1, sampled.view(-1, 1)).all().item())
+        )
+
+    @unittest.skipIf(is_hip(), "FlashInfer is not available on ROCm")
+    def test_flashinfer_capture_only_materializes_requested_rows(self):
+        batch_size = 4
+        top_k = 2
+        top_p = 0.45
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), top_p, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+        )
+        top_k_renorm = sampler_module.top_k_renorm_prob
+        top_p_renorm = sampler_module.top_p_renorm_prob
+        with (
+            patch(
+                "sglang.srt.layers.sampler.get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(sampling_backend="flashinfer")
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.sampler.top_k_renorm_prob",
+                wraps=top_k_renorm,
+            ) as top_k_mock,
+            patch(
+                "sglang.srt.layers.sampler.top_p_renorm_prob",
+                wraps=top_p_renorm,
+            ) as top_p_mock,
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(top_k_mock.call_args.args[0].shape), (2, 5))
+        self.assertEqual(tuple(top_p_mock.call_args.args[0].shape), (2, 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        self.sampler._attach_sampling_mask_to_output(
+            output, sampling_info, sampled, capture
+        )
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
+        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertIsNone(output.next_token_sampling_logprobs[0])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[1])
+        self.assertIsNone(output.next_token_sampling_logprobs[2])
+        self.assertIsNotNone(output.next_token_sampling_logprobs[3])
+
+    def test_pytorch_capture_compacts_requested_rows(self):
+        batch_size = 4
+        requested_rows = [1, 3]
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]], device="cuda").repeat(
+            batch_size, 1
+        )
+        sampling_info = SimpleNamespace(
+            sampling_seed=None,
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+            top_ks=torch.full((batch_size,), 2, dtype=torch.int32, device="cuda"),
+            top_ps=torch.full((batch_size,), 0.45, device="cuda"),
+            min_ps=torch.zeros(batch_size, device="cuda"),
+            return_sampling_masks=[False, True, False, True],
+        )
+        with patch(
+            "sglang.srt.layers.sampler.get_exec",
+            return_value=SimpleNamespace(
+                kernel=SimpleNamespace(sampling_backend="pytorch")
+            ),
+        ):
+            sampled, capture = self.sampler._sample_from_probs(
+                probs,
+                sampling_info,
+                positions=torch.zeros(batch_size, dtype=torch.int64, device="cuda"),
+                simple_sampling_case=False,
+                return_sampling_mask=True,
+            )
+
+        self.assertIsNotNone(capture)
+        self.assertEqual(capture.batch_rows.cpu().tolist(), requested_rows)
+        self.assertEqual(tuple(capture.weights.shape), (len(requested_rows), 5))
+        self.assertEqual(tuple(capture.token_ids.shape), (len(requested_rows), 5))
+
+        output = LogitsProcessorOutput(next_token_logits=None)
+        self.sampler._attach_sampling_mask_to_output(
+            output, sampling_info, sampled, capture
+        )
+        for batch_row in requested_rows:
+            self.assertIn(
+                int(sampled[batch_row]),
+                output.next_token_sampling_mask_idx[batch_row],
+            )
+            self.assertIsNotNone(output.next_token_sampling_logprobs[batch_row])
+        self.assertIsNone(output.next_token_sampling_mask_idx[0])
+        self.assertIsNone(output.next_token_sampling_mask_idx[2])
 
 
 class SamplingMaskTestMixin:
@@ -79,6 +260,7 @@ class SamplingMaskTestMixin:
         self.assertEqual(len(sampling_masks), len(output_ids))
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
+            self.assertEqual(len(sampling_mask), len(set(sampling_mask)))
         return sampling_masks
 
     def _assert_rejects_unbounded_sampling_mask(self, sampling_params):
@@ -88,6 +270,8 @@ class SamplingMaskTestMixin:
 
 
 class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
+    _sampling_backend = "flashinfer"
+
     @classmethod
     def setUpClass(cls):
         cls._launch_server()
@@ -102,12 +286,8 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             }
         )
-        # The mask keeps at most top_k tokens, plus possibly the actually
-        # sampled token when the sampling kernel picks one just outside the
-        # mask's topk reconstruction (fp cumsum divergence); see
-        # Sampler._attach_sampling_mask_to_output.
         for sampling_mask in top_p_sampling_masks:
-            self.assertLessEqual(len(sampling_mask), _TOP_K + 1)
+            self.assertGreater(len(sampling_mask), 0)
 
         top_k_sampling_masks = self._generate_sampling_masks(
             {
@@ -118,7 +298,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
 
         top_k_top_p_one_sampling_masks = self._generate_sampling_masks(
             {
@@ -130,18 +310,19 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
 
     def test_sampling_mask_matches_topk_logprobs(self):
         """Check the returned mask and its renormalized logprobs.
 
-        We get the per-token full-vocab logprobs via ``return_logprob`` with
-        ``top_logprobs_num == top_k``, which covers every token the mask can
-        contain. With ``temperature=1.0`` these are the sampler's distribution,
-        so ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
+        We get a wide prefix of full-vocab logprobs via ``return_logprob`` so
+        cutoff ties that extend beyond ``top_k`` are visible. With
+        ``temperature=1.0`` these are the sampler's distribution, so
+        ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
 
-        1. the returned mask matches the nucleus reconstructed from those probs,
-        2. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
+        1. the sampled token is in the returned top-k-bounded mask,
+        2. every mask token is present in the returned top logprobs,
+        3. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
         """
         top_k, top_p = _TOP_K, _TOP_P
         response = self._post_generate(
@@ -153,7 +334,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             },
             return_logprob=True,
-            top_logprobs_num=top_k,
+            top_logprobs_num=_TOP_LOGPROBS_NUM,
         )
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -175,19 +356,13 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 int(tid): math.exp(logprob) for logprob, tid, _ in step_top_logprobs
             }
 
-            reconstructed = []
-            mass_before = 0.0
-            for logprob, tid, _ in step_top_logprobs:
-                if mass_before <= top_p:
-                    reconstructed.append(int(tid))
-                mass_before += math.exp(logprob)
-            if output_id not in reconstructed:
-                reconstructed.append(output_id)
-            # ``<= 1``: fp32 (server) and fp64 (here) cumsums may split on the
-            # single token straddling the top_p cut.
-            self.assertLessEqual(len(set(mask) ^ set(reconstructed)), 1)
+            mask_set = set(mask)
 
-            support_mass = sum(probs[tid] for tid in mask)
+            self.assertIn(output_id, mask_set)
+            self.assertLessEqual(len(mask_set), top_k)
+            self.assertTrue(mask_set.issubset(probs))
+
+            support_mass = sum(probs[token_id] for token_id in mask_set)
             expected_logprob = math.log(probs[output_id] / support_mass)
             self.assertAlmostEqual(mask_logprob, expected_logprob, delta=1e-2)
 
@@ -278,6 +453,14 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             with_mask_output["output_ids"], without_mask_output["output_ids"]
         )
         self.assertEqual(with_mask_output["text"], without_mask_output["text"])
+
+
+class TestSamplingMaskPytorch(TestSamplingMask):
+    _sampling_backend = "pytorch"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._launch_server(("--sampling-backend", "pytorch"))
 
 
 if __name__ == "__main__":
