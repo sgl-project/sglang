@@ -148,5 +148,6 @@ class TestXPUEncoderDecoderVarlen(CustomTestCase):
             causal=True,
         )
 
+
 if __name__ == "__main__":
     unittest.main()
