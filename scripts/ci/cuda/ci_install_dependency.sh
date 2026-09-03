@@ -138,6 +138,8 @@ cleanup_stale_shm() {
 
 is_apt_package_installed() {
     local name
+    # Ubuntu 24.04 renamed time64 libraries (librdmacm1 -> librdmacm1t64);
+    # apt-get follows the Provides alias, dpkg -l does not.
     for name in "$1" "${1}t64"; do
         if dpkg -l "$name" 2>/dev/null | grep -q "^ii"; then
             return 0
@@ -159,11 +161,6 @@ install_apt_packages() {
     # trips to install nothing. Skipping it costs no currency either: apt-get
     # install only ever considers the packages named above, and a passing run
     # leaves 100+ others un-upgraded - the image is what pins these versions.
-    #
-    # Ubuntu 24.04's time64 transition renamed some libraries with a t64
-    # suffix (librdmacm1 -> librdmacm1t64). apt-get resolves the old name
-    # through Provides, but dpkg -l does not, so also accept the t64 name or
-    # the skip never fires on 24.04 images.
     local pkg
     local -a MISSING_APT_PACKAGES=()
     for pkg in "${CI_APT_PACKAGES[@]}"; do
