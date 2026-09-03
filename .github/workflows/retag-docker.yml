@@ -6,6 +6,10 @@ on:
       source_tag:
         description: "Existing image tag (e.g., v0.4.7-cu129-amd64)"
         required: true
+      source_repo:
+        description: "Docker Hub repo holding source_tag (e.g. lmsysorg/sglang-staging to promote a staged image). Target is always lmsysorg/sglang."
+        required: false
+        default: "lmsysorg/sglang"
       target_tag:
         description: "New tag to apply (e.g., latest)"
         required: true
@@ -24,7 +28,9 @@ jobs:
 
       - name: Retag image
         run: |
-          echo "Retagging lmsysorg/sglang:${{ inputs.source_tag }} -> lmsysorg/sglang:${{ inputs.target_tag }}"
+          SRC_REPO="${{ inputs.source_repo }}"; SRC_REPO="${SRC_REPO:-lmsysorg/sglang}"
+          echo "Retagging ${SRC_REPO}:${{ inputs.source_tag }} -> lmsysorg/sglang:${{ inputs.target_tag }}"
           docker buildx imagetools create \
             -t lmsysorg/sglang:${{ inputs.target_tag }} \
-            lmsysorg/sglang:${{ inputs.source_tag }}
+            "${SRC_REPO}:${{ inputs.source_tag }}"
+          docker buildx imagetools inspect lmsysorg/sglang:${{ inputs.target_tag }}
