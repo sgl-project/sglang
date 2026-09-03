@@ -467,11 +467,13 @@ def test_kimi_k3_encoder_dp_defers_feature_materialization(monkeypatch):
     # The IPC consumer count asks for the *configured* TP size (matching
     # MmItemMemoryPool.try_to_recycle), so publish it; the live topology the
     # sharding helper reads is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=sharded_embeddings,
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=sharded_embeddings,
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
     ):
         output = model.get_image_feature(items)
         # Exercise the loader while the runtime topology is forced.
@@ -558,14 +560,17 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
-    with mock_patch(
-        "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
-        return_value=torch.zeros(1, 2),
-    ) as run_dp, get_context().override_server_args(tp_size=1), get_parallel().override(
-        tp_size=1, attn_tp_size=1
-    ), mock_patch(
-        "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-        side_effect=fake_preprocess,
+    with (
+        mock_patch(
+            "sglang.srt.multimodal.mm_utils.run_dp_sharded_mrope_vision_model",
+            return_value=torch.zeros(1, 2),
+        ) as run_dp,
+        get_context().override_server_args(tp_size=1),
+        get_parallel().override(tp_size=1, attn_tp_size=1),
+        mock_patch(
+            "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+            side_effect=fake_preprocess,
+        ),
     ):
         model.get_image_feature(items)
         loader = run_dp.call_args.kwargs["load_local_pixel_values"]
