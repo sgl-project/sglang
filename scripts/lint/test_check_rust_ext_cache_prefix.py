@@ -132,7 +132,7 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             )
             return check(root)
 
-    def assert_one(self, problems: list[str], fragment: str) -> None:
+    def assert_one(self, *, problems: list[str], fragment: str) -> None:
         self.assertEqual(len(problems), 1, problems)
         self.assertIn(fragment, problems[0])
 
@@ -149,7 +149,8 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
         )
         problems = self.check_tree(jobs=X86 + ARM + crossed)
         self.assert_one(
-            problems, "runs on aarch64 (4-gpu-gb300) but takes its artifact"
+            problems=problems,
+            fragment="runs on aarch64 (4-gpu-gb300) but takes its artifact",
         )
 
     def test_rejects_a_stage_on_an_architecture_with_no_producer(self):
@@ -180,15 +181,16 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             "      runner_config: ${{ matrix.runner_config }}\n"
         )
         self.assert_one(
-            self.check_tree(jobs=X86 + matrixed),
-            "stages run on ['aarch64'] with no producer",
+            problems=self.check_tree(jobs=X86 + matrixed),
+            fragment="stages run on ['aarch64'] with no producer",
         )
 
     def test_rejects_a_runner_config_it_cannot_resolve(self):
         """A caller whose pool is unknown gets reported, never skipped."""
         opaque = stage("test-opaque", runner_config="${{ inputs.runner_config }}")
         self.assert_one(
-            self.check_tree(jobs=X86 + opaque), "cannot resolve runner_config"
+            problems=self.check_tree(jobs=X86 + opaque),
+            fragment="cannot resolve runner_config",
         )
 
     def test_rejects_an_aarch64_prefix_compiled_on_an_x86_runner(self):
@@ -198,7 +200,9 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             collect_runs_on="ubuntu-22.04-arm",
             cache_key_prefix="rust-ext-aarch64-cp310-cp312",
         )
-        self.assert_one(self.check_tree(jobs=wrong), "runs_on is 'ubuntu-22.04'")
+        self.assert_one(
+            problems=self.check_tree(jobs=wrong), fragment="runs_on is 'ubuntu-22.04'"
+        )
 
     def test_rejects_an_aarch64_producer_left_on_the_collect_default(self):
         """collect_runs_on decides which objdump reads the module's GLIBC symbols."""
@@ -208,7 +212,8 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             cache_key_prefix="rust-ext-aarch64-cp310-cp312",
         )
         self.assert_one(
-            self.check_tree(jobs=wrong), "collect_runs_on is 'ubuntu-latest'"
+            problems=self.check_tree(jobs=wrong),
+            fragment="collect_runs_on is 'ubuntu-latest'",
         )
 
     def test_rejects_a_runner_label_with_no_architecture_on_record(self):
@@ -219,7 +224,10 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             collect_runs_on="ubuntu-22.04-arm",
             cache_key_prefix="rust-ext-aarch64-cp310-cp312",
         )
-        self.assert_one(self.check_tree(jobs=unknown), "has no architecture on record")
+        self.assert_one(
+            problems=self.check_tree(jobs=unknown),
+            fragment="has no architecture on record",
+        )
 
     def test_rejects_a_prefix_no_consumer_can_derive(self):
         wrong = producer(
@@ -227,27 +235,35 @@ class TestCheckRustExtCachePrefix(unittest.TestCase):
             runs_on="ubuntu-22.04",
             cache_key_prefix="rust-ext-mips64-cp310-cp312",
         )
-        self.assert_one(self.check_tree(jobs=wrong), "no consumer can derive")
+        self.assert_one(
+            problems=self.check_tree(jobs=wrong), fragment="no consumer can derive"
+        )
 
     def test_rejects_a_prefix_naming_interpreters_the_matrix_does_not_build(self):
         problems = self.check_tree(jobs=X86, versions="['3.10', '3.13']")
-        self.assert_one(problems, "the compile matrix builds cp310-cp313")
+        self.assert_one(
+            problems=problems, fragment="the compile matrix builds cp310-cp313"
+        )
 
     def test_rejects_a_restore_key_that_drops_the_derived_prefix(self):
         """The derived literal can sit in the file while nothing interpolates it."""
         problems = self.check_tree(jobs=X86, key="rust-ext-x86_64-cp310-cp312")
-        self.assert_one(problems, "does not interpolate that step's output")
+        self.assert_one(
+            problems=problems, fragment="does not interpolate that step's output"
+        )
 
     def test_rejects_a_file_hashed_by_only_one_side(self):
         problems = self.check_tree(jobs=X86, action_hashed=f"{HASHED}, 'python/new.py'")
-        self.assert_one(problems, "cache key inputs do not match")
+        self.assert_one(problems=problems, fragment="cache key inputs do not match")
 
     def test_reports_a_dead_check_when_no_producer_calls_the_build_workflow(self):
-        self.assert_one(self.check_tree(jobs=X86_STAGE), "this check is dead")
+        self.assert_one(
+            problems=self.check_tree(jobs=X86_STAGE), fragment="this check is dead"
+        )
 
     def test_reports_an_unparseable_workflow_instead_of_raising(self):
         problems = self.check_tree(jobs=X86, extra_workflow="jobs:\n  x: [unclosed\n")
-        self.assert_one(problems, "cannot read")
+        self.assert_one(problems=problems, fragment="cannot read")
 
 
 if __name__ == "__main__":
