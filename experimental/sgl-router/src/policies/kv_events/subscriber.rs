@@ -218,18 +218,18 @@ impl KvEventSubscriberRegistry {
     /// with a `warn!` log and the remaining ranks proceed.
     pub async fn add_worker(&self, worker_url: &str, cfg: &EventConfig) {
         // (port_base, topic) depend on this registry's kind. KV uses the cache
-        // socket + configured topic; Load uses the dedicated load socket (own
-        // port range) and subscribe-all (that socket carries only load). A Load
-        // registry whose worker advertises no load port (older engine) opens no
-        // sockets at all.
+        // socket + configured topic; Load uses its own advertised socket +
+        // topic. Refuse an incomplete load descriptor rather than subscribe-all:
+        // the load wire is a distinct contract and a future mixed-use socket
+        // must not feed unrelated payloads into the load decoder.
         let (port_base, topic) = match self.kind {
             SubKind::Kv => (cfg.port_base, cfg.topic.clone()),
-            SubKind::Load => match cfg.load_port_base {
-                Some(p) => (p, String::new()),
-                None => {
+            SubKind::Load => match (&cfg.load_port_base, &cfg.load_topic) {
+                (Some(port), Some(topic)) => (*port, topic.clone()),
+                _ => {
                     debug!(
                         worker_url = %worker_url,
-                        "kv-events: worker advertises no load port; skipping load subscribers"
+                        "kv-events: worker lacks a complete load descriptor; skipping load subscribers"
                     );
                     return;
                 }
@@ -695,6 +695,7 @@ mod tests {
                 port_base,
                 topic: String::new(),
                 load_port_base: None,
+                load_topic: None,
                 block_size: 64,
                 dp_size,
                 is_bigram: false,
@@ -886,6 +887,56 @@ mod tests {
             stray.is_err(),
             "second message with topic=`other` must NOT pass the filter \
              (got {stray:?}); cfg.topic is being ignored at subscribe()",
+        );
+
+        registry.shutdown().await;
+    }
+
+    /// The #34608 load stream has its own advertised topic. It must use that
+    /// filter too: accepting every frame on the socket would make a future
+    /// colocated publisher influence routing through a coincidentally
+    /// decodable payload.
+    #[tokio::test]
+    async fn load_subscriber_filters_by_advertised_topic() {
+        let (mut pub_sock, port) = helpers::make_pub_bound().await;
+        let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
+        let registry = KvEventSubscriberRegistry::with_kind(tx, SubKind::Load);
+
+        let worker_url = "http://127.0.0.1:30101";
+        let mut cfg = helpers::cfg_for(worker_url, port, 1);
+        cfg.load_port_base = Some(port);
+        cfg.load_topic = Some("load".into());
+        registry.add_worker(worker_url, &cfg).await;
+        helpers::settle().await;
+
+        let payload = helpers::encode_load_stat(5, 2, 100, 1000, 0);
+        pub_sock
+            .send(helpers::build_multipart_with_topic(b"load", 3, payload))
+            .await
+            .unwrap();
+        let other_payload = helpers::encode_load_stat(99, 0, 0, 0, 0);
+        pub_sock
+            .send(helpers::build_multipart_with_topic(
+                b"other",
+                4,
+                other_payload,
+            ))
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for load event")
+            .expect("channel closed");
+        match event {
+            WorkerEvent::Load { load, .. } => assert_eq!(load.num_running_reqs, 5),
+            other => panic!("expected Load, got {other:?}"),
+        }
+        assert!(
+            timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "unmatched load topic must not reach the subscriber"
         );
 
         registry.shutdown().await;

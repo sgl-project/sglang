@@ -132,6 +132,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         block_size,
         dp_size: 1,
         load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
     kv_index.add_worker(url_a, Some(preresolved.clone())).await;

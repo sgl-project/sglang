@@ -60,6 +60,16 @@ struct WorkerEntry {
     dp_ranks: Vec<u32>,
 }
 
+/// Ranks whose socket port is representable for a publisher range. This is
+/// shared by lifecycle bookkeeping and the subscriber registry contract so an
+/// expected load rank always has a corresponding SUB socket.
+fn subscribable_ranks(port_base: u16, dp_size: u32) -> Vec<u32> {
+    let port_base = u32::from(port_base);
+    (0..dp_size)
+        .filter(|rank| port_base.saturating_add(*rank) <= u32::from(u16::MAX))
+        .collect()
+}
+
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
 ///
 /// Construct one instance per router process and hand it to the worker
@@ -205,10 +215,12 @@ impl KvEventIndex {
     /// the internal HTTP round-trip; otherwise (standalone callers,
     /// e.g. integration tests) we fall back to `fetch_event_config`.
     ///
-    /// Opens one ZMQ SUB per advertised DP rank. If the worker is not
-    /// publishing KV events (older SGLang, opt-out config), this is a
-    /// logged no-op — the worker still routes via the non-cache-aware
-    /// policies.
+    /// Opens one ZMQ SUB per advertised DP rank for each usable stream. In
+    /// metadata-only mode KV subscriptions remain disabled, but the separate
+    /// #34608 load stream is still attached when its full descriptor exists.
+    /// If the worker is not publishing KV events (older SGLang, opt-out
+    /// config), this is a logged no-op — the worker still routes via the
+    /// non-cache-aware policies.
     pub async fn add_worker(&self, worker_url: &str, preresolved: Option<EventConfig>) {
         let cfg: EventConfig = match preresolved {
             Some(c) => c,
@@ -252,38 +264,57 @@ impl KvEventIndex {
         // hash KV blocks over token bigrams, so the policy must use the bigram
         // hasher for its query hashes to match the worker's stored hashes.
         self.block_size_oracle.set_bigram(cfg.is_bigram);
-        if !self.maintain_tree {
-            info!(
+        let kv_dp_ranks = if self.maintain_tree {
+            subscribable_ranks(cfg.port_base, cfg.dp_size)
+        } else {
+            Vec::new()
+        };
+        let load_descriptor_complete = cfg.load_port_base.is_some() && cfg.load_topic.is_some();
+        if cfg.load_port_base.is_some() != cfg.load_topic.is_some() {
+            warn!(
                 worker_url = %worker_url,
-                block_size = cfg.block_size,
-                is_bigram = cfg.is_bigram,
-                "kv-events: external Indexer configured; discovered hash metadata without subscribing"
+                load_port_base = ?cfg.load_port_base,
+                load_topic = ?cfg.load_topic,
+                "kv-events: incomplete load descriptor; refusing load subscription"
             );
-            return;
         }
-        info!(
-            worker_url = %worker_url,
-            dp_size = cfg.dp_size,
-            port_base = cfg.port_base,
-            block_size = cfg.block_size,
-            is_bigram = cfg.is_bigram,
-            "kv-events: subscribing",
-        );
-        // Compute the DP ranks that will actually be subscribed (skip
-        // ranks whose port overflows u16; the subscriber will warn on
-        // each skipped rank).
-        let port_base_u32 = u32::from(cfg.port_base);
-        let dp_ranks: Vec<u32> = (0..cfg.dp_size)
-            .filter(|rank| (port_base_u32 + rank) <= u32::from(u16::MAX))
-            .collect();
+        let load_dp_ranks = cfg
+            .load_port_base
+            .filter(|_| load_descriptor_complete)
+            .map(|port_base| subscribable_ranks(port_base, cfg.dp_size))
+            .unwrap_or_default();
+        let mut dp_ranks = kv_dp_ranks.clone();
+        dp_ranks.extend(load_dp_ranks.iter().copied());
+        dp_ranks.sort_unstable();
+        dp_ranks.dedup();
         if dp_ranks.is_empty() {
             warn!(
                 worker_url = %worker_url,
                 port_base = cfg.port_base,
                 dp_size = cfg.dp_size,
-                "kv-events: every advertised rank's port overflows u16; skipping worker",
+                "kv-events: no usable KV or load publisher ranks; skipping worker",
             );
             return;
+        }
+        if self.maintain_tree {
+            info!(
+                worker_url = %worker_url,
+                dp_size = cfg.dp_size,
+                port_base = cfg.port_base,
+                load_port_base = ?cfg.load_port_base,
+                block_size = cfg.block_size,
+                is_bigram = cfg.is_bigram,
+                "kv-events: subscribing",
+            );
+        } else {
+            info!(
+                worker_url = %worker_url,
+                dp_size = cfg.dp_size,
+                load_port_base = ?cfg.load_port_base,
+                block_size = cfg.block_size,
+                is_bigram = cfg.is_bigram,
+                "kv-events: external Indexer configured; subscribing only to engine load",
+            );
         }
         // Mark every rank live BEFORE the subscriber starts so any event
         // it queues is accepted by the pump.
@@ -302,15 +333,17 @@ impl KvEventIndex {
                 dp_ranks: dp_ranks.clone(),
             },
         );
-        self.subscribers.add_worker(worker_url, &cfg).await;
-        // Load subscribers (one per rank on the dedicated load port). A no-op
-        // when the worker advertises no load port (older engine). Workers that
-        // do advertise one are marked expected, so the router can tell a dead
-        // load publisher apart from one that was never configured.
-        if cfg.load_port_base.is_some() {
-            self.engine_load.mark_expected(worker_url);
+        if self.maintain_tree && !kv_dp_ranks.is_empty() {
+            self.subscribers.add_worker(worker_url, &cfg).await;
         }
-        self.load_subscribers.add_worker(worker_url, &cfg).await;
+        // Mark only the ranks that have an actual SUB socket. `EngineLoadTable`
+        // then rejects missing or stale advertised ranks as a whole worker.
+        if !load_dp_ranks.is_empty() {
+            for rank in &load_dp_ranks {
+                self.engine_load.mark_expected_rank(worker_url, *rank);
+            }
+            self.load_subscribers.add_worker(worker_url, &cfg).await;
+        }
     }
 
     /// Tear down a worker's subscribers and clear it from the tree.
@@ -754,6 +787,7 @@ mod tests {
             port_base: 30100,
             topic: String::new(),
             load_port_base: None,
+            load_topic: None,
             block_size: 128,
             dp_size: 1,
             is_bigram: false,
@@ -784,6 +818,7 @@ mod tests {
             port_base: 30200,
             topic: String::new(),
             load_port_base: None,
+            load_topic: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: false,
@@ -806,6 +841,7 @@ mod tests {
             port_base: 30300,
             topic: String::new(),
             load_port_base: None,
+            load_topic: None,
             block_size: 64,
             dp_size: 0,
             is_bigram: true,
@@ -830,6 +866,7 @@ mod tests {
             port_base: 30400,
             topic: "kv-events".into(),
             load_port_base: Some(30410),
+            load_topic: Some("load".into()),
             block_size: 64,
             dp_size: 2,
             is_bigram: true,
@@ -857,6 +894,7 @@ mod tests {
             port_base: 59123,
             topic: String::new(),
             load_port_base: Some(59223),
+            load_topic: Some("load".into()),
             block_size: 64,
             dp_size: 1,
             is_bigram: false,

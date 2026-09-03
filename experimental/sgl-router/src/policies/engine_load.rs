@@ -15,8 +15,9 @@
 //! Load is a *gauge*, not a delta: last value wins, no sequence/replay
 //! semantics. Entries older than [`EngineLoadTable::freshness`] are ignored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,34 @@ pub struct LoadStat {
     pub max_total_num_tokens: u64,
 }
 
+/// Aggregated, usable Engine load for one Worker at a fixed instant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineWorkerLoad {
+    pub num_running_reqs: u64,
+    pub num_waiting_reqs: u64,
+    pub num_tokens: u64,
+    pub max_total_num_tokens: u64,
+    pub captured_at: Instant,
+}
+
+/// Immutable Engine-load view captured once at request ingress.
+#[derive(Debug, Clone, Default)]
+pub struct EngineLoadSnapshot {
+    pub version: u64,
+    workers: HashMap<String, EngineWorkerLoad>,
+}
+
+impl EngineLoadSnapshot {
+    pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineWorkerLoad> {
+        self.workers.get(worker_url)
+    }
+
+    /// Builds a view from already validated Worker data for tests and offline checks.
+    pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
+        Self { version, workers }
+    }
+}
+
 impl<'de> Deserialize<'de> for LoadStat {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -71,13 +100,22 @@ impl<'de> Deserialize<'de> for LoadStat {
                         "expected \"LoadStat\" tag, got {tag:?}"
                     )));
                 }
-                // Counts are always emitted (no Python defaults), but default
-                // missing fields to 0 and drain trailing fields (attn_dp_rank,
-                // future additions) for forward-compatibility.
-                let num_running_reqs: u64 = seq.next_element()?.unwrap_or(0);
-                let num_waiting_reqs: u64 = seq.next_element()?.unwrap_or(0);
-                let num_tokens: u64 = seq.next_element()?.unwrap_or(0);
-                let max_total_num_tokens: u64 = seq.next_element()?.unwrap_or(0);
+                // The Python publisher always emits all four counts. Treat a
+                // shortened frame as malformed rather than inventing zeros:
+                // a partial gauge must fall back to router-local load, never
+                // make a worker appear artificially idle.
+                let num_running_reqs: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("num_running_reqs"))?;
+                let num_waiting_reqs: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("num_waiting_reqs"))?;
+                let num_tokens: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("num_tokens"))?;
+                let max_total_num_tokens: u64 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::missing_field("max_total_num_tokens"))?;
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(LoadStat {
                     num_running_reqs,
@@ -114,12 +152,12 @@ struct LoadEntry {
 #[derive(Debug)]
 pub struct EngineLoadTable {
     by_rank: DashMap<(String, u32), LoadEntry>,
-    /// Worker URLs that advertised a load topic and so are *expected* to
-    /// publish load. Lets the router distinguish "load-aware routing active"
-    /// from "silently degraded to the in-flight counter" (expected but no
-    /// fresh snapshot) — see [`Self::expected_count`].
-    expected: DashSet<String>,
+    /// Per-rank publishers the worker advertised. A worker is usable only
+    /// when every advertised rank has a fresh value; accepting a partial
+    /// aggregate would make a silent rank look idle and attract traffic.
+    expected: DashSet<(String, u32)>,
     freshness: Duration,
+    version: AtomicU64,
 }
 
 impl EngineLoadTable {
@@ -128,6 +166,7 @@ impl EngineLoadTable {
             by_rank: DashMap::new(),
             expected: DashSet::new(),
             freshness: DEFAULT_FRESHNESS,
+            version: AtomicU64::new(0),
         })
     }
 
@@ -137,6 +176,7 @@ impl EngineLoadTable {
             by_rank: DashMap::new(),
             expected: DashSet::new(),
             freshness,
+            version: AtomicU64::new(0),
         })
     }
 
@@ -144,29 +184,35 @@ impl EngineLoadTable {
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
         self.by_rank
             .insert((url.to_string(), dp_rank), LoadEntry { load, at });
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Mark a worker as expected to publish load (it advertised a load topic).
-    pub fn mark_expected(&self, url: &str) {
-        self.expected.insert(url.to_string());
+    /// Mark one advertised scheduler rank as expected to publish load.
+    pub fn mark_expected_rank(&self, url: &str, dp_rank: u32) {
+        if self.expected.insert((url.to_string(), dp_rank)) {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Number of workers expected to publish load. Compared against the size
     /// of [`Self::snapshot_fresh`] to surface a dead/misconfigured publisher
     /// (expected > 0 but no fresh snapshots) in logs.
     pub fn expected_count(&self) -> usize {
-        self.expected.len()
+        self.expected
+            .iter()
+            .map(|entry| entry.key().0.clone())
+            .collect::<HashSet<_>>()
+            .len()
     }
 
-    /// Shared accumulation pass behind [`Self::snapshot_fresh`] (and used
-    /// directly by `cache_aware_zmq::WorkerLoads`, which needs both halves):
-    /// one walk of the table, per worker URL, producing the summed queue
-    /// depth (`num_running_reqs + num_waiting_reqs`) across that worker's
-    /// ranks and the OLDEST snapshot timestamp among them — **but only for
-    /// workers whose every known rank is fresh**. A worker with any stale
-    /// rank is omitted, so the caller falls back to its own load signal.
-    /// (Summing only the fresh ranks would make a worker whose other ranks
-    /// went silent look misleadingly idle and draw *more* traffic.)
+    /// Shared accumulation pass behind [`Self::snapshot_fresh`] and
+    /// [`Self::capture_snapshot`]. It produces the #34608 fields summed across
+    /// ranks and the OLDEST snapshot timestamp — **but only for workers whose
+    /// every advertised rank is present and fresh**. A missing or stale rank is
+    /// omitted, so the caller falls back to its own load signal. (Summing
+    /// only the fresh ranks would make a worker whose other ranks went silent
+    /// look misleadingly idle and draw *more* traffic.) Callers that never
+    /// registered expected ranks retain the legacy all-known-ranks rule.
     /// `snapshot_fresh` and any other consumer walking this same pass can
     /// never disagree with each other about which workers count as fresh.
     ///
@@ -186,29 +232,96 @@ impl EngineLoadTable {
     /// not a correctness hole) rather than something this method can close
     /// on its own — closing it would require per-rank dispatch attribution,
     /// which the router-side slot tracking below doesn't have.
-    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
-        // url -> (summed depth across all ranks, all-ranks-fresh, oldest at).
-        let mut acc: HashMap<String, (usize, bool, Instant)> = HashMap::new();
+    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineWorkerLoad> {
+        // url -> rank -> (reported load, fresh, timestamp).
+        let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
         for entry in self.by_rank.iter() {
             let at = entry.value().at;
-            let fresh = now.duration_since(at) <= self.freshness;
-            let l = &entry.value().load;
-            let depth = (l.num_running_reqs.saturating_add(l.num_waiting_reqs)) as usize;
-            let slot = acc.entry(entry.key().0.clone()).or_insert((0, true, at));
-            slot.0 = slot.0.saturating_add(depth);
-            slot.1 = slot.1 && fresh;
-            slot.2 = slot.2.min(at);
+            let fresh = now.saturating_duration_since(at) <= self.freshness;
+            observed
+                .entry(entry.key().0.clone())
+                .or_default()
+                .insert(entry.key().1, (entry.value().load.clone(), fresh, at));
         }
-        acc.into_iter()
-            .filter_map(|(url, (depth, all_fresh, oldest_at))| {
-                all_fresh.then_some((url, (depth, oldest_at)))
+        let mut expected: HashMap<String, HashSet<u32>> = HashMap::new();
+        for entry in self.expected.iter() {
+            expected
+                .entry(entry.key().0.clone())
+                .or_default()
+                .insert(entry.key().1);
+        }
+
+        let workers: HashSet<String> = observed.keys().chain(expected.keys()).cloned().collect();
+        workers
+            .into_iter()
+            .filter_map(|url| {
+                let ranks = observed.get(&url)?;
+                let required: Vec<u32> = match expected.get(&url) {
+                    Some(expected_ranks) => expected_ranks.iter().copied().collect(),
+                    None => ranks.keys().copied().collect(),
+                };
+                let mut num_running_reqs = 0u64;
+                let mut num_waiting_reqs = 0u64;
+                let mut num_tokens = 0u64;
+                let mut max_total_num_tokens = 0u64;
+                let mut oldest_at = None;
+                for rank in required {
+                    let (load, fresh, at) = ranks.get(&rank)?;
+                    if !fresh {
+                        return None;
+                    }
+                    num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
+                    num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
+                    num_tokens = num_tokens.saturating_add(load.num_tokens);
+                    max_total_num_tokens =
+                        max_total_num_tokens.saturating_add(load.max_total_num_tokens);
+                    oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
+                }
+                oldest_at.map(|captured_at| {
+                    (
+                        url,
+                        EngineWorkerLoad {
+                            num_running_reqs,
+                            num_waiting_reqs,
+                            num_tokens,
+                            max_total_num_tokens,
+                            captured_at,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Captures the immutable view consumed by all routing decisions in one request.
+    pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
+        EngineLoadSnapshot {
+            version: self.version.load(Ordering::Acquire),
+            workers: self.fresh_worker_loads(now),
+        }
+    }
+
+    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
+        self.fresh_worker_loads(now)
+            .into_iter()
+            .map(|(url, load)| {
+                (
+                    url,
+                    (
+                        load.num_running_reqs
+                            .saturating_add(load.num_waiting_reqs)
+                            .try_into()
+                            .unwrap_or(usize::MAX),
+                        load.captured_at,
+                    ),
+                )
             })
             .collect()
     }
 
     /// Per worker URL, the summed queue depth (`num_running_reqs +
     /// num_waiting_reqs`) across that worker's ranks, for workers whose
-    /// every known rank is fresh. Computed once per selection so per-worker
+    /// every advertised rank is fresh. Computed once per selection so per-worker
     /// lookups are O(1). See [`Self::fresh_worker_state`] for the freshness
     /// gate behind this.
     pub fn snapshot_fresh(&self, now: Instant) -> HashMap<String, usize> {
@@ -222,7 +335,8 @@ impl EngineLoadTable {
     /// worker removal so a re-added worker does not leave stale load behind.
     pub fn forget_worker(&self, url: &str) {
         self.by_rank.retain(|k, _| k.0 != url);
-        self.expected.remove(url);
+        self.expected.retain(|key| key.0 != url);
+        self.version.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -242,6 +356,25 @@ mod tests {
             num_tokens: 0,
             max_total_num_tokens: 0,
         }
+    }
+
+    #[test]
+    fn load_wire_rejects_wrong_tag_and_missing_counts() {
+        let mut wrong_tag = Vec::new();
+        rmp::encode::write_array_len(&mut wrong_tag, 5).unwrap();
+        rmp::encode::write_str(&mut wrong_tag, "OtherStat").unwrap();
+        for value in [1, 2, 3, 4] {
+            rmp::encode::write_u64(&mut wrong_tag, value).unwrap();
+        }
+        assert!(decode_load_stat(&wrong_tag).is_err());
+
+        let mut missing_count = Vec::new();
+        rmp::encode::write_array_len(&mut missing_count, 4).unwrap();
+        rmp::encode::write_str(&mut missing_count, "LoadStat").unwrap();
+        for value in [1, 2, 3] {
+            rmp::encode::write_u64(&mut missing_count, value).unwrap();
+        }
+        assert!(decode_load_stat(&missing_count).is_err());
     }
 
     #[test]
@@ -295,6 +428,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_expected_rank_excludes_worker() {
+        let t = EngineLoadTable::new();
+        let now = Instant::now();
+        t.mark_expected_rank("http://w:30000", 0);
+        t.mark_expected_rank("http://w:30000", 1);
+        t.set("http://w:30000", 0, load(5, 1), now);
+        assert!(
+            !t.snapshot_fresh(now).contains_key("http://w:30000"),
+            "an advertised rank without a reading must not produce a partial aggregate"
+        );
+
+        t.set("http://w:30000", 1, load(3, 2), now);
+        assert_eq!(t.snapshot_fresh(now).get("http://w:30000"), Some(&11));
+    }
+
+    #[test]
     fn fresh_worker_state_picks_the_earliest_rank_timestamp() {
         let t = EngineLoadTable::new();
         let earlier = Instant::now() - Duration::from_secs(2);
@@ -330,9 +479,9 @@ mod tests {
     fn expected_count_tracks_marked_workers_and_forget() {
         let t = EngineLoadTable::new();
         assert_eq!(t.expected_count(), 0);
-        t.mark_expected("http://w:30000");
-        t.mark_expected("http://w:30000"); // idempotent
-        t.mark_expected("http://other:30000");
+        t.mark_expected_rank("http://w:30000", 0);
+        t.mark_expected_rank("http://w:30000", 1); // same worker
+        t.mark_expected_rank("http://other:30000", 0);
         assert_eq!(t.expected_count(), 2);
         t.forget_worker("http://w:30000");
         assert_eq!(t.expected_count(), 1);

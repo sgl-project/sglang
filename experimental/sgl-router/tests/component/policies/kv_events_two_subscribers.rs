@@ -42,6 +42,7 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
         block_size,
         dp_size: 1,
         load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
 
@@ -176,6 +177,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         block_size,
         dp_size: 1,
         load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
     let cfg_y = EventConfig {
@@ -185,6 +187,7 @@ async fn two_subscribers_merge_events_from_two_publishers() {
         block_size,
         dp_size: 1,
         load_port_base: None,
+        load_topic: None,
         is_bigram: false,
     };
 

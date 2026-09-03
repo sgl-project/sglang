@@ -319,6 +319,7 @@ pub(crate) fn resolve_event_config(
         port_base: block.endpoint_port_base,
         topic: block.topic,
         load_port_base: block.load_endpoint_port_base,
+        load_topic: block.load_topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -379,6 +380,8 @@ pub(crate) struct KvEventsBlock {
     /// workers that predate load publishing (`None` ⇒ no load subscriber).
     #[serde(default)]
     pub load_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    pub load_topic: Option<String>,
     pub block_size: u32,
     pub dp_size: u32,
 }

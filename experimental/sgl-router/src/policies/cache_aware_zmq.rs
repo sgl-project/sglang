@@ -1279,6 +1279,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1326,6 +1327,7 @@ mod tests {
                 // 2) and selection reaches the matched-set tiebreak.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1376,6 +1378,7 @@ mod tests {
                 // matched-set tiebreak, which also uses `load_of`.
                 balance_abs_threshold: 100,
                 balance_rel_threshold: 100.0,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,
@@ -1482,6 +1485,7 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                kv_indexer_endpoint: None,
             },
             tree,
             registry,

@@ -44,6 +44,9 @@ pub struct EventConfig {
     /// worker predates load publishing — the load subscriber is then skipped
     /// and selection falls back to the router-side in-flight counter.
     pub load_port_base: Option<u16>,
+    /// Topic prefix for the dedicated load socket. The publisher advertises
+    /// it with `load_port_base`; both fields are required before subscribing.
+    pub load_topic: Option<String>,
     /// Worker-reported `page_size`. Callers MUST compare against their
     /// own configured `block_size`; a mismatch produces silent
     /// miscompute since [`super::hash::compute_block_hashes`] is keyed
@@ -133,6 +136,7 @@ pub async fn fetch_event_config(
         port_base: block.endpoint_port_base,
         topic: block.topic,
         load_port_base: block.load_endpoint_port_base,
+        load_topic: block.load_topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
         is_bigram,
@@ -262,6 +266,8 @@ struct KvEventsBlock {
     /// workers that predate load publishing (`None` ⇒ no load subscriber).
     #[serde(default)]
     load_endpoint_port_base: Option<u16>,
+    #[serde(default)]
+    load_topic: Option<String>,
     block_size: u32,
     dp_size: u32,
 }
@@ -317,6 +323,7 @@ mod tests {
                 "endpoint_port_base": 5557,
                 "topic": "kv",
                 "load_endpoint_port_base": 5559,
+                "load_topic": "load",
                 "block_size": 64,
                 "dp_size": 2,
             }
@@ -330,6 +337,7 @@ mod tests {
                 port_base: 5557,
                 topic: "kv".to_string(),
                 load_port_base: Some(5559),
+                load_topic: Some("load".to_string()),
                 block_size: 64,
                 dp_size: 2,
                 is_bigram: false,
