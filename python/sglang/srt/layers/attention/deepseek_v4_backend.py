@@ -2390,9 +2390,11 @@ class DeepseekV4AttnBackend(
         # The tail never takes the sparse path, so it carries no chunk cache.
         use_sparse_prefill = (
             not get_platform().is_sm120
+            and self.dsv4_prefill_backend != "flashmla_kvcache"
             and metadata.late_layer_tail is None
             and (
-                num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
+                self.dsv4_prefill_backend in ("flashmla_sparse", "flashmla_sparse_q8")
+                or num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             )
         )
@@ -3496,7 +3498,7 @@ class DeepseekV4AttnBackend(
             )
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not get_platform().is_sm120
                 and cp_sparse_supported
                 and not force_kvcache_prefill
                 and (
@@ -3662,79 +3664,63 @@ class DeepseekV4AttnBackend(
         extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
         query_positions = (core_attn_metadata.seq_lens_casual - 1).to(torch.int32)
-        num_qo_tokens = q_flat.shape[0]
-        swa_first_pos = None
-        swa_gather_lens = None
+        strategy = get_cp_strategy()
+        assert strategy is not None and strategy.name == "interleave"
+        (
+            local_query_lens_cpu,
+            local_query_lens,
+            local_request_indices_cpu,
+            local_request_indices,
+        ) = strategy.shard_per_request(
+            extend_seq_lens_cpu,
+            forward_batch.extend_seq_lens,
+        )
+        num_qo_tokens = sum(local_query_lens_cpu)
+        assert num_qo_tokens <= q_flat.shape[0], (
+            f"CP sparse prefill has {num_qo_tokens} logical query rows, "
+            f"but Q only has {q_flat.shape[0]} physical rows"
+        )
+        assert query_positions.shape[0] >= num_qo_tokens
+        query_positions = query_positions[:num_qo_tokens]
 
-        prefill_cp_active = is_cp_active(forward_batch)
-        if prefill_cp_active:
-            strategy = get_cp_strategy()
-            assert strategy is not None and strategy.name == "interleave"
-            (
-                local_query_lens_cpu,
-                local_query_lens,
-                local_request_indices_cpu,
-                local_request_indices,
-            ) = strategy.shard_per_request(
-                extend_seq_lens_cpu,
-                forward_batch.extend_seq_lens,
-            )
-            num_qo_tokens = sum(local_query_lens_cpu)
-            assert num_qo_tokens <= q_flat.shape[0], (
-                f"CP sparse prefill has {num_qo_tokens} logical query rows, "
-                f"but Q only has {q_flat.shape[0]} physical rows"
-            )
-            assert query_positions.shape[0] >= num_qo_tokens
-            query_positions = query_positions[:num_qo_tokens]
+        local_index = local_request_indices.long()
+        seq_lens = seq_lens.index_select(0, local_index)
+        req_pool_indices = req_pool_indices.index_select(0, local_index)
+        extend_seq_lens = extend_seq_lens.index_select(0, local_index)
 
-            local_index = local_request_indices.long()
-            seq_lens = seq_lens.index_select(0, local_index)
-            req_pool_indices = req_pool_indices.index_select(0, local_index)
-            extend_seq_lens = local_query_lens.to(torch.int32)
-
-            first_positions_cpu, gather_lens_cpu = compute_interleave_cp_swa_ranges(
-                seq_lens=seq_lens_cpu,
-                extend_seq_lens=extend_seq_lens_cpu,
-                local_query_lens=local_query_lens_cpu,
-                local_request_indices=local_request_indices_cpu,
-                cp_rank=get_parallel().attn_cp_rank,
-                cp_size=get_parallel().attn_cp_size,
-                swa_window=SWA_WINDOW,
-            )
-            device = seq_lens.device
-            # A direct ``torch.tensor(..., device=device)`` for each list uses
-            # pageable host memory and synchronizes the current CUDA stream.
-            # Pack both tiny arrays into one pinned allocation so their H2D
-            # transfer is a single asynchronous operation ordered before the
-            # cache-build kernels on the same stream.
-            swa_ranges_cpu = torch.tensor(
-                [first_positions_cpu, gather_lens_cpu],
-                dtype=torch.int32,
-                pin_memory=device.type == "cuda",
-            )
-            swa_ranges = swa_ranges_cpu.to(
-                device=device,
-                non_blocking=device.type == "cuda",
-            )
-            swa_first_pos, swa_gather_lens = swa_ranges.unbind(0)
-            total_swa = sum(gather_lens_cpu)
-            selected_seq_lens_cpu = [seq_lens_cpu[i] for i in local_request_indices_cpu]
-            max_seq_len = max(selected_seq_lens_cpu)
-        else:
-            assert query_positions.shape[0] >= num_qo_tokens
-            query_positions = query_positions[:num_qo_tokens]
-            total_swa = sum(
-                min(seq_len, extend_len + SWA_WINDOW - 1)
-                for seq_len, extend_len in zip(
-                    seq_lens_cpu, extend_seq_lens_cpu, strict=True
-                )
-            )
-            max_seq_len = max(seq_lens_cpu)
+        first_positions_cpu, gather_lens_cpu = compute_interleave_cp_swa_ranges(
+            seq_lens=seq_lens_cpu,
+            extend_seq_lens=extend_seq_lens_cpu,
+            local_query_lens=local_query_lens_cpu,
+            local_request_indices=local_request_indices_cpu,
+            cp_rank=get_parallel().attn_cp_rank,
+            cp_size=get_parallel().attn_cp_size,
+            swa_window=SWA_WINDOW,
+        )
+        device = seq_lens.device
+        # A direct ``torch.tensor(..., device=device)`` for each list uses
+        # pageable host memory and synchronizes the current CUDA stream.
+        # Pack both tiny arrays into one pinned allocation so their H2D
+        # transfer is a single asynchronous operation ordered before the
+        # cache-build kernels on the same stream.
+        swa_ranges_cpu = torch.tensor(
+            [first_positions_cpu, gather_lens_cpu],
+            dtype=torch.int32,
+            pin_memory=device.type == "cuda",
+        )
+        swa_ranges = swa_ranges_cpu.to(
+            device=device,
+            non_blocking=device.type == "cuda",
+        )
+        swa_first_pos, swa_gather_lens = swa_ranges.unbind(0)
+        total_swa = sum(gather_lens_cpu)
+        selected_seq_lens_cpu = [seq_lens_cpu[i] for i in local_request_indices_cpu]
+        max_seq_len = max(selected_seq_lens_cpu)
 
         cache = SparsePrefillChunkCache.build(
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
-            query_lens=extend_seq_lens,
+            query_lens=local_query_lens.to(torch.int32),
             query_pos=query_positions,
             req_pool_indices=req_pool_indices,
             req_to_token=self.req_to_token,

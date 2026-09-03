@@ -592,12 +592,18 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
         cache = object()
-        for num_qo_tokens, builds in (
-            (_LARGE_INDEXER_QUERY_THRESHOLD, False),
-            (_LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+        for prefill_backend, num_qo_tokens, builds in (
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD, False),
+            ("auto", _LARGE_INDEXER_QUERY_THRESHOLD + 1, True),
+            ("flashmla_sparse", 1, True),
+            ("flashmla_sparse_q8", 1, True),
+            ("flashmla_kvcache", _LARGE_INDEXER_QUERY_THRESHOLD + 1, False),
         ):
-            with self.subTest(num_qo_tokens=num_qo_tokens):
+            with self.subTest(
+                prefill_backend=prefill_backend, num_qo_tokens=num_qo_tokens
+            ):
                 backend = object.__new__(DeepseekV4AttnBackend)
+                backend.dsv4_prefill_backend = prefill_backend
                 backend.model_runner = SimpleNamespace(
                     spec_algorithm=SpeculativeAlgorithm.DFLASH
                 )
@@ -643,6 +649,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         backend = object.__new__(DeepseekV4AttnBackend)
+        backend.dsv4_prefill_backend = "auto"
         backend.model_runner = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.DFLASH
         )

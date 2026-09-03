@@ -40,10 +40,10 @@ sys.path.insert(0, str(_REPO_ROOT / "python"))
 import torch  # noqa: E402
 
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS  # noqa: E402
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout  # noqa: E402
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (  # noqa: E402
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.layers.attention.deepseek_v4_backend import (  # noqa: E402
     DeepseekV4AttnBackend,
 )
@@ -102,6 +102,26 @@ class _TokenToKVPool:
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
         del layer_id
         return self._extra_cache
+
+    def get_swa_key_page_size(self) -> int:
+        return self.swa_window_size
+
+    def get_swa_key_layout(self) -> KVLayout:
+        return KVLayout.V4
+
+    def get_extra_key_layout(self, layer_id: int) -> KVLayout:
+        del layer_id
+        return KVLayout.V4
+
+
+class _CoreMetadata(SimpleNamespace):
+    def sparse_raw_indices(self, compress_ratio: int) -> torch.Tensor:
+        assert compress_ratio == 4
+        return self.c4_sparse_raw_indices
+
+    def sparse_page_indices(self, compress_ratio: int) -> torch.Tensor:
+        assert compress_ratio == 128
+        return self.c128_page_indices
 
 
 @dataclass
@@ -464,7 +484,9 @@ def build_case(
         extra_page_size=extra_page_size,
     )
     backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
-    backend.forward_metadata = SimpleNamespace(sparse_prefill_cache=None)
+    backend.forward_metadata = SimpleNamespace(
+        sparse_prefill_cache=None, late_layer_tail=None
+    )
     backend.req_to_token = req_to_token
     backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
     backend.softmax_scale = DSV4_HEAD_DIM**-0.5
@@ -484,8 +506,9 @@ def build_case(
         * 0.05
     ).contiguous()
     attn_sink = torch.zeros(num_heads, dtype=torch.float32, device=device)
-    core_metadata = SimpleNamespace(
-        positions_casual=query_positions,
+    core_metadata = _CoreMetadata(
+        request_window_layout=None,
+        seq_lens_casual=query_positions + 1,
         page_table=page_table,
         c4_sparse_raw_indices=c4_raw_indices,
         c128_page_indices=c128_page_indices,
@@ -868,7 +891,7 @@ def main() -> None:
     # Model CP communication is intentionally excluded, but the attention
     # backend must see the same CP-v2/interleave topology and local coordinates
     # as production. No process group is touched by either measured function.
-    with envs.SGLANG_ENABLE_CP_V2.override(True), get_parallel().override(
+    with get_parallel().override(
         world_size=args.cp_size,
         world_rank=args.cp_rank,
         tp_size=args.cp_size,
