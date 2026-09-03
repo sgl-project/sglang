@@ -13,6 +13,7 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod scoring;
+pub mod session_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
@@ -416,6 +417,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 
     /// Indicates whether this policy uses shared prefill admission and guards.
     fn uses_shared_prefill_admission(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy resolves an affinity primary within the candidate range.
+    fn is_bucket_affinity_policy(&self) -> bool {
         false
     }
 

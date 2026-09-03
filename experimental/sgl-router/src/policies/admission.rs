@@ -455,7 +455,6 @@ fn decode_domain_fallback(
 }
 
 /// Prefill 的真实外部比较顺序：等待请求、运行请求、KV 使用率。
-#[cfg(test)]
 pub(crate) fn compare_prefill_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
