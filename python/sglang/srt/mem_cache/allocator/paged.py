@@ -284,10 +284,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
         """Fixed-shape counterpart of free().
 
-        A page's tokens sit consecutively in the kv row and the segment starts
-        on a page boundary, so ``free_index[::page_size]`` holds one token of
-        every page touched. No torch.unique, whose data-dependent output shape
-        forces a device sync. Contract: see base."""
+        The segment starts on a page boundary and a page's tokens sit
+        consecutively in the kv row, so ``free_index[::page_size]`` is one
+        token from each page the segment covers -- including a partial last
+        page. No torch.unique, whose data-dependent output shape forces a
+        device sync. Contract: see base."""
         if free_index.numel() == 0:
             return
 
