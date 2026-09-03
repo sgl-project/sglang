@@ -3517,7 +3517,11 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
     def _reference(self, loc, v2p, page_size, stride, dcp_size, dcp_rank):
         out = []
         for raw in loc.tolist():
-            if raw < 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
+            # `raw <= 0`: slot 0 is the reserved padding anchor in every id
+            # space (`min_page_index` keeps live ids above it) and the runner
+            # pads a write loc with zeros to mean the sink, so 0 maps to kernel
+            # id 0 rather than through v2p.
+            if raw <= 0 or (dcp_size > 1 and raw % dcp_size != dcp_rank):
                 out.append(0)
                 continue
             collapsed = raw // dcp_size
@@ -3569,6 +3573,10 @@ class TestFusedWriteLocTranslate(unittest.TestCase):
         )
         self.assertIs(ret, dst)
         self.assertEqual(dst.tolist(), want)
+        # The pad sink is kernel id 0, never `v2p[0] * stride`: this pool grows
+        # DOWN, so the anchor page can be a top physical page whose id runs
+        # past the KV buffer's rows.
+        self.assertEqual(got[0].item(), 0)
 
     def test_matches_reference_on_cpu(self):
         for page_size in (1, 64):

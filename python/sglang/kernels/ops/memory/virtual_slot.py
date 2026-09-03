@@ -242,7 +242,13 @@ def write_loc_to_kernel_id_kernel(
     mask = offs < N
     loc = tl.load(loc_ptr + offs, mask=mask, other=0).to(tl.int64)
 
-    keep = mask & (loc >= 0)
+    # Slot 0 is the reserved padding sink in every id space (the allocator's
+    # `min_slot_index` keeps live ids well above it), and the runner pads a
+    # write loc with zeros to mean exactly that. So 0 maps to kernel id 0 and
+    # is NOT sent through v2p: this pool grows DOWN, so `v2p[0]` can name a top
+    # physical page whose id runs past the buffer's rows -- an illegal write,
+    # not merely an out-of-range index.
+    keep = mask & (loc > 0)
     if DCP_SIZE > 1:
         keep = keep & ((loc % DCP_SIZE) == DCP_RANK)
         loc = loc // DCP_SIZE
@@ -308,7 +314,7 @@ def write_loc_to_kernel_ids(
     if not loc.is_cuda:
         # Pure-torch reference; the allocator's unit tests run on CPU.
         big = loc.to(torch.int64)
-        keep = big >= 0
+        keep = big > 0
         if dcp_size > 1:
             keep = keep & (big % dcp_size == dcp_rank)
             big = torch.div(big, dcp_size, rounding_mode="floor")

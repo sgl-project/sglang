@@ -170,6 +170,11 @@ def build_replay_fb_view(
 
     Subsumes the _replay_forward_batch side channel that DSV4 used to
     read out-of-band before the init_forward_metadata 3-method ABC.
+
+    Every field a replay-side reader touches has to be listed below. This is a
+    SimpleNamespace and not a ForwardBatch, so an omission raises
+    AttributeError rather than reading a default -- and `actual_forward_mode`
+    and `num_padding` exist only here, which is why it is not one.
     """
     return SimpleNamespace(
         batch_size=bs,
@@ -191,11 +196,8 @@ def build_replay_fb_view(
         ),
         num_padding=bs - raw_bs,
         encoder_lens=buffers.encoder_lens[:bs] if is_encoder_decoder else None,
-        out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
-        # The pre-translate loc, which the unified pool's backends re-derive
-        # from straight into their capture-stable buffer. None on a static pool.
-        out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
-        out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        out_cache_loc=forward_batch.out_cache_loc,
+        out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
         # The mamba-track registry slot (VIRTUAL ids) is the v2p translate SOURCE
         # for the backend, which copies the result into its own static buffer and
         # reads THAT in the decode track-save — this slot is never mutated. None
@@ -1185,6 +1187,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+            self.model_runner.kv_index_translator.rebind_write_loc(
+                forward_batch, attn_backend, for_capture=True
+            )
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
@@ -1401,6 +1406,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        # One translate for this replay, before either prep branch. It must sit
+        # outside the glue's captured region: that graph records metadata prep
+        # itself, so a translate placed inside would replay frozen at its
+        # capture-time v2p.
+        self.model_runner.kv_index_translator.rebind_write_loc(
+            fb_view, attn_backend, for_capture=True
+        )
+
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
@@ -1418,6 +1431,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # req_pool_indices / out_cache_loc when the runtime mode is IDLE,
             # so IDLE and active DECODE are different python branches and must
             # not share a captured graph.
+            # Outside the glue's captured region on purpose: the glue graph
+            # records metadata prep itself, so a translate placed inside would
+            # replay frozen at its capture-time v2p.
             self._metadata_glue.run(
                 attn_backend,
                 fb_view,

@@ -722,25 +722,29 @@ class TritonAttnBackend(AttentionBackend):
             )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """The captured WRITE-loc buffer; see the base class.
+
+        The full width is requested so the translate clears what a smaller
+        replay left behind: the captured store consumes the whole buffer, and
+        stale ids past the batch would be written as live rows. Zeroing sends
+        them to slot 0, the reserved sink in every id space.
+        """
+        buf = self.cuda_graph_out_cache_loc_full_physical
+        return None if buf is None else (buf, buf.numel())
+
     def _fill_cuda_graph_write_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
-        """Copy the cuda-graph WRITE loc into the capture-stable buffer and
-        return the ``[:n]`` view; no-op for non-unified pools.
+        """The capture-stable WRITE loc, or None for a non-unified pool.
 
-        Runs BEFORE graph.replay() so it reads the live post-compaction v2p.
-        The capture batch is runner-built with zeros, which is safe because
-        slot 0 is the reserved sink in every id space.
+        `rebind_write_loc` already translated into the buffer this backend
+        named, so out_cache_loc IS its live view; nothing to copy. Reading it
+        here (rather than at capture time) keeps the post-compaction v2p.
         """
-        # One launch: the live prefix is translated straight in and the padded
-        # tail cleared. A smaller replay batch would otherwise leave [n:]
-        # holding stale ids that the captured store writes; zeroing sends those
-        # rows to slot 0 (the sink).
-        return self.kv_index_translator.fill_capture_write_loc(
-            out=self.cuda_graph_out_cache_loc_full_physical,
-            forward_batch=forward_batch,
-            width=self.cuda_graph_out_cache_loc_full_physical.numel(),
-        )
+        if not self.kv_index_translator.is_translating:
+            return None
+        return forward_batch.out_cache_loc
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""

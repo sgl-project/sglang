@@ -323,6 +323,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and can_use_set_mla_kv_concat_q_fp8()
         )
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """The captured decode's write-loc buffer; see the base class.
+
+        Replay-prep is handed the RAW (unpadded) out_cache_loc
+        (`build_replay_fb_view`) while the captured write kernel consumes the
+        whole buffer, so the full width is requested: the translate clears the
+        tail an earlier larger replay left, sending pad rows to the sink (row
+        0) instead of scattering stale ids into live KV pages. Mirrors the
+        runner's PaddingPolicy.ZERO on its own out_cache_loc slot.
+        """
+        buf = self.cuda_graph_out_cache_loc_kernel
+        if buf is None:
+            return None
+        mode = forward_batch.forward_mode
+        if not (mode.is_decode_or_idle() or mode.is_target_verify()):
+            return None
+        return buf, buf.numel()
+
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
         Calculate padded block count that satisfies both TRT-LLM and Triton constraints.
@@ -761,34 +779,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
 
-        # Out-of-graph on capture AND every replay-prep, so the in-graph
-        # set_mla_kv_buffer captures no translate.
+        # `rebind_write_loc` already translated straight into the buffer this
+        # backend named via `capture_write_loc_dest`, so out_cache_loc IS that
+        # buffer's live view -- capture-stable, nothing to re-stage.
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):
-            # One launch: translate the batch's live prefix straight into the
-            # capture-stable buffer and clear the tail. Replay-prep receives the
-            # RAW (unpadded) out_cache_loc (build_replay_fb_view) while the
-            # captured write kernel consumes the whole buffer, so a stale tail
-            # left by an earlier larger replay would scatter pad-row garbage
-            # into live KV pages; zeroing sends those rows to the sink (row 0),
-            # mirroring the runner's PaddingPolicy.ZERO on its own slot.
-            self._decode_kernel_loc = self.kv_index_translator.fill_capture_write_loc(
-                out=self.cuda_graph_out_cache_loc_kernel,
-                forward_batch=forward_batch,
-                width=self.cuda_graph_out_cache_loc_kernel.numel(),
-            )
+            self._decode_kernel_loc = forward_batch.out_cache_loc
         else:
             self._decode_kernel_loc = None
 
     def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The loc an unfused KV scatter must write at: the capture-stable
-        buffer under a captured unified-pool decode, since the translate
-        rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
-        the batch's own loc everywhere else.
+        """The loc an unfused KV scatter writes at.
+
+        One tensor for every path now: `rebind_write_loc` translated into the
+        buffer this backend named via `capture_write_loc_dest`, so under a
+        captured decode `out_cache_loc` IS that buffer's live view, and
+        elsewhere it is the per-forward tensor. Kept as a named hook because
+        the subclasses call it.
         """
-        if self._decode_kernel_loc is not None:
-            return self._decode_kernel_loc
         return forward_batch.out_cache_loc
 
     def _resolve_fused_write_loc(

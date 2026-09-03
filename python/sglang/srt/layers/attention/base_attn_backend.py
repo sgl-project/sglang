@@ -85,6 +85,18 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """Where this backend needs the unified pool's WRITE loc written, as
+        ``(buffer, width)``, or None for an ordinary per-forward tensor.
+
+        A captured graph baked in a fixed address, so a backend whose in-graph
+        KV store reads its own buffer answers with it and the translate lands
+        there directly -- no second pass, and the padded tail is cleared in the
+        same launch. Asked only on the capture / replay-prep path, where the
+        buffer exists and prep is adjacent to the launch that reads it.
+        """
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 

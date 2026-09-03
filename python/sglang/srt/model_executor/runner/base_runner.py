@@ -636,6 +636,7 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        mr.kv_index_translator.rebind_write_loc(forward_batch, mr.attn_backend)
         mr.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():

@@ -496,7 +496,9 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         write_loc_to_kernel_ids(
             loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=buf, out_width=width
         )
-        self.assertEqual(buf[:3].tolist(), [2 * 128, 5 * 128, 1 * 128])
+        # loc 0 is the reserved padding anchor, so it sinks to kernel id 0
+        # rather than gathering `v2p[0]`.
+        self.assertEqual(buf[:3].tolist(), [0, 5 * 128, 1 * 128])
         self.assertEqual(buf[3:].tolist(), [0] * (width - 3))
 
         # And it must agree with the narrow call on the live prefix.
@@ -509,13 +511,15 @@ class TestFusedWriteLocTranslateCuda(CustomTestCase):
         from sglang.kernels.ops.memory.virtual_slot import write_loc_to_kernel_ids
 
         v2p = torch.tensor([2, 5, -1, 3], dtype=torch.int64, device="cuda")
-        loc = torch.tensor([0, 64, 128, 192], dtype=torch.int64, device="cuda")
+        loc = torch.tensor([64, 128, 192, 0], dtype=torch.int64, device="cuda")
         dst = torch.full_like(loc, -7)
         ret = write_loc_to_kernel_ids(
             loc=loc, v2p=v2p, page_size=64, stride=64 * 2, out=dst
         )
         self.assertIs(ret, dst)
-        self.assertEqual(dst.tolist(), [2 * 128, 5 * 128, 0, 3 * 128])
+        # Two distinct routes to kernel id 0: loc 128 gathers the tombstoned
+        # v2p row, and the trailing loc 0 is the reserved padding anchor.
+        self.assertEqual(dst.tolist(), [5 * 128, 0, 3 * 128, 0])
 
 
 class TestDcpDecodeLayout(CustomTestCase):

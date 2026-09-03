@@ -11,19 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""ForwardBatch construction wires the unified write-loc rebind.
+"""Where the unified write-loc translate is allowed to happen.
 
-`init_new` must call `kv_index_translator.rebind_write_loc`: a construction
-path that skips it ships VIRTUAL write ids to the kernels, a silent
-wrong-slot store. Also runs the REAL `_pad_inputs_to_size` against a live
-translator, since pad lanes are zeros and zeros must derive to the slot-0
-sink. Sliding-window semantics are pinned in test_kv_index_translator.py.
+It belongs at attention-metadata init and nowhere else: construction must
+leave the loc VIRTUAL, and a runner that preps metadata without translating
+first ships VIRTUAL ids to the KV store, a silent wrong-slot store. Also runs
+the REAL `_pad_inputs_to_size` against a live translator, since pad lanes are
+zeros and zeros must derive to the slot-0 sink. Sliding-window semantics are
+pinned in test_kv_index_translator.py.
 
     python -m pytest test/registered/unit/model_executor/test_unified_out_cache_loc_rebind.py -v
 """
 
 import ast
 import inspect
+import pathlib
 import textwrap
 import unittest
 from types import SimpleNamespace
@@ -31,6 +33,7 @@ from unittest.mock import create_autospec
 
 import torch
 
+import sglang.srt.model_executor.runner
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -104,14 +107,52 @@ def _call_names(func) -> list:
 
 
 class TestForwardBatchWiring(CustomTestCase):
-    """Critical-path bookkeeping: the construction-time call sites."""
+    """Where the one write-loc translate is allowed to happen."""
 
-    def test_init_new_calls_the_rebind(self):
-        self.assertIn(
+    def test_init_new_does_not_translate(self):
+        """Construction must leave the loc VIRTUAL.
+
+        The translate moved to attention-metadata-init time so a backend can
+        name a capture-stable destination and be written into directly. It
+        cannot happen here: padding runs in between and `torch.cat`s a fresh
+        tensor, and a shared buffer filled this early would race a still-
+        pending previous step under overlap scheduling.
+        """
+        self.assertNotIn(
             "model_runner.kv_index_translator.rebind_write_loc",
             _call_names(ForwardBatch.init_new.__func__),
-            "init_new must rebind the write loc through the source; a batch "
-            "built without it ships virtual ids to the kernels",
+            "init_new must NOT translate the write loc; the runners do it "
+            "immediately before attention-metadata init",
+        )
+
+    def test_every_runner_that_inits_metadata_also_rebinds(self):
+        """A runner that preps attention metadata without translating first
+        ships VIRTUAL ids to the KV store.
+
+        Coarse on purpose: it is a module-level guard, so a NEW runner that
+        preps metadata and forgets the translate fails here rather than at a
+        write door. `metadata_glue_graph` is exempt by design -- it captures
+        metadata prep itself, so its caller must translate outside the
+        captured region.
+        """
+        runner_dir = pathlib.Path(sglang.srt.model_executor.runner.__file__).parent
+        exempt = {"metadata_glue_graph.py"}
+        offenders = []
+        for path in sorted(runner_dir.glob("*.py")):
+            if path.name in exempt or path.name.startswith("._"):
+                continue
+            # Tolerate junk a file transfer may have dropped alongside the
+            # sources; a real module always decodes.
+            text = path.read_text(errors="ignore")
+            if "attn_backend.init_forward_metadata" not in text:
+                continue
+            if "rebind_write_loc" not in text:
+                offenders.append(path.name)
+        self.assertEqual(
+            offenders,
+            [],
+            "these runners prep attention metadata without translating the "
+            f"write loc first: {offenders}",
         )
 
 
@@ -135,10 +176,12 @@ class TestPadComposesWithDerivation(CustomTestCase):
         fb = _make_fb(virt.clone())
         fb.positions = torch.arange(n, dtype=torch.int64)
         fb.lora_ids = [None] * fb.batch_size
-        src.rebind_write_loc(fb)
-        self.assertTrue(torch.equal(fb.out_cache_loc, v2p[virt]))
-
+        # Production order: pad the VIRTUAL loc, then translate. Padding
+        # appends zeros, and virtual 0 is the reserved anchor, so the pad lanes
+        # derive to the slot-0 sink just as kernel-facing zeros did.
         fb._pad_inputs_to_size(self._fake_runner_for_pad(src), padded, fb.batch_size)
+        self.assertEqual(fb.out_cache_loc.shape[0], padded)
+        src.rebind_write_loc(fb)
 
         self.assertEqual(fb.out_cache_loc.shape[0], padded)
         # Padded tail lanes go to slot 0 -- the reserved dummy-write sink.

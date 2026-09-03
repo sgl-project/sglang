@@ -770,6 +770,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         inside enable_torch_compile_warmup).
         """
         fb, attn_backend = self.capture_prepare(num_tokens)
+        self.model_runner.kv_index_translator.rebind_write_loc(fb, attn_backend)
         attn_backend.init_forward_metadata(fb)
         self._run_forward(fb, num_tokens)
 
@@ -799,6 +800,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             or self.model_runner.model_config.hidden_size
         )
         fb, attn_backend = self.capture_prepare(num_tokens)
+        self.model_runner.kv_index_translator.rebind_write_loc(fb, attn_backend)
         attn_backend.init_forward_metadata(fb)
         deepstack_embeds = torch.zeros(
             (num_tokens, hidden_size * num_deepstack),
@@ -1065,6 +1067,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
+        self.model_runner.kv_index_translator.rebind_write_loc(
+            forward_batch, attn_backend
+        )
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             return
@@ -1104,8 +1109,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            self.model_runner.kv_index_translator.rebind_write_loc(
+                padded_view, attn_backend, for_capture=True
+            )
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
+        self.model_runner.kv_index_translator.rebind_write_loc(
+            forward_batch, attn_backend
+        )
         if not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
@@ -1476,6 +1487,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
         if self._is_full_backend:
             if not prefix_num_chunks:
+                self.model_runner.kv_index_translator.rebind_write_loc(
+                    forward_batch, attn_backend, for_capture=True
+                )
                 attn_backend.init_forward_metadata_out_graph(
                     forward_batch, in_capture=True
                 )

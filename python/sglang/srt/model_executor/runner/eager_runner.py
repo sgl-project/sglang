@@ -255,6 +255,9 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
+            model_runner.kv_index_translator.rebind_write_loc(
+                forward_batch, attn_backend
+            )
             attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
@@ -318,6 +321,9 @@ class EagerRunner(BaseRunner):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
+            model_runner.kv_index_translator.rebind_write_loc(
+                forward_batch, model_runner.attn_backend
+            )
             model_runner.attn_backend.init_forward_metadata(forward_batch)
             model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch,
@@ -450,6 +456,9 @@ class EagerRunner(BaseRunner):
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            model_runner.kv_index_translator.rebind_write_loc(
+                forward_batch, model_runner.attn_backend
+            )
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None

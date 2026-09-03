@@ -1010,6 +1010,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             full_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False
         ) or getattr(linear_attn_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
+    def capture_write_loc_dest(self, forward_batch: ForwardBatch):
+        """Forward to the full-attention backend, which owns the KV write.
+
+        The runner hands the write-loc translate THIS object, so inheriting the
+        base class's None means the inner backend's capture-stable buffer never
+        gets filled -- its captured store then bakes a per-step tensor's address
+        and reads freed memory on replay.
+        """
+        return self.full_attn_backend.capture_write_loc_dest(forward_batch)
+
     @property
     def data_type(self):
         # KV-cache dtype readers (e.g. the trtllm_mla fused-rope check) reach the
