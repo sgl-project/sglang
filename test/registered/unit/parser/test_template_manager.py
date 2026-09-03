@@ -483,6 +483,28 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
         self.assertEqual(config.toggle_param, "enable_thinking")
         self.assertTrue(config.default_enabled)
 
+    def test_k2_horizon_detects_always_on_reasoning_and_tool_parsers(self):
+        template = """
+        {% set tool_call_fmt = tool_call_format | default('xml') %}
+        {% set effort = reasoning_effort | default('high') %}
+        <ifm|think><ifm|think_fast><ifm|think_faster>
+        <ifm|tool_calls><ifm|tool_call>
+        """
+        force, config = detect_reasoning_pattern(template)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertTrue(force)
+        self.assertIsNotNone(config)
+        self.assertEqual(config.special_case, "always")
+        self.assertEqual(
+            detect_reasoning_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+        self.assertEqual(
+            detect_tool_call_parser(template, tokenizer, config, force),
+            "k2_horizon",
+        )
+
 
 class TestToolCallParserDetection(unittest.TestCase):
     """Tests for detect_tool_call_parser() using real model tokenizers."""
