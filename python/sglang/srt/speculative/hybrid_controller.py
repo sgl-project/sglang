@@ -491,8 +491,6 @@ class HybridController(BaseSpecWorker):
             graph_runners[width] = target_graph_runner
             attn_backends[width] = target_attn_backend
 
-        target_runner.hybrid_target_verify_graph_runners = graph_runners
-        target_runner.hybrid_target_verify_attn_backends = attn_backends
         self._target_verify_graph_runners = graph_runners
         self._target_verify_attn_backends = attn_backends
 
@@ -600,8 +598,6 @@ class HybridController(BaseSpecWorker):
 
         if route == "neural":
             self.neural_worker.apply_runtime_state(spec_state)
-            self._active_runtime_state = state
-            return
 
         target_runner.attn_backend = spec_state.target_attn_backend
         target_runner.decode_cuda_graph_runner = spec_state.target_graph_runner

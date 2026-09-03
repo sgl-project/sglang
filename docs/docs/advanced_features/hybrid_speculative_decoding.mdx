@@ -77,6 +77,7 @@ Retrieval is selected for the whole decode batch only when the number of qualify
 Both workers stay live across route switches, so routing can change on the next decode step without rebuilding state:
 
 - The CUDA graph runners and attention backends of both workers are captured at init and switched when the route changes.
+- Each verify width owns a shape-matched graph capture. Compatible buffers use the same registry-managed reuse as adaptive speculative decoding, rather than sharing one route's capture buffers directly.
 - The suffix tree and the EAGLE draft KV are updated with accepted tokens every step, so either worker can be picked on the next step.
 - The prompt is inserted into the NGRAM trie, so drafts can also match against the input.
 

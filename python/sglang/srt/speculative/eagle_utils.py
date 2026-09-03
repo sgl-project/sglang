@@ -507,23 +507,6 @@ def get_draft_recurrent_hidden_state_spec(
     )
 
 
-def get_target_verify_attn_backend(target_worker: TpModelWorker, draft_token_num: int):
-    """Return the attention backend paired with a Hybrid verify width.
-
-    Hybrid owns one target-verify CUDA graph per draft width. Tree-mask
-    preparation and post-draft metadata updates must use the backend captured
-    with that graph; otherwise they write one static buffer and replay another.
-    """
-    graph_runners = getattr(
-        target_worker.model_runner, "hybrid_target_verify_graph_runners", None
-    )
-    if graph_runners is not None:
-        graph_runner = graph_runners.get(draft_token_num)
-        if graph_runner is not None:
-            return graph_runner.attn_backend
-    return target_worker.model_runner.attn_backend
-
-
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
@@ -591,17 +574,9 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
     )
 
-    # Hybrid captures one target-verify graph per configured source width.
-    # The runners reuse physical buffers sized to the widest route while their
-    # attention metadata and replay graph remain shape-specific.
-    target_graph_runners = getattr(
-        target_worker.model_runner, "hybrid_target_verify_graph_runners", None
-    )
-    cuda_graph_runner = (
-        target_graph_runners.get(verify_input.draft_token_num)
-        if target_graph_runners is not None
-        else target_worker.model_runner.decode_cuda_graph_runner
-    )
+    # The active speculative runtime state installs its verify graph before
+    # this preparation step, following the adaptive runtime-state contract.
+    cuda_graph_runner = target_worker.model_runner.decode_cuda_graph_runner
     can_run_cuda_graph = bool(
         cuda_graph_runner and cuda_graph_runner.can_run_graph(verify_forward_batch)
     )
@@ -996,8 +971,6 @@ def eagle_sample(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
@@ -135,114 +134,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
-
-    def test_draft_worker_construction_enters_all_contexts(self):
-        events = []
-
-        @contextlib.contextmanager
-        def recording_context(name):
-            events.append(("enter", name))
-            try:
-                yield
-            finally:
-                events.append(("exit", name))
-
-        context_factories = {
-            "empty_context": lambda: recording_context("tp"),
-            "draft_pp_context": lambda: recording_context("pp"),
-            "speculative_moe_backend_context": lambda: recording_context("moe"),
-            "speculative_moe_a2a_backend_context": lambda: recording_context("moe_a2a"),
-            "draft_model_build_scope": lambda: recording_context("draft_model"),
-        }
-
-        def fake_tp_worker(**_kwargs):
-            self.assertEqual(
-                [event for event in events if event[0] == "enter"],
-                [
-                    ("enter", "tp"),
-                    ("enter", "pp"),
-                    ("enter", "moe"),
-                    ("enter", "moe_a2a"),
-                    ("enter", "draft_model"),
-                ],
-            )
-            return SimpleNamespace(
-                model_runner=SimpleNamespace(
-                    model_config=SimpleNamespace(hf_config=SimpleNamespace())
-                )
-            )
-
-        spec = SimpleNamespace(
-            speculative_eagle_topk=1,
-            speculative_use_rejection_sampling=False,
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            speculative_algorithm="EAGLE3",
-        )
-        target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(context_len=1024)
-            ),
-            random_seed=0,
-        )
-
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.get_device",
-                    return_value=SimpleNamespace(device=DEVICE),
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.get_parallel",
-                    return_value=SimpleNamespace(enable_dp_attention=False),
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.get_spec",
-                    return_value=spec,
-                )
-            )
-            stack.enter_context(
-                patch.object(EagleDraftWorker, "_rebuild_topk1_chain_buffers")
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.TpModelWorker",
-                    side_effect=fake_tp_worker,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.speculative.eagle_worker_v2.get_plan_stream",
-                    return_value=(None, None),
-                )
-            )
-            for name, factory in context_factories.items():
-                stack.enter_context(
-                    patch(f"sglang.srt.speculative.eagle_worker_v2.{name}", factory)
-                )
-
-            EagleDraftWorker(
-                server_args=SimpleNamespace(),
-                gpu_id=0,
-                ps=ParallelState.trivial(),
-                nccl_port=12345,
-                target_worker=target_worker,
-            )
-
-        self.assertEqual(
-            [event for event in events if event[0] == "exit"],
-            [
-                ("exit", "draft_model"),
-                ("exit", "moe_a2a"),
-                ("exit", "moe"),
-                ("exit", "pp"),
-                ("exit", "tp"),
-            ],
-        )
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)

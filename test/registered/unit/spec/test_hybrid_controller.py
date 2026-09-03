@@ -164,6 +164,8 @@ class TestHybridRuntimeSwitch(CustomTestCase):
         controller._target_prefill_attn_backend = "target-prefill"
 
         def apply_runtime_state(state):
+            if neural_worker._active_runtime_state is state:
+                return
             neural_worker.speculative_num_steps = state.speculative_num_steps
             neural_worker.speculative_num_draft_tokens = (
                 state.speculative_num_draft_tokens
@@ -221,6 +223,9 @@ class TestHybridRuntimeSwitch(CustomTestCase):
         self.controller._apply_runtime_state("neural")
 
         self.assertEqual(self.target_runner.attn_backend, "target-step7")
+        self.assertEqual(
+            self.target_runner.decode_cuda_graph_runner, "target-graph-step7"
+        )
         self.assertEqual(self.draft_worker.cuda_graph_runner, "draft-graph-step7")
         self.assertEqual(
             self.draft_worker.cuda_graph_runner_for_draft_extend,
@@ -240,10 +245,115 @@ class TestHybridRuntimeSwitch(CustomTestCase):
         self.controller._apply_runtime_state("retrieval")
 
         self.assertEqual(self.neural_worker.speculative_num_steps, 7)
+        self.assertEqual(self.target_runner.attn_backend, "target-retrieval")
+        self.assertEqual(
+            self.target_runner.decode_cuda_graph_runner, "target-graph-retrieval"
+        )
         self.assertEqual(
             self.draft_worker.cuda_graph_runner_for_draft_extend,
             "extend-graph-retrieval",
         )
+
+    def test_retrieval_to_neural_restores_target_verify_resources(self):
+        neural_spec_state = _runtime_state("neural", steps=3, width=4)
+        self.controller._runtime_states = {
+            ("neural", 3): HybridRuntimeState(
+                "neural", self.neural_worker, neural_spec_state
+            ),
+            ("retrieval", None): HybridRuntimeState(
+                "retrieval",
+                SimpleNamespace(),
+                _runtime_state("retrieval", steps=5, width=6),
+            ),
+        }
+
+        self.controller._apply_runtime_state("neural")
+        self.controller._apply_runtime_state("retrieval")
+        self.controller._apply_runtime_state("neural")
+
+        # EAGLE's second apply is a no-op because it still considers the neural
+        # state active. The outer controller must restore target verify itself.
+        self.assertEqual(self.target_runner.attn_backend, "target-neural")
+        self.assertEqual(
+            self.target_runner.decode_cuda_graph_runner, "target-graph-neural"
+        )
+
+
+class TestHybridGraphResources(CustomTestCase):
+    @patch(
+        "sglang.srt.speculative.hybrid_controller.speculative_moe_a2a_backend_context",
+        return_value=nullcontext(),
+    )
+    @patch(
+        "sglang.srt.speculative.hybrid_controller.speculative_moe_backend_context",
+        return_value=nullcontext(),
+    )
+    def test_draft_extend_resources_do_not_inject_primary_buffers(self, _moe, _moe_a2a):
+        draft_worker = SimpleNamespace(
+            draft_extend_attn_backend="extend-4",
+            cuda_graph_runner_for_draft_extend="extend-graph-4",
+            draft_runner=SimpleNamespace(tp_group=object()),
+            draft_tp_context=MagicMock(return_value=nullcontext()),
+            build_draft_extend_runtime_resource=MagicMock(
+                return_value=("extend-6", "extend-graph-6")
+            ),
+        )
+        controller = object.__new__(HybridController)
+        controller.neural_worker = SimpleNamespace(
+            speculative_num_draft_tokens=4,
+            adaptive_runtime_states={},
+            draft_worker=draft_worker,
+        )
+        controller._runtime_widths = (4, 6)
+
+        controller._init_draft_extend_resources()
+
+        draft_worker.build_draft_extend_runtime_resource.assert_called_once_with(
+            num_tokens_per_bs=6
+        )
+        self.assertEqual(
+            controller._draft_extend_resources,
+            {
+                4: ("extend-4", "extend-graph-4"),
+                6: ("extend-6", "extend-graph-6"),
+            },
+        )
+
+    def test_target_verify_resources_use_width_local_graph_construction(self):
+        target_runner = SimpleNamespace(
+            init_new_workspace=False,
+            _get_attention_backend=MagicMock(return_value="target-4"),
+        )
+        graph4 = object()
+        bootstrap_graph = object()
+        controller = object.__new__(HybridController)
+        controller._target_worker = SimpleNamespace(model_runner=target_runner)
+        controller.neural_worker = SimpleNamespace(
+            adaptive_runtime_states={},
+            _override_worker_state=MagicMock(return_value=nullcontext()),
+        )
+        controller._runtime_widths = (4, 6)
+
+        with patch(
+            "sglang.srt.model_executor.runner.DecodeCudaGraphRunner",
+            return_value=graph4,
+        ) as graph_runner:
+            controller._init_target_verify_resources(
+                bootstrap_width=6,
+                bootstrap_graph_runner=bootstrap_graph,
+                bootstrap_attn_backend="target-6",
+            )
+
+        graph_runner.assert_called_once_with(
+            target_runner,
+            attn_backend="target-4",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+        self.assertIs(controller._target_verify_graph_runners[4], graph4)
+        self.assertIs(controller._target_verify_graph_runners[6], bootstrap_graph)
+        self.assertFalse(hasattr(target_runner, "hybrid_target_verify_graph_runners"))
+        self.assertFalse(hasattr(target_runner, "hybrid_target_verify_attn_backends"))
 
 
 class TestHybridDraftInputRelay(CustomTestCase):

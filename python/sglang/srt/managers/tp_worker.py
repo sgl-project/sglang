@@ -599,7 +599,6 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
-        skip_cuda_graph: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         if batch is not None:
@@ -621,15 +620,6 @@ class TpModelWorker(BaseTpWorker):
 
         # Deprecated kwarg: pre-planners mark the batch themselves now.
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
-        if skip_cuda_graph:
-            forward_batch.disable_cuda_graph = True
-        elif is_verify:
-            graph_runners = getattr(
-                self.model_runner, "hybrid_target_verify_graph_runners", None
-            )
-            source_width = getattr(forward_batch.spec_info, "draft_token_num", None)
-            if graph_runners is not None and source_width in graph_runners:
-                forward_batch.cuda_graph_runner = graph_runners[source_width]
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
