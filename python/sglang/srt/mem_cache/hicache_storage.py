@@ -129,7 +129,7 @@ class PoolTransferResult:
     extra_pool_hit_pages: dict[str, int]
 
     # Pools with TRAILING_PAGES (SWA, Mamba state) only hold a window that ends on an
-    # offloaded node boundary.
+    # offloaded node boundary, so 5 can be restorable while 4 and 3 are not.
     # Each rank owns its own shard and may hold a different set, so reducing a
     # per-rank maximum would pick a length that is illegal on another rank; the
     # caller intersects these sets instead.
