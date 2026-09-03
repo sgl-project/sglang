@@ -10,6 +10,7 @@
 
 mod common;
 
+mod bucket_routing;
 mod cache_aware_input_ids;
 mod chat_routing;
 mod external_indexer_routing;
