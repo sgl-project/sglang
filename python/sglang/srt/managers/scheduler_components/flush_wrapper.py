@@ -63,7 +63,7 @@ class SchedulerFlushWrapper:
                 FlushCacheReqOutput(
                     success=False,
                     message=(
-                        "Timed out waiting for idle state. " f"blocked-by: {blocked_by}"
+                        f"Timed out waiting for idle state. blocked-by: {blocked_by}"
                     ),
                 ),
                 pending_req,
