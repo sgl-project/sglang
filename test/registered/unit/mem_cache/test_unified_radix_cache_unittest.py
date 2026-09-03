@@ -8713,6 +8713,12 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
     def test_write_through_eviction_counts_unbacked_tokens(self):
+        if _selected_tree_core_test_backend() == "rust":
+            # The unbacked-eviction tracker is a Python tree-core feature;
+            # UnifiedRadixCache only enables it for that backend.
+            self.skipTest(
+                "write-through unbacked-eviction tracking is Python-core only"
+            )
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
         cache.metrics_collector = mock.Mock()
