@@ -1362,6 +1362,27 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if pre_warmup and validate_only:
             raise ValueError("static placement cannot be validation-only")
         records = list(self._auto_residency_warmup_records)
+        if self.is_output_rank:
+            # The regression check compares request durations extrapolated from
+            # these few steps, so a rollback is only explainable with them.
+            for record in records:
+                logger.info(
+                    "Auto residency calibration record: %dx%dx%df steps=%d ok=%s "
+                    "total=%.1fs stages=%s steps_ms=%s iterations=%s",
+                    record.width,
+                    record.height,
+                    record.num_frames,
+                    record.num_inference_steps,
+                    record.succeeded,
+                    record.total_duration_ms / 1000.0,
+                    {
+                        name: round(ms / 1000.0, 2)
+                        for name, ms in record.stage_duration_ms.items()
+                        if ms >= 100.0
+                    },
+                    [round(ms) for ms in record.step_duration_ms],
+                    record.stage_iterations,
+                )
         # Each round must describe one placement. Intersecting phase ownership
         # across old and newly adjusted layouts would double-count weights that
         # are already resident in the new layout.
