@@ -66,6 +66,7 @@ from sglang.srt.configs.step3_vl import (
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
+from sglang.srt.configs.xingchen4 import XingChen4Config
 from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
@@ -121,6 +122,7 @@ __all__ = [
     "Spark2_5Config",
     "Step3p7Config",
     "Qwen3ASRConfig",
+    "XingChen4Config",
     "InklingAudioConfig",
     "InklingMMConfig",
     "InklingModelConfig",
