@@ -173,7 +173,9 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
         (
             scheduler._pd_role_switch_unhealthy,
             False,
-            lambda: "instance is unhealthy after a failed role switch; restart required",
+            lambda: (
+                "instance is unhealthy after a failed role switch; restart required"
+            ),
         ),
         (
             scheduler._pd_role_switch_in_progress,
@@ -193,14 +195,18 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
         (
             km is not None and not km.supports_role_switch,
             True,
-            lambda: f"transfer backend {get_disagg().disaggregation_transfer_backend!r} "
-            "does not support runtime role switch",
+            lambda: (
+                f"transfer backend {get_disagg().disaggregation_transfer_backend!r} "
+                "does not support runtime role switch"
+            ),
         ),
         (
             getattr(km, "enable_staging", False),
             True,
-            lambda: "staging buffer (SGLANG_DISAGG_STAGING_BUFFER) is not "
-            "supported with runtime role switch",
+            lambda: (
+                "staging buffer (SGLANG_DISAGG_STAGING_BUFFER) is not "
+                "supported with runtime role switch"
+            ),
         ),
     )
     return next(
