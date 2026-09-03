@@ -1096,6 +1096,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         dcp_size: int,
         dcp_rank: int = 0,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """One launch for the read and write conversions alike.
 
@@ -1108,10 +1109,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"translate_kv_loc_for_kernel: out= dtype must be int64 (matches v2p), "
                 f"got {out.dtype}"
             )
-            assert out.shape == loc.shape, (
-                f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
-                f"match virt_tokens shape {tuple(loc.shape)}"
-            )
+            if out_width is None:
+                assert out.shape == loc.shape, (
+                    f"translate_kv_loc_for_kernel: out= shape {tuple(out.shape)} must "
+                    f"match virt_tokens shape {tuple(loc.shape)}"
+                )
         return write_loc_to_kernel_ids(
             loc=loc,
             v2p=self.virtual_to_physical,
@@ -1120,6 +1122,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
             out=out,
+            out_width=out_width,
         )
 
     def translate_write_loc_for_kernel(
@@ -1127,6 +1130,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         widened_loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc (`out_cache_loc`) -> kernel-facing id.
 
@@ -1144,6 +1148,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 dcp_size=dcp_size,
                 dcp_rank=parallel.attn_dcp_rank,
                 out=out,
+                out_width=out_width,
             )
 
     # -- alloc --
@@ -2992,9 +2997,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> DENSE id; see the sub-allocator's copy."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
 
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
@@ -3461,11 +3469,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         loc: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        out_width: Optional[int] = None,
     ) -> torch.Tensor:
         """Widened virtual WRITE loc -> kernel-facing id; see the sub-allocator's
         copy. DCP is rejected for this composite at argument validation, so this
         is the dcp_size == 1 identity with the read translate."""
-        return self.full_attn_allocator.translate_write_loc_for_kernel(loc, out=out)
+        return self.full_attn_allocator.translate_write_loc_for_kernel(
+            loc, out=out, out_width=out_width
+        )
 
     @property
     def swa_kernel_page_multiplier(self) -> int:
