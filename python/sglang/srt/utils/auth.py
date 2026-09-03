@@ -25,6 +25,14 @@ class AuthLevel(str, Enum):
     ADMIN_FORCE = "admin_force"
 
 
+def _normalize_auth_level(level: Any) -> AuthLevel:
+    """Normalize route metadata that may come from a reloaded auth module."""
+    try:
+        return AuthLevel(level)
+    except (TypeError, ValueError):
+        return AuthLevel.NORMAL
+
+
 def auth_level(level: AuthLevel):
     """Mark endpoint with auth level (stored in endpoint metadata)."""
 
@@ -54,7 +62,7 @@ def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
         if match == Match.FULL:
             endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
             level = getattr(endpoint, "_auth_level", None)
-            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+            return _normalize_auth_level(level)
 
     return AuthLevel.NORMAL
 
@@ -66,7 +74,10 @@ def app_has_admin_force_endpoints(app: Any) -> bool:
     )
     for route in routes:
         endpoint = getattr(route, "endpoint", None)
-        if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
+        if (
+            _normalize_auth_level(getattr(endpoint, "_auth_level", None))
+            == AuthLevel.ADMIN_FORCE
+        ):
             return True
     return False
 
