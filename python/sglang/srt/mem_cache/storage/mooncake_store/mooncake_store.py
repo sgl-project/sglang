@@ -277,7 +277,7 @@ class MooncakeBaseStore:
                 "to run SGLang with MooncakeConnector."
             ) from e
 
-    def _import_mooncake_group_semantics(self):
+    def _import_mooncake_replicate_config(self):
         try:
             from mooncake.store import ReplicateConfig
         except ImportError:
@@ -382,7 +382,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         MooncakeBaseStore.__init__(self)
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
-            self._import_mooncake_group_semantics()
+            self._import_mooncake_replicate_config()
         )
         try:
             self.store = MooncakeDistributedStore()
@@ -398,6 +398,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if extra_config
                 else False
             )
+            self.process_local_first = bool(
+                extra_config.get("process_local_first", False)
+                if extra_config
+                else False
+            )
+            self._preferred_put_segment = None
+            if self.process_local_first:
+                if self.config.standalone_storage:
+                    raise RuntimeError(
+                        "process_local_first is unsupported with standalone storage"
+                    )
+                if self._replicate_config_cls is None:
+                    raise RuntimeError("process_local_first requires ReplicateConfig")
+                replicate_config = self._replicate_config_cls()
+                if not hasattr(replicate_config, "preferred_segments"):
+                    raise RuntimeError(
+                        "The installed Mooncake version does not support "
+                        "ReplicateConfig.preferred_segments"
+                    )
             self._use_group_semantics = (
                 self.enable_group_semantics
                 and self._supports_group_ids
@@ -548,6 +567,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
             logger.info("Mooncake store setup successfully.")
+
+            if self.process_local_first:
+                self._preferred_put_segment = self.store.get_hostname()
+                logger.info(
+                    "Preferring the process-local Mooncake segment for PUT: %s",
+                    self._preferred_put_segment,
+                )
 
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0
@@ -1326,6 +1352,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             config = self._replicate_config_cls()
             config.group_ids = group_ids
+
+        if self._preferred_put_segment is not None:
+            config = config or self._replicate_config_cls()
+            config.preferred_segments = [self._preferred_put_segment]
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
