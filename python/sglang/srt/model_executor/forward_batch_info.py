@@ -1291,6 +1291,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    @property
+    def logical_forward_mode(self) -> ForwardMode:
+        """The mode these rows actually carry.
+
+        ``prepare_mlp_sync_batch`` may relabel a decode batch as a 1-token
+        extend so every DP rank presents one shape to the collectives.
+        Consumers that need the decode semantics behind the label -- mamba
+        state updates, linear-attention gates -- read through it here.
+        """
+        original = self._original_forward_mode
+        if (
+            original is not None
+            and original.is_decode()
+            and self.forward_mode.is_extend()
+        ):
+            return original
+        return self.forward_mode
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1413,16 +1431,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
-                # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                # empty (idle) rank. Non-hybrid ranks reach it once MAX_LEN is
+                # forced for the prefill breakable CUDA graph (idle + prefill),
+                # which needs every DP rank to run the same captured shape.
+                # The `else` branch handles decode rows padded to a 1-token
+                # extend: full attention runs them as real 1-token extends,
+                # while the mamba layers read back through the relabel via
+                # logical_forward_mode.
+                if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert (
-                        self.seq_lens.shape[0] == 0
-                    ), "extend-idle conversion expects an empty rank"
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev

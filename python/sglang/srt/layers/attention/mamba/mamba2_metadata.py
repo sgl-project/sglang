@@ -219,7 +219,10 @@ class Mamba2Metadata(ForwardMetadata):
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
-        if forward_batch.extend_num_tokens is None:
+        if (
+            forward_batch.extend_num_tokens is None
+            or forward_batch.logical_forward_mode.is_decode()
+        ):
             draft_token_num = (
                 forward_batch.spec_info.draft_token_num
                 if forward_batch.spec_info is not None

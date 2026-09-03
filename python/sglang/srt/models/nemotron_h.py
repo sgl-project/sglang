@@ -689,7 +689,6 @@ class NemotronHAttention(nn.Module):
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_idle()
-            or forward_batch._original_forward_mode is not None
         )
         original_out_cache_loc = forward_batch.out_cache_loc
 
