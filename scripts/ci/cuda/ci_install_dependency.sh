@@ -309,6 +309,16 @@ setup_cargo_cache() {
         mkdir -p "${CARGO_TARGET_DIR}"
     fi
 
+    local build_dir torch_lib
+    for build_dir in "${CARGO_TARGET_DIR}"/*/build/torch-sys-*; do
+        [ -f "${build_dir}/output" ] || continue
+        torch_lib="$(sed -n '/^cargo:libtorch_lib=/{s///p;q;}' "${build_dir}/output")"
+        if [ -n "${torch_lib}" ] && [ ! -d "${torch_lib}" ]; then
+            echo "torch-sys cached a libtorch dir that is gone (${torch_lib}); forcing a rebuild"
+            rm -rf "${build_dir}" "${build_dir%/build/*}/.fingerprint/${build_dir##*/}"
+        fi
+    done
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
