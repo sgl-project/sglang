@@ -10,6 +10,11 @@ import tvm_ffi
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 _MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
+_GLOBAL_TREE_MODE_MAP = {
+    "disabled": 0,
+    "path_probability": 1,
+    "specificity_path_probability": 2,
+}
 
 
 def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -31,6 +36,7 @@ def get_ngram_corpus_cls():
             "ngram_corpus/result.cpp",
             "ngram_corpus/trie.cpp",
             "ngram_corpus/suffix_automaton.cpp",
+            "ngram_corpus/global_tree.cpp",
             "ngram_corpus/ngram.cpp",
             "ngram_corpus/ngram_corpus_ffi.cpp",
         ],
@@ -52,11 +58,19 @@ def get_ngram_corpus_cls():
             match_type: str,
             external_sam_budget: int = 0,
             external_corpus_max_tokens: int = 10000000,
+            global_tree_mode: str = "specificity_path_probability",
         ) -> None:
             mt = _MATCH_TYPE_MAP.get(match_type)
             if mt is None:
                 raise ValueError(
                     f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
+                )
+            gtm = _GLOBAL_TREE_MODE_MAP.get(global_tree_mode)
+            if gtm is None:
+                raise ValueError(
+                    f"Unknown global_tree_mode: '{global_tree_mode}'. Must be "
+                    "'disabled', 'path_probability', or "
+                    "'specificity_path_probability'."
                 )
             self.__ffi_init__(
                 capacity,
@@ -67,6 +81,7 @@ def get_ngram_corpus_cls():
                 mt,
                 external_sam_budget,
                 external_corpus_max_tokens,
+                gtm,
             )
             self._draft_token_num = draft_token_num
 

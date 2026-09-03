@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -12,9 +13,12 @@ namespace sglang {
 
 namespace ngram {
 
+class SuffixAutomaton;
+
 struct SamAnchor {
+  const SuffixAutomaton* sam = nullptr;
   int state = 0;
-  int32_t matched_len = 0;
+  int32_t matched_length = 0;
 };
 
 struct SamState {
@@ -23,8 +27,15 @@ struct SamState {
   std::unordered_map<int32_t, int> next;
   uint64_t occ_count = 0;
   int64_t max_end_pos = -1;
+  uint64_t outgoing_occurrence_mass = 0;
   std::vector<std::pair<int32_t, int>> children_by_freq;
   std::vector<std::pair<int32_t, int>> children_by_recency;
+};
+
+struct SamFrequencyTransition {
+  int32_t token = 0;
+  int state = 0;
+  uint64_t mass = 0;
 };
 
 class SuffixAutomaton {
@@ -50,6 +61,10 @@ class SuffixAutomaton {
 
   Result buildFrequency(
       const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
+
+  std::optional<SamAnchor> longestExpandableMatch(const int32_t* context, size_t len, size_t max_depth) const;
+
+  uint64_t frequencyTransitions(int state, size_t max_breadth, std::vector<SamFrequencyTransition>& ranked) const;
 
  private:
   void reset_();
