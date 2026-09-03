@@ -339,6 +339,9 @@ impl Cli {
                 "--max-in-flight and `--filter overloaded` require each other"
             ));
         }
+        if self.max_in_flight == Some(0) {
+            return Err(anyhow!("--max-in-flight must be greater than 0"));
+        }
         if self.prefix_cache_min_share.is_some() != has(FilterKind::PrefixCache) {
             return Err(anyhow!(
                 "--prefix-cache-min-share and `--filter prefix_cache` require each other"
@@ -349,6 +352,9 @@ impl Cli {
             .is_some_and(|s| !(s > 0.0 && s <= 1.0))
         {
             return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
+        }
+        if self.policy == PolicyKind::Sticky && !self.filter.is_empty() {
+            return Err(anyhow!("--filter cannot be combined with --policy sticky"));
         }
         let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
             filters: self.filter.clone(),
@@ -1332,7 +1338,7 @@ mod tests {
 
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
-        let cases: [(&[&str], &str); 6] = [
+        let cases: [(&[&str], &str); 8] = [
             (&["--filter", "overloaded"], "require each other"),
             (&["--max-in-flight", "64"], "require each other"),
             (&["--filter", "prefix_cache"], "require each other"),
@@ -1349,6 +1355,21 @@ mod tests {
                     "0.0",
                 ],
                 "must be in (0, 1]",
+            ),
+            (
+                &["--filter", "overloaded", "--max-in-flight", "0"],
+                "must be greater than 0",
+            ),
+            (
+                &[
+                    "--policy",
+                    "sticky",
+                    "--filter",
+                    "overloaded",
+                    "--max-in-flight",
+                    "1",
+                ],
+                "cannot be combined with --policy sticky",
             ),
         ];
         for (extra, want) in cases {

@@ -57,6 +57,7 @@ pub fn build_policy(
     block_size_oracle: Arc<BlockSizeOracle>,
     engine_load: Arc<EngineLoadTable>,
 ) -> Result<Arc<dyn Policy>> {
+    validate_eligibility(model)?;
     let inner = build_kind(
         model.policy,
         model,
@@ -73,6 +74,26 @@ pub fn build_policy(
         filters.push(build_filter(kind, model, &tree, &block_size_oracle));
     }
     Ok(Arc::new(Pipeline::new(filters, inner)?))
+}
+
+/// Reject configurations that can bypass CLI validation when constructed in code.
+fn validate_eligibility(model: &ModelConfig) -> Result<()> {
+    let Some(eligibility) = model.eligibility.as_ref().filter(|e| !e.filters.is_empty()) else {
+        return Ok(());
+    };
+
+    if model.policy == PolicyKind::Sticky {
+        return Err(anyhow!(
+            "eligibility filters cannot be combined with sticky policy"
+        ));
+    }
+    if eligibility.filters.contains(&FilterKind::Overloaded)
+        && eligibility.max_in_flight.unwrap_or(0) == 0
+    {
+        return Err(anyhow!("max_in_flight must be greater than 0"));
+    }
+
+    Ok(())
 }
 
 /// Build one policy kind with the shared model dependencies.
@@ -470,27 +491,39 @@ mod tests {
     }
 
     #[test]
-    fn fused_score_accepts_an_outer_eligibility_pipeline() {
-        let mut cfg = cfg_with_model("modelA", PolicyKind::FusedScore);
-        cfg.model.fused = Some(vec![crate::config::FusedTerm {
-            kind: ScoreTermKind::LoadBased,
-            weight: None,
-        }]);
+    fn factory_rejects_missing_or_zero_overloaded_capacity() {
+        for max_in_flight in [None, Some(0)] {
+            let mut cfg = cfg_with_model("modelA", PolicyKind::FusedScore);
+            cfg.model.fused = Some(vec![crate::config::FusedTerm {
+                kind: ScoreTermKind::LoadBased,
+                weight: None,
+            }]);
+            cfg.model.eligibility = Some(EligibilityConfig {
+                filters: vec![FilterKind::Overloaded],
+                max_in_flight,
+                min_prefix_share: None,
+            });
+
+            let error = build_registry_with_defaults(&cfg)
+                .expect_err("overloaded capacity must be positive at construction");
+            let message = error.to_string();
+            assert!(message.contains("max_in_flight must be greater than 0"));
+        }
+    }
+
+    #[test]
+    fn factory_rejects_sticky_eligibility_pipeline() {
+        let mut cfg = cfg_with_model("modelA", PolicyKind::Sticky);
         cfg.model.eligibility = Some(EligibilityConfig {
             filters: vec![FilterKind::Overloaded],
-            max_in_flight: Some(0),
+            max_in_flight: Some(2),
             min_prefix_share: None,
         });
 
-        let policy = build_registry_with_defaults(&cfg)
-            .expect("an outer filter must not make fused terms non-fusable")
-            .get(&ModelId("modelA".into()))
-            .unwrap();
-        let workers = vec![worker("w0"), worker("w1")];
-        let model = ModelId("modelA".into());
-        assert!(policy
-            .select(&workers, &SelectionContext::new(&model, None))
-            .is_none());
+        let error = build_registry_with_defaults(&cfg)
+            .expect_err("sticky assignments cannot be wrapped by eligibility filters");
+        let message = error.to_string();
+        assert!(message.contains("eligibility filters cannot be combined with sticky"));
     }
 
     #[test]

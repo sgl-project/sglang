@@ -99,11 +99,10 @@ pub fn admit<'f>(
             match on_empty {
                 OnEmpty::Hold => return None,
                 OnEmpty::Abstain if untouched => {
-                    tracing::warn!(
+                    tracing::debug!(
                         filter = ?filter,
                         n_workers = workers.len(),
-                        "eligibility filter rejected every worker on its own; a filter \
-                         with no signal should abstain (all true), not veto the fleet",
+                        "eligibility filter has no eligible workers; falling back to the full candidate set",
                     );
                     continue;
                 }
