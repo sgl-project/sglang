@@ -2245,6 +2245,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             device=k_nope.device,
         )
         return q, k_placeholder
+
     @staticmethod
     def _split_kv_b_weight_loader(param, loaded_weight) -> None:
         from torch.nn.parameter import UninitializedParameter
