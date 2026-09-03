@@ -107,6 +107,11 @@ PAGEABLE_H2D_COST_MULTIPLIER = 3
 # whole cycle is re-read from the drive: ~1 GiB/s against the 24 GiB/s the
 # transfer model assumes for pinned copies.
 DISK_MISS_COST_MULTIPLIER = 24
+# On a shared pool a stage-resident set is re-armed from its mapping on every
+# request, so it is only offered for a component small enough to arm cheaply
+# and re-streamed often enough per request for the arm to pay for itself.
+SHARED_POOL_STAGE_RESIDENT_MAX_BYTES = 16 * 1024**3
+SHARED_POOL_STAGE_RESIDENT_MIN_USES = 4
 AUTO_PLACEMENT_LATENCY_TOLERANCE_NS = 0
 # Allow normal measurement noise, but undo a round whose calibrated request is
 # materially slower than the original layout.
@@ -1524,6 +1529,7 @@ def layerwise_streamed_mapped_bytes(modules: Mapping[str, object]) -> int:
 def _shared_pool_resident_targets(
     targets: Iterable[tuple[int, ...]],
     current_resident_layers: tuple[int, ...] | None,
+    keep: Iterable[tuple[int, ...]] = (),
 ) -> list[tuple[int, ...]]:
     """Resident-layer layouts worth offering when host and device share one pool.
 
@@ -1535,9 +1541,10 @@ def _shared_pool_resident_targets(
     layout remain; permanent residency is a separate, transition-budgeted
     option.
     """
+    keep = list(keep)
     kept = []
-    for target in targets:
-        if target == current_resident_layers or not any(target):
+    for target in list(targets) + keep:
+        if target == current_resident_layers or not any(target) or target in keep:
             if target not in kept:
                 kept.append(target)
     return kept
@@ -2718,8 +2725,22 @@ def collect_residency_targets(
             current_resident_layers=current_resident_layers,
         )
         if shared_memory_pool:
+            # The exception to "no stage residency on a shared pool": a small
+            # component whose layers run many times per request (the H3 video
+            # VAE decodes ~200 tiles through its 36 layers) re-streams its
+            # whole mapping on every pass; arming it once per request costs
+            # its size and saves every pass but the first.
+            max_layer_uses = max(
+                (max(counts) for counts in (layer_uses or ()) if counts), default=0
+            )
+            keep_full = (
+                [tuple(manager.num_layers for manager in managers)]
+                if max_layer_uses >= SHARED_POOL_STAGE_RESIDENT_MIN_USES
+                and managed_weight_bytes <= SHARED_POOL_STAGE_RESIDENT_MAX_BYTES
+                else []
+            )
             resident_layer_targets = _shared_pool_resident_targets(
-                resident_layer_targets, current_resident_layers
+                resident_layer_targets, current_resident_layers, keep=keep_full
             )
         layerwise_layouts = [
             (target_resident_layers, target_policies)

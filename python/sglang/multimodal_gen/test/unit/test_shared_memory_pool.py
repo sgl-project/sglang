@@ -650,3 +650,19 @@ def test_direct_reader_locates_mapped_tensors_and_reads_them(tmp_path):
         assert bytes(buffer[skew : skew + 16]) == payload[4100:4116].tobytes()
     finally:
         reader.close()
+
+
+def test_shared_pool_keeps_the_full_layout_when_asked():
+    targets = [(0,), (12,), (24,), (36,)]
+    assert auto_residency._shared_pool_resident_targets(targets, (0,)) == [(0,)]
+    assert auto_residency._shared_pool_resident_targets(
+        targets, (0,), keep=[(36,)]
+    ) == [
+        (0,),
+        (36,),
+    ]
+    # A full layout not among the frontier is still offered when kept.
+    assert auto_residency._shared_pool_resident_targets([(0,)], (0,), keep=[(36,)]) == [
+        (0,),
+        (36,),
+    ]

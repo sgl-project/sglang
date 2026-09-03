@@ -444,6 +444,11 @@ def _shared_pool_hosting(
 
 _DIRECT_ALIGN = 4096
 _DIRECT_CHUNK = 64 << 20
+# Components smaller than this keep the page-cache path: their pages fit the
+# cache next to a resident DiT, and a component re-streamed many times per
+# request (the H3 video VAE: 36 layers, 4.5 GiB, ~200 passes per decode)
+# must not go to the drive on every pass.
+MAPPED_DIRECT_READ_MIN_BYTES = 8 * 1024**3
 
 
 class _DirectReader:
@@ -1848,6 +1853,7 @@ class LayerwiseOffloadManager:
                 direct_read=(
                     host_copies_are_redundant()
                     and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
+                    and self._mapped_bytes >= MAPPED_DIRECT_READ_MIN_BYTES
                 ),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
