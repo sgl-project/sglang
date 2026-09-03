@@ -211,7 +211,7 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
         )
 
     def get_key_buffer(self, layer_id: int):
-        return self.kv_buffer[layer_id - self.start_layer]
+        return self.kv_buffer[layer_id]
 
     def set_key_buffer(
         self,

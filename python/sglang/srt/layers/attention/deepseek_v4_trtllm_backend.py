@@ -23,7 +23,13 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DeepseekV4MultiStepBackend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    max_prefill_buffer_tokens,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DSV4AttnMetadata
@@ -54,9 +60,35 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
 
 
 _trtllm_semaphore_installed = False
+# Query rows the persistent semaphore buffer is sized for. Every launch
+# (decode rows = requests x draft tokens, varlen prefill rows = sum_q) is
+# checked against it in _check_trtllm_query_rows.
+_trtllm_semaphore_rows: int = 0
 
 
-def _install_persistent_trtllm_semaphores() -> None:
+def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
+    """Conservative bound on query rows per trtllm-gen launch in this process.
+
+    Prefill launches carry at most one chunk (``chunked_prefill_size``, or the
+    PP dynamic-chunk ceiling); decode / target-verify launches carry at most
+    ``max_running_requests x speculative_num_draft_tokens`` rows.
+    """
+    schedule = get_schedule()
+    rows = max(
+        schedule.max_prefill_tokens or 0,
+        max_prefill_buffer_tokens(),
+    )
+    spec = get_spec()
+    rows_per_req = (
+        (spec.speculative_num_draft_tokens or 1)
+        if spec.speculative_algorithm is not None
+        else 1
+    )
+    rows = max(rows, (schedule.max_running_requests or 0) * rows_per_req)
+    return max(rows, 1)
+
+
+def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
     """WAR for flashinfer's trtllm-gen multi-CTA KV counter (semaphore)
     buffer handling. flashinfer sizes it batch_size (= requests) x heads and
     allocates it per call, but the kernel indexes semaphores as
@@ -64,7 +96,8 @@ def _install_persistent_trtllm_semaphores() -> None:
     the DSv4 sparse kernels (trtllm-gen TmemCorr.h counterOffset) -- i.e.
     under-allocated for any multi-token launch. Remove once flashinfer
     accepts a caller-provided persistent buffer with tile-aware sizing."""
-    global _trtllm_semaphore_installed
+    global _trtllm_semaphore_installed, _trtllm_semaphore_rows
+    _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
     if _trtllm_semaphore_installed:
         return
     import flashinfer.mla._core as _fi_core
@@ -77,9 +110,9 @@ def _install_persistent_trtllm_semaphores() -> None:
     # is safe. This removes both failure modes of per-call allocation:
     # (a) under-sizing for VarSeq multi-token launches (kernel indexes
     # counters per q-tile, TmemCorr.h counterOffset formula), sized here for
-    # 16384 query rows; (b) capture-pool lifetime bugs (a buffer allocated
-    # inside capture whose reference dies is recycled by later captures,
-    # letting replays scribble counters over other graphs' tensors).
+    # the largest configured launch; (b) capture-pool lifetime bugs (a buffer
+    # allocated inside capture whose reference dies is recycled by later
+    # captures, letting replays scribble counters over other graphs' tensors).
     state: dict = {}
 
     def _patched(batch_size, num_qo_heads, sm_count, device):
@@ -89,16 +122,26 @@ def _install_persistent_trtllm_semaphores() -> None:
                 "persistent trtllm semaphore buffer must be created outside "
                 "graph capture (first call is expected during eager warmup)"
             )
-            buf = _orig(16384, num_qo_heads, sm_count, device)
+            buf = _orig(_trtllm_semaphore_rows, num_qo_heads, sm_count, device)
             state["buf"] = buf
         return buf
 
     _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
-    _fi_core._trtllm_semaphore_state = state
     _trtllm_semaphore_installed = True
     logger.info(
-        "trtllm-gen multi-CTA semaphores: single persistent 16384-row buffer "
-        "shared across launches (flashinfer sizing WAR)."
+        "trtllm-gen multi-CTA semaphores: single persistent buffer sized for "
+        "%d query rows, shared across launches (flashinfer sizing WAR).",
+        _trtllm_semaphore_rows,
+    )
+
+
+def _check_trtllm_query_rows(num_rows: int) -> None:
+    assert num_rows <= _trtllm_semaphore_rows, (
+        f"trtllm-gen launch with {num_rows} query rows exceeds the persistent "
+        f"semaphore capacity of {_trtllm_semaphore_rows} rows derived from "
+        "--chunked-prefill-size / --max-prefill-tokens / --max-running-requests; "
+        "lower --chunked-prefill-size (chunking must stay enabled) or raise the "
+        "capacity."
     )
 
 
@@ -115,7 +158,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        _install_persistent_trtllm_semaphores()
+        _install_persistent_trtllm_semaphores(_trtllm_query_row_capacity(model_runner))
         super().__init__(
             model_runner,
             skip_prefill=skip_prefill,
@@ -137,12 +180,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
-
-    def _compute_prep_in_cuda_graph(self, model_runner: ModelRunner) -> bool:
-        # trtllm + speculative + DP attention prepares metadata on the host:
-        # in-graph prep degrades draft acceptance under DP's padded/idle-rank
-        # batches. Otherwise prep metadata in-graph.
-        return not (self.mtp_enabled and model_runner.server_args.enable_dp_attention)
 
     def _forward_trtllm(
         self,
@@ -341,6 +378,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             seq_lens = seq_lens[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
+        _check_trtllm_query_rows(bs)
 
         out = trtllm_batch_decode_sparse_mla_dsv4(
             query=q_fp8,
@@ -492,6 +530,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
+        _check_trtllm_query_rows(sum_q)
 
         out_padded = None
         out_arg = None

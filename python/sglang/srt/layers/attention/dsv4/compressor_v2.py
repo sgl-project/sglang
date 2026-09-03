@@ -245,7 +245,8 @@ class CompressorBackendMixin:
             # The fused epilogue only writes the packed layout; the trtllm
             # backend's uniform-FP8 pool stores through its standalone
             # pipeline (compressor_trtllm.py). The indexer compressor keeps
-            # its own (blockwise-FP8) path below.
+            # its own (blockwise-FP8) path below. Online c128 MTP states are
+            # not supported with that pool, so nothing else runs here.
             from sglang.srt.layers.attention.dsv4.compressor_trtllm import (
                 forward_compress_uniform_fp8,
             )
@@ -258,62 +259,57 @@ class CompressorBackendMixin:
                 compressor=compressor,
                 layer_id=layer_id,
             )
-        else:
-            out_loc = self._get_out_loc(compressor.ratio)
-            use_fp4_indexer = (
-                compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
-            )
-            use_hip_fp4 = _is_hip and use_fp4_indexer
-            bf16_store = False
-            kv_scale_cache = None
-            if compressor.is_in_indexer:
-                page_size = token_to_kv_pool.get_index_k_page_size()
-                if use_hip_fp4:
-                    kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
-                    kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(
-                        layer_id
-                    )
-                else:
-                    kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
-            elif is_unified_kv_triton():
-                kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
-                page_size = 1
-                out_loc = getattr(
-                    self.forward_metadata.core_metadata.unified,
-                    f"c{compressor.ratio}_out_loc",
-                )
-                bf16_store = True
+            return
+
+        out_loc = self._get_out_loc(compressor.ratio)
+        use_fp4_indexer = (
+            compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
+        )
+        use_hip_fp4 = _is_hip and use_fp4_indexer
+        bf16_store = False
+        kv_scale_cache = None
+        if compressor.is_in_indexer:
+            page_size = token_to_kv_pool.get_index_k_page_size()
+            if use_hip_fp4:
+                kv_cache = token_to_kv_pool.get_index_k_fp4_payload_buffer(layer_id)
+                kv_scale_cache = token_to_kv_pool.get_index_k_fp4_scale_buffer(layer_id)
             else:
-                _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
-                assert compress_kv_pool is not None
-                kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
-                page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
-                if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
-                    out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
-                        out_loc
-                    )
-            self._forward_compress_all_in_one(
-                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                kv_score_input=kv_score_input,
-                ape=compressor.ape,
-                head_dim=compressor.head_dim,
-                norm=compressor.norm,
-                freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=(
-                    kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8)
-                ),
-                is_indexer=compressor.is_in_indexer,
-                rotate=compressor.rotate,
-                compress_ratio=compressor.ratio,
-                page_size=page_size,
-                out_loc=out_loc,
-                use_fp4_indexer=use_fp4_indexer,
-                bf16_store=bf16_store,
-                kv_scale_cache=kv_scale_cache,
-                rope_cache=(
-                    (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
-                ),
+                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
+        elif is_unified_kv_triton():
+            kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
+            page_size = 1
+            out_loc = getattr(
+                self.forward_metadata.core_metadata.unified,
+                f"c{compressor.ratio}_out_loc",
             )
+            bf16_store = True
+        else:
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
+                out_loc = compress_kv_pool._translate_loc_to_hisparse_device(out_loc)
+        self._forward_compress_all_in_one(
+            kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape,
+            head_dim=compressor.head_dim,
+            norm=compressor.norm,
+            freqs_cis_cache=compressor.freqs_cis,
+            kv_cache=kv_cache if use_hip_fp4 else kv_cache.view(dtype=torch.uint8),
+            is_indexer=compressor.is_in_indexer,
+            rotate=compressor.rotate,
+            compress_ratio=compressor.ratio,
+            page_size=page_size,
+            out_loc=out_loc,
+            use_fp4_indexer=use_fp4_indexer,
+            bf16_store=bf16_store,
+            kv_scale_cache=kv_scale_cache,
+            rope_cache=(
+                (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
+            ),
+        )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(

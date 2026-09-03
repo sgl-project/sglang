@@ -604,6 +604,34 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        schedule = SimpleNamespace(
+            max_prefill_tokens=16384,
+            chunked_prefill_size=4096,
+            max_running_requests=256,
+        )
+        spec = SimpleNamespace(
+            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
+        )
+        model_runner = SimpleNamespace()
+        with (
+            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
+            mock.patch.object(trtllm, "get_spec", return_value=spec),
+            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
+        ):
+            # Prefill chunk / max_prefill_tokens dominates.
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
+            # Decode rows = requests x draft tokens dominate.
+            schedule.max_running_requests = 8192
+            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+
+        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
+            trtllm._check_trtllm_query_rows(64)
+            with self.assertRaisesRegex(AssertionError, "exceeds the persistent"):
+                trtllm._check_trtllm_query_rows(65)
+
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
             SparsePrefillWorkspace,

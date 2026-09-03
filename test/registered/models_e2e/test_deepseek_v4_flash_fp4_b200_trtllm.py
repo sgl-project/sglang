@@ -169,16 +169,6 @@ class TestDSV4FlashFP4NonMTPB200Trtllm(
             kill_process_tree(cls.process.pid)
 
 
-@unittest.skip(
-    "DP prefill BCG with an idle rank fabricates a dummy EXTEND whose tokens "
-    "are counted as real; their hidden states enter the shared EP grouped "
-    "GEMMs and perturb live ranks' logits (#31125). Under FlashMLA this "
-    "shows as nondeterministic outputs; under the trtllm backend the "
-    "perturbation reliably drives generations empty, so every "
-    "low-concurrency probe here fails. "
-    "Re-enable once the generic DP idle-rank fix lands (follow-up PR to "
-    "#30805)."
-)
 class TestDSV4FlashFP4BreakableCudaGraphB200Trtllm(
     BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
 ):

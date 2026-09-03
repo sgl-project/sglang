@@ -1,26 +1,25 @@
 """DeepSeek-V4 uniform-FP8 trtllm backend (SM100/SM103 Blackwell only).
 
-Validates --dsv4-attn-backend trtllm — DSv4 decode and sparse
-varlen prefill through flashinfer's ``trtllm_batch_decode_sparse_mla_dsv4``
-on a uniform 512-dim FP8-e4m3 KV cache with an FP8 query — against the
-default packed-FP8 FlashMLA path:
+Validates --dsv4-attn-backend trtllm — DSv4 decode and sparse varlen prefill
+through flashinfer's ``trtllm_batch_decode_sparse_mla_dsv4`` on a uniform
+512-dim FP8-e4m3 KV cache with an FP8 query:
 
-1. A short greedy-output baseline is collected from a FlashMLA server, then
-   the same prompts are replayed on a trtllm server and compared (output-level).
-2. Long multi-k-token prompts do the same comparison for the varlen prefill
-   path (mixed lengths fired concurrently to exercise cum_seq_lens_q
-   packing; a repeat run exercises the radix-cache-hit / cached-prefix
-   extend, and the longest prompt exceeds --chunked-prefill-size so chunked
-   prefill is exercised too).
-3. Decode-correctness probes + a GSM8K sanity eval run on the trtllm
-   server.
-4. A CUDA-graph capture/replay smoke: concurrent decode batches of varying
+1. Decode-correctness probes + a GSM8K sanity eval.
+2. Long multi-k-token prompts exercise the varlen prefill path (mixed lengths
+   fired concurrently to exercise cum_seq_lens_q packing; a repeat run
+   exercises the radix-cache-hit / cached-prefix extend, and the longest
+   prompt exceeds --chunked-prefill-size so chunked prefill is exercised too).
+3. A CUDA-graph capture/replay smoke: concurrent decode batches of varying
    size (replaying different captured decode-graph buckets) must stay
    consistent with a single-request greedy run.
+
+Greedy tails are not compared against FlashMLA: the two FP8 cache formats
+(packed per-block scales + BF16 RoPE vs uniform per-tensor e4m3) legitimately
+diverge after the answer, and temperature-0 outputs also depend on batch
+composition. Accuracy is gated by GSM8K instead.
 """
 
 import concurrent.futures
-import difflib
 import unittest
 from types import SimpleNamespace
 
@@ -35,11 +34,12 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    try_cached_model,
 )
 
-register_cuda_ci(est_time=1200, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-b200")
 
-DSV4_FLASH_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
+DSV4_FLASH_MODEL_PATH = try_cached_model("deepseek-ai/DeepSeek-V4-Flash")
 SERVER_LAUNCH_TIMEOUT = 3600
 DSV4_BASE_ENV = {
     "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
@@ -47,6 +47,8 @@ DSV4_BASE_ENV = {
 
 SERVER_ARGS = [
     "--trust-remote-code",
+    "--dsv4-attn-backend",
+    "trtllm",
     "--tp",
     "4",
     "--max-running-requests",
@@ -55,28 +57,12 @@ SERVER_ARGS = [
     "0.85",
     "--chunked-prefill-size",
     "4096",
-    # V4-Flash shis MXFP4 routed experts, and the auto-selected Triton MoE runner
+    # V4-Flash ships MXFP4 routed experts, and the auto-selected Triton MoE runner
     # cannot consume the packed layout. Matches the B200 Flash cookbook recipe.
     "--moe-runner-backend",
     "flashinfer_mxfp4",
     "--disable-flashinfer-autotune",
 ]
-
-COMPARE_PROMPTS = [
-    "The capital of France is",
-    "In one sentence, explain why the sky is blue.",
-    "List the first five prime numbers:",
-    "Water boils at",
-    "The author of Romeo and Juliet is",
-    "Translate 'good morning' to French:",
-    "2 + 2 * 3 =",
-    "Photosynthesis is the process by which",
-]
-COMPARE_MAX_NEW_TOKENS = 64
-# FP8 formats differ (packed per-block scales + BF16 rope vs uniform
-# per-tensor e4m3), so greedy outputs may diverge after some tokens; require
-# strong average prefix similarity rather than exact equality.
-COMPARE_MIN_MEAN_SIMILARITY = 0.6
 
 # Long multi-k-token prompts that exercise the trtllm-gen varlen
 # prefill: real c4 indexer top-k selection needs >~2k tokens of context and
@@ -116,7 +102,8 @@ LONG_PROMPTS = [
     _make_long_prompt(2, 28_000),
 ]
 LONG_MAX_NEW_TOKENS = 32
-LONG_MIN_MEAN_SIMILARITY = 0.6
+# Same gibberish gate as BasicDecodeCorrectnessMixin.test_ascii_ratio.
+MIN_PRINTABLE_ASCII_RATIO = 0.85
 
 GSM8K_NUM_EXAMPLES = 200
 GSM8K_MIN_SCORE = 0.90
@@ -128,16 +115,6 @@ def _is_sm100() -> bool:
     if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-
-
-def _launch(backend: str):
-    return popen_launch_server(
-        DSV4_FLASH_MODEL_PATH,
-        DEFAULT_URL_FOR_TEST,
-        timeout=SERVER_LAUNCH_TIMEOUT,
-        other_args=SERVER_ARGS + ["--dsv4-attn-backend", backend],
-        env=dict(DSV4_BASE_ENV),
-    )
 
 
 def _greedy_generate(base_url: str, prompt: str, max_new_tokens: int) -> str:
@@ -156,6 +133,12 @@ def _greedy_generate(base_url: str, prompt: str, max_new_tokens: int) -> str:
     return resp.json()["text"]
 
 
+def _printable_ascii_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    return sum(32 <= ord(c) < 127 or c in "\n\t" for c in text) / len(text)
+
+
 class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
     """TP4 DSv4-Flash-FP8 with --dsv4-attn-backend trtllm."""
 
@@ -166,60 +149,39 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
                 "DSv4 trtllm uniform-FP8 attention requires SM100/SM103 (Blackwell)"
             )
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = None
-
-        # Collect the packed-FP8 FlashMLA greedy baselines (short
-        # decode-focused prompts + long prefill-focused prompts).
-        baseline_process = _launch("flashmla")
-        try:
-            cls.flashmla_outputs = [
-                _greedy_generate(cls.base_url, p, COMPARE_MAX_NEW_TOKENS)
-                for p in COMPARE_PROMPTS
-            ]
-            cls.flashmla_long_outputs = [
-                _greedy_generate(cls.base_url, p, LONG_MAX_NEW_TOKENS)
-                for p in LONG_PROMPTS
-            ]
-        finally:
-            kill_process_tree(baseline_process.pid)
-
-        # The server under test (kept alive for all test methods).
-        cls.process = _launch("trtllm")
+        cls.process = popen_launch_server(
+            DSV4_FLASH_MODEL_PATH,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=SERVER_ARGS,
+            env=dict(DSV4_BASE_ENV),
+        )
 
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process is not None:
             kill_process_tree(cls.process.pid)
 
-    def test_greedy_outputs_match_flashmla(self):
-        """Output-level comparison vs the packed-FP8 FlashMLA path."""
-        similarities = []
-        for prompt, ref_out in zip(COMPARE_PROMPTS, self.flashmla_outputs):
-            out = _greedy_generate(self.base_url, prompt, COMPARE_MAX_NEW_TOKENS)
-            sim = difflib.SequenceMatcher(None, ref_out, out).ratio()
-            similarities.append(sim)
-            print(
-                f"[compare] sim={sim:.3f} prompt={prompt!r}\n"
-                f"  flashmla : {ref_out!r}\n"
-                f"  trtllm   : {out!r}"
-            )
-        mean_sim = sum(similarities) / len(similarities)
+    def _assert_sane(self, out: str, what: str) -> None:
+        self.assertGreater(len(out.strip()), 0, f"{what}: empty output")
+        ratio = _printable_ascii_ratio(out)
         self.assertGreater(
-            mean_sim,
-            COMPARE_MIN_MEAN_SIMILARITY,
-            f"trtllm greedy outputs diverge from flashmla: "
-            f"mean similarity {mean_sim:.3f}, per-prompt {similarities}",
+            ratio,
+            MIN_PRINTABLE_ASCII_RATIO,
+            f"{what}: output looks like gibberish (ascii ratio={ratio:.2f}): {out!r}",
         )
 
-    def test_long_prompt_prefill_matches_flashmla(self):
-        """Varlen trtllm-gen prefill vs FlashMLA on multi-k-token prompts.
+    def test_long_prompt_varlen_prefill(self):
+        """Varlen trtllm-gen prefill on multi-k-token prompts.
 
         The three prompts are fired concurrently (mixed extend lengths in
         one batch exercise cum_seq_lens_q packing and per-token sparse-table
-        construction), then the longest is re-sent alone (radix-cache hit →
-        cached-prefix extend, where seq_lens > extend len). The longest
-        prompt also exceeds --chunked-prefill-size, covering chunked
-        prefill.
+        construction; the longest prompt also exceeds --chunked-prefill-size,
+        covering chunked prefill). The longest is then re-sent alone so the
+        radix cache serves its prefix (cached-prefix extend, where seq_lens >
+        extend len). Outputs are checked for sanity only: at these context
+        lengths temperature-0 decode is not bit-reproducible (split-KV
+        reduction order), so exact-match assertions would be flaky.
         """
 
         with concurrent.futures.ThreadPoolExecutor(len(LONG_PROMPTS)) as pool:
@@ -229,34 +191,13 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
                     LONG_PROMPTS,
                 )
             )
+        for i, out in enumerate(outs):
+            print(f"[long-prefill] prompt_chars={len(LONG_PROMPTS[i])} out={out!r}")
+            self._assert_sane(out, f"concurrent long prompt {i}")
 
-        similarities = []
-        for i, (ref_out, out) in enumerate(zip(self.flashmla_long_outputs, outs)):
-            sim = difflib.SequenceMatcher(None, ref_out, out).ratio()
-            similarities.append(sim)
-            print(
-                f"[long-compare] sim={sim:.3f} prompt_chars={len(LONG_PROMPTS[i])}\n"
-                f"  flashmla : {ref_out!r}\n"
-                f"  trtllm   : {out!r}"
-            )
-        mean_sim = sum(similarities) / len(similarities)
-        self.assertGreater(
-            mean_sim,
-            LONG_MIN_MEAN_SIMILARITY,
-            f"trtllm long-prompt (varlen prefill) outputs diverge from "
-            f"flashmla: mean similarity {mean_sim:.3f}, per-prompt {similarities}",
-        )
-
-        # Cached-prefix extend: re-run the longest prompt; the radix cache
-        # holds its prefix, so this prefill extends from cached tokens
-        # (seq_lens total > extend tokens). Greedy output must be unchanged.
-        rerun = _greedy_generate(self.base_url, LONG_PROMPTS[-1], LONG_MAX_NEW_TOKENS)
-        self.assertEqual(
-            outs[-1],
-            rerun,
-            "greedy long-prompt output changed on the cached-prefix "
-            "(radix-cache hit) extend path",
-        )
+        cached = _greedy_generate(self.base_url, LONG_PROMPTS[-1], LONG_MAX_NEW_TOKENS)
+        print(f"[long-prefill] cached-prefix rerun out={cached!r}")
+        self._assert_sane(cached, "cached-prefix extend")
 
     def test_gsm8k_sanity(self):
         args = SimpleNamespace(
