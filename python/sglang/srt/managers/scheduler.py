@@ -461,6 +461,7 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             get_schedule().priority_scheduling_preemption_threshold
         )
+        self.max_retraction_count = get_schedule().max_retraction_count
         self.enable_lora = get_lora().enable_lora
         self.enable_lora_overlap_loading = get_lora().enable_lora_overlap_loading
         self.max_loras_per_batch = get_lora().max_loras_per_batch
@@ -3053,12 +3054,26 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        if is_retracted and self._abort_on_retraction_limit(req):
+            return
         if self.disaggregation_mode == DisaggregationMode.NULL:
-            if self._abort_on_queued_limit(req):
+            # A retracted request is not a new arrival: it was already admitted and
+            # has already paid for a full prefill. Rejecting it here because other
+            # requests filled the queue would throw that work away and punish the
+            # victim of memory pressure it did not create. Retracted requests are
+            # therefore exempt from the cap; the resulting overflow is bounded by
+            # the running batch size (you can only retract what was running), so
+            # the queue can exceed max_queued_requests by at most
+            # max_running_requests. Churn is bounded separately by
+            # _abort_on_retraction_limit above.
+            if not is_retracted and self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
-            req.time_stats.set_wait_queue_entry_time()
+            if is_retracted:
+                req.time_stats.set_retract_time()
+            else:
+                req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3097,6 +3112,49 @@ class Scheduler(
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return False
+        return True
+
+    def _abort_on_retraction_limit(self, req: Req) -> bool:
+        """Fail a request fast once it has been retracted too many times.
+
+        Retracted requests bypass the waiting-queue cap so that memory pressure
+        does not kill work that was already admitted and prefilled. That
+        exemption needs a bound: every retraction discards the request's KV
+        cache, so a request that keeps getting retracted keeps paying for a full
+        re-prefill and can livelock between the running batch and the waiting
+        queue while the GPU stays busy at zero goodput. Aborting explicitly is
+        strictly better for the client than hanging indefinitely.
+
+        Returns True if the request was aborted.
+        """
+        if (
+            self.max_retraction_count is None
+            or req.retraction_count <= self.max_retraction_count
+        ):
+            return False
+
+        message = (
+            f"The request was retracted {req.retraction_count} times, exceeding "
+            f"--max-retraction-count ({self.max_retraction_count}). The server is "
+            "memory-bound; retry later or reduce the input length."
+        )
+        logger.warning(
+            "Aborting req %s: retraction_count=%d > max_retraction_count=%d",
+            req.rid,
+            req.retraction_count,
+            self.max_retraction_count,
+        )
+        abort_req = _make_abort_req(
+            req,
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+        )
+        req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+        self.beam_coordinator.retire_group(req)
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:

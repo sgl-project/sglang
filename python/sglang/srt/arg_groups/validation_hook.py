@@ -165,6 +165,8 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--retraction-policy priority requires --enable-priority-scheduling"
         )
+    if cfg.max_retraction_count is not None and cfg.max_retraction_count < 0:
+        raise ValueError("--max-retraction-count must be non-negative")
 
     # Check hisparse
     # Moved to the resolution pipeline (arg_groups/overrides.py:
