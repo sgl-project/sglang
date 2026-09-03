@@ -16,7 +16,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_I2V_A14B_Config,
     WanT2V480PConfig,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
+from sglang.multimodal_gen.runtime.loader.component_loaders import (
+    component_loader,
+    vae_loader,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
 )
@@ -49,6 +52,7 @@ class _FakeServerArgs:
         self.revision = "test-revision"
         self.trust_remote_code = True
         self.layerwise_components = set()
+        self.component_weights_paths = {}
         self.component_quantizations = {}
         self.component_precisions = {}
         self.component_direct_gpu_weight_loading = {}
@@ -327,15 +331,15 @@ class TestVAELoader(unittest.TestCase):
         }
 
         with (
-            patch.object(vae_loader, "resolve_weight", return_value="resolved"),
+            patch.object(component_loader, "resolve_weight", return_value="resolved"),
             patch.object(
-                vae_loader,
+                component_loader,
                 "materialize_weight",
                 return_value="/cache/audio.safetensors",
             ),
         ):
             self.assertEqual(
-                loader.resolve_model_weights_path(
+                loader.resolve_component_weights_path(
                     "/base/audio_vae", server_args, "audio_vae"
                 ),
                 "/cache/audio.safetensors",
