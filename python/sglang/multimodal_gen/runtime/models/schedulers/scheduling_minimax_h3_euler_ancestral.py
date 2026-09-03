@@ -138,8 +138,7 @@ class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
     def __init__(self, **config: Any) -> None:
         if config:
             raise ValueError(
-                f"{type(self).__name__} does not accept config fields: "
-                f"{sorted(config)}"
+                f"{type(self).__name__} does not accept config fields: {sorted(config)}"
             )
 
     def set_shift(self, _flow_shift: float) -> None:

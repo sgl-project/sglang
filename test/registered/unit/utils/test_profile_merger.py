@@ -201,7 +201,6 @@ class TestProfileMerger(CustomTestCase):
 
 
 class TestProfileMergerIntegration(CustomTestCase):
-
     def test_data_structures_merge_profiles(self):
         # Test ProfileReq
         req = ProfileReq()

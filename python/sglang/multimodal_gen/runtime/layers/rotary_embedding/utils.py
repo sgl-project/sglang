@@ -195,7 +195,7 @@ def apply_flashinfer_rope_qk_inplace(
             raise ValueError("positions must be a 1D Tensor")
         if positions.numel() != bsz * seqlen:
             raise ValueError(
-                f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
+                f"positions length must be bsz*seqlen={bsz * seqlen}, got {positions.numel()}"
             )
         positions = positions.to(device=q.device, dtype=torch.long)
 

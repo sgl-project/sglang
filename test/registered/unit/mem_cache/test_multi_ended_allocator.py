@@ -3141,12 +3141,16 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         _, _, fla, _, kv = self._build_tri()
         v = fla.alloc(4)
         self._stamp(fla, kv, v)
-        with mock.patch.object(
-            torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
-        ), mock.patch.object(
-            torch.Tensor, "item", side_effect=AssertionError("item = D2H")
-        ), mock.patch.object(
-            torch, "unique", side_effect=AssertionError("unique = host sync")
+        with (
+            mock.patch.object(
+                torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = D2H")
+            ),
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
         ):
             fla.free(v[:2], _pages=v[:2])
 
