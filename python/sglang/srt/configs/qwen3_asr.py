@@ -164,5 +164,21 @@ class Qwen3ASRConfig(PretrainedConfig):
         return self.thinker_config.text_config
 
 
-AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
-AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+def register_qwen3_asr_config() -> None:
+    """Register Qwen3-ASR configs with HuggingFace ``AutoConfig``.
+
+    Safe to call multiple times. ``AutoConfig.register`` raises ``ValueError``
+    on duplicate registration, which is suppressed so importing this module
+    stays idempotent. Newer ``transformers`` releases (>=5.13.0) ship
+    ``qwen3_asr`` natively, which triggers exactly this collision.
+    """
+    try:
+        AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
+        AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
+    except ValueError:
+        # Either config is already registered (e.g. by a newer transformers
+        # release, or by a previous import) -- nothing to do.
+        pass
+
+
+register_qwen3_asr_config()
