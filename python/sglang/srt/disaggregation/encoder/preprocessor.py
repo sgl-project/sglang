@@ -334,7 +334,12 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                # NOTE: frame_count_limit is only computed for IMAGE items; it
+                # must not be forwarded here. load_video's second parameter is
+                # use_gpu, so passing frame_count_limit positionally would
+                # silently route video decoding to CUDA whenever it is a
+                # positive int.
+                return load_video(data, use_gpu=False)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
