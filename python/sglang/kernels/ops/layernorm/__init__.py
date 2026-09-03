@@ -385,8 +385,7 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
             "(rocm-triton, sglang.kernels.jit)."
         ),
         KernelBackend.TORCH: (
-            "Gemma-style fused residual-add + RMS normalization "
-            "(pure-torch reference)."
+            "Gemma-style fused residual-add + RMS normalization (pure-torch reference)."
         ),
     }
 

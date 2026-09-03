@@ -42,6 +42,9 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_decode_precision,
 )
+from sglang.multimodal_gen.runtime.weights.source import (
+    filter_duplicate_precision_variant_safetensors,
+)
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
@@ -467,9 +470,9 @@ class VAELoader(WeightOverrideComponentLoader):
         )
 
         class_name = config.pop("_class_name", None)
-        assert (
-            class_name is not None
-        ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        assert class_name is not None, (
+            "Model config does not contain a _class_name attribute. Only diffusers format is supported."
+        )
 
         component_type = self.structural_component_type(component_name)
         if component_type in ("vae", "video_vae"):
@@ -568,7 +571,11 @@ class VAELoader(WeightOverrideComponentLoader):
                 )
             safetensors_list = [component_weights_path]
         else:
-            safetensors_list = _list_safetensors_files(component_weights_path)
+            # VAE configs may explicitly choose a precision variant, so their
+            # selector must run before the canonical fallback.
+            safetensors_list = _list_safetensors_files(
+                component_weights_path, raw_candidates=True
+            )
             safetensors_list = self.select_weight_files(
                 safetensors_list,
                 component_weights_path,
@@ -576,10 +583,13 @@ class VAELoader(WeightOverrideComponentLoader):
                 component_name,
                 vae_precision,
             )
+            safetensors_list = filter_duplicate_precision_variant_safetensors(
+                safetensors_list
+            )
 
-        assert (
-            len(safetensors_list) >= 1
-        ), f"Found no safetensors files in {component_weights_path}"
+        assert len(safetensors_list) >= 1, (
+            f"Found no safetensors files in {component_weights_path}"
+        )
         if direct_gpu_weight_loading:
             _assign_direct_gpu_vae_state(
                 vae,

@@ -52,9 +52,9 @@ def moe_fused_gate_jit(
     apply_routed_scaling_factor_on_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert (
-        scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    assert scoring_func_int is not None, (
+        f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    )
 
     assert input.dtype == torch.float32, "input must be float32"
     assert bias.dtype == torch.float32, "bias must be float32"
@@ -214,9 +214,7 @@ def _router_triton_kernel(
         win_lane = tl.min(lane_id, axis=1)[:, None].to(tl.int32)  # [BLOCK_M, 1]
         win_activated = tl.sum(
             tl.where(offs_n[None, :] == win_lane, activated, 0.0), axis=1
-        )[
-            :, None
-        ]  # [BLOCK_M, 1]
+        )[:, None]  # [BLOCK_M, 1]
         slot = offs_k[None, :] == k  # [1, BLOCK_K]
         selected_vals = tl.where(slot, win_activated, selected_vals)
         selected_idx = tl.where(slot, win_lane, selected_idx)
@@ -278,9 +276,9 @@ def moe_fused_gate(
     the existing call sites.
     """
     scoring_func_int = _SCORING_FUNC_MAP.get(scoring_func.lower())
-    assert (
-        scoring_func_int is not None
-    ), f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    assert scoring_func_int is not None, (
+        f"Unknown scoring_func '{scoring_func}', must be one of {list(_SCORING_FUNC_MAP.keys())}"
+    )
     assert scores.dtype in (
         torch.float32,
         torch.float16,
@@ -288,9 +286,9 @@ def moe_fused_gate(
     ), "scores must be float32/float16/bfloat16"
     assert scores.ndim == 2, "scores must be 2D"
     if bias is None:
-        assert (
-            scoring_func.lower() == "softmax"
-        ), "bias is required for non-softmax routing"
+        assert scoring_func.lower() == "softmax", (
+            "bias is required for non-softmax routing"
+        )
     else:
         # The kernel loads the bias and upcasts it to fp32 in-register (see
         # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
@@ -301,9 +299,9 @@ def moe_fused_gate(
             torch.bfloat16,
         ), "bias must be float32/float16/bfloat16"
         assert bias.ndim == 1, "bias must be 1D"
-        assert scores.size(1) == bias.size(
-            0
-        ), "scores and bias must have same num_experts"
+        assert scores.size(1) == bias.size(0), (
+            "scores and bias must have same num_experts"
+        )
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0

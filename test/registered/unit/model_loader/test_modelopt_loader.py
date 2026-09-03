@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
+from transformers import PretrainedConfig
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
@@ -672,7 +673,7 @@ class TestModelOptFp4LoaderSelection(CustomTestCase):
                     quantization="modelopt_fp4",
                     is_draft_model=True,
                     is_draft_quantization_explicit=is_explicit,
-                    hf_config=SimpleNamespace(
+                    hf_config=PretrainedConfig(
                         quantization_config={
                             "quant_algo": "NVFP4",
                             "group_size": 16,
@@ -772,7 +773,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                 with self.subTest(inline_config=inline_config):
                     model_config = SimpleNamespace(
                         quantization="modelopt_mixed",
-                        hf_config=SimpleNamespace(
+                        hf_config=PretrainedConfig(
                             quantization_config=inline_config,
                         ),
                         model_path=model_path,
@@ -802,7 +803,7 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         }
         model_config = SimpleNamespace(
             quantization="modelopt_mixed",
-            hf_config=SimpleNamespace(
+            hf_config=PretrainedConfig(
                 quantization_config={
                     "quant_method": "modelopt_mixed",
                     "quant_algo": "MIXED_PRECISION",

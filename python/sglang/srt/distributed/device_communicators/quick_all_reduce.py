@@ -50,7 +50,6 @@ MB = 1024 * 1024
 
 
 class QuickAllReduce:
-
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
@@ -103,9 +102,9 @@ class QuickAllReduce:
             return
 
         self.group = group
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "Custom quick allreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "Custom quick allreduce should be attached to a non-NCCL group."
+        )
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom quick allreduce for
             # multi-node case.
