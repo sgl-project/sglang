@@ -390,9 +390,9 @@ class Fp8Config(QuantizationConfig):
             fp8_method = Fp8MoEMethod(self)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert (
-                    get_moe_runner_backend().is_auto()
-                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                assert get_moe_runner_backend().is_auto(), (
+                    f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                )
                 return fp8_method
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
@@ -697,9 +697,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.input_scale = None
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["weight"])
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
@@ -1098,9 +1098,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
         if get_moe_runner_backend().is_cutlass():
-            assert (
-                cutlass_fp8_supported()
-            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert cutlass_fp8_supported(), (
+                "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            )
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
                 get_platform().is_sm100
@@ -1666,9 +1666,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.copy_(t)
             del t
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
@@ -2319,9 +2319,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -2546,7 +2546,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
