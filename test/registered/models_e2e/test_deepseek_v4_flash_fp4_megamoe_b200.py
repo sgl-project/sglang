@@ -64,6 +64,7 @@ class TestDSV4FlashFP4B200W4A8MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--speculative-algorithm",
