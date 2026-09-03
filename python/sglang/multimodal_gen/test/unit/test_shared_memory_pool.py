@@ -614,3 +614,39 @@ def test_stage_end_pages_out_the_head_that_will_not_fit(monkeypatch):
     # No room figure: the old behaviour.
     assert manager.advise_mapped_pages_cold() == 0
     assert [reclaim for _, reclaim in calls] == [False] * 4
+
+
+def test_direct_reader_locates_mapped_tensors_and_reads_them(tmp_path):
+    import os
+
+    import numpy as np
+
+    if not hasattr(os, "O_DIRECT"):
+        return
+    path = tmp_path / "shard.bin"
+    payload = np.arange(3 * 4096 + 100, dtype=np.uint8)
+    payload.tofile(path)
+    mapped = np.memmap(path, dtype=np.uint8, mode="r")
+    tensor = torch.from_numpy(
+        np.asarray(mapped[4100 : 4100 + 8000]).copy()
+    )  # anonymous
+    view = torch.frombuffer(memoryview(mapped)[4100 : 4100 + 8000], dtype=torch.uint8)
+    reader = layerwise_offload._DirectReader()
+    try:
+        assert reader.locate(tensor) is None
+        located = reader.locate(view)
+        assert located is not None
+        located_path, file_offset, nbytes = located
+        assert os.path.realpath(located_path) == os.path.realpath(path)
+        assert (file_offset, nbytes) == (4100, 8000)
+        start, span = layerwise_offload._aligned_span(file_offset, nbytes)
+        assert (start, span) == (4096, 2 * 4096)
+        buffer = bytearray(span)
+        try:
+            reader.read_into(memoryview(buffer), located_path, start, span)
+        except OSError:
+            return  # filesystem without O_DIRECT (tmpfs)
+        skew = file_offset - start
+        assert bytes(buffer[skew : skew + 16]) == payload[4100:4116].tobytes()
+    finally:
+        reader.close()

@@ -442,6 +442,101 @@ def _shared_pool_hosting(
     }
 
 
+_DIRECT_ALIGN = 4096
+_DIRECT_CHUNK = 64 << 20
+
+
+class _DirectReader:
+    """Read a mapped tensor's bytes from its checkpoint file with O_DIRECT.
+
+    Measured on a GB10: the NVMe delivers 9.9 GiB/s to an O_DIRECT reader,
+    but 1.1 GiB/s (one stream) to 3.7 GiB/s (twelve) through the page cache,
+    whose page allocation and reclaim are the wall on a shared pool. Reading
+    straight into the courier's pinned slot skips the cache entirely: no
+    pages to populate, evict or reclaim, and no cache footprint at all.
+    """
+
+    def __init__(self) -> None:
+        self._ranges: List[tuple[int, int, int, str]] = []
+        self._starts: List[int] = []
+        self._fds: Dict[str, int] = {}
+        self._located: Dict[int, Optional[tuple[str, int, int]]] = {}
+        self.refresh()
+
+    def refresh(self) -> None:
+        ranges = []
+        try:
+            with open("/proc/self/maps") as handle:
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) < 6 or fields[5].startswith("["):
+                        continue
+                    start, end = (int(x, 16) for x in fields[0].split("-"))
+                    ranges.append((start, end, int(fields[2], 16), fields[5]))
+        except OSError:
+            ranges = []
+        ranges.sort()
+        self._ranges = ranges
+        self._starts = [r[0] for r in ranges]
+        self._located.clear()
+
+    def locate(self, tensor: torch.Tensor) -> Optional[tuple[str, int, int]]:
+        """(path, file offset, nbytes) of the tensor's bytes, or None if unmapped."""
+        ptr = tensor.data_ptr()
+        nbytes = tensor.numel() * tensor.element_size()
+        cached = self._located.get(ptr)
+        if cached is not None or ptr in self._located:
+            return cached
+        found = None
+        for attempt in range(2):
+            index = bisect.bisect_right(self._starts, ptr) - 1
+            if index >= 0:
+                start, end, file_offset, path = self._ranges[index]
+                if start <= ptr and ptr + nbytes <= end:
+                    found = (path, file_offset + (ptr - start), nbytes)
+                    break
+            if attempt == 0:
+                self.refresh()
+        self._located[ptr] = found
+        return found
+
+    def fd(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECT"))
+            self._fds[path] = fd
+        return fd
+
+    def read_into(
+        self, buffer: memoryview, path: str, aligned_offset: int, span: int
+    ) -> None:
+        """Fill buffer[:span] with the file bytes at aligned_offset (both 4 KiB aligned)."""
+        fd = self.fd(path)
+        pos = 0
+        while pos < span:
+            want = min(_DIRECT_CHUNK, span - pos)
+            got = os.preadv(fd, [buffer[pos : pos + want]], aligned_offset + pos)
+            if got <= 0:
+                # past the end of the file: the tail of the last aligned span
+                break
+            pos += got
+
+    def close(self) -> None:
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+
+
+def _aligned_span(file_offset: int, nbytes: int) -> tuple[int, int]:
+    """(aligned start, span) covering [file_offset, file_offset + nbytes) at 4 KiB granularity."""
+    start = file_offset & ~(_DIRECT_ALIGN - 1)
+    end = (file_offset + nbytes + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
+    return start, end - start
+
+
 class _MappedPopulator:
     """Fault upcoming mapped layers in from several threads at once.
 
@@ -547,8 +642,16 @@ class MappedLayerCourier:
         populate_source: Optional[Callable[[int], bool]] = None,
         await_populated: Optional[Callable[[int], bool]] = None,
         direct_copy: bool = False,
+        direct_read: bool = False,
     ) -> None:
         self._mapped_cpu_weights = mapped_cpu_weights
+        # Read each layer's bytes from the checkpoint file with O_DIRECT into the
+        # pinned slot instead of copying them out of the page cache.
+        self.direct_read = bool(direct_read) and hasattr(os, "O_DIRECT")
+        self._reader: Optional[_DirectReader] = (
+            _DirectReader() if self.direct_read else None
+        )
+        self._slot_views: Dict[int, Any] = {}
         # On a shared host/device pool the device reads host pages directly, so
         # a layer goes mapping -> device in one copy and the pinned staging
         # slots (2.7 GiB on the H3 encoder + VAE) are not allocated at all.
@@ -561,6 +664,8 @@ class MappedLayerCourier:
             "populate_s": 0.0,
             "memcpy_s": 0.0,
             "h2d_issue_s": 0.0,
+            "direct_read_s": 0.0,
+            "direct_read_bytes": 0,
         }
         # Blocks until a populator thread has faulted the layer in; True if one
         # did, so the courier does not fault the same range a second time.
@@ -575,12 +680,17 @@ class MappedLayerCourier:
         self._populate_source = populate_source
         slot_bytes = max(
             (
-                sum(t.numel() * t.element_size() for t in weights.values())
+                sum(
+                    t.numel() * t.element_size()
+                    + (2 * _DIRECT_ALIGN if self.direct_read else 0)
+                    for t in weights.values()
+                )
                 for weights in mapped_cpu_weights.values()
                 if weights
             ),
             default=0,
         )
+        slot_bytes = (slot_bytes + _DIRECT_ALIGN - 1) & ~(_DIRECT_ALIGN - 1)
         if slot_bytes <= 0:
             raise ValueError("no mapped weights to ship")
         self._slots = (
@@ -633,6 +743,8 @@ class MappedLayerCourier:
     def close(self) -> None:
         self._tasks.put(None)
         self._thread.join(timeout=5.0)
+        if self._reader is not None:
+            self._reader.close()
 
     def _run(self) -> None:
         slot_turn = 0
@@ -664,7 +776,11 @@ class MappedLayerCourier:
                 started = time.perf_counter()
                 previous.synchronize()
                 stats["slot_sync_s"] += time.perf_counter() - started
-        if self._populate_source is not None and self._populate_source(layer_idx):
+        if (
+            not self.direct_read
+            and self._populate_source is not None
+            and self._populate_source(layer_idx)
+        ):
             started = time.perf_counter()
             if self._await_populated is not None and self._await_populated(layer_idx):
                 stats["populate_wait_s"] += time.perf_counter() - started
@@ -695,19 +811,68 @@ class MappedLayerCourier:
                 offset = 0
                 staged = []
                 started = time.perf_counter()
+                slot_bytes_view = None
+                if self.direct_read:
+                    slot_bytes_view = self._slot_views.get(slot_turn)
+                    if slot_bytes_view is None:
+                        slot_bytes_view = memoryview(slot.numpy())
+                        self._slot_views[slot_turn] = slot_bytes_view
                 for name, cpu_tensor in self._mapped_cpu_weights[layer_idx].items():
                     width = cpu_tensor.element_size()
-                    if offset % width:
-                        offset += width - (offset % width)
-                    start = offset // width
-                    window = slot.view(cpu_tensor.dtype)[
-                        start : start + cpu_tensor.numel()
-                    ].view(cpu_tensor.shape)
-                    window.copy_(cpu_tensor)
-                    if self._cold_source is not None and self._cold_source(layer_idx):
-                        _advise_mapped_source_cold(cpu_tensor, reclaim=True)
-                    offset += cpu_tensor.numel() * width
-                    layer_bytes += cpu_tensor.numel() * width
+                    nbytes = cpu_tensor.numel() * width
+                    located = (
+                        self._reader.locate(cpu_tensor) if self.direct_read else None
+                    )
+                    if located is not None:
+                        path, file_offset, _ = located
+                        aligned_start, span = _aligned_span(file_offset, nbytes)
+                        skew = file_offset - aligned_start
+                        if offset % _DIRECT_ALIGN:
+                            offset += _DIRECT_ALIGN - (offset % _DIRECT_ALIGN)
+                        if skew % width == 0 and offset + span <= slot.numel():
+                            read_started = time.perf_counter()
+                            try:
+                                self._reader.read_into(
+                                    slot_bytes_view[offset : offset + span],
+                                    path,
+                                    aligned_start,
+                                    span,
+                                )
+                            except OSError as exc:
+                                logger.warning(
+                                    "Layerwise offload: O_DIRECT read failed (%s); "
+                                    "mapped layers return to the page-cache copy.",
+                                    exc,
+                                )
+                                self.direct_read = False
+                                located = None
+                            else:
+                                stats["direct_read_s"] += (
+                                    time.perf_counter() - read_started
+                                )
+                                stats["direct_read_bytes"] += span
+                                window = (
+                                    slot[offset + skew : offset + skew + nbytes]
+                                    .view(cpu_tensor.dtype)
+                                    .view(cpu_tensor.shape)
+                                )
+                                offset += span
+                        else:
+                            located = None
+                    if located is None:
+                        if offset % width:
+                            offset += width - (offset % width)
+                        start = offset // width
+                        window = slot.view(cpu_tensor.dtype)[
+                            start : start + cpu_tensor.numel()
+                        ].view(cpu_tensor.shape)
+                        window.copy_(cpu_tensor)
+                        if self._cold_source is not None and self._cold_source(
+                            layer_idx
+                        ):
+                            _advise_mapped_source_cold(cpu_tensor, reclaim=True)
+                        offset += nbytes
+                    layer_bytes += nbytes
                     staged.append((name, window))
                 stats["memcpy_s"] += time.perf_counter() - started
                 started = time.perf_counter()
@@ -1460,7 +1625,8 @@ class LayerwiseOffloadManager:
         )
         logger.info(
             "Layerwise timing %s: layers=%d bytes=%.2fGiB direct=%s | courier: slot_sync=%.2fs "
-            "populate_wait=%.2fs populate=%.2fs memcpy=%.2fs h2d_issue=%.2fs | populator: "
+            "populate_wait=%.2fs populate=%.2fs memcpy=%.2fs (direct_read=%.2fs %.2fGiB) "
+            "h2d_issue=%.2fs | populator: "
             "layers=%d bytes=%.2fGiB busy=%.2fs | compute thread collect wait=%.2fs",
             self.layers_attr_str,
             cs["layers"],
@@ -1470,6 +1636,8 @@ class LayerwiseOffloadManager:
             cs["populate_wait_s"],
             cs["populate_s"],
             cs["memcpy_s"],
+            cs["direct_read_s"],
+            cs["direct_read_bytes"] / (1024**3),
             cs["h2d_issue_s"],
             ps["layers"],
             ps["bytes"] / (1024**3),
@@ -1565,7 +1733,10 @@ class LayerwiseOffloadManager:
             if courier is not None and courier.submit(layer_idx):
                 self._courier_inflight.add(layer_idx)
                 ship_mapped = True
-                if not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED:
+                if (
+                    not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED
+                    and not courier.direct_read
+                ):
                     # Schedule the disk read for this layer's pages now, in
                     # one bulk request, so it overlaps the previous layer's
                     # compute instead of trickling in at fault-time beats.
@@ -1674,6 +1845,10 @@ class LayerwiseOffloadManager:
                 # page) and the process's anonymous memory grew past 100 GiB;
                 # the pinned slots stay even on a shared pool.
                 direct_copy=False,
+                direct_read=(
+                    host_copies_are_redundant()
+                    and not envs.SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ
+                ),
                 cold_source=self._mapped_source_is_cold,
                 populate_source=self._mapped_source_may_be_cold,
                 await_populated=self._await_mapped_populated,

@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
+    SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ: bool = False
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
@@ -293,6 +294,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # courier; their pages arrive at fault-time readahead beats instead.
     "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED"
+    ),
+    # Kill-switch: on a shared host/device pool the courier reads mapped layers
+    # from their checkpoint files with O_DIRECT instead of through the page
+    # cache. This forces the mmap path.
+    "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_MAPPED_DIRECT_READ"
     ),
     # Debug: after auto residency settles, log where this process's host memory
     # sits -- per component and per kind (anonymous, mapped, pinned) -- next to
