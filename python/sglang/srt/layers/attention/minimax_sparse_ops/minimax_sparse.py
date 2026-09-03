@@ -46,7 +46,7 @@ def _warn_gluon_fallback(msg: str) -> None:
     if _gluon_fallback_warned:
         return
     logger.warning(
-        "SGLANG_OPT_USE_GLUON_PREFILL is set, but the Gluon sparse prefill "
+        "SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL is set, but the Gluon sparse prefill "
         "path is unavailable (%s); falling back to Triton.",
         msg,
     )
@@ -153,7 +153,7 @@ def minimax_sparse_prefill(
     # MSA paths only replace this step; the indexer above is unchanged. MSA has
     # no attn-sink input, so keep the Triton path when sink is present.
     o = None
-    if _use_aiter_gfx95 and envs.SGLANG_OPT_USE_GLUON_PREFILL.get():
+    if _use_aiter_gfx95 and envs.SGLANG_MINIMAX_OPT_USE_GLUON_PREFILL.get():
         try:
             from .gluon_prefill import can_use_gluon_prefill, gluon_sparse_prefill
 
