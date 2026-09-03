@@ -123,6 +123,19 @@ def test_vdn_h3_pipeline_config_forces_hybrid_backend_and_rejects() -> None:
         config.validate_quality_deployment(server_args=None)
 
 
+@requires_cuda
+def test_vdn_h3_pipeline_config_forces_hybrid_backend_when_unset() -> None:
+    """The runtime selector reads server_args.attention_backend; an unset
+    backend must become the hybrid one, not the platform default."""
+    config = VDNH3PipelineConfig()
+    args = _server_args()
+    config.validate_server_args(args)
+    assert args.attention_backend == "hybrid_window_attn_h3"
+    explicit = _server_args(attention_backend="hybrid_window_attn_h3")
+    config.validate_server_args(explicit)
+    assert explicit.attention_backend == "hybrid_window_attn_h3"
+
+
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:
     transform = {
         "anchor_frames": "both",

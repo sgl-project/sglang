@@ -353,6 +353,13 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "not apply. FL2VA and Ref2VA tasks were not trained; use "
                 "MiniMaxAI/MiniMax-H3 for those."
             )
+        # Force the hybrid backend when none was chosen: the runtime selector
+        # reads server_args.attention_backend, so leaving it None would run the
+        # platform default (dense FA) on these weights.
+        if server_args.attention_backend is None and not (
+            server_args.component_attention_backends or {}
+        ).get("transformer"):
+            server_args.attention_backend = "hybrid_window_attn_h3"
         selected_backend = self.resolve_transformer_attention_backend(server_args)
         if selected_backend is not AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
             # The dense-equivalence smoke (section 5 of the port plan) runs the
