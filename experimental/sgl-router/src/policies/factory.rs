@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::{Config, ModelConfig, PolicyKind};
+use crate::config::{
+    Config, FilterKind, ModelConfig, PolicyKind, ScoreTermKind, StickyFallbackKind,
+};
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
@@ -22,23 +24,13 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Build a dependency-free policy for use as the sticky-session fallback
-/// (keyless requests + initial pin of a new key). `Cli::into_config`
-/// validates `--sticky-fallback-policy` to one of these four, so the
-/// `CacheAwareZmq`/`Sticky` arms are never reached in practice.
-fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
+/// Build a dependency-free policy for keyless sticky requests and new pins.
+fn build_sticky_fallback(kind: StickyFallbackKind) -> Arc<dyn Policy> {
     match kind {
-        PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
-        PolicyKind::Random => Arc::new(RandomPolicy::new()),
-        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq
-        | PolicyKind::Overloaded
-        | PolicyKind::Sticky
-        | PolicyKind::PrefixCache
-        | PolicyKind::FusedScore => {
-            unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
-        }
+        StickyFallbackKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+        StickyFallbackKind::Random => Arc::new(RandomPolicy::new()),
+        StickyFallbackKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        StickyFallbackKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
     }
 }
 
@@ -67,11 +59,7 @@ pub fn build_policy(
     };
     let mut filters = Vec::with_capacity(elig.filters.len());
     for &kind in &elig.filters {
-        let f = build_kind(kind, model, &tree, &tokenizers, &block_size_oracle)?;
-        if !f.can_filter() {
-            return Err(anyhow!("--filter: `{kind}` imposes no eligibility rule"));
-        }
-        filters.push(f);
+        filters.push(build_filter(kind, model, &tree, &block_size_oracle));
     }
     Ok(Arc::new(Pipeline::new(filters, inner)?))
 }
@@ -104,29 +92,61 @@ fn build_kind(
             ))
         }
         PolicyKind::Sticky => build_sticky(model),
-        PolicyKind::FusedScore => build_fused(model, &tree, &tokenizers, &block_size_oracle)?,
-        PolicyKind::PrefixCache => {
-            let p = PrefixCachePolicy::new(tree, block_size_oracle, prefix_cache::DEFAULT_WEIGHT);
-            let share = (model.eligibility.as_ref()).and_then(|e| e.min_prefix_share);
-            Arc::new(match share {
-                Some(s) => p.with_min_share(s),
-                None => p,
-            })
-        }
-        PolicyKind::Overloaded => {
+        PolicyKind::FusedScore => build_fused(model, &tree, &block_size_oracle)?,
+    })
+}
+
+/// Builds one hard admission filter with the shared model dependencies.
+fn build_filter(
+    kind: FilterKind,
+    model: &ModelConfig,
+    tree: &Arc<HashTree>,
+    block_size_oracle: &Arc<BlockSizeOracle>,
+) -> Arc<dyn Policy> {
+    match kind {
+        FilterKind::Overloaded => {
             let cap = (model.eligibility.as_ref())
                 .and_then(|e| e.max_in_flight)
                 .unwrap_or(usize::MAX);
             Arc::new(Overloaded::new(cap))
         }
-    })
+        FilterKind::PrefixCache => {
+            let share = (model.eligibility.as_ref())
+                .and_then(|e| e.min_prefix_share)
+                .unwrap_or(0.0);
+            Arc::new(
+                PrefixCachePolicy::new(
+                    Arc::clone(tree),
+                    Arc::clone(block_size_oracle),
+                    prefix_cache::DEFAULT_WEIGHT,
+                )
+                .with_min_share(share),
+            )
+        }
+    }
+}
+
+/// Builds one soft scoring term for `--policy fused_score`.
+fn build_score(
+    kind: ScoreTermKind,
+    tree: &Arc<HashTree>,
+    block_size_oracle: &Arc<BlockSizeOracle>,
+) -> Arc<dyn Policy> {
+    match kind {
+        ScoreTermKind::Random => Arc::new(RandomPolicy::new()),
+        ScoreTermKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        ScoreTermKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
+            Arc::clone(tree),
+            Arc::clone(block_size_oracle),
+            prefix_cache::DEFAULT_WEIGHT,
+        )),
+    }
 }
 
 /// Builds `--policy fused_score`.
 fn build_fused(
     model: &ModelConfig,
     tree: &Arc<HashTree>,
-    tokenizers: &Arc<TokenizerRegistry>,
     oracle: &Arc<BlockSizeOracle>,
 ) -> Result<Arc<dyn Policy>> {
     let spec = model.fused.as_deref().unwrap_or_default();
@@ -137,19 +157,7 @@ fn build_fused(
     }
     let mut terms: Vec<(Arc<dyn Policy>, Option<f32>)> = Vec::with_capacity(spec.len());
     for t in spec {
-        let mut m = model.clone();
-        (m.policy, m.fused) = (t.kind, None);
-        m.eligibility = None;
-        let inner = build_policy(
-            &m,
-            Arc::clone(tree),
-            Arc::clone(tokenizers),
-            Arc::clone(oracle),
-        )?;
-        if !inner.can_fuse() {
-            return Err(anyhow!("--fuse: `{}` does not support fusion", t.kind));
-        }
-        terms.push((inner, t.weight));
+        terms.push((build_score(t.kind, tree, oracle), t.weight));
     }
     Ok(Arc::new(FusedScorePolicy::new(terms)?))
 }
@@ -176,12 +184,6 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
-        PolicyKind::Overloaded => Arc::new(Overloaded::new(usize::MAX)),
-        PolicyKind::PrefixCache => Arc::new(PrefixCachePolicy::new(
-            Arc::new(HashTree::new()),
-            BlockSizeOracle::new(),
-            prefix_cache::DEFAULT_WEIGHT,
-        )),
         PolicyKind::FusedScore => {
             return Err(anyhow!("--policy {kind} needs --fuse terms from the model"))
         }
@@ -226,7 +228,9 @@ mod tests {
         StaticUrlsDiscoveryConfig,
     };
 
-    use crate::config::{EligibilityConfig, PolicyKind};
+    use crate::config::{
+        EligibilityConfig, FilterKind, PolicyKind, ScoreTermKind, StickyFallbackKind,
+    };
     use crate::discovery::{WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::SelectionContext;
     use crate::workers::Worker;
@@ -245,7 +249,7 @@ mod tests {
     fn filter_overloaded_wires_through_the_factory() {
         let mut cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         cfg.model.eligibility = Some(EligibilityConfig {
-            filters: vec![PolicyKind::Overloaded],
+            filters: vec![FilterKind::Overloaded],
             max_in_flight: Some(2),
             min_prefix_share: None,
         });
@@ -273,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_filter_must_actually_constrain() {
-        let mut cfg = cfg_with_model("modelA", PolicyKind::PrefixCache);
+        let mut cfg = cfg_with_model("modelA", PolicyKind::LoadBased);
         let built = |c: &Config| {
             build_registry_with_defaults(c).map(|r| r.get(&ModelId("modelA".into())).unwrap())
         };
@@ -283,7 +287,7 @@ mod tests {
         );
 
         cfg.model.eligibility = Some(EligibilityConfig {
-            filters: vec![PolicyKind::PrefixCache],
+            filters: vec![FilterKind::PrefixCache],
             max_in_flight: None,
             min_prefix_share: Some(0.6),
         });
@@ -293,14 +297,19 @@ mod tests {
         );
 
         cfg.model.eligibility = Some(EligibilityConfig {
-            filters: vec![PolicyKind::RoundRobin],
+            filters: vec![FilterKind::PrefixCache],
             max_in_flight: None,
-            min_prefix_share: None,
+            min_prefix_share: Some(0.6),
         });
-        let err = built(&cfg).unwrap_err().to_string();
+        let filter = build_filter(
+            FilterKind::PrefixCache,
+            &cfg.model,
+            &Arc::new(HashTree::new()),
+            &BlockSizeOracle::new(),
+        );
         assert!(
-            err.contains("round_robin") && err.contains("no eligibility rule"),
-            "{err}"
+            filter.can_filter(),
+            "a configured prefix-cache floor is a filter",
         );
     }
 
@@ -338,7 +347,6 @@ mod tests {
             PolicyKind::LoadBased,
             PolicyKind::CacheAwareZmq,
             PolicyKind::Sticky,
-            PolicyKind::PrefixCache,
         ] {
             assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
         }
@@ -346,31 +354,24 @@ mod tests {
     }
 
     #[test]
-    fn prefix_cache_builds_standalone_and_is_fusable() {
-        let p = build_policy(
-            &cfg_with_model("m", PolicyKind::PrefixCache).model,
-            Arc::new(HashTree::new()),
-            Arc::new(TokenizerRegistry::default()),
-            BlockSizeOracle::new(),
-        )
-        .expect("--policy prefix_cache must build");
+    fn prefix_cache_builds_as_a_score_term() {
+        let p = build_score(
+            ScoreTermKind::PrefixCache,
+            &Arc::new(HashTree::new()),
+            &BlockSizeOracle::new(),
+        );
         assert!(p.can_fuse(), "prefix_cache must be usable as a --fuse term");
     }
 
     #[test]
-    fn fused_score_refuses_a_non_fusable_term_at_startup() {
+    fn fused_score_builds_score_terms_and_rejects_an_empty_config() {
         let mut cfg = cfg_with_model("m", PolicyKind::FusedScore);
         let term = |kind, weight| crate::config::FusedTerm { kind, weight };
 
         for weight in [None, Some(2.5)] {
-            cfg.model.fused = Some(vec![term(PolicyKind::PrefixCache, weight)]);
+            cfg.model.fused = Some(vec![term(ScoreTermKind::PrefixCache, weight)]);
             assert!(build_registry_with_defaults(&cfg).is_ok(), "{weight:?}");
         }
-
-        cfg.model.fused = Some(vec![term(PolicyKind::RoundRobin, None)]);
-        let err = build_registry_with_defaults(&cfg).unwrap_err().to_string();
-        assert!(err.contains("round_robin"), "{err}");
-        assert!(err.contains("does not support fusion"), "{err}");
 
         cfg.model.fused = Some(vec![]);
         assert!(build_registry_with_defaults(&cfg)
@@ -383,11 +384,11 @@ mod tests {
     fn fused_score_accepts_an_outer_eligibility_pipeline() {
         let mut cfg = cfg_with_model("modelA", PolicyKind::FusedScore);
         cfg.model.fused = Some(vec![crate::config::FusedTerm {
-            kind: PolicyKind::LoadBased,
+            kind: ScoreTermKind::LoadBased,
             weight: None,
         }]);
         cfg.model.eligibility = Some(EligibilityConfig {
-            filters: vec![PolicyKind::Overloaded],
+            filters: vec![FilterKind::Overloaded],
             max_in_flight: Some(0),
             min_prefix_share: None,
         });
@@ -453,5 +454,23 @@ mod tests {
             dbg.contains("StickyPolicy"),
             "expected StickyPolicy debug repr, got: {dbg}",
         );
+    }
+
+    #[test]
+    fn sticky_fallback_builder_covers_all_typed_choices() {
+        let workers = vec![worker("w0"), worker("w1")];
+        let model = ModelId("modelA".into());
+        let ctx = SelectionContext::new(&model, None);
+        for kind in [
+            StickyFallbackKind::RoundRobin,
+            StickyFallbackKind::Random,
+            StickyFallbackKind::PowerOfTwo,
+            StickyFallbackKind::LoadBased,
+        ] {
+            assert!(
+                build_sticky_fallback(kind).select(&workers, &ctx).is_some(),
+                "{kind:?}"
+            );
+        }
     }
 }

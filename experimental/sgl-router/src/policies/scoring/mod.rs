@@ -76,6 +76,7 @@ pub fn admit<'f>(
             break;
         }
         let flags = filter.keep(&alive, ctx);
+        let on_empty = filter.on_empty();
         if flags.len() != alive.len() {
             tracing::debug!(
                 filter = ?filter,
@@ -83,6 +84,9 @@ pub fn admit<'f>(
                 n_flags = flags.len(),
                 "eligibility filter returned the wrong arity",
             );
+            if on_empty == OnEmpty::Hold {
+                return None;
+            }
         }
         let untouched = alive.len() == workers.len();
 
@@ -92,7 +96,7 @@ pub fn admit<'f>(
             .collect();
 
         if next.is_empty() {
-            match filter.on_empty() {
+            match on_empty {
                 OnEmpty::Hold => return None,
                 OnEmpty::Abstain if untouched => {
                     tracing::warn!(
@@ -517,6 +521,26 @@ mod tests {
         let ctx = SelectionContext::new(&model, None);
         let out = admit(refs(&[boxed(Short)]), &ws, &ctx).expect("the tail was admitted");
         assert_eq!(urls(&out), urls(&ws[1..]), "only index 0 rejected");
+    }
+
+    #[test]
+    fn a_short_hold_filter_fails_closed() {
+        #[derive(Debug)]
+        struct ShortHold;
+        impl EligibilityFilter for ShortHold {
+            fn keep(&self, _: &[Arc<Worker>], _: &SelectionContext<'_>) -> Vec<bool> {
+                vec![true]
+            }
+
+            fn on_empty(&self) -> OnEmpty {
+                OnEmpty::Hold
+            }
+        }
+
+        let ws = fleet();
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None);
+        assert!(admit(refs(&[boxed(ShortHold)]), &ws, &ctx).is_none());
     }
 
     #[test]
