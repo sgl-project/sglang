@@ -10,7 +10,6 @@ from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 register_cpu_ci(
     est_time=480,
     suite="base-b-test-cpu",
-    disabled="EAGLE3 numerical parity mismatches on CPU intel_amx",
 )
 
 
