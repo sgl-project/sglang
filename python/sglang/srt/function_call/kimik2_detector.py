@@ -17,6 +17,11 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import get_schema_properties
 
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:  # pragma: no cover - jsonschema is a hard dependency of the server
+    Draft202012Validator = None
+
 logger = logging.getLogger(__name__)
 
 _KIMI_K2_SPECIAL_TOKENS = [
@@ -131,8 +136,15 @@ class KimiK2Detector(BaseFormatDetector):
         (bare counter or client-style id).
 
         With a single tool the answer is unambiguous. Otherwise the arguments
-        must be a JSON object that structurally satisfies exactly one tool
-        schema: every required property present and no undeclared property.
+        must be a JSON object that exactly one tool accepts, where "accepts"
+        means: the object validates against the tool's ``parameters`` schema
+        (Draft 2020-12, the same validator the request path uses), and it
+        carries no key the schema does not declare unless the schema explicitly
+        allows additional properties. The second rule is an inference policy
+        on top of JSON Schema, whose default for undeclared keys is "allowed":
+        a tool schema almost never means to accept arbitrary keys, and a model
+        that hallucinated one should not be matched to a tool on the rest.
+
         Zero or several candidates return ``None`` so the caller drops the
         call instead of guessing; a wrong guess would hand the client an
         executable call to a tool the model did not choose.
@@ -162,11 +174,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         candidates = []
         for tool in tools:
-            params = tool.function.parameters or {}
-            props = set(get_schema_properties(params).keys())
-            required = params.get("required")
-            required = set(required) & props if isinstance(required, list) else set()
-            if required <= arg_keys and arg_keys <= props:
+            if self._schema_accepts_arguments(tool.function.parameters, args, arg_keys):
                 candidates.append(tool.function.name)
 
         if len(candidates) == 1:
@@ -178,6 +186,41 @@ class KimiK2Detector(BaseFormatDetector):
                 candidates,
             )
         return None
+
+    @staticmethod
+    def _schema_accepts_arguments(schema, args: dict, arg_keys: set) -> bool:
+        """Whether ``args`` is a plausible argument object for ``schema``.
+
+        Boolean schemas are legal (``true`` accepts anything, ``false``
+        nothing); a missing schema behaves like ``true``.
+        """
+        if schema is None or schema is True:
+            schema = {}
+        if schema is False or not isinstance(schema, dict):
+            return False
+
+        if Draft202012Validator is not None:
+            try:
+                if not Draft202012Validator(schema).is_valid(args):
+                    return False
+            except Exception:  # malformed schema: fall back to the key policy
+                logger.debug(
+                    "Could not validate arguments against tool schema", exc_info=True
+                )
+
+        props = set(get_schema_properties(schema).keys())
+        required = schema.get("required")
+        required = set(required) & props if isinstance(required, list) else set()
+        if not required <= arg_keys:
+            return False
+        extra_allowed = schema.get("additionalProperties")
+        if (
+            arg_keys <= props
+            or extra_allowed is True
+            or isinstance(extra_allowed, dict)
+        ):
+            return True
+        return False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""

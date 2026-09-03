@@ -1759,6 +1759,91 @@ class TestKimiK2ToolNameInferenceStrictness(unittest.TestCase):
                 )
                 self.assertIsNone(name)
 
+    def test_boolean_schema_does_not_raise_and_matches_only_empty_object(self):
+        # ``parameters: true`` is a legal schema that accepts anything; it must
+        # not crash the matcher, and under the undeclared-key policy it only
+        # matches ``{}``.
+        tools = [
+            _make_tool("anything", True),
+            _make_tool(
+                "query",
+                {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            ),
+        ]
+        self.assertEqual(self._infer('{"q": "x"}', tools), "query")
+        self.assertEqual(self._infer("{}", tools), "anything")
+        text = (
+            "<|tool_calls_section_begin|>"
+            '<|tool_call_begin|>call_3<|tool_call_argument_begin|>{"q": "x"}'
+            "<|tool_call_end|><|tool_calls_section_end|>"
+        )
+        result = KimiK2FuncDetector().detect_and_parse(text, tools)
+        self.assertEqual([c.name for c in result.calls], ["query"])
+        self.assertNotIn("<|tool_call", result.normal_text)
+        false_tool = [_make_tool("never", False)] + tools
+        self.assertEqual(self._infer("{}", false_tool), "anything")
+
+    def test_composite_required_is_validated_not_flattened(self):
+        # anyOf(city | zip): ``{}`` satisfies neither branch, so it must not be
+        # matched even though the merged property set makes it look valid.
+        tools = [
+            _make_tool(
+                "locate",
+                {
+                    "type": "object",
+                    "anyOf": [
+                        {
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                        {
+                            "properties": {"zip": {"type": "string"}},
+                            "required": ["zip"],
+                        },
+                    ],
+                },
+            ),
+            _make_tool(
+                "query",
+                {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            ),
+        ]
+        self.assertIsNone(self._infer("{}", tools))
+        self.assertEqual(self._infer('{"zip": "94110"}', tools), "locate")
+
+    def test_value_constraints_and_additional_properties_are_honored(self):
+        tools = [
+            _make_tool(
+                "delete",
+                {
+                    "type": "object",
+                    "properties": {"action": {"const": "delete"}},
+                    "required": ["action"],
+                },
+            ),
+            _make_tool(
+                "dispatch",
+                {"type": "object", "additionalProperties": {"type": "string"}},
+            ),
+        ]
+        # const mismatch rules out ``delete``; ``dispatch`` explicitly allows
+        # extra string-valued keys, so it is the unique candidate.
+        self.assertEqual(self._infer('{"action": "read"}', tools), "dispatch")
+        self.assertEqual(self._infer('{"action": "delete"}', tools), None)
+        # a non-string value violates dispatch's additionalProperties type
+        self.assertIsNone(self._infer('{"action": 5}', tools))
+        # type mismatch on a declared property
+        self.assertIsNone(self._infer('{"path": 5}', self.tools))
+        self.assertEqual(self._infer('{"path": "/x"}', self.tools), "LS")
+
     def test_streaming_ambiguous_section_is_skipped_without_wedging(self):
         chunks = [
             "<|tool_calls_section_begin|>",
