@@ -1269,7 +1269,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
-        if forward_batch.forward_mode.is_idle():
+        if forward_batch.batch_size == 0 or forward_batch.forward_mode.is_idle():
+            # DP-attention represents an idle hybrid rank as an empty
+            # TARGET_VERIFY batch so the rank can still join the later MoE
+            # collectives.  There is no attention work or metadata on that
+            # rank; preserve the expected output shape and let the model
+            # continue to the collective instead of entering a child backend.
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim

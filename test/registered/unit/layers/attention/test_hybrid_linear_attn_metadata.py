@@ -92,6 +92,23 @@ class TestHybridLinearAttentionMetadata(CustomTestCase):
         self.assertIsNone(full_attn.forward_metadata)
         self.assertIsNone(linear_attn.forward_metadata)
 
+    def test_empty_dp_target_verify_skips_linear_attention_forward(self):
+        backend = object.__new__(HybridLinearAttnBackend)
+        backend._is_full_attn = lambda *_args, **_kwargs: False
+        mixed_qkv = torch.empty((0, 16))
+        layer = SimpleNamespace(num_v_heads=2, head_v_dim=4)
+        forward_batch = SimpleNamespace(
+            batch_size=0, forward_mode=ForwardMode.TARGET_VERIFY
+        )
+
+        output = backend.forward(
+            layer=layer,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+        )
+
+        self.assertEqual(output.shape, (0, 2, 4))
+
     def test_eager_target_verify_collapses_mlp_sync_padding_rows(self):
         # Adaptive MTP N=4 is physically padded to attn-TP=8. The recurrent
         # backend keeps two request rows for collective shape compatibility,
