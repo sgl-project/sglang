@@ -250,15 +250,6 @@ def build_dcp_replicated_token_transfer_plan(
     decode_prefix_len: int = 0,
     num_kv_tokens: Optional[int] = None,
 ) -> DCPTokenTransferPlan:
-    """Plan for DCP-replicated rows (the spec-draft KV): every chunk token goes
-    to every decode rank.
-
-    The decode's page list holds virtual page ids of the shared allocator
-    (page = physical_page_size * dcp_size). A replicated pool indexes virtual
-    locs raw, so the destination row for delta-relative position ``pos`` is
-    ``dst_pages[pos // vps] * vps + pos % vps`` — the widened loc itself,
-    while the owner-sharded target plan collapses the same list by dcp_size.
-    """
     src_pages, dst_pages, num_kv_tokens = _validate_dcp_plan_inputs(
         src_page_indices,
         dst_page_indices,

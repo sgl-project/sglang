@@ -954,8 +954,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         draft_plan = None
         if num_draft > 0:
-            # Draft rows are DCP-replicated on the decode: every chunk token
-            # goes to this rank, addressed at widened virtual locs.
             draft_plan = build_dcp_replicated_token_transfer_plan(
                 prefill_kv_indices,
                 dst_kv_indices,
@@ -984,8 +982,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if packed is not None:
                 target_src_kv_ptrs, src_token_indices = packed
 
-        # (src_ptr, dst_ptr, token_item_len, (src_groups, dst_groups)) per entry;
-        # target entries share the strided groups, draft entries the replicated ones.
         layers_params = []
         if src_token_indices.size:
             target_groups = group_concurrent_contiguous(
@@ -2133,9 +2129,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         decode_kv_args.dst_dcp_rank,
                     )
                     if decode_kv_args.requires_dcp_relayout:
-                        # The registration wire carries one dst item len (the
-                        # first, a target entry); draft entries page at the
-                        # widened dst page size and are validated on NIXL only.
                         num_entries = len(self.kv_args.kv_item_lens)
                         num_draft = self.kv_args.num_draft_entries
                         dst_item_lens: List[Optional[int]] = [

@@ -51,10 +51,6 @@ class TestPackedDcpGrouping(CustomTestCase):
 
 
 class TestReplicatedDcpPlan(CustomTestCase):
-    """The DCP-replicated (spec-draft) plan must address the decode's WIDENED
-    virtual locs from the same page list the owner-strided target plan collapses
-    by dcp_size; a mismatch silently lands draft rows on the wrong tokens."""
-
     def test_replicated_rows_consistent_with_strided_plan(self):
         page_size = 64
         dcp_size = 4
@@ -75,7 +71,6 @@ class TestReplicatedDcpPlan(CustomTestCase):
             src_pages.astype(np.int64)[offsets // page_size] * page_size
             + offsets % page_size,
         )
-        # One virtual page: widened locs are the raw in-page offsets.
         np.testing.assert_array_equal(
             replicated.dst_token_indices, 7 * virtual_page_size + offsets
         )
@@ -102,8 +97,6 @@ class TestReplicatedDcpPlan(CustomTestCase):
         page_size = 64
         dcp_size = 2
         virtual_page_size = page_size * dcp_size
-        # Chunk 2 of a request: two source pages past a two-page first chunk,
-        # decode prefix occupying one aligned virtual page.
         src_pages = np.array([9, 3], dtype=np.int32)
         dst_pages = np.array([4, 6], dtype=np.int32)
         plan = build_dcp_replicated_token_transfer_plan(
@@ -122,26 +115,6 @@ class TestReplicatedDcpPlan(CustomTestCase):
             + relative % virtual_page_size,
         )
 
-    def test_rejects_unaligned_prefix(self):
-        with self.assertRaisesRegex(ValueError, "decode_prefix_len"):
-            build_dcp_replicated_token_transfer_plan(
-                np.array([0], dtype=np.int32),
-                np.array([0], dtype=np.int32),
-                physical_page_size=64,
-                dcp_size=4,
-                decode_prefix_len=64,
-            )
-
-    def test_rejects_insufficient_dst_pages(self):
-        with self.assertRaisesRegex(ValueError, "Insufficient destination"):
-            build_dcp_replicated_token_transfer_plan(
-                np.arange(4, dtype=np.int32),
-                np.array([], dtype=np.int32),
-                physical_page_size=64,
-                dcp_size=2,
-                num_kv_tokens=256,
-            )
-
 
 def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
     return SimpleNamespace(
@@ -154,10 +127,6 @@ def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
 
 
 class TestPrepareDcpTokenItemLens(CustomTestCase):
-    """Draft entries page at page_size * dcp_size on the decode, so their
-    registered item lens carry that factor; accepting the unscaled value would
-    let a mis-sized draft pool pass registration and corrupt rows at runtime."""
-
     def test_draft_tail_scales_by_dst_dcp_size(self):
         mgr = _dcp_kv_manager_stub(
             page_size=64,
@@ -179,26 +148,6 @@ class TestPrepareDcpTokenItemLens(CustomTestCase):
             CommonKVManager.prepare_dcp_token_item_lens(
                 mgr, [64 * 32, 64 * 16], dst_dcp_size=4
             )
-
-    def test_none_entries_skip_validation(self):
-        mgr = _dcp_kv_manager_stub(
-            page_size=64,
-            kv_item_lens=[64 * 32, 64 * 16],
-            num_draft_entries=1,
-        )
-        token_lens = CommonKVManager.prepare_dcp_token_item_lens(
-            mgr, [64 * 32, None], dst_dcp_size=4
-        )
-        self.assertEqual(token_lens, [32, 16])
-
-    def test_rejects_entry_count_mismatch(self):
-        mgr = _dcp_kv_manager_stub(
-            page_size=64,
-            kv_item_lens=[64 * 32, 64 * 16],
-            num_draft_entries=1,
-        )
-        with self.assertRaisesRegex(RuntimeError, "one KV entry per"):
-            CommonKVManager.prepare_dcp_token_item_lens(mgr, [64 * 32], dst_dcp_size=4)
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

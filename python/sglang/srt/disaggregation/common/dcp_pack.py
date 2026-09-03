@@ -96,8 +96,6 @@ def init_dcp_pack_buffers(
     max_tokens = max_prefill_buffer_tokens()
     if max_tokens <= 0:
         max_tokens = get_schedule().max_prefill_tokens
-    # Packing only serves the owner-strided target entries; DCP-replicated
-    # draft entries transfer page-contiguous and never enter the pack buffer.
     kv_item_lens = kv_args.kv_item_lens
     if kv_args.num_draft_entries > 0:
         kv_item_lens = kv_item_lens[: len(kv_item_lens) - kv_args.num_draft_entries]

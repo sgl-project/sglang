@@ -88,10 +88,6 @@ class KVArgs:
     kv_buf_groups: int
     # Only used of npu, for decode total kv layers
     total_kv_layers: int
-    # Draft-model KV entries appended after the target's in kv_data_ptrs.
-    # Under a DCP1 -> DCP-N relayout these rows are replicated per decode rank
-    # (never context-sharded), so the sender plans them separately. Class-level
-    # default keeps constructors that predate draft KV working.
     num_draft_entries: int = 0
 
 

@@ -1,13 +1,3 @@
-"""Kimi-Linear DCP1 prefill -> DCP4 decode PD transfer with DSPARK.
-
-The prefill injects the DSpark draft KV and ships it alongside the target MLA
-KV; the decode's draft pool is DCP-replicated, so the relayout must land every
-draft row on every rank at widened virtual locs. GSM8K guards the target path
-end to end; a spec sanity check guards against silently serving without
-speculation. With a dummy-weight draft nothing is ever accepted, so verify runs
-as a pure no-op on top of the transferred draft KV.
-"""
-
 import json
 import os
 import shutil
@@ -41,7 +31,6 @@ def _has_eight_blackwell_gpus() -> bool:
 
 
 def _write_dummy_qwen3_dspark_draft(root: Path) -> str:
-    """Write a dummy Qwen3 DSpark config with Kimi Linear dimensions."""
     draft_dir = root / "qwen3-dspark-kimi-proxy"
     draft_dir.mkdir()
     config = {
@@ -89,8 +78,6 @@ def _write_dummy_qwen3_dspark_draft(root: Path) -> str:
 class TestKimiLinearPDDCP4DSpark(GSM8KMixin, PDDisaggregationServerBase):
     model = KIMI_LINEAR_MODEL
     gsm8k_score_threshold = 0.88
-    # n=200 puts 0.88 only ~1.3 sigma below the observed mean; n=400 halves the
-    # flake rate at negligible eval cost.
     gsm8k_num_examples = 400
     gsm8k_num_threads = 64
     gsm8k_num_shots = 5
@@ -98,10 +85,6 @@ class TestKimiLinearPDDCP4DSpark(GSM8KMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # Mooncake >=0.3.13 bounds TCP admission per peer and hard-fails the
-        # overflow; the TP4/EP4 -> TP4/DCP4 fan-out blows past the defaults on
-        # hosts that fall back to TCP. Set before launch_all() so the server
-        # subprocesses inherit it.
         os.environ["MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"] = "65535"
         os.environ["MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"] = "65535"
 
@@ -166,9 +149,6 @@ class TestKimiLinearPDDCP4DSpark(GSM8KMixin, PDDisaggregationServerBase):
         super().tearDownClass()
 
     def test_spec_verify_runs_on_decode(self):
-        """A PD request must actually exercise DSPARK verify on the decode; a
-        silent fallback to plain decoding would leave the transferred draft KV
-        untested while every accuracy check still passes."""
         response = requests.post(
             self.base_url + "/generate",
             json={
@@ -183,7 +163,6 @@ class TestKimiLinearPDDCP4DSpark(GSM8KMixin, PDDisaggregationServerBase):
         )
         response.raise_for_status()
         meta_info = response.json()["meta_info"]
-        # The key is only present when verify ran at least once.
         self.assertGreater(
             meta_info.get("spec_verify_ct", 0),
             0,

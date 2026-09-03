@@ -330,15 +330,6 @@ class CommonKVManager(BaseKVManager):
     def prepare_dcp_token_item_lens(
         self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
     ) -> List[int]:
-        """Per-token byte widths for a DCP relayout, validated against the
-        decode's registered per-page item lens.
-
-        Target entries page at the physical page size on both peers. Draft
-        entries are DCP-replicated on the decode, whose pool pages at
-        page_size * dcp_size, so their per-page item lens carry that factor.
-        A None dst entry skips validation (mooncake's registration carries a
-        single item len, so draft entries cannot be checked there).
-        """
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
         num_entries = len(self.kv_args.kv_item_lens)

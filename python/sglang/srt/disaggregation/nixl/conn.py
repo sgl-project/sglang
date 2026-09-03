@@ -1717,8 +1717,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         token_item_lens = dst_info.dcp_token_item_lens
         assert token_item_lens is not None
-        # Packing serves only the owner-strided target entries; DCP-replicated
-        # draft entries transfer page-contiguous without a gather.
         num_target = len(self.kv_args.kv_data_ptrs) - self.kv_args.num_draft_entries
         rank_stride = pack_buffer.get_size() // dst_info.dst_dcp_size
         packed_source_by_dcp_rank[rank] = try_pack_dcp_src(
@@ -1739,13 +1737,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         packed_src,
         draft_plan=None,
     ):
-        """Send one DCP relayout chunk; returns the list of xfer handles.
-
-        Target entries follow the owner-strided plan (packed when possible);
-        draft entries follow the replicated plan. Two live parts share the
-        chunk notif via the `_part_{i}_{n}` suffix that
-        `_track_kv_part_arrival` reassembles on the decode.
-        """
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
         if dst_info.dst_homogeneous_mem_kind is None:
@@ -1759,7 +1750,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
 
-        # (src_ptrs, dst_ptrs, item_lens, src_token_indices, dst_token_indices)
         parts = []
         if plan.src_token_indices.size:
             src_kv_ptrs = self.kv_args.kv_data_ptrs[:num_target]
