@@ -405,9 +405,9 @@ def _triton_sparse_mla_fwd_single(
     assert d_v_in == d_v
     assert d_v % 128 == 0, f"Triton sparse MLA requires d_v divisible by 128, got {d_v}"
     num_groups = d_v // 128
-    assert (
-        num_groups <= 4
-    ), f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
+    assert num_groups <= 4, (
+        f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
+    )
     # The single-pass kernel indexes heads with an unmasked `tl.arange(0, H)`,
     # which Triton requires to be a power of two. H < 16 is padded up to 16
     # below; anything larger must already be a power of two.
