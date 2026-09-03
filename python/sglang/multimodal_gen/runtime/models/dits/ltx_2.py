@@ -10,28 +10,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_linear_gelu,
+    can_use_ltx2_qknorm_split_rope_cuda,
+    can_use_ltx2_rms_norm_modulate,
+    can_use_modulate_scale_shift_cuda,
     fused_gelu_active,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
-    can_use_ltx2_qknorm_split_rope_cuda,
-    ltx2_qknorm_split_rope_cuda,
-)
-from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
-    can_fuse_ltx2_rms_norm_modulate,
     fused_ltx2_rms_norm_modulate,
+    ltx2_qknorm_split_rope_cuda,
     ltx2_rms_norm_modulate_active,
+    mark_fused_gelu_site,
     mark_ltx2_rms_norm_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import (
-    can_use_modulate_scale_shift_cuda,
     modulate_scale_shift_cuda,
+    residual_gate_add,
 )
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_blocks_or_transformer_blocks,
@@ -204,12 +198,12 @@ def _ltx2_rms_norm_modulate(
     """``rms_norm(x) * (1 + scale) + shift`` for the LTX-2 adaLN sites.
 
     Folds the weightless RMSNorm and the modulate into one kernel when the
-    ``quality="high"`` fusion is mounted on ``block`` and the per-call guard
+    request-gated fusion is mounted on ``block`` and the per-call guard
     passes; otherwise the verbatim eager reference chain (the ``lossless``
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_fuse_ltx2_rms_norm_modulate(
+    if ltx2_rms_norm_modulate_active(block) and can_use_ltx2_rms_norm_modulate(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
@@ -256,9 +250,7 @@ def _ltx2_try_fused_ada_values9(
         return None
 
     try:
-        from sglang.kernels.ops.diffusion.triton.ltx2_ada_values import (
-            ltx2_ada_values9,
-        )
+        from sglang.kernels.ops.diffusion import ltx2_ada_values9
 
         return ltx2_ada_values9(scale_shift_table, timestep)
     except Exception as exc:
@@ -338,9 +330,7 @@ def apply_split_rotary_emb(
         and cos.is_cuda
         and sin.is_cuda
     ):
-        from sglang.kernels.ops.diffusion.triton.ltx2_rotary import (
-            apply_ltx2_split_rotary_emb,
-        )
+        from sglang.kernels.ops.diffusion import apply_ltx2_split_rotary_emb
 
         return apply_ltx2_split_rotary_emb(x, cos, sin)
 
@@ -745,11 +735,13 @@ class LTX2Attention(nn.Module):
         apply_gated_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        required_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
 
+        is_cross_attention = context_dim is not None
         self.query_dim = int(query_dim)
         self.context_dim = int(query_dim if context_dim is None else context_dim)
         self.heads = int(heads)
@@ -846,6 +838,8 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
+                is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
@@ -860,6 +854,8 @@ class LTX2Attention(nn.Module):
                 softmax_scale=None,
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
+                required_attention_backend=required_attention_backend,
+                is_cross_attention=is_cross_attention,
                 prefix=f"{prefix}.attn",
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
@@ -1080,7 +1076,7 @@ class LTX2FeedForward(nn.Module):
         mark_fused_gelu_site(self, "proj_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj_in, x):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj_in, x):
             x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
         else:
             x, _ = self.proj_in(x)
@@ -1203,10 +1199,11 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
-            supported_attention_backends=(
-                {AttentionBackendEnum.TORCH_SDPA}
+            supported_attention_backends=supported_attention_backends,
+            required_attention_backend=(
+                AttentionBackendEnum.TORCH_SDPA
                 if force_sdpa_v2a_cross_attention
-                else supported_attention_backends
+                else None
             ),
             prefix=f"{prefix}.video_to_audio_attn",
             quant_config=quant_config,

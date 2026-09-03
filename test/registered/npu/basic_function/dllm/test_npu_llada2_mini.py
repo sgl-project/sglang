@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
@@ -40,8 +40,7 @@ class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (llada2-mini) with tp1\n"
-                f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (llada2-mini) with tp1\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 130)
 

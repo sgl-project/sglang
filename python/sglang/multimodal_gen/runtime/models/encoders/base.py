@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
@@ -36,6 +37,10 @@ def get_folding_tp_group(config: EncoderConfig):
     if mode == "world":
         # the whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
         return get_world_group()
+    if mode == "replica":
+        # the ranks serving this rank's pipeline replica (== world when
+        # dp_size is 1); the shape-independent choice for explicit folding
+        return get_replica_group()
     if mode is None:
         return get_tp_group()
     raise ValueError(f"Unsupported encoder folding mode: {mode!r}")
@@ -153,6 +158,20 @@ class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
+    checkpoint_quantization_backend = "diffusion"
+    packed_modules_mapping: dict[str, list[str]] = {}
+
+    @staticmethod
+    def should_materialize_checkpoint_weight(name: str) -> bool:
+        return True
+
+    @classmethod
+    def configure_component_paths(
+        cls,
+        config: EncoderConfig,
+        component_paths: dict[str, str],
+    ) -> None:
+        """Apply optional runtime components before parallel layout is resolved."""
 
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group

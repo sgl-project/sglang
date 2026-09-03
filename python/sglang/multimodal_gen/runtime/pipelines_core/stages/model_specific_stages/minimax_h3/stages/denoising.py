@@ -5,7 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -15,6 +15,10 @@ import torch
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
+    CubeSparseAttentionMetadata,
+    CubeSparseAttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
@@ -35,6 +39,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -46,6 +54,7 @@ _REF2VA_VIDEO_CHAINS = {
     "video.reference_preserve",
     "video_audio.reference_preserve",
 }
+_REFINED_PROMPT_EMBEDS_KEY = "_minimax_h3_refined_prompt_embeds"
 
 
 def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
@@ -75,38 +84,42 @@ def minimax_h3_condition_noise_aug(sampling: Any) -> tuple[float, float]:
     return float(imgvid_noise_aug), float(audio_noise_aug)
 
 
-def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
+def _validate_keyframe_payload(plan: Any, keyframe: Any) -> None:
     """Reject stale/middle/reordered keyframe payloads at the DiT sink."""
 
     task = None if plan is None else str(plan.task)
-    if task != "fl2va":
+    if task not in {"fl2va", "ref2va"}:
         if keyframe is not None:
             raise ValueError(
-                "keyframe condition rows are only valid for plan.task='fl2va'"
+                "keyframe condition rows require plan.task='fl2va' or 'ref2va'"
             )
         return
+    if keyframe is None:
+        if task == "fl2va":
+            raise ValueError("fl2va denoising requires encoded keyframe condition rows")
+        return
     if not isinstance(keyframe, Mapping):
-        raise ValueError("fl2va denoising requires encoded keyframe condition rows")
+        raise ValueError("encoded keyframe condition rows must be a mapping")
 
     semantic_indices = tuple(keyframe.get("semantic_frame_indices") or ())
     if semantic_indices not in MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES:
         raise ValueError(
-            "fl2va denoising requires semantic_frame_indices in "
+            "keyframe denoising requires semantic_frame_indices in "
             f"{MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES!r}, "
             f"got {semantic_indices!r}"
         )
     frame_count = keyframe.get("frame_count")
     if isinstance(frame_count, bool) or not isinstance(frame_count, int):
-        raise ValueError("fl2va keyframe payload requires an integer frame_count")
+        raise ValueError("keyframe payload requires an integer frame_count")
     if frame_count <= 1:
-        raise ValueError("fl2va keyframe payload frame_count must be greater than one")
+        raise ValueError("keyframe payload frame_count must be greater than one")
     pixel_indices = keyframe.get("pixel_frame_indices")
     expected_pixel_indices = [
         frame_count - 1 if index == -1 else index for index in semantic_indices
     ]
     if pixel_indices != expected_pixel_indices:
         raise ValueError(
-            "fl2va denoising requires pixel_frame_indices resolved from the "
+            "keyframe denoising requires pixel_frame_indices resolved from the "
             "semantic anchors, "
             f"got {pixel_indices!r} for frame_count={frame_count}"
         )
@@ -118,15 +131,15 @@ def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
         or any(not isinstance(entry, Mapping) for entry in entries)
     ):
         raise ValueError(
-            "fl2va denoising requires one encoded keyframe per semantic anchor"
+            "keyframe denoising requires one encoded keyframe per semantic anchor"
         )
     if [entry.get("frame_index") for entry in entries] != list(semantic_indices):
-        raise ValueError("fl2va encoded keyframes must remain in semantic anchor order")
+        raise ValueError("encoded keyframes must remain in semantic anchor order")
     if [
         entry.get("resolved_frame_index") for entry in entries
     ] != expected_pixel_indices:
         raise ValueError(
-            "fl2va encoded keyframes must carry matching resolved_frame_index values"
+            "encoded keyframes must carry matching resolved_frame_index values"
         )
 
     latent_h = int(keyframe.get("latent_h") or 0)
@@ -141,7 +154,7 @@ def _validate_fl2va_keyframe_payload(plan: Any, keyframe: Any) -> None:
     ):
         actual_rows = None if not isinstance(rows, torch.Tensor) else int(rows.shape[0])
         raise ValueError(
-            "fl2va encoded keyframe rows do not match target-canvas blocks: "
+            "encoded keyframe rows do not match target-canvas blocks: "
             f"expected={expected_rows}, actual={actual_rows}"
         )
 
@@ -154,8 +167,26 @@ def _imgvid_condition_shapes(
 ) -> list[tuple[int, int, int]]:
     """Return visual-condition ``(T,H,W)`` in packed anchor-row order."""
 
+    shapes = []
+    if isinstance(keyframe, Mapping):
+        entries = keyframe.get("keyframes")
+        if isinstance(entries, list) and entries:
+            shapes.extend(
+                (1, int(entry["latent_h"]), int(entry["latent_w"])) for entry in entries
+            )
+        else:
+            latent_h = int(keyframe["latent_h"])
+            latent_w = int(keyframe["latent_w"])
+            frame_rows = (latent_h // 2) * (latent_w // 2)
+            rows = keyframe["rows"]
+            if frame_rows <= 0 or int(rows.shape[0]) % frame_rows:
+                raise ValueError(
+                    "legacy keyframe rows cannot be split into visual-condition frames"
+                )
+            shapes.extend(
+                [(1, latent_h, latent_w)] * (int(rows.shape[0]) // frame_rows)
+            )
     if ref2va_blocks is not None:
-        shapes = []
         for block in ref2va_blocks:
             kind = str(block["kind"])
             if kind == "image":
@@ -175,23 +206,7 @@ def _imgvid_condition_shapes(
         # supplied above; reaching here indicates an upstream bug.
         raise ValueError("ref2va visual-condition shapes require ordered blocks")
 
-    if not isinstance(keyframe, Mapping):
-        return []
-    entries = keyframe.get("keyframes")
-    if isinstance(entries, list) and entries:
-        return [
-            (1, int(entry["latent_h"]), int(entry["latent_w"])) for entry in entries
-        ]
-
-    latent_h = int(keyframe["latent_h"])
-    latent_w = int(keyframe["latent_w"])
-    frame_rows = (latent_h // 2) * (latent_w // 2)
-    rows = keyframe["rows"]
-    if frame_rows <= 0 or int(rows.shape[0]) % frame_rows:
-        raise ValueError(
-            "legacy keyframe rows cannot be split into visual-condition frames"
-        )
-    return [(1, latent_h, latent_w)] * (int(rows.shape[0]) // frame_rows)
+    return shapes
 
 
 def _ref2va_payload_entry(
@@ -245,6 +260,8 @@ def _ref2va_ordered_blocks_and_rows(
     for material in plan.materials:
         chain = str(material.material_chain)
         condition_index = int(material.condition_index)
+        if chain == "image.target_canvas":
+            continue
         if chain == "image.reference_preserve":
             entry = _ref2va_payload_entry(
                 ref_image,
@@ -325,30 +342,73 @@ def _resolve_denoise_model(
     return model.to(device).eval()
 
 
+def _build_cube_attn_metadata(
+    server_args: ServerArgs,
+    *,
+    packed: dict[str, Any],
+    num_steps: int,
+    device: torch.device,
+) -> CubeSparseAttentionMetadata | None:
+    """Build cube sparse attention metadata when that backend is selected."""
+    transformer_backend = (server_args.component_attention_backends or {}).get(
+        "transformer", server_args.attention_backend
+    )
+    if str(transformer_backend).lower() != "cube_sparse_attn":
+        return None
+
+    config = server_args.attention_backend_config or {}
+    local_cube_size = config.get("local_cube_size")
+    topk_ratio_list = config.get("topk_ratio_list")
+    if not local_cube_size or not topk_ratio_list:
+        raise ValueError(
+            "cube_sparse_attn requires --attention-backend-config with "
+            "local_cube_size and topk_ratio_list"
+        )
+    metadata = CubeSparseAttentionMetadataBuilder().build(
+        packed=packed,
+        local_cube_size=local_cube_size,
+        topk_ratio_list=topk_ratio_list,
+        num_steps=num_steps,
+        device=device,
+    )
+    logger.info(
+        "cube sparse attention enabled: local_cube_size=%s "
+        "topk_ratio_list(len=%d, min=%.4f, max=%.4f)",
+        list(local_cube_size),
+        len(metadata.topk_ratio_list),
+        min(metadata.topk_ratio_list),
+        max(metadata.topk_ratio_list),
+    )
+    return metadata
+
+
 def _precompute_refined_prompt_embeds(
     model: Any,
     positive: Any,
     *,
     device: torch.device,
+    shared_conditioning: dict[str, Any] | None = None,
 ) -> bool:
-    """Move request-static text refinement out of the denoise hot loop."""
+    """Refine text once for outputs that share the encoded presentation."""
     refine = getattr(model, "refine_prompt_embeds", None)
     if not callable(refine):
         return False
 
     static_kwargs = positive.static_kwargs
     prompt_embeds = static_kwargs["prompt_embeds"]
-    refiner_params = static_kwargs["refiner_packed_seq_params"]
-    if isinstance(refiner_params, dict):
-        refiner_cu = refiner_params["cu_seqlens_q"]
-    else:
-        refiner_cu = refiner_params.cu_seqlens_q
-    with torch.inference_mode():
-        refined = refine(
-            prompt_embeds,
-            refiner_cu,
-            device=device,
-        )
+    refined = (
+        shared_conditioning.get(_REFINED_PROMPT_EMBEDS_KEY)
+        if shared_conditioning is not None
+        else None
+    )
+    if refined is None:
+        refiner_params = static_kwargs["refiner_packed_seq_params"]
+        if isinstance(refiner_params, dict):
+            refiner_cu = refiner_params["cu_seqlens_q"]
+        else:
+            refiner_cu = refiner_params.cu_seqlens_q
+        with torch.inference_mode():
+            refined = refine(prompt_embeds, refiner_cu, device=device)
     if not torch.is_tensor(refined):
         raise TypeError("MiniMax H3 refine_prompt_embeds must return a torch.Tensor")
     if int(refined.shape[0]) != int(prompt_embeds.shape[0]):
@@ -356,6 +416,8 @@ def _precompute_refined_prompt_embeds(
             "MiniMax H3 refined prompt row count changed: "
             f"{int(prompt_embeds.shape[0])} -> {int(refined.shape[0])}"
         )
+    if shared_conditioning is not None:
+        shared_conditioning.setdefault(_REFINED_PROMPT_EMBEDS_KEY, refined)
     static_kwargs["prompt_embeds"] = refined
     static_kwargs["refined_prompt_embeds_length"] = int(refined.shape[0])
     return True
@@ -404,12 +466,20 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
-        generic_requested = (
-            super()._cache_dit_requested() and "quality" not in explicit_fields
+        enable_override = batch.sampling_params.enable_cache_dit
+        generic_enabled = (
+            super()._cache_dit_requested()
+            if enable_override is None
+            else enable_override
         )
-        desired_mode = (
-            "high" if quality == "high" else ("generic" if generic_requested else None)
-        )
+        generic_requested = generic_enabled and "quality" not in explicit_fields
+        if enable_override is False:
+            # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif quality == "high":
+            desired_mode = "high"
+        else:
+            desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
 
@@ -426,9 +496,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Cache-DiT still holds references to their inputs. Settle the state
             # fields before restoring the in-place path, so a failure there
             # costs throughput rather than leaving the stage inconsistent.
-            self.transformer = disable_cache_on_transformer(self.transformer)
-            self._cache_dit_enabled = False
-            self._cached_num_steps = None
+            self._unmount_cache_dit()
             self._minimax_h3_cache_mode = None
             self._set_cache_dit_input_preservation(False)
 
@@ -484,6 +552,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # mounted.
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
 
@@ -593,14 +662,22 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
             MiniMaxH3DenoiseBranch,
+            _minimax_h3_subblock_video_query_indices,
             minimax_h3_denoise_loop,
         )
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_mps()
+            or current_platform.is_npu()
+        ):
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, MPS, or Ascend NPU"
+            )
+
+        device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
@@ -610,11 +687,28 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         _assemble_condition_rows(ctx)
 
         emb = ctx.embeddings["positive"]
-        packed = _build_packed_layout(ctx, emb)
+        subblock_enabled = server_args.pipeline_config.uses_subblock_attention(
+            server_args
+        )
+        packed = _build_packed_layout(
+            ctx,
+            emb,
+            include_video_pos=subblock_enabled,
+        )
         tags = packed["token_tags"]
         tags[packed["text_pos"].view(-1)] = (
             emb["text_token_tags"].view(-1).to(torch.long)
         )
+        video_query_indices = None
+        if subblock_enabled:
+            text_video_token_mask = emb.get("text_video_token_mask")
+            # Legacy/precomputed presentations may lack this optional
+            # provenance. The helper then keeps their Qwen rows dense while
+            # retaining packed reference/target video rows as sparse.
+            video_query_indices = _minimax_h3_subblock_video_query_indices(
+                packed,
+                text_video_token_mask,
+            )
 
         sampling = batch.sampling_params
         imgvid_noise_aug, audio_noise_aug = minimax_h3_condition_noise_aug(sampling)
@@ -623,6 +717,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
+        )
+        attn_metadata = _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=len(sigmas_video) - 1,
+            device=device,
         )
 
         placement_managed = self._component_residency_manager is not None
@@ -634,16 +734,25 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            build_vsa_h3_step_metadata = _maybe_prepare_vsa_h3_step_metadata(
+                model=model,
+                packed=packed,
+                ctx=ctx,
+                server_args=server_args,
+                device=device,
+            )
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
                 token_tags=tags,
+                video_query_indices=video_query_indices,
                 device=device,
             )
             _precompute_refined_prompt_embeds(
                 model,
                 positive,
                 device=device,
+                shared_conditioning=emb,
             )
             _precompute_rope_cache(
                 model,
@@ -667,7 +776,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     model=model,
-                    model_forward=partial(self._forward_dit, batch=batch),
+                    model_forward=partial(
+                        self._forward_dit,
+                        batch=batch,
+                        attn_metadata=attn_metadata,
+                        build_vsa_h3_step_metadata=build_vsa_h3_step_metadata,
+                    ),
                     positive=positive,
                     initial_video_rows=initial_video,
                     initial_audio_rows=initial_audio,
@@ -678,6 +792,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                     device=device,
                     imgvid_cond_noise_aug_for_inference=float(imgvid_noise_aug),
                     audio_cond_noise_aug_for_inference=float(audio_noise_aug),
+                    attn_metadata=attn_metadata,
                     on_step=on_step,
                     step_profiler=partial(
                         self._profile_denoising_step,
@@ -718,6 +833,8 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
+        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
 
@@ -727,7 +844,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         with set_forward_context(
             current_timestep=step_index,
-            attn_metadata=None,
+            attn_metadata=(
+                build_vsa_h3_step_metadata(step_index)
+                if build_vsa_h3_step_metadata is not None
+                else attn_metadata
+            ),
             forward_batch=batch,
         ):
             runner = self._maybe_get_bcg_runner(model)
@@ -781,8 +902,7 @@ class _FullLoopContext:
 def _resolve_full_loop_context(batch: Req) -> _FullLoopContext:
     """Read/validate extras and the denoise state into a loop context.
 
-    Enforces the task-payload exclusivity rules (keyframe vs reference
-    exclusivity) and cross-checks the resolved latent dims.
+    Validates task payloads and cross-checks the resolved latent dims.
     """
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
         MINIMAX_H3_DENOISE_STATE_EXTRA_KEY,
@@ -811,9 +931,7 @@ def _resolve_full_loop_context(batch: Req) -> _FullLoopContext:
         or ctx.ref_audio is not None
         or ctx.ref_video is not None
     )
-    if ctx.is_ref2va and ctx.keyframe is not None:
-        raise ValueError("keyframe and reference extras are mutually exclusive")
-    _validate_fl2va_keyframe_payload(ctx.plan, ctx.keyframe)
+    _validate_keyframe_payload(ctx.plan, ctx.keyframe)
 
     ctx.latent_t = int(ctx.state["latent_t"])
     ctx.latent_h = int(ctx.state["latent_h"])
@@ -836,7 +954,7 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
                 "ref2va reference extras require a resolved plan; "
                 "plan-less ref2va requests are unsupported"
             )
-        ctx.ref2va_positive_blocks, ctx.cond_rows, ctx.audio_ref_rows = (
+        ctx.ref2va_positive_blocks, ref_rows, ctx.audio_ref_rows = (
             _ref2va_ordered_blocks_and_rows(
                 plan=ctx.plan,
                 ref_image=ctx.ref_image,
@@ -844,6 +962,12 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
                 ref_video=ctx.ref_video,
             )
         )
+        condition_parts = []
+        if ctx.keyframe is not None:
+            condition_parts.append(ctx.keyframe["rows"])
+        if ref_rows is not None:
+            condition_parts.append(ref_rows)
+        ctx.cond_rows = _cat_optional(condition_parts)
         ctx.include_cond = ctx.cond_rows is not None
     else:
         ctx.cond_rows = ctx.keyframe["rows"] if ctx.include_cond else None
@@ -856,9 +980,78 @@ def _assemble_condition_rows(ctx: _FullLoopContext) -> None:
         ctx.keyframe_frame_count = int(ctx.keyframe["frame_count"])
 
 
+def _maybe_prepare_vsa_h3_step_metadata(
+    *,
+    model: Any,
+    packed: Mapping[str, torch.Tensor],
+    ctx: _FullLoopContext,
+    server_args: ServerArgs,
+    device: torch.device,
+) -> Callable[[int], Any] | None:
+    """Per-step VSA-H3 metadata builder over the request-static packed layout,
+    or None off the VSA path."""
+    model._resolve_attention_backend_once()
+    if (
+        model._resolved_attention_backend
+        is not AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3
+    ):
+        return None
+    if ctx.is_ref2va:
+        raise NotImplementedError(
+            "VSA-H3 supports the t2va/fl2va packed layout; the ref2va "
+            "reference-block layout is not tiled yet. Use --attention-backend "
+            "fa for ref2va."
+        )
+
+    config = server_args.attention_backend_config or {}
+    tile_size = int(config.get("vsa_tile_size", 64))
+    if tile_size != 64:
+        raise ValueError(
+            "VSA-H3 in SGLang serves the trained 64-token (4, 4, 4) tile "
+            f"geometry; got vsa_tile_size={tile_size}."
+        )
+    sparsity = float(config.get("VSA_sparsity", config.get("sparsity", 0.9)))
+    if not 0.0 <= sparsity < 1.0:
+        raise ValueError(f"VSA sparsity must be in [0, 1), got {sparsity}")
+    mode = str(config.get("vsa_mode", "exempt"))
+    if mode not in ("exempt", "compete"):
+        raise ValueError(f"vsa_mode must be 'exempt' or 'compete', got {mode!r}")
+    dense_first_n_steps = int(config.get("vsa_dense_first_n_steps", 0))
+    dense_layers = tuple(int(layer) for layer in config.get("vsa_dense_layers", ()))
+
+    text_len = int(packed["text_pos"].numel())
+    video_rows = int(packed["update_mask"].sum())
+    cond_rows = int(packed["img_pos"].numel()) - video_rows
+    audio_rows = int(packed["audio_pos"].numel())
+    patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+        VideoSparseAttentionH3MetadataBuilder,
+    )
+
+    builder = VideoSparseAttentionH3MetadataBuilder()
+
+    def build(step_index: int):
+        return builder.build(
+            current_timestep=step_index,
+            raw_latent_shape=(ctx.latent_t, ctx.latent_h, ctx.latent_w),
+            patch_size=patch_size,
+            VSA_sparsity=sparsity,
+            prefix_segments=(text_len, cond_rows, audio_rows),
+            device=device,
+            exempt=mode == "exempt",
+            dense_layers=dense_layers,
+            dense_first_n_steps=dense_first_n_steps,
+        )
+
+    return build
+
+
 def _build_packed_layout(
     ctx: _FullLoopContext,
     emb: Mapping[str, Any],
+    *,
+    include_video_pos: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build the per-task packed layout for the positive branch."""
 
@@ -877,6 +1070,9 @@ def _build_packed_layout(
             latent_w=ctx.latent_w,
             audio_t=ctx.audio_t,
             ref_blocks=ctx.ref2va_positive_blocks,
+            keyframe_frame_indices=ctx.keyframe_frame_indices,
+            frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     else:
         packed = minimax_h3_packed_sequence(
@@ -890,6 +1086,7 @@ def _build_packed_layout(
                 ctx.keyframe_frame_indices if ctx.include_cond else None
             ),
             frame_count=ctx.keyframe_frame_count,
+            include_video_pos=include_video_pos,
         )
     return packed
 

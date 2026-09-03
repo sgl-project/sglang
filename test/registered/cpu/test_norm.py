@@ -2,12 +2,13 @@ import sys
 from typing import Optional, Tuple, Union
 
 import pytest
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import make_non_contiguous, precision
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)
@@ -18,7 +19,6 @@ eps = 1e-6
 
 
 class TestNorm:
-
     def _forward_native(
         self,
         x: torch.Tensor,
@@ -200,7 +200,6 @@ class TestNorm:
 
 
 class TestFusedRMSNormGated:
-
     def _forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -235,7 +234,6 @@ class TestFusedRMSNormGated:
 
 
 class TestFusedQKRMSNorm:
-
     @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
     @pytest.mark.parametrize(
         "batch_size,q_size,k_size,v_size",
@@ -316,7 +314,6 @@ class TestFusedQKRMSNorm:
 
 
 class TestLayerNorm:
-
     def _forward_native(
         self,
         x: torch.Tensor,
@@ -381,7 +378,6 @@ class TestLayerNorm:
 
 
 class TestFusedQKGemmaRMSNorm:
-
     def _gemma_rmsnorm_per_head_native(
         self,
         x: torch.Tensor,

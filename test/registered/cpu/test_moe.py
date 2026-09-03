@@ -3,6 +3,7 @@ import math
 import pytest
 
 # TODO: use interface in cpu.py
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.amx_utils import CPUQuantMethod
@@ -33,7 +34,7 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
 )
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="base-b-test-cpu")
 
 
 def run_fused_experts(
@@ -139,7 +140,6 @@ def make_mxfp4_weights(e, out_dim, in_dim, dtype, with_bias=False):
 
 
 class TestFusedExperts:
-
     def test_unsupported_activation_is_rejected(self):
         m, n, k, e, topk = 2, 32, 32, 4, 2
         a = torch.randn((m, k), dtype=dtype) / 10
