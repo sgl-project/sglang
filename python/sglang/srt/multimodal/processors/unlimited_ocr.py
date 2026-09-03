@@ -37,8 +37,7 @@ def _resolve_mode(images_config, num_images: int = 1) -> dict:
             f"Unknown image_mode '{mode}'. Supported: {', '.join(_IMAGE_MODE_PRESETS)}"
         )
         raise ValueError(
-            f"Unknown image_mode '{mode}'. "
-            f"Supported: {', '.join(_IMAGE_MODE_PRESETS)}"
+            f"Unknown image_mode '{mode}'. Supported: {', '.join(_IMAGE_MODE_PRESETS)}"
         )
     _MULTI_IMAGE_ALLOWED = ("tiny", "small", "base")
     base_size, image_size, crop_mode = preset
