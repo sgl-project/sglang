@@ -7,6 +7,7 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
+import os
 from collections.abc import Iterable
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -121,8 +122,9 @@ from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_platform,
 )
-from sglang.srt.utils import is_blackwell_supported, is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -780,7 +782,10 @@ class KimiK3MoE(nn.Module):
         from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
         from sglang.srt.distributed.parallel_state import get_moe_ep_group
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.mega_moe import _get_mega_moe_symm_buffer
+        from sglang.srt.layers.moe.mega_moe import (
+            _configure_mega_moe_deep_gemm_num_sms,
+            _get_mega_moe_symm_buffer,
+        )
 
         # In SP-MoE mode (KimiK3DecoderLayer reduce-scatters the o_proj
         # output) the incoming rows are already this rank's token shard, so
@@ -833,15 +838,16 @@ class KimiK3MoE(nn.Module):
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="situ",
-            fast_math=True,
-        )
+        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+            deep_gemm.fp8_fp4_mega_moe(
+                y,
+                self.experts.mega_l1_weights,
+                self.experts.mega_l2_weights,
+                buf,
+                recipe=(1, 1, 32),
+                activation="situ",
+                fast_math=True,
+            )
         y = y[:num_tokens]
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1052,7 +1058,7 @@ class KimiK3MoE(nn.Module):
             topk_output, routed_input = routed_input
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-            # or dsv3_router_gemm); non-CUDA falls back to F.linear (bf16). The
+            # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
@@ -1401,7 +1407,7 @@ class KimiK3DeltaAttention(nn.Module):
         # Same SM bound rationale as the MLA gate stream.
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            (128 if is_blackwell_supported() else 64)
+            (128 if get_platform().is_blackwell else 64)
             if bfa_alt_stream is not None
             else 0
         )
@@ -1690,6 +1696,7 @@ class KimiK3DeltaAttention(nn.Module):
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
         # Set by _prepare_fused_decode() once weights are loaded.
         self._kda_fused_decode_ready = False
+        self._kda_hip_fused_decode_ready = False
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1741,7 +1748,51 @@ class KimiK3DeltaAttention(nn.Module):
         unfused chain. Called once from load_weights (after all weights are
         loaded, before cuda graph capture)."""
         if _is_hip:
-            # The fused KDA decode kernel is NVIDIA-only
+            from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+
+            layer = self.attn
+            w = layer.conv_weights
+            f_b_weight = self.f_b_proj.weight
+            backend = os.environ.get("SGLANG_K3_KDA_FUSED_BACKEND", "").lower()
+            backend_available = (
+                backend == "aiter"
+                and kda_fused_decode_aiter_hip.available(f_b_weight.device)
+            )
+            if (
+                backend_available
+                and w is not None
+                and tuple(w.shape) == (3 * 12 * 128, 4)
+                and w.dtype == torch.float32
+                and f_b_weight.shape == (12 * 128, 128)
+                and f_b_weight.dtype == torch.bfloat16
+                and layer.A_log is not None
+                and layer.A_log.numel() == 12
+                and layer.A_log.dtype == torch.float32
+                and layer.dt_bias is not None
+                and tuple(layer.dt_bias.shape) == (12 * 128,)
+                and layer.dt_bias.dtype == torch.float32
+                and layer.lower_bound is not None
+            ):
+                norm_weight = self.o_norm.weight.data.to(torch.bfloat16).contiguous()
+                f_b_weight = f_b_weight.view(12, 128, 128).contiguous()
+                a_log = layer.A_log.detach().reshape(-1).contiguous()
+                layer._k3_hip_fused_decode_args = (
+                    f_b_weight,
+                    norm_weight,
+                    float(self.o_norm.eps),
+                    a_log,
+                )
+                kda_fused_decode_aiter_hip.warmup(
+                    f_b_weight=f_b_weight,
+                    conv_weight=w,
+                    A_log=a_log,
+                    dt_bias=layer.dt_bias,
+                    lower_bound=float(layer.lower_bound),
+                    norm_weight=norm_weight,
+                    norm_eps=float(self.o_norm.eps),
+                )
+                layer._k3_hip_fused_decode_backend = backend
+                self._kda_hip_fused_decode_ready = True
             return
         layer = self.attn
         w = layer.conv_weights
@@ -1787,7 +1838,9 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._kda_fused_decode_ready = True
 
-    def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
+    def forward_qkvbfg_fused(
+        self, hidden_states: torch.Tensor, defer_f_b: bool = False
+    ):
         if self.use_full_rank_gate:
             if self._bfa_w is not None:
                 w = self._bfa_w
@@ -1808,7 +1861,11 @@ class KimiK3DeltaAttention(nn.Module):
                     alt.wait_stream(cur)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
-                        forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
+                        forget_gate = (
+                            bfa[..., :n_fa]
+                            if defer_f_b
+                            else gemm(bfa[..., :n_fa], self._bfa_f_b_w)
+                        )
                         beta = bfa[..., n_fa : n_fa + n_b]
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
@@ -1820,13 +1877,18 @@ class KimiK3DeltaAttention(nn.Module):
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
-                forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
+                forget_gate = (
+                    bfa[..., :n_fa]
+                    if defer_f_b
+                    else gemm(bfa[..., :n_fa], self._bfa_f_b_w)
+                )
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
-                forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+                f_a = self.f_a_proj(hidden_states)[0]
+                forget_gate = f_a if defer_f_b else self.f_b_proj(f_a)[0]
         else:
             fused_states = self.fused_qkvbfg_a_proj(hidden_states)
             qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
@@ -1842,9 +1904,12 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        defer_f_b = (
+            self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
+        )
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
-                hidden_states
+                hidden_states, defer_f_b=defer_f_b
             )
         else:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
@@ -1865,13 +1930,15 @@ class KimiK3DeltaAttention(nn.Module):
         # into the recurrence kernel. If the backend leaves the stash
         # unconsumed (env off or shape not covered), apply o_norm here as
         # before.
-        fused_onorm = self._kda_fused_decode_ready and (
+        fused_onorm = (self._kda_fused_decode_ready or defer_f_b) and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
         if fused_onorm:
             self.attn._k3_onorm_gate = g_proj_states
             self.attn._k3_onorm_consumed = False
+        if defer_f_b:
+            self.attn._k3_deferred_f_b = True
 
         core_attn_out = self.attn(
             forward_batch,
@@ -1883,6 +1950,8 @@ class KimiK3DeltaAttention(nn.Module):
         if fused_onorm:
             self.attn._k3_onorm_gate = None
             fused_onorm = self.attn._k3_onorm_consumed
+        if defer_f_b:
+            self.attn._k3_deferred_f_b = False
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
@@ -2046,7 +2115,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # on their own and the overlap only adds sync overhead (same
             # bound as deepseek_v4).
             self._gate_bs_limit = (
-                (128 if is_blackwell_supported() else 64)
+                (128 if get_platform().is_blackwell else 64)
                 if self._gate_alt_stream is not None
                 else 0
             )
