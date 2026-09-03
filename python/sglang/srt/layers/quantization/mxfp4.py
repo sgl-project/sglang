@@ -65,6 +65,7 @@ from sglang.srt.utils import (
     round_up,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1061,6 +1062,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
             return
+        elif use_intel_xpu_backend():
+            if layer.w13_weight_bias is not None:
+                layer.w13_weight_bias = Parameter(
+                    layer.w13_weight_bias.float(), requires_grad=False
+                )
+            if layer.w2_weight_bias is not None:
+                layer.w2_weight_bias = Parameter(
+                    layer.w2_weight_bias.float(), requires_grad=False
+                )
+            return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -1578,6 +1589,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     topk_output,
                     self.moe_runner_config,
                 )
+            return StandardCombineInput(hidden_states=output)
+
+        if use_intel_xpu_backend():
+            from sgl_kernel import fused_experts
+
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            topk_weights, topk_ids, _ = topk_output
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                activation=self.moe_runner_config.activation,
+                use_mxfp4_w4a16=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+                gemm1_alpha=self.moe_runner_config.gemm1_alpha,
+                gemm1_limit=self.moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=self.moe_runner_config.swiglu_limit,
+            )
             return StandardCombineInput(hidden_states=output)
 
         if self.use_marlin:
