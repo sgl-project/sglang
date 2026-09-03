@@ -149,14 +149,10 @@ class GatedResidual(HyperConnectionBase):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
-            from sglang.srt.environ import envs
-
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
-                envs.SGLANG_HC_MIX_CUDA.get()
-                and torch.cuda.is_available()
-                # The CuTe split-K pair is tcgen05 (sm_100 family) only; the
-                # default-on env must not route Hopper/Ada to it.
+                torch.cuda.is_available()
+                # The CuTe split-K pair is tcgen05 (sm_100 family) only.
                 and torch.cuda.get_device_capability()[0] == 10
                 and (self.hc_count * self.hidden_size) % 2048 == 0
                 and self.hidden_size % 8 == 0
@@ -180,12 +176,9 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size % 8 == 0
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
-            from sglang.srt.environ import envs
-
             vecs = self.hc_count * self.hidden_size // 8
             self._split_combine_ok = (
-                envs.SGLANG_HC_COMBINE_SPLIT.get()
-                and self._jit_combine_ok
+                self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
