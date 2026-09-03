@@ -94,7 +94,9 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
         batch.convert_decode_to_extend()
 
         self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
-        self.assertEqual(batch.prefix_lens, [3])
+        # The last output token is the pending bonus token replayed as the
+        # one-token extend input, so the preceding four tokens are the prefix.
+        self.assertEqual(batch.prefix_lens, [4])
         self.assertEqual(req.extend_range, Range(4, 5))
         self.assertIs(batch.decoding_reqs, batch.reqs)
 
