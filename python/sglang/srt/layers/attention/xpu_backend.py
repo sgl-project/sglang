@@ -136,9 +136,9 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert (
-                    False
-                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
+                assert False, (
+                    "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
+                )
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -288,9 +288,7 @@ class XPUAttentionBackend(AttentionBackend):
                 # create expand page table
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
+                ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
@@ -1168,12 +1166,12 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        assert (
-            spec_info is None
-        ), "XPUAttentionBackend does not support speculative decoding in XPU graph"
-        assert (
-            forward_mode.is_decode_or_idle()
-        ), "XPUAttentionBackend XPU graph only supports decode mode"
+        assert spec_info is None, (
+            "XPUAttentionBackend does not support speculative decoding in XPU graph"
+        )
+        assert forward_mode.is_decode_or_idle(), (
+            "XPUAttentionBackend XPU graph only supports decode mode"
+        )
 
         if in_capture:
             # Bind static-shape slices of the pre-allocated buffers so the
@@ -1374,9 +1372,9 @@ class XPUAttentionBackend(AttentionBackend):
         metadata_swa: Optional[FlashAttentionMetadata] = None,
     ):
         # TODO: support page_size > 1 for swa spec
-        assert (
-            self.page_size == 1
-        ), "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        assert self.page_size == 1, (
+            "FlashAttention backend doesn't support topk > 1 speculative decoding with page size > 1 sliding window attention"
+        )
 
         cache_seqlens_int32 = (
             metadata.cache_seqlens_int32.repeat_interleave(

@@ -11,7 +11,6 @@ register_amd_ci(est_time=243, stage="extra-a", runner_config="2-gpu-large-amd")
 
 
 class TestPPBaselineSwa(CanaryPPFixture):
-
     kv_canary_mode = CanaryMode.LOG
 
     def test_no_violation(self) -> None:

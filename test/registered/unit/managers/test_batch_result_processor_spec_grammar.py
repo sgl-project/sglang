@@ -65,7 +65,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=False,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(enable_metrics=False),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
@@ -78,6 +77,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         model_worker=SimpleNamespace(on_verify_complete_cpu=lambda *a, **k: None),
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
+        beam_coordinator=SimpleNamespace(),
         abort_request=lambda *a, **k: None,
     )
 
@@ -92,7 +92,7 @@ def _make_req(terminate_after: int) -> Req:
         sampling_params=sp,
     )
     req.grammar = _FakeGrammar(terminate_after=terminate_after)
-    req.kv_committed_len = 0
+    req.kv.kv_committed_len = 0
     return req
 
 
@@ -121,7 +121,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
         self.assertEqual(predict_tokens, [[101, 102]])
         # No pre-claim: commit the full retained run (no -1 refund).
-        self.assertEqual(req.kv_committed_len, 2)
+        self.assertEqual(req.kv.kv_committed_len, 2)
 
     def test_resolve_keeps_all_when_grammar_not_terminated(self):
         req = _make_req(terminate_after=99)
@@ -131,7 +131,7 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
         predict_tokens = proc._resolve_spec_v2_tokens(result, _FakeBatch([req]))
 
         self.assertEqual(predict_tokens, [[201, 202, 203]])
-        self.assertEqual(req.kv_committed_len, 3)
+        self.assertEqual(req.kv.kv_committed_len, 3)
 
 
 class TestReasoningTokenAccounting(CustomTestCase):

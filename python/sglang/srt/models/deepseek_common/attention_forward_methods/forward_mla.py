@@ -681,6 +681,7 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -910,6 +911,8 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
             )
+        if gate is not None:
+            attn_bmm_output = self._apply_gated(attn_bmm_output, gate)
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

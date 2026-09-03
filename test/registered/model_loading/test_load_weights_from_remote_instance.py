@@ -350,7 +350,6 @@ def test_load_weights_from_remote_instance(
 
 
 class TestLoadWeightsFromRemoteInstance(CustomTestCase):
-
     def test_load_weights_from_remote_instance(self):
 
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
