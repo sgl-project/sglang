@@ -1086,6 +1086,10 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # Persistent CuTe DSL AOT objects. Resolved lazily so it tracks
+    # SGLANG_CACHE_DIR; set to an empty string to keep compilation
+    # process-local. Must be trusted: cached objects are loaded into the process.
+    SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
 
     # ===================================================================
     # Kernel development: JIT build cache, diagnostics and benchmarks
@@ -1093,7 +1097,6 @@ class Envs:
     # Everything here is a developer knob for working ON kernels -- building
     # them, inspecting what the compiler produced, and benchmarking them. Flags
     # that select a kernel in production live with their own feature instead.
-
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
@@ -1107,6 +1110,10 @@ class Envs:
     # loads. The result is still published, so the cost is one rebuild per
     # module, not one per load.
     SGLANG_JIT_FORCE_RECOMPILE = EnvBool(False)
+    # Raise instead of compiling when a module misses the cache, so a
+    # deployment that expects a pre-seeded cache fails loudly at startup
+    # rather than silently eating a cold compile.
+    SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
     # Ask the device compiler for per-kernel resource usage (registers, spills,
     # shared memory) and log it at INFO. Changes the build flags, so it compiles
     # into its own cache entry and leaves the normal one alone -- but that entry

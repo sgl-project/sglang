@@ -94,8 +94,7 @@ class SimplePhaseChecker:
     def _reset_to_idle(self) -> None:
         self._phase.fill_(self._initial_phase)
         _host_debug(
-            f"[SimplePhaseChecker._reset_to_idle] phase reset to "
-            f"{self._initial_phase}"
+            f"[SimplePhaseChecker._reset_to_idle] phase reset to {self._initial_phase}"
         )
 
     def _resolve_caller_tag(self, caller_name: str) -> int:

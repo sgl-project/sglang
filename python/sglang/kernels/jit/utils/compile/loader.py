@@ -129,10 +129,20 @@ def load_jit(
             # Also the benign case where a concurrent GC unlinked the leaf
             # between the lookup and the load.
             logger.warning(
-                "Cached JIT module %s failed to load; rebuilding. " "Got error: %s",
+                "Cached JIT module %s failed to load; rebuilding. Got error: %s",
                 spec.module_name,
                 e,
             )
+
+    # Before the lock: with the flag set no process ever publishes a build,
+    # so waiting on the lock cannot turn this miss into a hit.
+    if envs.SGLANG_CRASH_ON_JIT_COMPILE.get():
+        raise RuntimeError(
+            f"JIT module '{spec.module_name}' has no usable cached build under "
+            f"{scope}, and SGLANG_CRASH_ON_JIT_COMPILE forbids compiling at "
+            "runtime. Seed the cache with prebuilt artifacts matching this "
+            "environment, or unset the flag."
+        )
 
     with _build_lock(scope):
         # Re-check: whoever held the lock before us has very likely just
