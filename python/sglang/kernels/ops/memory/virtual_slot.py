@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -189,3 +191,115 @@ def bind_inplace(
         return
     grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
     bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)
+
+
+# ---------------------------------------------------------------------------
+# Fused virtual WRITE loc -> kernel-facing id.
+#
+# The eager form of this is a chain of ~6 torch ops (floor_divide, remainder,
+# take, mul, add, clamp), and ~12 once the DCP owner rule is resolved on top
+# (remainder, eq, floor_divide, zeros_like, where, copy). It runs per forward
+# on the write loc, OUTSIDE any cuda graph, so every op is a real launch on the
+# critical path. That is invisible next to a Hopper decode step and is not
+# next to a Blackwell one, which is why this is one kernel.
+# ---------------------------------------------------------------------------
+
+WRITE_LOC_BLOCK = 512
+
+
+@triton.jit
+def write_loc_to_kernel_id_kernel(
+    loc_ptr,  # in:  [N] int64 — WIDENED virtual token ids
+    v2p_ptr,  # in:  [num_pages + 1] int64 — virtual->physical page table
+    out_ptr,  # out: [N] int64 — kernel-facing ids
+    N,  # runtime: element count
+    stride,  # runtime: pool_page_size * kernel_page_multiplier
+    PAGE_SIZE: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``kernel_id(t) = v2p[t // ps] * ps * mult + t % ps``, clamped at 0.
+
+    Under DCP the incoming id is WIDENED: ``loc % dcp_size`` names its owner
+    and ``loc // dcp_size`` is the row. Ids this rank does not own resolve to
+    kernel id 0, the padding sink every write kernel skips.
+
+    A negative loc resolves to 0, matching the torch path: it floor-divides to
+    page -1, gathers the v2p sentinel row (-1), and clamps. Triton truncates
+    toward zero instead, so the sign is tested explicitly rather than relying
+    on the division.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    loc = tl.load(loc_ptr + offs, mask=mask, other=0).to(tl.int64)
+
+    keep = loc >= 0
+    if DCP_SIZE > 1:
+        keep = keep & ((loc % DCP_SIZE) == DCP_RANK)
+        loc = loc // DCP_SIZE
+
+    page = loc // PAGE_SIZE if PAGE_SIZE > 1 else loc
+    offset = loc % PAGE_SIZE if PAGE_SIZE > 1 else 0
+    # `keep` already excludes negatives, so the gather index is in range.
+    phys = tl.load(v2p_ptr + tl.where(keep, page, 0), mask=mask, other=0).to(tl.int64)
+    ids = tl.maximum(phys * stride + offset, 0)
+    tl.store(out_ptr + offs, tl.where(keep, ids, 0), mask=mask)
+
+
+def write_loc_to_kernel_ids(
+    *,
+    loc: torch.Tensor,
+    v2p: torch.Tensor,
+    page_size: int,
+    stride: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """One launch for the whole write-loc conversion; see the kernel.
+
+    ``out`` is written in place when given (a captured graph records the
+    gather against a fixed ``data_ptr``), else a fresh int64 tensor is
+    returned. Cuda-graph safe: no ``.item()``, no host sync, no allocation on
+    the ``out=`` path.
+    """
+    N = int(loc.numel())
+    if out is None:
+        out = torch.empty_like(loc, dtype=torch.int64)
+    assert out.dtype == torch.int64, (
+        f"write_loc_to_kernel_ids: out dtype must be int64 (matches v2p), "
+        f"got {out.dtype}"
+    )
+    assert out.shape == loc.shape, (
+        f"write_loc_to_kernel_ids: out shape {tuple(out.shape)} must match "
+        f"loc shape {tuple(loc.shape)}"
+    )
+    if N == 0:
+        return out
+    if not loc.is_cuda:
+        # Pure-torch reference; the allocator's unit tests run on CPU.
+        big = loc.to(torch.int64)
+        keep = big >= 0
+        if dcp_size > 1:
+            keep = keep & (big % dcp_size == dcp_rank)
+            big = torch.div(big, dcp_size, rounding_mode="floor")
+        page = torch.where(keep, torch.div(big, page_size, rounding_mode="floor"), 0)
+        offset = big % page_size if page_size > 1 else 0
+        ids = (v2p[page] * stride + offset).clamp_(min=0)
+        out.copy_(torch.where(keep, ids, torch.zeros_like(ids)))
+        return out
+    grid = (triton.cdiv(N, WRITE_LOC_BLOCK),)
+    write_loc_to_kernel_id_kernel[grid](
+        loc,
+        v2p,
+        out,
+        N,
+        stride,
+        PAGE_SIZE=page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        BLOCK=WRITE_LOC_BLOCK,
+    )
+    return out
