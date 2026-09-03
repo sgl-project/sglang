@@ -22,14 +22,16 @@ namespace {
 //      plain causal mask (correct for non-spec extend and topk == 1 chains).
 //
 
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, typename packed_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
     scalar_t* __restrict__ o_extend,
     const scalar_t* __restrict__ q_extend,
     const scalar_t* __restrict__ k_extend,
     const scalar_t* __restrict__ v_extend,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    const packed_t* __restrict__ k_buffer,
+    const packed_t* __restrict__ v_buffer,
+    const float* __restrict__ k_buf_scale,
+    const float* __restrict__ v_buf_scale,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -63,6 +65,8 @@ void extend_attention_kernel_impl(
     int64_t sliding_window_size,
     bool is_prefix_skipped,
     bool is_cross_attn,
+    bool is_causal,
+    bool kv_from_cache,
     bool has_encoder_lens,
     bool has_sink) {
   // strides
@@ -148,8 +152,9 @@ void extend_attention_kernel_impl(
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
       // stage 1: compute scores with prefix
+      // kv_from_cache has no stage 2, so cover the extend range and stop at the diagonal
       int kv_start = 0;
-      int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
+      int kv_end = is_cross_attn ? encoder_lens[bs] : (kv_from_cache ? seq_len_prefix + m + m_size : seq_len_prefix);
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
         int n_size = std::min(BLOCK_N, kv_end - n);
 
@@ -157,9 +162,10 @@ void extend_attention_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
+            /* src_scale*/ k_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     N  */ n_size,
             /*     K  */ head_size,
@@ -180,21 +186,41 @@ void extend_attention_kernel_impl(
             /* C     */ s_i);
 
         for (int row = 0; row < m_size; ++row) {
-          if (sliding_window_size > 0) {
+          bool row_is_empty = false;
+          if (kv_from_cache) {
+            int first_future_col = seq_len_prefix + m + row + 1;
+            if (n >= first_future_col) {
+              row_is_empty = true;
+            } else if (first_future_col < n + n_size) {
+              fill_stub(
+                  s_i + row * BLOCK_N + (first_future_col - n),
+                  -std::numeric_limits<float>::infinity(),
+                  n + n_size - first_future_col);
+            }
+          }
+          if (!row_is_empty && sliding_window_size > 0) {
             int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
             if (last_col >= n + n_size) {
-              continue;
+              row_is_empty = true;
+            } else {
+              fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
             }
-            fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
+          }
+          if (row_is_empty) {
+            // s_delta is reused across blocks - zero an empty row rather than
+            // skip it, or P @ V below applies the previous block's weights here
+            fill_stub(s_delta + row * BLOCK_N, 0.f, padded_n_size);
+            continue;
           }
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
               s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale, row);
         }
 
         // get value and pack
-        pack_vnni2<scalar_t>(
+        pack_vnni2<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
+            /* src_scale*/ v_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n + kv_offset,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -214,9 +240,9 @@ void extend_attention_kernel_impl(
             /* B     */ Btmp,
             /* C     */ v_prime);
       }  // loop with seq_len_prefix
-      if (!is_cross_attn) {
-        // stage 2: compute the triangle part
-        int num_keys = std::min(seq_len_extend, m + BLOCK_M);
+      if (!is_cross_attn && !kv_from_cache) {
+        // stage 2: compute the triangle part (or, when !is_causal, the full square)
+        int num_keys = is_causal ? std::min(seq_len_extend, m + BLOCK_M) : seq_len_extend;
         for (int n = 0; n < num_keys; n += BLOCK_N) {
           int n_size = std::min(BLOCK_N, num_keys - n);
 
@@ -265,7 +291,7 @@ void extend_attention_kernel_impl(
                 }
               }
             }
-          } else if (n + n_size - 1 > m) {
+          } else if (is_causal && n + n_size - 1 > m) {
             // apply causal mask
             // [Note] condition to apply causal mask.
             // Mask any block whose last key (n + n_size - 1) is strictly after the first query position (m), i.e. n +
@@ -360,13 +386,15 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
   do {                                                                                     \
     int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v); \
                                                                                            \
-    extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(                     \
+    extend_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_M, BLOCK_N>(           \
         o_extend.data_ptr<scalar_t>(),                                                     \
         q_extend.data_ptr<scalar_t>(),                                                     \
         k_extend.data_ptr<scalar_t>(),                                                     \
         v_extend.data_ptr<scalar_t>(),                                                     \
-        k_buffer.data_ptr<scalar_t>(),                                                     \
-        v_buffer.data_ptr<scalar_t>(),                                                     \
+        k_buffer.data_ptr<packed_t>(),                                                     \
+        v_buffer.data_ptr<packed_t>(),                                                     \
+        k_buf_scale_ptr,                                                                   \
+        v_buf_scale_ptr,                                                                   \
         req_to_token.data_ptr<index_t>(),                                                  \
         req_pool_indices.data_ptr<int64_t>(),                                              \
         seq_lens.data_ptr<int64_t>(),                                                      \
@@ -400,6 +428,8 @@ inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int
         sliding_window_size,                                                               \
         is_prefix_skipped,                                                                 \
         is_cross_attn,                                                                     \
+        is_causal,                                                                         \
+        kv_from_cache,                                                                     \
         has_encoder_lens,                                                                  \
         has_sink);                                                                         \
   } while (0)
@@ -429,6 +459,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    double k_buf_scale,
+    double v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -441,14 +473,15 @@ void extend_attention_cpu(
     int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks,
-    std::optional<at::Tensor> tree_mask) {
-  if (!is_cross_attn) {
-    TORCH_CHECK(
-        k_extend_opt.has_value() && v_extend_opt.has_value(),
-        "k_extend and v_extend are required for non-cross attention");
-  }
-  // Since k_extend and v_extend are not used for cross attention, they can be initialized as k_buffer and v_buffer
-  // here.
+    std::optional<at::Tensor> tree_mask,
+    bool is_causal = true) {
+  TORCH_CHECK(k_extend_opt.has_value() == v_extend_opt.has_value(), "k_extend and v_extend must be given together");
+  // A KV-shared layer (Gemma 4) passes no extend K/V - the layer it shares with
+  // already wrote them to the cache, so this kernel masks causally itself. Cross
+  // attention can also arrive without K/V but reads an encoder sequence that
+  // carries no causal order, so it keeps its own path.
+  const bool kv_from_cache = !is_cross_attn && !k_extend_opt.has_value();
+  // unused when the range comes from the cache - bind them to the buffers
   auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
   auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
 
@@ -511,8 +544,16 @@ void extend_attention_cpu(
   // D and DV need to be 32x as we transpose by 512-bit
   TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
   TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
-
+  auto kv_dtype = k_buffer.scalar_type();
+  if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+    TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+    TORCH_CHECK(k_buf_scale > 0.0 && v_buf_scale > 0.0, "float8 static scales must be positive");
+  }
   int num_threads = at::get_num_threads();
+  float k_buf_scale_float = static_cast<float>(k_buf_scale);
+  float v_buf_scale_float = static_cast<float>(v_buf_scale);
+  const float* k_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &k_buf_scale_float : nullptr;
+  const float* v_buf_scale_ptr = kv_dtype == at::ScalarType::Float8_e4m3fn ? &v_buf_scale_float : nullptr;
   auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
 
   bool has_encoder_lens = encoder_lens.has_value();
@@ -540,6 +581,7 @@ void extend_attention_cpu(
         ", got ",
         tree_mask_t.numel());
     TORCH_CHECK(!is_cross_attn, "extend: tree_mask is not supported for cross attention");
+    TORCH_CHECK(!kv_from_cache, "extend: tree_mask is not supported for KV-shared layers");
     // The window mask derives query positions from the row index
     // (seq_len_prefix + m + row), but tree-mask rows sit at their tree depth,
     // which is <= the row index; combining the two would over-mask the prefix.
@@ -549,15 +591,17 @@ void extend_attention_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      if (max_len_extend <= 256) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
-      } else if (max_len_extend <= 1024) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
-      } else if (max_len_extend <= 4096) {
-        LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
-      } else {  // max_len_extend > 4096
-        LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
-      }
+      CPU_DISPATCH_PACKED_TYPES(k_buffer.scalar_type(), "extend_attention_packed_types", [&] {
+        if (max_len_extend <= 256) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
+        } else if (max_len_extend <= 1024) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+        } else if (max_len_extend <= 4096) {
+          LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
+        } else {  // max_len_extend > 4096
+          LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
+        }
+      });
     });
   });
 }

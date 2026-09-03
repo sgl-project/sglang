@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bench"))
 from bench_parity import PS, make_photo_like, ref_patchify
 
 OUT = (

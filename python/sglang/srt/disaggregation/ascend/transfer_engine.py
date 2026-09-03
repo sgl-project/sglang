@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 class AscendTransferEngine(MooncakeTransferEngine):
-
     def __init__(
         self,
         hostname: str,
@@ -31,7 +30,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ):
         if import_error is not None:
             logger.warning(
-                "Please install memfabric_hybrid, for details, see docs_new/docs/advanced_features/pd_disaggregation.mdx"
+                "Please install memfabric_hybrid, for details, see docs/docs/advanced_features/pd_disaggregation.mdx"
             )
             raise import_error
 

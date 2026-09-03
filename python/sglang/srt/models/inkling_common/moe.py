@@ -25,7 +25,7 @@ from sglang.kernels.ops.moe.inkling_moe import (
     post_reorder,
     pre_reorder,
     select_grouped_gemm_block_m,
-    silu_and_mul_helion,
+    silu_and_mul,
 )
 from sglang.kernels.ops.moe.sigmoid_gate_topk_renorm import (
     sigmoid_gate_topk_renorm,
@@ -59,7 +59,7 @@ from sglang.srt.models.inkling_common.util import (
     lora_compatible_layout_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip
 
@@ -512,7 +512,9 @@ def make_forward_inputs_2d(
     return hidden_states, topk_weights, topk_ids, top_k, num_experts
 
 
-def run_moe_preprocess(topk_ids: torch.Tensor, num_experts: int) -> tuple[
+def run_moe_preprocess(
+    topk_ids: torch.Tensor, num_experts: int
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -562,9 +564,9 @@ def activation(
     use_interleaved: bool = True,
 ):
     if activation_type == "silu_and_mul":
-        assert (
-            gateup_output.is_contiguous()
-        ), f"{gateup_output.shape=} {gateup_output.stride()=}"
+        assert gateup_output.is_contiguous(), (
+            f"{gateup_output.shape=} {gateup_output.stride()=}"
+        )
         assert gateup_output.ndim == 2, f"{gateup_output.shape=}"
         out_dtype = None
         if gateup_output.numel() == 0:
@@ -572,7 +574,7 @@ def activation(
                 *gateup_output.shape[:-1], gateup_output.shape[-1] // 2, dtype=out_dtype
             )
 
-        return silu_and_mul_helion(
+        return silu_and_mul(
             gateup_output, topk_weights, out_dtype, use_interleaved=use_interleaved
         )
     raise ValueError(f"Unsupported activation: {activation_type}")
@@ -891,9 +893,8 @@ class InklingMoE(nn.Module):
         )
         # --enable-scattered-sconv: the output reduction becomes a hidden-dim
         # reduce-scatter (the consumer mlp_sconv runs on the [T, H/P] shard).
-        from sglang.srt.runtime_context import get_server_args
 
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
         # Fold the shared-expert partials into the custom AR kernels (or their
         # stage-in copies) instead of a separate torch.add per MoE layer.
         self._fused_ar_shared = envs.SGLANG_OPT_USE_INKLING_FUSED_AR_SHARED.get()

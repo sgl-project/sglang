@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace device {
 
 namespace details {
@@ -160,8 +162,6 @@ SGL_DEVICE void store_vec(void* __restrict__ dst, const Storage& vec) {
 }
 
 }  // namespace device
-
-namespace {
 
 #define SGL_HICACHE_KERNEL __global__ __launch_bounds__(kBlockSize, 1)
 
@@ -521,4 +521,4 @@ struct HiCacheKernel {
 
 #undef SGL_HICACHE_KERNEL
 
-}  // namespace
+}  // namespace sglang

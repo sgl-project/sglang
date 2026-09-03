@@ -193,6 +193,7 @@ def _fused_metadata_kernel_general(
     use_swa: tl.constexpr,
     SHIFT: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -209,6 +210,8 @@ def _fused_metadata_kernel_general(
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
     # 2. Gather for this batch and column chunk
+    if SKIP_PAGE_TABLE:
+        return
     if max_seq_pages == 0:
         return
 
@@ -233,7 +236,7 @@ def _fused_metadata_kernel_general(
     col_offsets = col_start + tl.arange(0, BLOCK_COLS)
     mask = col_offsets < num_live_pages
 
-    # Compute column indices in the source tensor (token offset)
+    # Compute column indices in the source tensor
     if page_size == 1:
         col_idx = col_offsets
     else:
@@ -295,6 +298,7 @@ def _fused_metadata_kernel_ps1_no_swa(
     max_seq_pages,
     seq_len_delta: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    SKIP_PAGE_TABLE: tl.constexpr = 0,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -311,6 +315,8 @@ def _fused_metadata_kernel_ps1_no_swa(
         tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
 
     # 2. Gather for this batch and column chunk
+    if SKIP_PAGE_TABLE:
+        return
     if max_seq_pages == 0:
         return
 
@@ -337,7 +343,6 @@ def _fused_metadata_kernel_ps1_no_swa(
         req_to_token + rt_offsets, mask=mask, other=0, cache_modifier=".cg"
     )
 
-    # page_table = page_index // 1 = page_index
     pt_offsets = i * page_table_stride_0 + col_offsets * page_table_stride_1
     tl.store(page_table + pt_offsets, page_index, mask=mask, cache_modifier=".cg")
 
@@ -491,9 +496,9 @@ def draft_extend_set_metadata(
     row tails keep stale values that attention kernels never read past
     cache_seqlens, matching the eager replay path's bounded writes.
     """
-    assert (
-        page_size > 0 and (page_size & (page_size - 1)) == 0
-    ), f"page_size must be a power of two, got {page_size}"
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
+        f"page_size must be a power of two, got {page_size}"
+    )
 
     batch_size = cache_seqlens_int32.shape[0]
     max_seq_pages = page_table.shape[1]
@@ -558,13 +563,13 @@ def normal_decode_set_metadata(
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    strided_indices: torch.Tensor,
     max_seq_pages: torch.Tensor,
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
     swa_page_table: Optional[torch.Tensor] = None,
     token_to_kv_pool: Optional["SWAKVPool"] = None,
+    skip_page_table: bool = False,
 ):
     """
     Fused Triton implementation that replaces 4-5 sequential CUDA kernels with 1-2 kernels:
@@ -574,15 +579,18 @@ def normal_decode_set_metadata(
       4. page_table = page_indices // page_size (floor-divide)
       5. (optional) swa_page_table for sliding window attention
 
+    Unified pool (``skip_page_table=True``): the translator has already filled
+    the page tables in place, so only steps 1-2 run.
+
     Achieves ~5.2x speedup on H200 hardware for typical decode workloads.
 
     Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
     page_table / swa_page_table row is (re)written; the tail keeps stale values
     across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
-    assert (
-        page_size > 0 and (page_size & (page_size - 1)) == 0
-    ), f"page_size must be a power of two, got {page_size}"
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
+        f"page_size must be a power of two, got {page_size}"
+    )
 
     batch_size = cache_seqlens_int32.shape[0]
     device = seq_lens.device
@@ -602,8 +610,46 @@ def normal_decode_set_metadata(
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
 
-    # Check if we should use the specialized fast path for page_size=1, no SWA
+    if skip_page_table:
+        # One block does the prefix sum, so one block is the whole grid.
+        _fused_metadata_kernel_ps1_no_swa[(1, 1)](
+            seq_lens,
+            seq_lens_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            req_pool_indices,
+            req_pool_indices_stride_0,
+            cache_seqlens_int32,
+            cache_seqlens_int32_stride_0,
+            cu_seqlens_k,
+            cu_seqlens_k_stride_0,
+            page_table,
+            page_table_stride_0,
+            page_table_stride_1,
+            batch_size,
+            0,
+            seq_len_delta,
+            BLOCK_COLS=256,
+            SKIP_PAGE_TABLE=1,
+            num_warps=8,
+            num_stages=3,
+        )
+        return
+
     use_swa = swa_page_table is not None and token_to_kv_pool is not None
+
+    # Unified SWA uses an independent SWA v2p table.
+    swa_v2p_page_table = None
+    if use_swa and token_to_kv_pool.full_to_swa_index_mapping is None:
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+
+        assert isinstance(token_to_kv_pool, UnifiedSWAKVPool)
+        assert token_to_kv_pool._swa_allocator is not None
+        swa_v2p_page_table = token_to_kv_pool._swa_allocator.virtual_to_physical
+
+    # Check if we should use the specialized fast path for page_size=1, no SWA
+    swa_uses_v2p = swa_v2p_page_table is not None
 
     if page_size == 1 and not use_swa:
         # Specialized kernel for the common case (page_size=1, no SWA)
@@ -642,15 +688,18 @@ def normal_decode_set_metadata(
         if use_swa:
             from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-            assert isinstance(token_to_kv_pool, SWAKVPool)
             swa_page_table = swa_page_table.contiguous()
             swa_page_table_stride_0 = swa_page_table.stride(0)
             swa_page_table_stride_1 = swa_page_table.stride(1)
-            # Extract the full_to_swa_index_mapping from token_to_kv_pool
-            full_to_swa_mapping = (
-                token_to_kv_pool.full_to_swa_index_mapping.contiguous()
-            )
-            full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
+            if swa_uses_v2p:
+                full_to_swa_mapping = swa_v2p_page_table.contiguous()
+                full_to_swa_mapping_stride_0 = 0
+            else:
+                assert isinstance(token_to_kv_pool, SWAKVPool)
+                full_to_swa_mapping = (
+                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+                )
+                full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
         else:
             # Dummy tensors (not used)
             swa_page_table = torch.empty(0, dtype=torch.int32, device=device)

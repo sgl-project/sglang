@@ -6,8 +6,7 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200 via the nightly-8-gpu-common suite.
-register_cuda_ci(est_time=1200, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="8-gpu-h200")
 
 # LongCat-Flash-Lite-FP8 is the smallest member of the LongCat family
 # (~138 GB FP8 weights, hidden=3072, 14 layers, 256 routed + 128 zero
@@ -20,7 +19,6 @@ register_cuda_ci(est_time=1200, suite="nightly-8-gpu-common", nightly=True)
 # LongcatFlashNgramForCausalLM is remapped to model_type "longcat_flash")
 # with LongCat-Flash-Chat-FP8 and LongCat-2.0-FP8, so it guards the shared
 # code paths that recent LongCat EP fixes touched:
-#   - the scheduler moe-topk gate for --moe-a2a-backend (PR #30975)
 #   - ScMoE dense-branch gather (RoPE) + the MoE-vs-DeepEPMoE double
 #     all_reduce fix (PR #31311)
 #   - the zero-expert (identity) compute path (zero_expert_num=128) and
@@ -41,28 +39,14 @@ class TestLongCatFlashLiteFp8(unittest.TestCase):
 
     Two variants exercise the two MoE all-to-all backends that the LongCat
     EP fixes gate on:
-      - EP8 + deepep : real expert parallelism (the path #30975/#31311 fix)
       - EP8 + none   : EP-over-TP baseline (all_reduce / gather correctness)
+      - EP8 + deepep : real expert parallelism (the path #30975/#31311 fix),
+        skipped until DeepEP raises its low-latency top-k cap to 12
     """
 
-    def test_longcat_flash_lite_fp8(self):
-        variants = [
-            ModelLaunchSettings(
-                LONGCAT_FLASH_LITE_FP8_MODEL_PATH,
-                tp_size=8,
-                extra_args=COMMON_ARGS + ["--ep=8"],
-                variant="TP8+EP8+none",
-            ),
-            ModelLaunchSettings(
-                LONGCAT_FLASH_LITE_FP8_MODEL_PATH,
-                tp_size=8,
-                extra_args=COMMON_ARGS + ["--ep=8", "--moe-a2a-backend=deepep"],
-                variant="TP8+EP8+deepep",
-            ),
-        ]
-
+    def _run(self, variant: ModelLaunchSettings):
         run_combined_tests(
-            models=variants,
+            models=[variant],
             test_name="LongCat-Flash-Lite-FP8",
             # Measured 2026-07-22 on 8xH100-80GB, gsm8k 200q, 5-shot, greedy:
             #   TP8+EP8+none   -> 0.840
@@ -74,8 +58,32 @@ class TestLongCatFlashLiteFp8(unittest.TestCase):
                 num_examples=200,
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_longcat_flash_lite_fp8",
+                result_dir="performance_results_longcat_flash_lite_fp8",
             ),
+        )
+
+    def test_longcat_flash_lite_fp8(self):
+        self._run(
+            ModelLaunchSettings(
+                LONGCAT_FLASH_LITE_FP8_MODEL_PATH,
+                tp_size=8,
+                extra_args=COMMON_ARGS + ["--ep=8"],
+                variant="TP8+EP8+none",
+            )
+        )
+
+    @unittest.skip(
+        "Blocked: DeepEP low-latency dispatch asserts num_topk <= kNumMaxTopK "
+        "(11 in internode_ll.cu), LongCat moe_topk is 12."
+    )
+    def test_longcat_flash_lite_fp8_deepep(self):
+        self._run(
+            ModelLaunchSettings(
+                LONGCAT_FLASH_LITE_FP8_MODEL_PATH,
+                tp_size=8,
+                extra_args=COMMON_ARGS + ["--ep=8", "--moe-a2a-backend=deepep"],
+                variant="TP8+EP8+deepep",
+            )
         )
 
 

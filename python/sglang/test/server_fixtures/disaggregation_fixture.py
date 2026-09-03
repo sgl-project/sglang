@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     popen_with_error_check,
     start_subprocess_fail_fast_watcher,
+    terminate_and_kill_process_tree,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -68,12 +69,19 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
         cls.bootstrap_port = f"{int(base_port) + 500}"
+        # Pin distinct nccl (torch.distributed rendezvous) ports below the
+        # ephemeral range; otherwise both sides derive them from get_free_port()
+        # and can race onto the same port, failing at init_process_group with
+        # EADDRINUSE.
+        cls.prefill_nccl_port = f"{int(base_port) + 300}"
+        cls.decode_nccl_port = f"{int(base_port) + 400}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         cls.base_url = cls.lb_url
         print(
-            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} "
+            f"{cls.bootstrap_port=} {cls.prefill_nccl_port=} {cls.decode_nccl_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
         if cls.capture_per_side_logs:
@@ -116,6 +124,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             "prefill",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
@@ -141,6 +151,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             "decode",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
             "--tp",
             str(cls.decode_tp_size),
             "--base-gpu-id",
@@ -214,10 +226,17 @@ class PDDisaggregationServerBase(CustomTestCase):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)
-        for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
+        # The LB holds no device state, and popen_with_error_check only stays
+        # quiet for a SIGKILL rc, so hard-kill it rather than SIGTERM first.
+        if cls.process_lb:
+            try:
+                kill_process_tree(cls.process_lb.pid, wait_timeout=60)
+            except Exception as e:
+                print(f"Error killing process {cls.process_lb.pid}: {e}")
+        for process in [cls.process_decode, cls.process_prefill]:
             if process:
                 try:
-                    kill_process_tree(process.pid, wait_timeout=60)
+                    terminate_and_kill_process_tree(process, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
@@ -359,7 +378,7 @@ def get_rdma_devices_args():
         if not (base_rdma_group <= gpu_idx < base_rdma_group + 4):
             warnings.warn(
                 f"GPU index {gpu_idx} is outside expected group "
-                f"{base_rdma_group}-{base_rdma_group+3}"
+                f"{base_rdma_group}-{base_rdma_group + 3}"
             )
 
     # 3. Generate RDMA device names

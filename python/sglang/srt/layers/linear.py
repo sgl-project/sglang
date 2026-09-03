@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -39,7 +40,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -155,6 +156,15 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Set by quant methods that attach a per-layer scheme, eagerly in
+    # get_quant_method(), which runs before create_weights() picks the loader,
+    # or lazily inside create_weights() itself (GPTQ). The default is what lets
+    # callers probe with `is None`; a hasattr() probe answers "yes" once it
+    # exists. Schemes must stay plain objects -- nn.Module.__setattr__ files a
+    # Module value under self._modules, which this default then shadows on read.
+    # VocabParallelEmbedding and FusedMoE carry the same default.
+    scheme = None
+
     def __init__(
         self,
         input_size: int,
@@ -258,6 +268,14 @@ class ReplicatedLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
+
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
             if param.size() != loaded_weight.size() and param.size(0) == 1:
@@ -267,13 +285,13 @@ class ReplicatedLinear(LinearBase):
                     raise ValueError(f"{loaded_weight} are not all equal")
 
             if param.dtype == torch.int8 or loaded_weight.dtype == torch.int8:
-                assert (
-                    param.dtype == loaded_weight.dtype
-                ), "init para dtype and loaded weight dtype should be the same"
+                assert param.dtype == loaded_weight.dtype, (
+                    "init para dtype and loaded weight dtype should be the same"
+                )
 
-        assert (
-            param.size() == loaded_weight.size()
-        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        assert param.size() == loaded_weight.size(), (
+            f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -366,7 +384,13 @@ class ColumnParallelLinear(LinearBase):
             skip_block_quant_check=skip_block_quant_check,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -434,9 +458,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -468,6 +492,14 @@ class ColumnParallelLinear(LinearBase):
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
+
+        # Megatron SP "g": the input is this rank's [M_pad/tp, K] sequence shard;
+        # all-gather to the full sequence and matmul. Participants (qkv/gate_up)
+        # have gather_output=False, so there is no output all-gather to reconcile.
+        if get_forward().sp_active and self.tp_size > 1:
+            output = layernorm_sp.column_parallel_g_matmul(self, input_, bias)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
 
         # Matrix multiply.
         assert self.quant_method is not None
@@ -960,6 +992,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
+        kv_tp_rank: Optional[int] = None,
+        kv_tp_size: Optional[int] = None,
     ):
         self.with_bias = bias
         self.hidden_size = hidden_size
@@ -975,12 +1009,17 @@ class QKVParallelLinear(ColumnParallelLinear):
         if tp_size is None:
             tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
+        if kv_tp_rank is None:
+            kv_tp_rank = tp_rank
+        if kv_tp_size is None:
+            kv_tp_size = tp_size
+        self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
+        if kv_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(kv_tp_size, self.total_num_kv_heads)
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, kv_tp_size)
             self.num_kv_head_replicas = 1
         self.q_proj_shard_size = self.num_heads * self.head_size
         self.kv_proj_shard_size = self.num_kv_heads * self.head_size
@@ -1102,7 +1141,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id=shard_id,
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
-                tp_rank=self.tp_rank,
+                tp_rank=(self.tp_rank if shard_id == "q" else self.kv_tp_rank),
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -1156,7 +1195,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
-            tp_rank=self.tp_rank,
+            tp_rank=(self.tp_rank if loaded_shard_id == "q" else self.kv_tp_rank),
             use_presharded_weights=self.use_presharded_weights,
         )
 
@@ -1179,8 +1218,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
+            shard_tp_rank, shard_tp_size = (
+                (self.kv_tp_rank, self.kv_tp_size)
+                if loaded_shard_id in ("k", "v")
+                else (self.tp_rank, self.tp_size)
+            )
+            shard_size = loaded_weight.size(output_dim) // shard_tp_size
+            start_idx = shard_tp_rank * shard_size
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1326,7 +1370,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             if loaded_shard_id == "q":
                 shard_id = self.tp_rank
             else:
-                shard_id = self.tp_rank // self.num_kv_head_replicas
+                shard_id = self.kv_tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
             if _is_cpu:
@@ -1371,9 +1415,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -1450,7 +1494,13 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -1525,9 +1575,9 @@ class RowParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=} {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=} {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1560,7 +1610,13 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        output_tensor=None,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1574,6 +1630,21 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+
+        # Megatron SP "g-bar": reduce-scatter along the token dim instead of
+        # all-reduce, leaving the output sharded for the next SP LayerNorm region.
+        # Fires regardless of reduce_results: o_proj / down are built
+        # reduce_results=False, so under SP the linear owns the reduction.
+        if (
+            get_forward().sp_active
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and output_tensor is None
+        ):
+            output = layernorm_sp.row_parallel_gbar_matmul(self, input_parallel, bias_)
+            output_bias = self.bias if self.skip_bias_add else None
+            return output, output_bias
+
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
@@ -1581,7 +1652,20 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if output_tensor is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+            else:
+                apply_into = getattr(self.quant_method, "apply_into", None)
+                if apply_into is None:
+                    raise RuntimeError(
+                        f"{type(self.quant_method).__name__} cannot write into "
+                        "caller-owned linear output"
+                    )
+                output_parallel = apply_into(
+                    self, input_parallel, output_tensor, bias=bias_
+                )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
@@ -1597,7 +1681,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_server_args().enable_quant_communications
+                        and get_exec().comm.enable_quant_communications
                     )
                     if forward_batch is not None
                     else False
@@ -1633,6 +1717,10 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+        tp_rank: Rank to shard the column-parallel part on. Defaults to the
+            global TP rank; pass the attention-TP rank to shard on attn-TP
+            instead (see KimiDeltaAttention's shard_on_attn_tp).
+        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
     """
 
     def __init__(
@@ -1644,6 +1732,8 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
         super().__init__(
@@ -1655,8 +1745,11 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        self.tp_rank = get_parallel().tp_rank
-        self.tp_size = get_parallel().tp_size
+        if tp_rank is None:
+            tp_rank = get_parallel().tp_rank
+        if tp_size is None:
+            tp_size = get_parallel().tp_size
+        self.tp_rank, self.tp_size = tp_rank, tp_size
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1701,14 +1794,27 @@ class ColumnParallelBatchedLinear(nn.Module):
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
         dtype: Data type for the parameters.
+        tp_rank: Rank to shard the output dimension on. Defaults to the global
+            TP rank; pass the attention-TP rank to shard on attn-TP instead
+            (see KimiDeltaAttention's shard_on_attn_tp).
+        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
     """
 
     def __init__(
-        self, batch: int, input_size: int, output_size: int, dtype: torch.dtype
+        self,
+        batch: int,
+        input_size: int,
+        output_size: int,
+        dtype: torch.dtype,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_rank = get_parallel().tp_rank
-        self.tp_size = get_parallel().tp_size
+        if tp_rank is None:
+            tp_rank = get_parallel().tp_rank
+        if tp_size is None:
+            tp_size = get_parallel().tp_size
+        self.tp_rank, self.tp_size = tp_rank, tp_size
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

@@ -78,11 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -322,8 +318,7 @@ class MiMoV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -376,7 +371,6 @@ class MoEGate(nn.Module):
 
 
 class MiMoV2MoE(nn.Module):
-
     def __init__(
         self,
         config: MiMoV2Config,
@@ -413,7 +407,7 @@ class MiMoV2MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -448,7 +442,7 @@ class MiMoV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -1137,7 +1131,7 @@ class MiMoV2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -1191,7 +1185,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1239,9 +1233,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.model is not None
-        ), "get_input_embedding() is not available in encoder_only mode"
+        assert self.model is not None, (
+            "get_input_embedding() is not available in encoder_only mode"
+        )
         return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -1355,9 +1349,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        assert (
-            not self.config.encoder_only
-        ), "forward() should not be called in encoder_only mode"
+        assert not self.config.encoder_only, (
+            "forward() should not be called in encoder_only mode"
+        )
 
         if self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
@@ -1628,15 +1622,15 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             )
 
     def get_embed_and_head(self):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "get_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "get_embed_and_head() is not available in encoder_only mode"
+        )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "set_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "set_embed_and_head() is not available in encoder_only mode"
+        )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
