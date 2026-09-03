@@ -735,7 +735,66 @@ SGLang port. Use base MiniMax-H3 when output quality matters more than
 latency.
 </Note>
 
-## 7. Sampling and output controls
+## 7. VDN-H3: hybrid attention, 8-step distill
+
+[OpenVDN/vdn-minimax-h3](https://huggingface.co/OpenVDN/vdn-minimax-h3)
+(Video DeltaNet MiniMax-H3, [openvdn.github.io](https://openvdn.github.io/))
+replaces every DiT block's dense self-attention with a hybrid of two branches:
+an exact, gated softmax over a chunk-aligned frame window (chunk 5, radius 1,
+the first and last frames dense as anchors, text and audio dense both ways)
+and a frame-wise linear-attention branch (the Video Delta rule, scanned
+forward and backward over frames) that covers exactly the rest. The released
+`stage-dmd-step-250` checkpoint is an 8-NFE DMD2 distill and adds a 4.3 GB
+linear branch plus two small LoRA adapters on top of the untouched MiniMax-H3
+backbone. Only T2VA was trained: requests must use `task: "t2va"`, and `fl2va`
+/ `ref2va` requests are rejected. The weights inherit the MiniMax-H3 Community
+License, including its territorial exclusions.
+
+Pass the repository directly to `--model-path`. A registered model overlay
+materializes the base-H3 layout once: both LoRA adapters are prefused into the
+transformer weights (a real 62 GB write), the linear branch is attached as an
+extra shard, the Qwen3-VL conditioner is linked from `MiniMaxAI/MiniMax-H3`,
+and the video VAE is re-serialized as for FastH3. Point
+`SGLANG_DIFFUSION_CACHE_ROOT` at a volume with at least 90 GB free before the
+first launch.
+
+```bash 4×B200 hybrid window attention
+sglang serve \
+  --model-path OpenVDN/vdn-minimax-h3 \
+  --num-gpus 4 \
+  --attention-backend hybrid_window_attn_h3 \
+  --performance-mode speed \
+  --port 30010
+```
+
+Requests use the same asynchronous video endpoint as the base model, with
+`task: "t2va"`, `conditions: []`, and a target such as
+`{"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 14.375}`. The
+request default is `num_inference_steps: 9`: nine points on the standard
+shift-12/shift-3 sigma grid, i.e. the eight distilled DiT evaluations (VDN
+counts NFEs, SGLang counts grid points). Any other step count is rejected. The
+paper workload is 1344×768 at 24 fps for 14.375 s: 345 frames, already 17n+5
+aligned, 102 latent frames and about 104.5k packed rows.
+
+`hybrid_window_attn_h3` is required for the transformer: a dense backend on
+these weights would silently skip the linear branch and the softmax gates and
+produce the wrong model, so it is rejected. The window softmax runs as a union
+of dense FlashAttention varlen calls by default, or as the in-tree tile-64
+Triton block-sparse kernel with `--attention-backend-config
+'{"vdn_window_kernel": "tiles"}'`; both are exact to bf16 rounding. The
+linear branch runs on fused Triton kernels (temporal conv + SiLU + L2 norm,
+statistics prologue, gated RMSNorm epilogue). Online `--quantization fp8`
+quantizes the projections and feed-forward as for base H3; the gates, beta,
+alpha and the conv stay bf16. Ulysses sequence parallelism is supported;
+`--model-variant`, `quality: "high"`, `--ring-degree` greater than 1,
+`torch.compile`, and breakable CUDA graph execution are rejected. See
+[Attention Backends](/docs/sglang-diffusion/attention_backends) for the
+backend options.
+
+Measured latencies for the 4× B200 recipe are in
+[VDN-H3 on B200](#vdn-h3-on-b200).
+
+## 8. Sampling and output controls
 
 MiniMax-H3 supports more than one output per prompt. The video API accepts
 `num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
@@ -910,7 +969,7 @@ has completed, but the `quality: "high"` path above remains fail-closed
 to the audited 4×H200 workload.
 </Warning>
 
-## 8. Feature contracts and advanced recipes
+## 9. Feature contracts and advanced recipes
 
 The generated command already contains the recommended topology and encoder
 setting. Use the detailed reference below only when applying an optional
@@ -1151,7 +1210,7 @@ fold decision is not node-boundary aware:
 
 </Tabs>
 
-## 9. Configuration notes
+## 10. Configuration notes
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
@@ -1170,7 +1229,7 @@ fold decision is not node-boundary aware:
 - `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 10. Benchmarks
+## 11. Benchmarks
 
 The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
 counts are properties of the selected recipes, not a claim that every platform
