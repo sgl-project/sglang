@@ -338,6 +338,9 @@ _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+# Hoisted like the gfx probes above: is_sm120_supported is an lru_cache object, and
+# Dynamo cannot trace _lru_cache_wrapper.__call__ from inside the traced forward.
+_is_sm120_supported = is_sm120_supported()
 
 if _use_aiter:
     if _is_gfx95_supported or _is_gfx1250_supported:
@@ -1615,7 +1618,7 @@ class MQALayer(MqaAttentionBase):
         tp_slice, q_padded, q_out = slice(None), None, None
         # Above this the SM120 route is the prefill kernel, which takes
         # arbitrary h_q, so the decode pad below would just be sliced back off.
-        skip_decode_pad = is_sm120_supported() and x.shape[0] > SM120_DECODE_MAX_TOKENS
+        skip_decode_pad = _is_sm120_supported and x.shape[0] > SM120_DECODE_MAX_TOKENS
         if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
