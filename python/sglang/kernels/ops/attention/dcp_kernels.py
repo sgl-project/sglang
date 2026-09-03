@@ -94,16 +94,10 @@ def create_mla_kv_page_table_for_dcp(
 ):
     """This rank's cyclic slice of each request, as a page table.
 
-    Local page ``k`` holds local tokens ``[k*ps, (k+1)*ps)``, at global
-    positions ``dcp_rank + (k*ps + j) * dcp_size``. Collapsing the widened id
-    found there stays inside one page, so a local page names exactly one page
-    of the pool.
-
-    ``HAS_V2P`` picks which id space that page number is in: on a static pool
-    the collapsed page IS physical, under the unified memory pool it is still
-    VIRTUAL and takes one more gather through ``v2p_ptr``, then ``mult`` to
-    reach the per-layer views -- what ``build_kv_read_table`` does for the
-    non-DCP block-table backends.
+    ``HAS_V2P`` picks the id space the emitted page number is in: the
+    DCP-collapsed page IS physical on a static pool, and still VIRTUAL under
+    the unified memory pool, where it takes one more gather through ``v2p_ptr``
+    and a ``mult`` scale to reach the per-layer views.
     """
     req = tl.program_id(0)
     page_block = tl.program_id(1)

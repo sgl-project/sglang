@@ -337,6 +337,101 @@ class TestDcpBlockTableIdSpace(CustomTestCase):
         self.assertEqual(int(table[0, 0]), 0)
 
 
+class TestFusedFp8WriteGate(CustomTestCase):
+    """The fused fp8 KV write must not serve a DCP-resolved loc.
+
+    Its only skip is the DCP owner rule (`vloc % world != rank`). Under the
+    unified pool that rule is already applied before the loc arrives, with
+    non-owned rows folded onto kernel id 0 -- so the kernel cannot skip the
+    padding sink the way `set_mla_kv_buffer`'s `reserved_skip_index` does, and
+    every non-owned token would store into slot 0.
+
+    A revert of the gate leaves accuracy tests green (slot 0 holds no real
+    data), which is why this is asserted directly.
+    """
+
+    def _gate(self, *, dcp_enabled: bool, is_translating: bool) -> bool:
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.data_type = torch.float8_e4m3fn
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
+        backend.kv_index_translator = SimpleNamespace(is_translating=is_translating)
+        parallel = SimpleNamespace(
+            dcp_enabled=dcp_enabled,
+            attn_dcp_size=DCP_SIZE if dcp_enabled else 1,
+            attn_dcp_rank=DCP_RANK if dcp_enabled else 0,
+        )
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend_module, "can_use_set_mla_kv_concat_q_fp8", return_value=True
+            ),
+            patch.object(
+                backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT, "get", lambda: False
+            ),
+        ):
+            return bool(
+                backend.data_type == torch.float8_e4m3fn
+                and not backend_module.envs.SGLANG_ENABLE_ASYNC_ASSERT.get()
+                and backend.kv_lora_rank == 512
+                and backend.qk_rope_head_dim == 64
+                and not (
+                    backend_module.get_parallel().dcp_enabled
+                    and backend.kv_index_translator.is_translating
+                )
+                and backend_module.can_use_set_mla_kv_concat_q_fp8()
+            )
+
+    def test_off_for_the_unified_pool_under_dcp(self):
+        self.assertFalse(self._gate(dcp_enabled=True, is_translating=True))
+
+    def test_on_for_every_other_combination(self):
+        # The gate must not cost the static pool or a non-DCP unified run
+        # their fused write.
+        self.assertTrue(self._gate(dcp_enabled=True, is_translating=False))
+        self.assertTrue(self._gate(dcp_enabled=False, is_translating=True))
+        self.assertTrue(self._gate(dcp_enabled=False, is_translating=False))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "backend construction")
+    def test_helper_refuses_a_resolved_loc(self):
+        """Belt and braces: reaching the helper with a resolved loc asserts
+        rather than silently storing into the sink."""
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.kv_index_translator = SimpleNamespace(is_translating=True)
+        parallel = SimpleNamespace(
+            dcp_enabled=True, attn_dcp_size=DCP_SIZE, attn_dcp_rank=DCP_RANK
+        )
+        layer = SimpleNamespace(
+            tp_q_head_num=1, v_head_dim=512, head_dim=576, layer_id=0
+        )
+        n = 4
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend_module, "set_mla_kv_concat_q_fp8_covered", return_value=True
+            ),
+            patch.object(
+                backend,
+                "token_to_kv_pool",
+                SimpleNamespace(
+                    get_key_buffer=lambda _: torch.zeros(
+                        (8, 576), dtype=torch.uint8, device="cuda"
+                    )
+                ),
+                create=True,
+            ),
+        ):
+            with self.assertRaises(AssertionError):
+                backend._set_kv_and_concat_q_fp8_fused(
+                    layer=layer,
+                    loc=torch.zeros(n, dtype=torch.int64, device="cuda"),
+                    q=torch.zeros((n, 512), dtype=torch.bfloat16, device="cuda"),
+                    q_rope=torch.zeros((n, 64), dtype=torch.bfloat16, device="cuda"),
+                    k=torch.zeros((n, 512), dtype=torch.bfloat16, device="cuda"),
+                    k_rope=torch.zeros((n, 64), dtype=torch.bfloat16, device="cuda"),
+                )
+
+
 class TestDcpDecodeLayout(CustomTestCase):
     """Rank-local length math the decode page table above is built from."""
 

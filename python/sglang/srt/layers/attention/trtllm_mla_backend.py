@@ -783,12 +783,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._decode_kernel_loc = None
 
     def _kv_write_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """The loc an unfused KV scatter must write at.
-
-        A captured decode on the unified pool must read the capture-stable
-        kernel-facing buffer `init_forward_metadata_out_graph` refilled, since
-        the translate rebinds `out_cache_loc` to a FRESH tensor the graph never
-        recorded. Everywhere else the batch's own loc is what the pool expects.
+        """The loc an unfused KV scatter must write at: the capture-stable
+        buffer under a captured unified-pool decode, since the translate
+        rebinds `out_cache_loc` to a fresh tensor the graph never recorded;
+        the batch's own loc everywhere else.
         """
         if self._decode_kernel_loc is not None:
             return self._decode_kernel_loc
@@ -1215,11 +1213,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             return None
         parallel = get_parallel()
-        # The unified pool declares `write_loc_is_dcp_resolved`, so its loc
-        # arrives with the DCP owner rule already applied; asking the kernel to
-        # apply it again would divide a kernel-facing id.
-        dcp_world_size = (
-            1 if self.kv_index_translator.is_translating else parallel.attn_dcp_size
+        # `loc` is WIDENED: the kernel resolves the owner rule itself, and that
+        # is also its only skip. A DCP-resolved loc never reaches here -- see
+        # the `_fused_set_kv_concat_q_fp8` gate.
+        assert not (parallel.dcp_enabled and self.kv_index_translator.is_translating), (
+            "fused fp8 KV write reached with a DCP-resolved loc"
         )
         return set_mla_kv_concat_q_fp8(
             kv_buffer=kv_2d,
@@ -1228,8 +1226,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cache_k_rope=k_rope_2d,
             q_nope=q_nope,
             q_rope=q_rope_3d,
-            dcp_world_size=dcp_world_size,
-            dcp_rank=0 if dcp_world_size == 1 else parallel.attn_dcp_rank,
+            dcp_world_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
         )
 
     def _dummy_dcp_decode_for_autotune(
