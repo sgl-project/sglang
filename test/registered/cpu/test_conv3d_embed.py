@@ -24,12 +24,8 @@ class TestConv3dEmbed(CustomTestCase):
         kernel_size: tuple[int, int, int],
     ) -> None:
         dtype = torch.bfloat16
-        input_tensor = torch.randn(
-            batch_size, in_channels, *kernel_size, dtype=dtype
-        )
-        weight = torch.randn(
-            out_channels, in_channels, *kernel_size, dtype=dtype
-        )
+        input_tensor = torch.randn(batch_size, in_channels, *kernel_size, dtype=dtype)
+        weight = torch.randn(out_channels, in_channels, *kernel_size, dtype=dtype)
         bias = torch.randn(out_channels, dtype=dtype)
 
         expected = F.conv3d(input_tensor, weight, bias).flatten(1)
