@@ -218,9 +218,9 @@ def handle_model_specific_adjustments(server_args: Any):
                 run_post_process_pass(server_args, _dsa_split_backend_resolution)
 
             if cfg.enable_prefill_cp:
-                assert (
-                    cfg.disaggregation_mode != "decode"
-                ), "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                assert cfg.disaggregation_mode != "decode", (
+                    "CP is only supported for prefill when PD disaggregation, please remove --enable-prefill-cp."
+                )
             if (
                 cfg.enable_dsa_cache_layer_split
                 and cfg.disaggregation_mode != "prefill"
@@ -423,9 +423,9 @@ def handle_model_specific_adjustments(server_args: Any):
         # (arg_groups/overrides.py: _gpt_oss_overrides).
 
         if resolved_view(server_args).moe_runner_backend == "triton_kernel":
-            assert (
-                resolved_view(server_args).ep_size == 1
-            ), "Triton kernel MoE is only supported when ep_size == 1"
+            assert resolved_view(server_args).ep_size == 1, (
+                "Triton kernel MoE is only supported when ep_size == 1"
+            )
 
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
@@ -481,7 +481,9 @@ def handle_model_specific_adjustments(server_args: Any):
             "ascend",
             "trtllm_mha",
             "intel_xpu",
-        }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+        }, (
+            f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {attention_backend}"
+        )
         # The moe_runner_backend selection moved to the override registry
         # (arg_groups/overrides.py: _llama4_overrides).
     # Gemma2/Gemma3 (disable_hybrid_swa_memory) moved to the override registry
@@ -523,9 +525,9 @@ def handle_model_specific_adjustments(server_args: Any):
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
-            assert (
-                attention_backend in accepted_backends
-            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+            assert attention_backend in accepted_backends, (
+                f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
+            )
     elif model_arch in ["Olmo2ForCausalLM"]:
         # disable_hybrid_swa_memory + attention backend selection moved to
         # the override registry (arg_groups/overrides.py: _olmo2_overrides).
@@ -534,9 +536,9 @@ def handle_model_specific_adjustments(server_args: Any):
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
         # but Olmo3 does.
         attention_backend = resolved_view(server_args).attention_backend
-        assert (
-            attention_backend != "flashinfer"
-        ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+        assert attention_backend != "flashinfer", (
+            "FlashInfer backend can significantly degrade the performance of Olmo3 models."
+        )
 
         logger.info(f"Using {attention_backend} as attention backend for {model_arch}.")
     elif model_arch in [

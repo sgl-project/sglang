@@ -562,7 +562,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
                         + (self.VIDEO_CONTEXT_TOKEN * ctx_cnt)
                         + self.IMG_END
                     )
-                    frame_lines.append(f"Frame {i+1}: {frame_tokens}")
+                    frame_lines.append(f"Frame {i + 1}: {frame_tokens}")
                 video_tokens = "\n".join(frame_lines) + "\n"
                 input_text_updated = input_text_updated.replace(vid_ph, video_tokens, 1)
 

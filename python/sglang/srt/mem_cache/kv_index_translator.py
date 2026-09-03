@@ -227,8 +227,7 @@ class KVIndexTranslator:
 
         if sliding_window:
             assert self._swa_v2p_table is not None, (
-                "fill_packed_read_stream: sliding_window on a pool with no swa "
-                "sub-pool"
+                "fill_packed_read_stream: sliding_window on a pool with no swa sub-pool"
             )
         build_kv_read_table_packed(
             req_to_token=self.req_to_token,

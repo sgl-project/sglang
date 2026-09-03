@@ -1727,7 +1727,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,

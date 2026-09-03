@@ -74,9 +74,9 @@ def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
     token_ids = key.raw_token_ids()
-    assert (
-        isinstance(token_ids, array) and token_ids.typecode == "q"
-    ), f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
+    assert isinstance(token_ids, array) and token_ids.typecode == "q", (
+        f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
+    )
     return token_ids
 
 
@@ -478,9 +478,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
         # The binding reads is_write_back from the core's construction config.
-        assert (
-            is_write_back == self.is_write_back
-        ), "is_write_back must match the core's construction config"
+        assert is_write_back == self.is_write_back, (
+            "is_write_back must match the core's construction config"
+        )
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
