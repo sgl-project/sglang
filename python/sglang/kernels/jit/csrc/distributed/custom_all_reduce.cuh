@@ -333,8 +333,13 @@ all_reduce_2shot_push_kernel(const __grid_constant__ AllReduce2ShotPushParams<kW
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
 
+  const bool spread_shard = my_len * 4 <= num_threads;
+  const auto tid_bc = spread_shard
+      ? (blockIdx.x + gridDim.x * (threadIdx.x / 32)) * 32 + (threadIdx.x % 32)
+      : global_tid;
+
   // B: reduce my shard out of my scatter slots, fan the result out
-  for (auto lid = global_tid; lid < my_len; lid += num_threads) {
+  for (auto lid = tid_bc; lid < my_len; lid += num_threads) {
     const auto vid = my_lo + lid;
     vec_t vecs[kWorldSize];
 #pragma unroll
@@ -376,7 +381,7 @@ all_reduce_2shot_push_kernel(const __grid_constant__ AllReduce2ShotPushParams<kW
   // C: drain the gather half (everyone else's shards) into the output
   const auto local_gather = gather_epoch.slot_ptr(r);
   const auto num_remote_vecs = num_vecs - my_len;
-  for (auto rid = global_tid; rid < num_remote_vecs; rid += num_threads) {
+  for (auto rid = tid_bc; rid < num_remote_vecs; rid += num_threads) {
     const auto vid = rid < my_lo ? rid : rid + my_len;
     vec_t vec;
     do {
@@ -388,7 +393,7 @@ all_reduce_2shot_push_kernel(const __grid_constant__ AllReduce2ShotPushParams<kW
   }
 
   if constexpr (kUseMc) {
-    for (auto lid = global_tid; lid < my_len; lid += num_threads) {
+    for (auto lid = tid_bc; lid < my_len; lid += num_threads) {
       const auto vid = my_lo + lid;
       vec_t vec;
       do {
