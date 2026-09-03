@@ -45,6 +45,9 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # True when tp_rank/tp_size are the attention-TP coordinates and DP/CP
+    # must be added to recover the scheduler's engine-global coordinate.
+    tp_rank_is_attention_scoped: bool = False
 
 
 @dataclass
