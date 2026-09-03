@@ -1086,6 +1086,10 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # Persistent CuTe DSL AOT objects. Resolved lazily so it tracks
+    # SGLANG_CACHE_DIR; set to an empty string to keep compilation
+    # process-local. Must be trusted: cached objects are loaded into the process.
+    SGLANG_CUTE_AOT_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("cute_aot"))
     # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
     # point it at a persistent mount to share builds across CI jobs.
     SGLANG_JIT_CACHE_DIR = EnvStr(None)
@@ -1095,6 +1099,10 @@ class Envs:
     # is what makes reverting an edit an instant hit instead of a rebuild; set
     # it to trade that away for disk (1 keeps only the most recent build).
     SGLANG_JIT_CACHE_KEEP = EnvInt(None)
+    # Raise instead of compiling when a module misses the cache, so a
+    # deployment that expects a pre-seeded cache fails loudly at startup
+    # rather than silently eating a cold compile.
+    SGLANG_CRASH_ON_JIT_COMPILE = EnvBool(False)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1293,6 +1301,9 @@ class Envs:
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
+    # Mint capture's measured footprint as one span so the graph pool is carved
+    # out of a single contiguous region instead of grown segment by segment.
+    SGLANG_ENABLE_GRAPH_POOL_PRECARVE = EnvBool(False)
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)

@@ -312,9 +312,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -488,9 +488,9 @@ def _usp_input_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -504,12 +504,12 @@ def _usp_input_all_to_all_varlen(
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        s_local == seq_lens[rank]
-    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert s_local == seq_lens[rank], (
+        f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    )
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local = h_global // world_size
 
@@ -578,9 +578,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
-    assert (
-        s_global % world_size == 0
-    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    assert s_global % world_size == 0, (
+        f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    )
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
@@ -632,9 +632,9 @@ def _usp_output_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -648,9 +648,9 @@ def _usp_output_all_to_all_varlen(
         # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
         permute_order = (2, 0, 1, 3)
 
-    assert s_global == sum(
-        seq_lens
-    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    assert s_global == sum(seq_lens), (
+        f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    )
 
     s_local = seq_lens[rank]
 

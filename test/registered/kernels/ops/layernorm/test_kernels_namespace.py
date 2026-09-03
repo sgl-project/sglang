@@ -43,6 +43,7 @@ EXPECTED = {
     "diffusion.flux2_layernorm_modulate_fp8_quant": {"KDA"},
     "diffusion.flux2_qkv_epilogue": {"KDA"},
     "diffusion.flux2_token_cat_fp8": {"KDA"},
+    "gemm.qwen3x_nvfp4": {"KDA"},
 }
 
 _CPU = PlatformInfo(device_type="cpu")
@@ -118,6 +119,14 @@ def test_sparse_linear_attention_registry_targets_forward_kernel():
 def test_merged_diffusion_kda_provenance_backend(op, target_suffix):
     spec = K.registry.get_backend(op, KernelBackend.KDA)
     assert spec.target.endswith(target_suffix)
+
+
+def test_kda_backend_implementations_live_in_kda_home():
+    specs = [
+        spec for spec in K.registry.all_specs() if spec.backend is KernelBackend.KDA
+    ]
+    assert specs
+    assert all(spec.target.startswith("sglang.kernels.kda_kernels.") for spec in specs)
 
 
 def test_single_backend_resolves_without_backend():
