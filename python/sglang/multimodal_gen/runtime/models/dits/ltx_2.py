@@ -810,7 +810,7 @@ class LTX2Attention(nn.Module):
                     self.k_norm = RMSNorm(self.inner_dim, eps=self.norm_eps)
                 else:
                     self.q_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
-                    self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)                    
+                    self.k_norm = torch.nn.RMSNorm(self.inner_dim, eps=self.norm_eps)
             else:
                 self.q_norm = LTX2TPRMSNormAcrossHeads(
                     full_hidden_size=self.inner_dim,
