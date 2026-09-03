@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -80,6 +81,17 @@ class HybridWindowAttentionH3Backend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["HybridWindowAttentionH3MetadataBuilder"]:
         return HybridWindowAttentionH3MetadataBuilder
+
+    @classmethod
+    def unsupported_requirements(
+        cls, requirements: AttentionRequirements
+    ) -> tuple[str, ...]:
+        # Only MiniMax-H3's packed varlen attention is served here. Auxiliary
+        # components (the Qwen3-VL conditioner, VAE attention) that ask for
+        # plain dense attention must fall back to their default backend.
+        if not requirements.packed_varlen:
+            return ("dense (non-packed) attention",)
+        return super().unsupported_requirements(requirements)
 
 
 def window_mask_frames(
