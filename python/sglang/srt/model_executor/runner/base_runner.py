@@ -125,12 +125,17 @@ def _allocate_decode_buffers(
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
+            # Sized in tokens, not requests: under speculative decoding the
+            # verify forward carries num_tokens_per_req tokens per request and
+            # _dummy_run slices these buffers to num_tokens (same as
+            # topk_indices below). Identical for plain decode where
+            # num_tokens_per_req == 1.
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
             if not is_mhc:
                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                # [T, blocks, H]. Other models use [T, H].
                 residual_shape = (
                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                     if pp_proxy_residual_num_blocks is not None

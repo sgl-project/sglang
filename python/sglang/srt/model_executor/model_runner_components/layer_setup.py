@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import msgspec
 from torch import nn
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -196,6 +198,8 @@ def _assert_pp_mtp_compat(
     num_effective_layers: int,
     model_num_layers: int,
 ) -> None:
+    if envs.SGLANG_ENABLE_PP_SPEC.get():
+        return
     assert (
         (not model_has_mtp_layers)
         or (spec_algorithm.is_none())
