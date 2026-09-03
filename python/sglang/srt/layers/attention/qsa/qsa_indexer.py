@@ -23,6 +23,25 @@ from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
+
+def _qsa_ensure_rope(rotary_emb, positions):
+    """Grow the cos/sin cache without a device sync on the hot path.
+
+    positions.max().item() synchronizes the device once per QSA layer. The
+    cache only ever needs to reach the server context length, so size it to
+    that once (a Python-side comparison afterwards) and fall back to the
+    synchronizing path only if a position somehow exceeds it.
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    ctx = int(getattr(get_global_server_args(), "context_length", 0) or 0)
+    if ctx > 0:
+        if int(rotary_emb.cos_sin_cache.shape[0]) <= ctx:
+            rotary_emb._ensure_cos_sin_cache_length(ctx)
+        return
+    rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+
+
 # Bound the dominant FP32 [query_rows, compressed_keys] prefill workspace.
 # Top-k is row-independent, so large scheduler chunks can be scored in smaller
 # row tiles without changing the selected blocks.
@@ -181,9 +200,7 @@ class QSAIndexer(MultiPlatformOp):
             if not get_is_capture_mode() and hasattr(
                 self.rotary_emb, "_ensure_cos_sin_cache_length"
             ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
+                _qsa_ensure_rope(self.rotary_emb, positions)
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -415,7 +432,7 @@ class QSAIndexer(MultiPlatformOp):
         if not get_is_capture_mode() and hasattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length"
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            _qsa_ensure_rope(self.rotary_emb, positions)
 
         # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
         # multimodal positions.  Its public cache view repeats cos/sin to the

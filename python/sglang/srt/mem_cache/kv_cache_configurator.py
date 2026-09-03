@@ -1900,6 +1900,24 @@ class KVCacheConfigurator:
         If constraints change the value, the configurator re-runs and re-aligns.
         """
         user_limit = get_schedule().max_total_tokens
+        _env = __import__("os").environ
+        _lazy_tokens = (
+            int(_env.get("SGLANG_KV_LAZY_TOKENS", "0"))
+            if _env.get("SGLANG_KV_LAZY") == "1"
+            else 0
+        )
+        if _lazy_tokens > 0:
+            # The profiled capacity is what the free VRAM at startup could back physically; with the
+            # headroom rule (1.5 GB kept free for prefill working memory) the practical limit measured
+            # 0.85 x profiled (84k of 106k tokens at bf16). Longer prompts are rejected at admission
+            # instead of crashing the scheduler mid-prefill.
+            _safety = float(_env.get("SGLANG_KV_LAZY_SAFETY", "0.85"))
+            _new = min(_lazy_tokens, int(token_capacity * _safety))
+            logging.warning(
+                f"KV lazy backing: token capacity {token_capacity} (profiled) -> {_new} "
+                f"(requested {_lazy_tokens}, safety {_safety})"
+            )
+            token_capacity = _new
 
         # Apply user-specified upper bound
         if user_limit is not None:

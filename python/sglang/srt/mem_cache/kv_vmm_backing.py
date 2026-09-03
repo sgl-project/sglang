@@ -187,6 +187,38 @@ class KvVmmArena:
         """Total physically-backed bytes (sum of scattered per-buffer ranges)."""
         return self._range_backed
 
+    def uncommit_beyond(self, offset: int, keep_bytes: int) -> int:
+        """Release every mapping of the buffer at ``offset`` that starts at or beyond
+        ``keep_bytes`` (mappings straddling the boundary stay). Returns bytes freed."""
+        if self._closed:
+            return 0
+        from sglang.srt.cuda_vmm_utils import _get_cuda_driver, check_drv
+
+        drv = _get_cuda_driver()
+        start = self.base + offset
+        limit = start + self._committed_by_offset.get(offset, 0)
+        cut = start + self._align(int(keep_bytes))
+        maps = self._allocation._mappings
+        victims = sorted(
+            [m for m in maps if start <= m[0] < limit and m[0] >= cut],
+            key=lambda m: -m[0],
+        )
+        freed = 0
+        with torch.cuda.device(self.device_id):
+            for m in victims:
+                address, size, handle = m
+                check_drv(drv.cuMemUnmap(address, size), "cuMemUnmap(uncommit)")
+                if handle is not None:
+                    check_drv(drv.cuMemRelease(handle), "cuMemRelease(uncommit)")
+                maps.remove(m)
+                freed += size
+        if freed:
+            self._committed_by_offset[offset] = (
+                self._committed_by_offset.get(offset, 0) - freed
+            )
+            self._range_backed -= freed
+        return freed
+
     @property
     def cursor_bytes(self) -> int:
         return int(self._fn_cursor())
@@ -336,6 +368,28 @@ class KvVmmBufferOwner:
         self._back_spans(
             [s.desc.prefix_span_bytes(num_tokens, self.page_size) for s in self._specs]
         )
+        self.backed_tokens = max(getattr(self, "backed_tokens", 0), int(num_tokens))
+
+    def release_beyond(self, num_tokens: int) -> int:
+        """Unmap the backing beyond the first ``num_tokens`` slots of every buffer."""
+        if self._arena is None:
+            return 0
+        torch.cuda.synchronize()
+        freed = 0
+        for s in self._specs:
+            keep = align_up(
+                s.desc.prefix_span_bytes(num_tokens, self.page_size),
+                self._arena.granularity,
+            )
+            freed += self._arena.uncommit_beyond(s.offset, keep)
+            s.backed_to = min(
+                s.backed_to, self._arena._committed_by_offset.get(s.offset, 0)
+            )
+        self.backed_tokens = min(getattr(self, "backed_tokens", 0), int(num_tokens))
+        return freed
+
+    def bytes_per_token(self) -> int:
+        return sum(-(-s.desc.row_bytes // s.desc.tokens_per_row) for s in self._specs)
 
     def finalize(self, final_num_tokens: int) -> None:
         """Back each buffer's final advertised span; set the final serving capacity."""

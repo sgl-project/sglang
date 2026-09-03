@@ -146,6 +146,31 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 pass
         self.clear()
 
+    def _lazy_hook(self, pages: torch.Tensor) -> bool:
+        """Back the KV rows of the pages about to be handed out. False = no physical memory."""
+        kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
+        ensure = getattr(kv, "lazy_ensure", None)
+        if ensure is None or pages.numel() == 0:
+            return True
+        try:
+            ensure((int(pages.max().item()) + 1) * self.page_size)
+            return True
+        except Exception as ex:
+            __import__("logging").getLogger(__name__).warning(
+                "KV lazy backing: commit failed, allocation refused (%s)", ex
+            )
+            return False
+
+    def _lazy_idle_check(self) -> None:
+        if (
+            len(self.free_pages) + len(self.release_pages) >= self.num_pages
+        ):  # pool idle: slot order + give memory back
+            kv = getattr(self._kvcache, "full_kv_pool", self._kvcache)
+            release = getattr(kv, "lazy_release", None)
+            if release is not None:
+                self.clear()
+                release()
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
@@ -160,6 +185,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         out_pages = self.free_pages[:num_pages]
+        if not self._lazy_hook(out_pages):
+            return None
         self.free_pages = self.free_pages[num_pages:]
 
         out_indices = (
@@ -215,6 +242,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         if num_new_pages > len(self.free_pages):
             return None
+        if not self._lazy_hook(self.free_pages[:num_new_pages]):
+            return None
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
@@ -253,6 +282,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             decode=True,
         )
         if num_new_pages > len(self.free_pages):
+            return None
+        if not self._lazy_hook(self.free_pages[:num_new_pages]):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
@@ -312,6 +343,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.release_pages = torch.cat((*page_ids, self.release_pages))
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
+        self._lazy_idle_check()
 
     def free_group_begin(self):
         super().free_group_begin()
