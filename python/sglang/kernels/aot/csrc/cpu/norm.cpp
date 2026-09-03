@@ -1052,3 +1052,106 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qk_gemma_rmsnorm_with_gate_
   });
   return std::make_tuple(q_out, k_out, gate_out);
 }
+
+namespace {
+
+template <typename scalar_t>
+inline void
+fused_qk_norm_per_head(scalar_t* __restrict__ data, const scalar_t* __restrict__ weight, int64_t D, float eps) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = bVec::size();
+
+  fVec sum2_fvec{0.f};
+  float sum2_val{0.f};
+
+  int64_t d = 0;
+#pragma GCC unroll 4
+  for (; d <= D - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(data + d);
+    sum2_fvec += x_fvec0 * x_fvec0;
+    sum2_fvec += x_fvec1 * x_fvec1;
+  }
+  for (; d < D; ++d) {
+    const float x_val = static_cast<float>(data[d]);
+    sum2_val += x_val * x_val;
+  }
+
+  const float scale = 1.f / std::sqrt((sum2_val + vec_reduce_sum(sum2_fvec)) / D + eps);
+  const fVec scale_fvec{scale};
+
+  d = 0;
+#pragma GCC unroll 4
+  for (; d <= D - kVecSize; d += kVecSize) {
+    auto [x_fvec0, x_fvec1] = load_float_vec2(data + d);
+    auto [w_fvec0, w_fvec1] = load_float_vec2(weight + d);
+    convert_from_float_ext<scalar_t>(x_fvec0 * scale_fvec * w_fvec0, x_fvec1 * scale_fvec * w_fvec1).store(data + d);
+  }
+  for (; d < D; ++d) {
+    data[d] = static_cast<scalar_t>(static_cast<float>(data[d]) * scale * static_cast<float>(weight[d]));
+  }
+}
+
+template <typename scalar_t>
+void fused_qk_norm_kernel_impl(
+    scalar_t* __restrict__ q,
+    scalar_t* __restrict__ k,
+    const scalar_t* __restrict__ q_weight,
+    const scalar_t* __restrict__ k_weight,
+    int64_t num_tokens,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    int64_t q_stride,
+    int64_t k_stride,
+    float eps) {
+  const int64_t num_qk_heads = num_q_heads + num_kv_heads;
+
+  at::parallel_for(0, num_tokens * num_qk_heads, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t work = begin; work < end; ++work) {
+      const int64_t token = work / num_qk_heads;
+      const int64_t local_head = work % num_qk_heads;
+      const bool is_q = local_head < num_q_heads;
+
+      scalar_t* __restrict__ data = is_q ? q + token * q_stride + local_head * head_dim
+                                         : k + token * k_stride + (local_head - num_q_heads) * head_dim;
+      fused_qk_norm_per_head<scalar_t>(data, is_q ? q_weight : k_weight, head_dim, eps);
+    }
+  });
+}
+
+}  // anonymous namespace
+
+void fused_qk_norm_cpu(
+    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps) {
+  const auto st = q.scalar_type();
+  CHECK_INPUT_ND<2>(q);
+  CHECK_INPUT_ND<2>(k);
+  CHECK_EQ(k.size(0), q.size(0));
+  CHECK_EQ(k.scalar_type(), st);
+
+  const int64_t head_dim = q_weight.numel();
+  CHECK_GT(head_dim, 0);
+  CHECK_INPUT_SHAPE_DTYPE<false>(q_weight, {head_dim}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(k_weight, {head_dim}, st);
+  CHECK_EQ(q.size(1) % head_dim, 0);
+  CHECK_EQ(k.size(1) % head_dim, 0);
+
+  const int64_t num_tokens = q.size(0);
+  if (num_tokens == 0) return;
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_qk_norm_kernel", [&] {
+    fused_qk_norm_kernel_impl<scalar_t>(
+        q.data_ptr<scalar_t>(),
+        k.data_ptr<scalar_t>(),
+        q_weight.data_ptr<scalar_t>(),
+        k_weight.data_ptr<scalar_t>(),
+        num_tokens,
+        q.size(1) / head_dim,
+        k.size(1) / head_dim,
+        head_dim,
+        q.stride(0),
+        k.stride(0),
+        static_cast<float>(eps));
+  });
+}
