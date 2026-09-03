@@ -92,7 +92,6 @@ def _aiter_supports_mxfp8_dispatch() -> bool:
 
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
-
     def __call__(self, dispatcher: BaseDispatcher):
         for hook_fun in self.hook_dict.values():
             hook_fun(dispatcher)
@@ -782,7 +781,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     compute_stream.wait_stream(comm_stream)
 
         else:
-
             (
                 packed_recv_hidden,
                 recv_topk_weights,

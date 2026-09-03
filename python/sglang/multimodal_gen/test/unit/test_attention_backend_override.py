@@ -26,7 +26,7 @@ def _fake_backend_cls(enum, *, ring_capable=True):
     return SimpleNamespace(
         get_enum=lambda: enum,
         supports_ring_rotation=lambda: ring_capable,
-        get_impl_cls=lambda: (lambda **kwargs: f"{enum.name.lower()}_impl"),
+        get_impl_cls=lambda: lambda **kwargs: f"{enum.name.lower()}_impl",
     )
 
 

@@ -327,9 +327,9 @@ def merge_features_for_dynamic_s2(
                     )
                 )
 
-    assert block_cnt == len(
-        image_features
-    ), f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    assert block_cnt == len(image_features), (
+        f"The number of blocks ({block_cnt}) does not match length of image_features ({len(image_features)})!"
+    )
 
     return image_features_each_image, new_block_sizes
 
