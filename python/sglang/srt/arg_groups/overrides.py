@@ -1006,12 +1006,24 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
 
 @register_post_process
 def _enforce_disable_allreduce_fusion(view: Any) -> dict:
-    """Slot pass right after the auto-enable: the user's enforce-disable
-    switch wins over every model-specific adjustment."""
+    """Apply terminal safety overrides after all-reduce auto selection."""
     if view.enforce_disable_flashinfer_allreduce_fusion:
         logger.info(
             "FlashInfer allreduce fusion is forcibly disabled "
             "via --enforce-disable-flashinfer-allreduce-fusion."
+        )
+        return {"flashinfer_allreduce_fusion_backend": None}
+    if (
+        view.flashinfer_allreduce_fusion_backend == "auto"
+        and view.nnodes == 1
+        and view.speculative_algorithm in ("EAGLE", "NEXTN")
+        and model_config_of(view).hf_config.architectures[0]
+        == "Glm5NextForConditionalGeneration"
+    ):
+        logger.warning(
+            "Disabling FlashInfer all-reduce auto selection for single-node "
+            "GLM-5 NEXTN to preserve speculative acceptance. Set an explicit "
+            "FlashInfer backend to override."
         )
         return {"flashinfer_allreduce_fusion_backend": None}
     return {}
