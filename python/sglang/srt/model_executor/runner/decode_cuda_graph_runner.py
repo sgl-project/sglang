@@ -1279,7 +1279,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             not isinstance(out, LogitsProcessorOutput)
             or out.hidden_states is None
             or out.hidden_states.dim() != 2
-            or self.return_hidden_states_mode.need_capture()
+            or self.enable_return_hidden_states
         ):
             return
         hidden_states = out.hidden_states
