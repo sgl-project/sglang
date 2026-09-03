@@ -492,13 +492,8 @@ def run_eagle_verify(
     bs = len(batch.seq_lens)
 
     # Batch 1: Target verify
-    # Prepare for target verify in a separate stream. The cuda-graph load_batch
-    # inside writes the target's pooled input buffers, which the in-flight draft
-    # graph may still be reading, so order the plan stream after the forward
-    # stream first.
+    # Prepare for target verify in a separate stream
     with plan_stream_ctx:
-        if plan_stream:
-            plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,

@@ -110,11 +110,10 @@ class AdaptiveController:
         self._activate(self.worker.speculative_num_steps)
 
     def _build_order(self) -> list[int]:
-        def graph_footprint(steps: int) -> tuple[int, int, int]:
-            max_bs = max(self.params.cuda_graph_bs_for_step(steps) or [0])
-            return (max_bs * (steps + 1), max_bs, steps)
-
-        return sorted(self.candidate_steps, key=graph_footprint, reverse=True)
+        """Every state captures the same batch sizes (the resolved cuda-graph
+        config, not the pruned list), so the widest step has the largest
+        footprint."""
+        return sorted(self.candidate_steps, reverse=True)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = self.params.get_steps_for_batch(batch_size)

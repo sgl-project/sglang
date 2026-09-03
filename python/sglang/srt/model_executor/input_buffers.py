@@ -62,6 +62,10 @@ def share_graph_state_buffer(
     return share_input_buffer(f"{namespace}.{name}", buffer)
 
 
+def _pool_device(device) -> torch.device:
+    return torch.empty(0, device=device).device
+
+
 def alloc_graph_state_buffer(
     namespace: Optional[str],
     name: str,
@@ -72,7 +76,7 @@ def alloc_graph_state_buffer(
     fill_value: float = 0,
 ) -> torch.Tensor:
     """Pool-first ``share_graph_state_buffer``: allocate only on a miss."""
-    device = torch.device(device)
+    device = _pool_device(device)
     if namespace is not None:
         key: _PoolKey = (f"{namespace}.{name}", dtype, device, tuple(shape[1:]))
         canonical = _forward_input_buffer_pool.get(key, None)
@@ -91,7 +95,7 @@ def alloc_graph_state_grid(
     device,
 ) -> torch.Tensor:
     """Pool a 2-D grid as the corner view ``canonical[:rows, :cols]``."""
-    device = torch.device(device)
+    device = _pool_device(device)
     if namespace is None:
         return torch.zeros((rows, cols), dtype=dtype, device=device)
     key = (f"{namespace}.{name}", dtype, device, "grid")
@@ -100,6 +104,16 @@ def alloc_graph_state_grid(
         canonical = torch.zeros((rows, cols), dtype=dtype, device=device)
         _forward_input_buffer_pool[key] = canonical
     return canonical[:rows, :cols]
+
+
+def graph_state_pool_footprint(namespace_prefix: str) -> Tuple[int, int]:
+    """(buffers, bytes) currently pooled under names starting with the prefix."""
+    buffers = [
+        buffer
+        for (name, _, _, _), buffer in _forward_input_buffer_pool.items()
+        if name.startswith(namespace_prefix)
+    ]
+    return len(buffers), sum(b.numel() * b.element_size() for b in buffers)
 
 
 # Values that index the rope table, the KV pool, req_to_token, or the mamba

@@ -220,14 +220,6 @@ class AttentionBackend(ABC):
             fill_value=fill_value,
         )
 
-    def share_cuda_graph_state_dict(
-        self, metadata: dict, role: str, keys: Iterable[str]
-    ) -> None:
-        for key in keys:
-            buffer = metadata.get(key)
-            if isinstance(buffer, torch.Tensor):
-                metadata[key] = self.share_cuda_graph_state(f"{role}.{key}", buffer)
-
     def child_cuda_graph_state_namespace(self, tag: str) -> Optional[str]:
         if self.cuda_graph_state_namespace is None:
             return None

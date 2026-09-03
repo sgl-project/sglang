@@ -86,19 +86,7 @@ class TestAdaptiveController(unittest.TestCase):
         )
         self.assertEqual(worker.applied_steps, [3])
 
-    def test_token_footprint_orders_before_batch_size(self):
-        worker = _FakeWorker(initial_steps=1)
-        policy = _FakePolicy()
-        policy.candidate_steps = [1, 7]
-        bs_for_step = {7: [1, 2, 4, 8], 1: [1, 2, 4, 8, 16]}
-        policy.cuda_graph_bs_for_step = lambda step: bs_for_step[step]
-        controller = AdaptiveController(worker, policy)
-
-        controller.init_states(cuda_graph_bs=[1, 2, 4, 8, 16])
-
-        self.assertEqual([steps for steps, _, _ in worker.build_calls], [7, 1])
-
-    def test_states_are_built_widest_first(self):
+    def test_states_are_built_widest_step_first_regardless_of_pruning(self):
         worker = _FakeWorker(initial_steps=3)
         policy = _FakePolicy()
         policy.candidate_steps = [1, 3, 7]
@@ -109,8 +97,12 @@ class TestAdaptiveController(unittest.TestCase):
         controller.init_states(cuda_graph_bs=[1, 2, 4, 8, 16, 32])
 
         self.assertEqual(
-            [steps for steps, _, _ in worker.build_calls],
-            [1, 3, 7],
+            worker.build_calls,
+            [
+                (7, 8, [1, 2, 4]),
+                (3, 4, [1, 2, 4, 8, 16]),
+                (1, 2, [1, 2, 4, 8, 16, 32]),
+            ],
         )
 
     def test_states_are_built_by_descending_steps_without_cuda_graph(self):

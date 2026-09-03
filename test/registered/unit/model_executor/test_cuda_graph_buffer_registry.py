@@ -18,6 +18,7 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest import mock
 
 import torch
 
@@ -703,9 +704,11 @@ class TestPoolBackedAlloc(unittest.TestCase):
         target_a = input_buffers.alloc_graph_state_buffer(
             "adaptive.target", "kv_indices", (16, 4), torch.int64, "cpu"
         )
-        target_b = input_buffers.alloc_graph_state_buffer(
-            "adaptive.target", "kv_indices", (8, 4), torch.int64, "cpu"
-        )
+        with mock.patch("torch.full", wraps=torch.full) as spy:
+            target_b = input_buffers.alloc_graph_state_buffer(
+                "adaptive.target", "kv_indices", (8, 4), torch.int64, "cpu"
+            )
+        spy.assert_not_called()
         draft = input_buffers.alloc_graph_state_buffer(
             "adaptive.draft_extend",
             "kv_indices",
@@ -739,6 +742,25 @@ class TestPoolBackedAlloc(unittest.TestCase):
         )
         self.assertEqual(tuple(private_grid.shape), (2, 8))
         self.assertNotEqual(private_grid.data_ptr(), grid_a.data_ptr())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a cuda device")
+    def test_graph_state_pool_first_hits_across_device_spellings(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+        first = input_buffers.alloc_graph_state_buffer(
+            "adaptive.target", "kv_indices", (16,), torch.int32, "cuda"
+        )
+        with mock.patch("torch.full", wraps=torch.full) as spy:
+            second = input_buffers.alloc_graph_state_buffer(
+                "adaptive.target",
+                "kv_indices",
+                (8,),
+                torch.int32,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+        spy.assert_not_called()
+        self.assertEqual(second.data_ptr(), first.data_ptr())
 
     def test_share_input_buffer_aliases_row_prefixes_only(self):
         from sglang.srt.model_executor import input_buffers
@@ -1188,6 +1210,11 @@ class TestBuildPrefillRegistry(unittest.TestCase):
     """Token-axis prefill registry (piecewise / breakable runners): ZERO-tail
     padding, input_embeds reset-only, mamba bs-axis copy, source adoption."""
 
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
+
     def _src(self, **extra):
         base = dict(
             input_ids=torch.zeros(16, dtype=torch.int64),
@@ -1569,6 +1596,11 @@ class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
 class TestFillOncePolicy(unittest.TestCase):
     """FILL_ONCE initializes the whole buffer at alloc and never resets the
     padded tail per iter (unlike FILL_SENTINEL)."""
+
+    def setUp(self):
+        from sglang.srt.model_executor import input_buffers
+
+        input_buffers._forward_input_buffer_pool.clear()
 
     def test_fill_once_inits_once_and_keeps_tail(self):
         reg = CudaGraphBufferRegistry(

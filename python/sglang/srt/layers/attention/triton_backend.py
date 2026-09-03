@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional
 
-import msgspec
 import torch
 import triton
 
@@ -1097,14 +1097,8 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
             is_read=True,
             dtype=torch.uint8,
+            allocate=partial(self.alloc_cuda_graph_state, "verify_mask"),
         )
-        if self._verify_mask is not None:
-            self._verify_mask = msgspec.structs.replace(
-                self._verify_mask,
-                buffer=self.share_cuda_graph_state(
-                    "verify_mask", self._verify_mask.buffer
-                ),
-            )
 
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
@@ -1115,8 +1109,11 @@ class TritonAttnBackend(AttentionBackend):
                     self.device,
                 )
             else:
-                self.cuda_graph_window_kv_indices = self.share_cuda_graph_state(
-                    "window_kv_indices", torch.zeros_like(kv_indices_buf)
+                self.cuda_graph_window_kv_indices = self.alloc_cuda_graph_state(
+                    "window_kv_indices",
+                    kv_indices_buf.shape,
+                    kv_indices_buf.dtype,
+                    kv_indices_buf.device,
                 )
 
             self.cuda_graph_window_num_kv_splits = self.alloc_cuda_graph_state(
