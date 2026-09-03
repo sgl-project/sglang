@@ -95,6 +95,10 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             prefix=prefix,
         )
         self.hot_token_id = None
+        # Native MTP checkpoints do not store a separate output head. EAGLE3's
+        # initialization path must share both target tensors, just as NEXTN's
+        # EAGLE path already does.
+        self.load_lm_head_from_target = True
 
     def _build_nextn_model(
         self,
