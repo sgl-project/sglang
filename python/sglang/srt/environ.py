@@ -388,6 +388,12 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    # Max workers for the grammar-compilation thread pool. 0 (default) sizes
+    # the pool as min(cpu_count // 2, 8). The pool is deliberately capped:
+    # os.cpu_count() is not cgroup-aware, so sizing by host CPU count
+    # oversubscribes container CPU quotas (CFS throttling) and stalls the
+    # scheduler while grammars compile.
+    SGLANG_GRAMMAR_COMPILE_MAX_WORKERS = EnvInt(0)
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # ===================================================================
