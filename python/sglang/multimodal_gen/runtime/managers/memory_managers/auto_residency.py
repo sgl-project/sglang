@@ -1307,6 +1307,12 @@ def _resolve_layerwise_policies(
     return policies
 
 
+def _manager_mapped_layer_bytes(manager) -> dict[int, int]:
+    """Mapped bytes per layer; nothing for a store without a mapping (legacy managers, tests)."""
+    getter = getattr(manager, "mapped_layer_bytes", None)
+    return dict(getter()) if callable(getter) else {}
+
+
 def _layerwise_transfer_work_bytes(
     *,
     managers: Sequence,
@@ -1352,7 +1358,7 @@ def _layerwise_transfer_work_bytes(
             )
         )
         pinned = set(pinned_indices)
-        mapped = manager.mapped_layer_bytes() if shared_pool else {}
+        mapped = _manager_mapped_layer_bytes(manager) if shared_pool else {}
         for layer_idx, weight_bytes in manager.layer_weight_bytes().items():
             observed_uses = manager_uses[layer_idx]
             uses = observed_uses if layer_idx in streamed else min(1, observed_uses)
@@ -1458,7 +1464,7 @@ def _layerwise_streamed_mapped_bytes(
     for group, (manager, resident_count, policy) in enumerate(
         zip(managers, resident_layers, policies)
     ):
-        mapped = manager.mapped_layer_bytes()
+        mapped = _manager_mapped_layer_bytes(manager)
         if not mapped:
             continue
         for layer_idx in compute_streamed_layers(
@@ -1487,7 +1493,7 @@ def layerwise_mapped_bytes(modules: Mapping[str, object]) -> int:
             if id(manager) in seen or not manager.enabled:
                 continue
             seen.add(id(manager))
-            total += sum(manager.mapped_layer_bytes().values())
+            total += sum(_manager_mapped_layer_bytes(manager).values())
     return total
 
 
