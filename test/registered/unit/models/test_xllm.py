@@ -137,6 +137,36 @@ def test_mova_horizon_schema_rejects_missing_source_router_contract():
         _normalize_k2_horizon_config(config)
 
 
+def test_moe_without_mova_schema_normalization():
+    config = K2HorizonConfig.from_dict(
+        {
+            "architectures": ["K2HorizonForCausalLM"],
+            "model_type": "k2_horizon",
+            "hidden_size": 16,
+            "num_hidden_layers": 4,
+            "num_experts": 192,
+            "num_experts_per_tok": 8,
+            "num_shared_experts": 1,
+            "mova_num_experts": 0,
+            "mova_num_experts_per_tok": 0,
+            "mlp_only_layers": [0],
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 10_000_000.0,
+            },
+        }
+    )
+
+    _normalize_k2_horizon_config(config)
+
+    assert config.num_values == 0
+    assert config.num_values_per_tok == 0
+    assert config.num_experts == 192
+    assert config.num_experts_per_tok == 8
+    assert config.num_shared_experts == 1
+    assert config.num_dense_layers == 1
+
+
 def test_group_rms_norm_matches_groupwise_reference_and_residual_contract():
     norm = XllmGroupRMSNorm(hidden_size=4, n_groups=2, eps=0.0)
     with torch.no_grad():
