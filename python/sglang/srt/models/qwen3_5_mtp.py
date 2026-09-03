@@ -15,7 +15,9 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import copy
+import json
 import logging
+import os
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
@@ -80,6 +82,41 @@ def _mtp_quant_config(quant_config):
         ):
             return None
     return quant_config
+
+
+def _load_mtp_w8a8_dequant_scales(model_path: str) -> dict:
+    """Per-row int8 dequant scales for W8A8 MTP weights, keyed by the
+    original checkpoint weight name.
+
+    On NPU the MTP draft runs unquantized (quant_config=None) while
+    ModelSlim checkpoints may store the MTP projections as W8A8 (int8 +
+    per-row weight_scale). Without dequantization the raw int8 codes are
+    copied into the bf16 parameters and the draft model is numerically
+    broken (spec-decode accept rate collapses to ~0).
+    """
+    scales: dict = {}
+    try:
+        index_file = os.path.join(
+            model_path, "quant_model_weights.safetensors.index.json"
+        )
+        if not os.path.exists(index_file):
+            return scales
+        with open(index_file) as f:
+            weight_map = json.load(f)["weight_map"]
+        from safetensors import safe_open
+
+        for key in weight_map:
+            if not key.startswith("mtp.") or not key.endswith(".weight_scale"):
+                continue
+            with safe_open(
+                os.path.join(model_path, weight_map[key]),
+                framework="pt",
+                device="cpu",
+            ) as f:
+                scales[key[: -len("_scale")]] = f.get_tensor(key)
+    except Exception as e:
+        logger.warning("MTP draft: failed to load W8A8 scales: %s", e)
+    return scales
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -321,6 +358,13 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        mtp_w8a8_scales = (
+            _load_mtp_w8a8_dequant_scales(
+                get_spec().speculative_draft_model_path or get_model().model_path
+            )
+            if self.quant_config is None
+            else {}
+        )
 
         for name, loaded_weight in weights:
             # The last-stage MTP draft cannot share the target embedding on PP0.
@@ -346,6 +390,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             # Only process MTP branch weights
             if "mtp" not in name:
                 continue
+
+            orig_ckpt_name = name
+            if (
+                self.quant_config is None
+                and loaded_weight.dtype == torch.int8
+                and orig_ckpt_name in mtp_w8a8_scales
+            ):
+                w8a8_scale = mtp_w8a8_scales[orig_ckpt_name]
+                if w8a8_scale.shape[0] == loaded_weight.shape[0]:
+                    loaded_weight = (
+                        loaded_weight.to(torch.float32) * w8a8_scale.to(torch.float32)
+                    ).to(getattr(self.config, "torch_dtype", torch.bfloat16))
 
             if name.startswith("mtp."):
                 # Remove the mtp. prefix for processing
