@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.runtime.cache.seacache import SeaCache
 
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
@@ -124,7 +125,8 @@ class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
     Base class for DiT models that support inference-time cache accelerators.
 
     Inherits ``SpectrumMixin`` (Chebyshev step skipping) and ``TeaCacheMixin``
-    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality.
+    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality, and holds
+    a ``SeaCache`` collaborator (spectral-evolution-aware step skipping).
 
     """
 
@@ -142,6 +144,7 @@ class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
         super().__init__(config, **kwargs)
         self._init_spectrum_state()
         self._init_teacache_state()
+        self.seacache = SeaCache(prefix=config.prefix)
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:

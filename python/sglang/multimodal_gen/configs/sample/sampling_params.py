@@ -232,6 +232,10 @@ class SamplingParams:
     # request; see DenoisingStage._maybe_override_attention_backend.
     attention_backend_override: str | None = None
 
+    # SeaCache parameters
+    enable_seacache: bool = False
+    seacache_params: Any = None  # SeaCacheParams
+
     # Spectrum parameters
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
@@ -356,6 +360,16 @@ class SamplingParams:
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
 
             self.spectrum_params = SpectrumParams()
+
+        if self.enable_seacache and isinstance(self.seacache_params, dict):
+            from sglang.multimodal_gen.configs.sample.seacache import SeaCacheParams
+
+            self.seacache_params = SeaCacheParams(**self.seacache_params)
+
+        if self.enable_seacache and self.seacache_params is None:
+            from sglang.multimodal_gen.configs.sample.seacache import SeaCacheParams
+
+            self.seacache_params = SeaCacheParams()
 
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
@@ -604,6 +618,14 @@ class SamplingParams:
         if self.enable_teacache and self.enable_spectrum:
             raise ValueError(
                 "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
+        if self.enable_seacache and self.enable_teacache:
+            raise ValueError(
+                "enable_seacache and enable_teacache are mutually exclusive; enable only one."
+            )
+        if self.enable_seacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_seacache and enable_spectrum are mutually exclusive; enable only one."
             )
 
         RLRolloutArgs.validate_sampling_params(self)
@@ -954,6 +976,25 @@ class SamplingParams:
         add_argument(
             "--attention-backend-override",
             type=str,
+        )
+        add_argument(
+            "--enable-seacache",
+            action="store_true",
+        )
+        add_argument(
+            "--seacache-thresh",
+            "--seacache_thresh",
+            dest="seacache_thresh",
+            type=float,
+            help="SeaCache refresh threshold; larger skips more steps (0 never skips).",
+        )
+        add_argument(
+            "--seacache-norm-mode",
+            "--seacache_norm_mode",
+            dest="seacache_norm_mode",
+            type=str,
+            choices=["mean", "peak", "none"],
+            help="SeaCache filter gain normalization; 'none' reproduces the paper ablation.",
         )
         add_argument(
             "--enable-spectrum",
@@ -1467,6 +1508,26 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        seacache_overrides = {}
+        seacache_flag_map = {
+            "thresh": "seacache_thresh",
+            "norm_mode": "seacache_norm_mode",
+        }
+        for field_name, arg_name in seacache_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                seacache_overrides[field_name] = getattr(args, arg_name)
+        if seacache_overrides:
+            if not cli_args.get("enable_seacache", False):
+                logger.info(
+                    "SeaCache override flags were provided without --enable-seacache; "
+                    "auto-enabling SeaCache caching."
+                )
+                cli_args["enable_seacache"] = True
+            existing_seacache_params = cli_args.get("seacache_params")
+            if isinstance(existing_seacache_params, dict):
+                seacache_overrides = {**existing_seacache_params, **seacache_overrides}
+            cli_args["seacache_params"] = seacache_overrides
 
         spectrum_overrides = {}
         spectrum_flag_map = {

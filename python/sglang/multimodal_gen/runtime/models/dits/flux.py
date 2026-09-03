@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -90,7 +90,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1242,6 +1246,34 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             "single_transformer_blocks",
         ]
 
+    def _seacache_should_run_blocks(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        forward_batch: "Req",
+    ) -> bool:
+        """Ask SeaCache whether the transformer blocks must run this step."""
+        # Block 0's first adaLN modulation is SeaCache's decision feature. Recomputing
+        # it here costs one LayerNorm + one 3072->18432 projection; the block recomputes
+        # its own copy when it runs.
+        modulated_inp = self.transformer_blocks[0].norm1(hidden_states, emb=temb)[0]
+        # hidden_states holds image tokens only -- text stays in encoder_hidden_states
+        # and is concatenated inside the blocks -- so the cached residual covers the
+        # whole stream that norm_out/proj_out consume.
+        vae_scale_factor = (
+            get_global_server_args().pipeline_config.vae_config.arch_config.vae_scale_factor
+        )
+        patched = vae_scale_factor * 2
+        grid_hw = (
+            int(forward_batch.height) // patched,
+            int(forward_batch.width) // patched,
+        )
+        assert grid_hw[0] * grid_hw[1] == int(forward_batch.raw_latent_shape[1])
+        return self.seacache.should_run_blocks(
+            modulated_inp=modulated_inp, grid_hw=grid_hw
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1348,10 +1380,18 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         forward_batch = get_forward_context().forward_batch
         spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
-        run_transformer_blocks = (
-            self.begin_spectrum_step() if spectrum_enabled else True
-        )
+        seacache_enabled = forward_batch is not None and forward_batch.enable_seacache
+        run_transformer_blocks = True
+        if spectrum_enabled:
+            run_transformer_blocks = self.begin_spectrum_step()
+        elif seacache_enabled:
+            run_transformer_blocks = self._seacache_should_run_blocks(
+                hidden_states=hidden_states, temb=temb, forward_batch=forward_batch
+            )
         if run_transformer_blocks:
+            # SeaCache caches the delta across the block stack, so snapshot the
+            # entry value; norm_out/proj_out below stay outside the cached span.
+            original_hidden_states = hidden_states.clone() if seacache_enabled else None
             for block in self.transformer_blocks:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
@@ -1372,9 +1412,16 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
             if spectrum_enabled:
                 self.spectrum_record_features(hidden_states)
+            elif seacache_enabled:
+                self.seacache.record_residual(
+                    hidden_states=hidden_states,
+                    original_hidden_states=original_hidden_states,
+                )
         else:
             if spectrum_enabled:
                 hidden_states = self.spectrum_predict_features(hidden_states)
+            elif seacache_enabled:
+                hidden_states = self.seacache.retrieve(hidden_states=hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
 

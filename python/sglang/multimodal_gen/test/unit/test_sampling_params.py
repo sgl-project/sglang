@@ -130,6 +130,23 @@ class TestSamplingParamsValidate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SpectrumParams(**kwargs)
 
+    def test_seacache_is_mutually_exclusive_with_the_other_step_caches(self):
+        with self.assertRaisesRegex(
+            ValueError, r"enable_seacache and enable_teacache are mutually exclusive"
+        ):
+            SamplingParams(enable_seacache=True, enable_teacache=True)
+        with self.assertRaisesRegex(
+            ValueError, r"enable_seacache and enable_spectrum are mutually exclusive"
+        ):
+            SamplingParams(enable_seacache=True, enable_spectrum=True)
+
+    def test_seacache_dict_is_validated_when_sampling_params_constructs_it(self):
+        with self.assertRaisesRegex(ValueError, "norm_mode"):
+            SamplingParams(
+                enable_seacache=True,
+                seacache_params={"norm_mode": "lowpass"},
+            )
+
     def test_spectrum_dict_is_validated_when_sampling_params_constructs_it(self):
         with self.assertRaisesRegex(ValueError, "history_size"):
             SamplingParams(
@@ -383,6 +400,29 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
                 "tau_num_steps": 42,
             },
         )
+
+    def test_get_cli_args_maps_seacache_prefixed_flags(self):
+        kwargs = self._parse_cli_kwargs(
+            [
+                "--enable-seacache",
+                "--seacache-thresh",
+                "0.6",
+                "--seacache-norm-mode",
+                "none",
+            ]
+        )
+
+        self.assertTrue(kwargs["enable_seacache"])
+        self.assertEqual(
+            kwargs["seacache_params"],
+            {"thresh": 0.6, "norm_mode": "none"},
+        )
+
+    def test_seacache_override_flag_implicitly_enables_the_cache(self):
+        kwargs = self._parse_cli_kwargs(["--seacache-thresh", "0.215"])
+
+        self.assertTrue(kwargs["enable_seacache"])
+        self.assertEqual(kwargs["seacache_params"], {"thresh": 0.215})
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])
