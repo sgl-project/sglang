@@ -40,7 +40,6 @@ from sglang.kernels.ops.diffusion import (
     vdn_frame_stats_prep,
     vdn_gather_linear_state,
     vdn_linear_epilogue,
-    vdn_run_scans,
     vdn_silu_l2norm,
     vdn_temporal_conv_act,
 )
@@ -528,8 +527,10 @@ def run_scans(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """prefix[t] = frames 0..t, suffix[t] = frames t..F-1 (both fp32
     [F, H, dv, dk]); both start from ``text_state`` (or zero)."""
-    if transitions.is_cuda and _use_fused_kernels():
-        return vdn_run_scans(transitions, injections, text_state)
+    # NOTE: a persistent Triton scan (one program per head and direction) was
+    # measured at 9x the cost of these cuBLAS launches on B200: a 100-step
+    # dependent chain cannot fill the GPU from one program, while each
+    # baddbmm spreads the head batch over the whole device.
     num_frames = transitions.shape[0]
     start = (
         torch.zeros_like(injections[0])
