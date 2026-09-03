@@ -849,8 +849,10 @@ def test_qwen_dsa_indexer_forward_trims_dp_padding_rows():
             torch.zeros(positions.shape[0], 2),
             torch.zeros(positions.shape[0], 1, 4),
         ),
-        _select_paged=lambda q, w, metadata: calls.update(q_rows=q.shape[0])
-        or torch.empty(q.shape[0], 4, dtype=torch.int32),
+        _select_paged=lambda q, w, metadata: (
+            calls.update(q_rows=q.shape[0])
+            or torch.empty(q.shape[0], 4, dtype=torch.int32)
+        ),
     )
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
@@ -1509,8 +1511,8 @@ def test_qsa_indexer_decode_ignores_dp_attention_token_padding():
     indexer = SimpleNamespace(
         layer_id=0,
         index_n_heads=4,
-        _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
-            torch.zeros(logical_positions.numel(), dtype=torch.long)
+        _pending_ring_slots=lambda metadata, logical_positions, is_extend: torch.zeros(
+            logical_positions.numel(), dtype=torch.long
         ),
         project_qk=lambda hidden, rope_positions, **kwargs: (
             hidden.reshape(-1, 1, 2),

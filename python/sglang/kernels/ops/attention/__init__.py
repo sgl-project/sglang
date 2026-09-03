@@ -62,18 +62,18 @@ register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.TRITON,
-        target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:" "qwen38_qsa_sm121"),
+        target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))}
         ),
         format_signature=FormatSignature(
             supported_dtypes=("bfloat16",),
             description=(
-                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, " "1 <= q_rows <= 128"
+                "Qwen3.8 packed QSA decode: D=256, 12:1 GQA, 1 <= q_rows <= 128"
             ),
         ),
         description=(
-            "SM121 Qwen3.8 QSA decode optimized by Codex/Kimi K3 through " "KDA-1.5."
+            "SM121 Qwen3.8 QSA decode optimized by Codex/Kimi K3 through KDA-1.5."
         ),
     )
 )

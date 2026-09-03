@@ -2077,9 +2077,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
                     if name.endswith("_scale") and name not in params_dict:
-                        assert (
-                            abs(loaded_weight.item() - 1.0) < 1e-6
-                        ), f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        assert abs(loaded_weight.item() - 1.0) < 1e-6, (
+                            f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                        )
                         continue
                     if name in params_dict:
                         param = params_dict[name]

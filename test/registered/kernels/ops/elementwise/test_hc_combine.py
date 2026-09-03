@@ -155,7 +155,10 @@ def test_hc_combine_unsupported_dtype():
 def test_hc_combine_bad_hidden_size():
     dtype = torch.bfloat16
     block_output, residual, normed_residual, inject_weight = _make_inputs(
-        4, dtype, hc=4, hs=1000  # 4 * 1000 = 4000, not a multiple of 2048
+        4,
+        dtype,
+        hc=4,
+        hs=1000,  # 4 * 1000 = 4000, not a multiple of 2048
     )
     with pytest.raises(RuntimeError, match="2048"):
         hc_combine(
