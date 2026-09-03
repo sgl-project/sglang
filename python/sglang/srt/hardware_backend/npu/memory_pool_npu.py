@@ -22,12 +22,33 @@ if is_npu():
     import torch_npu
 
 
+def _pd_prefill_conv_draft_tokens() -> Optional[int]:
+    """PD prefill has no DSPARK worker, so ``speculative_num_draft_tokens`` is
+    None. Infer Decode's verify width (gamma+1) the same way ``_handle_dspark``
+    does, without loading draft weights.
+    """
+    from sglang.srt.arg_groups.overrides import max_speculative_num_draft_tokens
+    from sglang.srt.runtime_context import get_disagg, get_spec
+
+    if get_disagg().disaggregation_mode != "prefill":
+        return None
+    n = max_speculative_num_draft_tokens()
+    if n is not None:
+        return n
+    gamma = get_spec().speculative_dspark_block_size
+    if gamma is not None:
+        return int(gamma) + 1
+    return None
+
+
 def _init_npu_conv_state(
     conv_state_in,
     conv_state_shape,
     speculative_num_draft_tokens: Optional[int] = None,
     is_kda: bool = False,
 ):
+    if speculative_num_draft_tokens is None:
+        speculative_num_draft_tokens = _pd_prefill_conv_draft_tokens()
     extra_conv_len = 0
     if speculative_num_draft_tokens is not None:
         extra_conv_len = speculative_num_draft_tokens - 1
