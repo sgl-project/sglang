@@ -106,6 +106,7 @@ class TestDSV4FlashFP4B200W4A4MegaMoE(
                 "--dp",
                 "4",
                 "--enable-dp-attention",
+                "--enable-dp-lm-head",
                 "--moe-a2a-backend",
                 "megamoe",
                 "--enable-w4a4-mxfp4-megamoe",
