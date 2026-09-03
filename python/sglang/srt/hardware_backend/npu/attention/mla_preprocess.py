@@ -25,9 +25,9 @@ def is_mla_preprocess_enabled() -> bool:
 def is_fia_nz() -> bool:
     is_fia_nz_ = get_bool_env_var("SGLANG_USE_FIA_NZ")
     if is_fia_nz_:
-        assert (
-            is_mla_preprocess_enabled()
-        ), "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
+        assert is_mla_preprocess_enabled(), (
+            "SGLANG_USE_FIA_NZ must be enable with SGLANG_NPU_USE_MLAPO"
+        )
     return is_fia_nz_
 
 
