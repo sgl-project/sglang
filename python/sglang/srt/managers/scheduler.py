@@ -470,6 +470,7 @@ class Scheduler(
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
+        self.enable_streaming_session = get_serving().enable_streaming_session
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -1202,6 +1203,9 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # PP event loops replace this with one batch per microbatch before polling
+        # requests. Keep it initialized for control-plane wakeups before loop entry.
+        self.running_mbs: List[ScheduleBatch] = []
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1972,7 +1976,9 @@ class Scheduler(
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
+        available_req_slots = self.req_to_token_pool.available_size()
         self.session_controller.maybe_reap(now)
+        self._wake_batch_if_req_slot_released(available_req_slots)
 
         for recv_req in recv_reqs:
             vmm_errors = None
@@ -3034,6 +3040,8 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            if self._waiting_req_reuses_streaming_session_slot(req):
+                self._wake_full_prefill_batches()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3511,6 +3519,25 @@ class Scheduler(
 
         return res
 
+    def _waiting_req_reuses_streaming_session_slot(self, req: Req) -> bool:
+        session = req.session
+        return bool(
+            session is not None
+            and session.streaming
+            and req.to_finish is None
+            and self.tree_cache.has_reusable_streaming_session_slot(session.session_id)
+        )
+
+    def _wake_batch_if_req_slot_released(self, available_before: int) -> None:
+        if self.req_to_token_pool.available_size() > available_before:
+            self._wake_full_prefill_batches()
+
+    def _wake_full_prefill_batches(self) -> None:
+        self.running_batch.batch_is_full = False
+        if self.ps.pp_size > 1:
+            for running_batch in self.running_mbs:
+                running_batch.batch_is_full = False
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3582,10 +3609,22 @@ class Scheduler(
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        parallel_capacity = get_parallel().pp_max_micro_batch_size - running_bs
+        if (
+            parallel_capacity <= 0
+            and self.chunked_req is None
+            and not self.enable_priority_preemption
+        ):
+            running_batch.batch_is_full = True
+            return None, running_batch
         if (
             self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
+            and not (
+                self.enable_streaming_session
+                and self.tree_cache.supports_streaming_session()
+            )
         ):
             running_batch.batch_is_full = True
             return None, running_batch
@@ -3654,38 +3693,55 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        # Retained session rows are already registered and do not consume fresh slots.
+        fresh_slots_used = sum(not req.kv.holds_kv for req in adder.can_run_list)
+        reusable_retryable = False
+        fresh_slot_blocked = False
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
-                continue
-
+            candidate_reuses_slot = self._waiting_req_reuses_streaming_session_slot(req)
             running_bs = len(running_batch.reqs)
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+            parallel_full = len(adder.can_run_list) >= parallel_capacity
+            fresh_slot_full = fresh_slots_used >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+            )
+            disagg_full = (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and fresh_slots_used >= self.req_to_token_pool.available_size()
+            )
+            if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
+                if candidate_reuses_slot:
+                    reusable_retryable = True
+                elif fresh_slot_full:
+                    fresh_slot_blocked = True
+                continue
+            if fresh_slot_blocked and not candidate_reuses_slot:
+                continue
+            if (
+                parallel_full
+                or (disagg_full and not candidate_reuses_slot)
+                or (fresh_slot_full and not candidate_reuses_slot)
             ):
-                running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                preempted = (
+                    self.enable_priority_preemption and adder.preempt_to_schedule(req)
+                )
+                if not preempted:
+                    if fresh_slot_full and not parallel_full and not disagg_full:
+                        fresh_slot_blocked = True
+                        continue
                     running_batch.batch_is_full = True
-
-            if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
-                ):
                     break
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    reusable_retryable |= candidate_reuses_slot
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
@@ -3712,11 +3768,23 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+            previous_batch_size = len(adder.can_run_list)
+            owns_slot = req.kv.holds_kv
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            added = len(adder.can_run_list) > previous_batch_size
+            if added and not owns_slot:
+                fresh_slots_used += 1
+            if not added and candidate_reuses_slot:
+                # A transiently blocked retained turn must not latch admission full.
+                reusable_retryable |= res != AddReqResult.NO_TOKEN or (
+                    self.enable_hierarchical_cache
+                    and len(adder.can_run_list) == 0
+                    and running_batch.is_empty()
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3734,8 +3802,10 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
-                if not added:
+                req_was_added = (
+                    len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
+                )
+                if not req_was_added:
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None
@@ -3753,6 +3823,8 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            if fresh_slot_blocked and not reusable_retryable:
+                running_batch.batch_is_full = True
             return None, running_batch
 
         can_run_set = set(can_run_list)
@@ -5385,6 +5457,7 @@ class Scheduler(
         return None
 
     def close_session(self, recv_req: CloseSessionReqInput):
+        available_req_slots = self.req_to_token_pool.available_size()
         if self.enable_session_radix_cache:
             self.tree_cache.release_radix_session(recv_req.session_id)
         if (
@@ -5392,6 +5465,7 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+        self._wake_batch_if_req_slot_released(available_req_slots)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
