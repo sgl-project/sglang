@@ -70,6 +70,10 @@ class PoolName(str, Enum):
     # so it needs a second pool alongside DEEPSEEK_V4_C4_INDEXER.
     DEEPSEEK_V4_C4_INDEXER_SCALE = "deepseek_v4_c4_indexer_scale"
     DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    # fp8 unified_kv splits a row across a packed fp8 nope pool and a parallel
+    # bf16 rope pool, so each compressed region mirrors to two host pools.
+    DEEPSEEK_V4_C4_ROPE = "deepseek_v4_c4_rope"
+    DEEPSEEK_V4_C128_ROPE = "deepseek_v4_c128_rope"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
