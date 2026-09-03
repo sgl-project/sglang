@@ -1965,20 +1965,42 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self,
+        rid: str = "",
+        abort_all: bool = False,
+        *,
+        is_from_delayed_cleanup: bool = False,
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+
+        tokenizer_worker_num = get_serving().tokenizer_worker_num
+        # The scheduler treats rid as a prefix (e.g. to abort all parallel
+        # samples), so an exact dictionary lookup is not sufficient here.
+        targets_local_inflight_request = abort_all or any(
+            request_rid.startswith(rid) for request_rid in self.rid_to_state
+        )
         if (
             not abort_all
-            and get_serving().tokenizer_worker_num == 1
-            and rid not in self.rid_to_state
+            and tokenizer_worker_num == 1
+            and not targets_local_inflight_request
         ):
             return
+
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
-        if self.enable_metrics:
+        # The delayed client-disconnect safety net can run after the request has
+        # left rid_to_state. Preserve forwarding in multi-tokenizer mode, but do
+        # not count that late no-op as an aborted request. Explicit aborts still
+        # count in multi-tokenizer mode because their RID may belong to another
+        # tokenizer worker and is not present in this worker's local map.
+        if self.enable_metrics and (
+            targets_local_inflight_request
+            or (not is_from_delayed_cleanup and tokenizer_worker_num > 1)
+        ):
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
                 self.metrics_collector.labels
@@ -2141,10 +2163,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         async def abort_request():
             await asyncio.sleep(2)
             if obj.is_single:
-                self.abort_request(obj.rid)
+                self.abort_request(obj.rid, is_from_delayed_cleanup=True)
             else:
                 for rid in obj.rid:
-                    self.abort_request(rid)
+                    self.abort_request(rid, is_from_delayed_cleanup=True)
 
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
