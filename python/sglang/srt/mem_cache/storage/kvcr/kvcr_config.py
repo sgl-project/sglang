@@ -81,10 +81,11 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # manifest and rank topology before allowing hybrid peer reuse.
     cache_abi: Optional[str] = None
 
-    # Wall-clock budget for one deposit/deliver to report completion on the
-    # HiCache prefetch daemon thread. A remote fetch crosses the control plane
-    # plus a NIXL transfer, so this is generously above operation_timeout_ms;
-    # exceeding it is reported as a miss and HiCache recomputes.
+    # Legacy-named soft overdue threshold for one deposit/deliver on the HiCache
+    # prefetch daemon. A remote fetch crosses the control plane plus a NIXL
+    # transfer, so this is generously above operation_timeout_ms. The adapter
+    # logs after this threshold but retains the destination until KVCR reports
+    # terminal.
     get_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
@@ -100,39 +101,17 @@ class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     def _validate_timeout_ordering(self) -> None:
         """``get_timeout_s`` must outlast the core's own operation deadline.
 
-        ``_drain_until`` stops waiting at ``get_timeout_s`` and returns a miss.
-        It cannot cancel: ``kvcr.abort()`` is a no-op stub, and NIXL's
-        cancellation path releases the transfer handle without fencing an
-        in-flight DMA. HiCache then frees the operation's host pages -- via
-        ``append_host_mem_release`` in ``prefetch_io_aux_func``, or via
-        ``check_prefetch_progress`` on the scheduler thread -- and hands them to
-        the next prefetch.
-
-        Ordering the two this way is necessary, not sufficient. Both ends anchor
-        their deadline to ``operation_timeout_ms``, so waiting past it means no
-        peer *starts* a new write into those pages -- but the deadline is a
-        timer, not a DMA fence. The source's expiry drives ``poll_transfer
-        (cancellation_requested=True)`` into NIXL, whose contract is that the
-        transfer is cancelled *or errors*; a descriptor the NIC has already
-        begun can still land after the handle is released. Closing that hole
-        needs a per-op quiescence signal from KVCR (``abort()`` is a no-op stub
-        today, ``core.py``), which is filed upstream; this check only removes the
-        configuration that makes the race certain rather than unlikely.
-
-        Order the two the other way and an abandoned fetch is still being
-        actively driven while HiCache hands its pages to the next request, which
-        surfaces as wrong KV rather than as an error -- block keys are token
-        hashes with no content check, so nothing downstream can notice. Both
-        knobs are operator-settable, so the ordering is enforced here rather than
-        left as a comment on the defaults.
+        KVCR's operation deadline should fire before this adapter calls the wait
+        overdue. The adapter still waits for a KVCR terminal/quiescence result;
+        this ordering keeps the normal core timeout path ahead of the
+        operator-facing warning.
         """
         if self.get_timeout_s * 1000.0 <= self.operation_timeout_ms:
             raise ValueError(
                 f"KVCR get_timeout_s ({self.get_timeout_s}s) must exceed "
                 f"operation_timeout_ms ({self.operation_timeout_ms}ms): giving "
-                "up before the core does leaves an uncancellable transfer "
-                "writing into host pages HiCache has already reused, which "
-                "corrupts KV silently. Raise get_timeout_s or lower "
+                "the adapter's overdue threshold should outlast the core's "
+                "operation deadline. Raise get_timeout_s or lower "
                 "operation_timeout_ms in --hicache-storage-backend-extra-config."
             )
 
