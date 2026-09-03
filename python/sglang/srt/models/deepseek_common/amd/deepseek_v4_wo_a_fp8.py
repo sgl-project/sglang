@@ -119,9 +119,9 @@ def quant_wo_a_act_mxfp8(o: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     ``batched_gemm_a8w8_mxscale`` consumes directly.
     """
     T, G, D = o.shape
-    assert (
-        D % WO_A_MXFP8_GROUP_SIZE == 0
-    ), f"wo_a in-features ({D}) must be divisible by {WO_A_MXFP8_GROUP_SIZE}"
+    assert D % WO_A_MXFP8_GROUP_SIZE == 0, (
+        f"wo_a in-features ({D}) must be divisible by {WO_A_MXFP8_GROUP_SIZE}"
+    )
     if not o.is_contiguous():
         o = o.contiguous()
 
