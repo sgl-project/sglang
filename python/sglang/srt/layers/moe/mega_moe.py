@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 
 
-def get_mega_moe_max_tokens_per_rank() -> int:
+def _get_mega_moe_max_tokens_per_rank() -> int:
     if get_moe_runner_backend().is_flashinfer_megamoe():
         return get_exec().moe.flashinfer_megamoe_max_num_tokens
     return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
@@ -134,24 +134,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
 
-    # FlashInfer takes ownership of the checkpoint-format expert parameters in
-    # post-load processing, so there is intentionally no ordinary FusedMoE
-    # fallback. Fail explicitly on a capacity violation instead of falling
-    # through to a runner whose source weights have already been released.
+    # FlashInfer owns the source weights, so it has no ordinary FusedMoE fallback.
     if get_moe_runner_backend().is_flashinfer_megamoe():
-        global_num_tokens = get_dp_global_num_tokens()
-        if global_num_tokens and not is_dsa_enable_prefill_cp():
-            max_tokens_per_rank = max(global_num_tokens)
-        else:
-            max_tokens_per_rank = hidden_states.shape[0]
-        cap = get_mega_moe_max_tokens_per_rank()
-        if max_tokens_per_rank > cap:
-            raise ValueError(
-                "FlashInfer MegaMoE token capacity exceeded: "
-                f"required={max_tokens_per_rank}, capacity={cap}. Raise "
-                "--flashinfer-megamoe-max-num-tokens or reduce the per-rank "
-                "prefill/decode admission limit."
-            )
         return True
 
     if _device_sm == 90:
@@ -165,7 +149,7 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         max_tokens_per_rank = max(global_num_tokens)
     else:
         max_tokens_per_rank = hidden_states.shape[0]
-    cap = get_mega_moe_max_tokens_per_rank()
+    cap = _get_mega_moe_max_tokens_per_rank()
     return max_tokens_per_rank <= cap
 
 
@@ -194,9 +178,7 @@ def forward_mega_moe(
         mega_stream_ctx = nullcontext()
 
     with mega_stream_ctx:
-        y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
-        )
+        y = _run_mega_routed(moe, hidden_states, forward_batch, input_ids_global)
 
     if sbo_overlap_flag:
         current_stream.wait_stream(moe.alt_stream)
@@ -211,11 +193,8 @@ def _run_mega_routed(
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
-    num_tokens: int,
 ) -> torch.Tensor:
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-    hidden_size = moe.config.hidden_size
+    num_tokens = hidden_states.shape[0]
 
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
@@ -239,17 +218,7 @@ def _run_mega_routed(
         topk_ids = None
         topk_weights = None
 
-    ep_group = get_moe_ep_group().device_group
-    num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
-    intermediate_size = moe.config.moe_intermediate_size
-    num_max_tokens_per_rank = get_mega_moe_max_tokens_per_rank()
-    assert num_tokens <= num_max_tokens_per_rank, (
-        f"mega MoE: num_tokens={num_tokens} exceeds cap "
-        f"MegaMoE max tokens per rank="
-        f"{num_max_tokens_per_rank}; raise the configured capacity or shrink "
-        f"cuda_graph_max_bs / chunked_prefill_size accordingly"
-    )
 
     if get_moe_runner_backend().is_flashinfer_megamoe():
         from sglang.srt.layers.moe.flashinfer_mega_moe import (
@@ -257,9 +226,15 @@ def _run_mega_routed(
         )
 
         global_num_tokens = get_dp_global_num_tokens()
-        compile_tokens_per_rank = (
-            max(global_num_tokens) if global_num_tokens else num_tokens
-        )
+        compile_tokens_per_rank = max([num_tokens, *(global_num_tokens or [])])
+        capacity = _get_mega_moe_max_tokens_per_rank()
+        if compile_tokens_per_rank > capacity:
+            raise ValueError(
+                "FlashInfer MegaMoE token capacity exceeded: "
+                f"required={compile_tokens_per_rank}, capacity={capacity}. Raise "
+                "--flashinfer-megamoe-max-num-tokens or reduce the per-rank "
+                "prefill/decode admission limit."
+            )
         y = run_flashinfer_megamoe(
             moe.experts,
             hidden_states,
@@ -273,14 +248,26 @@ def _run_mega_routed(
                 if topk_weights is not None
                 else hidden_states.new_empty((0, top_k), dtype=torch.float32)
             ),
-            compile_tokens_per_rank=max(compile_tokens_per_rank, num_tokens),
-            activation_clamp=getattr(moe.config, "swiglu_limit", None),
+            compile_tokens_per_rank=compile_tokens_per_rank,
         )
         if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
             y.mul_(moe.routed_scaling_factor)
         return y
 
     import deep_gemm
+    from sglang.srt.distributed.parallel_state import get_moe_ep_group
+
+    ep_group = get_moe_ep_group().device_group
+    num_experts = moe.experts.num_experts
+    hidden_size = moe.config.hidden_size
+    intermediate_size = moe.config.moe_intermediate_size
+    num_max_tokens_per_rank = _get_mega_moe_max_tokens_per_rank()
+    assert num_tokens <= num_max_tokens_per_rank, (
+        f"mega MoE: num_tokens={num_tokens} exceeds cap "
+        f"MegaMoE max tokens per rank="
+        f"{num_max_tokens_per_rank}; raise the configured capacity or shrink "
+        f"cuda_graph_max_bs / chunked_prefill_size accordingly"
+    )
 
     buf = _get_mega_moe_symm_buffer(
         ep_group,
