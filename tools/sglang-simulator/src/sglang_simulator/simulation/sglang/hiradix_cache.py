@@ -4,6 +4,7 @@ from sglang_simulator.hook import BaseHook
 class C_HiRadixCacheHook(BaseHook):
     HOOK_CLASS_NAME = "HiRadixCache"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.hiradix_cache"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):

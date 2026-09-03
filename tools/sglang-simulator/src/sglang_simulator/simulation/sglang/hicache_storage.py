@@ -11,6 +11,7 @@ logger = get_logger("sglang-simulator")
 class C_StorageBackendFactory(BaseHook):
     HOOK_CLASS_NAME = "StorageBackendFactory"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.storage.backend_factory"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):

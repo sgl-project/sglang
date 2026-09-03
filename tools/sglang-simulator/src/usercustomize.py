@@ -2,7 +2,10 @@
 
 import os
 
-if os.environ.get("SGLANG_USE_CPU_ENGINE") == "1":
+if (
+    os.environ.get("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
+    and os.environ.get("SGLANG_USE_CPU_ENGINE") == "1"
+):
     import torch
 
     # Some model-specific import-time checks probe the target GPU even though

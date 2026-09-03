@@ -9,6 +9,7 @@ class BaseHook:
     HOOK_CLASS_NAME: Optional[str] = None
     HOOK_MODULE_NAME: Optional[str] = None
     REGEX: bool = False
+    REQUIRED: bool = True
 
     def __init__(self):
         pass

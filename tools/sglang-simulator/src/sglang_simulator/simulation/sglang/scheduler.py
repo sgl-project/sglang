@@ -7,7 +7,11 @@ from dataclasses import asdict
 from typing import Any
 
 from sglang_simulator.compat import validate_simulator_server_args
-from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook import (
+    BaseHook,
+    is_class_hook_matched,
+    validate_required_class_hooks,
+)
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
@@ -245,6 +249,10 @@ class C_SchedulerRequestReceiver(BaseHook):
     HOOK_CLASS_NAME = "SchedulerRequestReceiver"
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.request_receiver"
 
+    # Older SGLang versions receive requests directly on Scheduler; that path is
+    # patched by C_SchedulerHook instead.
+    REQUIRED = False
+
     REQ_DISPATCHER: ReqDispatcher = ReqDispatcher(
         SimulationMode(Envs.simulation_mode())
     )
@@ -306,6 +314,14 @@ class C_SchedulerHook(BaseHook):
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
             )
             original_init(self, *args, **kwargs)
+            validate_required_class_hooks()
+            if original_recv_requests is None and not is_class_hook_matched(
+                C_SchedulerRequestReceiver
+            ):
+                raise RuntimeError(
+                    "SGLang Simulator could not hook a request receiver. The "
+                    "simulator must be adapted to this SGLang revision."
+                )
 
             try:
                 if ConfigManager.get_model_info() is None:

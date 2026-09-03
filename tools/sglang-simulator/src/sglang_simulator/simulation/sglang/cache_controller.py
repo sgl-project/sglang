@@ -9,6 +9,7 @@ from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_m
 class C_HiCacheController(BaseHook):
     HOOK_CLASS_NAME = "HiCacheController"
     HOOK_MODULE_NAME = "sglang.srt.managers.cache_controller"
+    REQUIRED = False
 
     KV_CACHE_BYTES: Optional[int] = None
     DISK_READ_BANDWIDTH_BYTES: Optional[float] = None
@@ -282,6 +283,7 @@ class C_HybridCacheController(BaseHook):
 
     HOOK_CLASS_NAME = "HybridCacheController"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):

@@ -6,6 +6,7 @@ class C_UnifiedRadixCacheHook(BaseHook):
 
     HOOK_CLASS_NAME = "UnifiedRadixCache"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.unified_radix_cache"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):

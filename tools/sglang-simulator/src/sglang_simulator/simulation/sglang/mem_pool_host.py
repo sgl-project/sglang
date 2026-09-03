@@ -304,6 +304,7 @@ class C_MHATokenToKVPoolHostHook(BaseHook):
     HOOK_CLASS_NAME = "MHATokenToKVPoolHost"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.(memory_pool_host|pool_host\.mha)$"
     REGEX = True
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):
@@ -314,6 +315,7 @@ class C_HostKVCacheHook(BaseHook):
     HOOK_CLASS_NAME = "HostKVCache"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.(memory_pool_host|pool_host\.base)$"
     REGEX = True
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):
@@ -337,6 +339,7 @@ class C_PackedSingleKVPoolHook(BaseHook):
     HOOK_CLASS_NAME = r".*SingleKVPool$"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\..+$"
     REGEX = True
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):
@@ -373,6 +376,7 @@ class C_GenericHostKVCacheSubclassHook(BaseHook):
     HOOK_CLASS_NAME = r".*(?:PoolHost|HostPool)$"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.(memory_pool_host|pool_host\..+)$"
     REGEX = True
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):

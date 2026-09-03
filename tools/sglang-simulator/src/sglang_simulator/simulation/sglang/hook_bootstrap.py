@@ -1,5 +1,10 @@
 """Install SGLang Simulator hooks in the parent and spawned SGLang worker processes."""
 
+import os
+
+# Spawned interpreters inherit this marker before usercustomize runs.
+os.environ["SGLANG_SIMULATOR_BOOTSTRAP"] = "1"
+
 import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,

@@ -10,6 +10,7 @@ logger = get_logger("sgl_simulator")
 
 
 CLASS_HOOKS: List[BaseHook] = []
+_MATCHED_CLASS_HOOKS = set()
 
 _builtins_build_class_ = builtins.__build_class__
 
@@ -36,10 +37,8 @@ def _custom_build_class_(func, name: str, *bases, **kwargs):
                     )
                 )
                 target_class = _builtins_build_class_(func, name, *bases, **kwargs)
-                try:
-                    hook.hook(target_class)
-                except Exception as e:
-                    logger.warning(f"Failed to hook class [{name}]. Error: {e}")
+                hook.hook(target_class)
+                _MATCHED_CLASS_HOOKS.add(hook)
                 return target_class
 
     return _builtins_build_class_(func, name, *bases, **kwargs)
@@ -50,8 +49,32 @@ def install_class_hooks(hooks: Union[List[BaseHook], BaseHook]):
     builtins.__build_class__ = _custom_build_class_
 
 
+def is_class_hook_matched(hook: BaseHook) -> bool:
+    return hook in _MATCHED_CLASS_HOOKS
+
+
+def validate_required_class_hooks() -> None:
+    unmatched = [
+        hook
+        for hook in CLASS_HOOKS
+        if hook.REQUIRED and hook not in _MATCHED_CLASS_HOOKS
+    ]
+    if not unmatched:
+        return
+
+    hook_names = ", ".join(
+        f"{hook.__name__} ({hook.HOOK_MODULE_NAME}.{hook.HOOK_CLASS_NAME})"
+        for hook in unmatched
+    )
+    raise RuntimeError(
+        "Required SGLang Simulator hooks did not match imported SGLang classes: "
+        f"{hook_names}. The simulator must be adapted to this SGLang revision."
+    )
+
+
 def remove_class_hooks():
     # Clear the registered hooks and reset the build class function.
     # Note: The classes that have been hooked will not be reset.
     CLASS_HOOKS.clear()
+    _MATCHED_CLASS_HOOKS.clear()
     builtins.__build_class__ = _builtins_build_class_
