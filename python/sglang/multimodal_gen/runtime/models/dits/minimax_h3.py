@@ -23,6 +23,7 @@ from sglang.kernels.ops.activation.activation import (
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
+    fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
@@ -828,11 +829,16 @@ def _minimax_h3_hybrid_attention_core_impl(
             raise RuntimeError("VDN-H3 hybrid attention requires the RoPE cache")
         cos_sin_cache, positions = rope_cache
 
-    # QK-norm + RoPE out of place: the branch keeps reading the raw q/k.
-    q_sm = q.clone()
-    k_sm = k.clone()
+    # QK-norm + RoPE out of place: the branch keeps reading the raw q/k. The
+    # fused kernel reads the strided qkv views directly and writes contiguous
+    # softmax-branch copies (no clone pass); same arithmetic as the in-place
+    # kernel the dense path uses.
     if attention._use_fused_qknorm_rope and not torch.compiler.is_compiling():
-        fused_inplace_qknorm_rope(
+        q_sm = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        k_sm = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+        fused_qknorm_rope_out_of_place(
+            q,
+            k,
             q_sm,
             k_sm,
             attention.q_norm.weight,
@@ -847,7 +853,7 @@ def _minimax_h3_hybrid_attention_core_impl(
         )
     else:
         q_sm, k_sm = _apply_qk_norm(
-            q_sm, k_sm, attention.q_norm, attention.k_norm, attention.head_dim
+            q.clone(), k.clone(), attention.q_norm, attention.k_norm, attention.head_dim
         )
         q_sm, k_sm = _apply_rope_qk(q_sm, k_sm, cos_sin_cache, positions)
 

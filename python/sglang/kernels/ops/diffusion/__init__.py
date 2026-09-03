@@ -216,6 +216,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Fused in-place QK RMS-norm + RoPE.",
     ),
     (
+        "diffusion.fused_qknorm_rope_out_of_place",
+        KernelBackend.JIT,
+        "rope.qknorm_rope_jit:fused_qknorm_rope_out_of_place",
+        _CUDA,
+        "Out-of-place fused QK-norm + RoPE (raw q/k preserved).",
+    ),
+    (
         "diffusion.flux2_layernorm_modulate_fp8_quant",
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate_fp8_quant_raw",
@@ -520,6 +527,7 @@ _EXPORTS: dict[str, str] = {
     "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
+    "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
     "can_use_fused_rope_rotate_half": "rope.rope_rotate_half_bitexact",
