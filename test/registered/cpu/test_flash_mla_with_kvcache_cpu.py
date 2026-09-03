@@ -4,18 +4,21 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
+    FP8KVCacheLayout,
+    dequantize_k_cache,
+    quantize_k_cache,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")
 
 try:
-    import quant_utils as flashmla_quant
     from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
 
     _IMPORT_ERROR = None
 except Exception as _e:  # pragma: no cover - exercised only when kernel missing
     flash_mla_with_kvcache_cpu = None  # type: ignore[assignment]
-    flashmla_quant = None  # type: ignore[assignment]
     _IMPORT_ERROR = _e
 
 
@@ -107,8 +110,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     ):
 
         k_bf16 = torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
-        k_quant = flashmla_quant.quantize_k_cache(k_bf16, layout_enum)
-        k_dequant = flashmla_quant.dequantize_k_cache(k_quant, layout_enum)
+        k_quant = quantize_k_cache(k_bf16, layout_enum)
+        k_dequant = dequantize_k_cache(k_quant, layout_enum)
         if as_uint8:
             k_quant = k_quant.view(torch.uint8)
         return k_quant.contiguous(), k_dequant
@@ -161,7 +164,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         fp8_cache_as_uint8=False,
     ):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
-        layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
+        layout_enum = FP8KVCacheLayout(fp8_layout)
 
         q = torch.randn(b, s_q, h_q, d_qk, dtype=torch.bfloat16) * 0.5
 
