@@ -153,10 +153,16 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_state_types: List[StateType] = dataclasses.field(default_factory=list)
+    dst_page_size: int = 0
+    protocol_version: int = 1
     staging: Optional[StagingRegisterInfo] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        if 19 < len(msg) < 23:
+            raise ValueError("Incomplete Mooncake PD layout registration")
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -198,6 +204,19 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
+            # Frame 18 remains reserved for staging slot layer IDs.
+            dst_kv_item_lens=(
+                list(struct.unpack(f"{len(msg[19]) // 4}I", msg[19]))
+                if len(msg) > 19
+                else []
+            ),
+            dst_state_types=(
+                [StateType(value) for value in msg[20].decode("ascii").split(",")]
+                if len(msg) > 20 and msg[20]
+                else []
+            ),
+            dst_page_size=int(msg[21].decode("ascii")) if len(msg) > 21 else 0,
+            protocol_version=int(msg[22].decode("ascii")) if len(msg) > 22 else 1,
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
         )
@@ -205,6 +224,7 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    LAYOUT_PROTOCOL_VERSION = 2
 
     def __init__(
         self,
@@ -221,6 +241,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
+            self.registration_errors = {}
             self.session_lock = threading.Lock()
             self.start_prefill_thread()
             # Per-room count of chunks not yet transferred; teardown waits for
@@ -289,6 +310,94 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self._init_staging_allocator()
                 self._staging_handler = None
             self.start_decode_thread()
+
+    def _validate_decode_registration_layout(self, info: KVArgsRegisterInfo) -> None:
+        """Reject unsafe P/D layouts before issuing a direct memory write."""
+        local_state_types = list(self.kv_args.state_types)
+        if info.protocol_version < self.LAYOUT_PROTOCOL_VERSION:
+            if local_state_types:
+                raise RuntimeError(
+                    "Mooncake PD layout protocol mismatch: stateful transfer "
+                    f"requires v{self.LAYOUT_PROTOCOL_VERSION}, decode peer "
+                    f"reported v{info.protocol_version}. Restart P and D with "
+                    "the same SGLang build."
+                )
+            return
+
+        if info.dst_page_size != self.kv_args.page_size:
+            raise RuntimeError(
+                "Mooncake PD page-size mismatch: "
+                f"prefill={self.kv_args.page_size}, decode={info.dst_page_size}"
+            )
+        if info.dst_state_types != local_state_types:
+            raise RuntimeError(
+                "Mooncake PD state-component mismatch: "
+                f"prefill={[x.value for x in local_state_types]}, "
+                f"decode={[x.value for x in info.dst_state_types]}"
+            )
+        if not (
+            len(info.dst_state_item_lens)
+            == len(info.dst_state_layer_ids)
+            == len(info.dst_state_data_ptrs)
+            == len(local_state_types)
+        ):
+            raise RuntimeError(
+                "Mooncake PD decode state metadata is incomplete: "
+                f"types={len(info.dst_state_types)}, "
+                f"item_lens={len(info.dst_state_item_lens)}, "
+                f"layer_ids={len(info.dst_state_layer_ids)}"
+            )
+        if len(info.dst_kv_item_lens) != len(info.dst_kv_ptrs):
+            raise RuntimeError("Mooncake PD KV pointer/stride counts must match")
+        if any(
+            len(ptrs) != len(lens)
+            for ptrs, lens in zip(info.dst_state_data_ptrs, info.dst_state_item_lens)
+        ):
+            raise RuntimeError("Mooncake PD state pointer/stride counts must match")
+
+        same_attn_tp = self.attn_tp_size == info.dst_attn_tp_size
+        if same_attn_tp and not info.requires_dcp_relayout:
+            kv_pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                info.dst_kv_layer_ids,
+                len(self.kv_args.kv_item_lens),
+                len(info.dst_kv_item_lens),
+                allow_positional_fallback=self.pp_size == 1,
+            )
+            mismatched_kv = [
+                (i, j, self.kv_args.kv_item_lens[i], info.dst_kv_item_lens[j])
+                for i, j in kv_pairs
+                if self.kv_args.kv_item_lens[i] != info.dst_kv_item_lens[j]
+            ]
+            if mismatched_kv:
+                raise RuntimeError(
+                    "Mooncake PD KV stride mismatch for equal attention TP: "
+                    f"{mismatched_kv[:8]}"
+                )
+
+        if same_attn_tp:
+            for component, state_type in enumerate(local_state_types):
+                src_lens = self.kv_args.state_item_lens[component]
+                dst_lens = info.dst_state_item_lens[component]
+                pairs = build_transfer_entry_pairs(
+                    self.kv_args.state_layer_ids[component],
+                    info.dst_state_layer_ids[component],
+                    len(src_lens),
+                    len(dst_lens),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+                mismatched_state = [
+                    (i, j, src_lens[i], dst_lens[j])
+                    for i, j in pairs
+                    if src_lens[i] != dst_lens[j]
+                ]
+                if mismatched_state:
+                    raise RuntimeError(
+                        "Mooncake PD state stride mismatch for equal attention "
+                        f"TP, component={state_type.value}: "
+                        f"{mismatched_state[:8]}. Align P/D state dtype and "
+                        "model configuration; for GLM align --mamba-ssm-dtype."
+                    )
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1724,7 +1833,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             if req.mooncake_session_id in self.failed_sessions:
                                 self.record_failure(
                                     kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                    self.registration_errors.get(
+                                        req.mooncake_session_id
+                                    )
+                                    or f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
                                 )
                                 self.update_status(kv_chunk.room, KVPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
@@ -2089,11 +2201,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
-                        decode_kv_args.dst_dcp_size,
-                        decode_kv_args.dst_dcp_rank,
-                    )
+                    try:
+                        decode_kv_args = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                        decode_kv_args.requires_dcp_relayout = (
+                            self.requires_dcp_relayout(
+                                decode_kv_args.dst_dcp_size,
+                                decode_kv_args.dst_dcp_rank,
+                            )
+                        )
+                        self._validate_decode_registration_layout(decode_kv_args)
+                    except (RuntimeError, ValueError, IndexError, struct.error) as exc:
+                        error = f"Rejected Mooncake PD registration: {exc}"
+                        logger.error("%s (session=%s)", error, mooncake_session_id)
+                        self.decode_kv_args_table.pop(mooncake_session_id, None)
+                        with self.session_lock:
+                            self.failed_sessions.add(mooncake_session_id)
+                            self.registration_errors[mooncake_session_id] = error
+                        continue
                     if decode_kv_args.requires_dcp_relayout:
                         decode_kv_args.dcp_token_item_lens = (
                             self.prepare_dcp_token_item_lens(
@@ -2104,6 +2228,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
+                        self.registration_errors.pop(mooncake_session_id, None)
                         if mooncake_session_id in self.failed_sessions:
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
@@ -2275,7 +2400,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _run_one_probe_pass(self) -> None:
         with self.session_lock:
-            snapshot = list(self.failed_sessions)
+            snapshot = [
+                session_id
+                for session_id in self.failed_sessions
+                if session_id not in self.registration_errors
+            ]
         for session_id in snapshot:
             send_probe = getattr(self.engine, "send_probe", None)
             if send_probe is None:
@@ -2288,6 +2417,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
             if rc == 0:
                 with self.session_lock:
+                    # Registration can fail while the liveness probe is in flight.
+                    if session_id in self.registration_errors:
+                        continue
                     was_blacklisted = session_id in self.failed_sessions
                     self.failed_sessions.discard(session_id)
                     self.session_failures.pop(session_id, None)
@@ -2527,6 +2659,16 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             packed_staging_slot_layer_ids,
+                            struct.pack(
+                                f"{len(self.kv_mgr.kv_args.kv_item_lens)}I",
+                                *self.kv_mgr.kv_args.kv_item_lens,
+                            ),
+                            ",".join(
+                                state_type.value
+                                for state_type in self.kv_mgr.kv_args.state_types
+                            ).encode("ascii"),
+                            str(self.kv_mgr.kv_args.page_size).encode("ascii"),
+                            str(self.kv_mgr.LAYOUT_PROTOCOL_VERSION).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:
