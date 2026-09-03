@@ -475,6 +475,8 @@ mod tests {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy: PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                bucket_config: None,
                 circuit_breaker: Some(RawCbConfig {
                     threshold: NonZeroU32::new(threshold).unwrap(),
                     cool_down_secs,

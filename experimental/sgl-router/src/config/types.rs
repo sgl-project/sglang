@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use std::num::NonZeroU32;
 
 /// In-memory router configuration, built from CLI flags by
@@ -109,6 +110,71 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+}
+
+/// PD 请求的 Decode worker 选择策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DecodePolicyKind {
+    #[default]
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    #[value(name = "legacy_host_affinity")]
+    LegacyHostAffinity,
+}
+
+/// 静态 Bucket 的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketStage {
+    Prefill,
+    Decode,
+}
+
+/// Bucket 的 SLO 选择语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SloBucketPolicy {
+    #[default]
+    Disabled,
+    BestEffort,
+    SloFirst,
+}
+
+/// Router 启动时加载的静态 Bucket 配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub buckets: Vec<BucketSpec>,
+    #[serde(default)]
+    pub ttft_slo_policy: SloBucketPolicy,
+    #[serde(default)]
+    pub tps_slo_policy: SloBucketPolicy,
+}
+
+/// 一个角色化 Runtime 能力池；`rank` 越小优先级越高。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketSpec {
+    pub id: String,
+    pub stage: BucketStage,
+    pub rank: u32,
+    pub worker_ids: Vec<String>,
+    #[serde(default)]
+    pub min_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_extend_tokens: Option<u64>,
+    #[serde(default)]
+    pub min_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_sequence_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
+    #[serde(default)]
+    pub ttft_p95_at_capacity_ms: Option<u64>,
+    #[serde(default)]
+    pub tps_p05_at_capacity: Option<f64>,
+    #[serde(default)]
+    pub max_pending_prefill_tokens: Option<u64>,
 }
 
 impl std::fmt::Display for PolicyKind {
@@ -231,6 +297,10 @@ pub struct ModelConfig {
     /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     pub policy: PolicyKind,
+    /// Decode pool 的独立选择策略。
+    pub decode_policy: DecodePolicyKind,
+    /// 可选静态 Bucket 配置；`None` 使用全局 domain。
+    pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware ZMQ tuning and optional external Indexer endpoint.
     pub cache_aware: Option<CacheAwareConfig>,
