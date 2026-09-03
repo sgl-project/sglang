@@ -1075,6 +1075,12 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
+    elif _is_ppu:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
+        )
     else:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
