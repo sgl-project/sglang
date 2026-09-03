@@ -3119,9 +3119,6 @@ class DeepseekV4Model(nn.Module):
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
         if use_prefill_cp and not run_tbo:
-            _comm = get_tp_group().torch_symm_mem_comm
-            if _comm is not None and _cp_fused_symm_mem_enabled():
-                _comm.set_use_cp(True)
             if cp_v2_active:
                 input_ids = cp_round_robin_input_ids_v2(input_ids, forward_batch)
             else:
@@ -3132,58 +3129,64 @@ class DeepseekV4Model(nn.Module):
                 positions = cp_split_and_rebuild_position(forward_batch, positions)
                 input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+            # Set LAST in prep: anything that can raise stays before set, so
+            # the try below covers the whole use_cp window.
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None and _cp_fused_symm_mem_enabled():
+                _comm.set_use_cp(True)
 
-        # Reset Compressor's per-step freqs_cis cache from any previous step.
-        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
-            if hasattr(forward_batch, _attr):
-                delattr(forward_batch, _attr)
-        if run_tbo:
-            # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
-            # disabled here (each layer self-contained), so no trailing hc_post.
-            hidden_states = self._forward_layers_tbo(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-        else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
+        try:
+            # Reset Compressor's per-step freqs_cis cache from any previous step.
+            for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+                if hasattr(forward_batch, _attr):
+                    delattr(forward_batch, _attr)
+            if run_tbo:
+                # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
+                # disabled here (each layer self-contained), so no trailing hc_post.
+                hidden_states = self._forward_layers_tbo(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
                 )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
+            else:
+                use_fused = self.use_fused_mhc_post_pre
+                prev_residual, prev_post, prev_comb = None, None, None
+                last_layer = None
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    last_layer = layer
+                    ctx = (
+                        nullcontext()
+                        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                        else get_global_expert_distribution_recorder().with_current_layer(i)
                     )
-                if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
                         )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
-
-        _comm = get_tp_group().torch_symm_mem_comm
-        if _comm is not None:
-            _comm.set_use_cp(False)
+                    if capture_dspark and i in self.dspark_layers_to_capture:
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if use_fused and last_layer is not None:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
+        finally:
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is not None:
+                _comm.set_use_cp(False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (
             self.pp_group.is_last_rank

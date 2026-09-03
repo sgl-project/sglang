@@ -331,6 +331,9 @@ def fused_experts(
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            gate_up_interleaved=moe_runner_config.gate_up_interleaved,
+            a1_q=a1_q,
+            fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"

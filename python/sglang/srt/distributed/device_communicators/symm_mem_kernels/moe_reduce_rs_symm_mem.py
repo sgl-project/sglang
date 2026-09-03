@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -142,7 +142,7 @@ def barrier_on_this_grid(barrier_ptr):
 
 @triton.jit
 def _cas_sys_release(addrs, expected, desired):
-    """atom.global.release.sys.cas.b32 — spins until CAS succeeds."""
+    """atom.global.release.sys.cas.b32 -- spins until CAS succeeds."""
     return tl.inline_asm_elementwise(
         f"""
         {{
@@ -165,7 +165,7 @@ def _cas_sys_release(addrs, expected, desired):
 
 @triton.jit
 def _cas_sys_acquire(addrs, expected, desired):
-    """atom.global.acquire.sys.cas.b32 — spins until CAS succeeds."""
+    """atom.global.acquire.sys.cas.b32 -- spins until CAS succeeds."""
     return tl.inline_asm_elementwise(
         f"""
         {{
@@ -217,10 +217,10 @@ def barrier_all_intra_node_atomic_cas_block(
     tl.debug_barrier()
 
 
-@dataclass
-class MoEReduceRSSymmMemContext:
+class MoEReduceRSSymmMemContext(msgspec.Struct):
     """Context for symm_mem-based MoE reduce-scatter. Holds pre-allocated
-    symmetric buffers and synchronization resources."""
+    symmetric buffers and synchronization resources. Constructed only via
+    create_moe_rs_symm_mem_context, which performs the rendezvous."""
 
     max_M: int  # max tokens (NOT ntokens * topk)
     N: int
@@ -232,77 +232,26 @@ class MoEReduceRSSymmMemContext:
     num_ranks: int
     num_local_ranks: int
     n_chunks_max: int
+    local_rank: int
+    nnodes: int
+    num_sms: int  # GPU SM count, queried once at construction
     # local sync primitives
     grid_barrier: torch.Tensor  # [1] int32
     gemm_counter: torch.Tensor  # [n_chunks_max] int32
     gemm_done_flag: torch.Tensor  # [n_chunks_max] int32
     rs_counter: torch.Tensor  # [n_chunks_max * num_ranks] int32
-    group: Optional[object] = None
 
-    # Computed in __post_init__
-    local_rank: int = field(init=False)
-    nnodes: int = field(init=False)
-    num_sms: int = field(init=False)  # GPU SM count, queried once at init
-
-    # symm_mem handle and buffers
-    symm_mem_hdl: Optional[object] = field(default=None, init=False)
-    symm_reduce_scatter_buffer: Optional[torch.Tensor] = field(default=None, init=False)
-
-    buf_tuple: Optional[Tuple[torch.Tensor, ...]] = field(default=None, init=False)
-    signal_pad_tuple: Optional[Tuple[torch.Tensor, ...]] = field(
-        default=None, init=False
-    )
+    # symm_mem rendezvous products
+    symm_mem_hdl: object
+    symm_reduce_scatter_buffer: torch.Tensor
+    buf_tuple: Tuple[torch.Tensor, ...]
+    signal_pad_tuple: Tuple[torch.Tensor, ...]
 
     # GPU-side pointer arrays for Triton kernel (int64)
-    buf_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
-    signal_pad_ptrs: Optional[torch.Tensor] = field(default=None, init=False)
+    buf_ptrs: torch.Tensor
+    signal_pad_ptrs: torch.Tensor
 
-    def __post_init__(self):
-        assert self.dtype in [
-            torch.bfloat16,
-            torch.float16,
-        ], "Only float16 / bfloat16 are supported"
-
-        self.local_rank = self.rank % self.num_local_ranks
-        self.nnodes = self.num_ranks // self.num_local_ranks
-        self.num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
-
-        ntokens = self.max_M
-
-        self.symm_reduce_scatter_buffer = symm_mem.empty(
-            (ntokens, self.N),
-            dtype=self.dtype,
-            device=torch.cuda.current_device(),
-        )
-        rendezvous_group = self.group if self.group is not None else dist.group.WORLD
-        self.symm_mem_hdl = symm_mem.rendezvous(
-            self.symm_reduce_scatter_buffer,
-            group=rendezvous_group,
-        )
-
-        self.buf_tuple = tuple(
-            self.symm_mem_hdl.get_buffer(i, (ntokens, self.N), self.dtype)
-            for i in range(self.num_ranks)
-        )
-
-        self.signal_pad_tuple = tuple(
-            self.symm_mem_hdl.get_signal_pad(i, (self.num_ranks,), torch.int32)
-            for i in range(self.num_ranks)
-        )
-
-        self.buf_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in self.buf_tuple],
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-        self.signal_pad_ptrs = torch.tensor(
-            [pad.data_ptr() for pad in self.signal_pad_tuple],
-            dtype=torch.int64,
-            device=torch.cuda.current_device(),
-        )
-
-        barrier_group = self.group if self.group is not None else None
-        dist.barrier(group=barrier_group)
+    group: Optional[object] = None
 
     def finalize(self):
         """Release resources. symm_mem tensors freed by Python GC."""
@@ -333,6 +282,11 @@ def create_moe_rs_symm_mem_context(
     group: process group for symm_mem rendezvous (defaults to WORLD;
         set to TP group when pipeline parallelism is used).
     """
+    assert input_dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], "Only float16 / bfloat16 are supported"
+
     device = torch.cuda.current_device()
     grid_barrier = torch.zeros((1,), dtype=torch.int32, device=device)
     gemm_counter = torch.zeros((n_chunks_max,), dtype=torch.int32, device=device)
@@ -340,6 +294,40 @@ def create_moe_rs_symm_mem_context(
     rs_counter = torch.zeros(
         (n_chunks_max * world_size,), dtype=torch.int32, device=device
     )
+
+    ntokens = max_token_num
+    symm_reduce_scatter_buffer = symm_mem.empty(
+        (ntokens, hidden_dim),
+        dtype=input_dtype,
+        device=device,
+    )
+    rendezvous_group = group if group is not None else dist.group.WORLD
+    symm_mem_hdl = symm_mem.rendezvous(
+        symm_reduce_scatter_buffer,
+        group=rendezvous_group,
+    )
+
+    buf_tuple = tuple(
+        symm_mem_hdl.get_buffer(i, (ntokens, hidden_dim), input_dtype)
+        for i in range(world_size)
+    )
+    signal_pad_tuple = tuple(
+        symm_mem_hdl.get_signal_pad(i, (world_size,), torch.int32)
+        for i in range(world_size)
+    )
+    buf_ptrs = torch.tensor(
+        [buf.data_ptr() for buf in buf_tuple],
+        dtype=torch.int64,
+        device=device,
+    )
+    signal_pad_ptrs = torch.tensor(
+        [pad.data_ptr() for pad in signal_pad_tuple],
+        dtype=torch.int64,
+        device=device,
+    )
+
+    barrier_group = group if group is not None else None
+    dist.barrier(group=barrier_group)
 
     return MoEReduceRSSymmMemContext(
         max_M=max_token_num,
@@ -351,10 +339,19 @@ def create_moe_rs_symm_mem_context(
         num_ranks=world_size,
         num_local_ranks=local_world_size,
         n_chunks_max=n_chunks_max,
+        local_rank=rank % local_world_size,
+        nnodes=world_size // local_world_size,
+        num_sms=torch.cuda.get_device_properties("cuda").multi_processor_count,
         grid_barrier=grid_barrier,
         gemm_counter=gemm_counter,
         gemm_done_flag=gemm_done_flag,
         rs_counter=rs_counter,
+        symm_mem_hdl=symm_mem_hdl,
+        symm_reduce_scatter_buffer=symm_reduce_scatter_buffer,
+        buf_tuple=buf_tuple,
+        signal_pad_tuple=signal_pad_tuple,
+        buf_ptrs=buf_ptrs,
+        signal_pad_ptrs=signal_pad_ptrs,
         group=group,
     )
 
@@ -481,12 +478,16 @@ def moe_reduce_rs_symm_mem_kernel(
         )
 
 
+# Chunk width along N for the RS kernel. Must be a multiple of BLOCK_SIZE_N
+# (128, tile alignment) and of 16 (tl.multiple_of vectorization hint).
+MOE_RS_CHUNK_WIDTH = 512
+
+
 def moe_reduce_rs_symm_mem(
     grouped_gemm_out: torch.Tensor,
     shared_expert_out: torch.Tensor,
     ctx: MoEReduceRSSymmMemContext,
     ntokens: int,
-    n_chunks: int,
     out: torch.Tensor,
     routed_scaling_factor: float,
     BLOCK_SIZE_M: int = 64,
@@ -497,6 +498,18 @@ def moe_reduce_rs_symm_mem(
     output = reduce_scatter(routed_scaling_factor * sum_topk(grouped_gemm_out)
                             + shared_expert_out)
     """
+
+    # Out-of-range ntokens reads/writes peer ranks' rows in the shared buffer.
+    assert ntokens <= ctx.max_M, (
+        f"ntokens={ntokens} exceeds symm-mem RS buffer capacity "
+        f"{ctx.max_M}; prefill buffer grew past the size the context was "
+        "created with"
+    )
+    n_chunks = ctx.N // MOE_RS_CHUNK_WIDTH
+    assert n_chunks >= 1, (
+        f"ctx.N={ctx.N} is not a positive multiple of {MOE_RS_CHUNK_WIDTH}; "
+        "eligibility is checked in maybe_fused_shared_add_rs"
+    )
 
     N = ctx.N
     topk = ctx.topk
@@ -535,7 +548,7 @@ def moe_reduce_rs_symm_mem(
         num_stages=1,
     )
 
-    # Phase 2: local reduce — sum world_size contributions
+    # Phase 2: local reduce -- sum world_size contributions
     ntokens_per_rank = ntokens // world_size
     torch.sum(
         ctx.symm_reduce_scatter_buffer[:ntokens].view(world_size, ntokens_per_rank, N),
@@ -571,6 +584,9 @@ def maybe_fused_shared_add_rs(
     M, _, N = final_hidden_states.shape
     if M == 0 or (M % tp_size) != 0:
         return None
+    # Kernel has no tail masking; non-divisible N leaves stale tail columns.
+    if N % MOE_RS_CHUNK_WIDTH != 0:
+        return None
 
     ctx = comm.get_or_create_moe_rs_ctx(
         N=N,
@@ -586,16 +602,12 @@ def maybe_fused_shared_add_rs(
         dtype=final_hidden_states.dtype,
         device=final_hidden_states.device,
     )
-    try:
-        moe_reduce_rs_symm_mem(
-            grouped_gemm_out=final_hidden_states.view(M * top_k, N),
-            shared_expert_out=shared_output,
-            ctx=ctx,
-            ntokens=M,
-            n_chunks=N // 512,
-            out=out,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-    except Exception:
-        return None
+    moe_reduce_rs_symm_mem(
+        grouped_gemm_out=final_hidden_states.view(M * top_k, N),
+        shared_expert_out=shared_output,
+        ctx=ctx,
+        ntokens=M,
+        out=out,
+        routed_scaling_factor=routed_scaling_factor,
+    )
     return out

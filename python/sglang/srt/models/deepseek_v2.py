@@ -1193,11 +1193,11 @@ class DeepseekV2MoE(nn.Module):
                 gemm_output_zero_allocator,
                 pre_quant_input=pre_quant_input,
             )
-        # Fused shared-add + reduce-scatter path (falls through if not applicable).
+        # tp_size arg = shard divisor = cp_size (RS runs on the attn CP group).
         fused_out = maybe_fused_shared_add_rs(
             final_hidden_states,
             shared_output,
-            self.tp_size,
+            get_parallel().attn_cp_size,
             self.n_shared_experts,
             self.top_k,
             self.routed_scaling_factor,
@@ -1522,11 +1522,10 @@ class DeepseekV2MoE(nn.Module):
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            shared = getattr(self, "shared_experts", None)
             ag_out, gate_up_local = maybe_fused_ag_shared_experts(
                 hidden_states,
-                getattr(self, "shared_experts_is_fp8", False),
-                shared.gate_up_proj if shared is not None else None,
+                self.shared_experts_weight_block_size,
+                self.shared_experts.gate_up_proj,
             )
             if ag_out is not None:
                 if gate_up_local is not None:

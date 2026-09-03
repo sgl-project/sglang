@@ -12,7 +12,11 @@ from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_cuda, is_hip
 
 try:
@@ -145,11 +149,16 @@ class TorchSymmMemCommunicator:
         """Return the TP group's communicator if enabled and use_cp is active, else None."""
         from sglang.srt.distributed import get_tp_group
 
-        # TODO(zxdu): maybe use cp group here?
         comm = get_tp_group().torch_symm_mem_comm
         if comm is None or comm.disabled or not comm.use_cp:
             return None
         return comm
+
+    def _attn_cp_group_info(self):
+        """(cpu pg, rank, world size) on the attn CP group, the same ranks
+        dsa_cp_* collectives use; NOT this communicator's TP group."""
+        cp = get_parallel().attn_cp_group
+        return cp.cpu_group, cp.rank_in_group, cp.world_size
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
         """
@@ -212,14 +221,6 @@ class TorchSymmMemCommunicator:
         out.copy_(self.buffer[: inp.numel()].view(out.shape))
         return out
 
-    def _get_max_forward_tokens(self) -> int:
-        """Return max tokens per forward (chunked_prefill_size or max_prefill_tokens)."""
-        schedule = get_schedule()
-        cps = schedule.chunked_prefill_size
-        if cps is not None and cps > 0:
-            return cps
-        return schedule.max_prefill_tokens
-
     def get_or_create_moe_rs_ctx(
         self,
         N: int,
@@ -231,7 +232,8 @@ class TorchSymmMemCommunicator:
         """Lazy-init / cache the MoE reduce-scatter symm-mem context."""
         if self.disabled:
             return None
-        key = (N, num_experts, topk, dtype, n_chunks_max, self.world_size)
+        _, _, cp_world_size = self._attn_cp_group_info()
+        key = (N, num_experts, topk, dtype, n_chunks_max, cp_world_size)
         if self._moe_rs_key == key and self._moe_rs_ctx is not None:
             return self._moe_rs_ctx
         if self._moe_rs_ctx is not None:
@@ -250,20 +252,21 @@ class TorchSymmMemCommunicator:
             create_moe_rs_symm_mem_context,
         )
 
-        max_M = self._get_max_forward_tokens()
+        max_M = max_prefill_buffer_tokens()
+
+        cp_group, cp_rank, cp_world_size = self._attn_cp_group_info()
 
         self._moe_rs_ctx = create_moe_rs_symm_mem_context(
-            # TODO(zxdu): check whether we should use cp group here or not?
-            rank=dist.get_rank(self.group),
-            world_size=self.world_size,
-            local_world_size=self.world_size,
+            rank=cp_rank,
+            world_size=cp_world_size,
+            local_world_size=cp_world_size,
             max_token_num=max_M,
             hidden_dim=N,
             num_experts=num_experts,
             topk=topk,
             input_dtype=dtype,
             n_chunks_max=n_chunks_max,
-            group=self.group,
+            group=cp_group,
         )
         self._moe_rs_key = key
         return self._moe_rs_ctx
@@ -276,7 +279,8 @@ class TorchSymmMemCommunicator:
         """Lazy-init / cache the all-gather + GEMM symm-mem context."""
         if self.disabled:
             return None
-        key = (K, NUM_COMM_SMS, self.world_size)
+        _, _, cp_world_size = self._attn_cp_group_info()
+        key = (K, NUM_COMM_SMS, cp_world_size)
         if self._ag_gemm_key == key and self._ag_gemm_ctx is not None:
             return self._ag_gemm_ctx
         if self._ag_gemm_ctx is not None:
@@ -298,17 +302,19 @@ class TorchSymmMemCommunicator:
         if self._ag_gemm_stream is None:
             self._ag_gemm_stream = torch.cuda.Stream(device=self.device, priority=-1)
 
-        max_M = self._get_max_forward_tokens()
+        max_M = max_prefill_buffer_tokens()
+
+        cp_group, cp_rank, cp_world_size = self._attn_cp_group_info()
 
         self._ag_gemm_ctx = create_allgather_gemm_context_symm_mem(
             ag_stream=self._ag_gemm_stream,
-            rank=dist.get_rank(self.group),
-            world_size=self.world_size,
-            max_M=max_M // self.world_size,
+            rank=cp_rank,
+            world_size=cp_world_size,
+            max_M=max_M // cp_world_size,
             K=K,
             NUM_COMM_SMS=NUM_COMM_SMS,
             enable_multicast=False,
-            group=self.group,
+            group=cp_group,
         )
         self._ag_gemm_key = key
         return self._ag_gemm_ctx

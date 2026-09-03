@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import dataclasses
 import logging
 from typing import List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -61,7 +61,7 @@ def tid(axis: tl.constexpr = 0):
 
 @triton.jit
 def ld_sys(ptr):
-    """ld.global.acquire.sys.b32 — system-scope acquire load."""
+    """ld.global.acquire.sys.b32 -- system-scope acquire load."""
     return tl.inline_asm_elementwise(
         asm="ld.global.acquire.sys.b32 $0, [$1];",
         constraints=("=r,l"),
@@ -74,7 +74,7 @@ def ld_sys(ptr):
 
 @triton.jit
 def st_sys(ptr, val):
-    """st.global.release.sys.b32 — system-scope release store."""
+    """st.global.release.sys.b32 -- system-scope release store."""
     tl.inline_asm_elementwise(
         asm="""
         st.global.release.sys.b32 [$1], $2;
@@ -88,8 +88,7 @@ def st_sys(ptr, val):
     )
 
 
-@dataclasses.dataclass
-class AllGatherGemmContextSymmMem:
+class AllGatherGemmContextSymmMem(msgspec.Struct):
     """Context for AG->GEMM overlap. Holds symm_mem buffers and handles."""
 
     rank: int
@@ -240,7 +239,7 @@ def cp_engine_full_mesh_pull_ag(
     Signal writes via cuStreamWriteValue32.
     Caller must wrap in `with torch.cuda.stream(ag_stream):`.
     """
-    # Self-shard: local copy + PtoP signal via cuStreamWriteValue32
+    # Self-shard.
     local_dst = symm_ag_a[rank * M_local : (rank + 1) * M_local, :]
     local_dst.copy_(symm_input)
     _SymmetricMemory.stream_write_value32(ag_signal, rank, 1)
@@ -396,10 +395,15 @@ def allgather_gemm_op_symm_mem(
     assert a_bf16.dtype == torch.bfloat16, f"Expected bf16 A, got {a_bf16.dtype}"
     assert a_bf16.shape[1] == b_fp8.shape[1], "K dimension mismatch"
     assert a_bf16.is_contiguous()
+    # Slice-based view() would silently truncate an oversized M_local.
+    assert M_local <= ctx.symm_input_buf.shape[1], (
+        f"M_local={M_local} exceeds symm-mem AG buffer capacity "
+        f"{ctx.symm_input_buf.shape[1]}; prefill buffer grew past the size the "
+        "context was created with"
+    )
 
     num_pid_n = triton.cdiv(N, BLOCK_SIZE_N)
 
-    # Copy A shard to symmetric memory
     symm_input = ctx.get_input_buf(M_local, K)
     symm_input.copy_(a_bf16)
 
@@ -419,7 +423,7 @@ def allgather_gemm_op_symm_mem(
 
     ag_stream.wait_stream(current_stream)
 
-    # Step 1: AG on ag_stream (CE, no SM consumption)
+    # AG runs on CE: the pull loop consumes no SMs.
     with torch.cuda.stream(ag_stream):
         cp_engine_full_mesh_pull_ag(
             rank=ctx.rank,
@@ -432,7 +436,6 @@ def allgather_gemm_op_symm_mem(
             ag_signal=ag_signal,
         )
 
-    # Step 2: consumer GEMM on current_stream
     needs_masking = bool(K % BLOCK_SIZE_K != 0)
     M_local_tiles = triton.cdiv(M_local, BLOCK_SIZE_M)
     num_pid_m_grid = M_local_tiles * ctx.num_ranks
@@ -477,13 +480,14 @@ def allgather_gemm_op_symm_mem(
 
 def maybe_fused_ag_shared_experts(
     hidden_states: torch.Tensor,
-    shared_experts_is_fp8: bool,
+    weight_block_size: Optional[List[int]],
     gate_up_proj,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused AG + fp8-quant + gate_up gemm. Returns (None, None) to fall back.
 
     Standalone wrapper around allgather_gemm_op_symm_mem that handles
     communicator lookup, context creation, and output allocation.
+    weight_block_size comes from the MoE module (None = not block-wise FP8).
     """
     from sglang.srt.distributed.device_communicators.torch_symm_mem import (
         TorchSymmMemCommunicator,
@@ -492,32 +496,25 @@ def maybe_fused_ag_shared_experts(
     comm = TorchSymmMemCommunicator.get_active_comm()
     if comm is None:
         return None, None
-    if not shared_experts_is_fp8:
-        return None, None
-    if gate_up_proj is None:
+    # Block-wise FP8 has weight_scale_inv (2D); per-tensor has weight_scale
+    # (scalar), which this kernel cannot consume.
+    if weight_block_size is None:
         return None, None
 
     w_fp8 = gate_up_proj.weight
-    # Block-wise FP8 has weight_scale_inv (2D); per-tensor has weight_scale (scalar).
-    w_scale = getattr(gate_up_proj, "weight_scale_inv", None)
-    if w_scale is None:
-        return None, None
+    w_scale = gate_up_proj.weight_scale_inv
 
     _, K = hidden_states.shape
     ctx = comm.get_or_create_ag_gemm_ctx(K=K)
     if ctx is None:
         return None, None
 
-    try:
-        block_size = [64, 128, 128]
-        allgather_output, gate_up_full = allgather_gemm_op_symm_mem(
-            ctx=ctx,
-            a_bf16=hidden_states,
-            b_fp8=w_fp8.contiguous(),
-            b_scale=w_scale,
-            block_size=block_size,
-        )
-    except Exception:
-        return None, None
-
+    block_size = [64, 128, 128]
+    allgather_output, gate_up_full = allgather_gemm_op_symm_mem(
+        ctx=ctx,
+        a_bf16=hidden_states,
+        b_fp8=w_fp8.contiguous(),
+        b_scale=w_scale,
+        block_size=block_size,
+    )
     return allgather_output, gate_up_full
