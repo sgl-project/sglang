@@ -149,9 +149,8 @@ def _prepare_ple_batch(
                 f"{processed_tokens=} {row_width=}"
             )
         sequence_count = processed_tokens // row_width
-        # Eager verify can carry a valid length smaller than its fixed row
-        # stride.  Ignore the synthetic one-token lengths created when DP
-        # attention temporarily rewrites verify as EXTEND.
+        # Eager verify rows can be shorter than the row stride;
+        # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
         lengths = (
             forward_batch.extend_seq_lens[:sequence_count].long()
             if forward_batch.forward_mode.is_target_verify()
@@ -196,9 +195,7 @@ def _prepare_ple_batch(
 
     sequence_count = lengths.shape[0]
     if use_decode_fast_path:
-        # Decode has one real token position per row.  Retain explicit tensors for
-        # the common PLE batch contract without launching an index-select solely
-        # to prove that every token offset (zero) is below every length (one).
+        # One token per decode row: every offset is valid, no index-select needed.
         valid_tokens = torch.ones(
             processed_tokens, dtype=torch.bool, device=tokens.device
         )
@@ -237,9 +234,8 @@ def _prepare_ple_batch(
     if ngram_size is not None:
         assert ngram_eos_token_id is not None
         if use_decode_fast_path:
-            # For decode, rows and tokens are one-to-one and valid_tokens is all
-            # true.  The view is exactly the tensor the fill/where/index-put chain
-            # would materialize.
+            # One token per decode row:
+            # this view is the padded tensor the general path would materialize.
             padded = tokens.unsqueeze(1)
         else:
             padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
@@ -327,17 +323,12 @@ def _ple_track_targets(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Destination slots and gather offsets for the extra-buffer track snapshot.
 
-    With extra_buffer it is the ping-pong track slot — not the request's working
-    slot — that `cache_{un,}finished_req` hand to the radix tree, so a side state
-    that only writes the working slot gets cached with whatever the track slot's
-    previous owner left behind.
-
-    Both PLE side states are laid out `[incoming_state | this chunk's tokens]`, so
-    the boundary value is the state's own gather at a smaller offset; callers differ
-    only in tensor rank, hence returning offsets rather than doing the gather.
-    Masked-off rows route to reserved slot 0 instead of being compacted, so there is
-    no host sync and no data-dependent shape and this stays CUDA-graph capturable.
-
+    With extra_buffer the radix tree caches the ping-pong track slot,
+    not the working slot.
+    Both PLE side states are laid out [incoming_state | chunk tokens],
+    so the boundary value is the state's own gather at a smaller offset;
+    callers differ only in tensor rank, hence offsets rather than a gather.
+    Masked-off rows route to reserved slot 0, so the shape stays graph-capturable.
     None when tracking is inactive or its metadata is absent.
     """
     track_indices = forward_batch.mamba_track_indices
@@ -964,10 +955,8 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_state = pool.short_conv_layer_cache(self.layer_id)
 
         if batch.use_decode_fast_path:
-            # Preserve the native depthwise-convolution and SiLU implementations;
-            # only remove decode identities around them.  With row_width=1 the
-            # padded/transpose path is exactly x.unsqueeze(-1), and every state
-            # boundary is the contiguous one-column shift below.
+            # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
+            # and each state boundary is a one-column shift; conv and SiLU stay native.
             from sglang.kernels.ops.qwen4_ple import (
                 can_fuse_qwen4_short_conv_state,
                 fused_qwen4_short_conv_state,
@@ -1243,8 +1232,8 @@ class Qwen4ExpLayerExtensionMixin:
             ple_layer_index = {
                 abs_id: index for index, abs_id in enumerate(ple_layer_ids_sorted)
             }[layer_id + 1]
-            # PLE is a sibling of the attn block (self.ple), so strip the block-type
-            # segment like the dense mlp; else quant prefix misses ckpt skip-list → NaN.
+            # Strip the block-type segment like the dense mlp (PLE is attn's sibling);
+            # else the quant prefix misses the ckpt skip-list -> NaN.
             ple_prefix = prefix.replace(".linear_attn", "").replace(".self_attn", "")
             self.ple = Qwen4ExpPLELayer(
                 config,
@@ -1505,9 +1494,8 @@ class Qwen4ExpAttentionDecoderLayer(
         )
         attention_kwargs = {}
         if overlap_indexer:
-            # The indexer chain reads only hidden_states/positions and writes
-            # QSA-private pool buffers, so it runs concurrently with the main
-            # qkv projection + norm/rope chain.
+            # Safe to overlap: the indexer reads only hidden_states/positions,
+            # and writes QSA-private pool buffers.
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.alt_stream):
@@ -1717,6 +1705,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return Qwen4ExpVLModel.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
+
     def __init__(
         self,
         config: Qwen4ExpConfig,
@@ -1783,9 +1777,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            # qwen4 checkpoints are qwen3.5 format (head-first in_proj). These merge head-first
-            # into the fused in_proj_qkvz/in_proj_ba, which is correct because the linear-attn
-            # layer uses Qwen3_5GatedDeltaNet (head-first forward), not qwen3-next's group-first.
+            # Checkpoints use the qwen3.5 head-first in_proj layout,
+            # matching Qwen3_5GatedDeltaNet's forward, not qwen3-next's group-first.
             ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
             ("in_proj_qkvz.", "in_proj_z.", 3),
             ("in_proj_ba.", "in_proj_b.", 0),

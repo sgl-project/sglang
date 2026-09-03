@@ -343,9 +343,8 @@ def qwen_sparse_fa2_cu_seqlens_triton(
     seq_lens, indices, counts, cu_k, batch, topk, block_b: Optional[int] = None
 ):
     block_b = block_b or triton.next_power_of_2(batch)
-    # Count one request per program. The previous implementation formed a
-    # [next_power_of_2(topk), next_power_of_2(batch)] tensor in one program;
-    # topk=2051 and batch=512 therefore exceeded Triton's 1M-element limit.
+    # One request per program: Triton caps a tile at 1M elements,
+    # which [next_pow2(topk), next_pow2(batch)] exceeds at topk=2051, batch=512.
     _fa2_valid_counts[(batch,)](
         seq_lens,
         indices,
@@ -407,9 +406,7 @@ def _compact_kv(
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
-    """Valid-count pass alone, for consumers that need per-row lengths but
-    not the packed cu_seqlens prefix sum (trtllm paged decode packs rows at
-    a fixed page-aligned stride instead)."""
+    """Valid-count pass alone, without the packed cu_seqlens prefix sum."""
     _fa2_valid_counts[(batch,)](
         seq_lens,
         indices,

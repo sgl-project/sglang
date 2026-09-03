@@ -1,11 +1,6 @@
-"""Per-request side states that live alongside a MambaPool slot.
-
-Qwen4-Exp's PLE keeps two states per request — a short-conv window and an
-N-gram token context — addressed by the request's mamba slot index. They are
-registered on the owning ``MambaPool`` via ``register_slot_state`` so every
-slot lifecycle event (deferred clear, radix COW, host offload round-trip)
-carries them along and a slot never changes owner with a stale sibling row.
-"""
+"""Per-request PLE side states (short-conv window, N-gram context),
+addressed by the request's MambaPool slot and registered on that pool,
+so every slot lifecycle event carries them along."""
 
 from __future__ import annotations
 
@@ -20,15 +15,9 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 class SlotIndexedState(Protocol):
-    """Per-request state owned by a MambaPool slot but not layer-major.
-
-    Qwen4-Exp's PLE side states are addressed by the *mamba slot index*
-    (`get_ngram_indices` / `get_short_conv_indices` both forward to
-    `get_mamba_indices`), so anything that hands out, duplicates or persists a
-    slot must carry them too. Implementers own their own shapes, and every
-    method must be a no-op when the backing tensor is None so a disabled pool
-    can register safely.
-    """
+    """Per-request state addressed by MambaPool slot index,
+    carried through every slot handoff;
+    every method must be a no-op when the backing tensor is None (a disabled pool)."""
 
     def reset_slots(self, indices: torch.Tensor) -> None: ...
 

@@ -39,9 +39,8 @@ def _reference(accept_index, accept_lens, seq_lens, draft_token_num, track_inter
 @pytest.mark.parametrize("bs", [1, 3, 48, 257])
 @pytest.mark.parametrize("track_interval", [0, 64])
 def test_verify_commit_steps_matches_eager(bs, track_interval):
-    """Regression guard: the eager commit-step math launched ~12 tiny kernels
-    on [bs] tensors per verify; the fused kernel must match both outputs,
-    including interval-crossing selection near tracking boundaries."""
+    """The fused kernel must match eager on both outputs,
+    including the interval-crossing selection near tracking boundaries."""
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
     torch.manual_seed(bs + track_interval)

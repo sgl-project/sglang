@@ -15,11 +15,7 @@ def _reference_grouped_gemma_rmsnorm(
     eps: float,
     compute_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Eager reference, mirrors GroupedGemmaRMSNorm.forward in hyperconnection.py.
-
-    With compute_dtype=float64 this serves as the near-exact reference for
-    precision assertions.
-    """
+    """Mirrors GroupedGemmaRMSNorm.forward (hyperconnection.py); keep them in sync."""
     x_float = x.to(compute_dtype)
     hidden = x_float.shape[-1]
     x_grouped = x_float.reshape(*x_float.shape[:-1], hidden // group_size, group_size)

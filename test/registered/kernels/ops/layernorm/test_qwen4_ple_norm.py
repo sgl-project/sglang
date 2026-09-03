@@ -15,11 +15,7 @@ def _reference_ple_norm(
     eps: float,
     compute_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Eager reference, mirrors Qwen4ExpPLEGroupedNorm.forward's fallback path.
-
-    With compute_dtype=float64 this serves as the near-exact reference for
-    precision assertions.
-    """
+    """Eager reference mirroring Qwen4ExpPLEGroupedNorm.forward's fallback path."""
     x_float = x.to(compute_dtype)
     group_shape = x_float.shape[:-1] + (-1, group_size)
     variance = x_float.reshape(group_shape).pow(2).mean(dim=-1, keepdim=True)
@@ -28,13 +24,8 @@ def _reference_ple_norm(
     return x_norm * (weight.to(compute_dtype) + 1.0)
 
 
-# Tolerances are at the output-dtype quantization floor. The fused path is the
-# grouped_gemma_rmsnorm JIT kernel, which computes in fp32 like the eager
-# fallback. Measured on B300 (sm103) vs the fp64 reference at the largest
-# shape (8192 x 10240): the fp32 *eager* chain itself already sits 1 bf16 ulp
-# (rel 7.8e-3) off the fp64 reference on ~147/83.8M elements (the jit kernel:
-# ~143), so 5e-3 (half a bf16 ulp headroom) is unattainable at this shape and
-# bf16 is set to 2 ulp. fp16 passes at 0.5 ulp.
+# Even the fp32 eager chain is 1 bf16 ulp off on ~147/83.8M elements,
+# measured on B300 vs fp64 at 8192 x 10240; so bf16 gets 2 ulp, fp16 0.5 ulp.
 _TOLERANCES = {
     torch.bfloat16: dict(rtol=8e-3, atol=8e-3),
     torch.float16: dict(rtol=1e-3, atol=1e-3),

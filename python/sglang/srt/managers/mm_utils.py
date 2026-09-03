@@ -736,9 +736,8 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            # copy when a draft re-reads this after the target forward: the
-            # target may overwrite input_embeds in place (deepstack add_,
-            # residual reuse), which would corrupt the MTP draft's input.
+            # Clone under spec decoding: the target's deepstack add_ is in place,
+            # so it would corrupt input_embeds for the MTP draft's later re-read.
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
                 if forward_batch.spec_algorithm is not None

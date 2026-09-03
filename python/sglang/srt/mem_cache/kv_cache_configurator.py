@@ -1795,7 +1795,7 @@ class KVCacheConfigurator:
             QwenDSATokenToKVPool,
         )
 
-        qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
+        qsa_profile = parse_qsa_profile(self.model_config.hf_config)
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend

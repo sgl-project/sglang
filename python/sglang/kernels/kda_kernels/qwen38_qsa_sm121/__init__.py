@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# KDA provenance: optimized by Codex and Kimi K3 agents through KDA-1.5.
-# Task: https://github.com/radixark/KDA-1.5/pull/4 @
-# 414ce456e14ae8546f77d9356d2c4d955c5bb7f1.
-# Winning submission: b4181149c8884ddb.
 
 from __future__ import annotations
 

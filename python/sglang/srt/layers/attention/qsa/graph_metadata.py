@@ -1,25 +1,13 @@
 """GPU builders for QSA CUDA-graph replay metadata.
 
-Compressed addressing is pure arithmetic over the page-aligned full-KV
-cache (the DSV4 scheme): a group's compressed slot is any of its raw slots
-floor-divided by the compress ratio, so the kernels rebuild the per-row
-graph buffers from request lengths plus ``req_to_token`` alone — no
-allocation, no ownership state, and accept-dependent speculative lengths
-never need the host.
+Compressed addressing is pure arithmetic over the page-aligned full-KV cache:
+a group's compressed slot is any of its raw slots floor-divided by the compress ratio,
+so per-row graph buffers are rebuilt from request lengths and ``req_to_token`` alone;
+accept-dependent speculative lengths never need the host.
 
-* ``_qsa_graph_layout_kernel`` (one program per request + a tail program) —
-  request row layout: decode rows or speculative verify/draft-extend rows
-  plus static dummy-tail rows.
-* ``_qsa_graph_row_metadata_kernel`` (one program per row) — compressed
-  lengths, the boundary write slot (last raw slot // ratio; non-boundary
-  rows keep the inert reserved slot 0), the row's page table of full-KV
-  page ids, and the layer-independent indexer inputs (logical position,
-  pending-ring state slot, trailing-group member ring slots).
-
-Both are launched once eagerly at capture warmup (JIT compile + dummy
-layout) and then recorded into the main CUDA graph through
-``init_forward_metadata_in_graph``. All inputs are stable-address runner
-buffers.
+Both kernels run once eagerly at capture warmup,
+then are recorded into the main CUDA graph through ``init_forward_metadata_in_graph``;
+all inputs are stable-address runner buffers.
 """
 
 from __future__ import annotations
@@ -65,9 +53,7 @@ def _qsa_graph_layout_kernel(
 
     real_reqs = bs - num_padding
     if pid == bs:
-        # Tail program: dummy-fill the static-capacity rows past the real
-        # layout (length 1, prefix 0, aliased to request slot 0, matching
-        # the legacy padding contract).
+        # Tail program: dummy rows for the static capacity past the real layout.
         if MODE == 1:
             row_start = real_reqs * extend_len
         else:
@@ -138,11 +124,8 @@ def _qsa_graph_row_metadata_kernel(
     compressed = seq_len // RATIO
     tl.store(compressed_lens_ptr + row, compressed)
 
-    # DSV4-style compressed addressing: the page-aligned full-KV allocator
-    # keeps every compression group contiguous inside one page, so the
-    # group's compressed slot is any of its raw slots floor-divided by the
-    # ratio. Non-boundary rows keep the inert reserved slot 0 (full slot 0
-    # is the pools' padding slot).
+    # The page-aligned allocator keeps each compression group inside one page,
+    # so last_loc // RATIO is the group's compressed slot; slot 0 is the padding slot.
     boundary = (seq_len > 0) & (seq_len % RATIO == 0)
     write_loc = tl.where(boundary, last_loc // RATIO, 0)
     tl.store(write_locs_ptr + row, write_loc)
@@ -192,11 +175,6 @@ def launch_graph_metadata(
     req_to_token,
     pool,
 ) -> None:
-    """Launch the two metadata kernels for one graph bucket.
-
-    Used both for the eager capture-warmup launch and for recording the
-    kernels into the main CUDA graph (``init_forward_metadata_in_graph``).
-    """
 
     indexer = metadata.indexer_metadata
     max_pages = indexer.graph_compressed_page_table.shape[1]

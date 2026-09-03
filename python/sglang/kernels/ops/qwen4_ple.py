@@ -51,9 +51,7 @@ def _qwen4_ngram_hash_kernel(
     multiplier_1 = tl.load(multipliers_ptr + 1)
     multiplier_2 = tl.load(multipliers_ptr + 2)
 
-    # Only the final position of each three-token context is materialized. Its
-    # shift-1 source is valid unless the immediately preceding token is EOS;
-    # its shift-2 source is valid only if neither preceding token is EOS.
+    # Only the final position of each three-token context is materialized.
     previous_1 = tl.where(token_1 == eos_token_id, eos_token_id, token_1)
     previous_2 = tl.where(
         (token_0 == eos_token_id) | (token_1 == eos_token_id),
@@ -146,9 +144,8 @@ def _qwen4_gate_value_kernel(
     hidden = tl.arange(0, BLOCK_SIZE)
     mask = (token < num_tokens) & (hidden < HIDDEN_SIZE)
 
-    # `gate` is already the BF16 output of the existing multiply, reduction, and
-    # division kernels.  Reproduce every remaining eager BF16 rounding boundary
-    # while broadcasting the scalar over its 2,560-element value group.
+    # `gate` arrives already rounded to bf16 by the eager multiply/reduce/divide;
+    # every remaining eager bf16 rounding boundary is reproduced below.
     gate = tl.load(gate_ptr + token_group).to(tl.float32)
     magnitude = tl.maximum(tl.abs(gate), 1.0e-6)
     root = _round_bf16_to_fp32(tl.sqrt(magnitude))
@@ -226,9 +223,8 @@ def _qwen4_short_conv_state_kernel(
     output_base = token * CHANNELS * (STATE_LEN + 1)
     output_offset = output_base + channel * (STATE_LEN + 1) + state_col
 
-    # Each lane owns one complete channel history.  Materialize every old value
-    # before advancing the in-place cache so the convolution input is exactly
-    # the native index_select + cat result.
+    # Materialize every old state value before advancing the in-place cache,
+    # so the convolution input equals the native index_select + cat result.
     old_state = tl.load(state_ptr + state_offset, mask=state_mask, other=0.0)
     tl.store(conv_input_ptr + output_offset, old_state, mask=state_mask)
     x = tl.load(x_ptr + token * CHANNELS + channel, mask=channel_mask, other=0.0)
@@ -239,9 +235,8 @@ def _qwen4_short_conv_state_kernel(
     )
     tl.debug_barrier()
 
-    # Slot zero is the CUDA-graph padding slot and can occur in multiple rows.
-    # Its post-step value is unobservable; skipping it also avoids duplicate
-    # writers.  Real request slots are unique within a decode batch.
+    # Slot 0 is the CUDA-graph padding slot and may appear in several rows;
+    # its post-step value is unobservable, so skip it to avoid duplicate writers.
     update_mask = state_mask & (state_col < STATE_LEN - 1) & (state_index != 0)
     next_value = tl.load(
         conv_input_ptr + output_offset + 1, mask=update_mask, other=0.0

@@ -1,12 +1,6 @@
-"""Compressed write-plan contracts of DSV4-style QSA addressing.
-
-The compressed cache is addressed as ``full_slot // compress_ratio`` over a
-page-aligned full-KV allocator, and the per-forward write plan is computed
-entirely on device from row lengths (no host loops, no device-to-host sync,
-one code path for decode / verify / draft-extend / extend). These tests pin
-the derived properties the compression kernels rely on, plus the fail-fast
-guards that keep a misconfigured stack from silently corrupting shared
-groups.
+"""Write-plan contracts of compressed QSA addressing:
+``full_slot // compress_ratio`` over a page-aligned full-KV allocator,
+planned on device with no host sync.
 """
 
 import unittest
@@ -59,9 +53,8 @@ def _plan(*, lengths, table, extend_lens=None):
 
 class TestQsaCompressedWritePlan(CustomTestCase):
     def test_group_slot_is_any_raw_slot_over_ratio(self):
-        """Derived property: with a page-aligned table every raw slot of a
-        group floor-divides to the same compressed slot, so the plan can read
-        the group's first slot and divide."""
+        """Page-aligned table: a group's raw slots floor-divide to one compressed slot,
+        so the plan reads the first slot and divides."""
         table = _page_aligned_table(2, 512)
         write_locs, group_positions, sequence_ids, member_rows = _plan(
             lengths=[256, 260], table=table
@@ -75,9 +68,8 @@ class TestQsaCompressedWritePlan(CustomTestCase):
             self.assertEqual(int(table[0, 252 + offset]) // RATIO, expected[0])
 
     def test_non_boundary_rows_only_pad_the_plan(self):
-        """A row whose length does not complete a group contributes nothing;
-        the shape-derived capacity is padded with writes to the reserved slot
-        0, which the compression kernels treat as an inert dump."""
+        """Rows that do not complete a group pad the shape-derived capacity:
+        they write to reserved slot 0, which the compression kernels treat as inert."""
         table = _page_aligned_table(3, 512)
         write_locs, _, _, _ = _plan(lengths=[253, 254, 255], table=table)
         self.assertEqual(write_locs.numel(), 3)  # capacity, not group count

@@ -755,9 +755,8 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen4ExpForCausalLMMTP"
             text_config = self.hf_text_config
             text_config.num_nextn_predict_layers = 1
-            # Collapse to a single full_attention layer so the draft's
-            # full_attention_layer_ids is [0]. Qwen4ExpTextConfig.layers_block_type
-            # bypasses num_hidden_layers when layer_types is set.
+            # layers_block_type follows layer_types, not num_hidden_layers,
+            # so both must shrink for the draft's full_attention_layer_ids to be [0].
             text_config.num_hidden_layers = 1
             text_config.layer_types = ["full_attention"]
             text_config.full_attention_interval = 1

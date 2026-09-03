@@ -123,14 +123,11 @@ class DraftBackendFactory:
 
             profile = parse_qsa_profile(self.draft_model_runner.model_config.hf_config)
             if profile is not None and profile.variant != QSA_VARIANT_COMPRESSED:
-                # Tokenwise QSA has no graph-stable indexer metadata; keep
-                # the intentional eager draft-extend path and never fall
-                # back to a dense backend.
+                # Tokenwise QSA has no graph-stable indexer metadata: draft extend
+                # stays eager instead of falling back to a dense backend.
                 return None
-            # Compressed QSA draft-extend uses the draft model runner's own
-            # (QSA-wrapped hybrid) backend.  Its replay path pads the
-            # variable accepted-token rows to the captured static width, so
-            # the draft-extend CUDA graph expresses the dynamic accept count.
+            # Compressed QSA replay pads accepted-token rows to the captured width,
+            # so the runner's own hybrid backend serves the draft-extend graph.
             return self.draft_model_runner.attn_backend
 
         backend_map = {

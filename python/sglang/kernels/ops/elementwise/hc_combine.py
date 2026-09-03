@@ -20,9 +20,8 @@ def _jit_hc_combine_module(
     hc_count: int, hidden_size: int, dtype: torch.dtype
 ) -> Module:
     """Compile and cache the JIT HC combine module for a given shape/dtype."""
-    # Checks on the compile key live here, not in `hc_combine`: `cache_once`
-    # keys on (hc_count, hidden_size, dtype), so this runs once per
-    # specialisation instead of once per call.
+    # Validation lives here rather than in `hc_combine`,
+    # so `cache_once` runs it once per (hc_count, hidden_size, dtype), not per call.
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if hidden_size <= 0 or hidden_size % 8 != 0:

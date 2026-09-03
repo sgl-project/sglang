@@ -652,13 +652,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def finalize_fused_in_proj(self) -> None:
-        """Merge in_proj_qkvz + in_proj_ba into one output-stacked GEMM weight.
-
-        Both projections consume the same hidden_states and are output-sharded
-        identically, so their per-rank weights can be stacked along dim 0. The
-        module weights are re-pointed to row views of the fused buffer, keeping
-        every other consumer (weight reload, dtype checks) working unchanged.
-        """
+        """Stack in_proj_qkvz + in_proj_ba into one GEMM weight;
+        the module weights become row views of it,
+        so weight reload and dtype checks still see them."""
         if not _is_cuda or self._fused_in_proj_weight is not None:
             return
         if get_lora().enable_lora or get_lora().lora_paths:
@@ -693,9 +689,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             self._fused_in_proj_weight is not None
             and hidden_states.dtype == torch.bfloat16
-            # At prefill widths cuBLAS serves the merged (m, 4120) shape
-            # ~10% slower than the two original GEMMs; the merged win is
-            # launch count, which only matters at decode sizes.
+            # Measured on cuBLAS above ~1k rows:
+            # the merged (m, 4120) GEMM is ~10% slower than the two separate GEMMs.
             and hidden_states.shape[0] <= 1024
         ):
             fused_out = bf16_gemm_dispatch(
@@ -1384,8 +1379,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Project and rotate Q/K/V (+ the attention output gate) on the
-        platform's fused path."""
         if _is_cuda and self.attn_output_gate:
             return self.forward_prepare_cuda_fused(
                 positions=positions,
@@ -1699,8 +1692,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.layers_to_capture = []
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
-        """How this architecture shards its embedding. Qwen3.5 replicates it
-        under DP attention; a model reusing this backbone may shard instead."""
+        """Embedding sharding hook for models reusing this backbone."""
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
         return VocabParallelEmbedding(
@@ -2721,6 +2713,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
+_QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
+
+
 def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
     """Why this Qwen3.5 checkpoint cannot fuse its shared expert, or None.
 
@@ -2732,7 +2727,7 @@ def _qwen3_5_shared_experts_fusion_disable_reason(hf_config, quant_config):
     if not _is_hip:
         return None
     text_config = getattr(hf_config, "text_config", hf_config)
-    if getattr(text_config, "model_type", None) != "qwen3_5_moe_text":
+    if text_config.model_type not in _QWEN3_5_MOE_TEXT_MODEL_TYPES:
         return None
     if can_fuse_shared_expert(text_config, quant_config):
         return None

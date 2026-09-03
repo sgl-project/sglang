@@ -1,10 +1,5 @@
-"""B200 E2E coverage for Qwen3.8-Flash-Next (Qwen4-Exp).
-
-Two cases: plain serving (exercises the QSA sparse-decode path that MTP's
-verify widths otherwise mask, plus GDN, PLE and HC), and NEXTN MTP (the
-draft layer ships inside the target checkpoint; covers the shared QSA
-indexer across draft/verify and the PLE/mamba state rollback after verify).
-"""
+"""Qwen3.8-Flash-Next (Qwen4-Exp) E2E on B200; the plain-serving case is kept:
+MTP's verify widths never exercise the QSA sparse-decode path."""
 
 import unittest
 
@@ -76,9 +71,9 @@ class TestQwen4ExpBase(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
 class TestQwen4ExpMTP(_Qwen4ExpServer, GSM8KMixin, CustomTestCase):
     """NEXTN MTP serving (3 steps, topk 1, 4 draft tokens)."""
 
-    # Accept length measured at 2.46-2.49 on thinking workloads; 2.1 leaves
-    # noise margin while still failing on a real drop.
-    gsm8k_accept_length_thres = 2.1
+    # GSM8K accept length measured at 3.02-3.03 (max 4.0 with 3 steps);
+    # 2.7 leaves noise margin while still failing on a real drop.
+    gsm8k_accept_length_thres = 2.7
     speculative_args = [
         "--speculative-algorithm",
         "NEXTN",

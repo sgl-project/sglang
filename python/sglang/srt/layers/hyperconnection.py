@@ -169,9 +169,7 @@ class GatedResidual(HyperConnectionBase):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
-            # The JIT combine kernel requires hidden_size % 8 == 0 and
-            # hc_count * hidden_size % 2048 == 0; this is init-static, so
-            # resolve it once here (device/dtype stay per-call).
+            # hc_combine rejects other shapes; device and dtype are checked per call.
             self._jit_combine_ok = (
                 self.hidden_size % 8 == 0
                 and (self.hc_count * self.hidden_size) % 2048 == 0

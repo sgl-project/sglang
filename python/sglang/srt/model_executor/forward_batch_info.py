@@ -1029,18 +1029,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
     def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
-        """Tokens of THIS extend chunk covered by the tracked (extra-buffer) state.
-
-        The extra-buffer scheduler parks its snapshot at a `mamba_cache_chunk_size`
-        boundary, not at the current position, so anything snapshotting alongside it
-        needs the same boundary. Sole home of this math: `_init_track_conv_indices`
-        and the Qwen4-Exp PLE side states all call it so they cannot drift apart. The
-        `+1` that `_force_track_h` adds cancels under the floor division, which is
-        why one expression serves both.
-
-        None when tracking metadata is absent (no mask, or a prefill CUDA-graph
-        replay that does not carry `mamba_track_seqlens` — mamba skips tracking there
-        too). Masked-off rows hold garbage and are the caller's mask to handle.
+        """Tokens of this extend chunk covered by the tracked mamba state,
+        floored to the mamba_cache_chunk_size boundary the scheduler snapshots at;
+        the +1 that _force_track_h adds cancels under the floor.
+        Sole home of this math: every side state snapshotting alongside mamba calls it.
+        None means tracking is skipped for this forward:
+        no mask, or a prefill CUDA-graph replay without mamba_track_seqlens.
+        Masked-off rows hold garbage.
         """
         if (
             self.mamba_track_mask is None

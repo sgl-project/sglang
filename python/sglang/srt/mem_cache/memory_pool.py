@@ -373,10 +373,8 @@ class MambaPool:
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
     conv_window_axis = -1
 
-    # Per-request side states riding on this pool's slot lifecycle
-    # (see ple_state_pool.SlotIndexedState). Class-level empty default so
-    # subclasses that skip __init__ (UnifiedMambaPool) stay hook-free;
-    # register_slot_state rebinds an instance-level list.
+    # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
+    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
     _slot_siblings: Tuple = ()
 
     def register_slot_state(self, state) -> None:
@@ -1083,9 +1081,8 @@ class MambaPool:
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        # Sibling round-trip is per-instance symmetric: the pool that saved with
-        # registered siblings is the pool that loads, so the trailing element is
-        # present exactly when this instance carries siblings.
+        # The trailing element exists exactly when this instance registered siblings:
+        # the pool that saved the copy is the pool that loads it.
         siblings_cpu = None
         if self._slot_siblings:
             siblings_cpu = mamba_cache_cpu[-1]
@@ -1322,10 +1319,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
-        # Qwen4-Exp PLE side states, built here and registered on the pool that
-        # owns the slots. Callers that do not pass their config (e.g. the
-        # multi-layer draft clone) get disabled pools, which register as no-ops
-        # rather than being absent.
+        # Qwen4-Exp PLE side states; built disabled rather than None without a config,
+        # so every hybrid model has both attributes.
         from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
 
         self.short_conv_pool = ShortConvPool(
@@ -1371,9 +1366,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if self.mamba_ckpt_pool is not None and (
             self.short_conv_pool.enabled or self.ngram_pool.enabled
         ):
-            # The int8 pool frees the bf16 slot after donating its state, but the
-            # PLE side states live only in bf16-slot-indexed pools and would be
-            # lost with the slot.
+            # The int8 checkpoint pool frees the bf16 slot after donating its state,
+            # taking the bf16-slot-indexed PLE side states with it.
             raise ValueError(
                 "--enable-int8-mamba-checkpoint is incompatible with Qwen4-Exp "
                 "PLE side states"

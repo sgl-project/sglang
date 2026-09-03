@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# KDA provenance: optimized by Codex and Kimi K3 agents through KDA-1.5
-# (https://github.com/radixark/KDA-1.5).
-# Task: https://github.com/radixark/KDA-1.5/pull/4 @
-# 414ce456e14ae8546f77d9356d2c4d955c5bb7f1.
-# Winning submission: b4181149c8884ddb; byte-exact submitted source SHA256:
-# 4f9977f88abfea4393a2add3a2c9255699f7e13b981dbc1a976b024b3b00e909.
+# KDA-1.5 submission b4181149c8884ddb (https://github.com/radixark/KDA-1.5/pull/4);
+# source SHA256 4f9977f88abfea4393a2add3a2c9255699f7e13b981dbc1a976b024b3b00e909.
 """Shape-specialized Qwen3.8 packed QSA decode kernel for SM121."""
 
 from __future__ import annotations
@@ -236,9 +232,8 @@ def qwen38_qsa_sm121(
     batch, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
 
-    # This is the measured shape/topology schedule. The TP1 q_rows=4 shape is
-    # intentionally kept on BK64 because its short and saturated rows are
-    # host-indistinguishable; the live cu_seqlens still choose their split count.
+    # Measured schedule. The TP1 q_rows=4 shape stays on BK64 on purpose:
+    # its short and saturated rows cannot be told apart from the host.
     use_bk32 = (num_kv_heads == 1 and batch < 12) or (num_kv_heads == 2 and batch < 4)
     block_kv = 32 if use_bk32 else 64
     stages = 3 if use_bk32 else 2

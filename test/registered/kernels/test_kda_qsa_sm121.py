@@ -72,9 +72,8 @@ class TestKdaQwen38QsaSm121(CustomTestCase):
         relative_l2 = (
             actual.float() - expected.float()
         ).norm() / expected.float().norm()
-        # Synthetic normal inputs can have a much smaller output norm than the
-        # captured post-projection tensors. The real replay separately enforces
-        # the task's stricter relative-L2 <= 2e-3 acceptance gate.
+        # Looser than the real replay's 2e-3 gate; the output norm is far smaller here,
+        # since synthetic normal inputs replace the captured post-projection tensors.
         self.assertLessEqual(relative_l2.item(), 5e-3)
 
     def test_real_tp1_tp2_shapes_match_reference(self):

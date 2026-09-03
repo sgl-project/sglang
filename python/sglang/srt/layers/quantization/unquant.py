@@ -139,9 +139,8 @@ _FLASHINFER_PR4266_TUNED_TACTICS = {
     (16, 2560, 8192): (64, 16, 2, 11),
     (24, 2560, 8192): (64, 32, 2, 9),
     (32, 2560, 8192): (64, 32, 2, 9),
-    # Qwen4-Exp TP4 decode tactics measured on B300 (sm103) under CUDA graph
-    # replay against cuBLAS/nvjet with splitKreduce. Every entry beat the
-    # existing dispatch; unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
+    # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
+    # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
     (1, 320, 2560): (64, 8, 4, 11),
     (1, 512, 2560): (64, 8, 4, 11),
     (1, 640, 2560): (64, 8, 4, 10),
@@ -190,11 +189,8 @@ def use_flashinfer_pr4266_bf16_gemm(m: int, n: int, k: int) -> bool:
 
 
 def precompile_splitk_tactics() -> bool:
-    """JIT-compile every allowlisted low-M tactic before CUDA graph capture.
-
-    Runs each tuned (m, n, k) through the same direct/split-K choice the
-    dispatch makes, so capture never hits a cold kernel.
-    """
+    """JIT-compile every tuned tactic through the real dispatch,
+    so CUDA graph capture never hits a cold kernel."""
     if not _enable_bf16_splitk_gemm:
         return False
     device = torch.cuda.current_device()

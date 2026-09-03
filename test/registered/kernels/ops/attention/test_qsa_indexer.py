@@ -1,11 +1,5 @@
-"""Correctness tests for the fused QSA indexer-prep kernels.
-
-Compares the fused kernels (and the QSAIndexer wiring around them) against the
-eager indexer path they replace. Outputs must be bit-identical except for rare
-last-ulp RMSNorm reduction flips (see assert_bit_comparable):
-  - q prep: split -> GemmaRMSNorm -> MRoPE (+ raw-K / RoPE-position stores)
-  - compress: gather -> fp32 mean -> GemmaRMSNorm -> MRoPE -> compressed store
-"""
+"""Fused QSA indexer-prep kernels must match the eager indexer path bit-for-bit,
+up to rare last-ulp RMSNorm flips (see assert_bit_comparable)."""
 
 from types import SimpleNamespace
 
@@ -123,12 +117,8 @@ class FakePool:
 
 
 def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
-    """Bit-comparable to the eager path: identical except rare last-ulp flips.
-
-    The eager RMSNorm (flashinfer's CuTe DSL kernel) reduces sums of squares
-    in an order that cannot be reproduced exactly, so ~1 row in 30k lands on
-    a bf16 rounding boundary and flips by 1-2 ulp (capped at 0.015625 here).
-    """
+    """Eager RMSNorm (flashinfer CuTe DSL) reduces in an unreproducible order,
+    so ~1 row in 30k flips by 1-2 bf16 ulp; max_frac and max_abs bound that."""
     diff = (actual.float() - expected.float()).abs()
     mismatches = int((diff > 0).sum())
     allowed = max(16, int(max_frac * actual.numel()))
@@ -219,12 +209,8 @@ def test_expand_block_indices_int_inputs(dtype):
 
 
 def test_decode_selection_equivalent():
-    """End-to-end decode selection: eager-prepared vs fused-prepared inputs.
-
-    The last-ulp norm flips must not change the selected top-k blocks: index
-    scores are fp32 sums of 128-dim dot products, so a 1-ulp change in one
-    component only matters on exact ties.
-    """
+    """Last-ulp norm flips must not change the selected blocks:
+    scores are fp32 sums of 128-dim dots, so a 1-ulp flip only matters on exact ties."""
     from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
     from sglang.srt.layers.attention.qsa.mqa import torch_qsa_mqa_decode
 

@@ -1,27 +1,10 @@
 """Fused HC low-rank mix for decode-size batches.
 
-`GatedResidual._mix_compute` lowers to a five-kernel chain per call
-(down GEMV + splitK reduce, silu, up GEMV, sigmoid-mul-mean); at bs=1
-speculative decode that chain runs ~100 times per iteration on the GPU
-critical path between allreduces, and at these sizes every kernel is
-latency-bound, so the win comes from kernel count, not bandwidth.
-
-One persistent kernel replaces the chain.  A grid of one CTA per SM is
-resident by construction, which makes the software grid barrier
-deadlock-free:
-
-* phase 0 — zero the fp32 accumulator ``t_raw`` (strided across CTAs)
-* phase A — grid-strided (n-block, k-chunk) tiles of ``x @ W_down^T``
-  accumulated into ``t_raw`` with device-scope atomics
-* phase B — grid-strided output blocks: ``t = silu(t_raw / hc)`` on the
-  fly, one ``tl.dot`` covering all hc groups, then
-  ``out_j = mean_g(sigmoid(t @ W_up[g,j]^T) * x[g,j])``
-
-The barrier counters are reset by the last CTA to finish, so a captured
-CUDA graph replays with the buffers back in their initial state.
-
-Row counts beyond ``_FUSED_MIX_MAX_ROWS`` (prefill) keep the
-torch.compile path, which uses proper GEMM kernels.
+One persistent kernel replaces the five-kernel `GatedResidual._mix_compute` chain.
+One CTA per SM keeps every CTA resident, so the software grid barrier cannot deadlock;
+the last CTA to finish resets the barrier counters,
+so a captured CUDA graph replays with them in their initial state.
+Row counts beyond ``_FUSED_MIX_MAX_ROWS`` stay on the torch.compile path.
 """
 
 from __future__ import annotations
@@ -165,21 +148,14 @@ def _get_counters(device: torch.device) -> torch.Tensor:
     return buf
 
 
-_deterministic_inference_cached = None
-
-
 def _deterministic_inference() -> bool:
-    global _deterministic_inference_cached
-    if _deterministic_inference_cached is None:
-        try:
-            from sglang.srt.server_args import get_global_server_args
+    from sglang.srt.runtime_context import get_exec
 
-            _deterministic_inference_cached = bool(
-                get_global_server_args().enable_deterministic_inference
-            )
-        except Exception:
-            _deterministic_inference_cached = False
-    return _deterministic_inference_cached
+    try:
+        exec_cfg = get_exec()
+    except ValueError:
+        return False
+    return bool(exec_cfg.deterministic.enable_deterministic_inference)
 
 
 def fused_hc_mix_supported(

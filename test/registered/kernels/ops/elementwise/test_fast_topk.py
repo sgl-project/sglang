@@ -9,11 +9,8 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 
 def _check_topk_values(score, lengths, indices, topk, row_starts):
-    """The returned indices must select exactly the top-k value multiset.
-
-    Order is unspecified and tie-breaking may differ from torch.topk, so we
-    compare sorted score values, not index sets.
-    """
+    """fast_topk leaves order and tie-breaking unspecified,
+    so compare the sorted top-k values rather than index sets."""
     for b in range(score.shape[0]):
         start = int(row_starts[b]) if row_starts is not None else 0
         length = int(lengths[b])

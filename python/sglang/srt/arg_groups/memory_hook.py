@@ -24,11 +24,7 @@ _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 
 
 def handle_offload_compatibility(server_args: Any) -> None:
-    """Validates only: the pinned PLE embedding must not ride generic offload.
-
-    Runs twice -- before the dummy-model boundary for explicit flags, and after
-    the model overrides materialize so the Qwen4-Exp declared default is seen.
-    """
+    """Validation only; safe to re-run once the model overrides have materialized."""
     cfg = resolving_view(server_args)
     if cfg.ple_offload_embedding and (
         cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0

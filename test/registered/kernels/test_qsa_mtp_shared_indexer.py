@@ -47,9 +47,8 @@ def _forward_batch(mode, **kwargs):
 
 
 def test_prefill_extend_capture_anchors_last_row_per_request():
-    """The post-prefill draft extend (plain EXTEND, batch-major row mapping)
-    seeds the first decode loop; only each request's FINAL row is the seed,
-    and that exact row must be what the following MTP decode steps read."""
+    """Plain EXTEND after prefill seeds the decode loop from each request's final row;
+    the following MTP decode steps must read exactly that row and no other."""
     state = _make_state()
     backend = _make_backend(state)
     token_to_batch = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32)
@@ -82,21 +81,16 @@ def test_prefill_extend_capture_anchors_last_row_per_request():
     )
     assert torch.equal(got[0, :TOPK], topk[2])
     assert torch.equal(got[1, :TOPK], topk[4])
-    # The tail appends exactly [captured_len, current_position]: request A
-    # captured at 32, now at 32 -> tail {32}; request B captured at 41, now
-    # at 41 -> tail {41}; the rest of the tail is -1 (dropped downstream).
+    # The tail holds [captured_len, current_position] and -1 elsewhere;
+    # -1 entries are dropped downstream.
     assert got[0, TOPK:].tolist() == [32, -1, -1, -1]
     assert got[1, TOPK:].tolist() == [41, -1, -1, -1]
 
 
 def test_draft_extend_v2_capture_anchors_last_accepted_row():
-    """Production DRAFT_EXTEND_V2 packs uniform num_window_tokens blocks per
-    request (extend lens are the WINDOW width, not the accept count), and DP
-    token padding aliases tail rows to request 0.  The seed must be each
-    request's last ACCEPTED row (select_index semantics): the window-end row
-    is conditioned on rejected drafts and its captured_len overshoots, which
-    silently kills the in-flight tail; a run-boundary anchor would let an
-    alias-padding row overwrite request 0's seed nondeterministically."""
+    """DRAFT_EXTEND_V2 packs window-width blocks per request,
+    aliasing DP padding rows to request 0;
+    the seed must be each request's last ACCEPTED row."""
     state = _make_state()
     backend = _make_backend(state)
     row_lens = torch.tensor([30, 31, 32, 33, 40, 41, 42, 43, 1, 1], dtype=torch.int32)
@@ -127,12 +121,8 @@ def test_draft_extend_v2_capture_anchors_last_accepted_row():
 
 
 def test_graph_capture_routes_bucket_pad_slot0_to_trash():
-    """The draft-extend CUDA graph replays capture ops on static buffers.
-    Bucket-padding requests carry extend len == captured width with
-    req_pool_indices zeroed (the pool's reserved slot 0): their capture must
-    land in the trash row -- state row 0 stays untouched -- while real
-    requests anchor their last accepted row and read it back with the tail
-    starting exactly at captured_len."""
+    """Bucket-padding rows (extend len == captured width, req_pool_indices 0)
+    must capture into the trash row, leaving state row 0 untouched."""
     state = _make_state()
     backend = _make_backend(state)
     row_lens = torch.tensor(
@@ -199,9 +189,8 @@ def test_capture_routes_zero_extend_to_trash_row():
 
 
 def test_uncaptured_rows_stay_warmup_safe():
-    """CUDA-graph warmup replays decode with dummy request rows before any
-    draft-extend ran; a never-captured row must resolve to logical index 0
-    (attend the first token), never an empty or invalid selection."""
+    """Graph warmup runs decode on rows never captured by a draft extend;
+    such a row must resolve to logical index 0, never an empty or invalid selection."""
     state = _make_state(num_requests=4)
     got = state.lookup(
         torch.tensor([0, 3]), torch.zeros(2, dtype=torch.int32), layer_id=48
@@ -212,12 +201,8 @@ def test_uncaptured_rows_stay_warmup_safe():
 
 
 def test_reuse_and_capture_gating_by_mode_state_and_rewrite():
-    """Only decode steps of a backend that carries the shared state may skip
-    the indexer, and only genuine extend flavors may capture: the target
-    backend (no state), target-verify, and DP MAX_LEN mode rewrites
-    (_original_forward_mode set) keep the normal indexer path -- a wrong
-    True here either corrupts target selection or captures from a
-    fabricated batch with no requests."""
+    """Only decode steps of a state-carrying backend may reuse indices,
+    and only genuine extend flavors (no DP MAX_LEN rewrite) may capture."""
     backend = _make_backend()
     decode_batch = _forward_batch(ForwardMode.DECODE)
     assert not backend.should_reuse_mtp_sparse_indices(decode_batch)
@@ -240,11 +225,8 @@ def test_reuse_and_capture_gating_by_mode_state_and_rewrite():
 
 
 def test_index_share_flag_reads_override_and_checkpoint_locations():
-    """--json-model-override-args lands the flag on the TOP-LEVEL hf_config
-    while checkpoints carry it on the nested text_config; reading only
-    hf_text_config silently disabled the feature for override-launched
-    servers (caught as a boot with no 'index sharing enabled' log and
-    OFF-band accept)."""
+    """--json-model-override-args puts the flag on the top-level hf_config,
+    while checkpoints carry it on text_config; both locations must be read."""
     from sglang.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
 
     override_style = SimpleNamespace(

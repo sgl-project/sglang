@@ -167,9 +167,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         if hc_hidden_states is None:
             return
 
-        # EAGLE v2 stores one hidden state per request in the future map.
-        # When draft extend emits a token-shaped HC tensor, keep only the
-        # last token per request so the overlap cache sees [bs, hidden].
+        # The EAGLE v2 future map holds one hidden state per request;
+        # reduce a token-shaped draft-extend HC tensor to its last token per request.
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and forward_batch.extend_seq_lens is not None

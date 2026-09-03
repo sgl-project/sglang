@@ -21,12 +21,8 @@ def _reference_hc_combine(
     hs: int,
     compute_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Eager reference, mirrors GatedResidual._combine_compute in
-    hyperconnection.py.
-
-    With compute_dtype=float64 this serves as the near-exact reference for
-    precision assertions.
-    """
+    """Eager reference mirroring ``GatedResidual._combine_compute``;
+    ``compute_dtype=torch.float64`` is the near-exact reference."""
     R = residual.to(compute_dtype).unflatten(-1, (hc, hs))
     gates = 2 * torch.sigmoid(
         F.linear(normed_residual.to(compute_dtype), inject_weight.to(compute_dtype))
@@ -47,12 +43,9 @@ def _make_inputs(
     return block_output, residual, normed_residual, inject_weight
 
 
-# Tolerances are at the output-dtype quantization floor, measured against the
-# fp64 reference on B300 (sm103), worst case over M in {1,7,128,8192}: bf16 max
-# rel err 7.8e-3 (exactly 1 ulp at the lower edge of a binade, 9 / 83.8M
-# elements at M=8192), fp16 max rel err below 1e-3 (1 ulp = 9.8e-4). The kernel
-# accumulates in fp32 like the eager fp32 path; the residual error is fp32
-# dot-product reordering flipping the final bf16/fp16 rounding at ties.
+# Worst case over M in {1, 7, 128, 8192} against the fp64 reference on B300 (sm103):
+# bf16 max rel err 7.8e-3 (1 ulp at a binade edge), fp16 below 1e-3 (1 ulp = 9.8e-4);
+# the residual is fp32 reordering flipping the final rounding.
 _TOLERANCES = {
     torch.bfloat16: dict(rtol=1e-2, atol=5e-3),
     torch.float16: dict(rtol=1e-3, atol=1e-3),

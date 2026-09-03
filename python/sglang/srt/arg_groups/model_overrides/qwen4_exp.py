@@ -16,28 +16,16 @@ from sglang.srt.arg_groups.model_override_base import (
     use_mla_backend,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
 
 @_register_for("Qwen4ExpForConditionalGeneration")
 def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Qwen4-Exp keeps the MoE config under ``text_config``; every layer is
-    sparse, so a dense-MLP TP size of 1 only stalls the DP MoE path.
-
-    The arch shares the qwen3_5 hybrid stack but is not registered with
-    ``_qwen3_5_hybrid_overrides``: compressed QSA must own ``page_size``
-    (two family modules may never declare the same field for one arch), so
-    the hybrid family's attention-shape policy is restated here and the
-    compressed variant overrides its page choice. Compressed QSA pins
-    page_size=64: its compressed cache is addressed as
-    ``full_slot // compress_ratio`` (the DSV4 scheme), which requires
-    page-aligned full-KV allocation with the page a multiple of the compress
-    ratio, and page-granular prefix sharing so shared pages share their
-    compressed slots. MambaRadixCache supports page_size > 1 only with the
-    mamba extra-buffer strategy, so the QSA pool fails fast at boot when
-    neither that nor --disable-radix-cache holds.
+    """Compressed QSA must own ``page_size`` here,
+    so the qwen3_5 hybrid attention-shape policy is restated rather than shared.
+    page_size=64 needs page-aligned full-KV allocation (slots are full_slot // ratio),
+    which MambaRadixCache allows only with mamba extra-buffer or --disable-radix-cache.
     """
     cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
@@ -46,7 +34,8 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         import torch
 
         overrides["ple_offload_embedding"] = (
-            is_cuda() and model_config_of(server_args).dtype == torch.bfloat16
+            get_platform().is_cuda
+            and model_config_of(server_args).dtype == torch.bfloat16
         )
 
     text_config = getattr(hf_config, "text_config", hf_config)
@@ -79,14 +68,8 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
 
     profile = parse_qsa_profile(hf_config)
     if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
-        # Unconditional, like DeepSeek-V4's page-256 declaration: compressed
-        # addressing is full_slot // ratio and requires page-aligned
-        # allocation on every backend. Do not gate this on
-        # mamba_radix_cache_strategy — that field resolves in a later pass
-        # (mid-resolution it still holds the unresolved default, which made
-        # this declaration silently skip on non-SM100 boxes); if the finally
-        # resolved strategy cannot support page > 1, MambaRadixCache's own
-        # boot assertion reports it.
+        # Compressed slot = full_slot // ratio; all backends need page-aligned pages.
+        # mamba_radix_cache_strategy resolves later, so do not gate on it.
         overrides["page_size"] = 64
         logger.info(
             "Setting page size to 64 for compressed QSA "

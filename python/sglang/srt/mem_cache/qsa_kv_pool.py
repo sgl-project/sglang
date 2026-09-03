@@ -1,10 +1,4 @@
-"""KV pools carrying the QSA sparse-attention indexer caches.
-
-``QSATokenToKVPool`` (compressed, Qwen4-Exp) adds the per-token BF16 index-key
-state, its RoPE coordinates, and the paged compressed-K cache on top of the
-hybrid full/linear KV pool. ``QwenDSATokenToKVPool`` (tokenwise,
-Qwen3Next-DSA) adds only the flat per-token index-K cache.
-"""
+"""KV pools carrying the QSA sparse-attention indexer caches."""
 
 from __future__ import annotations
 
@@ -22,31 +16,18 @@ def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
 class QSATokenToKVPool(HybridLinearKVPool):
     """Hybrid KV pool with the minimal BF16 state required by simple QSA."""
 
-    # DSV4-style compressed addressing: the full-KV allocator is paged with
-    # the page a multiple of the compress ratio, so every compression
-    # group's raw tokens are contiguous in one page and
-    # ``compressed_slot = full_slot // compress_ratio`` is a stable,
-    # collision-free mapping (any of the group's slots floor-divides to the
-    # same value). The compressed cache therefore has exactly
-    # ``full_slots // ratio`` slots, its lifecycle rides the full-KV
-    # allocator and radix tree (page-granular sharing shares compressed
-    # slots by arithmetic), and no ownership bookkeeping exists. Full slot 0
-    # is the pools' reserved padding slot, so compressed slot 0 stays the
-    # inert dump target for non-boundary rows.
+    # Full-KV pages are a multiple of the compress ratio, so no group straddles pages;
+    # ``compressed_slot = full_slot // ratio`` needs no ownership bookkeeping;
+    # lifecycle rides the full-KV allocator and radix tree.
+    # Full slot 0 is the reserved padding slot; compressed slot 0 is the inert dump.
     index_state_dtype = torch.bfloat16
 
     @classmethod
     def qsa_bytes_per_token(
         cls, *, kv_heads: int, head_dim: int, compress_ratio: int, num_layers: int
     ) -> int:
-        """Per-token cost of the QSA index caches: the compressed keys only.
-
-        Pre-compression state is a per-request ring of ``compress_ratio``
-        slots (the pending group's members), not a per-token cache, so it
-        does not price per token; its total is bounded by the request-slot
-        count and stays outside this budget like the other per-request
-        buffers.
-        """
+        """Per-token QSA index-cache cost: compressed keys only;
+        the per-request pending ring is budgeted with the other per-request buffers."""
         index_k_bytes = _index_k_bytes(
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
         )
@@ -84,9 +65,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
                 "needs the mamba extra-buffer strategy or "
                 "--disable-radix-cache (see the Qwen4-Exp arg overrides)."
             )
-        # The base __init__ computes mem_usage through the overridden
-        # get_kv_size_bytes before the QSA buffers exist; give them empty
-        # placeholders first and recompute mem_usage at the end.
+        # super().__init__ computes mem_usage via the overridden get_kv_size_bytes,
+        # so the QSA buffers get placeholders first; mem_usage is recomputed last.
         self.qsa_key_state_buffer_pool = []
         self.qsa_compressed_k_buffer_pool = []
         self.qsa_rope_position_buffer = torch.empty(0)
@@ -129,15 +109,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request RING, not a
-        # per-token cache: once a group's compressed key is written, its raw
-        # members are never read again, and page-granular prefix sharing
-        # keeps every extend chunk group-aligned, so the only state that
-        # must survive a forward is the pending group's members -- at most
-        # ``ratio`` tokens per request, addressed as
-        # ``req_pool_idx * ratio + position % ratio``. Request slot 0 is
-        # never allocated, so ring rows [0, ratio) double as the inert dump
-        # for tokens whose group already compressed in the same forward.
+        # Pre-compression index-K state is a per-request ring, not a per-token cache:
+        # only the pending group's ``ratio`` members must survive a forward,
+        # addressed as ``req_pool_idx * ratio + position % ratio``.
+        # Request slot 0 is never allocated, so rows [0, ratio) are the inert dump.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
@@ -152,9 +127,8 @@ class QSATokenToKVPool(HybridLinearKVPool):
             )
             for _ in full_attention_layer_ids
         ]
-        # RoPE coordinates are layer-independent.  Keep the exact Qwen4-Exp MRoPE
-        # position of every pending key so compression can rotate the pooled
-        # key with the group's real starting coordinate.
+        # Layer-independent MRoPE coordinate of every pending key;
+        # the compress kernel rotates the pooled key at the group's real start position.
         self.qsa_rope_position_buffer = torch.zeros(
             (ring_slots, 3), dtype=torch.int64, device=device
         )
@@ -235,14 +209,9 @@ class QSATokenToKVPool(HybridLinearKVPool):
 
 
 class QwenDSATokenToKVPool(HybridLinearKVPool):
-    """Hybrid KV pool carrying the per-token index-K cache of tokenwise QSA.
-
-    Only the BF16 reference layout is ported: one flat
-    ``[size + page_size, index_kv_heads, index_head_dim]`` buffer per
-    full-attention (DSA) layer, addressed by raw KV slots.  The FP8
-    deep_gemm layout is intentionally not ported yet and the caller-side
-    fast paths fail loudly instead of silently degrading.
-    """
+    """Hybrid KV pool carrying the per-token index-K cache of tokenwise QSA:
+    a ``[size + page_size, index_kv_heads, index_head_dim]`` BF16 buffer per DSA layer,
+    addressed by raw KV slots; the FP8 deep_gemm layout is deliberately absent."""
 
     index_state_dtype = torch.bfloat16
 

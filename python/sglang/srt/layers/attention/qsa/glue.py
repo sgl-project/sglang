@@ -1,10 +1,4 @@
-"""Assembly helpers shared by models that carry a QSA indexer.
-
-Models stay free of backend-wrapping details: they build their indexer via
-``build_qsa_indexer`` and fetch per-forward indexer metadata through
-``get_qsa_indexer_metadata``.  Hybrid wrappers expose ``get_indexer_metadata``
-themselves; the unwrap here only remains as a compatibility fallback.
-"""
+"""Assembly helpers shared by models that carry a QSA indexer."""
 
 from __future__ import annotations
 
@@ -22,11 +16,6 @@ def build_qsa_indexer(
     prefix: str = "",
     rotary_emb=None,
 ):
-    """Construct the indexer module matching ``config``'s QSA profile.
-
-    Only the compressed (Qwen4-Exp) variant has an indexer in this tree; the
-    tokenwise (qsa_0511) indexer arrives with its pool in a later stage.
-    """
 
     profile = parse_qsa_profile(config)
     if profile is None:
@@ -58,14 +47,9 @@ def build_qsa_indexer(
 
 
 def resolve_qsa_sparse_backend(attn_backend):
-    """Backend owning the QSA MTP sparse-selection hooks.
-
-    The draft-extend backend is the runner's hybrid wrapper; the MTP shared
-    selection lives on its full-attention side, so hook callers resolve
-    through the same unwrap as ``get_qsa_indexer_metadata``.  The sentinel is
-    the state setter -- the one hook every owner (per-step backend and
-    multi-step container alike) defines.
-    """
+    """Backend owning the QSA MTP sparse-selection hooks;
+    a hybrid wrapper keeps them on its full-attention side.
+    ``set_mtp_shared_sparse_indices`` is the probe, the one hook all owners define."""
 
     if hasattr(attn_backend, "set_mtp_shared_sparse_indices"):
         return attn_backend
@@ -78,12 +62,7 @@ def resolve_qsa_sparse_backend(attn_backend):
 
 
 def get_qsa_indexer_metadata(attn_backend, layer_id: int, forward_batch):
-    """Fetch indexer metadata from a (possibly hybrid-wrapped) backend.
-
-    Hybrid wrappers forward ``get_indexer_metadata`` to their full-attention
-    side for full-attention layers; unwrapping here is only a compatibility
-    fallback for backends that predate that passthrough.
-    """
+    """Fetch indexer metadata from a (possibly hybrid-wrapped) backend."""
 
     metadata = None
     get_metadata = getattr(attn_backend, "get_indexer_metadata", None)

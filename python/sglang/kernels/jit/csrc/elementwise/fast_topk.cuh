@@ -1,12 +1,6 @@
-// Radix-select fast top-k, adapted from sgl-kernel's AOT topk.cu (itself
-// adapted from tilelang's topk_selector). Ported to the JIT layer so that
-// kTopK = 512 support ships with the sglang python package instead of
-// requiring an sgl-kernel wheel release.
-//
-// Semantics match the AOT fast_topk_v2 op: for each row b, select the
-// kTopK largest scores in [row_starts[b], row_starts[b] + lengths[b]) and
-// write their indices relative to row_starts[b]. Output order within a row
-// is unspecified (atomic collection order), matching the AOT kernel.
+// Radix-select fast top-k with the AOT fast_topk_v2 semantics: for each row b,
+// select the kTopK largest scores in [row_starts[b], row_starts[b] + lengths[b])
+// and write their indices relative to row_starts[b]; order within a row is unspecified.
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 

@@ -1,9 +1,5 @@
-"""Region benchmark: eager QSA indexer-prep chain vs fused kernels.
-
-Measures the per-layer indexer-prep region (index-Q norm+rope, raw-K/RoPE
-position stores, compressed-K mean+norm+rope+store) at the decode shape
-(bs=1) and the prefill shape (M=8000). Multiply the decode number by 12 for
-the per-step total across Qwen4-Exp's 12 QSA layers.
+"""Eager QSA indexer-prep chain vs fused kernels at bs=1 decode and M=8000 prefill.
+Per layer; Qwen4-Exp has 12 QSA layers, so multiply the decode number by 12 per step.
 """
 
 from types import SimpleNamespace
@@ -80,10 +76,8 @@ def _build(num_tokens, num_groups, device):
         mrope_section=[24, 20, 20],
         mrope_interleaved=True,
     )
-    # Production capture sets sglang's capture-mode flag, which makes
-    # apply_rope skip the host-side cache-length check (positions.max().item()
-    # is a D2H sync that breaks graph capture). Mirror that here; the cos/sin
-    # cache is pre-built long enough.
+    # Mirror production graph capture: the cos/sin cache is pre-built long enough,
+    # and the capture-mode flag skips apply_rope's host-side cache-length check.
     import sglang.srt.layers.attention.qsa.qsa_indexer as _qsa_mod
 
     _qsa_mod.get_is_capture_mode = lambda: True

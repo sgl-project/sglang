@@ -364,7 +364,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 ) // scale_block_size
 
         cell_size += self._compute_qsa_cell_size(
-            hf_config=model_config.hf_text_config, num_layers=num_layers
+            hf_config=model_config.hf_config, num_layers=num_layers
         )
         return cell_size
 

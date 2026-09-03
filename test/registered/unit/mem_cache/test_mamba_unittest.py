@@ -678,10 +678,8 @@ class TestMamba(unittest.TestCase):
         self.assertEqual(len(pool.mamba_pool._slot_siblings), 1)
 
     def test_ngram_clear_slots_resets_window(self):
-        """A recycled slot must not carry its previous owner's N-gram window.
-
-        Slot reuse zeroes state through the deferred ``clear_slots`` (executed on
-        the forward stream); the sibling reset must ride the same call."""
+        """A recycled slot must not carry its previous owner's N-gram window;
+        the sibling reset must ride the same deferred ``clear_slots`` call."""
         pool = self._setup_pool_with_ngram()
         mamba_pool = pool.mamba_pool
         ngram = pool.ngram_pool
@@ -748,13 +746,8 @@ class TestMamba(unittest.TestCase):
         pool.mamba_pool.load_cpu_copy(payload, src)
 
     def test_mamba_track_aligned_lens_math(self):
-        """Pin the tracked-boundary arithmetic, incl. _force_track_h's +1 cancelling.
-
-        The scheduler sometimes passes `aligned + 1` (to push the SSM source onto the
-        intermediate-`h` path). That +1 must vanish under the floor division, else the
-        PLE side states snapshot one token past the mamba state. Impossible to notice
-        end-to-end, cheap to pin here.
-        """
+        """Floor division must swallow the scheduler's `aligned + 1` (_force_track_h),
+        or the PLE side states snapshot one token past the mamba state."""
         from types import SimpleNamespace
 
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -37,9 +37,8 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
     ):
         if hc_count <= 1:
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {hc_count}.")
-        # Qwen3.5/Qwen4-Exp checkpoints may provide RoPE settings under
-        # rope_parameters. Normalize it before parent init so Qwen3Next shared
-        # config logic sees the expected rope_scaling and rope_theta fields.
+        # Newer checkpoints spell rope_scaling/rope_theta as rope_parameters;
+        # Qwen3NextConfig.__init__ only reads the old names.
         if rope_parameters is not None:
             if kwargs.get("rope_scaling") is None:
                 kwargs["rope_scaling"] = rope_parameters
@@ -72,9 +71,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_offload_embedding = ple_offload_embedding
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
-        # MTP draft decode steps reuse the draft-extend indexer selection
-        # (GLM-5.2 IndexShare); default on for Qwen4-Exp, checkpoint config
-        # or --json-model-override-args can disable it.
+        # Draft decode steps reuse the draft-extend indexer top-k (IndexShare).
         self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
     @property

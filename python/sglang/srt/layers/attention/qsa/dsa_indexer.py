@@ -1,15 +1,9 @@
 """Tokenwise (per-token) QSA indexer for Qwen3Next-DSA models.
 
-Ported from qsa_0511's ``nsa/qwen_indexer.py`` (QwenIndexer) onto this tree's
-shared QSA pieces: ``QSAIndexerMetadata`` row semantics, the
-``QwenSparseAttnBackend`` sparse-attention kernels and the ``qsa_fast_topk``
-primitive.  A tokenwise profile has ``compress_ratio = 1`` and
-``block_topk = budget = 2048``; it never consumes the compressed-only MQA
-inputs (``get_prefill_mqa_inputs``/``get_decode_mqa_inputs``).
-
-Only the BF16 torch reference compute is ported.  The qsa_0511 FP8
-(deep_gemm) and TileLang MQA fast paths are deliberately out of scope here:
-requesting them fails loudly instead of silently degrading.
+A tokenwise profile has ``compress_ratio = 1`` and ``block_topk = budget = 2048``;
+it never consumes the compressed-only MQA inputs.
+Only the BF16 torch reference path is implemented;
+requesting the FP8 or TileLang fast paths fails loudly.
 """
 
 from __future__ import annotations
@@ -39,17 +33,7 @@ def torch_dsa_weighted_mqa_logits(
     k: torch.Tensor,
     score_scale: float,
 ) -> torch.Tensor:
-    """Lightning-Index scoring reference: ReLU dot-product + per-head weight.
-
-    Args:
-        q: ``[rows, n_heads, head_dim]``
-        w: ``[rows, n_heads]`` per-head scalar weights
-        k: ``[keys, 1, head_dim]`` for shared packed keys, or
-            ``[rows, keys, 1, head_dim]`` for per-row keys (paged modes).
-
-    Returns:
-        ``[rows, keys]`` float32 logits, divided by ``score_scale``.
-    """
+    """Lightning-Index scoring reference: ReLU dot-product weighted per head."""
 
     if k.ndim == 4:
         if k.shape[2] != 1 or k.shape[0] != q.shape[0]:
@@ -68,13 +52,8 @@ def torch_dsa_weighted_mqa_logits(
 
 
 class QwenDSAIndexer(MultiPlatformOp):
-    """Tokenwise Lightning Indexer producing ``[rows, 2048]`` logical indices.
-
-    Input and output contracts match the compressed ``QSAIndexer``:
-    ``forward_cuda(hidden_states, positions, forward_batch, indexer_metadata)``
-    returns per-query-row logical token indices consumed as ``topk_indices``
-    by ``QwenSparseAttnBackend``.
-    """
+    """Tokenwise Lightning Indexer with the compressed ``QSAIndexer`` forward contract;
+    returns per-row logical token indices consumed as ``topk_indices``."""
 
     def __init__(
         self,
@@ -133,10 +112,8 @@ class QwenDSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
-        # Independent RoPE for indexer Q/K (qsa_0511): the main attention RoPE
-        # is shaped for the main head_dim, so the indexer keeps its own
-        # indexer-shaped instance and never touches another model's RoPE
-        # internals.  The effective rotary width follows the main attention's.
+        # The indexer keeps its own RoPE instance shaped for index_head_dim;
+        # its rotary width follows the main attention's partial_rotary_factor.
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is None:
             rope_scaling = getattr(config, "rope_parameters", None)
@@ -202,9 +179,8 @@ class QwenDSAIndexer(MultiPlatformOp):
         )
         is_paged = forward_mode.is_decode() or is_target_verify or is_draft_extend
         if is_paged:
-            # See the compressed QSAIndexer: speculative/decode rows derive
-            # their physical causal length from the paged metadata, not from
-            # the model's RoPE coordinate.
+            # Paged rows take their causal length from the paged metadata,
+            # not the model's RoPE coordinate, as in the compressed QSAIndexer.
             logical_positions = indexer_metadata.get_seqlens_expanded() - 1
         else:
             logical_positions = getattr(forward_batch, "positions", None)
@@ -212,9 +188,8 @@ class QwenDSAIndexer(MultiPlatformOp):
                 logical_positions = positions[0] if positions.ndim == 2 else positions
             logical_positions = logical_positions.flatten()
 
-        # DP padding adds token rows without assigning them to a request;
-        # token_to_batch_idx is the source of truth for semantic rows, exactly
-        # like the compressed indexer.
+        # DP padding adds token rows that belong to no request;
+        # token_to_batch_idx is the source of truth for semantic rows.
         num_valid_tokens = indexer_metadata.get_token_to_batch_idx().numel()
         if logical_positions.numel() < num_valid_tokens:
             raise ValueError(

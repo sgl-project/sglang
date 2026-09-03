@@ -613,10 +613,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
     def test_qwen4_ple_offload_default(self):
-        from sglang.srt.arg_groups.model_overrides import qwen4_exp as qwen4_module
-
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        with patch.object(qwen4_module, "is_cuda", return_value=True):
+        with override_platform(is_cuda=True):
             for kwargs, expected in (
                 ({}, True),
                 ({"dtype": "float16"}, False),
@@ -633,7 +631,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
             with self.assertRaisesRegex(ValueError, "cannot be combined"):
                 self._construct(*qwen4, cpu_offload_gb=1)
-        with patch.object(qwen4_module, "is_cuda", return_value=False):
+        with override_platform(is_cuda=False, is_hip=True):
             self.assertFalse(
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )

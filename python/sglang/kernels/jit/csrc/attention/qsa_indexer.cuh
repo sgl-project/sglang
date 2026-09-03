@@ -1,25 +1,5 @@
 // Fused QSA (Qwen4-Exp sparse attention) indexer-prep kernels.
-//
-// qsa_index_q_prep_kernel replaces, per token, the eager chain
-//   split -> GemmaRMSNorm(index q) -> MRoPE(index q)
-//   -> set_qsa_key_state_buffer(raw token k) -> set_qsa_rope_position_buffer
-// with a single kernel launch. q rows are normalised per (token, head) and
-// rotated with the model's (multimodal) RoPE; the raw k row and the RoPE
-// coordinates are written to the indexer state buffers.
-//
-// qsa_index_k_compress_kernel replaces, per completed compress group,
-//   gather group -> fp32 mean -> round to storage dtype -> GemmaRMSNorm
-//   -> MRoPE(group-start position) -> set_qsa_compressed_k_buffer
-// with one warp per group.
-//
-// Numerics follow the eager chain step by step so results are bit-identical:
-//   - norm: fp32 sum of squares, rsqrt(mean + eps), x * nf * (1 + w) rounded
-//     once to the storage dtype (matches sgl_kernel gemma_rmsnorm);
-//   - rope: cos/sin are rounded to the storage dtype first, every elementary
-//     multiply/add is rounded to the storage dtype, matching PyTorch's
-//     opmath (fp32) + per-op rounding on 2-byte tensors;
-//   - mean: fp32 sequential accumulation over the group, scaled by 1/ratio,
-//     rounded to the storage dtype before the norm reads it.
+// Outputs are bit-identical to the eager bf16/fp16 aten chain, mirrored step by step.
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>

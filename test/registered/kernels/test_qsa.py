@@ -582,9 +582,7 @@ def test_qsa_draft_extend_backend_decision_follows_profile():
             speculative_num_steps=3,
         )
 
-    # Compressed profiles run draft-extend through the draft model runner's
-    # own (QSA-wrapped hybrid) backend; the draft-extend CUDA graph replays
-    # it with variable accepted rows padded to the captured width.
+    # Compressed profiles reuse the draft runner's own QSA-wrapped hybrid backend.
     assert (
         factory(_compressed_config_namespace()).create_draft_extend_backend()
         == "draft-runner-backend"
@@ -759,7 +757,7 @@ def test_qwen_dsa_select_paged_picks_per_row_windows():
     pool = SimpleNamespace()
     # score(row, col) = relu(k[col, 0, 0]) * 2 (see q/w below).
     index_k = torch.zeros(8, 1, 4, dtype=torch.bfloat16)
-    # row 0 sees slots 1,2,3 (len 3): scores 10, 6, 2 → picks cols 0,1,2.
+    # row 0 sees slots 1,2,3 (len 3): scores 10, 6, 2 -> picks cols 0,1,2.
     index_k[1, 0, 0] = 5
     index_k[2, 0, 0] = 3
     index_k[3, 0, 0] = 1
@@ -789,8 +787,8 @@ def test_qwen_dsa_select_prefill_respects_causal_windows():
     from sglang.srt.layers.attention.qsa.dsa_indexer import QwenDSAIndexer
 
     index_k = torch.zeros(16, 1, 4, dtype=torch.bfloat16)
-    # seq 0 packed slot 4 is its logical col 1; seq 1 packed slots are
-    # [8, 9, 10, 11, 12] → slot 9 is its logical col 1, slot 12 its col 4.
+    # seq 0 packed slot 4 is its logical col 1; seq 1 packs slots [8, 9, 10, 11, 12],
+    # so slot 9 is its logical col 1 and slot 12 its col 4.
     index_k[4, 0, 0] = 8
     index_k[9, 0, 0] = 8
     index_k[12, 0, 0] = 20
@@ -812,8 +810,8 @@ def test_qwen_dsa_select_prefill_respects_causal_windows():
     logical_positions = torch.tensor([1, 2, 3, 1, 2, 3, 4], dtype=torch.int64)
     out = QwenDSAIndexer._select_prefill(indexer, q, w, logical_positions, metadata)
     assert out.shape == (7, 4)
-    # A row may never select a column beyond its causal end — in particular
-    # seq 1 rows before position 4 must not see the hot col 4.
+    # A row may never select a column beyond its causal end;
+    # in particular, seq 1 rows before position 4 must not see the hot col 4.
     for row, position in enumerate(logical_positions.tolist()):
         valid = out[row][out[row] >= 0]
         assert int(valid.max() if valid.numel() else 0) <= position
@@ -1381,10 +1379,8 @@ def test_qsa_decode_requires_one_query_row_per_request():
 
 
 def test_qsa_tokenwise_decode_metadata_skips_compressed_precompute():
-    """Tokenwise pools carry no compressed-page geometry; the once-per-forward
-    decode-MQA precompute is a compressed-variant fast path and must not read
-    qsa_compressed_page_size off a tokenwise pool -- an ungated read crashed
-    every tokenwise decode forward with AttributeError."""
+    """A tokenwise pool carries no compressed-page geometry;
+    the decode-MQA precompute must not read qsa_compressed_page_size off it."""
 
     class _TokenwisePool:
         qsa_compress_ratio = 1
@@ -1421,12 +1417,8 @@ def test_qsa_tokenwise_decode_metadata_skips_compressed_precompute():
 
 
 def test_qsa_extend_rope_matrix_uses_mrope_coordinates():
-    """VL models swap the layer positions to forward_batch.mrope_positions
-    ([3, N] t/h/w); the build-time extend_rope_matrix must be built from that
-    source -- building it from the flat 1-D positions RoPEs prefill-compressed
-    keys with wrong coordinates while decode-compressed keys of the same
-    request use true mrope coords, silently corrupting indexer selection on
-    image-bearing sequences."""
+    """extend_rope_matrix must be built from forward_batch.mrope_positions ([3, N])
+    when set, so prefill- and decode-compressed keys RoPE with the same coordinates."""
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
     num_tokens = 8
@@ -1984,12 +1976,9 @@ def test_qsa_sparse_attention_matches_explicit_gqa():
 
 
 def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
-    """Each MTP draft step's metadata must reference the same out_cache_loc
-    slice EAGLEWorker.draft_forward assigns for that step. The failure mode
-    this guards: every QSA step writing its key state into the first
-    ``batch_size`` slots of the shared buffer (the per-step layout tests
-    that covered this went with the loc-map suite; the helper is unchanged
-    and still the only mapping between the two layouts)."""
+    """EagleDraftWorker.draft_forward gives each MTP draft step an out_cache_loc slice;
+    the step's metadata must reference that slice, not the first batch_size slots.
+    """
     from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
         QwenSparseMultiStepDraftBackend,
     )
@@ -2019,9 +2008,8 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
 
 
 def test_qsa_graph_metadata_kernels_match_legacy_host_path():
-    """The recorded replay kernels and the legacy host refresh must produce
-    identical graph buffers from the same lengths + ledger sidecar, for both
-    decode rows and target-verify row fan-out (boundary and non-boundary)."""
+    """For decode rows and target-verify fan-out (boundary and non-boundary),
+    replay kernels and the host refresh must build identical graph buffers."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"
@@ -2154,9 +2142,7 @@ def test_qsa_graph_metadata_kernels_match_legacy_host_path():
 def _qsa_expected_graph_layout(
     *, mode, bs, num_rows, seq_lens, req_pool, extend_lens, extend_len, num_padding
 ):
-    """Host reimplementation of the graph layout contract (per-request rows +
-    padded dummy tail), used to check the kernels independently rather than
-    against another implementation of the same walk."""
+    """Independent host oracle for the graph row layout and padded dummy tail."""
     real_reqs = bs - num_padding
     row_lens, row_prefix, row_reqs = [], [], []
     for pid in range(bs):
@@ -2186,13 +2172,8 @@ def _qsa_expected_graph_layout(
 
 
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail():
-    """The recorded layout kernel must reproduce the per-step speculative row
-    fan-out (uniform target-verify window and per-request draft-extend lengths)
-    and the padded dummy-tail contract, and the row-metadata kernel must derive
-    compressed lengths / boundary write slots / group state locs from those
-    rows under arithmetic compressed addressing (write slot = boundary token's
-    full slot // ratio; non-boundary rows keep the inert reserved slot 0).
-    """
+    """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;
+    the row-metadata kernel must derive compressed slots from those rows."""
     from sglang.srt.layers.attention.qsa.graph_metadata import launch_graph_metadata
 
     device = "cuda"

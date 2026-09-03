@@ -1,9 +1,5 @@
-"""Weight-free TileLang MQA operators for the simple QSA indexer.
-
-The CUDA kernels are reduced versions of the previously validated Qwen MQA
-kernels: the per-head weight input and all unrelated feature branches are
-removed. Torch implementations are kept as the only fallback and reference.
-"""
+"""Weight-free TileLang MQA operators for the simple QSA indexer;
+the torch implementations are the fallback and the reference."""
 
 import math
 from typing import Optional
@@ -211,9 +207,8 @@ if HAS_TILELANG:
         num_stages: int = 3,
         threads: int = 128,
     ):
-        # The validated MMA layout wants 64 GEMM rows; pages narrower than
-        # that (full_page // ratio compressed views) are packed in sub-page
-        # quadrants of one 64-row tile.
+        # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
+        # so pages are packed as sub-pages of one 64-row tile.
         GROUP = 64
         assert GROUP % page_size == 0, page_size
         sub_pages = GROUP // page_size
@@ -246,9 +241,8 @@ if HAS_TILELANG:
                 for gi in T.Pipelined(groups_per_cta, num_stages=num_stages):
                     group = group_block * groups_per_cta + gi
                     if group * GROUP < context_len:
-                        # Python-level unroll: sub_pages is a compile-time
-                        # constant and TileLang's pipeliner rejects dynamic
-                        # inner loops around shared-memory copies.
+                        # TileLang's pipeliner rejects dynamic loops around smem copies;
+                        # unroll at the Python level instead.
                         for sp in range(sub_pages):
                             if (group * sub_pages + sp) * page_size < context_len:
                                 T.copy(
@@ -302,9 +296,8 @@ def tilelang_qsa_mqa_prefill(
     block_q = max(1, 128 // heads)
     padding = (-rows) % block_q
     padded_rows = rows + padding
-    # Allocate the padded output once. Appending even a few padding rows with
-    # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
-    # temporarily doubling the dominant prefill buffer for long contexts.
+    # A torch.cat of the padding rows would copy the whole [rows, keys] fp32 matrix,
+    # doubling the dominant prefill buffer; allocate pre-padded instead.
     logits = torch.zeros((padded_rows, keys), dtype=torch.float32, device=q.device)
     q_padded = q.to(torch.bfloat16).contiguous()
     starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()

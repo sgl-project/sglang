@@ -146,8 +146,8 @@ def qsa_index_k_compress_store(
     ----------
     key_state_buffer : CUDA bf16/fp16 [slots, head_dim] raw-K state buffer
     group_locs       : CUDA int32 [groups, compress_ratio] state slots of each
-                       completed group, group-start slot first? (any order;
-                       rope position is read from column 0)
+                       completed group, group-start slot in column 0 (its RoPE
+                       position rotates the group; other columns any order)
     rope_position_buffer : CUDA int64 [slots, 3] per-slot RoPE coordinates
     cos_sin_cache    : CUDA fp32 [capacity, rotary_dim] RoPE cache
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index

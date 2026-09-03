@@ -18,9 +18,8 @@ if TYPE_CHECKING:
 @cache_once
 def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
     """Compile and cache the JIT grouped Gemma RMSNorm module."""
-    # Checks on the compile key live here, not in `grouped_gemma_rmsnorm`:
-    # `cache_once` keys on (group_size, dtype), so this runs once per
-    # specialisation instead of once per call.
+    # Validation sits under `cache_once`: once per (group_size, dtype) specialisation,
+    # not once per call.
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if group_size <= 0 or group_size % 512 != 0:

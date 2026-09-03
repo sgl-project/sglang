@@ -368,12 +368,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
     def _configure_qsa_mtp_index_share(self) -> None:
-        """Share the draft-extend's target-aligned QSA selection across the
-        MTP decode steps (config-gated: index_share_for_mtp_iteration).
-
-        Chain speculation only: with topk > 1 the decode rows are not
-        request-major, so the captured per-request row has no unique reader.
-        """
+        """Reuse the draft-extend QSA selection across the MTP decode steps;
+        chain speculation only: with topk > 1 decode rows are not request-major."""
         from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
         from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
@@ -381,9 +377,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         hf_config = self.draft_runner.model_config.hf_config
-        requested = _qsa_index_share_requested(hf_config)
         if (
-            not requested
+            not _qsa_index_share_requested(hf_config)
             or self.topk != 1
             or self.speculative_num_steps <= 1
             or not is_qwen_qsa(hf_config)
@@ -392,9 +387,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             return
         if get_spec().speculative_adaptive:
-            # Adaptive candidates rebuild this worker per step count around
-            # one shared draft-extend backend; the shared selection state is
-            # not sized or validated for that regime.
+            # Adaptive speculation rebuilds this worker per step count,
+            # sharing one draft-extend backend; the shared state is not sized for that.
             logger.warning(
                 "index_share_for_mtp_iteration is disabled under adaptive "
                 "speculative decoding"
@@ -544,9 +538,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tuple(graph_supported_backend_types),
         )
         if not graph_supported_backend and self.draft_extend_attn_backend is not None:
-            # Qwen QSA keeps draft-extend metadata graph-stable (variable
-            # accepted rows padded to the captured width), so its hybrid
-            # backend is graph-capable even though it is not in the list.
+            # Qwen QSA pads accepted rows to the captured width,
+            # so its hybrid backend is graph-capable although it is not in the list.
             graph_supported_backend = is_qwen_qsa(
                 self.draft_runner.model_config.hf_config
             )

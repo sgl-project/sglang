@@ -1,23 +1,11 @@
 """Shared QSA profile parsing across model variants.
 
-This module is the single place that understands how each model family
-describes its sparse-attention indexer in the HF config.  ``QSAProfile``
-normalizes those schemas so backends, draft utilities and model glue branch
-on a stable variant name instead of probing raw config keys.
-
-Two schemas are recognized today:
-
-- ``compressed`` (Qwen4-Exp): block compression with average pooling, carrying
-  ``indexer_n_heads``/``indexer_kv_heads``/``indexer_head_dim``/
-  ``indexer_budget``/``indexer_compress_ratio``.
-- ``tokenwise`` (qsa_0511 / Qwen3.5-DSA): per-token indexing, carrying
-  ``index_topk``/``index_n_heads``/``index_kv_heads``/``index_head_dim``.
-  Only the profile is recognized here; the tokenwise indexer/pool land in a
-  later stage.
-
-DeepSeek NSA configs also expose ``index_topk``, so the tokenwise schema is
-additionally gated on a Qwen ``model_type`` to keep DeepSeek draft creation
-on its own path.
+``QSAProfile`` normalizes each model family's HF-config indexer schema,
+so backends, draft utilities and model glue branch on a stable variant name,
+not on raw config keys. ``compressed`` is Qwen4-Exp block compression;
+``tokenwise`` is qsa_0511 / Qwen3.5-DSA per-token indexing.
+DeepSeek NSA configs also expose ``index_topk``,
+so the tokenwise schema is additionally gated on a Qwen ``model_type``.
 """
 
 from __future__ import annotations
@@ -149,19 +137,14 @@ def _parse_tokenwise(text_config) -> QSAProfile:
         compress_ratio=1,
         # The tokenwise indexer owns plain per-token rotary positions.
         rope_mode=QSA_ROPE_PLAIN,
-        # qsa_0511 runs tokenwise draft-extend on a real graphable backend.
-        # This tree's BF16 reference indexer is not graph-stable yet, so the
-        # flag stays off and draft-extend runs eagerly through the shared
-        # backend.  Flip it only together with a graph-ready tokenwise path.
+        # The BF16 reference tokenwise indexer is not graph-stable;
+        # keep this off until a graph-ready tokenwise path lands.
         draft_extend_cuda_graph=False,
     )
 
 
 def parse_qsa_profile(config) -> Optional[QSAProfile]:
-    """Return the normalized QSA profile for ``config``, or None if absent.
-
-    Raises ValueError when a QSA schema is present but malformed.
-    """
+    """QSA profile of config, None if absent; malformed schemas raise ValueError."""
 
     if config is None:
         return None

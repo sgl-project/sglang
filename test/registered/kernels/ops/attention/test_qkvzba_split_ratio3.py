@@ -12,9 +12,8 @@ register_cuda_ci(est_time=4, stage="base-b", runner_config="1-gpu-large")
 
 
 def _reference(mixed_qkvz, mixed_ba, nq, nv, head_qk, head_v):
-    """Contiguous [all_q|all_k|all_v|all_z] / [all_b|all_a] split, mirroring
-    Qwen3_5GatedDeltaNet.fix_query_key_value_ordering plus the fused path's
-    cat/reshape."""
+    """Contiguous split mirroring Qwen3_5GatedDeltaNet.fix_query_key_value_ordering,
+    followed by the fused path's cat/reshape."""
     k_tp = nq * head_qk
     v_tp = nv * head_v
     q, k, v, z = mixed_qkvz.split([k_tp, k_tp, v_tp, v_tp], dim=-1)
@@ -30,9 +29,8 @@ def _reference(mixed_qkvz, mixed_ba, nq, nv, head_qk, head_v):
 
 @pytest.mark.parametrize("batch", [1, 4, 33])
 def test_strided_views_from_fused_in_proj_output(batch):
-    """The merged in_proj GEMM emits one [batch, qkvz+ba] tensor whose qkvz/ba
-    column views share a row stride wider than their own width; the split
-    kernel must honor those strides instead of assuming contiguity."""
+    """The qkvz/ba column views of the merged in_proj output are not contiguous:
+    their row stride is wider than their width; the split kernel must honor it."""
     torch.manual_seed(0)
     nq, nv, head_qk, head_v = 4, 12, 128, 128
     qkvz_width = 2 * nq * head_qk + 2 * nv * head_v

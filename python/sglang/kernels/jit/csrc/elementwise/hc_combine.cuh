@@ -61,9 +61,7 @@ __global__ __launch_bounds__(256) void hc_combine_kernel(const HcCombineParams _
 
   PDLWaitPrimary<kUsePDL>();
 
-  // Phase 1: gate values a_c = 2 * sigmoid(dot(N[m, :], W[c, :]) / HC), fp32.
-  // Each thread accumulates its kVecsPerThread strided vectors against all
-  // kHcCount weight rows, then the partials are reduced across the CTA.
+  // Phase 1: gate values a_c, accumulated in fp32 and reduced across the CTA.
   Storage n_vec[kVecsPerThread];
 #pragma unroll
   for (uint32_t j = 0; j < kVecsPerThread; ++j) {
