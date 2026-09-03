@@ -405,20 +405,25 @@ mod tests {
 
     #[test]
     fn build_policy_kind_only_covers_all_variants() {
-        for (kind, needs_load_snapshot) in [
-            (PolicyKind::RoundRobin, false),
-            (PolicyKind::Random, false),
-            (PolicyKind::PowerOfTwo, true),
-            (PolicyKind::LoadBased, true),
-            (PolicyKind::CacheAwareZmq, true),
-            (PolicyKind::SessionAware, true),
-            (PolicyKind::CacheAware, true),
-            (PolicyKind::Sticky, false),
+        for (kind, needs_load_snapshot, needs_dispatch_timestamps) in [
+            (PolicyKind::RoundRobin, false, false),
+            (PolicyKind::Random, false, false),
+            (PolicyKind::PowerOfTwo, true, false),
+            (PolicyKind::LoadBased, true, true),
+            (PolicyKind::CacheAwareZmq, true, true),
+            (PolicyKind::SessionAware, true, false),
+            (PolicyKind::CacheAware, true, false),
+            (PolicyKind::Sticky, false, false),
         ] {
             let policy = build_policy_kind_only(kind).unwrap();
             assert_eq!(
                 policy.needs_load_snapshot(),
                 needs_load_snapshot,
+                "{kind:?}"
+            );
+            assert_eq!(
+                policy.needs_dispatch_timestamps(),
+                needs_dispatch_timestamps,
                 "{kind:?}"
             );
         }

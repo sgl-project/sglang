@@ -25,15 +25,28 @@ use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde::Deserialize;
 
+/// V3 native Cache-Aware 实际消费的每个 rank 负载字段。
+///
+/// 这组字段追加在 #34608 原有四个 gauge 后面；短帧没有该值，绝不能用于
+/// admission 或 pressure guard。Router 仍可把短帧用于只需要 queue depth 的
+/// `cache_aware_zmq`，但 native `cache_aware` 会 fail closed 到本地负载。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCacheRankLoad {
+    pub num_waiting_uncached_tokens: u64,
+    pub num_total_tokens: u64,
+    pub max_running_requests: u64,
+    pub total_prefill_uncached_tokens: u64,
+    pub total_prefill_busy_us: u64,
+}
+
 /// Per-scheduler runtime load snapshot. Mirrors the Python `LoadStat` in
 /// `managers/scheduler_components/load_publisher.py`, published on the
 /// worker's dedicated load socket (separate from KV-cache events).
 ///
-/// Wire shape (msgspec `tag=True` + `array_like`):
-/// `["LoadStat", num_running_reqs, num_waiting_reqs, num_tokens,
-/// max_total_num_tokens, attn_dp_rank?]`. We read the four counts and ignore
-/// any trailing fields (`attn_dp_rank` — the router keys load by the
-/// subscriber's socket rank, not the payload).
+/// The stable prefix remains `["LoadStat", running, waiting, used_tokens,
+/// max_tokens, attn_dp_rank]`; V4 appends the V3 native Cache-Aware fields.
+/// Older publishers therefore decode successfully with `native_cache=None`,
+/// which deliberately excludes them from monitor-backed admission/guard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadStat {
     /// Requests currently running on the engine.
@@ -44,9 +57,15 @@ pub struct LoadStat {
     pub num_tokens: u64,
     /// KV-cache token capacity; 0 when unknown.
     pub max_total_num_tokens: u64,
+    /// V3 native Cache-Aware semantics. `None` means the publisher is an old
+    /// four-field #34608 producer or sent a truncated extension.
+    pub native_cache: Option<NativeCacheRankLoad>,
 }
 
-/// Aggregated, usable Engine load for one Worker at a fixed instant.
+/// 一个 Worker 在一次固定时刻采集到的可用 Engine 负载。
+///
+/// 只包含 #34608 实际发布的四个字段的跨 DP-rank 求和结果。`captured_at`
+/// 保留最老 rank 的接收时刻，供 Router 把该时刻之后的本地派发叠加到队列深度。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineWorkerLoad {
     pub num_running_reqs: u64,
@@ -56,11 +75,34 @@ pub struct EngineWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// Immutable Engine-load view captured once at request ingress.
+/// 完整 ZMQ monitor 聚合值，字段与 V3 native Cache-Aware 的输入保持一致。
+///
+/// `prefill_throughput_tokens_per_s` 和 `estimated_prefill_queue_ms` 只在
+/// 每个 DP rank 都有两个相邻且单调递增的累计样本时出现；counter reset 或首帧
+/// 不会伪造吞吐/queue-time。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeCacheWorkerLoad {
+    pub num_running_reqs: u64,
+    pub num_waiting_reqs: u64,
+    pub num_waiting_uncached_tokens: u64,
+    pub num_used_tokens: u64,
+    pub num_total_tokens: u64,
+    pub max_total_num_tokens: u64,
+    pub max_running_requests: u64,
+    pub prefill_throughput_tokens_per_s: Option<f64>,
+    pub estimated_prefill_queue_ms: Option<f64>,
+    pub captured_at: Instant,
+}
+
+/// 请求入口一次性捕获的不可变 Engine 负载视图。
+///
+/// key 为 Router 实际派发使用的 Worker URL。缺少、过期或 DP rank 不完整的
+/// Worker 不会出现在该映射中，消费者必须回退到 Router 本地 active-load。
 #[derive(Debug, Clone, Default)]
 pub struct EngineLoadSnapshot {
     pub version: u64,
     workers: HashMap<String, EngineWorkerLoad>,
+    native_cache_workers: HashMap<String, NativeCacheWorkerLoad>,
 }
 
 impl EngineLoadSnapshot {
@@ -68,9 +110,51 @@ impl EngineLoadSnapshot {
         self.workers.get(worker_url)
     }
 
-    /// Builds a view from already validated Worker data for tests and offline checks.
+    /// 仅返回 complete + fresh 的 V3-equivalent native Cache-Aware monitor。
+    pub fn fresh_native_cache_load_for_url(
+        &self,
+        worker_url: &str,
+    ) -> Option<&NativeCacheWorkerLoad> {
+        self.native_cache_workers.get(worker_url)
+    }
+
+    /// 用已经完成 freshness/rank 校验的 Worker 数据构造视图。主要供组件测试和
+    /// 离线策略验证复用；生产请求应通过 [`EngineLoadTable::capture_snapshot`] 获取。
     pub fn from_workers(version: u64, workers: HashMap<String, EngineWorkerLoad>) -> Self {
-        Self { version, workers }
+        Self {
+            version,
+            workers,
+            native_cache_workers: HashMap::new(),
+        }
+    }
+
+    /// 用完整语义 monitor 构造测试/离线快照。生产入口必须使用
+    /// [`EngineLoadTable::capture_snapshot`]，让 freshness、expected rank 与
+    /// publisher compatibility 都在同一边界内判定。
+    pub fn from_native_cache_workers(
+        version: u64,
+        workers: HashMap<String, NativeCacheWorkerLoad>,
+    ) -> Self {
+        let basic = workers
+            .iter()
+            .map(|(url, load)| {
+                (
+                    url.clone(),
+                    EngineWorkerLoad {
+                        num_running_reqs: load.num_running_reqs,
+                        num_waiting_reqs: load.num_waiting_reqs,
+                        num_tokens: load.num_used_tokens,
+                        max_total_num_tokens: load.max_total_num_tokens,
+                        captured_at: load.captured_at,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            version,
+            workers: basic,
+            native_cache_workers: workers,
+        }
     }
 }
 
@@ -116,12 +200,46 @@ impl<'de> Deserialize<'de> for LoadStat {
                 let max_total_num_tokens: u64 = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::missing_field("max_total_num_tokens"))?;
+                // `attn_dp_rank` is informational: the subscriber's socket
+                // rank is authoritative for aggregation. Keep accepting null
+                // and integer values from both old and new publishers.
+                let _attn_dp_rank: Option<IgnoredAny> = seq.next_element()?;
+
+                // The extension is deliberately all-or-nothing. A four-field
+                // #34608 message remains valid for lightweight queue routing,
+                // but a partial semantic tail is not valid monitor data.
+                let native_cache = match seq.next_element::<u64>()? {
+                    None => None,
+                    Some(num_waiting_uncached_tokens) => {
+                        let num_total_tokens = seq
+                            .next_element()?
+                            .ok_or_else(|| de::Error::missing_field("num_total_tokens"))?;
+                        let max_running_requests = seq
+                            .next_element()?
+                            .ok_or_else(|| de::Error::missing_field("max_running_requests"))?;
+                        let total_prefill_uncached_tokens =
+                            seq.next_element()?.ok_or_else(|| {
+                                de::Error::missing_field("total_prefill_uncached_tokens")
+                            })?;
+                        let total_prefill_busy_us = seq
+                            .next_element()?
+                            .ok_or_else(|| de::Error::missing_field("total_prefill_busy_us"))?;
+                        Some(NativeCacheRankLoad {
+                            num_waiting_uncached_tokens,
+                            num_total_tokens,
+                            max_running_requests,
+                            total_prefill_uncached_tokens,
+                            total_prefill_busy_us,
+                        })
+                    }
+                };
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(LoadStat {
                     num_running_reqs,
                     num_waiting_reqs,
                     num_tokens,
                     max_total_num_tokens,
+                    native_cache,
                 })
             }
         }
@@ -143,8 +261,12 @@ const DEFAULT_FRESHNESS: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 struct LoadEntry {
     load: LoadStat,
+    previous_native_cache: Option<NativeCacheRankLoad>,
     at: Instant,
 }
+
+type NativeRankObservation = (LoadStat, Option<NativeCacheRankLoad>, bool, Instant);
+type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
 
 /// Per-`(worker_url, dp_rank)` engine-reported load. Written by the load
 /// subscriber pump, read by the cache-aware-zmq policy. Shared out of
@@ -182,8 +304,19 @@ impl EngineLoadTable {
 
     /// Record the latest load for one `(worker_url, dp_rank)`.
     pub fn set(&self, url: &str, dp_rank: u32, load: LoadStat, at: Instant) {
-        self.by_rank
-            .insert((url.to_string(), dp_rank), LoadEntry { load, at });
+        let key = (url.to_string(), dp_rank);
+        let previous_native_cache = self
+            .by_rank
+            .get(&key)
+            .and_then(|entry| entry.load.native_cache.clone());
+        self.by_rank.insert(
+            key,
+            LoadEntry {
+                load,
+                previous_native_cache,
+                at,
+            },
+        );
         self.version.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -293,11 +426,127 @@ impl EngineLoadTable {
             .collect()
     }
 
-    /// Captures the immutable view consumed by all routing decisions in one request.
+    /// 完整 native Cache-Aware monitor 的聚合。与 basic gauge 的 freshness
+    /// boundary 完全一致，额外要求每个 rank 都带 #34608 扩展字段且容量有效。
+    /// 任何缺失、短帧、stale 或不完整 rank 都让该 worker 从 monitor-backed
+    /// admission/guard 中消失，调用方只能使用 router-local fallback。
+    fn fresh_native_cache_worker_loads(
+        &self,
+        now: Instant,
+    ) -> HashMap<String, NativeCacheWorkerLoad> {
+        let mut observed: HashMap<String, NativeWorkerObservations> = HashMap::new();
+        for entry in self.by_rank.iter() {
+            let at = entry.value().at;
+            let fresh = now.saturating_duration_since(at) <= self.freshness;
+            observed.entry(entry.key().0.clone()).or_default().insert(
+                entry.key().1,
+                (
+                    entry.value().load.clone(),
+                    entry.value().previous_native_cache.clone(),
+                    fresh,
+                    at,
+                ),
+            );
+        }
+        let mut expected: HashMap<String, HashSet<u32>> = HashMap::new();
+        for entry in self.expected.iter() {
+            expected
+                .entry(entry.key().0.clone())
+                .or_default()
+                .insert(entry.key().1);
+        }
+        let workers: HashSet<String> = observed.keys().chain(expected.keys()).cloned().collect();
+        workers
+            .into_iter()
+            .filter_map(|url| {
+                let ranks = observed.get(&url)?;
+                let required: Vec<u32> = match expected.get(&url) {
+                    Some(expected_ranks) => expected_ranks.iter().copied().collect(),
+                    None => ranks.keys().copied().collect(),
+                };
+                let mut num_running_reqs = 0u64;
+                let mut num_waiting_reqs = 0u64;
+                let mut num_waiting_uncached_tokens = 0u64;
+                let mut num_used_tokens = 0u64;
+                let mut num_total_tokens = 0u64;
+                let mut max_total_num_tokens = 0u64;
+                let mut max_running_requests = 0u64;
+                let mut oldest_at = None;
+                let mut prefill_throughput_tokens_per_s = 0.0f64;
+                let mut complete_prefill_sample = !required.is_empty();
+
+                for rank in required {
+                    let (load, previous, fresh, at) = ranks.get(&rank)?;
+                    let native = load.native_cache.as_ref()?;
+                    if !fresh || load.max_total_num_tokens == 0 || native.max_running_requests == 0
+                    {
+                        return None;
+                    }
+                    num_running_reqs = num_running_reqs.saturating_add(load.num_running_reqs);
+                    num_waiting_reqs = num_waiting_reqs.saturating_add(load.num_waiting_reqs);
+                    num_waiting_uncached_tokens = num_waiting_uncached_tokens
+                        .saturating_add(native.num_waiting_uncached_tokens);
+                    num_used_tokens = num_used_tokens.saturating_add(load.num_tokens);
+                    num_total_tokens = num_total_tokens.saturating_add(native.num_total_tokens);
+                    max_total_num_tokens =
+                        max_total_num_tokens.saturating_add(load.max_total_num_tokens);
+                    max_running_requests =
+                        max_running_requests.saturating_add(native.max_running_requests);
+                    oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
+
+                    match previous {
+                        Some(previous)
+                            if native.total_prefill_uncached_tokens
+                                > previous.total_prefill_uncached_tokens
+                                && native.total_prefill_busy_us
+                                    > previous.total_prefill_busy_us =>
+                        {
+                            let tokens = native.total_prefill_uncached_tokens
+                                - previous.total_prefill_uncached_tokens;
+                            let busy_us =
+                                native.total_prefill_busy_us - previous.total_prefill_busy_us;
+                            let rate = 1_000_000.0 * tokens as f64 / busy_us as f64;
+                            if rate.is_finite() && rate > 0.0 {
+                                prefill_throughput_tokens_per_s += rate;
+                            } else {
+                                complete_prefill_sample = false;
+                            }
+                        }
+                        _ => complete_prefill_sample = false,
+                    }
+                }
+                let prefill_throughput_tokens_per_s =
+                    complete_prefill_sample.then_some(prefill_throughput_tokens_per_s);
+                let estimated_prefill_queue_ms = prefill_throughput_tokens_per_s
+                    .map(|rate| 1_000.0 * num_waiting_uncached_tokens as f64 / rate);
+                oldest_at.map(|captured_at| {
+                    (
+                        url,
+                        NativeCacheWorkerLoad {
+                            num_running_reqs,
+                            num_waiting_reqs,
+                            num_waiting_uncached_tokens,
+                            num_used_tokens,
+                            num_total_tokens,
+                            max_total_num_tokens,
+                            max_running_requests,
+                            prefill_throughput_tokens_per_s,
+                            estimated_prefill_queue_ms,
+                            captured_at,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// 当前时间点的不可变视图。请求入口只应调用一次，再把这个值传给全部
+    /// Prefill/Cache/Session/Decode 决策，避免一次请求内部观察到不同负载。
     pub fn capture_snapshot(&self, now: Instant) -> EngineLoadSnapshot {
         EngineLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
             workers: self.fresh_worker_loads(now),
+            native_cache_workers: self.fresh_native_cache_worker_loads(now),
         }
     }
 
@@ -355,6 +604,7 @@ mod tests {
             num_waiting_reqs: waiting,
             num_tokens: 0,
             max_total_num_tokens: 0,
+            native_cache: None,
         }
     }
 
@@ -375,6 +625,44 @@ mod tests {
             rmp::encode::write_u64(&mut missing_count, value).unwrap();
         }
         assert!(decode_load_stat(&missing_count).is_err());
+    }
+
+    #[test]
+    fn load_wire_preserves_the_v3_native_cache_extension_and_accepts_old_short_frames() {
+        let mut full = Vec::new();
+        rmp::encode::write_array_len(&mut full, 11).unwrap();
+        rmp::encode::write_str(&mut full, "LoadStat").unwrap();
+        for value in [2, 3, 4, 100] {
+            rmp::encode::write_u64(&mut full, value).unwrap();
+        }
+        rmp::encode::write_nil(&mut full).unwrap();
+        for value in [500, 600, 32, 1_000, 2_000] {
+            rmp::encode::write_u64(&mut full, value).unwrap();
+        }
+        let decoded = decode_load_stat(&full).expect("complete extended LoadStat decodes");
+        assert_eq!(decoded.num_running_reqs, 2);
+        assert_eq!(
+            decoded
+                .native_cache
+                .expect("extension must be retained")
+                .num_waiting_uncached_tokens,
+            500
+        );
+
+        let mut old = Vec::new();
+        rmp::encode::write_array_len(&mut old, 6).unwrap();
+        rmp::encode::write_str(&mut old, "LoadStat").unwrap();
+        for value in [2, 3, 4, 100] {
+            rmp::encode::write_u64(&mut old, value).unwrap();
+        }
+        rmp::encode::write_nil(&mut old).unwrap();
+        assert!(
+            decode_load_stat(&old)
+                .expect("old #34608 four-field frame remains decodable")
+                .native_cache
+                .is_none(),
+            "short frames must never be promoted to complete native monitor data"
+        );
     }
 
     #[test]
@@ -485,5 +773,49 @@ mod tests {
         assert_eq!(t.expected_count(), 2);
         t.forget_worker("http://w:30000");
         assert_eq!(t.expected_count(), 1);
+    }
+
+    #[test]
+    fn complete_v3_semantic_samples_derive_prefill_queue_time() {
+        let t = EngineLoadTable::new();
+        let first = Instant::now();
+        let second = first + Duration::from_secs(2);
+        let mut old = load(2, 3);
+        old.num_tokens = 16_000;
+        old.max_total_num_tokens = 32_000;
+        old.native_cache = Some(NativeCacheRankLoad {
+            num_waiting_uncached_tokens: 1_000,
+            num_total_tokens: 20_000,
+            max_running_requests: 64,
+            total_prefill_uncached_tokens: 10_000,
+            total_prefill_busy_us: 2_000_000,
+        });
+        let mut new = old.clone();
+        new.num_tokens = 20_000;
+        let native = new
+            .native_cache
+            .as_mut()
+            .expect("test sample has native-cache extension");
+        native.num_waiting_uncached_tokens = 4_000;
+        native.num_total_tokens = 24_000;
+        native.total_prefill_uncached_tokens = 22_000;
+        native.total_prefill_busy_us = 4_000_000;
+
+        t.mark_expected_rank("http://w:30000", 0);
+        t.set("http://w:30000", 0, old, first);
+        t.set("http://w:30000", 0, new, second);
+
+        let snapshot = t.capture_snapshot(second);
+        let worker = snapshot
+            .fresh_native_cache_load_for_url("http://w:30000")
+            .expect("complete fresh rank must be usable");
+        assert_eq!(worker.num_waiting_uncached_tokens, 4_000);
+        assert_eq!(worker.num_total_tokens, 24_000);
+        assert_eq!(worker.max_running_requests, 64);
+        assert_eq!(worker.prefill_throughput_tokens_per_s, Some(6_000.0));
+        assert_eq!(
+            worker.estimated_prefill_queue_ms,
+            Some(666.666_666_666_666_6)
+        );
     }
 }

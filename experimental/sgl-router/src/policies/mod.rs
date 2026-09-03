@@ -207,19 +207,19 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Attaches the Session-Aware session ID.
+    /// 附加 Session-Aware session id。
     pub fn with_session_id(mut self, session_id: Option<&'a str>) -> Self {
         self.session_id = session_id;
         self
     }
 
-    /// Attaches this policy evaluation's candidate range ID.
+    /// 标识本次 policy 的候选域。
     pub fn with_candidate_range_id(mut self, candidate_range_id: &'a str) -> Self {
         self.candidate_range_id = candidate_range_id;
         self
     }
 
-    /// Attaches the request input-token count.
+    /// 附加请求 input token 数。
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
         self
@@ -233,7 +233,7 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Attaches the Engine Load snapshot captured at request start.
+    /// 附加请求开始时捕获的 Engine Load snapshot。
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
         self.load_snapshot = Some(load_snapshot);
         self
@@ -250,14 +250,14 @@ impl<'a> SelectionContext<'a> {
         self
     }
 
-    /// Disables affinity lookup and assignment.
+    /// 禁用 affinity lookup 和 assignment。
     pub fn without_affinity_lookup(mut self) -> Self {
         self.affinity_lookup_enabled = false;
         self.affinity_assignment_enabled = false;
         self
     }
 
-    /// Keeps affinity lookup but disables assignment writes.
+    /// 保留 affinity lookup，但禁用 assignment 写入。
     pub fn without_affinity_assignment(mut self) -> Self {
         self.affinity_assignment_enabled = false;
         self
@@ -308,36 +308,43 @@ impl<'a> SelectionContext<'a> {
     }
 }
 
-/// A policy's primary/backup proposal.
+/// Policy 产生的 primary/backup 提案。
 #[derive(Clone)]
 pub struct SelectionProposal {
     pub primary: Arc<Worker>,
     pub backup: Option<Arc<Worker>>,
     pub kind: ProposalKind,
-    /// Workers still eligible for fallback after filtering.
+    /// Pair proposal 的可选 pressure-guard 参数。仅在 complete fresh native
+    /// monitor 覆盖 primary/backup 时生效；否则 admission 统一回退本地负载。
+    pub guard_hints: GuardHints,
+    /// EligibilityFilter 之后可用于 fallback 的 worker。
     pub eligible_workers: Option<Vec<Arc<Worker>>>,
 }
 
-/// A Cache-Aware Prefill candidate with `E = L - H`.
+/// 一个 Cache-Aware Prefill 候选，`E = L - H`。
 #[derive(Clone)]
 pub struct CacheCandidate {
     pub worker: Arc<Worker>,
     pub matched_prefix_tokens: u64,
     pub uncached_tokens: u64,
-    /// Candidate domain.
+    /// 候选所属 domain。
     pub candidate_range_id: String,
-    /// Optional pending-Prefill limit checked with `E`.
+    /// 使用 `E` 检查的可选 pending Prefill 上限。
     pub max_pending_prefill_tokens: Option<u64>,
 }
 
-/// A bounded Cache-Aware candidate set.
-#[derive(Clone)]
+/// 有界 Cache-Aware 候选集。
+#[derive(Clone, Default)]
 pub struct CacheCandidateProposal {
     pub candidates: Vec<CacheCandidate>,
     pub cache_switch_margin_tokens: u64,
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
 }
 
-/// A Prefill policy result: a pair or Cache-Aware candidates.
+/// Prefill policy 返回 pair 或 Cache-Aware 候选集。
 #[derive(Clone)]
 pub enum PrefillProposal {
     Pair(SelectionProposal),
@@ -345,7 +352,7 @@ pub enum PrefillProposal {
 }
 
 impl PrefillProposal {
-    /// Applies EligibilityFilter results to either proposal form.
+    /// 将 EligibilityFilter 结果应用到两种 proposal。
     pub fn with_eligible_workers(self, workers: Vec<Arc<Worker>>) -> Self {
         match self {
             Self::Pair(proposal) => Self::Pair(proposal.with_eligible_workers(workers)),
@@ -362,22 +369,24 @@ impl PrefillProposal {
 }
 
 impl SelectionProposal {
-    /// Creates a proposal without a backup.
+    /// 创建无 backup 的提案。
     pub fn primary(primary: Arc<Worker>) -> Self {
         Self {
             primary,
             backup: None,
             kind: ProposalKind::Generic,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
 
-    /// Creates a primary/backup proposal.
+    /// 创建 primary/backup 提案。
     pub fn with_backup(primary: Arc<Worker>, backup: Arc<Worker>) -> Self {
         Self {
             primary,
             backup: Some(backup),
             kind: ProposalKind::PowerOfTwo,
+            guard_hints: GuardHints::default(),
             eligible_workers: None,
         }
     }
@@ -387,13 +396,18 @@ impl SelectionProposal {
         self
     }
 
+    pub fn with_guard_hints(mut self, guard_hints: GuardHints) -> Self {
+        self.guard_hints = guard_hints;
+        self
+    }
+
     pub fn with_eligible_workers(mut self, workers: Vec<Arc<Worker>>) -> Self {
         self.eligible_workers = Some(workers);
         self
     }
 }
 
-/// The source of a primary/backup proposal.
+/// primary/backup 的来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposalKind {
     Generic,
@@ -401,6 +415,26 @@ pub enum ProposalKind {
     SessionAffinity,
     CacheAffinity,
     Score,
+}
+
+/// Pair proposal 的可选 Guard 参数。
+#[derive(Debug, Clone)]
+pub struct GuardHints {
+    pub enable_pressure_guard: bool,
+    pub pressure_abs_threshold_tokens: u64,
+    pub pressure_abs_threshold_ms: Option<f64>,
+    pub pressure_rel_threshold: f64,
+}
+
+impl Default for GuardHints {
+    fn default() -> Self {
+        Self {
+            enable_pressure_guard: false,
+            pressure_abs_threshold_tokens: 0,
+            pressure_abs_threshold_ms: None,
+            pressure_rel_threshold: 1.0,
+        }
+    }
 }
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
@@ -441,6 +475,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
     /// Whether routing needs one request-scoped Engine Load snapshot.
     fn needs_load_snapshot(&self) -> bool {
         self.uses_shared_prefill_admission()
+    }
+
+    /// Whether in-flight requests must be timestamped for load correction.
+    fn needs_dispatch_timestamps(&self) -> bool {
+        false
     }
 
     /// Whether this policy resolves an affinity primary within its candidate range.
@@ -516,20 +555,23 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
-    use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+    use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
     use std::collections::HashMap;
     use std::time::Instant;
 
-    /// Aggregated `LoadStat` values used only by policy tests.
+    /// 仅用于策略测试的 #34608 `LoadStat` 聚合值。
     #[derive(Clone, Default)]
     struct TestEngineLoad {
         num_running_reqs: u64,
         num_waiting_reqs: u64,
         num_tokens: u64,
         max_total_num_tokens: u64,
+        num_waiting_uncached_tokens: Option<u64>,
+        num_total_tokens: Option<u64>,
+        max_running_requests: Option<u64>,
     }
 
     fn worker(id: &str) -> Arc<Worker> {
@@ -618,6 +660,7 @@ mod tests {
                 max_pending_prefill_tokens: None,
             }],
             cache_switch_margin_tokens: 8,
+            ..Default::default()
         };
 
         assert_eq!(proposal.candidates[0].worker.id, hot.id);
@@ -1135,18 +1178,27 @@ mod tests {
     }
 
     fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
-        EngineLoadSnapshot::from_workers(
+        EngineLoadSnapshot::from_native_cache_workers(
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
-                        EngineWorkerLoad {
+                        NativeCacheWorkerLoad {
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
-                            num_tokens: aggregate.num_tokens,
+                            num_waiting_uncached_tokens: aggregate
+                                .num_waiting_uncached_tokens
+                                .unwrap_or(aggregate.num_waiting_reqs),
+                            num_used_tokens: aggregate.num_tokens,
+                            num_total_tokens: aggregate
+                                .num_total_tokens
+                                .unwrap_or(aggregate.num_tokens),
                             max_total_num_tokens: aggregate.max_total_num_tokens,
+                            max_running_requests: aggregate.max_running_requests.unwrap_or(64),
+                            prefill_throughput_tokens_per_s: None,
+                            estimated_prefill_queue_ms: None,
                             captured_at: Instant::now(),
                         },
                     )
@@ -1219,6 +1271,7 @@ mod tests {
                 cache_candidate(&winner, 70, 30, None),
             ],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1240,6 +1293,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("a later admitted cache match must survive");
 
         assert_eq!(decision.selected.id, winner.id);
@@ -1260,6 +1314,7 @@ mod tests {
                 cache_candidate(&final_winner, 80, 20, None),
             ],
             cache_switch_margin_tokens: 0,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1286,6 +1341,7 @@ mod tests {
         ]);
 
         let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
             .expect("all admitted candidates must participate in the tournament");
 
         assert_eq!(decision.selected.id, final_winner.id);
@@ -1299,6 +1355,7 @@ mod tests {
         let proposal = CacheCandidateProposal {
             candidates: vec![cache_candidate(&candidate, 80, 20, Some(30))],
             cache_switch_margin_tokens: 16,
+            ..Default::default()
         };
         let pending_allows = snapshot(&[(
             &candidate,
@@ -1309,7 +1366,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &pending_allows).is_some(),
+            resolve_cache_candidates(&proposal, 100, &pending_allows)
+                .decision
+                .is_some(),
             "pending admission must project E=20, not L=100"
         );
 
@@ -1323,7 +1382,9 @@ mod tests {
             },
         )]);
         assert!(
-            resolve_cache_candidates(&proposal, 100, &kv_rejects).is_none(),
+            resolve_cache_candidates(&proposal, 100, &kv_rejects)
+                .decision
+                .is_none(),
             "KV safety must conservatively project the complete input L=100"
         );
     }
@@ -1338,6 +1399,7 @@ mod tests {
                 cache_candidate(&idle, 80, 20, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1358,7 +1420,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(decision.selected.id, congested.id);
     }
 
@@ -1372,6 +1436,7 @@ mod tests {
                 cache_candidate(&idle, 20, 80, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1392,7 +1457,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(
             decision.selected.id, hot.id,
             "pressure may break a near tie, but must not erase a material cache-work gain"
@@ -1414,6 +1481,7 @@ mod tests {
                 cache_candidate(&beyond_margin, 60, 40, None),
             ],
             cache_switch_margin_tokens: 32,
+            ..Default::default()
         };
         let loads = snapshot(&[
             (
@@ -1442,7 +1510,9 @@ mod tests {
             ),
         ]);
 
-        let decision = resolve_cache_candidates(&proposal, 100, &loads).unwrap();
+        let decision = resolve_cache_candidates(&proposal, 100, &loads)
+            .decision
+            .unwrap();
         assert_eq!(
             decision.selected.id, best_work.id,
             "without a unit-compatible token-pressure signal, cache work remains authoritative"

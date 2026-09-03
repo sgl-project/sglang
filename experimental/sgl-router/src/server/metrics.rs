@@ -34,6 +34,11 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_policy_decisions_total` | Counter | `policy`, `reason` |
 //! | `sgl_router_policy_selection_failures_total` | Counter | `policy`, `reason` |
+//! | `sgl_router_cache_admission_evaluated_total` | Counter | — |
+//! | `sgl_router_cache_admission_rejected_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_compared_total` | Counter | — |
+//! | `sgl_router_cache_pressure_guard_override_total` | Counter | — |
+//! | `sgl_router_cache_monitor_decisions_total` | Counter | `source` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
@@ -246,6 +251,11 @@ pub struct MetricsRegistry {
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
+    cache_admission_evaluated_total: AtomicU64,
+    cache_admission_rejected_total: AtomicU64,
+    cache_pressure_guard_compared_total: AtomicU64,
+    cache_pressure_guard_override_total: AtomicU64,
+    cache_monitor_decisions_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
@@ -536,6 +546,38 @@ impl MetricsRegistry {
         let mut guard = self.policy_selection_failures_total.lock();
         let counter = guard
             .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记录 Cache-Aware hard admission 实际检查的候选数。
+    pub fn record_cache_admission_evaluations(&self, count: u64) {
+        self.cache_admission_evaluated_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// 记录 Cache-Aware hard admission 实际拒绝的候选数。
+    pub fn record_cache_admission_rejections(&self, count: u64) {
+        self.cache_admission_rejected_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// 记录 complete fresh monitor 覆盖下真正比较/覆盖的 pressure guard 对数。
+    pub fn record_cache_pressure_guard(&self, compared: u64, overrides: u64) {
+        self.cache_pressure_guard_compared_total
+            .fetch_add(compared, Ordering::Relaxed);
+        self.cache_pressure_guard_override_total
+            .fetch_add(overrides, Ordering::Relaxed);
+    }
+
+    /// 记录一次 Cache-Aware 候选解析实际使用的负载来源。性能 runner 用它拒绝
+    /// `router_local` 结果，保证 monitor 已真实参与而非仅完成订阅。
+    pub fn record_cache_monitor_decision(&self, source: &'static str) {
+        let mut guard = self.cache_monitor_decisions_total.lock();
+        let counter = guard
+            .entry(source)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -884,6 +926,58 @@ impl MetricsRegistry {
                 escape_label(&key.policy),
                 escape_label(&key.reason),
                 value,
+            ));
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_cache_admission_evaluated_total Cache-Aware candidates evaluated by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_evaluated_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_evaluated_total {}\n",
+            self.cache_admission_evaluated_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_admission_rejected_total Cache-Aware candidates rejected by hard admission.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_admission_rejected_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_admission_rejected_total {}\n",
+            self.cache_admission_rejected_total.load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_compared_total Complete fresh Cache-Aware candidate pairs evaluated by the pressure guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_compared_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_compared_total {}\n",
+            self.cache_pressure_guard_compared_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_pressure_guard_override_total Pressure-guard comparisons whose outcome differs from cache/work ordering without the guard.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_pressure_guard_override_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_pressure_guard_override_total {}\n",
+            self.cache_pressure_guard_override_total
+                .load(Ordering::Relaxed),
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_monitor_decisions_total Cache-Aware candidate resolutions by actual load source.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_monitor_decisions_total counter\n");
+        let guard = self.cache_monitor_decisions_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(source, value)| (source, value.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|entry| *entry.0);
+        for (source, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_monitor_decisions_total{{source=\"{}\"}} {}\n",
+                source, value,
             ));
         }
         drop(guard);
@@ -1318,6 +1412,24 @@ mod tests {
         assert!(out.contains(
             r#"sgl_router_policy_selection_failures_total{policy="round_robin",reason="proposal_empty"} 1"#
         ));
+    }
+
+    #[test]
+    fn cache_monitor_and_guard_counters_are_exposed() {
+        let reg = MetricsRegistry::new();
+        reg.record_cache_monitor_decision("estimated_prefill_queue_ms");
+        reg.record_cache_admission_evaluations(3);
+        reg.record_cache_admission_rejections(2);
+        reg.record_cache_pressure_guard(3, 1);
+
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_cache_monitor_decisions_total{source="estimated_prefill_queue_ms"} 1"#
+        ));
+        assert!(out.contains("sgl_router_cache_admission_evaluated_total 3"));
+        assert!(out.contains("sgl_router_cache_admission_rejected_total 2"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_compared_total 3"));
+        assert!(out.contains("sgl_router_cache_pressure_guard_override_total 1"));
     }
 
     #[test]

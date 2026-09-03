@@ -93,6 +93,10 @@ impl CacheAwarePolicy {
         Some(CacheCandidateProposal {
             candidates,
             cache_switch_margin_tokens: self.config.cache_switch_margin_tokens,
+            enable_pressure_guard: self.config.pressure_guard,
+            pressure_abs_threshold_tokens: self.config.pressure_abs_threshold_tokens,
+            pressure_abs_threshold_ms: self.config.pressure_abs_threshold_ms,
+            pressure_rel_threshold: self.config.pressure_rel_threshold,
         })
     }
 
