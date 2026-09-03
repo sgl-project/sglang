@@ -104,6 +104,7 @@ class DeepseekModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        embedding_tp_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
@@ -123,11 +124,13 @@ class DeepseekModelNextN(nn.Module):
 
         self.vocab_size = config.vocab_size
 
+        if embedding_tp_kwargs is None:
+            embedding_tp_kwargs = get_embedding_tp_kwargs()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
-            **get_embedding_tp_kwargs(),
+            **embedding_tp_kwargs,
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -332,6 +335,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             return None
         return quant_config
 
+    def _get_nextn_embedding_tp_kwargs(self) -> dict:
+        return get_embedding_tp_kwargs()
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -358,7 +364,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
-            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+            config,
+            nextn_quant_config,
+            prefix=add_prefix("model", prefix),
+            embedding_tp_kwargs=self._get_nextn_embedding_tp_kwargs(),
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
