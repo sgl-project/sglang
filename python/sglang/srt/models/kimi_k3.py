@@ -1712,7 +1712,9 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            self._bfa_f_b_w = self.f_b_proj.weight
+            # Alias the storage, not the Parameter: registering it here would shadow
+            # f_b_proj.weight in named_parameters() and weight updates would skip it.
+            self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _prepare_fused_decode(self) -> None:
