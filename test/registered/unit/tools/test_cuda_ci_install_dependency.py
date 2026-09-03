@@ -4,9 +4,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CI_REGISTER_PATH = (
-    REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
-)
+CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_register.py"
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "ci" / "cuda" / "ci_install_dependency.sh"
 
 
