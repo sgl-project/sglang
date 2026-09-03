@@ -168,10 +168,15 @@ def _pad_page_table_kernel(
 
 
 def padded_page_table_shape(page_table: torch.Tensor) -> Tuple[int, int, int]:
-    """Rows, logical width, and the 256-token-scheduling padded width."""
+    """Rows, logical width, and the 256-token-scheduling padded width.
+
+    The padding rule is shared with the logits sizing in ``fp4_indexer_hip``;
+    imported lazily because that module reaches back into this one.
+    """
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import _guarded_pages
+
     rows, logical_width = page_table.shape
-    padded_width = max(4, (logical_width + 3) // 4 * 4)
-    return rows, logical_width, padded_width
+    return rows, logical_width, _guarded_pages(logical_width)
 
 
 def _as_int32_2d(page_table: torch.Tensor) -> torch.Tensor:

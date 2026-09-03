@@ -308,6 +308,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -925,6 +926,30 @@ class Scheduler(
                     reasoning_parser.detector.think_end_token,
                 )
 
+            selectable_tokens = getattr(
+                reasoning_parser.detector,
+                "request_selectable_think_end_tokens",
+                (),
+            )
+            if selectable_tokens:
+                selectable_sequences = []
+                for end_token in selectable_tokens:
+                    token_ids = self.tokenizer.encode(
+                        end_token, add_special_tokens=False
+                    )
+                    if not token_ids:
+                        raise ValueError(
+                            f"Request-selectable reasoning terminator {end_token!r} "
+                            "could not be encoded"
+                        )
+                    selectable_sequences.append(token_ids)
+                self.model_config.request_selectable_think_end_id_sequences = [
+                    list(sequence)
+                    for sequence in dict.fromkeys(
+                        tuple(sequence) for sequence in selectable_sequences
+                    )
+                ]
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1265,6 +1290,7 @@ class Scheduler(
             page_size=self.page_size,
             device=self.device,
             pp_group=self.pp_group,
+            world_group=self.world_group,
             pp_rank=self.ps.pp_rank,
         )
         if sizer.profile_and_fit():
@@ -2321,19 +2347,31 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -2770,6 +2808,14 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req, self.enable_overlap)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
+        if self.spec_algorithm.is_uno():
+            error_msg = validate_uno_request(req)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3688,9 +3734,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 
@@ -4448,7 +4493,7 @@ class Scheduler(
                 self.decode_moment_totals,
                 batch_size,
                 step_us,
-                batch_size + result.num_correct_drafts,
+                result.get_num_generated_tokens(batch_size),
             )
 
     def maybe_send_health_check_signal(self):
