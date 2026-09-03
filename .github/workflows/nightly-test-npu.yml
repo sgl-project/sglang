@@ -269,7 +269,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-800i-16
+      runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
       test_suite: debug-nightly-perf-16-npu-a3
       is_nightly_pipeline_job: true
@@ -286,7 +286,7 @@ jobs:
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-16-
+      runner: linux-aarch64-a3-800i-16
       test_type: 'accuracy'
       test_suite: debug-nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
