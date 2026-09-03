@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.suffix_attention_merge import (
     merge_suffix_attention_in_place,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=15,
@@ -18,7 +19,7 @@ register_cuda_ci(
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestSuffixAttentionMerge(unittest.TestCase):
+class TestSuffixAttentionMerge(CustomTestCase):
     def _case(self, *, num_queries: int, head_dim: int, dtype: torch.dtype):
         torch.manual_seed(7)
         device = torch.device("cuda")
@@ -98,11 +99,22 @@ class TestSuffixAttentionMerge(unittest.TestCase):
             static_prefix.float(), reference, rtol=2e-2, atol=2e-2
         )
 
-    def test_q16_d64(self):
-        self._case(num_queries=16, head_dim=64, dtype=torch.float16)
-
-    def test_q60_d128(self):
-        self._case(num_queries=60, head_dim=128, dtype=torch.bfloat16)
+    def test_representative_shapes(self):
+        cases = (
+            (16, 64, torch.float16),
+            (60, 128, torch.bfloat16),
+        )
+        for num_queries, head_dim, dtype in cases:
+            with self.subTest(
+                num_queries=num_queries,
+                head_dim=head_dim,
+                dtype=dtype,
+            ):
+                self._case(
+                    num_queries=num_queries,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                )
 
 
 if __name__ == "__main__":

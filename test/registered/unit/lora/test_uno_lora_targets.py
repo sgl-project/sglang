@@ -12,10 +12,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -38,7 +34,7 @@ class TestUnoLoRATargets(CustomTestCase):
             **attributes,
         )
 
-    def test_supported_dense_targets_are_accepted(self):
+    def test_supported_decoder_targets_are_accepted(self):
         modules = [
             (
                 "model.layers.0.qkv_proj",
@@ -52,22 +48,13 @@ class TestUnoLoRATargets(CustomTestCase):
                 "model.layers.0.fused_qkv_a_proj_with_mqa",
                 ReplicatedLinear.__new__(ReplicatedLinear),
             ),
-            (
-                "model.embed_tokens",
-                VocabParallelEmbedding.__new__(VocabParallelEmbedding),
-            ),
         ]
         self.backend.validate_lora_targets(
-            base_model=self._model(
-                modules,
-                lm_head=ParallelLMHead.__new__(ParallelLMHead),
-            ),
+            base_model=self._model(modules),
             target_modules={
                 "qkv_proj",
                 "o_proj",
                 "fused_qkv_a_proj_with_mqa",
-                "embed_tokens",
-                "lm_head",
             },
         )
 

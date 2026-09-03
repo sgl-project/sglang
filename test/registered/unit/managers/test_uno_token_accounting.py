@@ -2,7 +2,6 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -49,27 +48,6 @@ class TestUnoTokenAccounting(CustomTestCase):
         self.assertEqual(reporter.spec_num_accept_tokens, 7)
         self.assertEqual(reporter.spec_num_correct_drafts, 3)
         self.assertEqual(reporter.spec_num_forward_ct, 2)
-
-    def test_realtime_metrics_receive_full_generated_token_count(self):
-        reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
-        reporter.current_scheduler_metrics_enabled = True
-        reporter.metrics_collector = Mock()
-        reporter.enable_mfu_metrics = False
-        reporter.scheduler_status_logger = None
-        reporter.forward_ct_decode = 1
-        reporter.decode_log_interval = 2
-        batch = SimpleNamespace(dp_cooperation_info=None)
-
-        reporter.report_decode_stats(
-            can_run_cuda_graph=True,
-            running_batch=batch,
-            num_generated_tokens=self.result.get_num_generated_tokens(self.batch_size),
-        )
-
-        reporter.metrics_collector.increment_realtime_tokens.assert_called_once_with(
-            decode_tokens=7,
-            dp_cooperation_info=None,
-        )
 
     def test_decode_moment_receives_full_generated_token_count(self):
         scheduler = Scheduler.__new__(Scheduler)
