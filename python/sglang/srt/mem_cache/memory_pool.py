@@ -509,6 +509,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        conv_window_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -599,7 +600,9 @@ class MambaPool:
                     conv_state = _init_npu_conv_state(
                         conv_state[0],
                         conv_state_shape,
-                        speculative_num_draft_tokens,
+                        speculative_num_draft_tokens
+                        if speculative_num_draft_tokens is not None
+                        else conv_window_draft_tokens,
                         is_kda=cache_params.is_kda,
                     )
 
@@ -1212,6 +1215,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_mamba_extra_buffer: bool,
         enable_mamba_extra_buffer_lazy: bool = False,
         speculative_num_draft_tokens: int = None,
+        conv_window_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
@@ -1241,6 +1245,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            conv_window_draft_tokens=conv_window_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
@@ -1257,6 +1262,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        conv_window_draft_tokens: Optional[int] = None,
         speculative_eagle_topk: Optional[int] = None,
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
@@ -1271,6 +1277,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            conv_window_draft_tokens=conv_window_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,

@@ -822,28 +822,6 @@ def compute_mamba_state_slice_blocks(
     return blocks
 
 
-def mamba_spec_conv_window_tail_offset(
-    src_item_len: int,
-    dst_item_len: int,
-    src_dim: int = 0,
-    dst_dim: int = 0,
-) -> int:
-    """Byte offset that places a shorter committed conv window in the decode tail.
-
-    Same channel width (equal attn-tp): the whole ``dst - src`` delta is extra
-    window rows. Different attn-tp: scale src to the decode channel width first,
-    then the remainder is the spec-extended tail (Kimi 3 -> 10).
-    """
-    if src_item_len <= 0 or dst_item_len <= src_item_len:
-        return 0
-    if src_dim > 0 and dst_dim > 0 and dst_item_len * src_dim > src_item_len * dst_dim:
-        same_window_dst = src_item_len // src_dim * dst_dim
-        return max(0, dst_item_len - same_window_dst)
-    if src_dim == dst_dim:
-        return dst_item_len - src_item_len
-    return 0
-
-
 def compute_mamba_state_slice_byte_blocks(
     *,
     src_item_len: int,
@@ -862,9 +840,6 @@ def compute_mamba_state_slice_byte_blocks(
     ``outer_count`` is one for the usual ``[slice_dim, ...]`` layout. Kimi
     conv state is ``[K - 1, slice_dim]``, so each logical channel slice expands
     into one byte block per convolution row.
-
-    ``dst_item_len`` must be the same-window decode slot (caller strips any
-    spec-extended tail and adds it back on the destination address).
     """
     src_bytes_per_dim = src_item_len // (src_dim * outer_count)
     dst_bytes_per_dim = dst_item_len // (dst_dim * outer_count)
