@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.arg_groups.cuda_graph_hook import _trtllm_mla_has_varlen_absorbed
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -99,29 +100,21 @@ class TestVarlenAbsorbedCapabilityContract(CustomTestCase):
 
     def test_server_args_delegates_to_the_backend_predicate(self):
         args = self._server_args()
+        args.attention_backend = "trtllm_mla"
         for supported in (True, False):
             with self.subTest(supported=supported):
-                with (
-                    patch.object(
-                        args,
-                        "_resolved_attention_backends",
-                        return_value=("trtllm_mla", "trtllm_mla"),
-                    ),
-                    patch(
-                        f"{self._BACKEND}.varlen_absorbed_mla_supported",
-                        return_value=supported,
-                    ) as helper,
-                ):
-                    has = args._trtllm_mla_has_varlen_absorbed()
+                with patch(
+                    f"{self._BACKEND}.varlen_absorbed_mla_supported",
+                    return_value=supported,
+                ) as helper:
+                    has = _trtllm_mla_has_varlen_absorbed(args)
                 self.assertEqual(has, supported)
                 helper.assert_called_once_with(args.kv_cache_dtype)
 
     def test_other_backends_are_never_excluded(self):
         args = self._server_args()
-        with patch.object(
-            args, "_resolved_attention_backends", return_value=("fa3", "fa3")
-        ):
-            self.assertTrue(args._trtllm_mla_has_varlen_absorbed())
+        args.attention_backend = "fa3"
+        self.assertTrue(_trtllm_mla_has_varlen_absorbed(args))
 
     def test_fp4_kv_spellings_match_the_dtype_resolver(self):
         # A --kv-cache-dtype spelling that resolves to the packed 4-bit dtype but

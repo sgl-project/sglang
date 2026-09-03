@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections import deque
@@ -67,7 +68,6 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
-    ReqKvInfo,
     ScheduleBatch,
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
@@ -192,14 +192,10 @@ class DecodeReqToTokenPool:
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -208,16 +204,16 @@ class DecodeReqToTokenPool:
         self.free_slots = self.free_slots[need_size:]
         offset = 0
         for r in reqs:
-            if r.req_pool_idx is None:
-                r.req_pool_idx = select_index[offset]
-                self.req_generation[r.req_pool_idx] += 1
+            if not r.kv.holds_kv:
+                r.kv.req_pool_idx = select_index[offset]
+                self.req_generation[r.kv.req_pool_idx] += 1
                 offset += 1
-        return [r.req_pool_idx for r in reqs]
+        return [r.kv.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
-        assert req.req_pool_idx is not None, "request must have req_pool_idx"
-        self.free_slots.append(req.req_pool_idx)
-        req.req_pool_idx = None
+        assert req.kv.holds_kv, "request must have req_pool_idx"
+        self.free_slots.append(req.kv.req_pool_idx)
+        req.kv.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
@@ -914,9 +910,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def resume_demoted_reqs(self) -> List[Req]:
         """Restore demoted requests only after their recovery duration expires."""
-        recovery_duration = (
-            self.scheduler.server_args.proactive_demotion_recovery_duration
-        )
+        recovery_duration = get_disagg().proactive_demotion_recovery_duration
         now = time.monotonic()
         resumed_reqs: List[Req] = []
         indices_to_remove = set()
@@ -978,17 +972,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self.queue:
             return
 
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if (
-            self.pp_size <= 1
-            and all(decode_req.waiting_for_input for decode_req in self.queue)
-            and not any(
-                decode_req.kv_receiver.conclude_state == KVPoll.Failed
-                for decode_req in self.queue
-            )
-        ):
-            return
-
+        # Receiver polling observes asynchronous failures while KV allocation
+        # is blocked.
         if self.pp_size > 1:
             polls = poll_and_all_reduce_pp(
                 (decode_req.req.rid for decode_req in self.queue),
@@ -1466,7 +1451,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
-            decode_req.req.cache_protected_len = total_prefix_len
+            decode_req.req.kv.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -1482,7 +1467,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
+                    decode_req.req.kv.req_pool_idx
                 ][total_prefix_len:origin_input_len]
                 kv_indices = (
                     self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
@@ -1496,7 +1481,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.req_pool_idx
+                            decode_req.req.kv.req_pool_idx
                         ]
                     )
                     .cpu()
@@ -1508,7 +1493,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
+                    decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -1519,7 +1504,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, :seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
@@ -1532,7 +1517,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_size = self.token_to_kv_pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
                 positions = np.arange(window_start, seq_len, dtype=np.int64)
-                state_slot = int(decode_req.req.req_pool_idx)
+                state_slot = int(decode_req.req.kv.req_pool_idx)
                 ring_rows = state_slot * ring_stride + (positions % ring_stride)
                 return ring_rows.astype(np.int32)
 
@@ -1540,7 +1525,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 online = is_dsv4_c128_online_enabled()
                 ring_size = 1 if online else self.token_to_kv_pool.get_ring_size(128)
                 return get_dsv4_c128_state_indices(
-                    int(decode_req.req.req_pool_idx),
+                    int(decode_req.req.kv.req_pool_idx),
                     seq_len,
                     online=online,
                     ring_size=ring_size,
@@ -1552,7 +1537,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self.token_to_kv_pool, "clear_c128_req_state", None
                 )
                 if clear_c128_state is not None:
-                    clear_c128_state(int(decode_req.req.req_pool_idx))
+                    clear_c128_state(int(decode_req.req.kv.req_pool_idx))
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
@@ -1571,7 +1556,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 payloads.update(
                     dsv4_state_payloads(
                         self.req_to_token_pool,
-                        decode_req.req.req_pool_idx,
+                        decode_req.req.kv.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
                         prefix_len=total_prefix_len,
@@ -1600,7 +1585,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # the C4 sparse physical-slot mapping; carry their logical page IDs
                 # alongside the independently allocated C4 host page IDs.
                 full_kv_indices = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx,
+                    decode_req.req.kv.req_pool_idx,
                     prefix_len:origin_input_len,
                 ]
                 device_page_indices = kv_to_page_indices(
@@ -1889,11 +1874,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
-        req.kv_committed_len = fill_len
+        req.kv.kv_committed_len = fill_len
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
-                (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
+                (req.kv.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
         # TODO(retraction): when retraction is implemented with radix cache
@@ -1948,7 +1933,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
-                req.req_pool_idx,
+                req.kv.req_pool_idx,
                 0,
                 coordinator.host_token_len(fill_len),
             )
@@ -1978,7 +1963,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         self.req_to_token_pool.write(
             (
-                req.req_pool_idx,
+                req.kv.req_pool_idx,
                 slice(total_prefix_len, total_prefix_len + len(kv_loc)),
             ),
             kv_loc,
@@ -1995,7 +1980,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
-        req.set_extend_range(total_prefix_len, req.kv_committed_len)
+        req.set_extend_range(total_prefix_len, req.kv.kv_committed_len)
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -2011,10 +1996,7 @@ def alloc_for_decode_prealloc_hisparse(
     uses_swa_tail: bool,
     swa_tail_len: int,
 ) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
+    req.kv.kv_allocated_len = fill_len
     device = allocator.device
     prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
     prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
@@ -2059,10 +2041,7 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
 ) -> torch.Tensor:
-    if req.kv is None:
-        req.kv = ReqKvInfo(kv_allocated_len=fill_len, swa_evicted_seqlen=0)
-    else:
-        req.kv.kv_allocated_len = fill_len
+    req.kv.kv_allocated_len = fill_len
     if allocator.page_size == 1:
         kv_loc = allocator.alloc(delta_len)
     else:
@@ -2126,6 +2105,22 @@ def alloc_for_decode_prealloc(
                 kv_loc, req_to_token_pool, req, total_prefix_len, fill_len
             )
     return kv_loc
+
+
+def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
+    """Generate a deterministic synthetic handoff token for fake-PD requests.
+
+    Fake-PD skips prefill and KV transfer, so its allocated prompt KV has no
+    request-specific state and its metadata output token remains zero. Reusing
+    token 0 for every request can unrealistically correlate decode workloads.
+    Hash the request ID so every TP rank gets the same request-diverse token.
+    """
+    if req.vocab_size is None or req.vocab_size <= 0:
+        raise ValueError("Fake-PD requests require a positive vocabulary size")
+    digest = hashlib.blake2b(
+        req.rid.encode(), digest_size=8, person=b"fake-pd"
+    ).digest()
+    return int.from_bytes(digest, byteorder="little") % req.vocab_size
 
 
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
@@ -2258,6 +2253,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
+        elif _is_fake_transfer(decode_req.req):
+            committed_output_id = _generate_fake_prefill_handoff_output_id(
+                decode_req.req
+            )
         else:
             committed_output_id = output_id[0].item()
         decode_req.req.output_ids.append(committed_output_id)
@@ -2794,8 +2793,10 @@ class SchedulerDisaggregationDecodeMixin:
             # Truncate fill_len to kv_committed_len so cache_unfinished_req
             # only sees committed KV (full array includes one uncommitted
             # token because init_next_round_input rebuilt it as full).
-            if req.kv_committed_len is not None:
-                req.set_extend_range(len(req.prefix_indices), req.kv_committed_len)
+            if req.kv.kv_committed_len is not None:
+                req.set_extend_range(
+                    len(req.prefix_indices), req.kv.kv_committed_len
+                )
 
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
@@ -2839,15 +2840,15 @@ class SchedulerDisaggregationDecodeMixin:
             return False
 
         cache_usage = self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
-        return cache_usage > self.server_args.proactive_decode_demotion_cache_usage
+        return cache_usage > get_disagg().proactive_decode_demotion_cache_usage
 
     def proactively_demote_longest_request(self: Scheduler) -> bool:
         batch = self.running_batch
         if batch is None or batch.is_empty():
             return False
 
-        max_input_len = self.server_args.proactive_demotion_max_input_len
-        min_output_len = self.server_args.proactive_demotion_min_output_len
+        max_input_len = get_disagg().proactive_demotion_max_input_len
+        min_output_len = get_disagg().proactive_demotion_min_output_len
 
         def is_demotion_candidate(req: Req) -> bool:
             return (

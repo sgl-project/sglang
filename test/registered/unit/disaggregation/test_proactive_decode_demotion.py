@@ -13,17 +13,13 @@ from sglang.srt.observability.decode_metric_collector import (
     DEFAULT_OUTPUT_LEN_BUCKETS,
     DecodeMetricCollector,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-
-_CPU_TENSOR_DISAGG = SimpleNamespace(
-    disaggregation_decode_retraction_backup="cpu_tensor"
-)
-
 
 class _FakeBatch:
     """Minimal running-batch stand-in recording release_req calls."""
@@ -76,10 +72,7 @@ def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
         running_batch=batch,
         enable_overlap=False,
         remain_cpu_demote_tokens=budget,
-        server_args=SimpleNamespace(
-            proactive_demotion_max_input_len=10,
-            proactive_demotion_min_output_len=11,
-        ),
+        server_args=SimpleNamespace(),
         disagg_decode_prealloc_queue=prealloc_queue,
         new_token_ratio_tracker=SimpleNamespace(current=0.0),
         metrics_reporter=SimpleNamespace(
@@ -97,6 +90,17 @@ def _make_demotion_scheduler(batch, *, budget, enable_metrics=False):
 
 
 class TestProactiveDecodeDemotion(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor",
+            proactive_decode_demotion_cache_usage=0.70,
+            proactive_demotion_max_input_len=10,
+            proactive_demotion_min_output_len=11,
+            proactive_demotion_recovery_duration=10.0,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_req_tracks_demote_separately_from_retract(self):
         demoted_req = Req(
             "demoted", "", array("q", [1]), SamplingParams(max_new_tokens=8)
@@ -174,17 +178,12 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 proactive_demotion_min_output_len=0,
             ).resolve_once()
 
-    def _make_demoted_queue(self, req, recovery_duration):
+    def _make_demoted_queue(self, req):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.demotion_queue = [
             DemotedRequest(req=req, demoted_start_time=0.0, demoted_tokens=7)
         ]
-        queue.scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(
-                proactive_demotion_recovery_duration=recovery_duration
-            ),
-            remain_cpu_demote_tokens=0,
-        )
+        queue.scheduler = SimpleNamespace(remain_cpu_demote_tokens=0)
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
         queue.token_to_kv_pool_allocator = MagicMock()
         queue.tree_cache = MagicMock()
@@ -196,7 +195,7 @@ class TestProactiveDecodeDemotion(CustomTestCase):
 
     def test_demoted_request_waits_then_restores(self):
         req = SimpleNamespace(is_retracted=False, is_demoted=True)
-        queue = self._make_demoted_queue(req, recovery_duration=10.0)
+        queue = self._make_demoted_queue(req)
         with patch(
             "sglang.srt.disaggregation.decode.time.monotonic", return_value=5.0
         ):
@@ -206,9 +205,6 @@ class TestProactiveDecodeDemotion(CustomTestCase):
 
         with patch(
             "sglang.srt.disaggregation.decode.time.monotonic", return_value=15.0
-        ), patch(
-            "sglang.srt.disaggregation.decode.get_disagg",
-            return_value=_CPU_TENSOR_DISAGG,
         ), patch("sglang.srt.disaggregation.decode.retraction_restore") as restore:
             self.assertEqual(queue.resume_demoted_reqs(), [req])
         self.assertEqual(queue.demotion_queue, [])
@@ -222,15 +218,14 @@ class TestProactiveDecodeDemotion(CustomTestCase):
         """Dropping a demoted CPU backup must return its tokens to the budget,
         or the budget leaks and demotion locks up permanently."""
         req = SimpleNamespace(is_retracted=False, is_demoted=True)
-        queue = self._make_demoted_queue(req, recovery_duration=10.0)
+        queue = self._make_demoted_queue(req)
         queue.queue = []
         queue.retracted_queue = []
         queue.kv_manager = SimpleNamespace()
         queue._cancel_prefill_dp_rank_queries = lambda: None
         with patch(
-            "sglang.srt.disaggregation.decode.get_disagg",
-            return_value=_CPU_TENSOR_DISAGG,
-        ), patch("sglang.srt.disaggregation.decode.retraction_discard") as discard:
+            "sglang.srt.disaggregation.decode.retraction_discard"
+        ) as discard:
             queue.release_memory_occupation()
         discard.assert_called_once()
         self.assertEqual(queue.demotion_queue, [])
@@ -244,9 +239,6 @@ class TestProactiveDecodeDemotion(CustomTestCase):
                 get_pool_stats=lambda: SimpleNamespace(
                     get_max_pool_usage=lambda: 0.96
                 )
-            ),
-            server_args=SimpleNamespace(
-                proactive_decode_demotion_cache_usage=0.70,
             ),
         )
 

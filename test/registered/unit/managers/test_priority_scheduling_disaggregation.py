@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.decode import (  # noqa: E402
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    FINISH_ABORT,
+    Req,
+    ReqKvInfo,
+)
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -93,11 +97,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             priority=priority,
             origin_input_ids=[1, 2, 3],
             output_ids=[],
-            req_pool_idx=int(priority) % 8,
             finished_reason=FINISH_ABORT("failed") if failed else None,
             return_logprob=False,
             sampling_params=SimpleNamespace(max_new_tokens=8),
-            cache_protected_len=0,
+            kv=ReqKvInfo(req_pool_idx=int(priority) % 8, cache_protected_len=0),
             time_stats=MagicMock(),
         )
         return SimpleNamespace(
@@ -426,6 +429,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = []
         scheduler.enable_priority_scheduling = False
+        scheduler.enable_priority_preemption = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock(size=1)
@@ -502,6 +506,26 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_prebuilt_init_uses_nested_committed_kv_length(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        req = MagicMock(rid="request")
+        req.prefix_indices = [1, 2]
+        req.kv = SimpleNamespace(kv_committed_len=7)
+        scheduler.waiting_queue = [req]
+
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=MagicMock(),
+        ), get_context().override_server_args(
+            disaggregation_decode_enable_radix_cache=False
+        ):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        req.init_next_round_input.assert_called_once_with(scheduler.tree_cache)
+        req.set_extend_range.assert_called_once_with(2, 7)
 
 
 if __name__ == "__main__":

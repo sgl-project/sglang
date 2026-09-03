@@ -4,6 +4,7 @@ import asyncio
 import threading
 import unittest
 from contextvars import ContextVar
+from types import SimpleNamespace
 
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -41,6 +42,7 @@ class TestTokenizerManagerEventLoop(CustomTestCase):
         manager.tokenizer = _BlockingFastTokenizer(
             tokenization_started, release_tokenization
         )
+        manager.model_config = SimpleNamespace(is_embedding_gemma=False)
         manager.async_dynamic_batch_tokenizer = None
         if hasattr(manager, "init_request_preprocessor"):
             manager.init_request_preprocessor()

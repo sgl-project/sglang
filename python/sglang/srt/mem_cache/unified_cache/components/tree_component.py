@@ -89,8 +89,19 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
-class LRURefreshPhase(str, Enum):
+class LinkerTransferPhase(str, Enum):
+    LOOKUP = "lookup"
+    LOAD = "load"
+    OFFLOAD = "offload"
 
+
+class ExternalLinkerLoadPhase(str, Enum):
+    PREPARE = "prepare"
+    COMMIT = "commit"
+    ABORT = "abort"
+
+
+class LRURefreshPhase(str, Enum):
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
     MATCH_END = "match_end"  # end of a successful prefix match
     INSERT_END = "insert_end"  # after a new/updated leaf is committed
@@ -382,6 +393,7 @@ class TreeComponent(ABC):
         total_prefix_len: int,
         value_slice: torch.Tensor,
         params: InsertParams,
+        result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> int:
         """Called per-node when an insert's key overlaps an existing node.
@@ -398,6 +410,7 @@ class TreeComponent(ABC):
         prefix_len: int,
         total_prefix_len: int,
         params: InsertParams,
+        result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Called after _unevict_node_on_insert restores the base (Full) value
@@ -703,3 +716,34 @@ class TreeComponent(ABC):
         raise NotImplementedError(
             f"{self.component_type} cannot apply {type(action).__name__}"
         )
+
+    # ---- External Cache Linker Hooks ----
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        """Build this component's direct device/storage transfer.
+
+        ``node`` carries the device pages to persist on OFFLOAD and is None
+        otherwise. ``keys`` are the per-page hashes of the device-uncached tail
+        (page 0 is the first uncached page) on LOOKUP / LOAD, and None on
+        OFFLOAD, where the keys come from ``node.hash_value``.
+        """
+        return None
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        """Prepare, commit, or abort this component's direct load."""
+        return transfer

@@ -12,6 +12,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import ImageData, load_image
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -66,16 +67,21 @@ class MultimodalLoadErrorTestCase(unittest.TestCase):
         )
 
     async def _load_bad_media(self, *, skip_tokenizer_init, prompt, tokens, **mm_data):
-        processor = self._make_processor(skip_tokenizer_init=skip_tokenizer_init)
-        try:
-            await processor.load_mm_data(
-                prompt=prompt,
-                multimodal_tokens=tokens,
-                **mm_data,
-            )
-        finally:
-            processor.io_executor.shutdown(wait=True)
-            processor.cpu_executor.shutdown(wait=True)
+        with get_context().override_server_args(
+            mm_process_config={},
+            keep_mm_feature_on_device=False,
+            skip_tokenizer_init=skip_tokenizer_init,
+        ):
+            processor = self._make_processor(skip_tokenizer_init=skip_tokenizer_init)
+            try:
+                await processor.load_mm_data(
+                    prompt=prompt,
+                    multimodal_tokens=tokens,
+                    **mm_data,
+                )
+            finally:
+                processor.io_executor.shutdown(wait=True)
+                processor.cpu_executor.shutdown(wait=True)
 
     async def _load_bad_image(self, *, skip_tokenizer_init):
         tokens = MultimodalSpecialTokens(image_token="<image>").build(SimpleNamespace())
@@ -142,7 +148,7 @@ class MultimodalLoadErrorTestCase(unittest.TestCase):
             asyncio.run(self._load_bad_video(skip_tokenizer_init=True))
 
     def test_cpu_image_decode_unidentified_image_raises_value_error(self):
-        with self.assertRaisesRegex(ValueError, "Invalid image data"):
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
             load_image(b"not an image", gpu_image_decode=False)
 
     def test_cpu_image_decode_broken_stream_raises_value_error(self):

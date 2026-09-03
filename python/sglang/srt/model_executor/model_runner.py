@@ -89,6 +89,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
@@ -123,8 +124,10 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
     is_post_capture_kv_active,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    AttentionAndMoeLayers,
     ModelLayerInfo,
     adjust_hybrid_swa_layer_ids,
+    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -252,6 +255,14 @@ elif current_platform.is_out_of_tree():
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SamplingPrewarmResult:
+    """Memory requirements observed while pre-warming a sampling path."""
+
+    sampling_input_bytes: int = 0
+    sampling_headroom_bytes: int = 0
+
+
 def _prefill_cuda_graph_allows_context_parallel(
     prefill_runner, forward_batch: ForwardBatch
 ) -> bool:
@@ -376,6 +387,7 @@ class ModelRunner:
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = get_memory().enable_hisparse
         self._sampling_observer: Optional[SamplingObserver] = None
+        self.sampling_prewarm_result = SamplingPrewarmResult()
 
         self.init_startup_observability()
 
@@ -444,7 +456,7 @@ class ModelRunner:
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id)
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
@@ -504,7 +516,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -543,7 +554,7 @@ class ModelRunner:
         self._rearm_eplb_after_elastic_scale()
 
     def init_msprobe(self):
-        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger()
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -714,7 +725,6 @@ class ModelRunner:
             )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
             )
@@ -755,7 +765,6 @@ class ModelRunner:
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
-                server_args=self.server_args,
                 model_config=self.model_config,
                 moe_ep_size=self.ps.moe_ep_size,
                 moe_ep_rank=self.ps.moe_ep_rank,
@@ -864,6 +873,18 @@ class ModelRunner:
             return
         self.pre_model_load_memory += preloaded_weights_bytes / (1 << 30)
 
+    def init_kv_index_translator(self):
+        """The one object that converts KV ids for this runner: attention
+        backends build their read indices from the table it hands them instead
+        of probing the pool's id spaces themselves."""
+        self.kv_index_translator = KVIndexTranslator(
+            req_to_token=self.req_to_token_pool.req_to_token,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            token_to_kv_pool=self.token_to_kv_pool,
+            page_size=self.page_size or 1,
+            device=self.device,
+        )
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -890,6 +911,8 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        self.init_kv_index_translator()
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -918,7 +941,7 @@ class ModelRunner:
         )
         from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-        hisparse_cfg = parse_hisparse_config(self.server_args)
+        hisparse_cfg = parse_hisparse_config()
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
@@ -976,7 +999,6 @@ class ModelRunner:
         )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=global_ep_rank,
             )
@@ -1005,6 +1027,9 @@ class ModelRunner:
         self.attn_backend = backends.attn_backend
         self.decode_attn_backend = backends.decode_attn_backend
         self.decode_attn_backend_group = backends.decode_attn_backend_group
+        self.kv_index_translator.bind_and_verify_backends(
+            [self.attn_backend, self.decode_attn_backend]
+        )
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()
@@ -1048,6 +1073,11 @@ class ModelRunner:
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
             n_prepared,
         )
+
+    def prewarm_sampling(self) -> SamplingPrewarmResult:
+        """Warm the sampling path after graph initialization."""
+        self.sampling_prewarm_result = SamplingPrewarmResult()
+        return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         capture = capture_cuda_graphs(
@@ -1139,13 +1169,8 @@ class ModelRunner:
             weight_cache_socket=get_model().weight_cache_socket,
         )
 
-        # If the weight cache is enabled, override the load format to IPC_CACHE
-        # and derive the per-rank daemon socket. Idempotent across reloads.
         maybe_enable_ipc_weight_cache(
             load_config=self.load_config,
-            tp_size=self.ps.tp_size,
-            pp_rank=self.ps.pp_rank,
-            tp_rank=self.ps.tp_rank,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
@@ -1426,6 +1451,10 @@ class ModelRunner:
         )
 
         return DecodeCudaGraphRunner
+
+    def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
+        """Return the model layers used by prefill CUDA graph execution."""
+        return compute_attention_and_moe_layers(layer_model)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
@@ -1982,7 +2011,6 @@ class ModelRunner:
             return
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
@@ -2047,7 +2075,6 @@ class ModelRunner:
         ElasticEPStateManager.on_scale(effective_size, target_size)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
-                self.server_args,
                 get_global_expert_location_metadata(),
                 rank=self._elastic_global_rank(),
             )
