@@ -141,12 +141,11 @@ def md(text: str) -> dict:
     return {"tag": "markdown", "content": text}
 
 
-def label(text: str) -> str:
+def grey(text: str) -> str:
     return f"<font color='grey'>{text}</font>"
 
 
 def kv_columns(pairs: list) -> dict:
-    """One row of grey-label / bold-value cells, one column per pair."""
     return {
         "tag": "column_set",
         "flex_mode": "flow",
@@ -156,7 +155,7 @@ def kv_columns(pairs: list) -> dict:
                 "tag": "column",
                 "width": "weighted",
                 "weight": 1,
-                "elements": [md(f"{label(k)}\n**{v}**")],
+                "elements": [md(f"{grey(k)}\n**{v}**")],
             }
             for k, v in pairs
         ],
@@ -164,7 +163,7 @@ def kv_columns(pairs: list) -> dict:
 
 
 def table(columns: list, rows: list, page_size: int = 12) -> dict:
-    """columns: [(key, display_name, data_type)], rows: [{key: value}]."""
+    # columns: (key, display_name, data_type); rows: {key: value}
     return {
         "tag": "table",
         "page_size": page_size,
@@ -195,7 +194,6 @@ HR = {"tag": "hr"}
 
 
 def build_card(title: str, color: str, elements: list, buttons: list) -> dict:
-    """color: red | orange | green | blue | grey."""
     return {
         "msg_type": "interactive",
         "card": {
@@ -203,7 +201,7 @@ def build_card(title: str, color: str, elements: list, buttons: list) -> dict:
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": title},
-                "template": color,
+                "template": color,  # red | orange | green | blue | grey
             },
             "body": {"elements": elements + [button(t, u) for t, u in buttons]},
         },
@@ -238,7 +236,6 @@ def parse_time(s: Optional[str]) -> Optional[datetime]:
 
 
 def fmt_local(dt: Optional[datetime]) -> str:
-    """2026-09-02 07:00 AM PDT"""
     if dt is None:
         return "-"
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p %Z")
@@ -365,7 +362,7 @@ def render_ci_status(run: dict, jobs: list, prev_failed: Optional[dict]) -> dict
     if cancelled:
         jobs_summary += f", {len(cancelled)} cancelled"
     elements = [
-        md(f"{label('Commit')}  {commit_md}"),
+        md(f"{grey('Commit')}  {commit_md}"),
         kv_columns(
             [
                 ("Started", fmt_local(started)),
@@ -434,7 +431,7 @@ def cmd_ci_status(args: argparse.Namespace, gh: GitHub) -> None:
 def summarize_pools(runners: list) -> dict:
     pools: dict = {}
     for r in runners:
-        pool_label = primary_cuda_label([l["name"] for l in r.get("labels", [])])
+        pool_label = primary_cuda_label([lb["name"] for lb in r.get("labels", [])])
         if pool_label is None:
             continue
         pool = pools.setdefault(
@@ -497,16 +494,7 @@ def render_health_event(
     if kind == "recovered":
         title = f"Runner pool recovered: {pool_label}"
         color = "green"
-        columns = [
-            ("Pool", pool_label),
-            ("Status", status),
-            ("Busy", str(pool["busy"])),
-            ("Was degraded for", elapsed),
-        ]
-        elements = [
-            kv_columns(columns),
-            md(f"{label('Degraded since')}  {fmt_local(since)}"),
-        ]
+        elapsed_key = "Was degraded for"
     else:
         state_word = "DOWN" if all_down else "degraded"
         if kind == "degraded":
@@ -514,15 +502,20 @@ def render_health_event(
         else:
             title = f"Runner pool still {state_word}: {pool_label} ({elapsed})"
         color = "red" if all_down else "orange"
-        columns = [
-            ("Pool", pool_label),
-            ("Status", status),
-            ("Busy", str(pool["busy"])),
-            ("Degraded for", elapsed),
-        ]
-        elements = [
-            kv_columns(columns),
-            md(f"{label('Since')}  {fmt_local(since)}"),
+        elapsed_key = "Degraded for"
+    elements = [
+        kv_columns(
+            [
+                ("Pool", pool_label),
+                ("Status", status),
+                ("Busy", str(pool["busy"])),
+                (elapsed_key, elapsed),
+            ]
+        ),
+        md(f"{grey('Degraded since')}  {fmt_local(since)}"),
+    ]
+    if kind != "recovered":
+        elements += [
             HR,
             md(f"**Offline runners**\n{compress_runner_names(pool['offline_names'])}"),
         ]
@@ -583,18 +576,15 @@ def summarize_queue(jobs: list, now: datetime) -> dict:
         q = job_queue_seconds(job, now)
         if q is None:
             continue
-        entry = per_label.setdefault(
-            pool_label, {"waits": [], "queued_now": [], "started": 0}
-        )
+        entry = per_label.setdefault(pool_label, {"waits": [], "queued_now": []})
         if job.get("status") == "queued":
             entry["queued_now"].append(q)
         else:
             entry["waits"].append(q)
-            entry["started"] += 1
     result = {}
     for pool_label, e in per_label.items():
         result[pool_label] = {
-            "n": e["started"],
+            "n": len(e["waits"]),
             "p50": percentile(e["waits"], 0.5),
             "p90": percentile(e["waits"], 0.9),
             "max": max(e["waits"]) if e["waits"] else None,
@@ -602,6 +592,10 @@ def summarize_queue(jobs: list, now: datetime) -> dict:
             "oldest_queued": max(e["queued_now"]) if e["queued_now"] else None,
         }
     return result
+
+
+def slow_pools(stats: dict, slow_minutes: float) -> set:
+    return {k for k, s in stats.items() if (s["p90"] or 0) >= slow_minutes * 60}
 
 
 QUEUE_COLUMNS = [
@@ -618,11 +612,11 @@ QUEUE_COLUMNS = [
 def render_queue_digest(
     stats: dict, hours: float, slow_minutes: float, now: datetime, report_url: str
 ) -> dict:
-    slow = slow_minutes * 60
+    slow = slow_pools(stats, slow_minutes)
     ordered = sorted(stats.items(), key=lambda kv: -(kv[1]["p90"] or 0))
     rows = []
     for pool_label, s in ordered:
-        is_slow = (s["p90"] or 0) >= slow
+        is_slow = pool_label in slow
         rows.append(
             {
                 "pool": f"**{pool_label}** (!)" if is_slow else pool_label,
@@ -634,20 +628,17 @@ def render_queue_digest(
                 "oldest": fmt_duration(s["oldest_queued"]) if s["queued_now"] else "-",
             }
         )
-    any_slow = any((s["p90"] or 0) >= slow for s in stats.values())
     title = f"CUDA queue time, last {int(hours)}h"
-    if any_slow:
+    if slow:
         title += f" - p90 over {int(slow_minutes)}m on some pools"
     window = f"{fmt_local(now - timedelta(hours=hours))} to {fmt_local(now)}"
     elements = [
-        md(
-            f"{label('Window')}  {window}\n{label('(!)')}  p90 over {int(slow_minutes)}m"
-        ),
+        md(f"{grey('Window')}  {window}\n{grey('(!)')}  p90 over {int(slow_minutes)}m"),
         table(QUEUE_COLUMNS, rows) if rows else md("_No CUDA jobs in this window._"),
     ]
     return build_card(
         title,
-        "orange" if any_slow else "blue",
+        "orange" if slow else "blue",
         elements,
         [("View utilization report", report_url)],
     )
@@ -678,8 +669,7 @@ def cmd_queue_digest(args: argparse.Namespace, gh: GitHub) -> None:
     now = datetime.now(timezone.utc)
     jobs = fetch_window_jobs(gh, args.hours, args.workflows.split(","), args.workers)
     stats = summarize_queue(jobs, now)
-    slow = args.slow_minutes * 60
-    if args.only_if_slow and not any((s["p90"] or 0) >= slow for s in stats.values()):
+    if args.only_if_slow and not slow_pools(stats, args.slow_minutes):
         print(f"no pool with p90 over {int(args.slow_minutes)}m; skipping")
         return
     report_url = gh.latest_run_url(UTILIZATION_WORKFLOW)
