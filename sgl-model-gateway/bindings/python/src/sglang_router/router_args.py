@@ -1069,7 +1069,6 @@ class RouterArgs:
 
         prefill_urls = []
         for prefill_args in prefill_list:
-
             url = prefill_args[0]
 
             # Handle optional bootstrap port

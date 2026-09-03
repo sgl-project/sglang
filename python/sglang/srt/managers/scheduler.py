@@ -216,6 +216,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
+    DynamicChunkSizer,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -627,6 +630,7 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
+        self.maybe_init_dynamic_chunk_sizer()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1060,6 +1064,13 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
+        with torch.get_device_module(model_runner.device).stream(
+            model_runner.forward_stream
+        ):
+            if self.draft_worker is None:
+                model_runner.prewarm_sampling()
+            else:
+                self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
@@ -1237,19 +1248,28 @@ class Scheduler(
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
-        # Init the dynamic chunking predictor for PP
-        self.enable_dynamic_chunking = (
-            get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1
+    def maybe_init_dynamic_chunk_sizer(self) -> None:
+        """Profile a PP prefill latency model that sizes chunks per stage."""
+        self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
+        if not (get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1):
+            return
+        sizer = DynamicChunkSizer(
+            model_runner=self.tp_worker.model_runner,
+            model_config=self.model_config,
+            tree_cache=self.tree_cache,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            chunked_prefill_size=self.chunked_prefill_size,
+            max_prefill_tokens=self.max_prefill_tokens,
+            page_size=self.page_size,
+            device=self.device,
+            pp_group=self.pp_group,
+            world_group=self.world_group,
+            pp_rank=self.ps.pp_rank,
         )
-        if self.enable_dynamic_chunking:
-            try:
-                self.profile_and_init_predictor()
-            except Exception as e:
-                logger.warning(
-                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
-                    "Dynamic chunking will be disabled."
-                )
-                self.enable_dynamic_chunking = False
+        if sizer.profile_and_fit():
+            self.dynamic_chunk_sizer = sizer
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -2164,6 +2184,9 @@ class Scheduler(
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
+    def rust_server_tokenizer_path(self) -> str:
+        return get_serving().tokenizer_path
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
@@ -2299,19 +2322,31 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -3591,9 +3626,9 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
+            dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
@@ -3666,9 +3701,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 
