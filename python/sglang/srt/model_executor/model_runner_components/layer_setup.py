@@ -62,12 +62,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
-        if attn_layer is not None:
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
-        elif hasattr(layer, "mixer"):
-            attention_layers.append(None)
-            mha_companion_layers.append(None)
+        # Keep these lists aligned with global layer ids. Pipeline-parallel
+        # models retain placeholders outside the local stage, while real
+        # attention modules use their global layer_id during graph replay.
+        attention_layers.append(attn_layer)
+        mha_companion_layers.append(mha_companion_layer)
 
         moe_block = None
         moe_fusion = None

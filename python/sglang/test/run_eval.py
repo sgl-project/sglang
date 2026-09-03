@@ -151,6 +151,10 @@ def _run_sgl_eval(eval_name, args) -> dict:
     # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
     if getattr(args, "seed", None) is not None:
         cmd += ["--seed", str(args.seed)]
+    # gpt-oss grades one score per effort tier, so dropping this collapses every
+    # tier onto the served model's default.
+    if getattr(args, "reasoning_effort", None) is not None:
+        cmd += ["--reasoning-effort", str(args.reasoning_effort)]
     if getattr(args, "repeat", None) is not None:
         cmd += ["--n-repeats", str(args.repeat)]
     # Bound generation length so long-reasoning models don't stall the eval.
@@ -265,52 +269,18 @@ def run_eval(args):
         # caller's threshold has to be measured against it, not inherited.
         # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
-    elif args.eval_name == "math":
-        from sglang.test.simple_eval_math import MathEval
-
-        equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
-        )
-        eval_obj = MathEval(
-            filename, equality_checker, args.num_examples, args.num_threads
-        )
-    elif args.eval_name == "mgsm":
-        from sglang.test.simple_eval_mgsm import MGSMEval
-
-        eval_obj = MGSMEval(args.num_examples, args.num_threads)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
     elif args.eval_name == "gpqa":
-        from sglang.test.simple_eval_gpqa import GPQAEval
-
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        )
-        eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
+        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
+        # caller's threshold has to be measured against it, not inherited.
+        return _run_sgl_eval("gpqa", args)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
-    elif args.eval_name == "longbench_v2":
-        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
-
-        # Default to HuggingFace dataset, can be overridden with --dataset-path
-        data_source = args.dataset_path
-        categories = args.categories.split(",") if args.categories else None
-
-        eval_obj = LongBenchV2Eval(
-            model=getattr(args, "model", None),
-            data_source=data_source,
-            num_examples=args.num_examples,
-            num_threads=args.num_threads,
-            categories=categories,
-            max_context_length=getattr(args, "max_context_length", None),
-            min_context_length=getattr(args, "min_context_length", None),
-        )
     elif args.eval_name == "mmmu":
         # VLM MMMU evaluation with fixed 100 examples by default
         from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
@@ -328,9 +298,7 @@ def run_eval(args):
         # simple_eval implementation to fall back to.
         return _run_sgl_eval("mmmu_pro_vision", args)
     elif args.eval_name == "aime25":
-        from sglang.test.simple_eval_aime25 import AIME25Eval
-
-        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+        return _run_sgl_eval("aime25", args)
     elif args.eval_name == "gsm8k":
         if getattr(args, "api", None) == "sgl_eval":
             # Only the nightly correctness eval opts into sgl-eval (zero-shot
@@ -524,28 +492,6 @@ if __name__ == "__main__":
     )
 
     # LongBench-v2 specific arguments
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="THUDM/LongBench-v2",
-        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
-    )
-    parser.add_argument(
-        "--categories",
-        type=str,
-        default=None,
-        help="Comma-separated list of categories to evaluate for LongBench-v2",
-    )
-    parser.add_argument(
-        "--max-context-length",
-        type=int,
-        help="Maximum context length in characters for LongBench-v2",
-    )
-    parser.add_argument(
-        "--min-context-length",
-        type=int,
-        help="Minimum context length in characters for LongBench-v2",
-    )
     parser.add_argument(
         "--num-shots",
         type=int,

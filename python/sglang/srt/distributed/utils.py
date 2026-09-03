@@ -17,13 +17,14 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+from sglang.srt.runtime_context import get_resources
+
 logger = logging.getLogger(__name__)
 
 
 def set_global_tcp_store(store: TCPStore) -> None:
     """Install the shared TCPStore created during distributed initialization;
     the handle lives on ``ctx.resources``."""
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().tcp_store = store
     logger.info("Global TCPStore has been set")
@@ -39,7 +40,6 @@ def get_global_tcp_store() -> Optional[TCPStore]:
     Returns:
         The global TCPStore instance, or None if not initialized yet.
     """
-    from sglang.srt.runtime_context import get_resources
 
     store = get_resources().tcp_store
     if store is None:
