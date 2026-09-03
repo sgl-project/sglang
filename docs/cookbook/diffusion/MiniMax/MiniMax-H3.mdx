@@ -1396,13 +1396,13 @@ and the same clip length:
 | SGLang, FP8, 1× B200, DiT layerwise offload (auto policy) | 7.49 | 61.7 s | 9.4 s | 111,616 MB |
 | SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
 | SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
-| SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.43** | **19.4 s** | 3.4 s | 63,022 MB |
+| SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
 
 Against the published 8× B200 headline (1.40 s/NFE, 11.2 GPU-seconds per
 NFE), the SGLang 4× B200 FP8 run spends 9.8 GPU-seconds per NFE, with half
 the GPUs and half the all-to-all fan-out. On the same host and GPU count the
-SGLang path is 7-10% faster per NFE than the released stack (2.43 vs 2.61 /
-2.68 s), and the 8-forward denoise is 19.4 s against their 20.9 / 21.4 s. In BF16 the single-GPU path matches the released tuned BF16 stack
+SGLang path is 10-13% faster per NFE than the released stack (2.34 vs 2.61 /
+2.68 s), and the 8-forward denoise is 18.7 s against their 20.9 / 21.4 s. In BF16 the single-GPU path matches the released tuned BF16 stack
 (7.86 vs 7.91 s/NFE); the single-GPU FP8 gap (7.49 vs 6.47 s) is the online
 FP8 GEMM path, not the hybrid attention.
 
