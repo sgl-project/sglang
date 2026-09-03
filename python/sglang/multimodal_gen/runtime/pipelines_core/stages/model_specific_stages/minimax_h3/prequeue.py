@@ -238,6 +238,22 @@ def _preserve_prequeue_material_dirs(batch: Any) -> None:
                 prequeue_paths.append(path)
 
 
+def _configured_reference_image_short_edge() -> int | None:
+    """Server-configured ref2va image short edge, ``None`` for the 2048 default.
+
+    Pre-queue admission runs outside the stage machinery, so it reads the global
+    server args directly; callers without a server keep the released default.
+    """
+
+    from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return None
+    return getattr(server_args, "minimax_h3_reference_image_short_edge", None)
+
+
 def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
     """Freeze MiniMax H3 media/shape facts before queue admission."""
 
@@ -312,6 +328,7 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                 resolved = minimax_h3_resolve_reference_image_shape(
                     width=width,
                     height=height,
+                    short_edge=_configured_reference_image_short_edge(),
                 )
             else:
                 continue
