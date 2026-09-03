@@ -122,5 +122,12 @@ def test_glm5_nextn_builds_glm_decoder_layer(monkeypatch):
     }
 
 
+def test_glm5_nextn_preserves_modelopt_quantization_for_routed_experts():
+    model = Glm5NextModelNextN.__new__(Glm5NextModelNextN)
+    quant_config = MagicMock()
+
+    assert model._resolve_modelopt_nextn_quant_config(quant_config) is quant_config
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

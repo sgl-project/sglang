@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextModelNextN(DeepseekModelNextN):
+    def _resolve_modelopt_nextn_quant_config(
+        self, quant_config: QuantizationConfig
+    ) -> QuantizationConfig:
+        # GLM-5.3's native MTP block keeps attention/shared projections in BF16
+        # via ModelOpt's ignore rules, but its routed experts remain NVFP4.  The
+        # generic DeepSeek drafter drops ModelOpt quantization entirely, which
+        # allocates unpacked BF16 expert tensors at twice the checkpoint width.
+        return quant_config
+
     def _build_decoder(
         self,
         config: PretrainedConfig,

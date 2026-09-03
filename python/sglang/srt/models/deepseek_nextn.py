@@ -21,6 +21,9 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file
+from torch import nn
+from transformers import PretrainedConfig
+
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
@@ -59,8 +62,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForC
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
-from torch import nn
-from transformers import PretrainedConfig
 
 
 def _gather_dsa_topk_indices_for_cp(
@@ -118,7 +119,7 @@ class DeepseekModelNextN(nn.Module):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
-            quant_config = None
+            quant_config = self._resolve_modelopt_nextn_quant_config(quant_config)
 
         self.vocab_size = config.vocab_size
 
@@ -183,6 +184,11 @@ class DeepseekModelNextN(nn.Module):
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def _resolve_modelopt_nextn_quant_config(
+        self, quant_config: QuantizationConfig
+    ) -> Optional[QuantizationConfig]:
+        return None
 
     def _build_decoder(
         self,
