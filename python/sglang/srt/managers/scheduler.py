@@ -112,6 +112,9 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+import zmq
+
+from sglang.srt.managers.dp_queue_lb import SchedulerMigrationAgent
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -152,6 +155,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
+    MigrateBatchReq,
+    MigrateOutReq,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -807,6 +812,10 @@ class Scheduler(
 
         self.load_snapshot_writer = None
         self.recv_from_tokenizer = None
+        # Defined on every rank so non-leader ranks (attn_tp_rank != 0), which
+        # still run handle_generate_request via broadcast, don't AttributeError.
+        self.migration_agent = None
+        self._migration_context = None
 
         if not is_rank_zero:
             return
@@ -822,6 +831,84 @@ class Scheduler(
             )
         except Exception as e:
             logger.warning("load snapshot writer init failed: %s", e)
+
+        self.init_migration_agent(port_args, dp_rank)
+
+    def init_migration_agent(self, port_args: PortArgs, dp_rank: int):
+        """Init the DP waiting-queue migration mesh (queue_lb feature, Phase 1)."""
+        self.migration_agent = None
+        enabled = bool(
+            getattr(self.server_args, "enable_dp_queue_balance", False)
+            and get_parallel().config.enable_dp_attention
+        )
+        if enabled and self.ps.attn_tp_size != 1:
+            # Phase 1 does not broadcast migrated reqs inside an attn_tp group,
+            # so it only supports attn_tp_size == 1 (e.g. dp8/tp8/ep8).
+            logger.warning(
+                "enable_dp_queue_balance requires attn_tp_size == 1 "
+                "(got %s); disabling DP queue balancing on this scheduler.",
+                self.ps.attn_tp_size,
+            )
+            enabled = False
+        self._migration_context = zmq.Context(2) if enabled else None
+        self.migration_agent = SchedulerMigrationAgent(
+            context=self._migration_context,
+            port_args=port_args,
+            dp_rank=dp_rank,
+            dp_size=self.ps.dp_size,
+            enabled=enabled,
+        )
+
+        # queue_lb Phase 2: also migrate queued reqs that already matched a
+        # prefix KV, bridging the prefix through the shared UMBP storage backend.
+        # Requires hicache storage (the shared L3 that both ranks read/write) and
+        # a RANK-REPLICATED KV cache so the storage key is dp/tp-rank independent
+        # (the same content hash resolves on the destination). That is exactly the
+        # condition hicache itself uses for a rank-independent key
+        # (cache_controller: is_rank_replicated = is_mla_model or
+        # is_compressed_mla_model): true MLA models AND DeepSeek-V4, whose
+        # DeepSeekV4TokenToKVPool is compressed-MLA rank-replicated even though its
+        # attention_arch is reported as MHA. Otherwise degrade to Phase 1.
+        self.migrate_kv_enabled = False
+        # rids of reqs that arrived via a Phase 2 (migrate_kv) batch on THIS rank,
+        # so we can prove the storage-bridge fired (destination storage_hit>0)
+        # rather than a plain recompute. Consumed once at schedule time.
+        self._migrate_kv_in_rids = set()
+        if enabled and getattr(
+            self.server_args, "dp_queue_balance_migrate_kv", False
+        ):
+            arch = getattr(self.model_config, "attention_arch", None)
+            is_mla = arch is not None and getattr(arch, "name", str(arch)) == "MLA"
+            # DeepSeek-V4's KV pool is compressed-MLA rank-replicated (shared,
+            # rank-independent storage key) even though attention_arch==MHA.
+            # NOTE: init_migration_agent runs before self.tp_worker is built, so
+            # read the already-initialized self.model_config (set above) rather
+            # than the worker's model_runner (which does not exist yet).
+            try:
+                hf_cfg = self.model_config.hf_config
+                is_compressed_mla = is_deepseek_v4(hf_cfg)
+            except Exception:
+                is_compressed_mla = False
+            is_rank_replicated = is_mla or is_compressed_mla
+            if self.enable_hicache_storage and is_rank_replicated:
+                self.migrate_kv_enabled = True
+                logger.info(
+                    "queue_lb Phase 2 KV migration enabled (hicache storage + "
+                    "rank-replicated KV: is_mla=%s is_compressed_mla=%s); "
+                    "matched-prefix queued reqs bridge through shared storage.",
+                    is_mla,
+                    is_compressed_mla,
+                )
+            else:
+                logger.warning(
+                    "dp_queue_balance_migrate_kv set but requires hicache storage "
+                    "(got enable_hicache_storage=%s) and a rank-replicated KV cache "
+                    "(got is_mla=%s is_compressed_mla=%s); degrading to Phase 1 "
+                    "(un-prefilled reqs only).",
+                    self.enable_hicache_storage,
+                    is_mla,
+                    is_compressed_mla,
+                )
 
     def init_idle_sleeper(self) -> None:
         if (
@@ -1669,6 +1756,8 @@ class Scheduler(
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (MigrateOutReq, self.handle_migrate_out),
+                (MigrateBatchReq, self.handle_migrate_in),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (
@@ -1859,6 +1948,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
 
@@ -1903,6 +1993,7 @@ class Scheduler(
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            self.poll_migration_inbox()
             if self._engine_paused:
                 continue
 
@@ -2716,6 +2807,11 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # queue_lb (Phase 1): keep the original tokenized input so a queued,
+            # un-prefilled request can be shipped verbatim to another DP rank.
+            if self.migration_agent is not None and self.migration_agent.enabled:
+                req.migration_src_recv_req = recv_req
+
             if radix_native_session:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     recv_req.session_id
@@ -3082,6 +3178,315 @@ class Scheduler(
                 req.storage_prefetch_retry_attempts,
             )
             self._prefetch_kvcache(req)
+
+    def poll_migration_inbox(self):
+        """Drain peer-migrated request batches and re-enqueue them.
+
+        Called once per scheduler loop. Migrated requests arrive as their
+        original ``TokenizedGenerateReqInput`` and are re-injected through the
+        normal request path, so they behave exactly like freshly dispatched
+        requests on this DP rank (queue_lb feature, Phase 1).
+        """
+        if self.migration_agent is None or not self.migration_agent.enabled:
+            return
+        for batch in self.migration_agent.poll():
+            # Undo the pickle-field wrapping applied before the peer socket hop
+            # (mirrors SchedulerRequestReceiver.unwrap_pickle_wrapper).
+            for sub_req in batch.reqs:
+                sub_req.unwrap_pickle_fields()
+            # Phase 2: remember which arrivals came through the KV-bridge path so
+            # we can later confirm the destination served their prefix from shared
+            # storage (storage_hit>0) instead of recomputing it.
+            if getattr(batch, "migrate_kv", False):
+                for sub_req in batch.reqs:
+                    rid = getattr(sub_req, "rid", None)
+                    if rid is not None:
+                        self._migrate_kv_in_rids.add(rid)
+            self.process_input_requests(batch.reqs)
+
+    def _is_migratable_waiting_req(self, req: Req) -> bool:
+        """Phase 1: only migrate requests that have not started prefill.
+
+        Such a request owns no KV cache and no radix-tree prefix lock, so it can
+        be re-run verbatim on the destination rank without any state transfer.
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and (req.prefix_indices is None or len(req.prefix_indices) == 0)
+            and not req.is_retracted
+            and req.finished_reason is None
+            # Phase 1: skip multimodal / embedding requests (their side inputs
+            # are not carried over the migration mesh yet).
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
+    def _is_kv_migratable_req(self, req: Req) -> bool:
+        """Phase 2: migrate a queued req that already matched a prefix KV.
+
+        The matched prefix lives in shared radix nodes (not owned by this req);
+        we bridge it through the shared UMBP storage backend so the destination
+        re-fetches it by content hash instead of recomputing. Superset of the
+        Phase 1 predicate: drops the "no matched prefix" restriction but still
+        requires a request that has not started decode and holds no own KV pool
+        slot (i.e. still purely queued, not mid-prefill).
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and not req.is_retracted
+            and req.finished_reason is None
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
+    def _is_pd_prefill_migratable_req(self, req: Req) -> bool:
+        """queue_lb (PD prefill): migrate a fully-bootstrapped, un-prefilled req.
+
+        Superset of the Phase 1 gate plus ``not pending_bootstrap``: the request
+        must sit in ``waiting_queue`` with its KV sender finalized
+        (``sender.init()`` done ⟺ room reached ``WaitingForInput`` ⟺ the decode
+        peer already published its transfer info), so we know the decode endpoint
+        to send the REBOOTSTRAP notification to and the handshake state is clean.
+
+        This deliberately excludes:
+          * requests mid-chunk (`self.chunked_req`, not in `waiting_queue`);
+          * requests that started prefill (`req_pool_idx`/`kv` set);
+          * optimistic re-queues (`is_retracted` after `reset_for_retract`);
+          * optimistic pre-handshake admissions (`pending_bootstrap`).
+        """
+        return (
+            getattr(req, "migration_src_recv_req", None) is not None
+            and len(req.output_ids) == 0
+            and req.req_pool_idx is None
+            and req.kv is None
+            and (req.prefix_indices is None or len(req.prefix_indices) == 0)
+            and not req.is_retracted
+            and req.finished_reason is None
+            and not getattr(req, "pending_bootstrap", False)
+            and getattr(req, "disagg_kv_sender", None) is not None
+            and getattr(req, "multimodal_inputs", None) is None
+            and req.input_embeds is None
+        )
+
+    def _backup_prefix_for_migration(self, req: Req) -> None:
+        """Ensure a migrating req's matched prefix is in shared storage (UMBP).
+
+        Idempotent: skips root / already-backed-up nodes. On any failure the
+        migration still proceeds — the destination just gets a storage miss and
+        recomputes the prefix, so correctness is preserved (only locality lost).
+        """
+        node = getattr(req, "last_host_node", None) or getattr(req, "last_node", None)
+        if node is None:
+            return
+        try:
+            if self.tree_cache.is_root(node) or self.tree_cache.is_backuped(node):
+                return
+            self.tree_cache.write_backup_storage(node)
+        except Exception as e:
+            logger.warning("migrate-kv prefix backup failed for %s: %s", req.rid, e)
+
+    def handle_migrate_out(self, recv_req: MigrateOutReq):
+        """Ship up to ``count`` queued requests to ``dst_dp_rank`` (queue_lb)."""
+        if self.migration_agent is None or not self.migration_agent.enabled:
+            return
+        if recv_req.dst_dp_rank == self.ps.dp_rank or recv_req.count <= 0:
+            return
+
+        # PD prefill uses a dedicated path: migrated reqs already hold a live KV
+        # sender + decode handshake, so we must tear that down and re-point the
+        # decode peer rather than just re-run them verbatim.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self._handle_migrate_out_pd_prefill(recv_req)
+
+        # Phase 2: when KV migration is enabled we also move queued reqs that
+        # already matched a prefix KV (bridged via shared storage); otherwise
+        # only un-prefilled reqs move (Phase 1).
+        migratable = (
+            self._is_kv_migratable_req
+            if self.migrate_kv_enabled
+            else self._is_migratable_waiting_req
+        )
+
+        # Pick from the tail: these are the requests scheduled last, so moving
+        # them perturbs prefix-cache locality the least.
+        picked: List[Req] = []
+        keep: List[Req] = []
+        for req in reversed(self.waiting_queue):
+            if len(picked) < recv_req.count and migratable(req):
+                picked.append(req)
+            else:
+                keep.append(req)
+        if not picked:
+            return
+        # `keep` was built from a reversed walk; restore original order.
+        self.waiting_queue = list(reversed(keep))
+
+        migrated_inputs = []
+        for req in picked:
+            # Phase 2: flush this req's matched prefix to shared storage before it
+            # leaves, so the destination can re-fetch it by content hash.
+            if self.migrate_kv_enabled and self.enable_hicache_storage:
+                self._backup_prefix_for_migration(req)
+            src_input = req.migration_src_recv_req
+            # Re-target routing metadata so the destination (and any downstream
+            # bookkeeping) sees the request as belonging to the new DP rank.
+            src_input.routed_dp_rank = recv_req.dst_dp_rank
+            # Re-wrap pickle-only fields (e.g. time_stats) for the socket hop;
+            # the destination unwraps them in poll_migration_inbox().
+            src_input.wrap_pickle_fields()
+            migrated_inputs.append(src_input)
+            self._cleanup_migrated_out_req(req)
+
+        self.migration_agent.send_batch(
+            MigrateBatchReq(
+                src_dp_rank=self.ps.dp_rank,
+                dst_dp_rank=recv_req.dst_dp_rank,
+                reqs=migrated_inputs,
+                migrate_kv=self.migrate_kv_enabled,
+            )
+        )
+        logger.info(
+            "Migrated %s queued reqs dp%s -> dp%s (queue=%s, migrate_kv=%s).",
+            len(migrated_inputs),
+            self.ps.dp_rank,
+            recv_req.dst_dp_rank,
+            len(self.waiting_queue),
+            self.migrate_kv_enabled,
+        )
+
+    def _handle_migrate_out_pd_prefill(self, recv_req: MigrateOutReq):
+        """queue_lb PD prefill: migrate fully-bootstrapped, un-prefilled reqs.
+
+        For each picked request we (1) notify its decode peer to re-handshake
+        against ``dst_dp_rank`` over the KV control channel, (2) tear down the
+        local KV sender and free its metadata buffer / room state, then (3) ship
+        the original tokenized input over the migration mesh. The destination
+        re-enters it through the normal bootstrap queue and picks the handshake
+        back up under the same bootstrap_room.
+        """
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.prefill import maybe_release_metadata_buffer
+
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        kv_manager = bootstrap_queue.kv_manager
+        notify = getattr(kv_manager, "notify_decode_rebootstrap", None)
+        get_infos = getattr(kv_manager, "get_transfer_infos", None)
+        if notify is None or get_infos is None:
+            logger.warning(
+                "queue_lb: KV backend %s lacks rebootstrap support; "
+                "PD prefill migration disabled.",
+                type(kv_manager).__name__,
+            )
+            return
+
+        picked: List[Req] = []
+        keep: List[Req] = []
+        for req in reversed(self.waiting_queue):
+            if (
+                len(picked) < recv_req.count
+                and self._is_pd_prefill_migratable_req(req)
+                # Defensive: the room must actually be WaitingForInput so its
+                # decode transfer info exists to address the notification.
+                and kv_manager.request_status.get(req.bootstrap_room)
+                == KVPoll.WaitingForInput
+            ):
+                picked.append(req)
+            else:
+                keep.append(req)
+        if not picked:
+            return
+        # `keep` was built from a reversed walk; restore original order.
+        self.waiting_queue = list(reversed(keep))
+
+        migrated_inputs = []
+        for req in picked:
+            room = req.bootstrap_room
+            # 1) Address + notify the decode peer(s) BEFORE tearing the room down
+            #    (teardown clears transfer_infos, losing the decode endpoint).
+            infos = get_infos(room)
+            if not infos:
+                # No decode endpoint recorded — cannot re-point safely; keep it.
+                self.waiting_queue.append(req)
+                continue
+            notify(infos, room, recv_req.dst_dp_rank)
+
+            # 2) Tear down the local sender + room state and free the metadata
+            #    buffer. We must NOT call sender.abort(): for mori that routes
+            #    through _finalize_failure() and pushes KVPoll.Failed to the very
+            #    decode peer we just told to re-handshake, racing it into a hard
+            #    failure. Instead clear the room's local bookkeeping silently:
+            #    clear() drops request_status/transfer_infos/req_to_decode_prefix
+            #    and _cleanup_room_tracking() detaches it from the sender-side
+            #    decode-liveness tracker so no stray failure is ever emitted.
+            try:
+                req.disagg_kv_sender.clear()
+                cleanup = getattr(kv_manager, "_cleanup_room_tracking", None)
+                if cleanup is not None:
+                    cleanup(room)
+            except Exception as e:
+                logger.warning("migrate-out sender teardown failed: %s", e)
+            maybe_release_metadata_buffer(
+                req, bootstrap_queue.req_to_metadata_buffer_idx_allocator
+            )
+            req.disagg_kv_sender = None
+            req.pending_bootstrap = True
+            req.metadata_buffer_index = -1
+
+            # 3) Re-target routing metadata and ship the original tokenized input.
+            src_input = req.migration_src_recv_req
+            src_input.routed_dp_rank = recv_req.dst_dp_rank
+            src_input.wrap_pickle_fields()
+            migrated_inputs.append(src_input)
+            self._cleanup_migrated_out_req(req)
+
+        if not migrated_inputs:
+            return
+
+        self.migration_agent.send_batch(
+            MigrateBatchReq(
+                src_dp_rank=self.ps.dp_rank,
+                dst_dp_rank=recv_req.dst_dp_rank,
+                reqs=migrated_inputs,
+                migrate_kv=False,
+            )
+        )
+        logger.info(
+            "Migrated %s PD-prefill reqs dp%s -> dp%s (queue=%s).",
+            len(migrated_inputs),
+            self.ps.dp_rank,
+            recv_req.dst_dp_rank,
+            len(self.waiting_queue),
+        )
+
+    def _cleanup_migrated_out_req(self, req: Req):
+        """Release local bookkeeping for a request leaving this rank.
+
+        The request keeps living on the destination rank under the same rid, so
+        (unlike abort) we must NOT notify the tokenizer here.
+        """
+        if self.enable_hicache_storage:
+            # Cancel any prefetch started by _prefetch_kvcache().
+            try:
+                self.tree_cache.release_aborted_request(req.rid)
+            except Exception as e:
+                logger.warning("migrate-out prefetch release failed: %s", e)
+
+    def handle_migrate_in(self, recv_req: MigrateBatchReq):
+        """Receive peer-migrated requests (queue_lb). See poll_migration_inbox.
+
+        Normally migrated batches arrive on the peer mesh and are handled by
+        poll_migration_inbox(); this dispatcher entry is a safety net for the
+        (unused) control-channel path.
+        """
+        for sub_req in recv_req.reqs:
+            sub_req.unwrap_pickle_fields()
+        self.process_input_requests(recv_req.reqs)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -3748,6 +4153,20 @@ class Scheduler(
                 loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                # Phase 2 proof: a req that migrated in via the KV-bridge and now
+                # loaded its prefix from shared storage confirms the bridge worked
+                # (destination reused the cached prefix instead of recomputing).
+                if self._migrate_kv_in_rids:
+                    if req.rid in self._migrate_kv_in_rids:
+                        self._migrate_kv_in_rids.discard(req.rid)
+                        if loaded_tokens > 0:
+                            logger.info(
+                                "queue_lb Phase 2 storage-bridge hit: migrated req "
+                                "%s loaded %d prefix tokens from shared storage on "
+                                "this rank.",
+                                req.rid,
+                                loaded_tokens,
+                            )
 
             req.init_next_round_input(self.tree_cache)
             if (
