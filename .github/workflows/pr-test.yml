@@ -231,6 +231,32 @@ jobs:
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
 
+  # The gb300 pool is Grace, so it can use none of the job above: PyO3 modules are
+  # portable across neither arch nor interpreter, which is why the arch is in the
+  # cache key. max_glibc stays 2.35 because it is a ceiling on what the LOADER has
+  # to offer, and the gb300 runner image is noble (2.39) - jammy-built modules
+  # clear it with room, the same direction as every x86_64 pool.
+  rust-ext-build-aarch64:
+    needs: [check-changes, call-gate]
+    # Same gate as rust-ext-build: every main-ref run has to seed the cache, and a
+    # docs-only PR still installs sglang on gb300.
+    if: |
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      # Not the ubuntu-latest default: the collect job's objdump has to read
+      # aarch64 ELF, and the hosted binutils is single-target. restore_runs_on is
+      # left alone - that job only moves bytes.
+      collect_runs_on: ubuntu-22.04-arm
+      artifact_name: rust-ext-aarch64
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   call-sgl-kernel-tests:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: |
@@ -363,7 +389,11 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '40'
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      # The per-commit stage that compiles during install, so install's own cargo
+      # path keeps a per-PR guard now that gb300 takes a prebuild. Here because it
+      # is the only per-commit stage at one partition: one compile per run, where
+      # gb300 was paying three, and stage B's long pole is its 9-partition jobs.
+      skip_prebuilt_rust_ext: true
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -455,7 +485,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -466,9 +496,11 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
-      # aarch64 has no prebuild, so this stage compiles during install - which also
-      # makes it the only stage still covering that path. Keep it that way.
-      skip_prebuilt_rust_ext: true
+      # The one aarch64 stage, so it takes the aarch64 prebuild and nothing from
+      # rust-ext-build. base-b-test-4-gpu-b200 is what covers the
+      # compile-during-install path per PR now, and the nightly gb300 stage covers
+      # it on aarch64; keep one of each.
+      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-8-gpu-b300:
@@ -499,6 +531,7 @@ jobs:
         call-sgl-kernel-tests,
 
         rust-ext-build,
+        rust-ext-build-aarch64,
 
         wait-for-base-a,
         wait-for-base-b,

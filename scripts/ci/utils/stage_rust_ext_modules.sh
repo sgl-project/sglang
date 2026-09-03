@@ -55,12 +55,25 @@ max_allowed="${MAX_GLIBC:-}"
 # Newer glibc than the test runners fails at import: "GLIBC_2.xx not found".
 status=0
 for so in "${built[@]}"; do
-    # grep exits 1 with no match; without `|| true` pipefail kills the script.
-    needed=$(objdump -T "$so" \
+    # objdump gets its own invocation rather than heading a pipeline: in a pipeline
+    # its failure is invisible, and the empty symbol list a wrong-arch objdump
+    # leaves behind ("file format not recognized") then reads exactly like "needs
+    # no glibc at all" and passes this gate silently.
+    if ! symbols=$(objdump -T "$so" 2>&1); then
+        echo "::error::objdump could not read ${so}: ${symbols}"
+        echo "::error::this gate must run on the same architecture as the modules"
+        status=1
+        continue
+    fi
+    # grep exits 1 with no match; without `|| true` pipefail kills the script. Now
+    # that objdump is known to have succeeded, no match really is no requirement -
+    # the count is printed so a zero has a denominator either way.
+    references=$(printf '%s\n' "${symbols}" | grep -coE 'GLIBC_2\.[0-9]+' || true)
+    needed=$(printf '%s\n' "${symbols}" \
         | grep -oE 'GLIBC_2\.[0-9]+' \
         | sed 's/GLIBC_//' \
         | sort -V | tail -1 || true)
-    echo "${so}: requires glibc <= ${needed:-none}"
+    echo "${so}: requires glibc <= ${needed:-none} (${references} GLIBC references)"
     if [ -n "${needed}" ] \
        && [ "$(printf '%s\n%s\n' "${max_allowed}" "${needed}" | sort -V | tail -1)" != "${max_allowed}" ]; then
         echo "::error::${so} requires glibc ${needed} > ${max_allowed} supported by the test runners; build on an older image"
