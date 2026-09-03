@@ -1175,7 +1175,7 @@ class MMEncoder:
             )
         except Exception:
             logger.exception(
-                "Global multimodal cache staging failed for req %s; " "skipping insert",
+                "Global multimodal cache staging failed for req %s; skipping insert",
                 ctx.req_id,
             )
             return [], []
