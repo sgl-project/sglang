@@ -475,31 +475,6 @@ class _MoriEPDispatcherImplBase:
             )
         return self._mori_op
 
-    def _moe_will_consume_mxfp8(self) -> bool:
-        """Would AITER take mxfp8 activations for this layer?
-
-        Only the mxfp8 override needs this: bf16 and fp4 land somewhere whatever
-        the MoE decides, mxfp8 only has the `q_dtype_a == fp8` branch. True when
-        the quant config is unset, since this also runs before weights load.
-        """
-        if not self.quant_config:
-            return True
-
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            AiterDispatchFormat,
-            resolve_aiter_dispatch_format,
-        )
-
-        return (
-            resolve_aiter_dispatch_format(
-                self.quant_config.get("quant_type"),
-                self.quant_config.get("weight_dtype"),
-                activation=self.quant_config.get("activation", "silu"),
-                swiglu_limit=self.quant_config.get("swiglu_limit"),
-            ).format
-            == AiterDispatchFormat.MXFP8
-        )
-
     def _apply_dispatch_dtype_override(self):
         """Apply env var override to fp8_dispatch/fp4_dispatch/fp8_combine flags."""
         if "SGLANG_MORI_DISPATCH_DTYPE" in os.environ:
@@ -512,20 +487,7 @@ class _MoriEPDispatcherImplBase:
                 elif dispatch_dtype == "fp4":
                     self.dispatch_dtype = DispatchDtype.fp4
                 elif dispatch_dtype == "mxfp8":
-                    if not self._moe_will_consume_mxfp8():
-                        # Refused rather than warned about: a mismatch aborts
-                        # at large M but silently returns garbage at decode
-                        # batch sizes.
-                        logger.warning_once(
-                            "SGLANG_MORI_DISPATCH_DTYPE=mxfp8 ignored: this "
-                            "layer's MoE does not resolve to fp8 activations "
-                            "(a8w4), so mxfp8 on the wire has no receiver. "
-                            "Needs gfx950 + AITER_BF16_FP8_MOE_BOUND<=1 + a "
-                            "clamped-SwiGLU layer on gate_mode=INTERLEAVE "
-                            "(SGLANG_USE_AITER_MOE_GU_ITLV=1). Falling back to "
-                            "bf16 dispatch."
-                        )
-                    elif _aiter_supports_mxfp8_dispatch():
+                    if _aiter_supports_mxfp8_dispatch():
                         self.dispatch_dtype = DispatchDtype.mxfp8
                     else:
                         logger.warning_once(
