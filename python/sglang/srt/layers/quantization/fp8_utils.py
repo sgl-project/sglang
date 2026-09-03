@@ -1559,8 +1559,6 @@ def requant_weight_ue8m0(
             weight, weight_scale_inv, weight_block_size
         )
 
-
-
     *_, n, k = weight.shape
 
     weight_dequant = block_quant_dequant(
