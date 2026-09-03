@@ -155,7 +155,6 @@ def _build_cycle_state_block_table(req_pool_indices: torch.Tensor) -> torch.Tens
 
 
 class CompressorAscendBackendMixin:
-
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
         if values is None:
@@ -533,9 +532,9 @@ class CompressorAscendBackendMixin:
         coff = 1 + int(compressor.overlap)
         split = coff * compressor.head_dim
         w = compressor.wkv_gate.weight
-        assert (
-            w.shape[0] == 2 * split
-        ), f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2*split}"
+        assert w.shape[0] == 2 * split, (
+            f"wkv_gate.weight rows={w.shape[0]} != 2*coff*head_dim={2 * split}"
+        )
         compressor._fused_wkv_w = w[:split]
         compressor._fused_wgate_w = w[split:]
         compressor._fused_norm_weight_fp32 = compressor.norm.weight.to(torch.float32)
@@ -625,7 +624,6 @@ class CompressorAscendBackendMixin:
 
 
 class C4IndexerAscendBackendMixin:
-
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
@@ -890,9 +888,9 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported on the NPU indexer path"
+        assert not skip_compressor, (
+            "skip_compressor=True is not supported on the NPU indexer path"
+        )
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
@@ -907,7 +905,6 @@ class C4IndexerAscendBackendMixin:
 class DeepseekV4AscendAttnBackend(
     AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
 ):
-
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1219,9 +1216,9 @@ class DeepseekV4AscendAttnBackend(
             dst.zero_()
             return
         n = src.numel()
-        assert (
-            n <= dst.shape[0]
-        ), f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
+        assert n <= dst.shape[0], (
+            f"graph replay 1D metadata overflow: src={n} > dst={dst.shape[0]}"
+        )
         if n > 0:
             if src.dtype != dst.dtype:
                 src = src.to(dst.dtype)
@@ -2199,7 +2196,6 @@ def _get_kv_indices(
 
 
 class DeepseekV4AscendMultiStepDraftBackend:
-
     def __init__(
         self,
         model_runner: ModelRunner,

@@ -54,7 +54,6 @@ def _get_float4_e2m1fn_x2_dtype():
 
 
 class _NPULinearMethodBase(LinearMethodBase):
-
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -63,7 +62,6 @@ class _NPULinearMethodBase(LinearMethodBase):
 
 
 class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -121,7 +119,6 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
 
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
@@ -325,8 +322,7 @@ def npu_w8a8_mxfp8_linear(
     """
     if weight.dtype != torch.float8_e4m3fn:
         raise ValueError(
-            f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, "
-            f"got {weight.dtype}"
+            f"npu_w8a8_mxfp8_linear expects float8_e4m3fn weights, got {weight.dtype}"
         )
 
     original_dtype = input.dtype
@@ -362,7 +358,6 @@ def npu_w8a8_mxfp8_linear(
 
 
 class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
-
     def process_weights_after_loading(self, layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()

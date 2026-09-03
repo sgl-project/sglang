@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 class AscendTransferEngine(MooncakeTransferEngine):
-
     def __init__(
         self,
         hostname: str,

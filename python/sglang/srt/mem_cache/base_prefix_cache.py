@@ -369,6 +369,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
 
+    def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
+        """Give back ascending, disjoint, half-open row-position ranges
+        of the ``kv`` record's row; one call keeps a shared page freed once.
+        """
+        from sglang.srt.mem_cache.common import free_kv_row_segments
+
+        row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
+        free_kv_row_segments(
+            self.token_to_kv_pool_allocator,
+            [(row[start:end], start) for start, end in ranges],
+            swa_evicted_seqlen=kv.swa_evicted_seqlen,
+        )
+
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass

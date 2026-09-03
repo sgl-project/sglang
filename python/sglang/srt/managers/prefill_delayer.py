@@ -118,9 +118,9 @@ class PrefillDelayer:
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
-            assert (
-                device_group is not None
-            ), "device_group is required when using NCCL for PrefillDelayer all-gather"
+            assert device_group is not None, (
+                "device_group is required when using NCCL for PrefillDelayer all-gather"
+            )
             self._gather_group = device_group
             self._gather_device = device
         else:
@@ -141,9 +141,9 @@ class PrefillDelayer:
         self._curr_state: Optional[_State] = None
         self.skip_first_delayer = True
 
-        assert (
-            not get_schedule().disable_overlap_schedule
-        ), "To use PrefillDelayer, disable_overlap_schedule must be False."
+        assert not get_schedule().disable_overlap_schedule, (
+            "To use PrefillDelayer, disable_overlap_schedule must be False."
+        )
 
     def _negotiate_should_allow_prefill(
         self,
