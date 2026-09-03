@@ -19,7 +19,6 @@ eps = 1e-6
 
 
 class TestNorm:
-
     def _forward_native(
         self,
         x: torch.Tensor,
@@ -201,7 +200,6 @@ class TestNorm:
 
 
 class TestFusedRMSNormGated:
-
     def _forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -236,7 +234,6 @@ class TestFusedRMSNormGated:
 
 
 class TestFusedQKRMSNorm:
-
     @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
     @pytest.mark.parametrize(
         "batch_size,q_size,k_size,v_size",
@@ -317,7 +314,6 @@ class TestFusedQKRMSNorm:
 
 
 class TestLayerNorm:
-
     def _forward_native(
         self,
         x: torch.Tensor,
@@ -382,7 +378,6 @@ class TestLayerNorm:
 
 
 class TestFusedQKGemmaRMSNorm:
-
     def _gemma_rmsnorm_per_head_native(
         self,
         x: torch.Tensor,
