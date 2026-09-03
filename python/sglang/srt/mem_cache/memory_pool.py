@@ -1513,6 +1513,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 f"next_track_idx={req.kv.mamba_next_track_idx}, "
                 f"rid={req.rid}"
             )
+        # The donated checkpoint is handed to the radix cache and the replacement
+        # slot starts a fresh tracking window, so neither carries pending
+        # ReplaySSM ring entries. MambaPool.copy_from performs the same reset on
+        # the no_buffer donate path; without it here both cursors would be stale.
+        _wp = getattr(self.mamba_pool, "replayssm_write_pos", None)
+        if _wp is not None:
+            _wp[mamba_value_donated] = 0
+            _wp[new_slot] = 0
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         return mamba_value_donated
 

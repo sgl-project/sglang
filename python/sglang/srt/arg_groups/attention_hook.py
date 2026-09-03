@@ -22,7 +22,6 @@ from sglang.srt.arg_groups.overrides import (
     _mla_kv_cache_dtype_checks,
     attention_backends_of,
     declare_resolution,
-    mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -333,12 +332,10 @@ def handle_linear_attn_backend(server_args: Any):
     # the COW copy-into-slot path resets the ring cursor) -- so the
     # --disable-radix-cache requirement is dropped.
     #
-    # Slice 2b only wires the no_buffer mamba scheduler strategy (the
-    # default). The extra_buffer strategy donates the track snapshot via
-    # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
-    # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
-    # cursor of the donated/kept slot would not be reset there. Handling
-    # that donation path is a follow-up; for now require no_buffer.
+    # Both mamba scheduler strategies are wired. no_buffer resets the ReplaySSM
+    # ring cursor in MambaPool.copy_from; extra_buffer donates the track snapshot
+    # via `donate_mamba_ping_pong_slot`, which resets the cursor on the donated
+    # and the replacement slot itself.
     if cfg.enable_linear_replayssm:
         if decode not in {"triton", "helion"}:
             raise ValueError(
@@ -347,13 +344,6 @@ def handle_linear_attn_backend(server_args: Any):
                 f"--linear-attn-decode-backend={decode!r}."
             )
 
-        if mamba_extra_buffer_of(resolved_view(server_args)):
-            raise ValueError(
-                "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                "no_buffer (the default); the extra_buffer ping-pong "
-                "donation path is not yet supported (follow-up). Got "
-                f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
-            )
         if cfg.disaggregation_mode != "null":
             # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
             # is not wired for the ReplaySSM ring, so the flag would silently
