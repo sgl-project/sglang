@@ -206,12 +206,22 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
         if callable(host_stats):
             try:
                 hs = host_stats()
+                big = {
+                    k: v
+                    for k, v in hs.items()
+                    if isinstance(v, (int, float)) and v >= 64 * 1024**2
+                }
                 lines.append(
-                    f"  pinned host allocator: reserved={hs.get('reserved_bytes.all.current', 0) / GIB:.2f}GiB "
-                    f"allocated={hs.get('allocated_bytes.all.current', 0) / GIB:.2f}GiB"
+                    "  pinned host allocator: "
+                    + (
+                        " ".join(
+                            f"{k}={v / GIB:.2f}GiB" for k, v in sorted(big.items())
+                        )
+                        or "no counter >= 64 MiB"
+                    )
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                lines.append(f"  pinned host allocator: unavailable ({exc})")
         for start, end, anon, flags in _anon_vmas()[:16]:
             inside = any(a <= start < b for a, b in ranges)
             lines.append(
