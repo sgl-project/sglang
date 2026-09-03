@@ -516,15 +516,18 @@ def build_fixture(
             full_attention_layer_ids=cfg.full_attention_layer_ids,
             device=device,
         )
-        allocator = SWATokenToKVPoolAllocator(
-            size=cfg.kv_size,
-            size_swa=cfg.kv_size,
-            page_size=cfg.page_size,
-            dtype=cfg.dtype,
-            device=device,
-            kvcache=kv_pool,
-            need_sort=False,
-        )
+        # Tree values reach the allocator as start_pos=0 segments, so only the
+        # debug cross-check against torch.unique catches a mis-aligned value.
+        with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
+            allocator = SWATokenToKVPoolAllocator(
+                size=cfg.kv_size,
+                size_swa=cfg.kv_size,
+                page_size=cfg.page_size,
+                dtype=cfg.dtype,
+                device=device,
+                kvcache=kv_pool,
+                need_sort=False,
+            )
     elif cfg.has_mamba:
         kv_pool = HybridLinearKVPool(
             size=cfg.kv_size,
@@ -4062,11 +4065,8 @@ class UnifiedRadixCacheSuite:
         # for an un-charged gate to accept.
         extend_need = 2 * ps + 1
         max_new = 8
-        self.assertIsNotNone(
-            cons_alloc.swa_attn_allocator.alloc(
-                cons_alloc.swa_available_size() - (window + extend_need - 1)
-            )
-        )
+        hold = cons_alloc.swa_available_size() - (window + extend_need - 1)
+        self.assertIsNotNone(cons_alloc.swa_attn_allocator.alloc(hold // ps * ps))
 
         # The adder's SWA gate for this request (_swa_budget_for_req).
         surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
