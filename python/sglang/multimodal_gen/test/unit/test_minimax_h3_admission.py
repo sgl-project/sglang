@@ -206,6 +206,29 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
         metadata.canonical_task(rejected)
 
 
+def test_synthetic_warmup_target_honors_warmup_flags():
+    req = SimpleNamespace(num_frames=345, width=1344, height=768)
+    default = MiniMaxH3SamplingParams._synthetic_warmup_target(
+        req, SimpleNamespace(warmup_num_frames=None, warmup_resolutions=None)
+    )
+    assert default == {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}
+    served = MiniMaxH3SamplingParams._synthetic_warmup_target(
+        req, SimpleNamespace(warmup_num_frames=345, warmup_resolutions=["1344x768"])
+    )
+    assert served["duration_seconds"] == 345 / 24.0
+    assert served["short_edge"] == 768 and served["aspect_ratio"] == "16:9"
+    portrait = MiniMaxH3SamplingParams._synthetic_warmup_target(
+        SimpleNamespace(num_frames=124, width=768, height=1344),
+        SimpleNamespace(warmup_num_frames=None, warmup_resolutions=["768x1344"]),
+    )
+    assert portrait["aspect_ratio"] == "9:16" and portrait["duration_seconds"] == 5.0
+    with pytest.raises(ValueError, match="aspect ratio"):
+        MiniMaxH3SamplingParams._synthetic_warmup_target(
+            SimpleNamespace(num_frames=124, width=2000, height=768),
+            SimpleNamespace(warmup_num_frames=None, warmup_resolutions=["2000x768"]),
+        )
+
+
 def test_duration_admission_accepts_released_4_to_15_second_range():
     for duration in (4.0, 15.0):
         target = {**TARGET, "duration_seconds": duration}

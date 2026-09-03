@@ -146,14 +146,60 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
         self.task = task
         self.conditions = conditions
-        self.target = {
+        self.target = self._synthetic_warmup_target(req, server_args)
+        selected_seed = req.seed if isinstance(req.seed, int) else int(req.seed[0])
+        req.extra.update(self.build_request_extra(_seed_override=int(selected_seed)))
+        self._video_hooks().prepare_for_queue_sync(req)
+
+    @staticmethod
+    def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
+        """The canvas the synthetic warmup renders.
+
+        Default: the released 768p 16:9 5-second clip. ``--warmup-num-frames``
+        and ``--warmup-resolutions`` override the duration and the canvas so
+        warmup allocates and tunes for the shape that will be served: the first
+        request at a new clip length otherwise pays allocator growth and
+        first-call kernel setup in every DiT block (about 2-3 s per forward on
+        the 14 s paper workload).
+        """
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+            MINIMAX_H3_FINITE_ASPECT_RATIOS,
+        )
+
+        target: dict[str, Any] = {
             "short_edge": 768,
             "aspect_ratio": "16:9",
             "duration_seconds": 5.0,
         }
-        selected_seed = req.seed if isinstance(req.seed, int) else int(req.seed[0])
-        req.extra.update(self.build_request_extra(_seed_override=int(selected_seed)))
-        self._video_hooks().prepare_for_queue_sync(req)
+        if getattr(server_args, "warmup_num_frames", None) is not None:
+            num_frames = int(req.num_frames)
+            if num_frames <= 0:
+                raise ValueError("--warmup-num-frames must be positive for MiniMax H3")
+            # H3 delivers 24 fps; the resolver aligns the frame count to 17n+5
+            target["duration_seconds"] = num_frames / 24.0
+        if getattr(server_args, "warmup_resolutions", None) is not None:
+            width, height = int(req.width), int(req.height)
+            if width <= 0 or height <= 0:
+                raise ValueError("--warmup-resolutions needs positive sizes for MiniMax H3")
+            # H3 canvases are named by their nominal ratio (1344x768 is the
+            # "16:9" 768p canvas), so snap to the nearest released ratio.
+            ratio = width / height
+
+            def _value(name: str) -> float:
+                a, b = name.split(":")
+                return int(a) / int(b)
+
+            aspect_ratio = min(
+                MINIMAX_H3_FINITE_ASPECT_RATIOS, key=lambda n: abs(_value(n) - ratio)
+            )
+            if abs(_value(aspect_ratio) - ratio) / ratio > 0.05:
+                raise ValueError(
+                    f"--warmup-resolutions {width}x{height} is not near any MiniMax H3 "
+                    f"aspect ratio {MINIMAX_H3_FINITE_ASPECT_RATIOS}"
+                )
+            target["short_edge"] = min(width, height)
+            target["aspect_ratio"] = aspect_ratio
+        return target
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         return self._video_hooks().project_queued_job_fields(req)
