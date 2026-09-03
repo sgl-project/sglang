@@ -59,6 +59,25 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Overlay in-tree sglang test helpers onto image site-packages
+        run: |
+          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
+          # changes to python/sglang/test/** don't reach the running container
+          # until the next image build (up to 24h after merge). Overlay the
+          # checkout's copy onto site-packages so this run always exercises the
+          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
+          # days, and scheduled nightlies all behave identically. When the
+          # image eventually bakes in the same file, this becomes a no-op.
+          # Auto-discovers the site-packages path so a Python version bump in
+          # the base image doesn't silently invalidate the overlay.
+          dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+                 "import sglang, os; print(os.path.dirname(sglang.__file__))")
+          docker exec ci_sglang_xpu cp \
+            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
+            "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            "import sglang.test.ci.ci_utils; print('overlay ok')"
+
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
@@ -155,6 +174,25 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Overlay in-tree sglang test helpers onto image site-packages
+        run: |
+          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
+          # changes to python/sglang/test/** don't reach the running container
+          # until the next image build (up to 24h after merge). Overlay the
+          # checkout's copy onto site-packages so this run always exercises the
+          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
+          # days, and scheduled nightlies all behave identically. When the
+          # image eventually bakes in the same file, this becomes a no-op.
+          # Auto-discovers the site-packages path so a Python version bump in
+          # the base image doesn't silently invalidate the overlay.
+          dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+                 "import sglang, os; print(os.path.dirname(sglang.__file__))")
+          docker exec ci_sglang_xpu cp \
+            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
+            "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            "import sglang.test.ci.ci_utils; print('overlay ok')"
+
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
@@ -240,6 +278,25 @@ jobs:
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      - name: Overlay in-tree sglang test helpers onto image site-packages
+        run: |
+          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
+          # changes to python/sglang/test/** don't reach the running container
+          # until the next image build (up to 24h after merge). Overlay the
+          # checkout's copy onto site-packages so this run always exercises the
+          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
+          # days, and scheduled nightlies all behave identically. When the
+          # image eventually bakes in the same file, this becomes a no-op.
+          # Auto-discovers the site-packages path so a Python version bump in
+          # the base image doesn't silently invalidate the overlay.
+          dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+                 "import sglang, os; print(os.path.dirname(sglang.__file__))")
+          docker exec ci_sglang_xpu cp \
+            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
+            "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            "import sglang.test.ci.ci_utils; print('overlay ok')"
+
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
@@ -324,6 +381,25 @@ jobs:
           bash scripts/ci/xpu/xpu_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Overlay in-tree sglang test helpers onto image site-packages
+        run: |
+          # intel/sglang-dev:latest rebuilds nightly from main, so PR-only
+          # changes to python/sglang/test/** don't reach the running container
+          # until the next image build (up to 24h after merge). Overlay the
+          # checkout's copy onto site-packages so this run always exercises the
+          # checkout's helpers -- pre-merge dispatch, post-merge-pre-rebuild
+          # days, and scheduled nightlies all behave identically. When the
+          # image eventually bakes in the same file, this becomes a no-op.
+          # Auto-discovers the site-packages path so a Python version bump in
+          # the base image doesn't silently invalidate the overlay.
+          dest=$(docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+                 "import sglang, os; print(os.path.dirname(sglang.__file__))")
+          docker exec ci_sglang_xpu cp \
+            /sglang-checkout/python/sglang/test/ci/ci_utils.py \
+            "$dest/test/ci/ci_utils.py"
+          docker exec ci_sglang_xpu /opt/venv/bin/python3 -c \
+            "import sglang.test.ci.ci_utils; print('overlay ok')"
 
       - name: HF login + install run_suite extras
         timeout-minutes: 10
