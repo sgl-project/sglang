@@ -691,6 +691,41 @@ class MambaComponent(TreeComponent):
             self.cache.req_to_token_pool.mamba_allocator.free(prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
 
+    # ---- Buffer-mode load-back handoff ----
+    #
+    # Buffer mode publishes a fetched span with a plain insert at prefill
+    # admission, so the state reaches the consuming request through its own
+    # H2D rather than through the match path's deferred copy.
+
+    def ensure_request_state_slot(self, req: Req) -> bool:
+        """Give the request a device Mamba slot to receive the staged state.
+        False when the pool has nothing to give even after an eviction pass."""
+        if req.kv.mamba_pool_idx is not None:
+            return True
+        dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst is None:
+            return False
+        req.kv.mamba_pool_idx = dst[0]
+        return True
+
+    def release_request_state_slot(self, req: Req) -> None:
+        """Return a slot ensure_request_state_slot allocated for a load-back
+        that was then called off."""
+        self.cache.req_to_token_pool.mamba_allocator.free(
+            req.kv.mamba_pool_idx.unsqueeze(-1)
+        )
+        req.kv.mamba_pool_idx = None
+
+    def supersede_pending_state_copy(self, req: Req) -> None:
+        """Drop the deferred CoW/clear staged by the match: the load-back
+        writes the request's slot directly with a deeper state, and the
+        deferred D2D copy is not ordered against that H2D."""
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+
     def prepare_prefetch(
         self,
         node_id: NodeId,
