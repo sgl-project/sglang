@@ -129,8 +129,6 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
-ADAPTIVE_TARGET_GRAPH_STATE_NAMESPACE = "adaptive.target"
-
 
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
@@ -1126,9 +1124,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cfg_path=get_spec().speculative_adaptive_config,
                 ),
             )
-            self._target_worker.model_runner.attn_backend.cuda_graph_state_namespace = (
-                ADAPTIVE_TARGET_GRAPH_STATE_NAMESPACE
-            )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1414,9 +1409,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
             target_attn_backend = target_model_runner._get_attention_backend()
-            target_attn_backend.cuda_graph_state_namespace = (
-                ADAPTIVE_TARGET_GRAPH_STATE_NAMESPACE
-            )
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):

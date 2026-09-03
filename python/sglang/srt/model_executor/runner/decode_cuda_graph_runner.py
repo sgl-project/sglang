@@ -70,6 +70,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.input_buffers import share_graph_state_buffer
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -227,6 +228,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self._hidden_states_out: Optional[torch.Tensor] = None
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -1240,6 +1242,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 for capture_hook in self.model_runner.capture_tail_hooks:
                     capture_hook(self, out, forward_batch, num_tokens)
+                self._stage_hidden_states(out)
                 return out
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
@@ -1277,6 +1280,29 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+
+    def _stage_hidden_states(self, out) -> None:
+        """Copy the graph's hidden-state output into one static buffer shared by
+        every captured shape (and, under adaptive speculative decoding, every
+        state), so the per-shape activations are released to the graph pool.
+        Same lifetime contract as the shared logits buffer: consumed before the
+        next replay."""
+        hidden_states = getattr(out, "hidden_states", None)
+        if hidden_states is None or hidden_states.dim() != 2:
+            return
+        if self._hidden_states_out is None:
+            self._hidden_states_out = share_graph_state_buffer(
+                self.attn_backend.cuda_graph_state_namespace,
+                "hidden_states_out",
+                torch.empty(
+                    (self.alloc_num_token, hidden_states.shape[1]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                ),
+            )
+        staged = self._hidden_states_out[: hidden_states.shape[0]]
+        staged.copy_(hidden_states)
+        out.hidden_states = staged
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:

@@ -18,7 +18,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sglang.srt.runtime_context import attention_backends, get_disagg, get_exec
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_disagg,
+    get_exec,
+    get_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +139,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     attn_backend.prefill_attention_backend_str = resolved.prefill
     attn_backend.decode_attention_backend_str = resolved.decode
 
+    _share_adaptive_target_graph_state(
+        model_runner=model_runner, attn_backend=attn_backend
+    )
     return AttentionBackends(
         attn_backend=attn_backend,
         decode_attn_backend=decode_attn_backend,
@@ -148,11 +156,15 @@ def get_attention_backend(
 ) -> AttentionBackend:
     """Init attention kernel backend."""
     resolved = resolve_attention_backend_strs(model_runner=model_runner)
-    return _build_resolved_backend(
+    attn_backend = _build_resolved_backend(
         model_runner=model_runner,
         resolved=resolved,
         init_new_workspace=init_new_workspace,
     )
+    _share_adaptive_target_graph_state(
+        model_runner=model_runner, attn_backend=attn_backend
+    )
+    return attn_backend
 
 
 def resolve_attention_backend_strs(
@@ -233,6 +245,17 @@ def _build_resolved_backend(
             init_new_workspace=init_new_workspace,
         )
     return attn_backend
+
+
+def _share_adaptive_target_graph_state(
+    *, model_runner: ModelRunner, attn_backend: AttentionBackend
+) -> None:
+    if (
+        get_spec().speculative_adaptive
+        and not model_runner.is_draft_worker
+        and not get_disagg().enable_pdmux
+    ):
+        attn_backend.cuda_graph_state_namespace = "adaptive.target"
 
 
 def _build_backend_from_str(
