@@ -31,6 +31,7 @@ TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
+CHANGED_TESTS_SHORT_FLAG = "-c"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -1239,7 +1240,8 @@ def handle_rerun_test(
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)\n"
             "- `/rerun-test test_*backend*.py` (wildcard — reruns every matching "
             "file; wrap the pattern in backticks so GitHub keeps the `*` literal)\n"
-            f"- `/rerun-test {CHANGED_TESTS_FLAG}` (every test file this PR adds or modifies)"
+            f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
+            "every test file this PR adds or modifies)"
         )
         return False
 
@@ -1570,8 +1572,9 @@ def main():
     elif first_line.startswith("/rerun-test"):
         rerun_args = first_line.split()[1:]
         refresh_precision_baseline = PRECISION_BASELINE_REFRESH_FLAG in rerun_args
-        include_changed_tests = CHANGED_TESTS_FLAG in rerun_args
-        flags = {PRECISION_BASELINE_REFRESH_FLAG, CHANGED_TESTS_FLAG}
+        changed_flags = {CHANGED_TESTS_FLAG, CHANGED_TESTS_SHORT_FLAG}
+        include_changed_tests = bool(changed_flags & set(rerun_args))
+        flags = changed_flags | {PRECISION_BASELINE_REFRESH_FLAG}
         test_specs = [arg for arg in rerun_args if arg not in flags]
         handle_rerun_test(
             repo,
