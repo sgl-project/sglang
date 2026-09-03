@@ -166,7 +166,6 @@ class Mamba2Metadata(ForwardMetadata):
 
         p = 0  # num of insertions
         for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
             # if does not divide chunk_size, then there is one chunk insertion
             p += s % chunk_size > 0
 

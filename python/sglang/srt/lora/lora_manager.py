@@ -242,12 +242,12 @@ class LoRAManager:
         Args:
             lora_ref (LoRARef): The LoRARef object containing the LoRA name, path, and ID.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             # load configs
@@ -337,9 +337,9 @@ class LoRAManager:
 
         adapter = self.configs.get(lora_ref.lora_id)
         lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert (
-            adapter is not None and lora_ref is not None
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        assert adapter is not None and lora_ref is not None, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -379,9 +379,9 @@ class LoRAManager:
         for lora_id in lora_ids:
             if lora_id is not None:
                 lora_ref = self.lora_refs.get(lora_id)
-                assert (
-                    lora_ref is not None
-                ), f"LoRA ID {lora_id} not found in lora_refs."
+                assert lora_ref is not None, (
+                    f"LoRA ID {lora_id} not found in lora_refs."
+                )
                 pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
@@ -570,7 +570,9 @@ class LoRAManager:
 
         assert lora_paths or (
             max_lora_rank is not None and target_modules is not None
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        ), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         self.init_lora_adapters(lora_paths)
         self.init_lora_shapes(
@@ -838,12 +840,12 @@ class LoRAManager:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             new_adapter = LoRAConfig.from_dict(

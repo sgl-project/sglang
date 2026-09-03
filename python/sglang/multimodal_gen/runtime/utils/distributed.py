@@ -131,9 +131,9 @@ def generate_masked_orthogonal_rank_groups(
         idx = [(index // d) % s for s, d in zip(shape, stride)]
         # stride is a prefix_product result. And the value of stride[-1]
         # is not used.
-        assert (
-            sum([x * y for x, y in zip(idx, stride[:-1])]) == index
-        ), "idx {} with shape {} mismatch the return idx {}".format(index, shape, idx)
+        assert sum([x * y for x, y in zip(idx, stride[:-1])]) == index, (
+            "idx {} with shape {} mismatch the return idx {}".format(index, shape, idx)
+        )
         return idx
 
     masked_shape = [s for s, m in zip(parallel_size, mask) if m]
