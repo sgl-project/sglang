@@ -97,9 +97,9 @@ def _run_transfer_roundtrip_mha(layout: str, element_dim: int) -> None:
         device_pool=device_pool,
         layout=layout,
     )
-    assert (
-        host_pool.can_use_jit
-    ), f"Expected JIT HiCache kernel for MHA dim={element_dim}"
+    assert host_pool.can_use_jit, (
+        f"Expected JIT HiCache kernel for MHA dim={element_dim}"
+    )
 
     for layer_id in range(NUM_LAYERS):
         _copy_tensor_with_offset(device_pool.k_buffer[layer_id], layer_id)
@@ -191,9 +191,9 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
         device_pool=device_pool,
         layout=layout,
     )
-    assert (
-        host_pool.can_use_jit
-    ), f"Expected JIT HiCache kernel for MLA dim={element_dim}"
+    assert host_pool.can_use_jit, (
+        f"Expected JIT HiCache kernel for MLA dim={element_dim}"
+    )
 
     for layer_id in range(NUM_LAYERS):
         _copy_tensor_with_offset(device_pool.kv_buffer[layer_id], layer_id)
