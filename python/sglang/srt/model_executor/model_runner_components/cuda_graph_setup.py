@@ -31,9 +31,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
 )
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    compute_attention_and_moe_layers,
-)
 from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
@@ -444,7 +441,7 @@ def capture_prefill_graph(
         model_runner.moe_fusions,
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
-    ) = compute_attention_and_moe_layers(layer_model)
+    ) = model_runner.get_cuda_graph_layers(layer_model)
     (
         model_runner.attention_layers,
         model_runner.mha_companion_layers,
