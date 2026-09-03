@@ -26,6 +26,7 @@ class DiTArchConfig(ArchConfig):
 
     # Reverse mapping for saving checkpoints: custom -> hf
     reverse_param_names_mapping: dict = field(default_factory=dict)
+    quant_ignore_remap: dict = field(default_factory=dict)
     hidden_size: int = 0
     num_attention_heads: int = 0
     num_channels_latents: int = 0

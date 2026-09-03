@@ -58,6 +58,7 @@ def test_runtime_sampling_quality_preserves_the_openai_default():
     assert _runtime_sampling_quality(None) is None
     assert _runtime_sampling_quality("auto") is None
     assert _runtime_sampling_quality("lossless") == "lossless"
+    assert _runtime_sampling_quality("extra-high") == "extra-high"
     assert _runtime_sampling_quality("high") == "high"
 
 

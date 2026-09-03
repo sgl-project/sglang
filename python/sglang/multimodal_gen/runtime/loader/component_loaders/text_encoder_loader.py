@@ -56,8 +56,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
-    ComponentLoader,
     NativeComponentLoaderRequired,
+    OnlineQuantizationComponentLoader,
     uses_native_transformers_quantization,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
@@ -101,10 +101,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config_from_safetensors_metadata,
     inspect_comfy_quant_markers,
     resolve_comfy_checkpoint_quantization,
-)
-from sglang.multimodal_gen.runtime.weights.source import (
-    materialize_weight,
-    resolve_weight,
 )
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
@@ -265,7 +261,10 @@ def _configure_encoder_quantization(
     explicit_quantization: str | None = None,
     ignored_layers: list[str] | None = None,
 ) -> None:
-    if getattr(model_cls, "manages_checkpoint_quantization", False):
+    if (
+        issubclass(model_cls, EncoderTensorParallelMixin)
+        and model_cls.checkpoint_quantization_backend == "model"
+    ):
         if explicit_quantization is not None:
             raise ComponentCheckpointUnsupportedError(
                 f"{component_name!r} manages its own checkpoint quantization and "
@@ -493,12 +492,21 @@ def _keep_this_checkpoint_mapped(model_path: str) -> bool:
     return True
 
 
-class TextEncoderLoader(ComponentLoader):
+class TextEncoderLoader(OnlineQuantizationComponentLoader):
     """Loader for text encoders."""
 
     component_names = ["text_encoder"]
     expected_library = "transformers"
-    supports_online_quantization_override = True
+
+    def component_load_precision(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        override = server_args.component_precisions.get(component_name)
+        if override is not None:
+            return override
+        return server_args.pipeline_config.text_encoder_precisions[
+            self._extract_encoder_index(component_name)
+        ]
 
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
@@ -508,33 +516,13 @@ class TextEncoderLoader(ComponentLoader):
             or component_name in server_args.component_quantizations
         )
 
-    @staticmethod
-    def resolve_model_weights_path(
-        component_model_path: str,
-        server_args: ServerArgs,
-        component_name: str,
-    ) -> str:
-        weights_override = server_args.component_weights_paths.get(component_name)
-        if weights_override is None:
-            return component_model_path
-        if names_gguf_checkpoint(weights_override):
+    def validate_component_weight_override(self, override: str) -> None:
+        if names_gguf_checkpoint(override):
             if not current_platform.is_cuda():
                 raise ValueError(
                     "GGUF encoder checkpoints require CUDA; the GGML kernels have "
                     f"no {current_platform.device_type} implementation"
                 )
-            if server_args.should_use_fsdp_for_component(component_name):
-                raise ValueError(
-                    f"GGUF encoder checkpoint {component_name!r} is incompatible "
-                    "with FSDP; select resident or layerwise placement"
-                )
-        model_weights_path = materialize_weight(resolve_weight(weights_override))
-        logger.info(
-            "Using weight-file override for %s: %s",
-            component_name,
-            model_weights_path,
-        )
-        return model_weights_path
 
     @dataclasses.dataclass
     class Source:
@@ -721,7 +709,7 @@ class TextEncoderLoader(ComponentLoader):
         component_starts_on_cpu: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
-        component_weights_path = self.resolve_model_weights_path(
+        component_weights_path = self.resolve_component_weights_path(
             component_model_path,
             server_args,
             component_name,
@@ -734,7 +722,9 @@ class TextEncoderLoader(ComponentLoader):
         )
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        encoder_index = self._extract_encoder_index(component_name)
+        encoder_index = self._extract_encoder_index(
+            self.structural_component_name(component_name)
+        )
         assert encoder_index < len(
             server_args.pipeline_config.text_encoder_configs
         ) and encoder_index < len(server_args.pipeline_config.text_encoder_precisions)
@@ -781,9 +771,8 @@ class TextEncoderLoader(ComponentLoader):
             server_args.encoder_parallel,
             prefer_dp=prefer_dp,
         )
-        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
-            encoder_index
-        ]
+        encoder_dtype = self.component_load_precision(server_args, component_name)
+        assert encoder_dtype is not None
         # TODO(will): add support for other dtypes
         try:
             return self.load_model(

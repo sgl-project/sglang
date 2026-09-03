@@ -4,10 +4,12 @@ from unittest import mock
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.multimodal_gen.configs.models.encoders.clip import CLIPVisionConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
+    ComponentLoader,
     NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.image_encoder_loader import (
@@ -39,8 +41,10 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             ),
             component_weights_paths={},
             component_quantizations={},
+            component_precisions={},
             encoder_parallel="replicate",
             resolve_component_attention_backend=lambda _name: (None, None),
+            requested_component_attention_backend=lambda _name: None,
             should_direct_gpu_weight_load_component=lambda _name: False,
             should_use_fsdp_for_component=lambda _name: False,
         )
@@ -83,6 +87,20 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             {"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
         )
 
+    def test_exact_image_encoder_precision_override(self):
+        self.server_args.component_precisions["image_encoder"] = "fp16"
+
+        self.assertEqual(
+            self.loader.component_load_precision(self.server_args, "image_encoder"),
+            "fp16",
+        )
+
+    def test_unadmitted_component_precision_fails_closed(self):
+        with self.assertRaises(ComponentCheckpointUnsupportedError):
+            ComponentLoader().component_load_precision(
+                SimpleNamespace(component_precisions={"vae": "fp16"}), "vae"
+            )
+
     def test_unknown_transformers_quantized_architecture_falls_back(self):
         config = self._component_config("UnknownVisionModel", quantized=True)
         with self._config_patch(config):
@@ -118,7 +136,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
 
 class TestImageEncoderNativeLoading(unittest.TestCase):
     def test_bnb4_uses_shared_transformers_path_and_image_precision(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["CLIPVisionModelWithProjection"],
             quantization_config={
@@ -131,6 +149,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(image_encoder_precision="bf16"),
             explicit_residency_mode=mock.Mock(return_value=None),
             require_component_resident=mock.Mock(),
@@ -175,13 +194,14 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
 
     def test_explicit_offload_is_rejected_before_transformers_load(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},
         )
         model_class = SimpleNamespace(from_pretrained=mock.Mock())
         server_args = SimpleNamespace(
+            component_precisions={},
             pipeline_config=SimpleNamespace(image_encoder_precision="bf16"),
             explicit_residency_mode=mock.Mock(return_value=COMPONENT_OFFLOAD),
             require_component_resident=mock.Mock(),
@@ -217,7 +237,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             def to(self, *args, **kwargs):
                 raise AssertionError("quantized component must not be moved again")
 
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},
@@ -227,12 +247,15 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_weights_paths={},
             component_quantizations={},
+            component_precisions={},
             pipeline_config=SimpleNamespace(
                 image_encoder_precision="bf16",
                 native_only_components=(),
             ),
             resolve_component_attention_backend=lambda _name: (None, None),
+            requested_component_attention_backend=lambda _name: None,
             explicit_residency_mode=lambda _name: None,
             require_component_resident=mock.Mock(),
             should_use_fsdp_for_component=lambda _name: False,

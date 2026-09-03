@@ -362,6 +362,50 @@ class StreamOrderedMmFeaturePool:
             raise
         return lease, destination
 
+    def cancel_lease(
+        self,
+        *,
+        ready_byte_offset: int,
+        ack_byte_offset: int,
+        generation: int,
+    ) -> None:
+        """Acknowledge every consumer for a lease that was not dispatched."""
+        slot_stride = self.control_words_per_slot * CONTROL_WORD_BYTES
+        if (
+            ready_byte_offset % slot_stride != 0
+            or ack_byte_offset != ready_byte_offset + CONTROL_WORD_BYTES
+        ):
+            raise RuntimeError(f"Invalid {self.transport_name} pool lease offsets")
+        slot = ready_byte_offset // slot_stride
+
+        with self._lock:
+            lease = self._occupied.get(slot)
+            if (
+                lease is None
+                or lease.generation != generation
+                or lease.ready_byte_offset != ready_byte_offset
+                or lease.ack_byte_offset != ack_byte_offset
+            ):
+                raise RuntimeError(
+                    f"Cannot cancel inactive {self.transport_name} pool lease "
+                    f"(slot={slot}, generation={generation})"
+                )
+
+            with torch.cuda.device(self.device_id):
+                stream_wait_value32(
+                    self.device_id,
+                    self.base_address + ready_byte_offset,
+                    generation,
+                    self.transport_name,
+                )
+                for rank in range(self.consumer_count):
+                    stream_write_value32(
+                        self.device_id,
+                        self.base_address + ack_byte_offset + rank * CONTROL_WORD_BYTES,
+                        generation,
+                        self.transport_name,
+                    )
+
     def shutdown(self) -> None:
         self._recycler_stop_event.set()
         if self._recycle_thread.is_alive():
