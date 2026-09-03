@@ -73,35 +73,46 @@ class DynamicChunkSizer:
     def profile_and_fit(self) -> bool:
         """PP0 profiles synthetic prefills and every rank fits the same samples;
         returns whether the predictor is ready."""
+        samples: Optional[Tuple[List[int], List[float]]] = None
+
+        if self.pp_group.is_first_rank:
+            try:
+                samples = self._profile_prefill_latency()
+            except Exception as e:
+                # Broadcast the failure as None; every PP rank must reach the
+                # collective below or the later stages block on it.
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
+                    "Dynamic chunking will be disabled."
+                )
+            samples = attn_cp_tp_broadcast_pyobj([samples])[0]
+
+        # Broadcast data to all ranks
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            data_to_sync = [samples]
+            self.pp_group.broadcast_object_list(data_to_sync, src=0)
+            samples = data_to_sync[0]
+
+        if samples is None:
+            return False
+
+        seq_lens, latencies = samples
+        # Quadratic model: f(l) = al^2 + bl + c
         try:
-            seq_lens: List[int] = []
-            latencies: List[float] = []
-
-            if self.pp_group.is_first_rank:
-                seq_lens, latencies = self._profile_prefill_latency()
-
-                seq_lens, latencies = attn_cp_tp_broadcast_pyobj([seq_lens, latencies])
-
-            # Broadcast data to all ranks
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                data_to_sync = [seq_lens, latencies]
-                self.pp_group.broadcast_object_list(data_to_sync, src=0)
-                seq_lens, latencies = data_to_sync
-
-            # Quadratic model: f(l) = al^2 + bl + c
             self.predictor.fit(seq_lens, latencies)
-            self.predictor.set_target_latency(self.chunked_prefill_size)
-            self.predictor.is_ready = True
-            logger.info(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
-                f"Target latency: {self.predictor.target_latency:.2f}ms"
-            )
         except Exception as e:
+            # Every rank fits the same samples, so this fails on all of them alike.
             logger.warning(
-                f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
+                f"[PP Dynamic Chunk] Failed to fit the chunk-size predictor: {e!r}. "
                 "Dynamic chunking will be disabled."
             )
             return False
+        self.predictor.set_target_latency(self.chunked_prefill_size)
+        self.predictor.is_ready = True
+        logger.info(
+            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
+            f"Target latency: {self.predictor.target_latency:.2f}ms"
+        )
         return True
 
     def predict(self, history_len: int) -> Optional[int]:
