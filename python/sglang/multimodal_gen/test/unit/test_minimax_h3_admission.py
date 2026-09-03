@@ -212,7 +212,11 @@ def test_synthetic_warmup_target_honors_warmup_flags():
     default = MiniMaxH3SamplingParams._synthetic_warmup_target(
         req, SimpleNamespace(warmup_num_frames=None, warmup_resolutions=None)
     )
-    assert default == {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}
+    assert default == {
+        "short_edge": 768,
+        "aspect_ratio": "16:9",
+        "duration_seconds": 5.0,
+    }
     served = MiniMaxH3SamplingParams._synthetic_warmup_target(
         req, SimpleNamespace(warmup_num_frames=345, warmup_resolutions=["1344x768"])
     )

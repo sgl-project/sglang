@@ -183,7 +183,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
         if getattr(server_args, "warmup_resolutions", None) is not None:
             width, height = int(req.width), int(req.height)
             if width <= 0 or height <= 0:
-                raise ValueError("--warmup-resolutions needs positive sizes for MiniMax H3")
+                raise ValueError(
+                    "--warmup-resolutions needs positive sizes for MiniMax H3"
+                )
             # H3 canvases are named by their nominal ratio (1344x768 is the
             # "16:9" 768p canvas), so snap to the nearest released ratio.
             ratio = width / height

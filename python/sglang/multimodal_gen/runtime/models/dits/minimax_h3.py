@@ -805,7 +805,11 @@ def _minimax_h3_hybrid_attention_core_impl(
             frame_sums.index_add_(
                 0, frame_index, x[lo - row_start : hi - row_start].to(_FP32_DTYPE)
             )
-        frame_mean = get_sp_group().all_reduce(frame_sums) / tokens_per_frame
+        # launch the reduction now and let the all-to-all hide it; the branch
+        # is the first consumer of the frame mean
+        frame_work = torch.distributed.all_reduce(
+            frame_sums, group=get_sp_group().device_group, async_op=True
+        )
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
         beta = _usp_input_all_to_all(beta[None, :, :, None], head_dim=2)[0, :, :, 0]
         linear_gate = _usp_input_all_to_all(linear_gate[None], head_dim=2)[0]
@@ -819,6 +823,8 @@ def _minimax_h3_hybrid_attention_core_impl(
                 "attention metadata"
             )
         cos_sin_cache, positions = meta.rope_cache_full
+        frame_work.wait()
+        frame_mean = frame_sums / tokens_per_frame
     else:
         frame_mean = (
             x[video_start:video_end]
