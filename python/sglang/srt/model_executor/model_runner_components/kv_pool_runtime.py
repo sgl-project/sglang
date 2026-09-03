@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import post_capture_kv_sizing_planned
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner_utils.pool import graph_pool_borrow_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -29,8 +31,9 @@ logger = logging.getLogger(__name__)
 def is_post_capture_kv_active(
     *, server_args: ServerArgs, is_draft_worker: bool
 ) -> bool:
+
     return (
-        server_args.post_capture_kv_sizing_planned()
+        post_capture_kv_sizing_planned(server_args)
         and current_platform.is_cuda()
         and not is_draft_worker
     )
@@ -83,6 +86,13 @@ def compute_post_capture_kv_resize(
             )
             / 1024,
         )
+    if not graph_pool_borrow_enabled():
+        # Borrowing serves the sampling temporaries out of idle graph storage;
+        # without it they need real headroom the KV pool must not claim.
+        headroom_gb = max(
+            headroom_gb,
+            model_runner.sampling_prewarm_result.sampling_headroom_bytes / (1 << 30),
+        )
     mm_reservation_gb = mm_runtime_reservation_gb(
         is_multimodal=model_runner.model_config.is_multimodal,
         mm_feature_transport=get_mm().mm_feature_transport,
@@ -96,6 +106,7 @@ def compute_post_capture_kv_resize(
     )
     pool.finalize_backing(config)
     model_runner.token_to_kv_pool_allocator.resize(config)
+    model_runner.req_to_token_pool.reset_aux_cache_allocator()
 
     capped_max_running_requests = None
     if model_runner.max_running_requests is not None:

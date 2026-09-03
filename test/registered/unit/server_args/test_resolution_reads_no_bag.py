@@ -28,6 +28,7 @@ It is a ratchet, not a proof.
 """
 
 import ast
+import functools
 import inspect
 import pathlib
 import unittest
@@ -52,13 +53,11 @@ def _accessor_names():
     names = {
         node.name
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and (node.name.startswith("get_") or node.name.startswith("configured_"))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("get_")
     }
-    # The context object itself is not a bag: it exists before anything is
-    # published, and `declare_late_resolution` calls it deliberately to find
-    # out whether the record it was handed has been published yet.
-    return frozenset(names - {"get_context"})
+    # Two that are not bags: the context object itself, and the platform facts.
+    # Both answer before anything is published.
+    return frozenset(names - {"get_context", "get_platform"})
 
 
 _BAG_ACCESSORS = _accessor_names()
@@ -70,6 +69,15 @@ _ATTRIBUTE_SPELLED = _BAG_ACCESSORS - {"get_device"}
 # The pipeline itself and the mechanism it publishes through: `runtime_context`
 # defines the accessors, and `arg_groups` is the pipeline's own code.
 _OWN = ("server_args.py", "runtime_context.py")
+
+
+def _pipeline_sources():
+    """The record plus every module under `arg_groups/`.
+
+    A handler that moved out of the record takes its imports with it, so
+    seeding the walk from two files would stop covering it.
+    """
+    return [_SRT / "server_args.py", *sorted((_SRT / "arg_groups").rglob("*.py"))]
 
 
 def _module_of(name):
@@ -114,6 +122,7 @@ def _registry_functions():
     return functions
 
 
+@functools.lru_cache(maxsize=None)
 def _registered_entries():
     """Entries the import map cannot reach: passes and override providers.
 
@@ -138,13 +147,17 @@ def _registered_entries():
     # from the source. The entry carries the *defining* file: `_reaches_a_bag`
     # walks functions in the entry's file, so a call-site key walks nothing.
     by_value = set()
-    trees = {}
-    for path in sorted(_SRT.rglob("*.py")):
+    sources = {
+        path: path.read_text(encoding="utf-8-sig")
+        for path in sorted(_SRT.rglob("*.py"))
+    }
+    for path, source in sources.items():
+        if "run_post_process_pass" not in source:
+            continue
         try:
-            trees[path] = ast.parse(path.read_text(encoding="utf-8-sig"))
+            tree = ast.parse(source)
         except SyntaxError:
             continue
-    for path, tree in trees.items():
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -154,6 +167,14 @@ def _registered_entries():
                 and isinstance(node.args[1], ast.Name)
             ):
                 by_value.add(node.args[1].id)
+    trees = {}
+    for path, source in sources.items():
+        if not any(name in source for name in by_value):
+            continue
+        try:
+            trees[path] = ast.parse(source)
+        except SyntaxError:
+            continue
     for name in sorted(by_value):
         defined_in = [
             path
@@ -173,14 +194,39 @@ def _registered_entries():
     return entries
 
 
-def _reaches_a_bag(path, entry):
-    """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
+@functools.lru_cache(maxsize=None)
+def _functions_in(path):
     tree = ast.parse(path.read_text(encoding="utf-8-sig"))
-    functions = {
+    return {
         node.name: node
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def _locally_shadowed_accessors(path):
+    """Accessor names this file imports from somewhere that is not the context.
+
+    `get_device` is both the `device` bag accessor and the hardware probe in
+    `utils.common`. Matching the bare name would report the probe as a bag read,
+    so a name imported from elsewhere in this file is not the accessor.
+    """
+    shadowed = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.endswith("runtime_context"):
+                continue
+            for alias in node.names:
+                name = alias.asname or alias.name
+                if name in _BAG_ACCESSORS:
+                    shadowed.add(name)
+    return shadowed
+
+
+def _reaches_a_bag(path, entry):
+    """Does `entry` in `path` reach a bag accessor, following calls in-module?"""
+    functions = _functions_in(path)
+    shadowed = _locally_shadowed_accessors(path)
     seen = set()
 
     def walk(name):
@@ -198,7 +244,7 @@ def _reaches_a_bag(path, entry):
                 continue
             if not isinstance(node.func, ast.Name):
                 continue
-            if node.func.id in _BAG_ACCESSORS:
+            if node.func.id in _BAG_ACCESSORS and node.func.id not in shadowed:
                 return node.lineno
             found = walk(node.func.id)
             if found is not None:
@@ -213,7 +259,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
         """A shrunken accessor set would make every other check pass quietly."""
         self.assertGreaterEqual(
             len(_BAG_ACCESSORS),
-            20,
+            15,
             f"only {len(_BAG_ACCESSORS)} accessors were derived from "
             "runtime_context; the derivation broke",
         )
@@ -223,9 +269,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
 
     def test_the_walk_finds_something_to_walk(self):
         """A collapsed import map would make the pin vacuous."""
-        imported = _imported_symbols(
-            [_SRT / "server_args.py", _SRT / "arg_groups" / "overrides.py"]
-        )
+        imported = _imported_symbols(_pipeline_sources())
         self.assertGreater(
             len(imported),
             20,
@@ -264,9 +308,7 @@ class TestResolutionReadsNoBag(CustomTestCase):
         )
 
     def test_nothing_the_pipeline_calls_reads_a_bag(self):
-        imported = _imported_symbols(
-            [_SRT / "server_args.py", _SRT / "arg_groups" / "overrides.py"]
-        )
+        imported = _imported_symbols(_pipeline_sources())
         reachable = {
             (path, symbol) for path, symbols in imported.items() for symbol in symbols
         } | _registered_entries()

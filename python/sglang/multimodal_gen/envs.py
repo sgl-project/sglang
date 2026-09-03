@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
+    SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
@@ -36,6 +37,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
+    SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -259,6 +262,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
+    # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
+    # up to num_inference_steps - 1 slots; the default covers the 50-step
+    # serving schedule, so this is an escape hatch, not a deployment knob.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS": _lazy_int(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS", 64
+    ),
+    # Experimental: compute the online AdaLN rebuild projections once in fp32
+    # (TF32 off) before the bf16 store. Not bit-comparable to resident
+    # adaln_proj weights; keep off until an e2e trajectory gate clears it.
+    "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32": _lazy_bool(
+        "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
@@ -277,6 +293,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory instead of a file-backed cache mapping the page cache can drop.
     "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE"
+    ),
+    # Kill-switch: keep LoRA-merged weights in anonymous host memory instead
+    # of the file-backed LoRA merge cache.
+    "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference

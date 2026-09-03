@@ -23,11 +23,13 @@ from sglang.srt.observability.metrics_collector import (
     compute_routing_key_stats,
 )
 from sglang.srt.runtime_context import (
-    configured_pp_size,
+    exports_expert_balancedness_to_prometheus,
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_spec,
+    logs_expert_balancedness_to_server_log,
 )
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -173,9 +175,10 @@ class SchedulerMetricsReporter:
         }.get(getattr(self.scheduler, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
-        # Each update adds (num_correct_drafts + bs, bs).
-        # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
+        # `*_accept_tokens` includes accepted drafts and non-draft output tokens;
+        # `*_correct_drafts` counts accepted draft proposals only.
         self.spec_num_accept_tokens = 0  # per-log-interval
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
@@ -238,7 +241,7 @@ class SchedulerMetricsReporter:
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
         self.scheduler.enable_fpm = False
         if (
-            self.scheduler.server_args.enable_forward_pass_metrics
+            get_observability().enable_forward_pass_metrics
             and self.scheduler.ps.attn_tp_rank == 0
             and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
         ):
@@ -252,7 +255,7 @@ class SchedulerMetricsReporter:
                 else 0
             )
             self.scheduler._fpm_worker_id = (
-                self.scheduler.server_args.forward_pass_metrics_worker_id
+                get_observability().forward_pass_metrics_worker_id
             )
             base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
@@ -396,16 +399,15 @@ class SchedulerMetricsReporter:
         self,
         bs: int,
         num_correct_drafts: int,
+        num_accept_tokens: int,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
     ):
-        self.spec_num_accept_tokens += num_correct_drafts + bs
+        self.spec_num_accept_tokens += num_accept_tokens
+        self.spec_num_correct_drafts += num_correct_drafts
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
-
-        # Bonus tokens updated elsewhere
-        self.num_generated_tokens += num_correct_drafts
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -570,6 +572,7 @@ class SchedulerMetricsReporter:
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accept_tokens = 0
+        self.spec_num_correct_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0
         self.spec_total_num_forward_ct = 0
@@ -755,13 +758,13 @@ class SchedulerMetricsReporter:
         self,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_correct_drafts: int = 0,
+        num_generated_tokens: int = 0,
     ):
         batch = running_batch or self.scheduler.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_correct_drafts
+            decode_tokens = num_generated_tokens
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -824,7 +827,7 @@ class SchedulerMetricsReporter:
             spec_block_accept_length = 0
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
-            num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
+            num_correct_drafts = self.spec_num_correct_drafts
             if get_spec().speculative_num_draft_tokens:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
@@ -851,7 +854,8 @@ class SchedulerMetricsReporter:
             )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
+            self.spec_num_accept_tokens = self.spec_num_correct_drafts = 0
+            self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
@@ -1009,9 +1013,7 @@ class SchedulerMetricsReporter:
         if (m := result.expert_distribution_metrics) is not None:
             balancedness = m.eplb_balancedness.item()
 
-            if (
-                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
-            ):
+            if logs_expert_balancedness_to_server_log():
                 if m.reset_server_log_history:
                     for history in self._eplb_balancedness_history:
                         history.clear()
@@ -1033,10 +1035,7 @@ class SchedulerMetricsReporter:
                     f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 )
 
-            if (
-                self.enable_metrics
-                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
-            ):
+            if self.enable_metrics and exports_expert_balancedness_to_prometheus():
                 assert self.metrics_collector is not None
                 self.metrics_collector.increment_eplb_balancedness(
                     forward_mode=batch.forward_mode.name.lower(),
@@ -1117,7 +1116,7 @@ class SchedulerMetricsReporter:
             active_lora_ids = set()
 
             # For PP mode, check all running micro batches
-            if configured_pp_size() > 1:
+            if get_parallel().pp_size > 1:
                 for batch in self.scheduler.running_mbs:
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:

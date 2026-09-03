@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -33,7 +34,7 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
         vocab_size=128,
     )
     req.output_ids.append(3)
-    req.kv_committed_len = 2
+    req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
     batch.tree_cache = SimpleNamespace(page_size=TRACK_INTERVAL)
@@ -60,11 +61,11 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         disaggregation_mode=None,
         enable_overlap=True,
         enable_overlap_mlx=False,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(think_end_ids=None),
         token_to_kv_pool_allocator=MagicMock(),
         tree_cache=SimpleNamespace(page_size=TRACK_INTERVAL),
         hisparse_coordinator=None,
+        beam_coordinator=MagicMock(),
         req_to_token_pool=None,
         decode_offload_manager=None,
         metrics_collector=None,
@@ -78,17 +79,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
 
 
 def _make_result():
-    return SimpleNamespace(
-        copy_done=None,
-        auxiliary_host_output=None,
-        routed_experts_output=None,
-        indexer_topk_output=None,
+    return GenerationBatchResult(
         logits_output=SimpleNamespace(hidden_states=None, customized_info=None),
         next_token_ids=[4],
-        can_run_cuda_graph=False,
-        num_correct_drafts=0,
-        num_block_accept_tokens=0,
-        num_cap_tokens=0,
         speculative_num_draft_tokens=0,
     )
 
