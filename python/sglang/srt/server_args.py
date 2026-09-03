@@ -4158,6 +4158,12 @@ class ServerArgs:
             )
         object.__setattr__(self, name, value)
 
+    def is_decoupled_verifier(self) -> bool:
+        return self.decoupled_spec_role == "verifier"
+
+    def is_decoupled_drafter(self) -> bool:
+        return self.decoupled_spec_role == "drafter"
+
     def enable_mamba_extra_buffer(self) -> bool:
         return mamba_extra_buffer_of(resolving_view(self))
 
