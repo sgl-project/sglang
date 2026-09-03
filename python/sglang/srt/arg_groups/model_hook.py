@@ -300,7 +300,7 @@ def handle_model_specific_adjustments(server_args: Any):
         run_post_process_pass(server_args, _deepseek_moe_quant_resolution)
         if get_platform().is_hip:
             if is_deepseek_dsa(hf_config):
-                # The fused top-k v2 kernel (topk_transform_512_v2) is a
+                # The fused top-k v2 kernel (topk_transform_paged_v2) is a
                 # CUDA/Hopper-only path: its JIT source includes
                 # <cooperative_groups.h> and uses cg::this_cluster()
                 # (thread-block clusters), neither of which exists on ROCm,
@@ -309,6 +309,14 @@ def handle_model_specific_adjustments(server_args: Any):
                 # here for the rest of the DSA family (DeepSeek-V3.2 /
                 # GLM-5.x) that shares the same decode top-k path.
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            if model_arch == "GlmMoeDsaForCausalLM":
+                # Open the fused top-k v2 kernel for the GLM-5.x DSA
+                # family on ROCm: it shares this decode top-k path, and
+                # the kernel's ROCm build compiles the streaming levels
+                # on gfx9xx. Order is load-bearing: the blanket disable
+                # above `set`s the variable unconditionally, so this has
+                # to follow it.
+                envs.SGLANG_OPT_USE_TOPK_V2.set(True)
             if not resolved_view(server_args).enable_dp_attention and cfg.nnodes == 1:
                 # TODO (Hubert): Put this back later
                 # server_args.enable_aiter_allreduce_fusion = True
@@ -337,13 +345,20 @@ def handle_model_specific_adjustments(server_args: Any):
             # DeepGEMM or require >99KB SMEM (topk_v2).
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
             envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
             if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
                 envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
-            # Prefer TileLang over the Torch fallback.
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
+            if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            # Out of the box the indexer runs the TileLang kernel (works on
+            # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+            # build with SM120 attention support can opt into
+            # fp8_paged_mqa_logits by setting them to 0.
+            if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
+                envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
         elif get_platform().is_hip:
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
