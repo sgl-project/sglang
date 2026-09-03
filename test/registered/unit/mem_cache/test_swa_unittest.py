@@ -1092,30 +1092,23 @@ class TestFreeKvRow(CustomTestCase):
 
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
 
-    def test_grouped_full_side_frees_flush_as_one_page_release(self):
+    def test_grouped_full_side_frees_defer_and_skip_the_unique_path(self):
         _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
         indices = _swa_alloc(allocator, 12)
         allocator.free_swa(indices[:8])
         after_alloc = allocator.full_available_size()
 
-        allocator.free_group_begin()
-        # dead rows [0, 8) and the alive row [8, 12) from one request
-        free_kv_row_segments(allocator, [(indices, 0)], swa_evicted_seqlen=8)
-        with (
-            patch.object(
-                allocator.full_attn_allocator,
-                "free",
-                side_effect=AssertionError("full side took the unique path"),
-            ),
-            patch.object(
-                allocator.full_attn_allocator,
-                "free_page_ids",
-                wraps=allocator.full_attn_allocator.free_page_ids,
-            ) as free_page_ids,
+        with patch.object(
+            allocator.full_attn_allocator,
+            "free",
+            side_effect=AssertionError("full side took the unique path"),
         ):
+            allocator.free_group_begin()
+            # dead rows [0, 8) and the alive row [8, 12) from one request
+            free_kv_row_segments(allocator, [(indices, 0)], swa_evicted_seqlen=8)
+            self.assertEqual(allocator.full_available_size(), after_alloc)
             allocator.free_group_end()
 
-        free_page_ids.assert_called_once()
         self.assertEqual(allocator.full_available_size(), after_alloc + 12)
 
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
