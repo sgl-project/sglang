@@ -148,8 +148,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_unaligned_committed_len_frees_the_whole_row(self):
-        """page_size > 1 with a mid-page committed length: one range, no
-        alignment arithmetic in the release path."""
+        """A mid-page committed length needs no alignment arithmetic here."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(

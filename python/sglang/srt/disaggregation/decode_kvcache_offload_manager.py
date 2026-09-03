@@ -244,10 +244,8 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
-        # The whole row goes back only here, at request finish: prefill slots,
-        # decoded slots, and any spec-v2 over-allocation past the committed
-        # length. Freeing mid-decode races with concurrent admission over live
-        # slots.
+        # Released only at request finish; a mid-decode free races with
+        # concurrent admission over live slots.
         self.tree_cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
 
         self.req_to_token_pool.free(req)
