@@ -147,9 +147,14 @@ class TestGLM53FlashQuarkMoE(CustomTestCase):
         with (
             patch.object(quark_moe, "_is_gfx1250", False),
             patch.object(quark_moe, "_is_shuffle_moe_mxfp4", True),
-            patch.object(quark_moe, "e8m0_shuffle", side_effect=lambda x: x),
             patch.object(
-                quark_moe, "shuffle_weight", side_effect=lambda x, _layout: x.clone()
+                quark_moe, "e8m0_shuffle", side_effect=lambda x: x, create=True
+            ),
+            patch.object(
+                quark_moe,
+                "shuffle_weight",
+                side_effect=lambda x, _layout: x.clone(),
+                create=True,
             ) as shuffle,
         ):
             scheme.process_weights_after_loading(layer)
