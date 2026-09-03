@@ -45,11 +45,20 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 Pick your card + checkpoint precision to generate the launch command. The model runs single-GPU on every supported card — H200, RTX PRO 6000, RTX 5090 and DGX Spark — and ships one operating point.
 
 <Note>
-`--mamba-full-memory-ratio` is the one sizing flag that matters for throughput
-on hybrid GDN models: the default (0.9) over-provisions the KV pool and silently
-clamps concurrency. Set your average request length in the
+When explicit workload caps are not both pinned, `--mamba-full-memory-ratio`
+is the sizing flag that matters for throughput on hybrid GDN models: the
+default (0.9) over-provisions the KV pool and silently clamps concurrency. Set
+your average request length in the
 [Mamba ratio calculator](#mamba-ratio-calculator) below; everything else follows
 the panels, and the computed value is pinned into the command.
+
+If a deployment already pins both `--max-running-requests` and
+`--max-total-tokens`, SGLang instead treats them as joint workload caps for
+non-speculative PP=1 serving with separate state and KV pools. When the
+requested state pool and capped KV pool fit together, startup grows the Mamba
+pool to honor the requested concurrency; otherwise it retains the ratio-sized
+split. The calculator remains useful when either workload cap is unknown, with
+`--enable-unified-memory`, or for unsupported execution modes.
 </Note>
 
 import { Deployment } from "/src/snippets/_deployment.jsx";

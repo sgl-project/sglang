@@ -2611,7 +2611,13 @@ class ServerArgs:
     mamba_full_memory_ratio: A[
         float,
         Arg(
-            help="The ratio of mamba state memory to full kv cache memory.",
+            help=(
+                "The ratio of mamba state memory to full kv cache memory. "
+                "When --max-running-requests and --max-total-tokens are both "
+                "explicit, non-speculative PP=1 serving with separate state "
+                "and KV pools first tries to honor those workload caps jointly "
+                "and uses this ratio as the fallback split."
+            ),
             resolvable=True,
         ),
         NS("schedule"),
