@@ -813,16 +813,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+
             new_input_ids = torch.empty_like(batch.input_ids)
+            if mm_input_embeds is not None:
+                # Rotate mm embeddings the same way as input_ids: shift left by
+                # one per request so they stay aligned with the rotated ids. The
+                # last position per request is filled by the draft model's own
+                # embed_tokens lookup on next_token_ids (see DeepseekModelNextN).
+                rotated_mm = torch.empty_like(mm_input_embeds)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
                 input_ids = batch.input_ids[pt : pt + extend_len]
                 new_input_ids[pt : pt + extend_len].copy_(
                     torch.cat((input_ids[1:], tail_tokens[i].reshape(1)))
                 )
+                if mm_input_embeds is not None:
+                    rotated_mm[pt : pt + extend_len - 1].copy_(
+                        mm_input_embeds[pt + 1 : pt + extend_len]
+                    )
                 pt += extend_len
             assert pt == batch.input_ids.numel()
             batch.input_ids = new_input_ids
+            if mm_input_embeds is not None:
+                mm_input_embeds = rotated_mm
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
