@@ -642,6 +642,35 @@ def run_eagle_verify(
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
+    token_probe_scores = logits_output.token_probe_scores
+    token_probe_finish_func = None
+    token_probe = target_worker.get_token_probe()
+    if (
+        token_probe is not None
+        and token_probe.uses_kv_cache
+        and not batch.forward_mode.is_idle()
+        and token_probe_scores is not None
+    ):
+        # The model-side validation restricts this shared EAGLE worker path to
+        # bundled MTP (linear top-k-1 chains).  Verify initially carries the
+        # probe's projected Q/K/V; score only the accepted chain now that its
+        # length is known.
+        if token_probe.overlap and token_probe.begin_score_accepted_verify(
+            qkv=token_probe_scores,
+            forward_batch=verify_forward_batch,
+            num_accept_slots=accept_index.shape[1],
+            num_draft_tokens=num_draft_tokens,
+        ):
+            token_probe_scores = None
+            token_probe_finish_func = token_probe.finish_score_accepted_verify
+        else:
+            token_probe_scores = token_probe.score_accepted_verify(
+                qkv=token_probe_scores,
+                forward_batch=verify_forward_batch,
+                num_accept_slots=accept_index.shape[1],
+                num_draft_tokens=num_draft_tokens,
+            )
+
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
     # batch.input_ids rebind in prepare_for_draft_extend.
@@ -656,5 +685,7 @@ def run_eagle_verify(
         new_seq_lens=new_seq_lens,
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
+        token_probe_scores=token_probe_scores,
+        token_probe_finish_func=token_probe_finish_func,
         extra_keep_alive_refs=[verify_forward_batch],
     )

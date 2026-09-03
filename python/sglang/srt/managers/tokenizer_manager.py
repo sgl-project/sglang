@@ -459,6 +459,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Init token-probe label names (static per server run)
+        self.maybe_init_token_probe_labels()
+
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
@@ -2190,6 +2193,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
+    def maybe_init_token_probe_labels(self):
+        """Label names used to key token_probe_probs rows in meta_info; read
+        once from the probe checkpoint config (static per server run)."""
+        self._token_probe_labels: tuple = ()
+        if not self.server_args.probe_ckpt:
+            return
+        try:
+            from sglang.srt.models.token_probe.loader import read_probe_labels
+
+            self._token_probe_labels = read_probe_labels(self.server_args.probe_ckpt)
+        except Exception as e:
+            logger.warning(
+                "failed to read token probe labels at %s: %s",
+                self.server_args.probe_ckpt,
+                e,
+            )
+
     async def _handle_batch_output(
         self,
         recv_obj: Union[
@@ -2328,6 +2348,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+            # Per-token probe rows become {label_name: prob} dicts.
+            if (
+                isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+                and recv_obj.token_probe_probs
+                and i < len(recv_obj.token_probe_probs)
+            ):
+                req_token_probe_probs = recv_obj.token_probe_probs[i]
+                if req_token_probe_probs:
+                    labels = self._token_probe_labels
+                    meta_info["token_probe_probs"] = [
+                        {
+                            (labels[j] if j < len(labels) else f"label_{j}"): float(v)
+                            for j, v in enumerate(row)
+                        }
+                        for row in req_token_probe_probs
+                    ]
 
             state.finished = recv_obj.finished_reasons[i] is not None
 

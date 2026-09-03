@@ -353,6 +353,10 @@ class TpModelWorker(BaseTpWorker):
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
 
+        self._token_probe_module = self._find_token_probe_module()
+        self._maybe_prepare_token_probe_device()
+        self._maybe_init_token_probe_kv_cache()
+
         self._init_dllm_algorithm()
 
         if get_serving().skip_tokenizer_init or self.is_draft_worker:
@@ -422,6 +426,8 @@ class TpModelWorker(BaseTpWorker):
             mr.req_to_token_pool = self.req_to_token_pool
             mr.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
             mr.alloc_memory_pool(memory_pool_config)
+        self._maybe_init_token_probe_kv_cache()
+        self._maybe_init_token_probe_overlap()
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
@@ -590,6 +596,76 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def _find_token_probe_module(self):
+        """The module owning a ``token_probe``, or None. Wrapped models nest
+        it under .model/.module/.language_model."""
+        candidates = [self.model_runner.model]
+        seen = set()
+        while candidates:
+            candidate = candidates.pop(0)
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            if getattr(candidate, "token_probe", None) is not None:
+                return candidate
+            for attr in ("model", "module", "language_model"):
+                child = getattr(candidate, attr, None)
+                if child is not None and id(child) not in seen:
+                    candidates.append(child)
+        return None
+
+    def get_token_probe(self):
+        """The model's TokenProbe, or None (draft/probe-less models)."""
+        if self._token_probe_module is None:
+            return None
+        return self._token_probe_module.token_probe
+
+    def _maybe_prepare_token_probe_device(self):
+        """Move the probe head onto the model's device. Runs once the model is
+        loaded, so the probe's own K/V pool can read the device back off it."""
+        if self._token_probe_module is None:
+            return
+        self._token_probe_module.token_probe.prepare_device(
+            next(self._token_probe_module.parameters()).device
+        )
+
+    def _maybe_init_token_probe_overlap(self):
+        """Open the probe's side stream and reduce communicator. Runs after the
+        memory pools are sized, so the communicator's buffers do not come out
+        of them, and before cuda graph capture, which neither may enter."""
+        if self._token_probe_module is None:
+            return
+        self._token_probe_module.token_probe.init_overlap(
+            next(self._token_probe_module.parameters()).device
+        )
+
+    def _maybe_init_token_probe_kv_cache(self):
+        """Size the probe's K/V pool from the base KV pool's real slot count
+        and hand it the live position->slot table. Idempotent; must run
+        before cuda graph capture."""
+        if self._token_probe_module is None:
+            return
+        req_to_token_pool = self.model_runner.req_to_token_pool
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        if req_to_token_pool is None or allocator is None:
+            return
+        kvcache = allocator.get_kvcache()
+        self._token_probe_module.token_probe.init_kv_cache(
+            num_slots=kvcache.size + kvcache.page_size,
+            req_to_token=req_to_token_pool.req_to_token,
+        )
+
+    def _get_token_probe_scores(self, logits_output=None):
+        if logits_output is not None and logits_output.token_probe_scores is not None:
+            return logits_output.token_probe_scores.detach()
+
+        if self._token_probe_module is None:
+            return None
+        token_probe_scores = self._token_probe_module.token_probe.last_scores
+        if token_probe_scores is not None:
+            token_probe_scores = token_probe_scores.detach()
+        return token_probe_scores
+
     def forward_batch_generation(
         self,
         batch: Optional[ScheduleBatch],
@@ -636,6 +712,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                token_probe_scores=self._get_token_probe_scores(logits_output),
             )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
@@ -725,6 +802,7 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            token_probe_scores=self._get_token_probe_scores(logits_output),
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

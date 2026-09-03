@@ -4251,7 +4251,11 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or batch.return_hidden_states:
+            if (
+                batch.return_logprob
+                or batch.return_hidden_states
+                or batch_result.token_probe_scores is not None
+            ):
                 batch_result.extend_input_len_per_req = [
                     req.extend_range.length if req.extend_range is not None else 0
                     for req in batch.reqs

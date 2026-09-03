@@ -80,6 +80,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
+from sglang.srt.models.token_probe import TokenProbe
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
@@ -1219,6 +1220,7 @@ class BailingMoELinearModel(nn.Module):
         # aux list and returns ``(hidden_states, aux_hidden_states)``.
         self.layers_to_capture: Optional[List[int]] = None
         self.capture_aux_hidden_states = False
+        self.token_probe = TokenProbe(config, logger=logger)
         return
 
     def forward(
@@ -1265,7 +1267,14 @@ class BailingMoELinearModel(nn.Module):
         if capture_aux:
             dspark_aux_hidden_states: List[torch.Tensor] = []
 
+        self.token_probe.begin_forward(forward_batch, hidden_states)
+
         for i in range(self.start_layer, self.end_layer):
+            self.token_probe.capture(
+                layer_id=i,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -1295,6 +1304,7 @@ class BailingMoELinearModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
+            self.token_probe.finish()
             if capture_aux and len(dspark_aux_hidden_states) > 0:
                 return hidden_states, dspark_aux_hidden_states
             return hidden_states
@@ -1692,7 +1702,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
                 hidden_states, aux_hidden_states = hidden_states
-            return self.logits_processor(
+            result = self.logits_processor(
                 input_ids,
                 # keep hidden_states in bf16 so the lm_head matmul runs in bf16
                 # (logits are cast to fp32 inside the logits processor)
@@ -1701,6 +1711,8 @@ class BailingMoeV3ForCausalLM(nn.Module):
                 forward_batch,
                 aux_hidden_states=aux_hidden_states,
             )
+            result.token_probe_scores = self.model.token_probe.last_scores
+            return result
         else:
             return hidden_states
 

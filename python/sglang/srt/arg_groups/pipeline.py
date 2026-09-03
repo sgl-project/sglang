@@ -318,6 +318,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_speculative_decoding(server_args)
 
+    from sglang.srt.arg_groups.token_probe_hook import validate_token_probe
+
+    validate_token_probe(server_args)
+
     # After the speculative hook so speculative_algorithm is final.
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
 

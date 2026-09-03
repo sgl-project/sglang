@@ -3657,6 +3657,11 @@ class ServerArgs:
         "The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
         NS("observability"),
     ] = None
+    probe_ckpt: A[
+        Optional[str],
+        "Path to a SingProbe checkpoint.",
+        NS("model"),
+    ] = None
 
     def __post_init__(self):
         """Construction leaves the record at what the caller asked for.

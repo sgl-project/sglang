@@ -1848,6 +1848,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.hidden_states is not None
                 else None
             ),
+            token_probe_scores=(
+                output.token_probe_scores[: self.raw_num_tokens]
+                if output.token_probe_scores is not None
+                else None
+            ),
             input_token_logprobs=output.input_token_logprobs,
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,

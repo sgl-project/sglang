@@ -1518,6 +1518,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
+    # Per-token multi-label probe probabilities: token_probe_probs[i] holds
+    # one [num_labels] row per token of output_ids[i].
+    token_probe_probs: Optional[List[List[List[float]]]] = None
+
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
     # leading-null count (see build_flat_input_top_logprobs_arrays). For such
@@ -1614,6 +1618,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
+    # Per-token multi-label probe probabilities: token_probe_probs[i] holds
+    # one [num_labels] row per token of output_ids[i].
+    token_probe_probs: Optional[List[List[List[float]]]] = None
 
     # Detokenizer pass-through for the scheduler-side flat prompt top logprob
     # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.

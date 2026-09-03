@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -10,6 +14,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import quote
 
 import torch
 
@@ -76,6 +81,28 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=8)
+def _cached_probe_config(ckpt_path: str) -> dict:
+    try:
+        from sglang.srt.models.token_probe.loader import read_probe_config
+
+        return read_probe_config(ckpt_path)
+    except Exception as e:
+        logger.warning("failed to read token probe config at %s: %s", ckpt_path, e)
+        return {}
+
+
+@lru_cache(maxsize=8)
+def _cached_probe_labels(ckpt_path: str) -> tuple:
+    try:
+        from sglang.srt.models.token_probe.loader import read_probe_labels
+
+        return read_probe_labels(ckpt_path)
+    except Exception as e:
+        logger.warning("failed to read token probe labels at %s: %s", ckpt_path, e)
+        return ()
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -240,6 +267,140 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
 
+    def _token_probe_labels(self) -> tuple:
+        ckpt = self.server_args.probe_ckpt
+        if not ckpt:
+            return ()
+        return _cached_probe_labels(ckpt)
+
+    def _collect_token_probe_scores_for_request(
+        self,
+        req,
+        score_row,
+    ) -> None:
+        if req.token_probe_probs is None:
+            req.token_probe_probs = []
+        req.token_probe_probs.append(score_row)
+
+    def _maybe_save_token_probe_result(self, req) -> None:
+        """Persist one request's accumulated per-token scores (idempotent)."""
+        save_dir = envs.SGLANG_TOKEN_PROBE_SAVE_DIR.get()
+        if not save_dir:
+            return
+        if req.token_probe_saved:
+            return
+        rows = req.token_probe_probs
+        if not rows:
+            return
+        req.token_probe_saved = True
+        try:
+            from safetensors.torch import save_file
+
+            os.makedirs(save_dir, exist_ok=True)
+            scores = (
+                torch.stack(rows)
+                if isinstance(rows[0], torch.Tensor)
+                else torch.tensor(rows, dtype=torch.float32)
+            )
+            labels = self._token_probe_labels()
+            metadata = {"rid": str(req.rid), "labels": json.dumps(list(labels))}
+            cfg = _cached_probe_config(self.server_args.probe_ckpt or "")
+            for key in ("model_type", "base_model_layer_ids", "hidden_size"):
+                if key in cfg:
+                    metadata[key] = json.dumps(cfg[key])
+            request_id = str(req.rid)
+            filename = quote(request_id, safe="")
+            if len(filename) > 200:
+                filename = hashlib.sha256(request_id.encode()).hexdigest()
+            path = os.path.join(save_dir, f"{filename}.safetensors")
+            save_file({"scores": scores}, path, metadata=metadata)
+        except Exception as e:  # never let result-dumping break serving
+            logger.warning(
+                "failed to save token probe result for req %s: %s", req.rid, e
+            )
+
+    def _record_token_probe_prefill_scores(
+        self,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+        next_token_ids: List[int],
+    ) -> None:
+        scores = getattr(result, "token_probe_scores", None)
+        if scores is None:
+            return
+        scores_cpu = scores.detach().cpu()
+        offset = 0
+        # Per-request token counts of THIS forward (the chunk sizes under
+        # chunked prefill), matching token_probe_scores' row count.
+        extend_lens = result.extend_input_len_per_req
+        if extend_lens is None:
+            extend_lens = batch.extend_lens
+        if extend_lens is None:
+            return
+        # Save path keeps every prompt token's row; the API path keeps one
+        # representative row per request (its last prompt token).
+        save_all = bool(envs.SGLANG_TOKEN_PROBE_SAVE_DIR.get())
+        total_extend = sum(int(x) for x in extend_lens)
+        all_token = scores_cpu.shape[0] == total_extend
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            extend_len = int(extend_lens[i])
+            start = offset
+            offset += extend_len
+            if extend_len <= 0 or req.finished() or req.is_retracted:
+                continue
+
+            if save_all and all_token:
+                end = min(start + extend_len, scores_cpu.shape[0])
+                for r in range(start, end):
+                    self._collect_token_probe_scores_for_request(
+                        req, scores_cpu[r].clone()
+                    )
+                continue
+
+            row = start + extend_len - 1
+            if row >= scores_cpu.shape[0] and scores_cpu.shape[0] == len(batch.reqs):
+                row = i
+            if row >= scores_cpu.shape[0]:
+                continue
+
+            score_row = scores_cpu[row]
+            self._collect_token_probe_scores_for_request(
+                req, score_row.clone() if save_all else score_row.tolist()
+            )
+
+    def _record_token_probe_decode_scores(
+        self, batch: ScheduleBatch, result: GenerationBatchResult, next_token_ids
+    ) -> None:
+        finish_func = getattr(result, "token_probe_finish_func", None)
+        if finish_func is not None:
+            # Non-overlap path: copy_to_cpu did not run, so materialize the
+            # deferred side-stream verify scores here.
+            result.token_probe_scores = finish_func()
+            result.token_probe_finish_func = None
+        scores = getattr(result, "token_probe_scores", None)
+        if scores is None:
+            return
+        scores_cpu = scores.detach().cpu()
+        save_rows = bool(envs.SGLANG_TOKEN_PROBE_SAVE_DIR.get())
+        rows = scores_cpu if save_rows else scores_cpu.tolist()
+        # Rows follow the hidden_states layout: one per-req block of `stride`
+        # rows whose first len(next_token_id) entries are the accepted tokens
+        # (stride = speculative_num_draft_tokens for spec verify, 1 for
+        # non-spec decode).
+        stride = result.speculative_num_draft_tokens or 1
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            if (self.enable_overlap or self.enable_overlap_mlx) and (
+                req.finished() or req.is_retracted
+            ):
+                continue
+            start = i * stride
+            num_rows = min(len(next_token_id), stride, scores_cpu.shape[0] - start)
+            for k in range(num_rows):
+                score_row = rows[start + k]
+                self._collect_token_probe_scores_for_request(
+                    req, score_row.clone() if save_rows else score_row
+                )
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -276,6 +437,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            self._record_token_probe_prefill_scores(batch, result, next_token_ids)
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
@@ -345,6 +507,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        self._maybe_save_token_probe_result(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -907,6 +1070,8 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
+        self._record_token_probe_decode_scores(batch, result, next_token_ids)
+
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
@@ -1201,6 +1366,7 @@ class SchedulerBatchResultProcessor:
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
+            self._maybe_save_token_probe_result(req)
 
         self._maybe_collect_customized_info(i, req, logits_output)
 

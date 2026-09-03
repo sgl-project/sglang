@@ -269,6 +269,9 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            token_probe_probs=_extract_field_by_index(
+                output, "token_probe_probs", i, check_length=False
+            ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),
@@ -393,6 +396,9 @@ def _handle_output_by_index(output, i):
             weight_versions=_extract_field_by_index(output, "weight_versions", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
+            ),
+            token_probe_probs=_extract_field_by_index(
+                output, "token_probe_probs", i, check_length=False
             ),
         )
     else:

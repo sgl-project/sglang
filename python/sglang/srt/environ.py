@@ -1606,6 +1606,13 @@ class Envs:
     SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES = EnvInt(1)
 
     # ===================================================================
+    # Token probe
+    # ===================================================================
+    SGLANG_TOKEN_PROBE_SAVE_DIR = EnvStr(None)
+    SGLANG_ENABLE_TOKEN_PROBE_PREFILL = EnvBool(False)
+    SGLANG_ENABLE_TOKEN_PROBE_OVERLAP = EnvBool(False)
+
+    # ===================================================================
     # Plugin system
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")

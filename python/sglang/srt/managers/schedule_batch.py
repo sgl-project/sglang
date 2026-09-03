@@ -1180,6 +1180,11 @@ class Req(ReqDllmMixin):
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
+        # Token probe (return values): one [num_labels] probability row per
+        # token (float lists on the API path, tensors on the save path).
+        self.token_probe_probs: Optional[List] = None
+        self.token_probe_saved = False
+
         # Embedding (return values)
         self.embedding = None
 
