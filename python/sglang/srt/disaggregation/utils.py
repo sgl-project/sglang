@@ -1269,9 +1269,7 @@ def setup_state_kv_args(
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = (
-                token_to_kv_pool.get_c4_state_buf_infos()
-            )
+            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
             if c4_ptrs:
                 append_state_component(
                     kv_args,

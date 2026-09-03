@@ -92,9 +92,7 @@ class AscendKVManager(MooncakeKVManager):
                 # Two groups, each c4_full entries; slice both by PP stage.
                 dst = []
                 for offset in (0, c4_full):
-                    dst.extend(
-                        dst_kv_ptrs[offset + c4_start : offset + c4_end]
-                    )
+                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             # NPU main KV layout: [C4 KV, index K, index scale].
@@ -109,10 +107,8 @@ class AscendKVManager(MooncakeKVManager):
             # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
             # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
             # here and slice SWA KV by layer index directly.
-            if (
-                state_type == StateType.SWA
-                and AscendStateType.DSV4_C4_STATE
-                in (self.kv_args.state_types or [])
+            if state_type == StateType.SWA and AscendStateType.DSV4_C4_STATE in (
+                self.kv_args.state_types or []
             ):
                 dst = list(dst_kv_ptrs[start_layer:end_layer])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)

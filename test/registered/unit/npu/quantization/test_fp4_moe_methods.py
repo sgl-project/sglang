@@ -18,6 +18,7 @@ register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
 # initialized, `_get_float8_e8m0fnu_dtype` not yet defined). Initializing the
 # package first mirrors how the engine loads quantization at model-config time.
 import sglang.srt.layers.quantization  # noqa: F401
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.quantization import fp4_moe_methods
 from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     NPUW4A4Fp4MoEMethod,
@@ -28,11 +29,9 @@ from sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods import (
     npu_apply_without_routing_weights_w4a4_mxfp,
     w4a8_mxfp_gmm,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-
 
 _NOT_PASSED = object()
 
