@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -547,15 +548,17 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
-        # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve
-        # the gap per new mamba slot or admission over-commits. Gate on the
-        # ALLOCATOR being the unified Mamba composite, NOT on `is_hybrid_ssm_cache`
-        # (False for `ChunkCache`, which would skip the reservation on the
-        # chunk-cache path): the gap coupling is a property of the byte buffer.
+        # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
+        # as free, so reserve per slot or admission over-commits. Gate on the
+        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
+        # which would skip the reservation on the chunk-cache path.
         self._mamba_slot_cost = 0
         if isinstance(
-            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator,
+            (
+                UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedMambaSWATokenToKVPoolAllocator,
+            ),
         ):
             self._mamba_slot_cost = (
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
@@ -569,9 +572,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -1313,9 +1314,9 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)

@@ -56,6 +56,9 @@ def _make_backend(runner):
     backend._outputs = {}
     backend._pool = None
     backend._capture_stream = None
+    backend._precarve = SimpleNamespace(
+        measure=contextlib.nullcontext, mint=mock.Mock()
+    )
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
@@ -136,8 +139,11 @@ class TestCaptureOneWithProfiling(CustomTestCase):
             rf_names.append(name)
             return contextlib.nullcontext()
 
-        with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"), mock.patch(
-            "torch.profiler.record_function", side_effect=_fake_record_function
+        with (
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+            mock.patch(
+                "torch.profiler.record_function", side_effect=_fake_record_function
+            ),
         ):
             backend.capture_one(ShapeKey(size=size), forward_fn)
 

@@ -116,26 +116,26 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
         torch._dynamo.config.suppress_errors = True
 
     def __init__(self, model_runner: ModelRunner):
-        assert (
-            not get_exec().features.enable_memory_saver
-        ), "XPUGraphRunner does not support Torch Memory Saver yet."
+        assert not get_exec().features.enable_memory_saver, (
+            "XPUGraphRunner does not support Torch Memory Saver yet."
+        )
         register_fake_ops()
         self._apply_xpu_compile_config()
         register_xpu_device_properties_for_dynamo()
         super().__init__(model_runner)
 
-        assert (
-            not self.enable_two_batch_overlap
-        ), "XPUGraphRunner does not support two batch overlap yet."
-        assert (
-            not self.require_mlp_tp_gather
-        ), "XPUGraphRunner does not support MLP TP gather yet."
-        assert (
-            not self.require_mlp_sync
-        ), "XPUGraphRunner does not support MLP sync yet."
-        assert (
-            not self.require_gathered_buffer
-        ), "XPUGraphRunner does not support gathered buffer yet."
+        assert not self.enable_two_batch_overlap, (
+            "XPUGraphRunner does not support two batch overlap yet."
+        )
+        assert not self.require_mlp_tp_gather, (
+            "XPUGraphRunner does not support MLP TP gather yet."
+        )
+        assert not self.require_mlp_sync, (
+            "XPUGraphRunner does not support MLP sync yet."
+        )
+        assert not self.require_gathered_buffer, (
+            "XPUGraphRunner does not support gathered buffer yet."
+        )
 
     def _init_profile_context_and_memory_record(self):
         profile_context = profile(

@@ -196,12 +196,15 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
     def test_auto_bind_disabled_skips_numa_detection(self, mock_avail, mock_query):
         args = self._make_server_args(numa_node=None)
         for bind_v2 in ("0", "1"):
-            with self.subTest(bind_v2=bind_v2), patch.dict(
-                os.environ,
-                {
-                    "SGLANG_AUTO_NUMA_BIND": "0",
-                    "SGLANG_NUMA_BIND_V2": bind_v2,
-                },
+            with (
+                self.subTest(bind_v2=bind_v2),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_AUTO_NUMA_BIND": "0",
+                        "SGLANG_NUMA_BIND_V2": bind_v2,
+                    },
+                ),
             ):
                 self.assertIsNone(get_numa_node_if_available(args, 0))
         mock_avail.assert_not_called()
