@@ -121,6 +121,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_src = None
         track_chunk_idx = None
         track_ssm_h_dst = None
+        track_ssm_h_batch_src = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
@@ -252,6 +253,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_chunk_idx,
                         track_ssm_h_src,
                         track_ssm_h_dst,
+                        track_ssm_h_batch_src,
                         track_ssm_final_src,
                         track_ssm_final_dst,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
@@ -270,6 +272,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
+            track_ssm_h_batch_src=track_ssm_h_batch_src,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             track_chunk_idx=track_chunk_idx,
@@ -351,7 +354,9 @@ class MambaAttnBackendBase(AttentionBackend):
     ):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
-        chunk boundary."""
+        chunk boundary. Also returns ``track_ssm_h_batch_src``: the batch rows of
+        the unaligned tracked seqs, used to integer-index the fp32 snapshot
+        buffer on the KDA path so the copy stays free of GPU syncs."""
         state_chunk_size = self.mamba_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
@@ -389,14 +394,15 @@ class MambaAttnBackendBase(AttentionBackend):
 
         track_chunk_idx = torch.full((lens_to_track.shape[0],), -1, dtype=torch.int32)
         tracked_seqs = mamba_track_mask.nonzero(as_tuple=True)[0][not_aligned]
-        track_chunk_idx[tracked_seqs] = (lens_masked[not_aligned] // chunk_size).to(
-            torch.int32
-        )
+        track_chunk_idx[tracked_seqs] = (
+            lens_masked[not_aligned] // state_chunk_size
+        ).to(torch.int32)
 
         return (
             track_chunk_idx.to(self.device, non_blocking=True),
             track_ssm_h_src.to(self.device, non_blocking=True),
             track_ssm_h_dst.to(self.device, non_blocking=True),
+            tracked_seqs.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
         )
@@ -864,8 +870,9 @@ class MambaAttnBackendBase(AttentionBackend):
         depends on chunk alignment; see `_init_track_ssm_indices`).
 
         Unaligned rows read the fp32 ``h_track_buf`` snapshot written in-kernel
-        when given (its rows follow the batch, selected by
-        ``track_chunk_idx >= 0``); otherwise they fall back to the per-chunk
+        when given (its rows follow the batch, selected by the integer index
+        ``track_ssm_h_batch_src`` — a boolean mask would nonzero() and sync the
+        stream once per layer); otherwise they fall back to the per-chunk
         states ``h`` (already rounded to the activation dtype)."""
         if forward_metadata.has_mamba_track_mask:
             # Triton always returns h; FlashInfer returns it only when checkpoints
@@ -873,7 +880,7 @@ class MambaAttnBackendBase(AttentionBackend):
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 if h_track_buf is not None:
                     ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
-                        forward_metadata.track_chunk_idx >= 0
+                        forward_metadata.track_ssm_h_batch_src
                     ].to(ssm_states.dtype, copy=False)
                 else:
                     assert h is not None
