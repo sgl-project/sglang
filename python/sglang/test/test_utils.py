@@ -235,15 +235,65 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+# DEFAULT_URL_FOR_TEST sits this many ports above the runner port, so a derived
+# base port must leave room for the offset and still be a valid TCP port.
+_TEST_PORT_URL_OFFSET = 1000
+_MAX_TCP_PORT = 65535
+
+
+def _device_index_from_visible_devices(raw: Optional[str]) -> int:
+    """Derive a small non-negative index from a CUDA_VISIBLE_DEVICES value.
+
+    The index only selects a port range so that concurrent per-device test
+    runners do not fight over the same TCP port; it never selects a device.
+    Concurrent runners cannot share a GPU, so their device lists are disjoint
+    and the first entry already discriminates between them.
+
+    CUDA_VISIBLE_DEVICES is user supplied and may legitimately hold values that
+    cannot be mapped to an index -- GPU UUIDs, or the empty string that hides
+    every device. Picking a test port is a convenience, not a correctness
+    requirement, so unparsable values fall back to 0 rather than raising and
+    breaking every import of this module.
+    """
+    if not raw:
+        return 0
+    first = raw.split(",")[0].strip()
+    try:
+        index = int(first)
+    except ValueError:
+        return 0
+    return index if index > 0 else 0
+
+
+def _port_for_device_index(base: int, stride: int, index: int) -> int:
+    """Map a device index onto a base port.
+
+    Indices are no longer truncated, so they can be arbitrarily large; the
+    index is wrapped into the slots that keep the result -- plus
+    _TEST_PORT_URL_OFFSET -- inside the valid TCP port range. Beyond the wrap
+    point ports repeat, which trades uniqueness for validity: a reused port
+    surfaces as "address already in use", an out-of-range one cannot bind at
+    all. The wrap point (45 slots non-CI, 28 in CI) is far above any realistic
+    single-host device count.
+    """
+    slots = (_MAX_TCP_PORT - _TEST_PORT_URL_OFFSET - base) // stride + 1
+    return base + (index % slots) * stride
+
+
+_TEST_DEVICE_INDEX = _device_index_from_visible_devices(
+    os.environ.get("CUDA_VISIBLE_DEVICES")
+)
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = _port_for_device_index(
+        10000, 2000, _TEST_DEVICE_INDEX
     )
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = _port_for_device_index(
+        20000, 1000, _TEST_DEVICE_INDEX
     )
-DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+DEFAULT_URL_FOR_TEST = (
+    f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + _TEST_PORT_URL_OFFSET}"
+)
 
 if is_in_amd_ci():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
