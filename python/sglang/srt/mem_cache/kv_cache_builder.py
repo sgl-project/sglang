@@ -23,6 +23,7 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     hybrid_lightning_config,
@@ -50,7 +51,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
@@ -60,6 +60,29 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+
+def get_draft_kv_pool(
+    *,
+    draft_worker: BaseTpWorker,
+    spec_algorithm: SpeculativeAlgorithm,
+    server_args: ServerArgs,
+):
+    """Return the draft token-to-KV pool for the current draft worker,
+    or None when no draft KV pool is available."""
+    if draft_worker is None or spec_algorithm.is_ngram():
+        return None
+
+    # V2 draft workers exist only on their hosting PP stage; other ranks own no
+    # nested draft worker or draft KV pool.
+    if draft_worker.draft_worker is None:
+        return None
+
+    if resolving_view(server_args).enable_multi_layer_eagle:
+        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
+    else:
+        draft_runner = draft_worker.draft_worker.draft_runner
+    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
@@ -290,6 +313,8 @@ def build_kv_cache(
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,
         pp_size=ps.pp_size,
+        attn_cp_rank=ps.attn_cp_rank,
+        attn_cp_size=ps.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,

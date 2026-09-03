@@ -7,7 +7,9 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -21,12 +23,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
     with_phase,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     is_cpu,
-    is_hip,
     is_mps,
-    is_npu,
-    is_xpu,
     parse_connector_type,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
@@ -110,8 +110,27 @@ def apply_cuda_graph_compatibility(server_args: Any):
     prefill backend (this folds in the old
     --enforce-piecewise-cuda-graph contract).
     """
+
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        return
+
+    # PP prefill graph replay is opt-in. It is most useful for small
+    # aggregate forwards, while enabling it implicitly would also capture
+    # large buckets that can be slower than eager. An explicit backend
+    # selection bypasses this default policy.
+    if cfg.pp_size > 1 and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+        logger.info(
+            "Disabling breakable prefill CUDA graph by default for pipeline "
+            "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
+        )
+        declare_resolution(
+            server_args,
+            "_apply_cuda_graph_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
         return
 
     # Breakable is the CUDA default but not multimodal-compatible;
@@ -120,14 +139,16 @@ def apply_cuda_graph_compatibility(server_args: Any):
     # this runs first, so piecewise would otherwise silently win.
     if (
         cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and server_args.get_model_config().is_multimodal_piecewise_cuda_graph_supported
-        and not server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported
+        and model_config_of(server_args).is_multimodal_piecewise_cuda_graph_supported
+        and not model_config_of(
+            server_args
+        ).is_multimodal_breakable_cuda_graph_supported
         # Keep trtllm_mla on the preferred breakable path, which now serves
         # MLA by falling back to the flashinfer MLA impl for extend.
-        and server_args._resolved_attention_backends()[0] != "trtllm_mla"
+        and attention_backends_of(resolved_view(server_args))[0] != "trtllm_mla"
     ):
         logger.info(
-            "Using tc_piecewise CUDA graph for validated multimodal " "decoder prefill."
+            "Using tc_piecewise CUDA graph for validated multimodal decoder prefill."
         )
         declare_resolution(
             server_args,
@@ -149,24 +170,33 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
     """TcPiecewise (torch.compile + piecewise) is incompatible with
     these configurations. Most are torch.compile / dynamo limitations.
     """
+
     cfg = resolving_view(server_args)
 
     rules = [
         (
             "model-arch blacklist",
-            lambda: server_args.get_model_config().is_piecewise_cuda_graph_disabled_model,
+            lambda: model_config_of(server_args).is_piecewise_cuda_graph_disabled_model,
         ),
         ("DP attention", lambda: resolved_view(server_args).enable_dp_attention),
         ("full torch.compile mode", lambda: cfg.enable_torch_compile),
         ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
         (
             "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
-            lambda: is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu(),
+            lambda: (
+                get_platform().is_hip
+                or get_platform().is_npu
+                or is_cpu()
+                or is_mps()
+                or get_platform().is_xpu
+            ),
         ),
         (
             "OOT platform without piecewise support",
-            lambda: current_platform.is_out_of_tree()
-            and not current_platform.support_piecewise_cuda_graph(),
+            lambda: (
+                current_platform.is_out_of_tree()
+                and not current_platform.support_piecewise_cuda_graph()
+            ),
         ),
         (
             "MoE A2A backend",
@@ -177,14 +207,20 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("LoRA", lambda: bool(cfg.lora_paths) or cfg.enable_lora),
         (
             "multimodal model",
-            lambda: server_args.get_model_config().is_multimodal
-            and not server_args.get_model_config().is_multimodal_piecewise_cuda_graph_supported,
+            lambda: (
+                model_config_of(server_args).is_multimodal
+                and not model_config_of(
+                    server_args
+                ).is_multimodal_piecewise_cuda_graph_supported
+            ),
         ),
         (
             "GGUF quantization",
-            lambda: cfg.load_format == "gguf"
-            or resolved_view(server_args).quantization == "gguf"
-            or check_gguf_file(cfg.model_path),
+            lambda: (
+                cfg.load_format == "gguf"
+                or resolved_view(server_args).quantization == "gguf"
+                or check_gguf_file(cfg.model_path)
+            ),
         ),
         ("DLLM (diffusion LLM)", lambda: cfg.dllm_algorithm is not None),
         (
@@ -199,8 +235,9 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("symmetric memory", lambda: cfg.enable_symm_mem),
         (
             "expert distribution recorder",
-            lambda: cfg.enable_eplb
-            or cfg.expert_distribution_recorder_mode is not None,
+            lambda: (
+                cfg.enable_eplb or cfg.expert_distribution_recorder_mode is not None
+            ),
         ),
         (
             "context parallel (attn_cp_size > 1)",
@@ -236,6 +273,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     memory-saver rejection in its own __init__; config-time rules can be
     added here as they're discovered.
     """
+
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
@@ -245,13 +283,15 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
         (
             "DeepSeek-V4 (heavy capture-pool memory pressure)",
-            lambda: is_deepseek_v4(server_args.get_model_config().hf_config),
+            lambda: is_deepseek_v4(model_config_of(server_args).hf_config),
         ),
         # CP all_gather replay size mismatch under BCG.
         (
             "context parallel (attn_cp_size > 1)",
-            lambda: resolved_view(server_args).attn_cp_size > 1
-            and not supports_prefill_cp_bcg(server_args),
+            lambda: (
+                resolved_view(server_args).attn_cp_size > 1
+                and not supports_prefill_cp_bcg(server_args)
+            ),
         ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
@@ -265,14 +305,20 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         ),
         (
             "unvalidated a2a backend",
-            lambda: resolved_view(server_args).moe_a2a_backend
-            not in ("none", "deepep", "megamoe", "flashinfer"),
+            lambda: (
+                resolved_view(server_args).moe_a2a_backend
+                not in ("none", "deepep", "megamoe", "flashinfer")
+            ),
         ),
         # Multimodal prefill replay faults under BCG; allowlisted archs opt back in.
         (
             "multimodal model",
-            lambda: server_args.get_model_config().is_multimodal
-            and not server_args.get_model_config().is_multimodal_breakable_cuda_graph_supported,
+            lambda: (
+                model_config_of(server_args).is_multimodal
+                and not model_config_of(
+                    server_args
+                ).is_multimodal_breakable_cuda_graph_supported
+            ),
         ),
     ]
     for name, predicate in rules:
@@ -319,6 +365,7 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
     breakable) trtllm_mla falls back to FlashAttention for prefill and regresses
     performance, so disable whichever prefill graph backend is in effect.
     """
+
     cfg = resolving_view(server_args)
 
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
@@ -327,10 +374,10 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
         return
     if (
         "DeepseekV3ForCausalLM"
-        not in server_args.get_model_config().hf_config.architectures
+        not in model_config_of(server_args).hf_config.architectures
     ):
         return
-    prefill_attention_backend, _ = server_args._resolved_attention_backends()
+    prefill_attention_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_attention_backend != "trtllm_mla":
         return
     logger.warning(
@@ -362,7 +409,7 @@ def apply_deepep_adjustments(server_args: Any):
         if bs is None:
             # 2048 = documented prefill default; max_bs unresolved here.
             max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
-            bs = server_args._generate_prefill_cuda_graph_batch_sizes(max_bs)
+            bs = generate_prefill_cuda_graph_batch_sizes(max_bs)
         aligned = sorted({((b + 7) // 8) * 8 for b in bs})
         if aligned != sorted(bs):
             logger.info(
@@ -389,6 +436,7 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     auto-disabled for this multimodal arch, and declarative model overrides
     materialize too late to steer cuda-graph resolution. Honors an explicit
     --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
+
     cfg = resolving_view(server_args)
     if (
         cfg.cuda_graph_backend_prefill is not None
@@ -396,7 +444,7 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
-    arch = server_args.get_model_config().hf_config.architectures[0]
+    arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
@@ -409,13 +457,14 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
+
     cfg = resolving_view(server_args)
     if (
         cfg.cuda_graph_max_bs_prefill is not None
         or parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE
     ):
         return
-    arch = server_args.get_model_config().hf_config.architectures[0]
+    arch = model_config_of(server_args).hf_config.architectures[0]
     if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
         declare_resolution(
             server_args,
@@ -430,7 +479,7 @@ def handle_cuda_graph_config(server_args: Any):
     parse_cuda_graph_config(server_args)
     apply_cuda_graph_compatibility(server_args)
     apply_deepep_adjustments(server_args)
-    server_args._apply_cuda_graph_disaggregation_roles()
+    apply_cuda_graph_disaggregation_roles(server_args)
     validate_cuda_graph_config(server_args)
     # Warn on the final resolved config (not inside the compat cascade —
     # that path is skipped when the user explicitly sets the backend,
@@ -452,4 +501,103 @@ def validate_cuda_graph_config(server_args: Any):
             raise ValueError(
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
+            )
+
+
+def generate_prefill_cuda_graph_batch_sizes(max_bs: int):
+    """
+    Generate the list of batch sizes for prefill CUDA graph capture
+    based on max_bs. For tc_piecewise prefill, bs carries the
+    captured token count (one shape knob per phase).
+    """
+    capture_sizes = (
+        list(range(4, 33, 4))
+        + list(range(48, 257, 16))
+        + list(range(288, 513, 32))
+        + list(range(576, 1024 + 1, 64))
+        + list(range(1280, 4096 + 1, 256))
+        + list(range(4608, max_bs + 1, 512))
+    )
+
+    capture_sizes = [s for s in capture_sizes if s <= max_bs]
+
+    return capture_sizes
+
+
+def generate_decode_cuda_graph_batch_sizes(server_args: Any, max_bs: int):
+    """
+    Generate the list of batch sizes for CUDA graph capture based on max_bs.
+    This integrates the logic from cuda_graph_runner.py.
+    """
+    cfg = resolving_view(server_args)
+    # Handle disable_cuda_graph_padding as the first condition for both spec and non-spec
+    if cfg.disable_cuda_graph_padding:
+        capture_bs = list(range(1, max_bs + 1))
+    elif cfg.speculative_algorithm is None:
+        # Normal case:
+        capture_bs = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, 512, 16))
+            + list(range(512, max_bs + 1, 32))
+        )
+    else:
+        # Spec decoding case: less padding for smaller batch sizes
+        capture_bs = (
+            list(range(1, 9, 1))
+            + list(range(10, 33, 2))
+            + list(range(40, 65, 4))
+            + list(range(72, 257, 8))
+            + list(range(272, max_bs + 1, 16))
+        )
+
+    capture_bs = [bs for bs in capture_bs if bs <= max_bs]
+
+    if max_bs not in capture_bs:
+        capture_bs.append(max_bs)
+
+    return capture_bs
+
+
+def generate_cpu_graph_batch_sizes(server_args: Any):
+    """
+    Generate the list of batch sizes for CPU graph capture based on torch_compile_max_bs.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.disable_cuda_graph_padding:
+        capture_bs = list(range(1, cfg.torch_compile_max_bs + 1))
+    else:
+        capture_bs = sorted(
+            set().union(
+                range(1, 17),
+                range(18, 31, 2),
+                range(32, 81, 4),
+                range(84, cfg.torch_compile_max_bs + 1, 8),
+                {cfg.torch_compile_max_bs},
+            )
+        )
+    capture_bs = [bs for bs in capture_bs if bs <= cfg.torch_compile_max_bs]
+
+    return capture_bs
+
+
+def apply_cuda_graph_disaggregation_roles(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_mode == "prefill":
+        if (Phase.DECODE, "backend") not in server_args._cuda_graph_config_locked:
+            declare_resolution(
+                server_args,
+                "_apply_cuda_graph_disaggregation_roles",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+    elif cfg.disaggregation_mode == "decode":
+        if (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked:
+            declare_resolution(
+                server_args,
+                "_apply_cuda_graph_disaggregation_roles",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
             )

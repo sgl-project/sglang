@@ -105,9 +105,12 @@ class TestMambaPathStateCap(unittest.TestCase):
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError,
-                "must be -1 \\(unlimited\\) or a positive integer",
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "must be -1 \\(unlimited\\) or a positive integer",
+                ),
             ):
                 handle_mamba_backend(args)
 
