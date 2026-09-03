@@ -464,9 +464,9 @@ class DeepseekV4HipRadixBackend(
         self.mtp_enabled = self.topk > 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
+        self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
         self.is_dspark_draft = (
-            getattr(model_runner, "is_draft_worker", False)
-            and model_runner.spec_algorithm.is_dspark()
+            self.is_draft_worker and model_runner.spec_algorithm.is_dspark()
         )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
@@ -492,7 +492,7 @@ class DeepseekV4HipRadixBackend(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
-            use_topk_v2=False,
+            use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
         )
 
     def init_forward_metadata_decode(
@@ -1048,7 +1048,9 @@ class DeepseekV4HipRadixBackend(
                 and extend_seq_lens is not None
                 and extend_seq_lens_cpu is not None
             )
-            is_draft = forward_batch.forward_mode.is_draft_extend_v2()
+            is_draft = (
+                forward_batch.forward_mode.is_draft_extend_v2() or self.is_draft_worker
+            )
             metadata = self.init_forward_metadata_prefill(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
