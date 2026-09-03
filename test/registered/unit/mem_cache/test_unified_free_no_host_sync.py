@@ -81,6 +81,12 @@ _TOMBSTONE_METHODS = [
 ]
 
 
+# Ways to write `-1` into a table without the value crossing the bus:
+# `index_fill_` takes the scalar as an argument torch keeps off the host, and
+# the fused launchers store it from inside the kernel.
+_NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
+
+
 def _allocators_in_module():
     """Every allocator class DEFINED in multi_ended_allocator (not imported)."""
     return sorted(
@@ -219,11 +225,19 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                     ),
                 )
 
-    def test_free_paths_actually_use_index_fill(self):
-        """Positive form, so deleting the scatter entirely cannot pass."""
+    def test_free_paths_actually_write_a_tombstone(self):
+        """Positive form, so deleting the scatter entirely cannot pass. The
+        mechanism is not the point -- keeping the tombstone value off the host
+        is -- so this lists the sanctioned ways to do that and a new one is
+        added here deliberately."""
         for cls, name in _TOMBSTONE_METHODS:
             with self.subTest(method=f"{cls.__name__}.{name}"):
-                self.assertIn("index_fill_", inspect.getsource(getattr(cls, name)))
+                src = inspect.getsource(getattr(cls, name))
+                self.assertTrue(
+                    any(form in src for form in _NO_SYNC_TOMBSTONE_FORMS),
+                    f"{cls.__name__}.{name} writes no tombstone through any of "
+                    f"{_NO_SYNC_TOMBSTONE_FORMS}",
+                )
 
     def test_index_fill_matches_scalar_assign_semantics(self):
         """Behaviour-preserving, including the edge cases the free path hands
@@ -492,6 +506,78 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
         v = alloc.alloc(4 * self.PS)
         alloc.free_swa(v, start_pos=0)
         alloc.free_swa(v, start_pos=0)  # all tombstoned -> filtered to empty
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available(), "the fused tombstone is a Triton kernel"
+)
+class TestFusedTombstoneWritesBothTables(unittest.TestCase):
+    """The source scan above accepts `free_unbind_inplace` as a no-sync
+    mechanism; this is what makes that acceptance mean something. On CPU the
+    launcher takes its pure-torch reference path, so nothing else in the suite
+    ever runs the kernel that does the tombstoning.
+    """
+
+    def test_matches_the_reference_over_randomized_bindings(self):
+        from sglang.kernels.ops.memory.virtual_slot import (
+            bind_inplace,
+            free_unbind_inplace,
+        )
+
+        g = torch.Generator(device="cuda").manual_seed(11)
+        for trial in range(20):
+            n_pages = int(torch.randint(4, 400, (1,), generator=g, device="cuda"))
+            n_free = int(
+                torch.randint(1, n_pages + 1, (1,), generator=g, device="cuda")
+            )
+            phys = torch.randperm(n_pages, device="cuda", generator=g).to(torch.int64)
+            virt = torch.randperm(n_pages, device="cuda", generator=g).to(torch.int64)
+            v2p = torch.full((n_pages,), -1, dtype=torch.int64, device="cuda")
+            p2v = torch.full((n_pages,), -1, dtype=torch.int64, device="cuda")
+            bind_inplace(virt, phys, v2p, p2v)
+            self.assertTrue(torch.equal(v2p[virt], phys), f"bind trial {trial}")
+            self.assertTrue(torch.equal(p2v[phys], virt), f"bind trial {trial}")
+
+            freed_v = virt[:n_free]
+            want_p = v2p[freed_v].clone()
+            got_p = free_unbind_inplace(freed_v, v2p, p2v)
+
+            self.assertTrue(torch.equal(got_p, want_p), f"freed pages, trial {trial}")
+            self.assertTrue(
+                torch.all(v2p[freed_v] == -1), f"v2p not tombstoned, trial {trial}"
+            )
+            self.assertTrue(
+                torch.all(p2v[want_p] == -1), f"p2v not tombstoned, trial {trial}"
+            )
+            live_v = virt[n_free:]
+            self.assertTrue(
+                torch.equal(v2p[live_v], phys[n_free:]),
+                f"a live binding was disturbed, trial {trial}",
+            )
+
+    def test_cuda_agrees_with_the_cpu_reference(self):
+        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
+
+        v = torch.tensor([3, 0, 5], dtype=torch.int64)
+        cpu_v2p = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.int64)
+        cpu_p2v = torch.tensor([5, 0, 1, 2, 3, 4], dtype=torch.int64)
+        cu_v2p, cu_p2v = cpu_v2p.cuda(), cpu_p2v.cuda()
+        cpu_out = free_unbind_inplace(v, cpu_v2p, cpu_p2v)
+        cu_out = free_unbind_inplace(v.cuda(), cu_v2p, cu_p2v)
+        self.assertTrue(torch.equal(cpu_out, cu_out.cpu()))
+        self.assertTrue(torch.equal(cpu_v2p, cu_v2p.cpu()))
+        self.assertTrue(torch.equal(cpu_p2v, cu_p2v.cpu()))
+
+    def test_empty_free_is_a_noop(self):
+        from sglang.kernels.ops.memory.virtual_slot import free_unbind_inplace
+
+        v2p = torch.arange(4, dtype=torch.int64, device="cuda")
+        before = v2p.clone()
+        out = free_unbind_inplace(
+            torch.empty(0, dtype=torch.int64, device="cuda"), v2p, v2p.clone()
+        )
+        self.assertEqual(int(out.numel()), 0)
+        self.assertTrue(torch.equal(v2p, before))
 
 
 if __name__ == "__main__":

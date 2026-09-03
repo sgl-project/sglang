@@ -239,6 +239,7 @@ def _build_deepseek_v4_device_pool_group(
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _dsv4_indexer_regions,
         _resolve_deepseek_v4_layer_mappings,
     )
 
@@ -288,13 +289,14 @@ def _build_deepseek_v4_device_pool_group(
         kvcache.c4_kv_pool.kv_buffer,
         mappings.c4,
     )
-    add(
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.KV,
-        kvcache.c4_indexer_kv_pool,
-        kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-        mappings.c4,
-    )
+    for region in _dsv4_indexer_regions(kvcache, page_size):
+        add(
+            region.name,
+            PoolName.KV,
+            kvcache.c4_indexer_kv_pool,
+            region.device_buffers,
+            mappings.c4,
+        )
     add(
         PoolName.DEEPSEEK_V4_C128,
         PoolName.KV,
