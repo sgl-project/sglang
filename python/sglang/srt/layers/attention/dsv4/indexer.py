@@ -879,7 +879,7 @@ class C4IndexerBackendMixin:
                     # range, so a chunk needs one built over its own rows.
                     (
                         indexer_metadata.topk_metadata
-                        if rows == all_rows
+                        if rows == all_rows or not is_hip()
                         else plan_topk_v2(c4_seq_lens[rows])
                     ),
                 )
