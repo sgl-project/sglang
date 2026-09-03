@@ -242,11 +242,7 @@ class CompressorBackendMixin:
         )
 
         if token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
-            # The fused epilogue only writes the packed layout; the trtllm
-            # backend's uniform-FP8 pool stores through its standalone
-            # pipeline (compressor_trtllm.py). The indexer compressor keeps
-            # its own (blockwise-FP8) path below. Online c128 MTP states are
-            # not supported with that pool, so nothing else runs here.
+            # The fused epilogue writes only the packed FlashMLA layout.
             from sglang.srt.layers.attention.dsv4.compressor_trtllm import (
                 forward_compress_uniform_fp8,
             )

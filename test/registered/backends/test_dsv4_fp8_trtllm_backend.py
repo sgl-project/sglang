@@ -1,22 +1,8 @@
-"""DeepSeek-V4 uniform-FP8 trtllm backend (SM100/SM103 Blackwell only).
+"""SM100/SM103 coverage for DSV4's uniform-FP8 trtllm backend.
 
-Validates --dsv4-attn-backend trtllm — DSv4 decode and sparse varlen prefill
-through flashinfer's ``trtllm_batch_decode_sparse_mla_dsv4`` on a uniform
-512-dim FP8-e4m3 KV cache with an FP8 query:
-
-1. Decode-correctness probes + a GSM8K sanity eval.
-2. Long multi-k-token prompts exercise the varlen prefill path (mixed lengths
-   fired concurrently to exercise cum_seq_lens_q packing; a repeat run
-   exercises the radix-cache-hit / cached-prefix extend, and the longest
-   prompt exceeds --chunked-prefill-size so chunked prefill is exercised too).
-3. A CUDA-graph capture/replay smoke: concurrent decode batches of varying
-   size (replaying different captured decode-graph buckets) must stay
-   consistent with a single-request greedy run.
-
-Greedy tails are not compared against FlashMLA: the two FP8 cache formats
-(packed per-block scales + BF16 RoPE vs uniform per-tensor e4m3) legitimately
-diverge after the answer, and temperature-0 outputs also depend on batch
-composition. Accuracy is gated by GSM8K instead.
+Covers decode correctness, GSM8K accuracy, varlen and cached-prefix prefill,
+chunking, and decode CUDA-graph replay. Long outputs use sanity checks because
+the FlashMLA and uniform-FP8 cache formats need not be bit-reproducible.
 """
 
 import concurrent.futures
@@ -64,11 +50,8 @@ SERVER_ARGS = [
     "--disable-flashinfer-autotune",
 ]
 
-# Long multi-k-token prompts that exercise the trtllm-gen varlen
-# prefill: real c4 indexer top-k selection needs >~2k tokens of context and
-# the c128 far tier needs whole 128-token pages; the mixed lengths also
-# exercise cum_seq_lens_q packing when fired concurrently, and the longest
-# exceeds --chunked-prefill-size (4096) so it prefills in multiple chunks.
+# Mixed lengths cover c4/c128 selection and VarSeq packing; the longest prompt
+# exceeds the 4096-token prefill chunk.
 _FILLER_SENTENCES = [
     "The expedition recorded water temperature, salinity, and current speed "
     "at every station along the transect. ",
@@ -94,14 +77,13 @@ def _make_long_prompt(idx: int, target_chars: int) -> str:
     return body + _LONG_PROMPT_QUESTION
 
 
-# ~4 chars/token: roughly 2.5k, 4.5k, and 7k tokens.
+# Roughly 2.5k, 4.5k, and 7k tokens.
 LONG_PROMPTS = [
     _make_long_prompt(0, 10_000),
     _make_long_prompt(1, 18_000),
     _make_long_prompt(2, 28_000),
 ]
 LONG_MAX_NEW_TOKENS = 32
-# Same gibberish gate as BasicDecodeCorrectnessMixin.test_ascii_ratio.
 MIN_PRINTABLE_ASCII_RATIO = 0.85
 
 GSM8K_NUM_EXAMPLES = 200
@@ -171,16 +153,9 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
         )
 
     def test_long_prompt_varlen_prefill(self):
-        """Varlen trtllm-gen prefill on multi-k-token prompts.
+        """Exercise mixed-length VarSeq and cached-prefix chunked prefill.
 
-        The three prompts are fired concurrently (mixed extend lengths in
-        one batch exercise cum_seq_lens_q packing and per-token sparse-table
-        construction; the longest prompt also exceeds --chunked-prefill-size,
-        covering chunked prefill). The longest is then re-sent alone so the
-        radix cache serves its prefix (cached-prefix extend, where seq_lens >
-        extend len). Outputs are checked for sanity only: at these context
-        lengths temperature-0 decode is not bit-reproducible (split-KV
-        reduction order), so exact-match assertions would be flaky.
+        Sanity checks avoid flaky exact matches from split-KV reduction order.
         """
 
         with concurrent.futures.ThreadPoolExecutor(len(LONG_PROMPTS)) as pool:
@@ -213,13 +188,7 @@ class TestDSV4Fp8TrtllmBackend(BasicDecodeCorrectnessMixin, CustomTestCase):
         self.assertGreater(metrics["score"], GSM8K_MIN_SCORE)
 
     def test_cuda_graph_capture_replay_smoke(self):
-        """Exercise decode CUDA-graph replay across batch-size buckets.
-
-        Bursts of concurrent requests at varying concurrency replay different
-        captured decode-graph buckets; a repeated greedy single must remain
-        identical to its first run afterwards (address-stable trtllm sparse
-        buffers, no capture/replay corruption).
-        """
+        """Replay several decode graph buckets and recheck a greedy anchor."""
         anchor_prompt = "Q: What is the capital of France?\nA:"
         anchor_out = _greedy_generate(self.base_url, anchor_prompt, 32)
 

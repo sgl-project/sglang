@@ -184,11 +184,8 @@ class DeepSeekV4SingleKVPool(KVCache):
 class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
     """Uniform 512-dim FP8 (e4m3) variant of the DSv4 single-KV pool.
 
-    Layout required by the trtllm-gen sparse MLA kernel: every token is 512
-    contiguous e4m3 values (448 nope + 64 rope, both FP8), with no in-cache
-    scales and no per-page padding -- the kernel addresses the cache at token
-    granularity as ``flat_index * 512`` bytes. The per-tensor dequant scale
-    is delivered externally via the kernel's bmm scales.
+    Each token is 448 NoPE + 64 RoPE contiguous e4m3 values without in-cache
+    scales or per-page padding. The backend supplies the dequant scale.
     """
 
     def get_bytes_per_token(self) -> int:
@@ -230,10 +227,9 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        """Store already-normed/roped rows as plain e4m3 with a fixed scale of
-        1.0 (the backend's bmm scales assume this - change both together).
+        """Store normed/roped rows as e4m3 with the backend's fixed unit scale.
 
-        Uses uint8 views to work around index_put not supporting fp8 dtypes.
+        uint8 views work around index_put not supporting FP8 dtypes.
         """
 
         assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim

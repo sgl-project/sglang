@@ -1,10 +1,7 @@
 """B200 per-commit CI: DeepSeek-V4-Flash FP4 with the trtllm attention backend.
 
-Same four recipes as test_deepseek_v4_flash_fp4_b200.py (which guards the
-default FlashMLA backend), with ``--dsv4-attn-backend trtllm`` (uniform-FP8
-KV pool, trtllm-gen sparse MLA for decode and prefill).
-
-Registry: base-c-test-4-gpu-b200 (per-commit, 4x B200)
+Mirrors the four FlashMLA recipes with a uniform-FP8 KV pool and trtllm-gen
+sparse MLA for decode and prefill.
 """
 
 import unittest

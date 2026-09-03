@@ -192,20 +192,13 @@ class DSV4AttnMetadata:
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
-    # trtllm decode: per-ratio combined sparse tables [num_tokens, 128 + w]
-    # and lens [num_tokens]. Layer-invariant content (SWA columns, the whole
-    # c128 table, the c0 lens) is written once per step by
-    # init_trtllm_sparse_buffers; the per-layer forward only writes the c4
-    # tail + lens (indexer top-k). c0 layers pass swa_page_indices itself as
-    # the table. None for prefill-style metadata and when trtllm is off.
+    # Combined decode tables. Only the c4 tail and lens vary by layer.
     trtllm_swa_lens: Optional[torch.Tensor] = None
     trtllm_c4_indices: Optional[torch.Tensor] = None
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
-    # trtllm prefill: per-chunk caches built lazily by _forward_trtllm_prefill
-    # (prefill runs eagerly). qmeta = (cum_seq_lens_q, max_q_len, sum_q,
-    # seq_lens_int32); c128 = (table, lens).
+    # Lazy eager-prefill caches: qmeta and per-ratio combined tables.
     trtllm_prefill_qmeta: Optional[tuple] = None
     trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
@@ -267,9 +260,7 @@ class DSV4AttnMetadata:
                 "c1_flashmla_metadata",
                 "c4_flashmla_metadata",
                 "c128_flashmla_metadata",
-                # Built lazily by the eager _forward_trtllm_prefill, so they
-                # are None on every metadata that reaches a graph replay; two
-                # of them are tuples, which content-copy cannot handle.
+                # Eager-only lazy caches are assigned, not content-copied.
                 "trtllm_prefill_qmeta",
                 "trtllm_prefill_swa_lens",
                 "trtllm_prefill_c4_indices",
@@ -291,9 +282,7 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
-            # trtllm tables: static parts are rebuilt per step by the host
-            # metadata; content-copy keeps the captured tensor objects alive
-            # (the c4 tail is refilled in place by the per-layer forward).
+            # Preserve graph-captured table addresses; refill c4 per layer.
             "trtllm_swa_lens",
             "trtllm_c4_indices",
             "trtllm_c4_lens",
@@ -309,10 +298,7 @@ class DSV4AttnMetadata:
             "c1_flashmla_metadata",
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
-            # Per-chunk lazy caches built by the eager _forward_trtllm_prefill;
-            # MUST be reset from the fresh metadata (None) on every breakable
-            # replay refresh, or a reused metadata object serves stale
-            # sum_q/tables to a different batch shape.
+            # Reset eager-only caches so a replay cannot reuse another shape.
             "trtllm_prefill_qmeta",
             "trtllm_prefill_swa_lens",
             "trtllm_prefill_c4_indices",
@@ -446,28 +432,17 @@ class DSV4AttnMetadata:
         self.c128_flashmla_metadata = _create_flashmla_metadata()
 
     def init_trtllm_sparse_buffers(self) -> None:
-        """Build the trtllm per-ratio combined sparse tables (decode).
+        """Build decode tables with 128 SWA columns followed by compressed KV.
 
-        Kernel contract per row: columns [0:128) SWA physical token indices,
-        [128:) compressed-tier indices, -1 invalid, capacity % 4 == 0; lens
-        include the 128 SWA slots. Everything layer-invariant is written here,
-        once per step: the SWA columns of both tables, the ENTIRE c128 table
-        and lens (its page list is metadata-level), and the constant SWA-only
-        lens (c0 layers pass swa_page_indices itself as the table). The
-        per-layer decode forward only writes the c4 tail + lens.
+        Indices use -1 for invalid entries; lens include all 128 SWA slots.
+        Only the c4 tail and lens are filled per layer.
         """
 
         num_tokens = self.seq_lens_casual.shape[0]
         assert self.swa_page_indices.shape == (num_tokens, SWA_WINDOW)
 
-        # TILE OVERRUN GUARD: the trtllm-gen VarSeq kernel processes query
-        # rows in 64-token tiles and reads per-token table rows up to the
-        # tile boundary, i.e. up to 63 rows past num_tokens. Allocate every
-        # per-token tensor it reads as a 64-row-aligned parent filled with
-        # INERT values (-1 indices, SWA-only lens, seq_len 1) and keep
-        # [:num_tokens] views, so over-reads land in mapped inert memory
-        # instead of past the allocation (observed as segment-boundary MMU
-        # faults / silent garbage depending on allocator layout).
+        # VarSeq reads rows to the 64-token tile boundary. Back every live view
+        # with an aligned parent whose extra rows contain inert values.
         n_pad = (num_tokens + 63) // 64 * 64
 
         def _tile_padded(fill, src=None, width=None):
@@ -486,11 +461,7 @@ class DSV4AttnMetadata:
         if self.c4_sparse_page_indices is not None:
             w4 = self.c4_sparse_page_indices.shape[-1]
             assert w4 % 4 == 0, f"{w4=}"
-            # The c4 tail + lens are per-layer values written by the decode
-            # forward. Initialize them INERT (-1 = invalid index, lens =
-            # SWA-only) rather than torch.empty: any row the per-layer fill
-            # does not cover must not hand the kernel allocator garbage as
-            # indices/lengths.
+            # Unwritten c4 rows must remain inert until the per-layer fill.
             self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
             self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
@@ -618,8 +589,6 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
-    # True on DeepseekV4TrtllmAttnBackend (deepseek_v4_trtllm_backend.py),
-    # which dispatches attention through the trtllm-gen sparse MLA kernel.
     trtllm_attn: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
@@ -1164,12 +1133,8 @@ class DeepseekV4AttnBackend(
             )
         )
         if self.trtllm_attn:
-            # DP-padded rows carry the graph seq-len fill value (1); expanding
-            # a 1-length row over num_tokens_per_req query tokens yields 0 (or
-            # negative) per-token lens for its leading tokens. FlashMLA
-            # tolerates that; the trtllm-gen kernel indexes KV from these lens
-            # and needs the >=1 floor (same convention as *_topk_lengths_clamp1).
-            # Real rows are unaffected (their first token's KV length is >= 1).
+            # DP padding can expand a length-one request into nonpositive
+            # per-token lens; trtllm-gen requires them to remain at least one.
             seq_lens_casual = seq_lens_casual.clamp(min=1)
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
@@ -1858,9 +1823,7 @@ class DeepseekV4AttnBackend(
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
             if self.trtllm_attn:
-                # The uniform-FP8 pool is only readable by the trtllm-gen
-                # kernel; the subclass owns the whole dispatch
-                # (deepseek_v4_trtllm_backend.DeepseekV4TrtllmAttnBackend).
+                # The uniform-FP8 pool is readable only by trtllm-gen.
                 return self._forward_trtllm(
                     q=q,
                     layer=layer,
@@ -2409,7 +2372,6 @@ class DeepseekV4AttnBackend(
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
             if self.trtllm_attn:
-                # SWA-only capacity (draft-extend metadata skips compression).
                 core_attn_metadata.init_trtllm_sparse_buffers()
         return core_attn_metadata
 
@@ -2458,8 +2420,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def _make_step_backend(
         self, model_runner: ModelRunner, step_id: int
     ) -> DeepseekV4AttnBackend:
-        # Overridden by DeepseekV4TrtllmMultiStepBackend
-        # (deepseek_v4_trtllm_backend.py) to build trtllm per-step backends.
         return DeepseekV4AttnBackend(
             model_runner,
             speculative_step_id=step_id,

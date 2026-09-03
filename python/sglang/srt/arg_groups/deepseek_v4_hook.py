@@ -140,8 +140,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert cfg.device == "cuda" and is_sm100_supported(), (
             "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."
         )
-        # "auto" is declared-but-unmaterialized here; the resolution pipeline
-        # (_deepseek_v4_kv_cache_dtype above) turns it into fp8_e4m3 on cuda.
+        # The resolution pipeline materializes "auto" as fp8_e4m3 on CUDA.
         assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3"), (
             "--dsv4-attn-backend trtllm requires kv_cache_dtype=fp8_e4m3, "
             f"got {cfg.kv_cache_dtype}."
