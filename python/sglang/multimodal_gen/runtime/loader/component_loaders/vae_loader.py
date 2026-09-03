@@ -4,7 +4,6 @@ import os
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen import envs
@@ -160,6 +159,15 @@ def _decode_dtype_store_path(
     return os.path.join(
         envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"
     )
+
+
+def _load_safetensors_file(path: str) -> dict:
+    """The VAE checkpoint itself: read-only where host copies are redundant."""
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        _load_safetensors_file as _load,
+    )
+
+    return _load(path)
 
 
 def _load_store(path: str) -> dict:
@@ -605,7 +613,7 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(safetensors_load_file(sf_path))
+            loaded.update(_load_safetensors_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         strict_load = native_only
         # `loaded` holds views into the safetensors mapping. When the component
