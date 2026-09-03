@@ -1371,9 +1371,8 @@ class Req(ReqDllmMixin):
         appending only the new output tokens.
 
         Falls back to a full rebuild when the in-place append is invalid:
-        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
-          origin_input_ids directly, so extending in place would write output
-          tokens into the origin;
+        - aliasing: full_untruncated_fill_ids is origin_input_ids itself, so
+          extending in place would write output tokens into the origin;
         - lengths disagree: fresh req (array still empty), retraction
           (output_ids reset to empty), or set_finish_with_abort (origin
           replaced by a 1-token stub).
@@ -2454,9 +2453,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert (
-            len(self.out_cache_loc) == self.extend_num_tokens
-        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        assert len(self.out_cache_loc) == self.extend_num_tokens, (
+            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+        )
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []
@@ -2887,10 +2886,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
-        for req in running_batch.reqs:
+        # Same invariant as convert_decode_to_extend: the caller ran
+        # prepare_for_decode, so a tail's prefix is its row length - 1.
+        if self.spec_algorithm.is_none():
+            running_prefix_lens = [s - 1 for s in running_batch.seq_lens_cpu.tolist()]
+        else:
+            # Spec rows sit at the committed base; seq_lens is rebuilt below.
+            running_prefix_lens = [r.seqlen - 1 for r in running_batch.reqs]
+        for req, prefix_len in zip(
+            running_batch.reqs, running_prefix_lens, strict=True
+        ):
             req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+            req.set_extend_range(prefix_len, prefix_len + 1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
         self.input_ids = None
@@ -2938,18 +2945,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             merged[-running_bs:] = tail_base + 1
             self.seq_lens = merged
 
-        # For overlap scheduler, the output_ids has one step delay;
-        # spec tail request state carries no delay in either mode.
-        if self.spec_algorithm.is_none():
-            delta = 0 if self.enable_overlap else -1
-        else:
-            delta = -1
-
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens = self.prefix_lens + [
-            len(r.origin_input_ids) + len(r.output_ids) + delta
-            for r in running_batch.reqs
-        ]
+        self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
@@ -2972,16 +2969,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
-        for req in self.reqs:
+        # A 1-token extend's position is arange(prefix, prefix + 1), so prefix
+        # must be seq_len - 1; output_ids trails the row by one or zero and
+        # cannot stand in for it. Rows past bs are a beam tail, not requests.
+        seq_lens = self.seq_lens_cpu[:bs].tolist()
+        for req, seq_len in zip(self.reqs, seq_lens, strict=True):
             req._refresh_fill_ids()
-            full_len = len(req.full_untruncated_fill_ids)
-            req.set_extend_range(full_len - 1, full_len)
+            # end runs one past full_untruncated_fill_ids while output_ids
+            # trails; safe only while decoding_reqs suppresses cache_unfinished_req.
+            req.set_extend_range(seq_len - 1, seq_len)
 
-        # Same one-step output_ids delay handling as mix_with_running.
-        delta = 0 if self.enable_overlap else -1
-        self.prefix_lens = [
-            len(r.origin_input_ids) + len(r.output_ids) + delta for r in self.reqs
-        ]
+        self.prefix_lens = [seq_len - 1 for seq_len in seq_lens]
         self.extend_lens = [1] * bs
         self.extend_num_tokens = bs
         self.extend_logprob_start_lens = [0] * bs

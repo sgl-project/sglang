@@ -108,9 +108,9 @@ def mamba_v2_sharded_weight_loader(
                 weight_full_dim_list.append(
                     int(full_dim / full_dim_sum * loaded_weight.size(0))
                 )
-            assert sum(weight_full_dim_list) == loaded_weight.size(
-                0
-            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            assert sum(weight_full_dim_list) == loaded_weight.size(0), (
+                f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            )
             if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
                 logger.warning(
                     f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
@@ -177,7 +177,9 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -237,9 +239,9 @@ class MambaMixer2(torch.nn.Module):
         self.num_heads = num_heads = cache_params.shape.num_heads
         self.head_dim = cache_params.shape.head_dim
 
-        assert (
-            num_heads % self.tp_size == 0
-        ), "Tensor parallel world size must divide num heads."
+        assert num_heads % self.tp_size == 0, (
+            "Tensor parallel world size must divide num heads."
+        )
 
         assert (n_groups % self.tp_size) == 0 or n_groups == 1, (
             "If tensor parallel world size does not divide num_groups, "
@@ -637,12 +639,12 @@ class MambaMixer2(torch.nn.Module):
 
             # 2. Convolution sequence transformation
             if is_target_verify:
-                assert (
-                    use_triton_causal_conv
-                ), "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
-                assert isinstance(
-                    layer_cache, MambaPool.SpeculativeState
-                ), "layer_cache must be SpeculativeState for speculative decoding"
+                assert use_triton_causal_conv, (
+                    "Speculative decoding requires use_triton_causal_conv=True for intermediate state support"
+                )
+                assert isinstance(layer_cache, MambaPool.SpeculativeState), (
+                    "layer_cache must be SpeculativeState for speculative decoding"
+                )
                 draft_token_num = metadata.draft_token_num
                 self.intermediate_state_indices = torch.arange(
                     num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device

@@ -971,9 +971,9 @@ def _triton_sparse_mla_fwd_splitk(
     h_padded = n_head_blocks * BLOCK_H
 
     num_groups = d_v // 128
-    assert (
-        num_groups <= 4
-    ), f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
+    assert num_groups <= 4, (
+        f"Triton sparse MLA supports d_v up to 512 (4 groups), got d_v={d_v}"
+    )
     qk_scale = float(sm_scale) * _LOG2E
 
     # Preserve the established split cap when a smaller BLOCK_K is required
