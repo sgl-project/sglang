@@ -101,8 +101,61 @@ def free_swa_out_of_window_slots(
         free_slots = req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        # Local import: multi_ended_allocator imports this module lazily for
+        # eviction; a module-level import here would be a cycle hazard.
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
+        if isinstance(token_to_kv_pool_allocator, UnifiedSWATokenToKVPoolAllocator):
+            # Contiguous range with host-int bounds: hand the composite its
+            # start position so the free stays host-sync-free (`free_segment`
+            # derives page reps by stride math instead of `torch.unique`).
+            token_to_kv_pool_allocator.free_swa(
+                free_slots, start_pos=req.kv.swa_evicted_seqlen
+            )
+        else:
+            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
+
+
+def free_kv_row_segments(
+    allocator: BaseTokenToKVPoolAllocator,
+    segments: list[tuple[torch.Tensor, int]],
+    *,
+    swa_evicted_seqlen: int,
+) -> None:
+    """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
+    request's kv row, split at the SWA eviction floor."""
+    swa_dead: list[torch.Tensor] = []
+    swa_alive: list[tuple[torch.Tensor, int]] = []
+    for kv_indices, start_pos in segments:
+        num_indices = kv_indices.numel()
+        if num_indices == 0:
+            continue
+        # Below the floor the SWA peers are already gone -- window eviction, or
+        # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
+        num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
+        if num_dead > 0:
+            swa_dead.append(kv_indices[:num_dead])
+        if num_dead < num_indices:
+            swa_alive.append((kv_indices[num_dead:], start_pos + num_dead))
+
+    if swa_dead and swa_alive:
+        # A mid-page floor would send a page shared by the dead and alive
+        # sides back twice.
+        assert swa_evicted_seqlen % allocator.page_size == 0, (
+            f"SWA eviction floor {swa_evicted_seqlen} splits a page "
+            f"(page_size {allocator.page_size})"
+        )
+    if len(swa_dead) == 1:
+        allocator.free_full(swa_dead[0])
+    elif swa_dead:
+        # Two dead pieces can share a boundary page, and only free_full's own
+        # page dedup covers that -- free_segments trims the alive side alone.
+        allocator.free_full(torch.cat(swa_dead))
+    if swa_alive:
+        allocator.free_segments(swa_alive)
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -261,12 +314,9 @@ def _release_overallocated_kv_indices(
         start_p = ceil_align(start_p, page_size)
 
     if start_p < end_p:
-        indices_to_free = tree_cache.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx
-        ][start_p:end_p]
         # start_p is aligned to the allocator's physical page size above, so it
         # never shares a page with cache_finished_req's tail free in this group.
-        allocator.free_segment(indices_to_free, start_pos=start_p)
+        tree_cache.free_kv_row(req.kv, [(start_p, end_p)])
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
