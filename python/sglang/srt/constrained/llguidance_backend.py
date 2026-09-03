@@ -28,6 +28,7 @@ from llguidance.torch import (
     fill_next_token_bitmask_par,
     fill_next_token_bitmask_par_with_draft_tokens,
 )
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
@@ -93,6 +94,22 @@ def _normalize_eos_token_ids(
     if eos_token_ids is None or isinstance(eos_token_ids, int):
         return eos_token_ids
     return list(eos_token_ids)
+
+
+def _create_llguidance_tokenizer(
+    tokenizer,
+    n_vocab: Optional[int],
+    eos_token: Optional[Union[int, List[int]]],
+) -> LLTokenizer:
+    if isinstance(tokenizer, PreTrainedTokenizerFast):
+        backend_tokenizer = tokenizer.backend_tokenizer
+        if backend_tokenizer.padding is None and backend_tokenizer.truncation is None:
+            return LLTokenizer(
+                backend_tokenizer.to_str(),
+                n_vocab=n_vocab,
+                eos_token=(tokenizer.eos_token_id if eos_token is None else eos_token),
+            )
+    return from_tokenizer(tokenizer, n_vocab, eos_token=eos_token)
 
 
 class GuidanceGrammar(BaseGrammarObject):
@@ -223,7 +240,7 @@ class GuidanceBackend(BaseGrammarBackend):
         self.tokenizer = tokenizer
         self.any_whitespace = any_whitespace
         self.whitespace_pattern = whitespace_pattern
-        self.llguidance_tokenizer = from_tokenizer(
+        self.llguidance_tokenizer = _create_llguidance_tokenizer(
             self.tokenizer,
             n_vocab,
             eos_token=_normalize_eos_token_ids(eos_token_ids),

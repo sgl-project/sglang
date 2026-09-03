@@ -80,9 +80,7 @@ class TestPPBasic(ScriptedTestCase):
     @staticmethod
     def _script_pp_static_chunk_size_predictor_returns_none(t: ScriptedContext):
         sched = t.scheduler
-        assert sched.enable_dynamic_chunking is False
-        assert sched.predict_next_chunk_size(0) is None
-        assert sched.predict_next_chunk_size(VERY_LONG_PROMPT_LEN // 2) is None
+        assert sched.dynamic_chunk_sizer is None
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
         assert r.finished
@@ -211,12 +209,9 @@ class TestPPDynamic(ScriptedTestCase):
 
     @staticmethod
     def _script_pp_dynamic_chunk_size_recompute_branch_taken(t: ScriptedContext):
-        sched = t.scheduler
-        assert sched.enable_dynamic_chunking is True
-        assert sched.length_predictor is not None
-        assert sched.length_predictor.is_ready is True
-        dynamic_size = sched.predict_next_chunk_size(0)
-        assert dynamic_size is not None
+        sizer = t.scheduler.dynamic_chunk_sizer
+        assert sizer is not None
+        dynamic_size = sizer.predict(0)
         assert isinstance(dynamic_size, int) and dynamic_size > 0
         r = t.start_req(
             prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2, prompt_token=4

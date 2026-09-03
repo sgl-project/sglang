@@ -216,6 +216,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
+    DynamicChunkSizer,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -627,6 +630,7 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
+        self.maybe_init_dynamic_chunk_sizer()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -1244,19 +1248,27 @@ class Scheduler(
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
-        # Init the dynamic chunking predictor for PP
-        self.enable_dynamic_chunking = (
-            get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1
+    def maybe_init_dynamic_chunk_sizer(self) -> None:
+        """Profile a PP prefill latency model that sizes chunks per stage."""
+        self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
+        if not (get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1):
+            return
+        sizer = DynamicChunkSizer(
+            model_runner=self.tp_worker.model_runner,
+            model_config=self.model_config,
+            tree_cache=self.tree_cache,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            chunked_prefill_size=self.chunked_prefill_size,
+            max_prefill_tokens=self.max_prefill_tokens,
+            page_size=self.page_size,
+            device=self.device,
+            pp_group=self.pp_group,
+            pp_rank=self.ps.pp_rank,
         )
-        if self.enable_dynamic_chunking:
-            try:
-                self.profile_and_init_predictor()
-            except Exception as e:
-                logger.warning(
-                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
-                    "Dynamic chunking will be disabled."
-                )
-                self.enable_dynamic_chunking = False
+        if sizer.profile_and_fit():
+            self.dynamic_chunk_sizer = sizer
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -3601,9 +3613,9 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
+            dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 

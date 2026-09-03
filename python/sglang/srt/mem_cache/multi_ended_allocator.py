@@ -40,7 +40,11 @@ from typing import (
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
+from sglang.kernels.ops.memory.virtual_slot import (
+    alloc_bind_inplace,
+    bind_inplace,
+    free_unbind_inplace,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -263,6 +267,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         sub_pool_name: str,
         device: str,
         is_id_owner: bool,
+        virtual_num_pages: Optional[int] = None,
         page_size: int = 1,
         shards_under_dcp: bool = False,
         need_sort: bool = False,
@@ -328,10 +333,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ) // self.pool_page_size
         self.entry_bytes_per_page = self.entry_bytes * self.pool_page_size
 
-        # v2p / p2v sized by PAGES. Page 0 is the padding anchor; trailing row is
-        # the -1 sentinel.
+        # v2p is indexed by VIRTUAL page id, p2v by PHYSICAL page id. A
+        # non-owner consumes the owner's ids, so its v2p spans the owner's
+        # count; the two are unrelated and either can be the larger.
+        self.num_virtual_ids = (
+            self.num_pages if virtual_num_pages is None else virtual_num_pages
+        )
+        # Page 0 is the padding anchor; the trailing row is the -1 sentinel.
         self.virtual_to_physical = torch.full(
-            (self.num_pages + 1,),
+            (self.num_virtual_ids + 1,),
             -1,
             dtype=torch.int64,
             device=device,
@@ -342,8 +352,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             dtype=torch.int64,
             device=device,
         )
-        # Back-compat alias (count of virtual PAGES) consulted by is_slot_allocated.
-        self.num_virtual_ids = self.num_pages
 
         # Chain neighbours: `low_peer` toward byte 0, `high_peer` toward
         # `total_bytes`. Ends have one (`bind_peer`), float middles have both.
@@ -536,7 +544,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def is_slot_allocated(self, slot: int) -> bool:
         """Whether the PAGE containing this virtual id is in use."""
         virt_page = slot // self.page_size
-        if virt_page < 0 or virt_page >= self.num_pages:
+        if virt_page < 0 or virt_page >= self.num_virtual_ids:
             return False
         return int(self.virtual_to_physical[virt_page].item()) != -1
 
@@ -909,8 +917,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def bind(self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor) -> None:
         """Bind page-granular virtual ids to physical ids."""
         with record_function("MultiEndedAlloc.bind"):
-            self.virtual_to_physical[virtual_ids] = physical_ids
-            self.physical_to_virtual[physical_ids] = virtual_ids
+            bind_inplace(
+                virtual_ids,
+                physical_ids,
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+            )
 
     def bind_pages(
         self, virtual_pages: torch.Tensor, physical_pages: torch.Tensor
@@ -1432,26 +1444,22 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
-            with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
-                free_v_pages_raw = free_index.detach().to(torch.int64)
-                if pages is not None:
-                    # `free_segment` already derived these by stride slicing.
-                    free_v_pages = pages
-                elif self.page_size == 1:
-                    free_v_pages = free_v_pages_raw
-                else:
-                    free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-                freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # Disjoint-element scatters — no barrier (a freed v has no live reader;
-            # per-element scatter writes are atomic).
-            # `index_fill_`, NOT `t[idx] = -1`: the scalar form makes torch
-            # materialise -1 as a CPU tensor and copy it H2D, and a pageable
-            # H2D copy is host-BLOCKING -- the scheduler parks behind the
-            # in-flight forward until the stream drains (~16 ms per free on an
-            # 8192-token prefill). `index_fill_` takes the scalar through the
-            # ATen Scalar overload: one device kernel, no host sync.
-            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
-            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
+            free_v_pages_raw = free_index.detach().to(torch.int64)
+            if pages is not None:
+                # `free_segment` already derived these by stride slicing.
+                free_v_pages = pages
+            elif self.page_size == 1:
+                free_v_pages = free_v_pages_raw
+            else:
+                free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
+            # One kernel for the v2p read and both tombstones. Disjoint-element
+            # scatters need no barrier (a freed v has no live reader), and the
+            # tombstone value never crosses the host -- the scalar `t[idx] = -1`
+            # form would materialise -1 on the CPU and block the scheduler on a
+            # pageable H2D copy (~16 ms per free on an 8192-token prefill).
+            freed_p_pages = free_unbind_inplace(
+                free_v_pages, self.virtual_to_physical, self.physical_to_virtual
+            )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
@@ -3208,6 +3216,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            # swa binds the virtual pages full mints, so it must address
+            # full's whole id space.
+            virtual_num_pages=self.full_attn_allocator.num_virtual_ids,
         )
         self._wire_peers()
 
