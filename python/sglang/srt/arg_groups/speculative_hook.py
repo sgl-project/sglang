@@ -1029,13 +1029,8 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             // cfg.speculative_eagle_topk,
         )
     if cfg.speculative_ngram_external_corpus_path is not None:
-        uses_legacy_allocation = (
-            cfg.speculative_ngram_global_tree_mode == "disabled"
-        )
-        if (
-            uses_legacy_allocation
-            and cfg.speculative_ngram_external_sam_budget <= 0
-        ):
+        uses_legacy_allocation = cfg.speculative_ngram_global_tree_mode == "disabled"
+        if uses_legacy_allocation and cfg.speculative_ngram_external_sam_budget <= 0:
             raise ValueError(
                 "--speculative-ngram-external-sam-budget must be positive when "
                 "--speculative-ngram-external-corpus-path is set and global tree "

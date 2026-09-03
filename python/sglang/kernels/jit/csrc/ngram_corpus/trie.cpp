@@ -204,8 +204,7 @@ std::vector<TrieAnchor> Trie::getExpandableAnchors_(const MatchState& state) con
   return result;
 }
 
-std::vector<TrieAnchor> Trie::match(
-    const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
+std::vector<TrieAnchor> Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
   const bool has_forward_progress = total_len >= state.processed_total_len;
   const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
   const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
@@ -265,9 +264,7 @@ Result Trie::buildRecency(
   for (const auto& anchor : anchors) {
     std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
     queue.push(
-        {root,
-         (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth,
-         anchor.state});
+        {root, (max_match_depth - anchor.matched_length) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
     while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
       auto front = queue.front();
       queue.pop();
