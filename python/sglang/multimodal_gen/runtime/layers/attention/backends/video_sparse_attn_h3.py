@@ -29,6 +29,7 @@ from typing import Any
 
 import torch
 
+from sglang.kernels.ops.diffusion import can_use_vsa_block_sparse_sm100
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -278,6 +279,8 @@ class _Workspace:
     """Per-geometry scratch: tiled q/k/v(/gate) [3|4, H, S_pad, D], pooled fp32
     tile means [3, H, n_tiles, D], and the kernel index lists (prefix rows and
     prefix columns are static; only the top-k video columns change per layer).
+    The native kernel pairs query tiles, so the tile axis is padded to an even
+    count with one empty tile.
     """
 
     def __init__(
@@ -290,9 +293,11 @@ class _Workspace:
         device: torch.device,
     ) -> None:
         n_tiles = meta.num_tiles
-        seq_pad = n_tiles * VSA_H3_TILE_ELEMS
+        self.native = can_use_vsa_block_sparse_sm100(device.index, dtype, head_dim)
+        n_alloc = n_tiles + (n_tiles % 2 if self.native else 0)
+        seq_pad = n_alloc * VSA_H3_TILE_ELEMS
         self.key = _workspace_key(meta, heads, head_dim, has_gate, dtype, device)
-        self.tiled = torch.empty(
+        self.tiled = torch.zeros(
             (3 + int(has_gate), heads, seq_pad, head_dim), dtype=dtype, device=device
         )
         self.pooled = torch.empty(
@@ -301,11 +306,15 @@ class _Workspace:
         self.out_tiled = torch.empty(
             (heads, seq_pad, head_dim), dtype=dtype, device=device
         )
+        self.block_sizes = torch.zeros(n_alloc, dtype=torch.int32, device=device)
+        self.block_sizes[:n_tiles] = meta.variable_block_sizes
         all_tiles = torch.arange(n_tiles, dtype=torch.int32, device=device)
-        self.dense_index = all_tiles.repeat(heads, n_tiles, 1)
-        self.dense_num = torch.full(
-            (heads, n_tiles), n_tiles, dtype=torch.int32, device=device
+        self.dense_index = torch.zeros(
+            (heads, n_alloc, n_tiles), dtype=torch.int32, device=device
         )
+        self.dense_index[:, :n_tiles] = all_tiles
+        self.dense_num = torch.zeros((heads, n_alloc), dtype=torch.int32, device=device)
+        self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()
 
@@ -513,8 +522,9 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             ws.tiled[2:3],
             q2k_index[None],
             q2k_num[None],
-            meta.variable_block_sizes,
+            ws.block_sizes,
             out=ws.out_tiled[None],
+            native=ws.native,
         )
 
         out_compress = None
