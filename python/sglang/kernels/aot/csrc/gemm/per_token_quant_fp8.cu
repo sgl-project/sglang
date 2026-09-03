@@ -209,7 +209,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
   __syncthreads();
 
-  const float scale_inv = 1.0f / scale;
+  const float scale_inv = scale == 0.0f ? 0.0f : 1.0f / scale;
 
   // Quantize using vectorized loads
   for (int32_t i = tid; i < num_vec_elems; i += block_dim) {
@@ -342,7 +342,7 @@ __global__ void prepare_moe_input_and_quant_fp8_shuffled_kernel(
   }
   __syncthreads();
 
-  const float scale_inv = 1.0f / scale;
+  const float scale_inv = scale == 0.0f ? 0.0f : 1.0f / scale;
   for (int32_t i = tid; i < num_vec_elems; i += blockDim.x) {
     vec_t input_vec;
     input_vec.cast_load(token_input + i * kVecSize);
