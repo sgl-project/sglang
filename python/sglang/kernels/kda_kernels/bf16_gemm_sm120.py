@@ -253,18 +253,32 @@ def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
     # n>=8192 check stays first, so the (48,11008,4096)=1.26x winner
     # keeps (48,128); (48,32) remains for K>=8192 with N not 96-divisible
     # and as the K%128!=0 tile_k=64 fallback.
-    # The k>=8192 / n<=6144 rows additionally get 2-way split-K: 128 thin
-    # (48,32) CTAs leaves 42/170 SMs idle, and each CTA's K-duplicated B
-    # stream is too long to hide, so halving the K range per CTA and
-    # doubling the grid to 256 CTAs (2 per output tile along K) fills the
-    # SM count and halves the per-CTA stream. The fp32 partials are summed
-    # by a tiny second-pass reduction (see run_bf16_gemm_sm120).
+    # Split-K is permanently disabled (measured a net loss on every M=48
+    # small-N large-K shape; see run_bf16_gemm_sm120), so the k>=8192
+    # small-N rows stay on the plain (48,32) single-pass tile.
     # (48,32) also stays the K%128!=0 tile_k=64 fallback in
     # run_bf16_gemm_sm120.
+    # PERF pass 9: big-N routing is K-sensitive. The 12-warp (48,128) fat
+    # stream pays a fixed prologue/epilogue overhead (12-warp pipeline
+    # barrier setup, 22.5KB stage TMA, wide epilogue) that only amortizes
+    # over a long k-loop: (48,12288,4096)=1.24 / (48,11008,4096)=1.26 win
+    # at K=4096, but (48,9216,2560) dropped to 0.83 on the same tile --
+    # K=2560 is only 40 64-wide k-tiles, so the overhead dominates.
+    # Short-K big-N rows (n>=8192, k<4096) now take (48,96): still a
+    # 12-warp fat stream but with a lighter per-warp footprint
+    # (MMA_N=3, 16x24 fp32 acc) and tile_k=128, so each CTA moves 2x the
+    # B bytes per k-step with fewer, deeper stages -- 96 CTAs on N=9216,
+    # 1.34x the (48,128) CTA count. The K>=4096 big-N winners keep
+    # (48,128).
     if m > 32:
-        if n >= 8192 and n % 128 == 0:
-            return (48, 128)
-        if n % 96 == 0:
+        if n >= 8192:
+            if k >= 4096 and n % 128 == 0:
+                return (48, 128)
+            if n % 96 == 0:
+                return (48, 96)
+            if n % 128 == 0:
+                return (48, 128)
+        elif n % 96 == 0:
             return (48, 96)
         if k >= 8192:
             return (48, 32)
@@ -1468,27 +1482,16 @@ def run_bf16_gemm_sm120(
         # benchmark set for exactly this case.
         tile_key = (48, 32) if rows > 32 else _tile_key_for_m(rows)
     tile_m, tile_n = tile_key
-    # 2-way split-K for the K-long / small-N M=48 rows (the (48,32) bucket
-    # above, gated by _tile_key_for_shape to n<=6144 / k>=8192). Each of the
-    # two grid.z CTAs computes half the K range into a fp32 workspace slab
-    # (a true fp32 accumulator, not a rounded bf16 partial), then the
-    # elementwise reduction sums both slabs (+ optional bias) and casts to
-    # bf16. The gate also requires K % (2 * tile_k) == 0 so both halves have
-    # the same integer k-tile count.
-    # DISABLED (measured regression): on (48,4096,11008) split-K ran 54.2us
-    # (0.625x) vs 48.2us (0.703x) for the plain (48,32) tile -- the SIMT fp32
-    # epilogue + extra fp32 reduction pass costs more than the 2x CTA
-    # parallelism gains. Gate forced off so all shapes route to the plain
-    # tile path; the split-K code below is kept but unreachable in case we
-    # revisit.
-    split_k = (
-        False
-        and rows > 32
-        and tile_key == (48, 32)
-        and k >= 8192
-        and n <= 6144
-        and k % (2 * tile_k) == 0
-    )
+    # Split-K is PERMANENTLY DISABLED: measured a net loss on every M=48
+    # small-N large-K shape tried on SM120. (48,2560,9216): 0.74x with
+    # split-K vs 0.81x plain; (48,4096,11008): 0.625x vs 0.703x. The SIMT
+    # fp32 epilogue (direct global-store, no TMA) plus the extra fp32
+    # reduction pass always costs more than the occupancy gain from the
+    # doubled grid. The code path (_run_bf16_gemm_sm120_split_k) is kept
+    # for reference but is unreachable; the small-N large-K rows
+    # ((48,2560,9216)=0.81, (48,4096,12288)=0.79) stay on the plain
+    # (48,32) tile, which is the best single-pass option measured.
+    split_k = False
     device_index = x.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
