@@ -2206,6 +2206,7 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens=paged_kernel_lens,
                         paged_kernel_lens_sum=paged_kernel_lens_sum,
                         translator=translator,
+                        sliding_window=use_swa_source,
                         kv_start_idx=kv_start_idx,
                     )
                 )
@@ -2216,6 +2217,7 @@ class FlashInferIndicesUpdaterPrefill:
                         paged_kernel_lens=paged_kernel_lens,
                         paged_kernel_lens_sum=paged_kernel_lens_sum,
                         translator=translator,
+                        sliding_window=use_swa_source,
                     )
                 )
 
