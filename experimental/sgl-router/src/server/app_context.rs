@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::buckets::BucketSelector;
 use crate::policies::engine_load::EngineLoadTable;
 use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
@@ -20,6 +21,8 @@ pub struct AppContext {
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
+    /// Converts static Bucket configuration into request candidate domains.
+    pub bucket_selector: Arc<BucketSelector>,
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub active_load: Arc<ActiveLoadRegistry>,
@@ -30,7 +33,7 @@ pub struct AppContext {
     pub metrics: Arc<MetricsRegistry>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
     pub engine_load: Arc<EngineLoadTable>,
-    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
@@ -76,12 +79,14 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
+        let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         Self {
             config,
             tokenizers,
             proxy,
             registry,
             policies,
+            bucket_selector,
             active_load,
             metrics,
             prefix_index: None,
@@ -135,6 +140,7 @@ impl AppContext {
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
+            bucket_selector: Arc::new(BucketSelector::new(None)),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
