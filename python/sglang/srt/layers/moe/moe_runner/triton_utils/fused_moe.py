@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -38,7 +38,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -54,7 +53,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
-_use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
@@ -701,9 +699,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert (
-                _is_cuda or _is_hip or _is_xpu
-            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            assert _is_cuda or _is_hip or _is_xpu, (
+                "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            )
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -711,9 +709,9 @@ def _fused_moe_kernel_sequence(
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
             else:
-                assert (
-                    _is_cuda or _is_xpu
-                ), "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                assert _is_cuda or _is_xpu, (
+                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
@@ -999,9 +997,9 @@ def fused_experts_impl(
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
-        assert (
-            hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), "Hidden size mismatch"
+        assert hidden_states.shape[1] == w1.shape[2] - padded_size, (
+            "Hidden size mismatch"
+        )
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -1133,7 +1131,7 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    if _use_sgl_xpu:
+    if _is_xpu and not get_moe_runner_backend().is_triton():
         topk_weight, topk_ids, _ = topk_output
         from sgl_kernel import fused_experts as sgl_fused_experts
 

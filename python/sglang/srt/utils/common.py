@@ -65,6 +65,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -100,7 +101,10 @@ from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
+    get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
@@ -352,10 +356,6 @@ def xpu_has_xmx_support():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
-
-
-def use_intel_xpu_backend():
-    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -1053,6 +1053,18 @@ def is_gfx942_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
@@ -1160,29 +1172,13 @@ def get_device_sm_nvidia_smi():
 
 
 @contextmanager
-def maybe_reindex_device_id(gpu_id: int):
-
-    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+def maybe_reindex_device_id(gpu_id: int) -> Iterator[int]:
+    if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         yield gpu_id
         return
 
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
-
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
-
-    yield 0
-
-    if original_cuda_visible_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+    with current_platform.reindex_device_id(gpu_id) as reindexed_device_id:
+        yield reindexed_device_id
 
 
 cached_device_index = -1
@@ -1435,7 +1431,6 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 class LayerFn(Protocol):
-
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
@@ -1792,6 +1787,14 @@ class ImageData:
     content_hash: Optional[str] = None
 
 
+GLM_MEDIA_CONFIG_KEYS = (
+    "fps",
+    "max_frames",
+    "max_tokens_per_frame",
+    "max_image_tokens",
+)
+
+
 @dataclass
 class VideoData:
     url: str
@@ -1800,6 +1803,44 @@ class VideoData:
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
+
+
+def smart_to_rgb(
+    image: Union[torch.Tensor, Image.Image],
+) -> Union[torch.Tensor, Image.Image]:
+    if not isinstance(image, Image.Image):
+        return image
+
+    if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        image = image.convert("RGBA")
+        width, height = image.size
+        edge_pixels = []
+
+        for x in range(0, width, max(1, width // 20)):
+            for y in (0, height - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        for y in range(0, height, max(1, height // 20)):
+            for x in (0, width - 1):
+                pixel = image.getpixel((x, y))
+                if pixel[3] > 128:
+                    edge_pixels.append(pixel[:3])
+
+        if edge_pixels:
+            avg_brightness = sum(sum(pixel) for pixel in edge_pixels) / (
+                len(edge_pixels) * 3
+            )
+            background_color = (32, 32, 32) if avg_brightness > 128 else (240, 240, 240)
+        else:
+            background_color = (255, 255, 255)
+
+        background = Image.new("RGB", image.size, background_color)
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+
+    return image.convert("RGB")
 
 
 def is_jpeg_with_cuda(
@@ -1858,7 +1899,20 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    return Image.open(BytesIO(image_bytes))
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return _fully_load_pil_image(image)
+
+
+def _fully_load_pil_image(image: Image.Image) -> Image.Image:
+    """Force PIL's lazy decode while malformed input is still request-local."""
+    try:
+        image.load()
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+    return image
 
 
 def load_image(
@@ -1875,7 +1929,7 @@ def load_image(
     image = None
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
-        image = image_file
+        image = _fully_load_pil_image(image_file)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
         image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
@@ -2145,7 +2199,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.17")
+        min_version: Minimum version required (e.g., "0.6.18")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -2219,14 +2273,17 @@ def kill_process_tree(
     parent_pid,
     include_parent: bool = True,
     skip_pid: int = None,
-    wait_timeout: Optional[float] = None,
+    wait_timeout: Optional[float] = 60,
 ):
     """Kill the process and all its child processes.
 
     `wait_timeout` (seconds) blocks until every killed process is reaped and
-    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
-    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
-    for itself -- use `include_parent=False` if child reap must finish first.
+    raises `RuntimeError` on timeout. SIGKILL only queues the teardown, so
+    returning without waiting leaves the GPU context, the pinned host memory
+    and the ports held for seconds; pass `None` only where blocking is
+    unacceptable, such as a `__del__`. The `parent_pid == os.getpid()` branch
+    calls `sys.exit(0)` and cannot wait for itself -- use
+    `include_parent=False` if child reap must finish first.
     """
     logger.info(
         f"kill_process_tree called: parent_pid={parent_pid}, "
@@ -2239,10 +2296,10 @@ def kill_process_tree(
 
     try:
         itself = psutil.Process(parent_pid)
+        children = itself.children(recursive=True)
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
     killed = []
     for child in children:
         if child.pid == skip_pid:
@@ -2337,6 +2394,8 @@ def configure_logger(server_args, prefix: str = ""):
     maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
     format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
+        # Runs before publish, and for multimodal_gen's ServerArgs, which
+        # never publishes these bags -- so the record, not the bag.
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -2400,7 +2459,9 @@ def broadcast_pyobj(
     device = torch.device(
         "cuda"
         if torch.cuda.is_available() and not force_cpu_device
-        else "musa" if is_musa() and not force_cpu_device else "cpu"
+        else "musa"
+        if is_musa() and not force_cpu_device
+        else "cpu"
     )
 
     if rank == src:
@@ -2675,9 +2736,9 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (
-        init_method is None
-    ), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -3197,13 +3258,13 @@ class UvicornAccessLogFilter(logging.Filter):
 def set_uvicorn_logging_configs(server_args=None):
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = (
+        "[%(asctime)s] %(levelprefix)s %(message)s"
+    )
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = (
+        '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    )
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
     _configure_uvicorn_access_log_filter(LOGGING_CONFIG, server_args)
@@ -3689,8 +3750,6 @@ def dispose_tensor(x: torch.Tensor):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return
 
-    from sglang.srt.runtime_context import get_flags
-
     if get_flags().capture.disable_dispose_tensor:
         return
 
@@ -3724,11 +3783,10 @@ def require_mlp_tp_gather():
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_exec, get_parallel
 
     # elastic-EP scale-up rewrites dp_size on the published config
-    if get_parallel().config.enable_dp_attention:
-        assert get_parallel().config.dp_size > 1, "dp_size must be greater than 1"
+    if get_parallel().enable_dp_attention:
+        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,
@@ -3737,10 +3795,10 @@ def require_mlp_tp_gather():
             if elastic_expanded_world_enabled():
                 return True
         if (
-            get_parallel().config.moe_dense_tp_size is None
+            get_parallel().moe_dense_tp_size is None
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not get_parallel().config.enable_dp_lm_head:
+        elif not get_parallel().enable_dp_lm_head:
             return True
         elif get_moe_a2a_backend().is_none():
             return True
@@ -3754,10 +3812,23 @@ def require_mlp_tp_gather():
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
+        elif get_moe_a2a_backend().is_mori() and get_bool_env_var(
+            "SGLANG_MORI_RECV_BOUND", "false"
+        ):
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
         else:
             return (
-                get_parallel().config.moe_dense_tp_size
-                > get_parallel().config.tp_size // get_parallel().config.dp_size
+                get_parallel().moe_dense_tp_size
+                > get_parallel().tp_size // get_parallel().dp_size
             )
     else:
         return False
@@ -3771,19 +3842,18 @@ def require_attn_tp_gather():
     # and do not consume the upstream gathered_buffer. Without this, the
     # cuda graph runner pads num_tokens to attn_tp_size, which can cause
     # autotuners to pick suboptimal kernel variants at small batches.
-    from sglang.srt.runtime_context import get_parallel
 
-    if get_parallel().config.disable_attn_tp_gather:
+    if get_parallel().disable_attn_tp_gather:
         return False
 
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if (
         not get_moe_a2a_backend().is_none()
-        or get_parallel().config.moe_dense_tp_size is not None
+        or get_parallel().moe_dense_tp_size is not None
     ):
-        if get_parallel().config.enable_dp_attention:
-            return get_parallel().config.dp_size < get_parallel().config.tp_size
+        if get_parallel().enable_dp_attention:
+            return get_parallel().dp_size < get_parallel().tp_size
         else:
             return True
     else:
@@ -3795,9 +3865,8 @@ def require_gathered_buffer():
 
 
 def require_mlp_sync():
-    from sglang.srt.runtime_context import get_parallel
 
-    return get_parallel().config.enable_dp_attention or require_gathered_buffer()
+    return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
 def get_cuda_graph_batch_size_alignment() -> int:
@@ -3896,9 +3965,9 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), (
+            "len(weight_names) should be equal to len(transpose_dims)"
+        )
 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
@@ -4038,7 +4107,7 @@ def configure_gc_logger():
             logger.info(
                 f"GC end: Time {time.time()} | Generation {gen} | "
                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f'{"(LONG GC)" if duration > 0.1 else ""}'
+                f"{'(LONG GC)' if duration > 0.1 else ''}"
             )
 
     gc.callbacks.append(gc_callback)
@@ -4118,9 +4187,9 @@ def get_physical_cpus_by_numa():
     for cpu, core, socket, node in cpu_info:
         key = (core, socket)
         if key not in physical_by_node[node]:
-            physical_by_node[node][
-                key
-            ] = cpu  # pick first CPU seen for that physical core
+            physical_by_node[node][key] = (
+                cpu  # pick first CPU seen for that physical core
+            )
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
@@ -4509,9 +4578,9 @@ class CachedKernel:
 
         # Check that no parameters have default values
         for name, param in self.signature.parameters.items():
-            assert (
-                param.default is inspect.Parameter.empty
-            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            assert param.default is inspect.Parameter.empty, (
+                f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            )
 
         functools.update_wrapper(self, original_fn)
         self.kernel_cache = {}
@@ -4524,9 +4593,9 @@ class CachedKernel:
         Index with grid to get a launcher function.
         Returns a launcher that will handle caching based on the key function.
         """
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Grid must be a tuple with at most 3 dimensions."
+        assert isinstance(grid, tuple) and len(grid) <= 3, (
+            "Grid must be a tuple with at most 3 dimensions."
+        )
 
         # Normalize grid once
         if len(grid) < 3:
@@ -4631,7 +4700,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     resolution's answers.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_model, get_spec
 
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()

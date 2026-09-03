@@ -120,6 +120,22 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             1,
             "dflash",
         ),
+        (
+            DenseAttentionCase(
+                name="runner_dflash_verify_swa_window_edges",
+                backend="flashinfer",
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                # Straddle the window: one request below, one at, one above.
+                prefix_lens=(1, 4, 9),
+                extend_lens=(3, 3, 3),
+                sliding_window_size=4,
+            ),
+            1,
+            "dflash",
+        ),
     )
     SPEC_VERIFY_CUDA_GRAPH_CASES = (
         (

@@ -99,7 +99,6 @@ def _ref_sparse_attn_decode(
     f"flash_mla_with_kvcache_cpu : {_IMPORT_ERROR}",
 )
 class TestFlashMLAWithKVCacheCPU(CustomTestCase):
-
     def setUp(self):
         torch.manual_seed(1234)
 

@@ -221,7 +221,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         ).to_tcp()
 
     send_sockets: List[zmq.Socket] = []
-    for rank in range(1, get_parallel().config.tp_size):
+    for rank in range(1, get_parallel().tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)

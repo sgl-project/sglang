@@ -141,7 +141,6 @@ def make_mxfp4_weights(e, out_dim, in_dim, dtype, with_bias=False):
 
 
 class TestFusedExperts:
-
     def test_unsupported_activation_is_rejected(self):
         m, n, k, e, topk = 2, 32, 32, 4, 2
         a = torch.randn((m, k), dtype=dtype) / 10

@@ -1,12 +1,16 @@
-import itertools
-import unittest
+import sys
+from types import SimpleNamespace
 
+import pytest
 import sgl_kernel  # noqa: F401
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    CPUFP8KVCacheMethod,
+)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=14, suite="base-b-test-cpu")
 
@@ -31,8 +35,6 @@ def _random_tensor(shape, dtype):
         return torch.randint(0, 256, shape, dtype=torch.uint8, device=DEVICE)
     return torch.randn(shape, dtype=dtype, device=DEVICE)
 
-
-torch.manual_seed(42)
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -103,144 +105,111 @@ def make_test_data(
     return buf, loc, k_nope, k_rope, scale_k_nope
 
 
-class TestStoreCache(CustomTestCase):
-    def _test_store_cache(self, batch_size, num_heads, head_dim, dtype):
-        shape = (batch_size, num_heads, head_dim)
-        cache_shape = (CACHE_SIZE, num_heads, head_dim)
-        k = _random_tensor(shape, dtype)
-        v = _random_tensor(shape, dtype)
-        k_cache = _random_tensor(cache_shape, dtype)
-        v_cache = _random_tensor(cache_shape, dtype)
-        indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[
-            :batch_size
-        ]
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads", [1, 8, 16, 32])
+@pytest.mark.parametrize("batch_size", [1, 7, 133])
+def test_store_cache(batch_size, num_heads, head_dim, dtype):
+    shape = (batch_size, num_heads, head_dim)
+    cache_shape = (CACHE_SIZE, num_heads, head_dim)
+    k = _random_tensor(shape, dtype)
+    v = _random_tensor(shape, dtype)
+    k_cache = _random_tensor(cache_shape, dtype)
+    v_cache = _random_tensor(cache_shape, dtype)
+    indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[:batch_size]
 
-        k_cache_ref = k_cache.clone()
-        v_cache_ref = v_cache.clone()
-        k_cache_ref[indices] = k
-        v_cache_ref[indices] = v
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    k_cache_ref[indices] = k
+    v_cache_ref[indices] = v
 
-        _store_cache_cpu(k, v, k_cache, v_cache, indices)
+    _store_cache_cpu(k, v, k_cache, v_cache, indices)
 
-        assert torch.equal(k_cache, k_cache_ref)
-        assert torch.equal(v_cache, v_cache_ref)
-
-    def test_store_cache(self):
-        dtype = DTYPES
-        head_dim = [64, 128]
-        num_heads = [1, 8, 16, 32]
-        batch_size = [1, 7, 133]
-        for params in itertools.product(batch_size, num_heads, head_dim, dtype):
-            with self.subTest(
-                batch_size=params[0],
-                num_heads=params[1],
-                head_dim=params[2],
-                dtype=params[3],
-            ):
-                self._test_store_cache(*params)
-
-    def _test_store_cache_int32_indices(self, batch_size, num_heads, head_dim, dtype):
-        shape = (batch_size, num_heads, head_dim)
-        cache_shape = (CACHE_SIZE, num_heads, head_dim)
-        k = _random_tensor(shape, dtype)
-        v = _random_tensor(shape, dtype)
-        k_cache = _random_tensor(cache_shape, dtype)
-        v_cache = _random_tensor(cache_shape, dtype)
-        indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[
-            :batch_size
-        ].to(torch.int32)
-
-        k_cache_ref = k_cache.clone()
-        v_cache_ref = v_cache.clone()
-        k_cache_ref[indices.long()] = k
-        v_cache_ref[indices.long()] = v
-
-        _store_cache_cpu(k, v, k_cache, v_cache, indices)
-
-        assert torch.equal(k_cache, k_cache_ref)
-        assert torch.equal(v_cache, v_cache_ref)
-
-    def test_store_cache_int32_indices(self):
-        dtype = DTYPES
-        head_dim = [64, 128]
-        num_heads = [1, 8]
-        batch_size = [11]
-        for params in itertools.product(batch_size, num_heads, head_dim, dtype):
-            with self.subTest(
-                batch_size=params[0],
-                num_heads=params[1],
-                head_dim=params[2],
-                dtype=params[3],
-            ):
-                self._test_store_cache_int32_indices(*params)
+    assert torch.equal(k_cache, k_cache_ref)
+    assert torch.equal(v_cache, v_cache_ref)
 
 
-class TestSetKAndS(CustomTestCase):
-    num_pages_list = [4, 16]
-    page_size_list = [1, 16]
-    num_tokens_list = [1, 7, 32]
+@pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads", [1, 8])
+@pytest.mark.parametrize("batch_size", [11])
+def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
+    shape = (batch_size, num_heads, head_dim)
+    cache_shape = (CACHE_SIZE, num_heads, head_dim)
+    k = _random_tensor(shape, dtype)
+    v = _random_tensor(shape, dtype)
+    k_cache = _random_tensor(cache_shape, dtype)
+    v_cache = _random_tensor(cache_shape, dtype)
+    indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[
+        :batch_size
+    ].to(torch.int32)
 
-    def _test_set_k_and_s(self, num_pages, page_size, num_tokens):
-        max_tokens = num_pages * page_size
-        if num_tokens > max_tokens:
-            num_tokens = max_tokens
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    k_cache_ref[indices.long()] = k
+    v_cache_ref[indices.long()] = v
 
-        buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(
-            num_pages, page_size, num_tokens
-        )
+    _store_cache_cpu(k, v, k_cache, v_cache, indices)
 
-        # Reference
-        buf_ref = buf.clone()
-        _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, page_size)
+    assert torch.equal(k_cache, k_cache_ref)
+    assert torch.equal(v_cache, v_cache_ref)
 
-        # C++ kernel
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_and_s_cpu(
-            buf_test, loc, k_nope, k_rope, scale_k_nope, page_size
-        )
 
-        torch.testing.assert_close(buf_ref, buf_test)
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_pages", [4, 16])
+def test_set_k_and_s(num_pages, page_size, num_tokens):
+    num_tokens = min(num_tokens, num_pages * page_size)
 
-    def test_set_k_and_s(self):
-        for params in itertools.product(
-            self.num_pages_list, self.page_size_list, self.num_tokens_list
-        ):
-            with self.subTest(
-                num_pages=params[0], page_size=params[1], num_tokens=params[2]
-            ):
-                self._test_set_k_and_s(*params)
+    buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(
+        num_pages, page_size, num_tokens
+    )
 
-    def test_set_k_and_s_int32_loc(self):
-        """Test with int32 loc tensor."""
-        buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(8, 16, 20)
-        loc_i32 = loc.to(torch.int32)
+    # Reference
+    buf_ref = buf.clone()
+    _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, page_size)
 
-        buf_ref = buf.clone()
-        _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, 16)
+    # C++ kernel
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_and_s_cpu(
+        buf_test, loc, k_nope, k_rope, scale_k_nope, page_size
+    )
 
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_and_s_cpu(
-            buf_test, loc_i32, k_nope, k_rope, scale_k_nope, 16
-        )
+    torch.testing.assert_close(buf_ref, buf_test)
 
-        torch.testing.assert_close(buf_ref, buf_test)
 
-    def test_set_k_and_s_large(self):
-        """Larger stress test."""
-        num_pages, page_size, num_tokens = 64, 16, 512
-        buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(
-            num_pages, page_size, num_tokens
-        )
+def test_set_k_and_s_int32_loc():
+    """Test with int32 loc tensor."""
+    buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(8, 16, 20)
+    loc_i32 = loc.to(torch.int32)
 
-        buf_ref = buf.clone()
-        _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, page_size)
+    buf_ref = buf.clone()
+    _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, 16)
 
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_and_s_cpu(
-            buf_test, loc, k_nope, k_rope, scale_k_nope, page_size
-        )
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_and_s_cpu(
+        buf_test, loc_i32, k_nope, k_rope, scale_k_nope, 16
+    )
 
-        torch.testing.assert_close(buf_ref, buf_test)
+    torch.testing.assert_close(buf_ref, buf_test)
+
+
+def test_set_k_and_s_large():
+    """Larger stress test."""
+    num_pages, page_size, num_tokens = 64, 16, 512
+    buf, loc, k_nope, k_rope, scale_k_nope = make_test_data(
+        num_pages, page_size, num_tokens
+    )
+
+    buf_ref = buf.clone()
+    _set_k_and_s_torch(buf_ref, loc, k_nope, k_rope, scale_k_nope, page_size)
+
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_and_s_cpu(
+        buf_test, loc, k_nope, k_rope, scale_k_nope, page_size
+    )
+
+    torch.testing.assert_close(buf_ref, buf_test)
 
 
 # ===========================================================================
@@ -276,82 +245,71 @@ def quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16):
     return k_nope_fp8, k_rope_bf16.contiguous(), scale_k_nope_ue8m0
 
 
-class TestQuantToNopeFp8RopeBf16Pack(CustomTestCase):
-    num_tokens_list = [1, 7, 32, 128, 512]
+@pytest.mark.parametrize("num_tokens", [1, 7, 32, 128, 512])
+def test_quant_various_sizes(num_tokens):
+    k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
 
-    def _test_quant(self, num_tokens):
-        k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
+    ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+    cpp_nope, cpp_rope, cpp_scale = (
+        torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+    )
 
-        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
-        cpp_nope, cpp_rope, cpp_scale = (
-            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
-        )
+    torch.testing.assert_close(ref_rope, cpp_rope)
+    torch.testing.assert_close(ref_scale, cpp_scale)
+    torch.testing.assert_close(ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8))
 
-        torch.testing.assert_close(ref_rope, cpp_rope)
-        torch.testing.assert_close(ref_scale, cpp_scale)
-        torch.testing.assert_close(
-            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
-        )
 
-    def test_quant_various_sizes(self):
-        for num_tokens in self.num_tokens_list:
-            with self.subTest(num_tokens=num_tokens):
-                self._test_quant(num_tokens)
+def test_quant_small_values():
+    """Test with very small values that exercise the EPS clamp."""
+    k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 1e-6
+    ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+    cpp_nope, cpp_rope, cpp_scale = (
+        torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+    )
+    torch.testing.assert_close(ref_rope, cpp_rope)
+    torch.testing.assert_close(ref_scale, cpp_scale)
+    torch.testing.assert_close(ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8))
 
-    def test_quant_small_values(self):
-        """Test with very small values that exercise the EPS clamp."""
-        k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 1e-6
-        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
-        cpp_nope, cpp_rope, cpp_scale = (
-            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
-        )
-        torch.testing.assert_close(ref_rope, cpp_rope)
-        torch.testing.assert_close(ref_scale, cpp_scale)
-        torch.testing.assert_close(
-            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
-        )
 
-    def test_quant_large_values(self):
-        """Test with large values."""
-        k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 100.0
-        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
-        cpp_nope, cpp_rope, cpp_scale = (
-            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
-        )
-        torch.testing.assert_close(ref_rope, cpp_rope)
-        torch.testing.assert_close(ref_scale, cpp_scale)
-        torch.testing.assert_close(
-            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
-        )
+def test_quant_large_values():
+    """Test with large values."""
+    k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 100.0
+    ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+    cpp_nope, cpp_rope, cpp_scale = (
+        torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+    )
+    torch.testing.assert_close(ref_rope, cpp_rope)
+    torch.testing.assert_close(ref_scale, cpp_scale)
+    torch.testing.assert_close(ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8))
 
-    def test_quant_zeros(self):
-        """Test with zero input."""
-        k_bf16 = torch.zeros(8, 512, dtype=torch.bfloat16)
-        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
-        cpp_nope, cpp_rope, cpp_scale = (
-            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
-        )
-        torch.testing.assert_close(ref_rope, cpp_rope)
-        torch.testing.assert_close(ref_scale, cpp_scale)
-        torch.testing.assert_close(
-            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
-        )
 
-    def test_output_shapes_and_dtypes(self):
-        """Verify output shapes and dtypes."""
-        num_tokens = 16
-        k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
-        cpp_nope, cpp_rope, cpp_scale = (
-            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
-        )
+def test_quant_zeros():
+    """Test with zero input."""
+    k_bf16 = torch.zeros(8, 512, dtype=torch.bfloat16)
+    ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+    cpp_nope, cpp_rope, cpp_scale = (
+        torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+    )
+    torch.testing.assert_close(ref_rope, cpp_rope)
+    torch.testing.assert_close(ref_scale, cpp_scale)
+    torch.testing.assert_close(ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8))
 
-        self.assertEqual(cpp_nope.shape, (num_tokens, 448))
-        self.assertEqual(cpp_rope.shape, (num_tokens, 64))
-        self.assertEqual(cpp_scale.shape, (num_tokens, 7))
 
-        self.assertEqual(cpp_nope.dtype, fp8_dtype)
-        self.assertEqual(cpp_rope.dtype, torch.bfloat16)
-        self.assertEqual(cpp_scale.dtype, torch.uint8)
+def test_output_shapes_and_dtypes():
+    """Verify output shapes and dtypes."""
+    num_tokens = 16
+    k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
+    cpp_nope, cpp_rope, cpp_scale = (
+        torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+    )
+
+    assert cpp_nope.shape == (num_tokens, 448)
+    assert cpp_rope.shape == (num_tokens, 64)
+    assert cpp_scale.shape == (num_tokens, 7)
+
+    assert cpp_nope.dtype == fp8_dtype
+    assert cpp_rope.dtype == torch.bfloat16
+    assert cpp_scale.dtype == torch.uint8
 
 
 # ===========================================================================
@@ -396,66 +354,53 @@ def make_set_k_test_data(num_pages, page_size, num_tokens, index_head_dim=128):
     return buf, loc, index_k
 
 
-class TestSetK(CustomTestCase):
-    num_pages_list = [4, 16]
-    page_size_list = [1, 16, 64]
-    num_tokens_list = [1, 7, 32]
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("page_size", [1, 16, 64])
+@pytest.mark.parametrize("num_pages", [4, 16])
+def test_set_k(num_pages, page_size, num_tokens, index_head_dim=128):
+    num_tokens = min(num_tokens, num_pages * page_size)
 
-    def _test_set_k(self, num_pages, page_size, num_tokens, index_head_dim=128):
-        max_tokens = num_pages * page_size
-        if num_tokens > max_tokens:
-            num_tokens = max_tokens
+    buf, loc, index_k = make_set_k_test_data(
+        num_pages, page_size, num_tokens, index_head_dim
+    )
 
-        buf, loc, index_k = make_set_k_test_data(
-            num_pages, page_size, num_tokens, index_head_dim
-        )
+    # Reference
+    buf_ref = buf.clone()
+    _set_k_torch(buf_ref, loc, index_k, page_size, index_head_dim)
 
-        # Reference
-        buf_ref = buf.clone()
-        _set_k_torch(buf_ref, loc, index_k, page_size, index_head_dim)
+    # C++ kernel
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_cpu(buf_test, loc, index_k, page_size, index_head_dim)
 
-        # C++ kernel
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_cpu(
-            buf_test, loc, index_k, page_size, index_head_dim
-        )
+    torch.testing.assert_close(buf_ref, buf_test)
 
-        torch.testing.assert_close(buf_ref, buf_test)
 
-    def test_set_k(self):
-        for params in itertools.product(
-            self.num_pages_list, self.page_size_list, self.num_tokens_list
-        ):
-            with self.subTest(
-                num_pages=params[0], page_size=params[1], num_tokens=params[2]
-            ):
-                self._test_set_k(*params)
+def test_set_k_int32_loc():
+    """Test with int32 loc tensor."""
+    buf, loc, index_k = make_set_k_test_data(8, 64, 20)
+    loc_i32 = loc.to(torch.int32)
 
-    def test_set_k_int32_loc(self):
-        """Test with int32 loc tensor."""
-        buf, loc, index_k = make_set_k_test_data(8, 64, 20)
-        loc_i32 = loc.to(torch.int32)
+    buf_ref = buf.clone()
+    _set_k_torch(buf_ref, loc, index_k, 64, 128)
 
-        buf_ref = buf.clone()
-        _set_k_torch(buf_ref, loc, index_k, 64, 128)
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_cpu(buf_test, loc_i32, index_k, 64, 128)
 
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_cpu(buf_test, loc_i32, index_k, 64, 128)
+    torch.testing.assert_close(buf_ref, buf_test)
 
-        torch.testing.assert_close(buf_ref, buf_test)
 
-    def test_set_k_large(self):
-        """Larger stress test."""
-        num_pages, page_size, num_tokens = 64, 64, 2048
-        buf, loc, index_k = make_set_k_test_data(num_pages, page_size, num_tokens)
+def test_set_k_large():
+    """Larger stress test."""
+    num_pages, page_size, num_tokens = 64, 64, 2048
+    buf, loc, index_k = make_set_k_test_data(num_pages, page_size, num_tokens)
 
-        buf_ref = buf.clone()
-        _set_k_torch(buf_ref, loc, index_k, page_size, 128)
+    buf_ref = buf.clone()
+    _set_k_torch(buf_ref, loc, index_k, page_size, 128)
 
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_k_cpu(buf_test, loc, index_k, page_size, 128)
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_k_cpu(buf_test, loc, index_k, page_size, 128)
 
-        torch.testing.assert_close(buf_ref, buf_test)
+    torch.testing.assert_close(buf_ref, buf_test)
 
 
 # ===========================================================================
@@ -500,85 +445,159 @@ def make_set_s_test_data(num_pages, page_size, num_tokens, index_head_dim=128):
     return buf, loc, index_k_scale
 
 
-class TestSetS(CustomTestCase):
-    num_pages_list = [4, 16]
-    page_size_list = [1, 16, 64]
-    num_tokens_list = [1, 7, 32]
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("page_size", [1, 16, 64])
+@pytest.mark.parametrize("num_pages", [4, 16])
+def test_set_s(num_pages, page_size, num_tokens, index_head_dim=128):
+    num_tokens = min(num_tokens, num_pages * page_size)
 
-    def _test_set_s(self, num_pages, page_size, num_tokens, index_head_dim=128):
-        max_tokens = num_pages * page_size
-        if num_tokens > max_tokens:
-            num_tokens = max_tokens
+    buf, loc, index_k_scale = make_set_s_test_data(
+        num_pages, page_size, num_tokens, index_head_dim
+    )
 
-        buf, loc, index_k_scale = make_set_s_test_data(
-            num_pages, page_size, num_tokens, index_head_dim
+    # Reference
+    buf_ref = buf.clone()
+    _set_s_torch(buf_ref, loc, index_k_scale, page_size, index_head_dim)
+
+    # C++ kernel
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_s_cpu(
+        buf_test, loc, index_k_scale, page_size, index_head_dim
+    )
+
+    torch.testing.assert_close(buf_ref, buf_test)
+
+
+def test_set_s_int32_loc():
+    """Test with int32 loc tensor."""
+    buf, loc, index_k_scale = make_set_s_test_data(8, 64, 20)
+    loc_i32 = loc.to(torch.int32)
+
+    buf_ref = buf.clone()
+    _set_s_torch(buf_ref, loc, index_k_scale, 64, 128)
+
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_s_cpu(buf_test, loc_i32, index_k_scale, 64, 128)
+
+    torch.testing.assert_close(buf_ref, buf_test)
+
+
+def test_set_s_large():
+    """Larger stress test."""
+    num_pages, page_size, num_tokens = 64, 64, 2048
+    buf, loc, index_k_scale = make_set_s_test_data(num_pages, page_size, num_tokens)
+
+    buf_ref = buf.clone()
+    _set_s_torch(buf_ref, loc, index_k_scale, page_size, 128)
+
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_s_cpu(buf_test, loc, index_k_scale, page_size, 128)
+
+    torch.testing.assert_close(buf_ref, buf_test)
+
+
+def test_set_s_2d_scale():
+    """Test with 2D scale tensor (num_tokens, 1)."""
+    num_pages, page_size, num_tokens = 8, 64, 20
+    buf_numel_per_page = page_size * 128 + page_size * 4
+    buf = torch.zeros(num_pages, buf_numel_per_page, dtype=torch.uint8)
+    total_slots = num_pages * page_size
+    perm = torch.randperm(total_slots)[:num_tokens]
+    loc = perm.to(torch.int64)
+    index_k_scale = torch.randn(num_tokens, 1, dtype=torch.float32)
+
+    buf_ref = buf.clone()
+    _set_s_torch(buf_ref, loc, index_k_scale.squeeze(1), page_size, 128)
+
+    buf_test = buf.clone()
+    torch.ops.sgl_kernel.set_s_cpu(buf_test, loc, index_k_scale, page_size, 128)
+
+    torch.testing.assert_close(buf_ref, buf_test)
+
+
+@pytest.mark.parametrize(
+    ("k_scale", "v_scale"),
+    [(None, None), (0.5, 0.25)],
+    ids=["unit-scale-default", "non-unit-static-scale"],
+)
+def test_mha_fp8_e4m3_pool_decode_numerics(k_scale, v_scale):
+    seq_len = 16
+    num_heads = 2
+    head_dim = 64
+    num_kv_splits = 8
+    sm_scale = head_dim**-0.5
+    pool = MHATokenToKVPool(
+        size=seq_len,
+        page_size=1,
+        dtype=torch.float8_e4m3fn,
+        head_num=num_heads,
+        head_dim=head_dim,
+        layer_num=1,
+        device=DEVICE,
+        enable_memory_saver=False,
+        quant_method=CPUFP8KVCacheMethod(),
+    )
+    layer = SimpleNamespace(layer_id=0)
+    loc = torch.arange(seq_len, dtype=torch.int64, device=DEVICE)
+    cache_k = torch.randn(
+        (seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+    )
+    cache_v = torch.randn(
+        (seq_len, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE
+    )
+    pool.set_kv_buffer(layer, loc, cache_k, cache_v, k_scale=k_scale, v_scale=v_scale)
+
+    effective_k_scale = 1.0 if k_scale is None else k_scale
+    effective_v_scale = 1.0 if v_scale is None else v_scale
+    k_dequant = (pool.get_key_buffer(0).float() * effective_k_scale).to(torch.bfloat16)
+    v_dequant = (pool.get_value_buffer(0).float() * effective_v_scale).to(
+        torch.bfloat16
+    )
+    query = torch.randn((1, num_heads, head_dim), dtype=torch.bfloat16, device=DEVICE)
+    output = torch.empty_like(query)
+    req_to_token = loc.to(torch.int32).unsqueeze(0)
+    req_pool_indices = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+    seq_lens = torch.full((1,), seq_len, dtype=torch.int64, device=DEVICE)
+    attn_logits = torch.empty(
+        (1, num_heads, num_kv_splits, head_dim + 1),
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+
+    torch.ops.sgl_kernel.decode_attention_cpu(
+        query,
+        pool.get_key_buffer(0),
+        pool.get_value_buffer(0),
+        effective_k_scale,
+        effective_v_scale,
+        output,
+        None,
+        None,
+        None,
+        attn_logits,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        sm_scale,
+        0.0,
+        False,
+        0,
+        None,
+        None,
+    )
+
+    output_ref = (
+        torch.nn.functional.scaled_dot_product_attention(
+            query.movedim(0, 1).unsqueeze(0),
+            k_dequant[:seq_len].movedim(0, 1).unsqueeze(0),
+            v_dequant[:seq_len].movedim(0, 1).unsqueeze(0),
+            scale=sm_scale,
         )
-
-        # Reference
-        buf_ref = buf.clone()
-        _set_s_torch(buf_ref, loc, index_k_scale, page_size, index_head_dim)
-
-        # C++ kernel
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_s_cpu(
-            buf_test, loc, index_k_scale, page_size, index_head_dim
-        )
-
-        torch.testing.assert_close(buf_ref, buf_test)
-
-    def test_set_s(self):
-        for params in itertools.product(
-            self.num_pages_list, self.page_size_list, self.num_tokens_list
-        ):
-            with self.subTest(
-                num_pages=params[0], page_size=params[1], num_tokens=params[2]
-            ):
-                self._test_set_s(*params)
-
-    def test_set_s_int32_loc(self):
-        """Test with int32 loc tensor."""
-        buf, loc, index_k_scale = make_set_s_test_data(8, 64, 20)
-        loc_i32 = loc.to(torch.int32)
-
-        buf_ref = buf.clone()
-        _set_s_torch(buf_ref, loc, index_k_scale, 64, 128)
-
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_s_cpu(buf_test, loc_i32, index_k_scale, 64, 128)
-
-        torch.testing.assert_close(buf_ref, buf_test)
-
-    def test_set_s_large(self):
-        """Larger stress test."""
-        num_pages, page_size, num_tokens = 64, 64, 2048
-        buf, loc, index_k_scale = make_set_s_test_data(num_pages, page_size, num_tokens)
-
-        buf_ref = buf.clone()
-        _set_s_torch(buf_ref, loc, index_k_scale, page_size, 128)
-
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_s_cpu(buf_test, loc, index_k_scale, page_size, 128)
-
-        torch.testing.assert_close(buf_ref, buf_test)
-
-    def test_set_s_2d_scale(self):
-        """Test with 2D scale tensor (num_tokens, 1)."""
-        num_pages, page_size, num_tokens = 8, 64, 20
-        buf_numel_per_page = page_size * 128 + page_size * 4
-        buf = torch.zeros(num_pages, buf_numel_per_page, dtype=torch.uint8)
-        total_slots = num_pages * page_size
-        perm = torch.randperm(total_slots)[:num_tokens]
-        loc = perm.to(torch.int64)
-        index_k_scale = torch.randn(num_tokens, 1, dtype=torch.float32)
-
-        buf_ref = buf.clone()
-        _set_s_torch(buf_ref, loc, index_k_scale.squeeze(1), page_size, 128)
-
-        buf_test = buf.clone()
-        torch.ops.sgl_kernel.set_s_cpu(buf_test, loc, index_k_scale, page_size, 128)
-
-        torch.testing.assert_close(buf_ref, buf_test)
+        .squeeze(0)
+        .movedim(1, 0)
+    )
+    torch.testing.assert_close(output, output_ref, atol=3e-2, rtol=1e-6)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

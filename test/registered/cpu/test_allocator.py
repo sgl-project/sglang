@@ -65,7 +65,7 @@ def alloc_extend_kernel_pytorch(
             pages = free_pages[new_page_start + page_indices]
             out_indices[
                 output_start + num_part1 : output_start + num_part1 + num_part2
-            ] = (pages * page_size + in_page_offsets)
+            ] = pages * page_size + in_page_offsets
 
         if pre_len + num_part1 + num_part2 == seq_len:
             continue
@@ -75,13 +75,11 @@ def alloc_extend_kernel_pytorch(
             start_page = free_pages[new_page_start + num_new_pages_self - 1].item()
             offsets = torch.arange(num_part3, device=out_indices.device)
             out_indices[
-                output_start
-                + num_part1
-                + num_part2 : output_start
+                output_start + num_part1 + num_part2 : output_start
                 + num_part1
                 + num_part2
                 + num_part3
-            ] = (start_page * page_size + offsets)
+            ] = start_page * page_size + offsets
 
 
 def alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out_indices, page_size):

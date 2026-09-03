@@ -99,7 +99,6 @@ _is_npu = is_npu()
 
 
 class DeepseekModelNextN(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -366,7 +365,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

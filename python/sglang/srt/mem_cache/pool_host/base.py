@@ -45,7 +45,7 @@ def ranks_per_host() -> int:
         return 1
     if world_group.world_size == 1:
         return 1
-    return max(world_group.world_size // get_parallel().config.nnodes, 1)
+    return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
 def host_memory_budget_bytes() -> int:
@@ -386,9 +386,9 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.logical_page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.logical_page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 

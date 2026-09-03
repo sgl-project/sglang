@@ -139,7 +139,6 @@ def compress_decode_ref(
 
 
 class TestCompressDecodeKernel(CustomTestCase):
-
     def _make_inputs(
         self, bs, ratio, head_dim, rope_head_dim, overlap, max_reqs=4, max_seq=256
     ):

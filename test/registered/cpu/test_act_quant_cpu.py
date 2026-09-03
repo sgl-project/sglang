@@ -30,9 +30,9 @@ def act_quant_pytorch(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert (
-        x.size(-1) % block_size == 0
-    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    assert x.size(-1) % block_size == 0, (
+        f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    )
 
     # FP8 e4m3fn constants
     fp8_max = 448.0
