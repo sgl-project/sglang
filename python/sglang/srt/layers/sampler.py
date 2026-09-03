@@ -356,9 +356,9 @@ class Sampler(nn.Module):
         else:
             backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
-                assert (
-                    sampling_info.sampling_seed is None
-                ), "Sampling seed is not supported for flashinfer backend"
+                assert sampling_info.sampling_seed is None, (
+                    "Sampling seed is not supported for flashinfer backend"
+                )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -574,9 +574,9 @@ class Sampler(nn.Module):
         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
         Requires sampling_seed to be set in sampling_info.
         """
-        assert (
-            sampling_info.sampling_seed is not None
-        ), "sampling_seed is required for sampling from logprobs"
+        assert sampling_info.sampling_seed is not None, (
+            "sampling_seed is required for sampling from logprobs"
+        )
         sampled_index = multinomial_with_seed(
             logprobs, sampling_info.sampling_seed, positions
         )
@@ -604,9 +604,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
-            assert (
-                self.use_ascend_backend
-            ), "Only ascend backend supports sampling from logits"
+            assert self.use_ascend_backend, (
+                "Only ascend backend supports sampling from logits"
+            )
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
@@ -744,9 +744,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
+        assert sampling_seed is None, (
+            "With sampling seed, multinomial_with_seed will provide wrong results"
+        )
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 

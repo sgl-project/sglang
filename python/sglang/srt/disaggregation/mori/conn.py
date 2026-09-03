@@ -1807,7 +1807,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,

@@ -113,9 +113,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         if hasattr(base_layer, "tp_size") and base_layer.tp_size > 1:
             from sglang.srt.layers.communicator import get_attn_tp_context
 
-            assert (
-                not get_attn_tp_context().allow_input_scattered
-            ), "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
+            assert not get_attn_tp_context().allow_input_scattered, (
+                "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
+            )
         offsets = [0, self.embed_dim]
         self.output_offset = torch.tensor(
             offsets,

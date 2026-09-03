@@ -496,9 +496,9 @@ def draft_extend_set_metadata(
     row tails keep stale values that attention kernels never read past
     cache_seqlens, matching the eager replay path's bounded writes.
     """
-    assert (
-        page_size > 0 and (page_size & (page_size - 1)) == 0
-    ), f"page_size must be a power of two, got {page_size}"
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
+        f"page_size must be a power of two, got {page_size}"
+    )
 
     batch_size = cache_seqlens_int32.shape[0]
     max_seq_pages = page_table.shape[1]
@@ -588,9 +588,9 @@ def normal_decode_set_metadata(
     page_table / swa_page_table row is (re)written; the tail keeps stale values
     across CUDA-graph replays, so consumers must bound reads by cache_seqlens.
     """
-    assert (
-        page_size > 0 and (page_size & (page_size - 1)) == 0
-    ), f"page_size must be a power of two, got {page_size}"
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
+        f"page_size must be a power of two, got {page_size}"
+    )
 
     batch_size = cache_seqlens_int32.shape[0]
     device = seq_lens.device
