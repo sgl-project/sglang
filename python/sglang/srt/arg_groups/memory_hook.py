@@ -254,13 +254,6 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             # skip the graph/activation reserve; keep only the floor + parallel slack.
             reserved_mem = 1536
             reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
-            if is_vlm:
-                reserved_mem += 8 * 1024
-            mem_fraction_static = (
-                round((gpu_mem - reserved_mem) / gpu_mem, 3)
-                if gpu_mem is not None
-                else 0.95
-            )
         else:
             # Tokens the activation working set scales with (per serving mode).
             if cfg.disaggregation_mode == "decode":
@@ -284,17 +277,20 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
 
-            mem_fraction_static = (
-                round((gpu_mem - reserved_mem) / gpu_mem, 3)
-                if gpu_mem is not None
-                else 0.88
-            )
+        mem_fraction_static = (
+            round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            if gpu_mem is not None
+            else 0.95
+        )
 
-            # Multimodal models need more memory for the image processing.
-            if is_vlm:
-                mem_fraction_static = adjust_mem_fraction_for_vlm(
-                    mem_fraction_static, model_config
-                )
+        # Multimodal models need more memory for the image processing.
+        if is_vlm:
+            mem_fraction_static = adjust_mem_fraction_for_vlm(
+                mem_fraction_static,
+                model_config,
+                post_capture_kv_sizing,
+                gpu_mem,
+            )
 
         declare_resolution(
             server_args,
@@ -374,7 +370,19 @@ def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
     return 0.0
 
 
-def adjust_mem_fraction_for_vlm(mem_fraction_static: float, model_config) -> float:
+def adjust_mem_fraction_for_vlm(
+    mem_fraction_static: float,
+    model_config,
+    post_capture_kv_sizing: bool,
+    gpu_mem,
+) -> float:
+    if post_capture_kv_sizing:
+        return (
+            mem_fraction_static - 8 * 1024 / gpu_mem
+            if gpu_mem is not None
+            else mem_fraction_static
+        )
+
     vision_config = getattr(model_config.hf_config, "vision_config", None)
     if vision_config is None:
         return mem_fraction_static
