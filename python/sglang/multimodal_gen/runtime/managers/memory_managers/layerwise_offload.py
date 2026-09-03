@@ -353,8 +353,9 @@ _MADV_PAGEOUT = 21  # Linux 5.4+: reclaim the pages now
 
 _MADV_POPULATE_READ = 22  # Linux 5.14+: fault the range in, in one sequential pass
 # Streamed layers faulted in concurrently on a cold pass. One sequential
-# stream gets ~1 GiB/s from a GB10's NVMe; six over different layers, ~3 GiB/s.
-MAPPED_POPULATE_AHEAD = 6
+# stream gets ~1 GiB/s from a GB10's NVMe. Within one checkpoint shard six
+# streams measured 1.7 GiB/s and twelve 3.0 GiB/s, so the pool runs twelve.
+MAPPED_POPULATE_AHEAD = 12
 
 
 def populate_mapped_source(tensors) -> int:
@@ -1439,8 +1440,8 @@ class LayerwiseOffloadManager:
                         # On the pass that may find pages cold, keep the drive
                         # saturated several layers ahead from parallel threads:
                         # one sequential stream idles the NVMe at ~1 GiB/s
-                        # while a layer is staged and computed; six streams
-                        # over different layers measured ~3 GiB/s on a GB10.
+                        # while a layer is staged and computed; twelve streams
+                        # within one shard measured ~3 GiB/s on a GB10.
                         self._populate_ahead(layer_idx)
 
         # create gpu buffer and load from CPU buffer
