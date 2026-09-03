@@ -269,9 +269,9 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
         import re
 
         coord_pattern = r"\[\[[\d\s,]+\]\]"
-        assert re.search(
-            coord_pattern, text
-        ), f"OCR text: {text}, should contain coordinate format [[x1, y1, x2, y2]]"
+        assert re.search(coord_pattern, text), (
+            f"OCR text: {text}, should contain coordinate format [[x1, y1, x2, y2]]"
+        )
 
         # Verify basic response fields
         assert response.id
