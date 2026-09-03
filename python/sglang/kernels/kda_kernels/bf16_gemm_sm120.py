@@ -115,9 +115,10 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # tile_n=64 stream across 2 N-warps (MMA_N=4 each) and caps the grid at
 # N/64 CTAs, which on N=4096 is only 64 CTAs / 170 SMs = 38% util in a
 # single wave and left (48,4096,11008) at 0.51x vs F.linear. (48,32) with
-# (3,1,1) sends the whole tile_n=32 B-stream to every warp (MMA_N=4 each,
-# same per-warp ldmatrix traffic) and doubles the grid to 128 CTAs (75%
-# util, 2 CTAs per L2 slice on the K-duplicated weight stream). The smem
+# (1,4,1) splits the tile_n=32 B-stream across 4 N-warps (MMA_N=1 each,
+# 4/3x the (3,1,1) per-CTA B-stream ldmatrix issue rate) and doubles the
+# grid to 128 CTAs (75% util, 2 CTAs per L2 slice on the K-duplicated
+# weight stream). The smem
 # stage shrinks to (48+32)*64*2 = 10KB, so raw_ab_stage stays >= 5 and the
 # pipeline depth is unchanged. The swap is gated on N/K size in
 # _tile_key_for_shape so the small-N M=48 wins (48,4096,4096)=0.93x and
@@ -131,7 +132,7 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # (16/32,*) buckets keep tile_k=64 (they are already >=1.10x), and (48,32)
 # keeps tile_k=64 so it stays in every M=48 benchmark row as the
 # non-tile_k fallback if K is not 128-divisible. k_loop_unroll follows
-# tile_k: the 64-wide 3-6-warp tiles go 2->4 to deepen the software
+# tile_k: the 64-wide 2-6-warp tiles go 2->4 to deepen the software
 # pipeline, while the 2-warp (16,64) bucket keeps 2 (its accumulator/ldmx
 # budget would spill at 4).
 # PERF pass 5: the M=48 rows are still 0.92-0.97x (K=4096) / 0.70x
@@ -167,12 +168,29 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # therefore per-shape in _tile_key_for_shape: large N -> (48,128),
 # large K / small N -> (48,32), otherwise (48,64). The (48,128) tile and
 # its 128-reg/thread fix stay for the large-N rows.
+# PERF pass 7: the (48,32) large-K bucket is re-warped (3,1,1) 3w ->
+# (1,4,1) 4w, the same all-warp-N-split pattern the (32,64) M<=32 bucket
+# proves fastest. The old (3,1,1) split M across 3 warps (MMA_M=1,
+# MMA_N=4, 16x32 acc), so all 3 warps consumed the SAME 32 B columns per
+# k-step: the per-CTA B stream was capped by a 3-warp ldmatrix issue rate
+# on a weight-stream-bound loop, which is why (48,4096,11008) sat at
+# 0.70x. The (1,4,1) layout splits tile_n=32 across 4 N-warps instead
+# (MMA_M=3, MMA_N=1): each warp now owns a DISTINCT 8-wide B column
+# slice, so the per-CTA B-stream ldmatrix issue rate rises 4/3x while the
+# fp32 accumulator per warp is UNCHANGED (48x32/128 threads = 16x32 = 32
+# regs/warp -- the extra M iterations reuse the same B fragment against 3
+# A-row fragments, +8 regs). The grid is unchanged (128 CTAs on N=4096),
+# the 10KB smem stage and >=5 pipeline depth are unchanged, and 4 warps
+# keep the 232-reg ldmatrix multi-buffering budget (128 threads; the
+# 128-reg fix is only needed at >=12 warps). mma.sync is warp-local, so
+# the (3,1,1)->(1,4,1) atom swap is a pure reschedule with identical
+# fp32 math and epilogue coverage.
 _TILE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, int, int], tuple, int]] = {
     (16, 64): ((16, 64, 64), (1, 2, 1), 2),
     (16, 128): ((16, 128, 64), (1, 4, 1), 4),
     (32, 64): ((32, 64, 64), (1, 4, 1), 4),
     (48, 64): ((48, 64, 128), (3, 2, 1), 6),
-    (48, 32): ((48, 32, 64), (3, 1, 1), 3),
+    (48, 32): ((48, 32, 64), (1, 4, 1), 4),
     (48, 128): ((48, 128, 64), (3, 4, 1), 12),
 }
 
@@ -286,7 +304,7 @@ class _Bf16GemmSm120Kernel:
         self.load_path = "tma"
         # Software-pipeline depth for the steady-state k loop. The tile_k=128
         # bucket has num_k_blocks=8 per stage, so its in-stage stream already
-        # hides smem latency at unroll 2; the tile_k=64 buckets with 3-6 MMA
+        # hides smem latency at unroll 2; the tile_k=64 buckets with 2-6 MMA
         # warps get unroll 4 (the 2-warp (16,64) tile would spill its
         # 232-reg budget there).
         self.k_loop_unroll = 2 if self.tile_shape_mnk[2] == 128 else 4
