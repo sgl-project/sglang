@@ -7,6 +7,7 @@ from sglang.srt.distributed.device_communicators.symm_mem_kernels.allgather_gemm
     maybe_fused_ag_shared_experts,
 )
 from sglang.srt.distributed.device_communicators.symm_mem_kernels.moe_reduce_rs_symm_mem import (
+    MOE_RS_CHUNK_WIDTH,
     MoEReduceRSSymmMemContext,
     create_moe_rs_symm_mem_context,
     maybe_fused_shared_add_rs,
@@ -15,6 +16,7 @@ from sglang.srt.distributed.device_communicators.symm_mem_kernels.moe_reduce_rs_
 
 __all__ = [
     "AllGatherGemmContextSymmMem",
+    "MOE_RS_CHUNK_WIDTH",
     "MoEReduceRSSymmMemContext",
     "allgather_gemm_op_symm_mem",
     "create_allgather_gemm_context_symm_mem",

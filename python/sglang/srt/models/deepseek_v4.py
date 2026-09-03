@@ -107,6 +107,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    dsa_prefill_cp_fused_symm_mem_eligible,
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -480,14 +481,6 @@ def _freqs_cis_to_cos_sin(
     sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
     _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
     return cos, sin
-
-
-def _cp_fused_symm_mem_enabled() -> bool:
-    """True when CP AG/RS should be handled by torch_symm_mem fused kernels."""
-    return (
-        envs.SGLANG_OPT_USE_TORCH_SYMM_MEM_FUSED_KERNEL.get()
-        and not get_is_capture_mode()
-    )
 
 
 def _apply_gguf_grouped_wo_a(
@@ -2312,10 +2305,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                if (
-                    not _cp_fused_symm_mem_enabled()
-                    or not self.mlp.experts.moe_runner_config.inplace
-                ):
+                # use_cp_fused_symm_mem is set only when the fused path
+                # really runs, so the skip sees what the kernels saw.
+                _comm = get_tp_group().torch_symm_mem_comm
+                if _comm is None or not _comm.use_cp_fused_symm_mem:
                     hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert (
@@ -2355,8 +2348,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            if not _cp_fused_symm_mem_enabled():
+            _comm = get_tp_group().torch_symm_mem_comm
+            if _comm is None or not _comm.use_cp_fused_symm_mem:
                 hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            else:
+                # Experts emitted unreduced [M, topk, H]; a 3D tensor here
+                # means fused RS fell back after that, which nothing repairs.
+                assert hidden_states.dim() == 2, (
+                    "fused CP RS fell back after no_topk_reduce expert output; "
+                    "add the missing condition to "
+                    "dsa_prefill_cp_fused_symm_mem_eligible"
+                )
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -3130,10 +3132,15 @@ class DeepseekV4Model(nn.Module):
                 input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
             # Set LAST in prep: anything that can raise stays before set, so
-            # the try below covers the whole use_cp window.
+            # the try below covers the whole use_cp_fused_symm_mem window.
             _comm = get_tp_group().torch_symm_mem_comm
-            if _comm is not None and _cp_fused_symm_mem_enabled():
-                _comm.set_use_cp(True)
+            if dsa_prefill_cp_fused_symm_mem_eligible(
+                self.layers[self.start_layer].mlp,
+                forward_batch,
+                hidden_states,
+                _comm,
+            ):
+                _comm.set_use_cp_fused_symm_mem(True)
 
         try:
             # Reset Compressor's per-step freqs_cis cache from any previous step.
@@ -3186,7 +3193,7 @@ class DeepseekV4Model(nn.Module):
         finally:
             _comm = get_tp_group().torch_symm_mem_comm
             if _comm is not None:
-                _comm.set_use_cp(False)
+                _comm.set_use_cp_fused_symm_mem(False)
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if (
             self.pp_group.is_last_rank

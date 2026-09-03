@@ -300,7 +300,9 @@ def fused_experts(
     comm = (
         get_tp_group().torch_symm_mem_comm if model_parallel_is_initialized() else None
     )
-    fused_topk_reduce_rs = comm is not None and comm.use_cp
+    fused_topk_reduce_rs = (
+        comm is not None and not comm.disabled and comm.use_cp_fused_symm_mem
+    )
     if fused_topk_reduce_rs:
         return outplace_fused_experts(
             hidden_states,

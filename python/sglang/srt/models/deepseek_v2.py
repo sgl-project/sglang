@@ -867,6 +867,14 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        # Fused CP AG/RS eligibility, used by the gate
+        # dsa_prefill_cp_fused_symm_mem_eligible.
+        self.cp_fused_symm_mem_eligible = (
+            self.num_fused_shared_experts == 0
+            and not self._fuse_shared_experts_inside_sbo
+            and self.shared_experts_weight_block_size is not None
+            and self.experts.moe_runner_config.inplace
+        )
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None

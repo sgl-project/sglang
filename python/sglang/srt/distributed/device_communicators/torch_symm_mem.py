@@ -69,7 +69,8 @@ class TorchSymmMemCommunicator:
         # may still serve fused-kernel contexts (RS/AG).
         self.disabled = True
         self.allreduce_disabled = True
-        self.use_cp = False  # set True during CP-mode forward
+        # Set by the eligibility gate for one fused-CP prefill forward.
+        self.use_cp_fused_symm_mem = False
         self.buffer = None
         self.max_size = 0
         # Lazy fused-kernel contexts (cached on first use).
@@ -140,17 +141,18 @@ class TorchSymmMemCommunicator:
             return
         self.allreduce_disabled = False
 
-    def set_use_cp(self, value: bool) -> None:
-        """Set the CP mode flag for fused kernels."""
-        self.use_cp = value
+    def set_use_cp_fused_symm_mem(self, value: bool) -> None:
+        """Set the fused CP AG/RS flag for this forward."""
+        self.use_cp_fused_symm_mem = value
 
     @staticmethod
     def get_active_comm() -> "Optional[TorchSymmMemCommunicator]":
-        """Return the TP group's communicator if enabled and use_cp is active, else None."""
+        """Return the TP group's communicator if enabled and the fused CP
+        path is active, else None."""
         from sglang.srt.distributed import get_tp_group
 
         comm = get_tp_group().torch_symm_mem_comm
-        if comm is None or comm.disabled or not comm.use_cp:
+        if comm is None or comm.disabled or not comm.use_cp_fused_symm_mem:
             return None
         return comm
 
