@@ -13,8 +13,8 @@ import unittest
 from typing import NamedTuple
 from unittest.mock import patch
 
-from huggingface_hub import snapshot_download
 import requests
+from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -112,9 +112,7 @@ class TestUnoLoraPathResolution(unittest.TestCase):
                 f"{__name__}.snapshot_download", return_value="/tmp/uno-snapshot"
             ) as download,
         ):
-            self.assertEqual(
-                _resolve_uno_lora_path(), "/tmp/uno-snapshot/adapter"
-            )
+            self.assertEqual(_resolve_uno_lora_path(), "/tmp/uno-snapshot/adapter")
         download.assert_called_once_with(
             repo_id=DEFAULT_UNO_LORA_REPO,
             allow_patterns=list(UNO_ADAPTER_FILES),
