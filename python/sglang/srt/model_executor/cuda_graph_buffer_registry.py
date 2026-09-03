@@ -300,13 +300,16 @@ class CudaGraphBufferRegistry:
         max_bs: int,
         max_num_tokens: int,
         share_pool: bool = False,
+        pool_namespace: str = "",
     ) -> None:
         self.device = device
         self.max_bs = max_bs
         self.max_num_tokens = max_num_tokens
         # Coalesce allocated slot buffers through the global pool; only applies
-        # when allocating (bind/source bypasses the pool).
+        # when allocating (bind/source bypasses the pool). A namespace keeps a
+        # registry's slots from aliasing same-named slots outside it.
         self.share_pool = share_pool
+        self.pool_namespace = pool_namespace
         self._slots: Dict[str, GraphSlot] = {}
 
     # ---- registration ------------------------------------------------------
@@ -357,7 +360,12 @@ class CudaGraphBufferRegistry:
             # Coalesce with any same-named buffer (e.g. the legacy
             # DecodeInputBuffers field) so capture and replay see one
             # physical allocation with a stable data_ptr.
-            buffer = share_input_buffer(slot.name, buffer)
+            pool_name = (
+                f"{self.pool_namespace}.{slot.name}"
+                if self.pool_namespace
+                else slot.name
+            )
+            buffer = share_input_buffer(pool_name, buffer)
         if (
             slot.padding_policy
             in (PaddingPolicy.FILL_SENTINEL, PaddingPolicy.FILL_ONCE)
@@ -525,6 +533,7 @@ def build_decode_registry(
     dp_size: int = 1,
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
+    pool_namespace: str = "",
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
@@ -553,6 +562,7 @@ def build_decode_registry(
         max_bs=max_bs,
         max_num_tokens=max_num_token,
         share_pool=share_pool,
+        pool_namespace=pool_namespace,
     )
 
     def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
@@ -999,10 +1009,13 @@ def build_eager_registry(
     is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
     pads, so the sentinel tail is never read.
 
-    ``share_pool=False``: the eager forward copies the live ForwardBatch into
-    these slots, and the graph runners route capture forwards through it with
-    fields that are views of the pooled input buffers (the EAGLE draft
-    capture), so these slots must not alias that pool.
+    ``share_pool=True`` under the ``eager`` pool namespace: the target and
+    draft eager registries coalesce their (largest) allocations with each
+    other but never alias the graph runners' pooled buffers. The eager forward
+    copies the live ForwardBatch into these slots, and the graph runners route
+    capture forwards through it with fields that are views of their pooled
+    buffers (the EAGLE draft capture), so a destination slot must not alias
+    its source.
     """
     return build_decode_registry(
         device=device,
@@ -1019,6 +1032,7 @@ def build_eager_registry(
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
         dp_size=dp_size,
-        share_pool=False,
+        share_pool=True,
+        pool_namespace="eager",
         source=None,
     )

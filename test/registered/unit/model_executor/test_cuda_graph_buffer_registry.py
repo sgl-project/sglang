@@ -661,6 +661,35 @@ class TestPoolBackedAlloc(unittest.TestCase):
             r3.get_slot("ids").buffer.data_ptr(), small_first.data_ptr()
         )
 
+    def test_pool_namespace_isolates_registries(self):
+        graph = self._reg(max_num_tokens=16, share_pool=True)
+        graph.register_slot(self._ids_slot("ids"))
+        eager_a = CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_tokens=32,
+            share_pool=True,
+            pool_namespace="eager",
+        )
+        eager_a.register_slot(self._ids_slot("ids"))
+        eager_b = CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_tokens=32,
+            share_pool=True,
+            pool_namespace="eager",
+        )
+        eager_b.register_slot(self._ids_slot("ids"))
+
+        self.assertNotEqual(
+            graph.get_slot("ids").buffer.data_ptr(),
+            eager_a.get_slot("ids").buffer.data_ptr(),
+        )
+        self.assertEqual(
+            eager_a.get_slot("ids").buffer.data_ptr(),
+            eager_b.get_slot("ids").buffer.data_ptr(),
+        )
+
     def test_share_input_buffer_aliases_row_prefixes_only(self):
         from sglang.srt.model_executor import input_buffers
 
