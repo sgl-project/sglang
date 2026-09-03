@@ -39,6 +39,10 @@ class ForwardMetadata:
     # cursor for THIS decode step (gathered from the persistent per-slot
     # buffer, then advanced once for the next step). int32, length == batch.
     replayssm_write_pos: Optional[torch.Tensor] = None
+    # Bounded KDA pre-decay: logical ring base paired with write_pos. It is a
+    # graph-static per-row snapshot; the persistent per-slot cursor is advanced
+    # exactly once outside the captured model body.
+    replayssm_cache_base: Optional[torch.Tensor] = None
     # GDN ReplaySSM (slice 2b): per-decode-row int32 flush flag for THIS decode
     # step. !=0 forces the kernel to fold the partial ring + current token into
     # the checkpoint (temporal[slot]) so the radix cache reads an up-to-date
