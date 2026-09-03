@@ -17,6 +17,7 @@ from sglang.srt.layers.sampler import (
     top_p_normalize_probs_torch,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
@@ -924,44 +925,22 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 
     device = next_token_logits.device
 
-    if uniform_samples is None:
-        uniform_samples = torch.rand(
-            (bs, draft_token_num), dtype=torch.float32, device=device
+    if uniform_samples is not None and uniform_samples.shape != (bs, draft_token_num):
+        raise ValueError(
+            "uniform_samples shape mismatch. "
+            f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
         )
-    else:
-        if uniform_samples.shape != (bs, draft_token_num):
-            raise ValueError(
-                "uniform_samples shape mismatch. "
-                f"Expected {(bs, draft_token_num)}, got {tuple(uniform_samples.shape)}."
-            )
-        uniform_samples = uniform_samples.to(device=device, dtype=torch.float32)
-
-    if uniform_samples_for_final_sampling is None:
-        uniform_samples_for_final_sampling = torch.rand(
-            (bs,), dtype=torch.float32, device=device
-        )
-    else:
-        if uniform_samples_for_final_sampling.shape != (bs,):
-            raise ValueError(
-                "uniform_samples_for_final_sampling shape mismatch. "
-                f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
-            )
-        uniform_samples_for_final_sampling = uniform_samples_for_final_sampling.to(
-            device=device,
-            dtype=torch.float32,
+    if (
+        uniform_samples_for_final_sampling is not None
+        and uniform_samples_for_final_sampling.shape != (bs,)
+    ):
+        raise ValueError(
+            "uniform_samples_for_final_sampling shape mismatch. "
+            f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
         )
 
-    target_probs = build_dflash_verify_target_probs(
-        next_token_logits=next_token_logits,
-        sampling_info=sampling_info,
-        draft_token_num=draft_token_num,
-        bs=bs,
-        max_top_k=max_top_k,
-        uniform_top_k_value=uniform_top_k_value,
-        use_sparse_topk=use_sparse_topk,
-    )
-    draft_probs = torch.zeros_like(target_probs)
-
+    # Cached across steps, and `correct_len` below aliases `accept_token_num`,
+    # so these must predate the borrow scope the next replay reclaims.
     (
         retrieve_index,
         retrieve_next_token,
@@ -974,25 +953,59 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+
+    # The full-vocabulary matrices die with this step, so their bytes may come
+    # from the graph pool's idle storage. Anything outliving the scope is not.
+    with borrow_graph_pool(user="DFLASH verify probabilities"):
+        if uniform_samples is None:
+            coins = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+        else:
+            coins = uniform_samples.to(device=device, dtype=torch.float32)
+        if uniform_samples_for_final_sampling is None:
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        else:
+            coins_for_final_sampling = uniform_samples_for_final_sampling.to(
+                device=device,
+                dtype=torch.float32,
+            )
+
+        target_probs = build_dflash_verify_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            bs=bs,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            use_sparse_topk=use_sparse_topk,
+        )
+        draft_probs = torch.zeros_like(target_probs)
+        candidates_i64 = (
+            candidates
+            if candidates.dtype == torch.int64
+            else candidates.to(torch.int64)
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+        del target_probs, draft_probs, candidates_i64
+        del coins, coins_for_final_sampling
 
     correct_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)

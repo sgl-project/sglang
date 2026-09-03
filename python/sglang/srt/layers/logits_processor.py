@@ -28,6 +28,7 @@ from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
+from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -272,8 +273,8 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
-    # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
-    # EagleDraftExtendInput.select_index).
+    # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
+    # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
     @classmethod
@@ -439,6 +440,15 @@ class LogitsProcessor(nn.Module):
         if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
+        # Under LayerNorm SP the decoder loop leaves these sequence-sharded; undo
+        # that before the LM head, which must not participate.
+        hidden_states, hidden_states_before_norm = layernorm_sp.maybe_exit_gather(
+            hidden_states=hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm,
+            input_ids=input_ids,
+            forward_mode=logits_metadata.forward_mode,
+        )
+
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
@@ -529,19 +539,37 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
-            if logits_metadata.draft_extend_select_index is not None:
-                # Only next_token_logits narrows to [bs, vocab]; the
-                # FULL-capture hidden stays unpruned.
-                pruned_states = hidden_states[logits_metadata.draft_extend_select_index]
+            draft_extend_select_index = logits_metadata.draft_extend_select_index
+            if draft_extend_select_index is not None:
+                # The draft-extend graph returns LAST hidden states alongside
+                # selected logits. Build selected variants for every hidden-state
+                # representation; FULL capture below still uses the original
+                # unpruned tensors.
+                pruned_states = hidden_states[draft_extend_select_index]
+                pruned_states_before_norm = (
+                    hidden_states_before_norm[draft_extend_select_index]
+                    if hidden_states_before_norm is not None
+                    else None
+                )
             else:
                 pruned_states = hidden_states
-            pruned_states_before_norm = hidden_states_before_norm
+                pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
-                aux_pruned_states = (
-                    aux_hidden_states
-                    if isinstance(aux_hidden_states, torch.Tensor)
-                    else [hidden for hidden in aux_hidden_states]
-                )
+                if draft_extend_select_index is not None:
+                    aux_pruned_states = (
+                        aux_hidden_states[draft_extend_select_index]
+                        if isinstance(aux_hidden_states, torch.Tensor)
+                        else [
+                            hidden[draft_extend_select_index]
+                            for hidden in aux_hidden_states
+                        ]
+                    )
+                else:
+                    aux_pruned_states = (
+                        aux_hidden_states
+                        if isinstance(aux_hidden_states, torch.Tensor)
+                        else [hidden for hidden in aux_hidden_states]
+                    )
             sample_indices = None
             input_logprob_indices = None
 
@@ -1186,6 +1214,16 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     # carrying the draft model's stale ModelOpt quant_method. Only use the
     # ModelOpt lm_head kernel when the runtime quantization state matches it.
     if method_name == "ModelOptFp4LinearMethod":
+        if quant_method.quant_mode == "w4a16":
+            return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+                lm_head,
+                (
+                    "weight_scale_interleaved",
+                    "alpha",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                ),
+            )
         if lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
             lm_head,
             (

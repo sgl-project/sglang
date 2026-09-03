@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -31,6 +32,7 @@ from sglang.srt.managers.utils import (
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -43,7 +45,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -633,8 +635,11 @@ class SchedulerPPMixin:
                     origin_input_ids=input_ids,
                     sampling_params=sampling_params,
                 )
-                req.full_untruncated_fill_ids = req.origin_input_ids
-                req.logprob_start_len = -1
+                # Walk the same match -> lock -> alloc lifecycle as a scheduled
+                # request so release_kv_cache can release it symmetrically.
+                req.init_next_round_input(self.tree_cache)
+                lock = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = lock.swa_uuid_for_lock
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
@@ -723,39 +728,15 @@ class SchedulerPPMixin:
                 latencies.append(latency_ms)
 
                 # Release KV and Mamba cache
-                if req.kv.is_held:
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.kv.req_pool_idx, : req.extend_range.end
-                    ]
-                    self.token_to_kv_pool_allocator.free(kv_indices)
-                    if req.mamba_pool_idx is not None:
-                        self.req_to_token_pool.free_mamba_cache(req)
-                    self.req_to_token_pool.free(req)
-                    req.kv.mark_released()
+                if req.kv.holds_kv:
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.ps.attn_tp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
-                data_to_sync_tp = broadcast_pyobj(
-                    data_to_sync_tp,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-                seq_lens, latencies = data_to_sync_tp
-
-            if self.ps.attn_cp_size > 1:
-                data_to_sync_tp = [seq_lens, latencies]
-                data_to_sync_tp = broadcast_pyobj(
-                    data_to_sync_tp,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            seq_lens, latencies = attn_cp_tp_broadcast_pyobj([seq_lens, latencies])
 
         # Broadcast data to all ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -1000,22 +981,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        if self.ps.attn_tp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_tp_group.rank,
-                self.attn_tp_cpu_group,
-                src=self.attn_tp_group.ranks[0],
-            )
-
-        if self.ps.attn_cp_size > 1:
-            data = broadcast_pyobj(
-                data,
-                self.attn_cp_group.rank,
-                self.attn_cp_cpu_group,
-                src=self.attn_cp_group.ranks[0],
-            )
-
+        data = attn_cp_tp_broadcast_pyobj(data)
         return data
 
     def _pp_prepare_tensor_dict(

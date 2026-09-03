@@ -65,6 +65,7 @@ from typing import (
     Callable,
     Dict,
     Generic,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -1052,6 +1053,18 @@ def is_gfx942_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx1250_supported():
+    """
+    Returns whether the current platform is AMD RDNA4 (gfx1250).
+    """
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return any(gfx in gcn_arch for gfx in ["gfx1250"])
+    else:
+        return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
@@ -1159,29 +1172,13 @@ def get_device_sm_nvidia_smi():
 
 
 @contextmanager
-def maybe_reindex_device_id(gpu_id: int):
-
-    if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
+def maybe_reindex_device_id(gpu_id: int) -> Iterator[int]:
+    if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
         yield gpu_id
         return
 
-    original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
-
-    str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
-
-    logger.debug(f"Set CUDA_VISIBLE_DEVICES to {str_gpu_id}")
-
-    yield 0
-
-    if original_cuda_visible_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible_devices
-    else:
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+    with current_platform.reindex_device_id(gpu_id) as reindexed_device_id:
+        yield reindexed_device_id
 
 
 cached_device_index = -1
