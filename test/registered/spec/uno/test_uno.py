@@ -36,8 +36,7 @@ MAX_NEW_TOKENS = 128
 # AR decode and UNO verification use different kernel shapes, so compare a
 # bounded greedy prefix instead of requiring full-sequence bitwise identity.
 PARITY_TOKENS = 32
-# One LoRA draft forward plus one clean verification forward. The draft's
-# clean-root token is useful output and therefore remains in the numerator.
+# One LoRA draft forward plus one clean verification forward.
 FORWARDS_PER_UNO_CYCLE = 2
 PROMPTS = (
     (
@@ -148,31 +147,34 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(config),
             )
+            greedy_output_ids = self._run_greedy_output_ids()
             tpf = self._run_generation_contract(config)
-            return tpf, self._run_greedy_output_ids()
+            return tpf, greedy_output_ids
         finally:
             if process is not None:
                 kill_process_tree(process.pid)
 
     def _run_greedy_output_ids(self) -> list[list[int]]:
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": PROMPTS,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": PARITY_TOKENS,
-                    "ignore_eos": True,
-                },
-            },
-            timeout=120,
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-
-        results = response.json()
-        self.assertEqual(len(results), len(PROMPTS))
+        # A list-valued request can be admitted with different prefill batch
+        # shapes across server launches. Run each parity prompt at BS1 so the
+        # AR and UNO comparisons use the same execution shape.
         output_ids = []
-        for prompt, result in zip(PROMPTS, results):
+        for prompt in PROMPTS:
+            response = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": prompt,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": PARITY_TOKENS,
+                        "ignore_eos": True,
+                    },
+                },
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+            result = response.json()
             self.assertIn("output_ids", result, result)
             self.assertEqual(
                 len(result["output_ids"]),
@@ -221,7 +223,7 @@ class TestUnoCudaGraph(CustomTestCase):
                     "ignore_eos": True,
                 },
             },
-            timeout=120,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
         self.assertEqual(response.status_code, 200, response.text)
 
