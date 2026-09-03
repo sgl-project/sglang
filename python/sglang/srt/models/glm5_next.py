@@ -138,9 +138,7 @@ logger = logging.getLogger(__name__)
 def _lora_serving_enabled() -> bool:
     """True when the server serves LoRA adapters (``--enable-lora`` / ``--lora-paths``)."""
     server_args = get_server_args()
-    return bool(getattr(server_args, "enable_lora", False)) or bool(
-        getattr(server_args, "lora_paths", None)
-    )
+    return bool(server_args.enable_lora) or bool(server_args.lora_paths)
 
 
 @torch.compile
