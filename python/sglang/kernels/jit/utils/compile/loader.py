@@ -121,7 +121,7 @@ def load_jit(
             # Also the benign case where a concurrent GC unlinked the leaf
             # between the lookup and the load.
             logger.warning(
-                "Cached JIT module %s failed to load; rebuilding. " "Got error: %s",
+                "Cached JIT module %s failed to load; rebuilding. Got error: %s",
                 spec.module_name,
                 e,
             )

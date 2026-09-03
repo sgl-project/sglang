@@ -892,8 +892,7 @@ class DPDispatcher:
                     )
                     self._listener_failed = True
                     self._fail_all_pending(
-                        "encoder DP result listener stopped after repeated "
-                        "recv errors",
+                        "encoder DP result listener stopped after repeated recv errors",
                         "ResultListenerStopped",
                     )
                     return
@@ -1301,8 +1300,7 @@ async def _dp_worker_handle_request(
                 # Error envelope, not 200 + phantom count: the decoder must
                 # fail fast instead of waiting for a ZMQ ack that never comes.
                 raise MMError(
-                    f"no staged embedding for /send req_id={req_id} "
-                    f"(already released)"
+                    f"no staged embedding for /send req_id={req_id} (already released)"
                 )
             # Releasing on the first /send breaks decoder TP > 1. No count means
             # a pre-refcount decoder: stay eager rather than pin until the sweep.
