@@ -770,8 +770,7 @@ def resolve_transformer_quant_load_spec(
             )
         if server_args.nunchaku_config is not None:
             raise ValueError(
-                "Per-layer checkpoint quantization and Nunchaku are mutually "
-                "exclusive"
+                "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
     elif getattr(model_cls, "handles_checkpoint_quantization", False):
