@@ -47,6 +47,71 @@ def _kind(
     return "anonymous"
 
 
+def _anon_vmas(min_bytes: int = 128 * 1024**2) -> list[tuple[int, int, int, str]]:
+    """(start, end, anonymous_bytes, vmflags) of anonymous mappings holding at least min_bytes."""
+    out: list[tuple[int, int, int, str]] = []
+    try:
+        start = end = 0
+        path = ""
+        anon = 0
+        flags = ""
+        with open("/proc/self/smaps") as handle:
+            for line in handle:
+                if line[0] in "0123456789abcdef" and "-" in line.split()[0]:
+                    if path in ("", "[anon]") and anon >= min_bytes:
+                        out.append((start, end, anon, flags))
+                    fields = line.split()
+                    start, end = (int(x, 16) for x in fields[0].split("-"))
+                    path = fields[5] if len(fields) >= 6 else ""
+                    anon = 0
+                    flags = ""
+                elif line.startswith("Anonymous:"):
+                    anon = int(line.split()[1]) * 1024
+                elif line.startswith("VmFlags:"):
+                    flags = line.split(":", 1)[1].strip()
+        if path in ("", "[anon]") and anon >= min_bytes:
+            out.append((start, end, anon, flags))
+    except OSError:
+        pass
+    return sorted(out, key=lambda item: -item[2])
+
+
+def _mallinfo() -> dict[str, float]:
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+
+        class MallInfo2(ctypes.Structure):
+            _fields_ = [
+                (name, ctypes.c_size_t)
+                for name in (
+                    "arena",
+                    "ordblks",
+                    "smblks",
+                    "hblks",
+                    "hblkhd",
+                    "usmblks",
+                    "fsmblks",
+                    "uordblks",
+                    "fordblks",
+                    "keepcost",
+                )
+            ]
+
+        libc.mallinfo2.restype = MallInfo2
+        info = libc.mallinfo2()
+        return {
+            "glibc_arena": info.arena / GIB,
+            "glibc_mmapped": info.hblkhd / GIB,
+            "glibc_in_use": info.uordblks / GIB,
+            "glibc_free": info.fordblks / GIB,
+        }
+    except Exception:
+        return {}
+
+
 def _smaps_rollup() -> dict[str, float]:
     totals: dict[str, float] = {}
     try:
@@ -125,6 +190,34 @@ def log_host_memory_breakdown(modules: Mapping[str, object], *, label: str) -> N
             segments = snapshot()
         except Exception:
             segments = []
+        ranges = [
+            (
+                int(s.get("address", 0)),
+                int(s.get("address", 0)) + int(s.get("total_size", 0)),
+            )
+            for s in segments
+        ]
+        malloc = _mallinfo()
+        if malloc:
+            lines.append(
+                "  glibc: " + " ".join(f"{k}={v:.2f}GiB" for k, v in malloc.items())
+            )
+        host_stats = getattr(device, "host_memory_stats", None)
+        if callable(host_stats):
+            try:
+                hs = host_stats()
+                lines.append(
+                    f"  pinned host allocator: reserved={hs.get('reserved_bytes.all.current', 0) / GIB:.2f}GiB "
+                    f"allocated={hs.get('allocated_bytes.all.current', 0) / GIB:.2f}GiB"
+                )
+            except Exception:
+                pass
+        for start, end, anon, flags in _anon_vmas()[:16]:
+            inside = any(a <= start < b for a, b in ranges)
+            lines.append(
+                f"  anon vma {start:#x}-{end:#x}: {anon / GIB:.2f}GiB "
+                f"{'INSIDE cuda segment' if inside else 'outside cuda segments'} [{flags}]"
+            )
         big = sorted(
             (
                 (int(segment.get("address", 0)), int(segment.get("total_size", 0)))
