@@ -603,9 +603,7 @@ def topk_from_pooled_history_logits(
     def _pad_rows(t: torch.Tensor | None) -> torch.Tensor | None:
         if t is None or out_rows is None or out_rows == t.shape[0]:
             return t
-        padded = torch.full(
-            (out_rows, t.shape[1]), -1, dtype=t.dtype, device=t.device
-        )
+        padded = torch.full((out_rows, t.shape[1]), -1, dtype=t.dtype, device=t.device)
         padded[: t.shape[0]] = t
         return padded
 

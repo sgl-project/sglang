@@ -267,8 +267,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration
-            and self.dsa_seed_topk_width is not None
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
         )
 
     def init_token_map(self):

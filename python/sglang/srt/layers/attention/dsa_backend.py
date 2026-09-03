@@ -16,7 +16,6 @@ from typing import (
 
 import torch
 
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
@@ -46,6 +45,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
@@ -92,7 +92,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_position,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_buffer, get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_spec
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
