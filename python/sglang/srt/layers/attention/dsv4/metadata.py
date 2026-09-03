@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import is_hip, is_sm120_supported, is_xpu
+
+_IS_SM120 = is_sm120_supported()
 
 if TYPE_CHECKING:
     pass
@@ -49,6 +51,8 @@ Some other notes:
                all related length will be clipped to 512.
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
+
+_SM120_INDEXER_M_CHUNK = 4096
 
 
 def copy_metadata(
@@ -143,13 +147,26 @@ class PagedIndexerMetadata:
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+            if _IS_SM120 and _c4.shape[0] > _SM120_INDEXER_M_CHUNK:
+                # Chunk metadata is identical for every layer in the forward
+                # pass; compute the per-chunk list once here instead of per
+                # layer in the indexer.
+                self.deep_gemm_metadata = [
+                    get_paged_mqa_logits_metadata(
+                        _c4[_s : _s + _SM120_INDEXER_M_CHUNK],
+                        self.c4_page_size,
+                        deep_gemm.get_num_sms(),
+                    )
+                    for _s in range(0, _c4.shape[0], _SM120_INDEXER_M_CHUNK)
+                ]
+            else:
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
 
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
         if self.use_topk_v2:
             from sglang.kernels.ops.attention.dsv4 import plan_topk_v2

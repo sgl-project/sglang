@@ -53,6 +53,9 @@ class RecordingAllocator(BaseTokenToKVPoolAllocator):
     def available_size(self):
         return self.capacity - len(self.live)
 
+    def get_all_free_pages(self):
+        return self.free_pages
+
     def clear(self):
         self.next_slot = 1
         self.live.clear()
@@ -244,7 +247,6 @@ def test_streaming_session_release_frees_compressed_slots():
 def test_mamba_leak_diagnostic_does_not_report_reserved_slots():
     pool, _, _, allocator = make_pool_and_req(capacity=69)
     allocator.free_pages = torch.arange(6, 70, dtype=torch.int64)
-    allocator.release_pages = torch.empty(0, dtype=torch.int64)
     pool.mamba_pool = SimpleNamespace(size=1)
     pool.mamba_allocator = SimpleNamespace(
         size=1,
