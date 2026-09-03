@@ -12,6 +12,10 @@ from sglang.kernels.ops.attention.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.suffix_attention_merge import (
+    can_use_fused_suffix_attention_merge,
+    merge_suffix_attention_in_place,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
@@ -1579,14 +1583,36 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+            if (
+                use_cascade_attn
+                and forward_batch.spec_algorithm.is_uno()
+                and can_use_fused_suffix_attention_merge(
+                    layer=layer,
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    extra_kwargs=kwargs,
+                )
+            ):
+                suffix_metadata = self.forward_metadata_spec_decode_expand
+                o = merge_suffix_attention_in_place(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache=value_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    suffix_page_table=suffix_metadata.page_table,
+                    suffix_cache_seqlens=suffix_metadata.cache_seqlens_int32,
+                    prefix=o,
+                    prefix_lse=softmax_lse,
+                    softmax_scale=layer.scaling,
+                )
+            elif use_cascade_attn:
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    # Here metadata_expand.page_table is not divided with page_size.
-                    # This is because we loose the fine control of  what token to attend,
-                    # but has to attend to some block completely.
+                    # The suffix table stores physical token slots, so expose
+                    # the paged cache as page-size-one blocks.
                     k_cache=key_cache.view(-1, 1, layer.tp_k_head_num, layer.head_dim),
                     v_cache=value_cache.view(
-                        -1, 1, layer.tp_v_head_num, layer.head_dim
+                        -1, 1, layer.tp_v_head_num, layer.v_head_dim
                     ),
                     page_table=self.forward_metadata_spec_decode_expand.page_table,
                     cache_seqlens=self.forward_metadata_spec_decode_expand.cache_seqlens_int32,
