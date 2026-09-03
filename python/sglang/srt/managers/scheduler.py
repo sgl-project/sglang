@@ -285,6 +285,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
+from sglang.srt.observability.state_mapping_observer import StateMappingObserver
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
@@ -590,6 +591,7 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.init_state_mapping_observer()
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
         if self.enable_hierarchical_cache:
@@ -706,6 +708,9 @@ class Scheduler(
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()
+
+    def init_state_mapping_observer(self) -> None:
+        self.state_mapping_observer = StateMappingObserver.from_scheduler(self)
 
     def init_startup_timing_summary(self) -> None:
         self.startup_time = build_scheduler_startup_time(
@@ -4068,6 +4073,9 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if self.state_mapping_observer is not None:
+            self.state_mapping_observer.observe(batch, "pre_forward")
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
@@ -4267,6 +4275,9 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
+
+        if self.state_mapping_observer is not None:
+            self.state_mapping_observer.observe(batch, "post_forward", ret)
 
         self._maybe_report_active_ranks()
 
