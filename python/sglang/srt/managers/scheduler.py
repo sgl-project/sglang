@@ -2321,19 +2321,31 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -3688,9 +3700,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 

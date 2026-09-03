@@ -25,16 +25,20 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(6, dtype=torch.uint8).reshape(3, 2)
 
-        with patch(
-            "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
-        ) as take, patch(
-            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
-            return_value=True,
-        ), patch(
-            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
-            return_value=(x_quant, x_scale),
-            create=True,
-        ) as quantize:
+        with (
+            patch(
+                "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
+            ) as take,
+            patch(
+                "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+                return_value=(x_quant, x_scale),
+                create=True,
+            ) as quantize,
+        ):
             actual_x, packed_topk, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 64)
             )
@@ -51,19 +55,24 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(6, dtype=torch.uint8).reshape(3, 2)
 
-        with patch(
-            "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
-        ) as take, patch(
-            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
-            return_value=True,
-        ), patch.object(
-            per_token_group_quant_module,
-            "per_token_group_quant",
-            return_value=(x_quant, x_scale),
-        ) as quantize, patch(
-            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
-            create=True,
-        ) as flashinfer_quantize:
+        with (
+            patch(
+                "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
+            ) as take,
+            patch(
+                "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+                return_value=True,
+            ),
+            patch.object(
+                per_token_group_quant_module,
+                "per_token_group_quant",
+                return_value=(x_quant, x_scale),
+            ) as quantize,
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+                create=True,
+            ) as flashinfer_quantize,
+        ):
             actual_x, packed_topk, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 64)
             )
@@ -81,19 +90,22 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(6, dtype=torch.uint8).reshape(3, 2)
 
-        with patch(
-            "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
-        ), patch(
-            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
-            return_value=False,
-        ), patch.object(
-            per_token_group_quant_module,
-            "per_token_group_quant",
-            return_value=(x_quant, x_scale),
-        ) as quantize, patch(
-            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
-            create=True,
-        ) as flashinfer_quantize:
+        with (
+            patch("sglang.srt.layers.moe.route_quant_handoff.take", return_value=None),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+                return_value=False,
+            ),
+            patch.object(
+                per_token_group_quant_module,
+                "per_token_group_quant",
+                return_value=(x_quant, x_scale),
+            ) as quantize,
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+                create=True,
+            ) as flashinfer_quantize,
+        ):
             actual_x, packed_topk, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 64)
             )
@@ -111,11 +123,14 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_quant = torch.empty(3, 128, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(12, dtype=torch.uint8)
 
-        with patch(
-            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
-            return_value=(x_quant, x_scale),
-            create=True,
-        ) as quantize, patch("sglang.srt.layers.moe.route_quant_handoff.take") as take:
+        with (
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+                return_value=(x_quant, x_scale),
+                create=True,
+            ) as quantize,
+            patch("sglang.srt.layers.moe.route_quant_handoff.take") as take,
+        ):
             actual_x, packed_topk, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 128)
             )
@@ -133,13 +148,16 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_quant = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
         x_scale = torch.arange(4, dtype=torch.uint8).reshape(2, 2)
 
-        with patch(
-            "sglang.srt.layers.moe.route_quant_handoff.take",
-            return_value=(packed_topk, x_quant, x_scale),
-        ), patch(
-            "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
-            create=True,
-        ) as quantize:
+        with (
+            patch(
+                "sglang.srt.layers.moe.route_quant_handoff.take",
+                return_value=(packed_topk, x_quant, x_scale),
+            ),
+            patch(
+                "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
+                create=True,
+            ) as quantize,
+        ):
             actual_x, actual_packed, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 64)
             )

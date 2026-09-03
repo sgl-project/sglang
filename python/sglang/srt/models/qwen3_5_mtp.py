@@ -83,7 +83,6 @@ def _mtp_quant_config(quant_config):
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
-
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
