@@ -273,8 +273,8 @@ class LogitsMetadata:
 
     mm_input_embeds: Optional[torch.Tensor] = None
 
-    # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
-    # EagleDraftExtendInput.select_index).
+    # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
+    # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
     @classmethod
@@ -539,19 +539,37 @@ class LogitsProcessor(nn.Module):
             or logits_metadata.forward_mode.is_target_verify()
             or logits_metadata.forward_mode.is_draft_extend_v2()
         ):
-            if logits_metadata.draft_extend_select_index is not None:
-                # Only next_token_logits narrows to [bs, vocab]; the
-                # FULL-capture hidden stays unpruned.
-                pruned_states = hidden_states[logits_metadata.draft_extend_select_index]
+            draft_extend_select_index = logits_metadata.draft_extend_select_index
+            if draft_extend_select_index is not None:
+                # The draft-extend graph returns LAST hidden states alongside
+                # selected logits. Build selected variants for every hidden-state
+                # representation; FULL capture below still uses the original
+                # unpruned tensors.
+                pruned_states = hidden_states[draft_extend_select_index]
+                pruned_states_before_norm = (
+                    hidden_states_before_norm[draft_extend_select_index]
+                    if hidden_states_before_norm is not None
+                    else None
+                )
             else:
                 pruned_states = hidden_states
-            pruned_states_before_norm = hidden_states_before_norm
+                pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
-                aux_pruned_states = (
-                    aux_hidden_states
-                    if isinstance(aux_hidden_states, torch.Tensor)
-                    else [hidden for hidden in aux_hidden_states]
-                )
+                if draft_extend_select_index is not None:
+                    aux_pruned_states = (
+                        aux_hidden_states[draft_extend_select_index]
+                        if isinstance(aux_hidden_states, torch.Tensor)
+                        else [
+                            hidden[draft_extend_select_index]
+                            for hidden in aux_hidden_states
+                        ]
+                    )
+                else:
+                    aux_pruned_states = (
+                        aux_hidden_states
+                        if isinstance(aux_hidden_states, torch.Tensor)
+                        else [hidden for hidden in aux_hidden_states]
+                    )
             sample_indices = None
             input_logprob_indices = None
 

@@ -792,12 +792,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
                 "text_encoder",
             )
 
-    def test_model_managed_quantization_bypasses_generic_lifecycle(self):
+    def test_model_quantization_backend_bypasses_generic_lifecycle(self):
         model_config = SimpleNamespace(quant_config=None)
         with mock.patch.object(
             TextEncoder,
-            "manages_checkpoint_quantization",
-            True,
+            "checkpoint_quantization_backend",
+            "model",
         ):
             _configure_encoder_quantization(
                 model_config,
