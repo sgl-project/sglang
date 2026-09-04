@@ -66,6 +66,7 @@ def _run_tp4_parity(local_rank: int, world_size: int, master_port: int) -> None:
                 embedding_dim,
                 params_dtype=torch.bfloat16,
             )
+            source.weight_scale = None
             offloaded = Qwen4ExpPinnedHostEmbedding(source)
 
             full_weight = (
