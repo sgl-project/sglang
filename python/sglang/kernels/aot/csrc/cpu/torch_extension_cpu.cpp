@@ -451,6 +451,17 @@ at::Tensor causal_conv1d_update_cpu(
     const std::optional<at::Tensor>& conv_state_indices,
     int64_t pad_slot_id,
     bool is_vnni);
+
+at::Tensor causal_conv1d_verify_cpu(
+    const at::Tensor& x,
+    at::Tensor& conv_states,
+    const at::Tensor& conv_state_indices,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    bool is_vnni);
 #endif
 
 // conv3d fast path for patch embedding
@@ -865,6 +876,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+  // causal_conv1d_verify
+  m.def(
+      "causal_conv1d_verify_cpu(Tensor x, Tensor(a!) conv_states, Tensor conv_state_indices, Tensor weight, "
+      "Tensor? bias, bool silu_activation, Tensor(b!) intermediate_conv_window, Tensor intermediate_state_indices, "
+      "bool is_vnni) -> Tensor");
+  m.impl("causal_conv1d_verify_cpu", torch::kCPU, &causal_conv1d_verify_cpu);
 #endif
 
   // conv3d fast path for patch embedding

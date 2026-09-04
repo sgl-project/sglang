@@ -95,40 +95,31 @@ def _causal_conv1d_update_cpu_verify(
     with directly, so it has to do the arithmetic.
     """
     seq_len = mixed_qkv.size(-1)
-    width = conv_weights.size(-1)
-    cache_idx = conv_state_indices.to(torch.int64)
-    window_idx = intermediate_state_indices.to(torch.int64)
 
-    # The decode kernel appends the raw input to the state, so the state after
-    # token t is just the width-1 window of [initial_state, block] ending at t.
-    # Batching them avoids one index_put_ per token, which costs ~12us
-    # regardless of how few bytes it moves.
-    extended = torch.cat([conv_states[cache_idx], mixed_qkv], dim=-1)
-    intermediate_conv_window[window_idx, :seq_len] = extended.unfold(-1, width - 1, 1)[
-        :, :, 1:
-    ].permute(0, 2, 1, 3)
+    # gdn_backend hands over mixed_qkv.view(batch, steps, -1).transpose(1, 2),
+    # and the kernel strides over tokens that way. Anything else has to be
+    # rebuilt in that layout first. A one-token block has no token stride to
+    # match, and transposing it would not change one either.
+    if mixed_qkv.stride(-2) != 1 or (
+        seq_len > 1 and mixed_qkv.stride(-1) != mixed_qkv.size(-2)
+    ):
+        mixed_qkv = mixed_qkv.transpose(-1, -2).contiguous().transpose(-1, -2)
 
-    # Roll a scratch copy so the real pool only sees the final state.
-    scratch = conv_states[cache_idx].contiguous()
-    step_state_indices = torch.arange(
-        cache_idx.numel(), dtype=torch.int32, device=mixed_qkv.device
+    # The rolling window the decode kernel keeps in registers already spans the
+    # whole block, so one dispatch replays it: only the first token reaches back
+    # into the incoming state. The kernel also writes the per-token snapshots
+    # and commits the final state.
+    result = torch.ops.sgl_kernel.causal_conv1d_verify_cpu(
+        mixed_qkv,
+        conv_states,
+        conv_state_indices,
+        conv_weights,
+        bias,
+        activation in ("silu", "swish"),
+        intermediate_conv_window,
+        intermediate_state_indices,
+        True,
     )
-
-    result = torch.empty_like(mixed_qkv)
-    for t in range(seq_len):
-        result[:, :, t] = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
-            mixed_qkv[:, :, t].contiguous(),
-            scratch,
-            conv_weights,
-            bias,
-            activation in ("silu", "swish"),
-            None,
-            step_state_indices,
-            -1,
-            True,
-        )
-
-    conv_states[cache_idx] = scratch
 
     if retrieve_parent_token is not None:
         # The Triton kernel fuses this; downstream GDN verify reads it.

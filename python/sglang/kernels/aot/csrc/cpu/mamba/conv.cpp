@@ -440,6 +440,115 @@ void causal_conv1d_update_kernel_impl(
   });
 }
 
+template <typename scalar_t>
+void causal_conv1d_verify_kernel_impl(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ conv_states,
+    scalar_t* __restrict__ window,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    const int32_t* __restrict__ conv_indices,
+    const int32_t* __restrict__ window_indices,
+    bool silu_activation,
+    int64_t batch,
+    int64_t dim,
+    int64_t seqlen,
+    int64_t width,
+    int64_t window_strideW,
+    int64_t window_strideT,
+    int64_t window_strideD,
+    int64_t window_strideK) {
+  constexpr int64_t BLOCK_N = block_size_n() * 2;
+  const int64_t NB = div_up(dim, BLOCK_N);
+
+  const bool has_conv_states = conv_states != nullptr;
+  const bool has_conv_indices = conv_indices != nullptr;
+
+  // The whole draft block goes through the rolling-window kernel in one pass:
+  // it already carries the window forward in registers across the M loop, so
+  // only the first token needs to reach back into the incoming state.
+  AT_DISPATCH_BOOL2(bias != nullptr, has_bias, silu_activation, has_silu, [&] {
+    at::parallel_for(0, batch * NB, 0, [&](int64_t begin, int64_t end) {
+      int64_t bs{0}, nb{0};
+      data_index_init(begin, bs, batch, nb, NB);
+
+      for (int64_t i = begin; i < end; ++i) {
+        int64_t mb_start = 0;
+        int64_t mb_size = seqlen;
+        int64_t nb_start = nb * BLOCK_N;
+        int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
+
+        const bool has_initial_states_value = true;
+        int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+
+        switch (width << 4 | nb_size >> 4) {
+          case 0x42:
+            LAUNCH_TINYGEMM_KERNEL(4, 32);
+            break;
+          case 0x44:
+            LAUNCH_TINYGEMM_KERNEL(4, 64);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected block size, ", width, " x ", nb_size);
+        }
+
+        data_index_step(bs, batch, nb, NB);
+      }
+    });
+  });
+
+  // The state after token t is the width-1 inputs ending at t, which run off
+  // the front of the block into the incoming state for the first width-2
+  // tokens. `window` may be an overlapping view, so this splits the work by
+  // channel: neighbouring t share elements, neighbouring d never do.
+  constexpr int64_t GRAIN_D = 512;
+  const int64_t ND = div_up(dim, GRAIN_D);
+  at::parallel_for(0, batch * ND, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, nd{0};
+    data_index_init(begin, bs, batch, nd, ND);
+
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t d_begin = nd * GRAIN_D;
+      const int64_t d_end = std::min(dim, d_begin + GRAIN_D);
+      const int64_t cs_index = has_conv_indices ? conv_indices[bs] : bs;
+      scalar_t* __restrict__ slot = window + int64_t(window_indices[bs]) * window_strideW;
+
+      for (int64_t t = 0; t < seqlen; ++t) {
+        for (int64_t k = 0; k < width - 1; ++k) {
+          const int64_t s = t - (width - 2) + k;
+          const scalar_t* __restrict__ src = (s < 0)
+                                                 ? conv_states + cs_index * (width - 1) * dim + (s + width - 1) * dim
+                                                 : input + bs * seqlen * dim + s * dim;
+          scalar_t* __restrict__ dst = slot + t * window_strideT + k * window_strideK;
+          for (int64_t d = d_begin; d < d_end; ++d) {
+            dst[d * window_strideD] = src[d];
+          }
+        }
+      }
+
+      data_index_step(bs, batch, nd, ND);
+    }
+  });
+
+  // Committing the last snapshot rather than recomputing it keeps this pass
+  // from reading the incoming state the pass above is still consuming.
+  at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t bs = begin; bs < end; ++bs) {
+      const int64_t cs_index = has_conv_indices ? conv_indices[bs] : bs;
+      const scalar_t* __restrict__ last =
+          window + int64_t(window_indices[bs]) * window_strideW + (seqlen - 1) * window_strideT;
+      scalar_t* __restrict__ state = conv_states + cs_index * (width - 1) * dim;
+
+      for (int64_t k = 0; k < width - 1; ++k) {
+        for (int64_t d = 0; d < dim; ++d) {
+          state[k * dim + d] = last[k * window_strideK + d * window_strideD];
+        }
+      }
+    }
+  });
+}
+
 }  // anonymous namespace
 
 // from [dim, width] or [N, K]
@@ -698,6 +807,98 @@ at::Tensor causal_conv1d_update_cpu(
         dim,
         seqlen,
         width);
+  });
+  return out;
+}
+
+// Target verify for a linear draft chain.
+//   x: (batch, dim, steps), transposed so that `dim` is the contiguous axis
+//   conv_states: (num_cache_lines, dim, width - 1)
+//   intermediate_conv_window: (num_slots, max_steps, dim, width - 1)
+//   out: (batch, dim, steps), same layout as x
+//
+at::Tensor causal_conv1d_verify_cpu(
+    const at::Tensor& x,
+    at::Tensor& conv_states,
+    const at::Tensor& conv_state_indices,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    bool is_vnni) {
+  CHECK_CONTIGUOUS(weight);
+  auto packed_w = is_vnni ? weight : causal_conv1d_weight_pack(weight);
+
+  TORCH_CHECK(x.dim() == 3, "causal_conv1d_verify_cpu: expect x to be 3D tensor.");
+
+  int64_t batch = x.size(0);
+  int64_t dim = x.size(1);
+  int64_t seqlen = x.size(2);
+  int64_t width = weight.size(-1);
+  TORCH_CHECK(seqlen > 0, "causal_conv1d_verify_cpu: expect a non-empty draft block.");
+  // A one-token block never steps along the token axis, so its stride carries no information.
+  TORCH_CHECK(
+      x.stride(-2) == 1 && (seqlen == 1 || x.stride(-1) == dim),
+      "causal_conv1d_verify_cpu: expect x to be transposed.");
+  TORCH_CHECK(x.stride(0) == seqlen * dim, "causal_conv1d_verify_cpu: expect x sequences to be packed back to back.");
+
+  const auto scalar_type = x.scalar_type();
+  CHECK_EQ(weight.scalar_type(), scalar_type);
+  CHECK_OPTIONAL_SHAPE_DTYPE(bias, dim, scalar_type);
+
+  auto cache_indices = conv_state_indices.contiguous();
+  auto window_indices = intermediate_state_indices.contiguous();
+  CHECK_EQ(cache_indices.scalar_type(), at::kInt);
+  CHECK_EQ(window_indices.scalar_type(), at::kInt);
+  TORCH_CHECK(cache_indices.numel() >= batch, "causal_conv1d_verify_cpu: conv_state_indices is shorter than batch.");
+  TORCH_CHECK(
+      window_indices.numel() >= batch, "causal_conv1d_verify_cpu: intermediate_state_indices is shorter than batch.");
+
+  CHECK_EQ(conv_states.scalar_type(), scalar_type);
+  CHECK_EQ(conv_states.size(1), dim);
+  CHECK_EQ(conv_states.size(2), width - 1);
+
+  // adjust `conv_states` to be contiguous on `dim`
+  if (conv_states.stride(-2) != 1) {
+    int64_t num_cache_lines = conv_states.size(0);
+    auto conv_states_copy = conv_states.clone();
+    conv_states.as_strided_({num_cache_lines, dim, width - 1}, {(width - 1) * dim, 1, dim});
+    conv_states.copy_(conv_states_copy);
+  }
+
+  CHECK_EQ(intermediate_conv_window.scalar_type(), scalar_type);
+  TORCH_CHECK(
+      intermediate_conv_window.dim() == 4, "causal_conv1d_verify_cpu: expect intermediate_conv_window to be 4D.");
+  TORCH_CHECK(
+      intermediate_conv_window.size(1) >= seqlen,
+      "causal_conv1d_verify_cpu: intermediate_conv_window holds ",
+      intermediate_conv_window.size(1),
+      " steps, need ",
+      seqlen);
+  CHECK_EQ(intermediate_conv_window.size(2), dim);
+  CHECK_EQ(intermediate_conv_window.size(3), width - 1);
+
+  at::Tensor out = at::empty_like(x);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "causal_conv1d_verify_kernel_impl", [&] {
+    causal_conv1d_verify_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        x.data_ptr<scalar_t>(),
+        conv_states.data_ptr<scalar_t>(),
+        intermediate_conv_window.data_ptr<scalar_t>(),
+        packed_w.data_ptr<scalar_t>(),
+        conditional_data_ptr<scalar_t>(bias),
+        cache_indices.data_ptr<int32_t>(),
+        window_indices.data_ptr<int32_t>(),
+        silu_activation,
+        batch,
+        dim,
+        seqlen,
+        width,
+        intermediate_conv_window.stride(0),
+        intermediate_conv_window.stride(1),
+        intermediate_conv_window.stride(2),
+        intermediate_conv_window.stride(3));
   });
   return out;
 }
