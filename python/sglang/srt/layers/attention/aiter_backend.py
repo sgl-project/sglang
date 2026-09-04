@@ -94,6 +94,7 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
@@ -149,6 +150,7 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    unified_page_table: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -1684,6 +1686,25 @@ class AiterAttnBackend(AttentionBackend):
                         ).to(torch.int32)
                     )
 
+                unified_page_table = None
+                if self.use_triton_unified_attention:
+                    kv_indices_2d = torch.zeros(
+                        bs, max_kv_len, dtype=torch.int32, device=self.device
+                    )
+                    create_flashmla_kv_indices_triton[
+                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+                    ](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        None,
+                        kv_indices_2d,
+                        self.req_to_token.stride(0),
+                        max_kv_len,
+                        1,
+                    )
+                    unified_page_table = self._transform_table_1_to_real(kv_indices_2d)
+
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
@@ -1693,6 +1714,7 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens_cpu.max().item(),
                     swa_page_table=swa_page_table,
                     swa_out_cache_loc=swa_out_cache_loc,
+                    unified_page_table=unified_page_table,
                 )
 
     def init_cuda_graph_state(
@@ -2577,12 +2599,18 @@ class AiterAttnBackend(AttentionBackend):
                 )
         else:
             if forward_batch.forward_mode.is_target_verify():
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
 
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
@@ -2726,12 +2754,18 @@ class AiterAttnBackend(AttentionBackend):
                 and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
             ):
                 bs = forward_batch.batch_size
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 page_table, swa_page_table = self._build_unified_page_table_from_spec(
                     self.forward_metadata, bs
@@ -2891,6 +2925,128 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if (
+                self.use_triton_unified_attention
+                and sinks is not None
+                and self.forward_metadata.unified_page_table is not None
+                and self.kv_cache_dtype != fp8_dtype
+                and (
+                    layer.sliding_window_size is None or layer.sliding_window_size <= -1
+                )
+                and self.forward_metadata.max_q_len is not None
+                and self.forward_metadata.max_q_len >= 8192
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                k_flat = k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                v_flat = v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+                num_seqs = bs0 - 1
+                kv_indptr_t = self.forward_metadata.kv_indptr
+                kv_indices_t = self.forward_metadata.kv_indices
+                cache_loc = forward_batch.out_cache_loc
+                prefix_lens = forward_batch.extend_prefix_lens_cpu
+                extend_lens = forward_batch.extend_seq_lens_cpu
+                tok_chunks = []
+                cu_k_list = [0]
+                p0 = 0
+                e0 = 0
+                max_kv_i = 0
+                for i in range(num_seqs):
+                    p_len = int(prefix_lens[i])
+                    e_len = int(extend_lens[i])
+                    ext = cache_loc[e0 : e0 + e_len].to(torch.int64)
+                    if p_len:
+                        pfx = kv_indices_t[p0 : p0 + p_len].to(torch.int64)
+                        tok_chunks.append(torch.cat((pfx, ext)))
+                    else:
+                        tok_chunks.append(ext)
+                    cu_k_list.append(cu_k_list[-1] + p_len + e_len)
+                    max_kv_i = max(max_kv_i, p_len + e_len)
+                    p0 += p_len
+                    e0 += e_len
+                gather_idx = tok_chunks[0] if num_seqs == 1 else torch.cat(tok_chunks)
+                k_full = k_flat.index_select(0, gather_idx)
+                v_full = v_flat.index_select(0, gather_idx)
+                cu_q = self.qo_indptr[:bs0].to(torch.int32)
+                cu_k = torch.tensor(cu_k_list, device=q.device, dtype=torch.int32)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
+                flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_full,
+                    v_full,
+                    cu_q,
+                    cu_k,
+                    self.forward_metadata.max_q_len,
+                    max_kv_i,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=(-1, 0, 0),
+                    sink_ptr=sinks,
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if (
+                self.use_triton_unified_attention
+                and sinks is not None
+                and self.forward_metadata.unified_page_table is not None
+                and self.kv_cache_dtype != fp8_dtype
+            ):
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                o = getattr(forward_batch, "_attn_output", None)
+                if (
+                    o is None
+                    or o.dtype != q.dtype
+                    or o.numel() != q.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+                ):
+                    if layer.qk_head_dim != layer.v_head_dim:
+                        o = q.new_empty(
+                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                        )
+                    else:
+                        o = torch.empty_like(q)
+                unified_window = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    unified_window = (layer.sliding_window_size - 1, 0)
+                unified_attention(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v=v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.qo_indptr[:bs0],
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=self.forward_metadata.max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=unified_window,
+                    block_table=self.forward_metadata.unified_page_table,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
+                )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if self.kv_cache_is_vectorized_5d:
