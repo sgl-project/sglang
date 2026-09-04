@@ -20,7 +20,7 @@ import signal
 import threading
 import time
 from enum import Enum, auto
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import psutil
 import setproctitle
@@ -50,6 +50,7 @@ from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_device,
     get_disagg,
     get_exec,
@@ -70,6 +71,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
+    get_local_ip_auto,
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
@@ -80,6 +82,54 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
+_KV_EVENT_BIND_HOSTS = frozenset({"*", "0.0.0.0", "::"})
+
+
+def build_kv_event_publishers(
+    *,
+    endpoint_host: str,
+    endpoint_port_base: int,
+    node_hosts: Dict[int, str],
+    nnodes: int,
+    dp_size: int,
+    tp_size: int,
+    pp_size: int,
+    attn_cp_size: int,
+    enable_dp_attention: bool,
+) -> List[Dict[str, object]]:
+    """Build dialable per-rank endpoints for a wildcard KV-event publisher."""
+    if endpoint_host.strip("[]") not in _KV_EVENT_BIND_HOSTS:
+        return []
+
+    if enable_dp_attention:
+        nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+        tp_size_per_node = tp_size // nnodes_per_pp_rank
+        attn_tp_size = tp_size // dp_size // attn_cp_size
+        publisher_nodes = [
+            (dp_rank * attn_cp_size * attn_tp_size) // tp_size_per_node
+            for dp_rank in range(dp_size)
+        ]
+    else:
+        # Each pure-DP replica spans the same TP group. Its publisher is the
+        # pp=0/attn-tp=0 scheduler, which is on node 0 for every replica.
+        publisher_nodes = [0] * dp_size
+
+    missing_nodes = sorted(set(publisher_nodes).difference(node_hosts))
+    if missing_nodes:
+        raise RuntimeError(
+            "Missing advertised KV-event hosts for node ranks "
+            + ", ".join(str(rank) for rank in missing_nodes)
+        )
+
+    return [
+        {
+            "dp_rank": dp_rank,
+            "endpoint": NetworkAddress(
+                node_hosts[node_rank], endpoint_port_base + dp_rank
+            ).to_tcp(),
+        }
+        for dp_rank, node_rank in enumerate(publisher_nodes)
+    ]
 
 
 class LoadBalanceMethod(Enum):
@@ -151,6 +201,22 @@ class DataParallelController:
             get_parallel().load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
+
+        descriptor = describe_kv_events_publisher(server_args)
+        self._needs_kv_event_node_hosts = bool(
+            server_args.nnodes > 1
+            and descriptor is not None
+            and descriptor["endpoint_host"].strip("[]") in _KV_EVENT_BIND_HOSTS
+        )
+        self._kv_event_host = (
+            get_local_ip_auto()
+            if self._needs_kv_event_node_hosts
+            and (server_args.node_rank == 0 or get_parallel().enable_dp_attention)
+            else None
+        )
+        self._kv_event_node_hosts: Dict[int, str] = {}
+        if self._kv_event_host is not None:
+            self._kv_event_node_hosts[server_args.node_rank] = self._kv_event_host
 
         # Init inter-process communication
         self.context = zmq.Context(1 + get_parallel().dp_size)
@@ -478,7 +544,11 @@ class DataParallelController:
             connected_clients = 0
             while connected_clients < expected_clients:
                 # Wait for client handshake
-                client_rank = sock_recv(rep_socket)
+                client_rank, kv_event_host = self._parse_node_registration(
+                    sock_recv(rep_socket)
+                )
+                if kv_event_host is not None:
+                    self._kv_event_node_hosts[client_rank] = kv_event_host
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
@@ -506,7 +576,11 @@ class DataParallelController:
         keeps ownership of every socket."""
         while True:
             try:
-                client_rank = sock_recv(rep_socket)
+                client_rank, kv_event_host = self._parse_node_registration(
+                    sock_recv(rep_socket)
+                )
+                if kv_event_host is not None:
+                    self._kv_event_node_hosts[client_rank] = kv_event_host
             except Exception:
                 logger.exception(
                     "Failed to recv/decode handshake in reply thread; continue"
@@ -528,7 +602,15 @@ class DataParallelController:
 
         try:
             # Send handshake with our node rank
-            sock_send(req_socket, wrap_as_pickle(str(node_rank)))
+            registration = (
+                {
+                    "node_rank": node_rank,
+                    "kv_event_host": self._kv_event_host,
+                }
+                if self._kv_event_host is not None
+                else str(node_rank)
+            )
+            sock_send(req_socket, wrap_as_pickle(registration))
 
             # Receive worker ports
             worker_ports = sock_recv(req_socket)
@@ -541,6 +623,32 @@ class DataParallelController:
             )
         finally:
             req_socket.close()
+
+    @staticmethod
+    def _parse_node_registration(registration) -> tuple[int, Optional[str]]:
+        if isinstance(registration, dict):
+            return int(registration["node_rank"]), registration.get("kv_event_host")
+        return int(registration), None
+
+    def get_kv_event_publishers(self) -> List[Dict[str, object]]:
+        if self.server_args.node_rank != 0 or not self._needs_kv_event_node_hosts:
+            return []
+
+        descriptor = describe_kv_events_publisher(self.server_args)
+        if descriptor is None:
+            return []
+        parallel = get_parallel()
+        return build_kv_event_publishers(
+            endpoint_host=descriptor["endpoint_host"],
+            endpoint_port_base=descriptor["endpoint_port_base"],
+            node_hosts=self._kv_event_node_hosts,
+            nnodes=self.server_args.nnodes,
+            dp_size=parallel.dp_size,
+            tp_size=self.server_args.tp_size,
+            pp_size=parallel.pp_size,
+            attn_cp_size=parallel.attn_cp_size,
+            enable_dp_attention=parallel.enable_dp_attention,
+        )
 
     def _joiner_local_tp_span(self, server_args: ServerArgs) -> int:
         return server_args.tp_size
@@ -848,15 +956,16 @@ def run_data_parallel_controller_process(
         scheduler_pids = [
             proc.pid for proc in controller.scheduler_procs if proc is not None
         ]
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "max_total_num_tokens": controller.max_total_num_tokens,
-                "max_req_input_len": controller.max_req_input_len,
-                "startup_time": controller.startup_time,
-                SCHEDULER_PIDS_ARG: scheduler_pids,
-            }
-        )
+        init_info = {
+            "status": "ready",
+            "max_total_num_tokens": controller.max_total_num_tokens,
+            "max_req_input_len": controller.max_req_input_len,
+            "startup_time": controller.startup_time,
+            SCHEDULER_PIDS_ARG: scheduler_pids,
+        }
+        if publishers := controller.get_kv_event_publishers():
+            init_info["kv_events"] = {"publishers": publishers}
+        pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
             controller.event_loop()

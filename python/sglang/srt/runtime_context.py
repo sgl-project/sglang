@@ -2041,16 +2041,19 @@ def is_ep_scale_joiner() -> bool:
     return get_exec().moe.ep_join_mode == "scale"
 
 
-def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
+def describe_kv_events_publisher(
+    server_args: Any, scheduler_info: Optional[dict] = None
+) -> Optional[dict]:
     """Return a structured description of this server's KV-event
     publisher, or `None` if publishing is disabled / misconfigured.
 
     This is the wire contract surfaced under the `kv_events` key on
     `/server_info` so KV-aware routers (e.g. the SGLang model
     gateway) can subscribe per-worker without operator-supplied port
-    coordination. The router constructs the per-DP-rank SUB endpoint
-    as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
-    every rank reported in dp_size.
+    coordination. Consumers should use the dialable per-rank endpoints in
+    ``publishers`` when present. Otherwise, they construct each SUB endpoint
+    as tcp://<worker_host>:<endpoint_port_base + dp_rank> for every rank
+    reported in dp_size.
 
     Returned descriptor shape:
 
@@ -2073,6 +2076,14 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
                                               # DCP shards within a rank
                                               # rather than adding
                                               # publishers
+            "publishers": [                  # optional dialable endpoints;
+                {
+                    "dp_rank": 0,
+                    "endpoint": "tcp://node0:5557",
+                },
+                ...,
+            ],                                 # present for multi-node
+                                               # wildcard publishers
             "load_endpoint_port_base": <resolved>,
                                               # base TCP port of the load
                                               # range (load rank r = base
@@ -2147,6 +2158,10 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
         "block_size": kv_event_block_size_of(resolved),
         "dp_size": resolved.dp_size,
     }
+    if scheduler_info is not None:
+        runtime_kv_events = scheduler_info.get("kv_events")
+        if isinstance(runtime_kv_events, dict) and runtime_kv_events.get("publishers"):
+            descriptor["publishers"] = runtime_kv_events["publishers"]
     # Load range, from the same resolver SchedulerLoadPublisher binds
     # with (so the two can't drift). The decline reason is logged once at
     # startup, not here — this runs per /server_info request.

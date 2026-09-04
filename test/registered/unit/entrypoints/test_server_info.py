@@ -59,6 +59,7 @@ def _call_server_info_with(
     server_args: ServerArgs,
     internal_states: list[dict] | None = None,
     config_updates: dict | None = None,
+    scheduler_info: dict | None = None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -81,7 +82,7 @@ def _call_server_info_with(
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
-        scheduler_info={"max_req_input_len": 1024},
+        scheduler_info={"max_req_input_len": 1024, **(scheduler_info or {})},
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
@@ -135,6 +136,24 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 "load_topic": "load",
             },
         )
+
+    def test_multi_node_publishers_are_returned_as_dialable_rank_endpoints(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_events_config='{"publisher": "zmq", "endpoint": "tcp://*:5557"}',
+            page_size=64,
+            dp_size=2,
+        )
+        publishers = [
+            {"dp_rank": 0, "endpoint": "tcp://10.0.0.1:5557"},
+            {"dp_rank": 1, "endpoint": "tcp://10.0.0.2:5558"},
+        ]
+
+        info = _call_server_info_with(
+            args, scheduler_info={"kv_events": {"publishers": publishers}}
+        )
+
+        self.assertEqual(info["kv_events"]["publishers"], publishers)
 
     def test_load_port_skips_an_overlapping_replay_range(self):
         # Conventional replay = kv + 1: the load range must be advertised
