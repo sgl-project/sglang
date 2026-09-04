@@ -911,6 +911,17 @@ class Envs:
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
     )
+    # Pre-load mrope_position_delta onto NPU during prefill and compute mrope_positions on NPU during decode.
+    SGLANG_NPU_MROPE_NPU_COMPUTE = EnvBool(False)
+    # Enable double-buffered pinned memory for DP on NPU.
+    SGLANG_NPU_DOUBLE_BUFFER_DP_MEMORY = EnvBool(False)
+    # Use Triton fused kernel for GDN qkvz/ba split+reshape+concat.
+    SGLANG_NPU_FUSED_QKVZBA_SPLIT = EnvBool(False)
+    # Use Triton fused sigmoid-gated multiply for attention/expert gating.
+    SGLANG_NPU_FUSED_SIGMOID_MUL = EnvBool(False)
+    # Use fused GDN delta-rule update kernel for decode.
+    SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
+
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)

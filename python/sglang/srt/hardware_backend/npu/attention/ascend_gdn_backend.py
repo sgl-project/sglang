@@ -5,7 +5,11 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
     fused_gdn_gating_kernel_without_sigmoid,
     fused_gdn_gating_npu,
 )
+from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
+    fused_sigmoid_gating_delta_rule_update_decode_npu,
+)
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
@@ -143,18 +147,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        core_attn_out = self.kernel_dispatcher.decode(
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            ssm_states=ssm_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-        )
+        if envs.SGLANG_NPU_GDN_UPDATE_FUSED.get():
+            # Decode-optimized fused gating + recurrent update in a single
+            # Triton kernel. Computing gating once per (token, value-head)
+            # and reusing it across the value-dimension tiles removes both
+            # the separate gating kernel launch and the original kernel's
+            # redundant per-V-block gating recomputation.
+            core_attn_out = fused_sigmoid_gating_delta_rule_update_decode_npu(
+                A_log=layer.A_log,
+                a=a,
+                dt_bias=layer.dt_bias,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                q=query,
+                k=key,
+                v=value,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                scale=layer.head_k_dim**-0.5,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=query_start_loc,
+            )
+        else:
+            core_attn_out = self.kernel_dispatcher.decode(
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+            )
 
         self._track_mamba_state_decode(
             forward_batch, conv_states, ssm_states, cache_indices

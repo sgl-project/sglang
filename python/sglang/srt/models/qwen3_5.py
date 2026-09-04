@@ -235,6 +235,11 @@ if _is_cpu:
         torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
     )
 
+if _is_npu:
+    # NPU uses the Ascend-tuned implementation; other backends keep the
+    # original Triton kernel.
+    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+
 
 @lru_cache(maxsize=1)
 def _enable_qwen35_fused_ar_quant() -> bool:
@@ -797,7 +802,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
-        elif use_fused_contiguous_unpack and not _is_npu:
+        elif use_fused_contiguous_unpack and not (_is_npu or envs.SGLANG_NPU_FUSED_QKVZBA_SPLIT.get()):
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -1367,6 +1372,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             if not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+            elif envs.SGLANG_NPU_FUSED_SIGMOID_MUL.get():
+                gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                if gate_val.numel() == attn_output.numel():
+                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+                    )
+
+                    attn_output = npu_fused_sigmoid_mul(
+                        attn_output, gate_val.contiguous()
+                    )
+                else:
+                    attn_output.mul_(torch.sigmoid(gate_val))
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))
