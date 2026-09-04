@@ -45,8 +45,6 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
-    resolve_linear_state_shards,
-    should_send_aux_metadata,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
@@ -1342,27 +1340,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             aux_notif += (
                                 f"_nokv_{self.transfer_source_rank}_{kv_chunk.chunk_id}"
                             )
-                        if should_send_aux_metadata(
-                            attn_cp_rank=self.attn_cp_rank,
-                            prefill_attn_tp_size=self.attn_tp_size,
-                            prefill_attn_tp_rank=self.attn_tp_rank,
-                            decode_attn_tp_size=decode_tp_size,
-                            decode_attn_tp_rank=dst_info.decode_tp_rank,
-                        ):
-                            aux_xfer_handle = self.send_aux(
-                                req.agent_name,
-                                kv_chunk.prefill_aux_index,
-                                dst_info.dst_aux_ptrs,
-                                req.dst_aux_index,
-                                aux_notif,
-                            )
-                            handles.append(aux_xfer_handle)
-                        else:
-                            # AUX is replicated; non-writers still notify so
-                            # per-source completion accounting advances.
-                            self.agent.send_notif(
-                                req.agent_name, aux_notif.encode("ascii")
-                            )
+                        aux_xfer_handle = self.send_aux(
+                            req.agent_name,
+                            kv_chunk.prefill_aux_index,
+                            dst_info.dst_aux_ptrs,
+                            req.dst_aux_index,
+                            aux_notif,
+                        )
+                        handles.append(aux_xfer_handle)
 
                 if staging_deferred:
                     # Chunk has been re-enqueued; do not advance status.
@@ -2226,10 +2211,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_dim_per_tensor: list[int],
         dst_gpu_id: int,
         notif: str,
-        src_shard_size: int,
-        src_shard_rank: int,
-        dst_shard_size: int,
-        dst_shard_rank: int,
+        decode_tp_size: int,
+        decode_tp_rank: int,
         src_state_conv_shard_groups: list = None,
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: list[int] = None,
@@ -2237,18 +2220,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ):
         """Transfer Mamba states with TP slice support via RDMA.
 
-        When prefill and decode have different head-shard sizes, we slice the
-        sharded dimension (3rd dim) of conv_state and temporal_state
-        accordingly. The source shard can be Prefill attention TP or CP. GDN
+        When prefill and decode have different attn_tp_size, we slice the
+        TP-sharded dimension (3rd dim) of conv_state and temporal_state
+        accordingly, mirroring Mooncake's _send_mamba_state_slice. GDN
         conv_state is [query | key | value] with each sub-block head-sharded
         independently, so on the scatter path it is sliced per sub-block via
         ``src_state_conv_shard_groups`` (see
         compute_mamba_state_slice_byte_blocks).
         """
         logger.warning_once(
-            "Using Mamba state slice transfer for different head-shard sizes. "
-            f"Prefill shard_size={src_shard_size}, "
-            f"Decode shard_size={dst_shard_size}."
+            "Using Mamba state slice transfer for different TP sizes. "
+            f"Prefill attn_tp_size={self.attn_tp_size}, "
+            f"Decode attn_tp_size={decode_tp_size}."
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
 
@@ -2265,6 +2248,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_layer_ids=src_layer_ids,
                 dst_layer_ids=dst_layer_ids,
             )
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
 
         src_addrs = []
         dst_addrs = []
@@ -2306,10 +2292,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=src_shard_size,
-                dst_attn_tp_size=dst_shard_size,
-                dst_tp_rank_in_group=dst_shard_rank,
-                local_tp_rank_in_group=src_shard_rank,
+                src_attn_tp_size=self.attn_tp_size,
+                dst_attn_tp_size=decode_tp_size,
+                dst_tp_rank_in_group=dst_tp_rank_in_group,
+                local_tp_rank_in_group=local_tp_rank_in_group,
                 conv_shard_groups=conv_shard_groups,
             ):
                 src_addr = (
@@ -2375,7 +2361,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_layer_ids = dst_state_layer_ids or []
 
         handles = []
-        skipped_replicated_state = False
         for i, st in enumerate(state_types):
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -2410,23 +2395,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             comp_notif = f"{notif}_{i}"
 
             if st == StateType.MAMBA:
-                shard_mapping = resolve_linear_state_shards(
-                    prefill_attn_tp_size=self.attn_tp_size,
-                    prefill_attn_tp_rank=self.attn_tp_rank,
-                    prefill_attn_cp_size=self.attn_cp_size,
-                    prefill_attn_cp_rank=self.attn_cp_rank,
-                    decode_attn_tp_size=decode_tp_size,
-                    decode_tp_rank=decode_tp_rank,
-                )
-                if shard_mapping is None:
-                    h = None
-                elif shard_mapping[0] != shard_mapping[2]:
-                    (
-                        src_shard_size,
-                        src_shard_rank,
-                        dst_shard_size,
-                        dst_shard_rank,
-                    ) = shard_mapping
+                if self.attn_tp_size != decode_tp_size:
                     h = self._send_mamba_state_slice(
                         peer_name,
                         src_indices,
@@ -2439,12 +2408,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_dims,
                         dst_gpu_id,
                         comp_notif,
-                        src_shard_size=src_shard_size,
-                        src_shard_rank=src_shard_rank,
-                        dst_shard_size=dst_shard_size,
-                        dst_shard_rank=dst_shard_rank,
-                        src_state_conv_shard_groups=src_conv,
-                        src_state_slice_outer_counts=src_outer_counts,
+                        decode_tp_size,
+                        decode_tp_rank,
+                        src_conv,
+                        src_outer_counts,
                         src_layer_ids=src_lids,
                         dst_layer_ids=dst_lids,
                     )
@@ -2462,21 +2429,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         dst_layer_ids=dst_lids,
                     )
             elif st == StateType.DSA_TAIL:
-                if self.attn_cp_size > 1 and self.attn_cp_rank != 0:
-                    skipped_replicated_state = True
-                    h = None
-                else:
-                    h = self._send_slot_state(
-                        peer_name,
-                        src_ptrs,
-                        src_lens,
-                        dst_ptrs,
-                        dst_lens,
-                        list(src_indices),
-                        list(dst_indices),
-                        dst_gpu_id,
-                        comp_notif,
-                    )
+                h = self._send_slot_state(
+                    peer_name,
+                    src_ptrs,
+                    src_lens,
+                    dst_ptrs,
+                    dst_lens,
+                    list(src_indices),
+                    list(dst_indices),
+                    dst_gpu_id,
+                    comp_notif,
+                )
             elif st == StateType.DSA:
                 if len(src_indices) != len(dst_indices):
                     raise RuntimeError(
@@ -2556,10 +2519,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             if h is not None:
                 handles.append(h)
-        if skipped_replicated_state and not handles:
-            # Non-owner CP ranks have no state bytes, but decode still expects
-            # one completion per source rank.
-            self.agent.send_notif(peer_name, f"{notif}_marker".encode("ascii"))
         return handles
 
     def add_transfer_request(

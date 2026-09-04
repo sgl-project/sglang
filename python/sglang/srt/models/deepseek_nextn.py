@@ -47,7 +47,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    is_prefill_context_parallel_enabled,
+    is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
     prepare_context_parallel_metadata,
 )
@@ -168,7 +168,7 @@ class DeepseekModelNextN(nn.Module):
         self.quant_config = quant_config
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
+            is_mla_prefill_cp_enabled() and not is_deepseek_dsa(config)
         )
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
@@ -371,9 +371,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.determine_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not self.use_dsa
-        )
+        self.mla_enable_prefill_cp = is_mla_prefill_cp_enabled() and not self.use_dsa
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_rank = get_parallel().attn_cp_rank
             self.cp_size = get_parallel().attn_cp_size

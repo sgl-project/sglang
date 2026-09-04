@@ -33,7 +33,6 @@ from sglang.srt.configs.hybrid_arch import (
     mamba2_config,
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
-from sglang.srt.disaggregation.utils import should_bypass_dsa_cp_prefix_cache
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
@@ -238,24 +237,14 @@ def build_kv_cache(
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
 
-    bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache()
-    disable_radix_cache = (
-        get_memory().disable_radix_cache
-        or (model_config.is_multimodal and uses_transformers_backend)
-        or bypass_dsa_cp_prefix_cache
+    disable_radix_cache = get_memory().disable_radix_cache or (
+        model_config.is_multimodal and uses_transformers_backend
     )
     if disable_radix_cache and not get_memory().disable_radix_cache:
-        if bypass_dsa_cp_prefix_cache:
-            logger.warning(
-                "Radix cache is disabled on this PD Prefill worker because DSA "
-                "Prefill CP requires CP-aware KV-cache resharding. Target-model "
-                "CP, speculative decoding, and P-to-D transfer remain enabled."
-            )
-        else:
-            logger.warning(
-                "Radix cache is disabled for multimodal models with the "
-                "Transformers backend to avoid multimodal prefix-cache mismatches."
-            )
+        logger.warning(
+            "Radix cache is disabled for multimodal models with the "
+            "Transformers backend to avoid multimodal prefix-cache mismatches."
+        )
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
