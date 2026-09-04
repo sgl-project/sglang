@@ -15,6 +15,11 @@ class _ConcreteComposedPipeline(ComposedPipelineBase):
         return None
 
 
+class _ConcretePipelineExecutor(PipelineExecutor):
+    def execute(self, stages, batch, server_args):
+        return batch
+
+
 class _RecordingExecutor:
     """Records the residency manager visible when an execute entry point runs.
 
@@ -111,7 +116,7 @@ class TestPipelineResidencyManagerInstall(unittest.TestCase):
         missing manager, the asymmetry above stops being fatal and these cases
         can be revisited. Until then a skipped install is a hard crash.
         """
-        executor = object.__new__(PipelineExecutor)
+        executor = object.__new__(_ConcretePipelineExecutor)
         executor.component_residency_manager = None
 
         with self.assertRaises(AttributeError):
