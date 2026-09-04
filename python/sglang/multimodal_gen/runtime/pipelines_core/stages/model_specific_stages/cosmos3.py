@@ -1608,6 +1608,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         for i, t in progress_bar:
+            # Precision is chosen once per step, before any transformer call,
+            # so all CFG branches of the step share the same selection.
+            self.transformer.set_denoising_step(step_index=i, num_steps=len(timesteps))
             batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
             timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
@@ -1868,6 +1871,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
+
+        # Hygiene only: the set_denoising_step at each loop head is what
+        # actually selects precision, so stale state cannot leak into the
+        # next request's steps.
+        self.transformer.reset_denoising_step()
 
         if batch.rollout:
             self._postprocess_rollout_outputs(
