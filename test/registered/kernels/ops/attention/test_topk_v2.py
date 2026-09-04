@@ -81,8 +81,14 @@ FIXED_CONFIGS = [
 ]
 
 
-def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
-    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties."""
+def _assert_topk_close(
+    scores_cpu, ref_raw, our_raw, bs, seq_lens, k, max_permit_error=MAX_PERMIT_ERROR
+):
+    """Set-compare our top-k raw indices vs torch's, tolerating equal-score ties.
+
+    ``max_permit_error`` covers the fp16 coarse histogram swapping near-equal
+    scores on ordinary inputs. Tests that specifically pin exactness pass 0.
+    """
     bad = 0
     for i in range(bs):
         L = int(seq_lens[i])
@@ -99,7 +105,7 @@ def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
         assert len(our) == min(k, L), (
             f"b={i} L={L} k={k}: {len(our)} valid != {min(k, L)}"
         )
-    assert bad <= MAX_PERMIT_ERROR, f"{bad=} > {MAX_PERMIT_ERROR}"
+    assert bad <= max_permit_error, f"{bad=} > {max_permit_error}"
 
 
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
@@ -268,6 +274,71 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+# --- exactness when the coarse histogram cannot discriminate -----------------
+# Every test above draws from ``torch.randn``, which spreads scores over many
+# coarse bins and leaves the threshold bin far below the tie-staging capacity.
+# The distributions here do the opposite: they collapse a whole row into one
+# coarse bin, so the threshold bin holds every candidate and overflows the
+# staging buffer. An implementation that drops that overflow ranks whichever
+# candidates arrived first and returns a wrong selected-value multiset, while
+# still passing every ``randn`` case above -- which is why these cases exist
+# separately rather than as more ``FIXED_CONFIGS`` entries.
+NARROW_DISTRIBUTIONS = ["narrow", "narrow_bin", "tiny", "all_equal"]
+
+
+def _single_bin_scores(kind, batch, width, device):
+    """Scores whose coarse bin carries no ordering information.
+
+    The coarse bin comes from the top bits of the fp16 cast of each score, so a
+    band narrower than one fp16 ulp -- or a magnitude that underflows fp16
+    entirely -- maps the whole row to one bin.
+    """
+    if kind == "narrow":
+        # One fp32 ulp at 1.0 is 1.19e-7, so a 1e-6 half-width band holds only a
+        # handful of representable values: this pins the tie COUNT.
+        u = torch.rand(batch, width, dtype=torch.float32, device=device) * 2.0 - 1.0
+        return 1.0 + u * 1e-6
+    if kind == "narrow_bin":
+        # [1.0, 1.02) sits inside a single coarse bin either way it is derived
+        # (fp16 top-byte quarter-binade [1.0, 1.25); v2's 3 mantissa bits give
+        # [1.0, 1.125)) while offering ~1.7e5 distinct fp32 values, so this pins
+        # the ORDERING and not merely the count.
+        return 1.0 + torch.rand(batch, width, dtype=torch.float32, device=device) * 0.02
+    if kind == "tiny":
+        # Far below the fp16 subnormal floor: every score casts to zero.
+        return (
+            0.5 + torch.rand(batch, width, dtype=torch.float32, device=device)
+        ) * 1e-30
+    # all_equal is the control: the bin also overflows, but every candidate is
+    # bit-identical, so any subset is a correct answer. It must stay passing --
+    # it is what distinguishes "cannot separate" from "did not try".
+    return torch.full((batch, width), 0.5, dtype=torch.float32, device=device)
+
+
+@pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
+@pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 32768)])
+@torch.inference_mode()
+def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
+    """No tolerance here: with k=2048 the threshold bin holds the whole row, so
+    any dropped candidate is a genuine wrong answer rather than a tie swap.
+
+    Both a register-path and a streaming-path shape are covered, because the
+    tie staging is per-template.
+    """
+    torch.manual_seed(batch * 100003 + seq * 7 + hash(dist) % 1000)
+    device = "cuda"
+    k = 2048
+    width = (seq + 3) & ~3
+    scores = _single_bin_scores(dist, batch, width, device)[:, :seq]
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(
+        scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k, max_permit_error=0
+    )
 
 
 # --- ragged entry point ------------------------------------------------------
