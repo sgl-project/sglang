@@ -46,9 +46,13 @@ pub struct Cli {
     /// Model id this router serves (the OpenAI `model` field).
     #[arg(long)]
     pub model_id: String,
-    /// Tokenizer source: a local `tokenizer.json` path, or a HuggingFace
-    /// repo id to download from. When omitted, falls back to `--model-id`
-    /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
+    /// Tokenizer source: a local `tokenizer.json` path, a HuggingFace repo
+    /// id to download from, or `none` to run without a tokenizer. When
+    /// omitted, falls back to `--model-id` as the repo id (download honors
+    /// `HF_TOKEN` / `HF_HOME`). A tokenizer is only required by cache-aware
+    /// routing (`cache_aware_zmq`); load-only policies route without one — a
+    /// failed load then logs a warning and continues, with no `input_ids`
+    /// offload and `/v1/tokenize` unavailable for the model.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
     /// Number of independent tokenizer instances to load for this model.
