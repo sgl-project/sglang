@@ -127,13 +127,16 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
-    # MultiPlatformOp integration
+    # BaseFusedOp integration
     # ------------------------------------------------------------------
 
     def get_dispatch_key_name(self) -> str:
-        """Return the dispatch key name for MultiPlatformOp.
+        """Return the dispatch key name for BaseFusedOp
+        (``sglang.kernels.fused_op``).
 
-        Determines which ``forward_<key>()`` method is selected.
-        E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Determines which ``forward_<key>()`` method is selected on an
+        out-of-tree platform. E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Forwards registered via ``BaseFusedOp.register_oot_forward`` with
+        this key take precedence over the method lookup.
         """
         return "native"

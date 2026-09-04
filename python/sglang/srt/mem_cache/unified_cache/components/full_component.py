@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -22,10 +23,13 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
+    LinkerTransferPhase,
     TreeComponent,
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -43,13 +47,67 @@ class FullComponent(TreeComponent):
         super().__init__(cache, params)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
+        # Lazy bind eviction strategy since tree core is initialized after component init.
+        self.session_ref_eviction_strategy = (
+            self._session_ref_eviction_strategy
+            if cache.enable_session_radix_cache
+            else None
+        )
+
+    def _ensure_eviction_strategy(self) -> None:
+        if self.session_ref_eviction_strategy is None:
+            self.session_ref_eviction_strategy = (
+                self.tree_core.eviction_strategy.get_priority
+            )
+
+    def _dec_session_coverage(self, session_id: str, leaf: UnifiedTreeNode) -> None:
+        node = leaf
+        while node is not None and node is not self.tree_core.root_node:
+            cd = node.component_data[self.component_type]
+            assert cd.session_ref > 0
+            cd.session_ref -= 1
+            node = node.parent
+
+    def _advance_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        old_ancestor: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = old_ancestor if old_ancestor is not None else self.tree_core.root_node
+        node = leaf
+        while (
+            node is not None
+            and node is not stop
+            and node is not self.tree_core.root_node
+        ):
+            node.component_data[self.component_type].session_ref += 1
+            node = node.parent
+
+    def _recede_session_coverage(
+        self,
+        session_id: str,
+        leaf: UnifiedTreeNode,
+        fallback: Optional[UnifiedTreeNode],
+    ) -> None:
+        stop = fallback if fallback is not None else self.tree_core.root_node
+        node = leaf
+        while (
+            node is not None
+            and node is not stop
+            and node is not self.tree_core.root_node
+        ):
+            cd = node.component_data[self.component_type]
+            assert cd.session_ref > 0
+            cd.session_ref -= 1
+            node = node.parent
 
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
-            return (
-                lambda node: node.component_data[self.component_type].value is not None
+            return lambda node: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -86,7 +144,9 @@ class FullComponent(TreeComponent):
     ):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
+        new_parent.component_data[ct].session_ref = child.component_data[ct].session_ref
         child_cd = child.component_data[ct]
+        assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
@@ -127,11 +187,16 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
+    def _session_ref_eviction_strategy(self, node: UnifiedTreeNode):
+        ref = self.session_ref(node)
+        return ref > 0, ref, self.tree_core.eviction_strategy.get_priority(node)
+
     def _evict_device_start(self, request_cnt: int) -> None:
+        self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
         self._evict_device_heap = [
-            (self.tree_core.eviction_strategy.get_priority(n), n)
+            (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_device_leaves
         ]
         heapq.heapify(self._evict_device_heap)
@@ -151,7 +216,7 @@ class FullComponent(TreeComponent):
         ):
             heapq.heappush(
                 self._evict_device_heap,
-                (self.tree_core.eviction_strategy.get_priority(lv.parent), lv.parent),
+                (self.session_ref_eviction_strategy(lv.parent), lv.parent),
             )
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
@@ -174,8 +239,9 @@ class FullComponent(TreeComponent):
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        self._ensure_eviction_strategy()
         heap = [
-            (self.tree_core.eviction_strategy.get_priority(n), n)
+            (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_host_leaves
         ]
         heapq.heapify(heap)
@@ -191,7 +257,7 @@ class FullComponent(TreeComponent):
             ):
                 heapq.heappush(
                     heap,
-                    (self.tree_core.eviction_strategy.get_priority(x.parent), x.parent),
+                    (self.session_ref_eviction_strategy(x.parent), x.parent),
                 )
 
     def acquire_component_lock(
@@ -224,9 +290,9 @@ class FullComponent(TreeComponent):
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            assert cd.value is not None, (
+                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
@@ -362,11 +428,76 @@ class FullComponent(TreeComponent):
 
             self.tree_core._update_evictable_leaf_sets(node)
 
+    def _full_allocator(self):
+        """The allocator that owns the full-attention pool alone."""
+        allocator = self.cache.token_to_kv_pool_allocator
+        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=value.to(torch.int64),
+                keys=list(node.hash_value),
+            )
+
+        if not keys:
+            return None
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+        if phase == LinkerTransferPhase.LOAD:
+            allocator = self._full_allocator()
+            num_tokens = len(keys) * self.cache.page_size
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(num_tokens=shortfall))
+            slots = allocator.alloc(num_tokens)
+            if slots is None:
+                return None
+
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=slots.to(torch.int64),
+                keys=list(keys),
+            )
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            self._full_allocator().free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        return transfer
+
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._full_kv_pool_host is None:
             return
         for host_value in host_values:
-            self._full_kv_pool_host.free(host_value)
+            self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
 
     def apply_component_action(self, action: ComponentAction) -> None:
         if isinstance(action, FreeComponentDeviceSlot):

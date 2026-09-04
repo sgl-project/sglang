@@ -12,8 +12,15 @@ if TYPE_CHECKING:
 
 import torch
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+
+@dataclass(frozen=True)
+class AttentionRequirements:
+    """Semantic attention operations required by a caller."""
+
+    packed_varlen: bool = False
 
 
 class AttentionBackend(ABC):
@@ -33,6 +40,24 @@ class AttentionBackend(ABC):
     @abstractmethod
     def get_impl_cls() -> type["AttentionImpl"]:
         raise NotImplementedError
+
+    @classmethod
+    def supports_packed_varlen(cls) -> bool:
+        return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether this backend can serve as the ring-attention kernel; the
+        per-hop online-softmax merge needs the kernel's softmax LSE."""
+        return False
+
+    @classmethod
+    def unsupported_requirements(
+        cls, requirements: AttentionRequirements
+    ) -> tuple[str, ...]:
+        if requirements.packed_varlen and not cls.supports_packed_varlen():
+            return ("packed varlen attention",)
+        return ()
 
     @staticmethod
     @abstractmethod
@@ -100,7 +125,6 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
 
 class AttentionLayer(Protocol):
-
     _k_scale: torch.Tensor
     _v_scale: torch.Tensor
     _k_scale_float: float
@@ -117,7 +141,6 @@ class AttentionLayer(Protocol):
 
 
 class AttentionImpl(ABC, Generic[T]):
-
     @abstractmethod
     def __init__(
         self,
@@ -169,6 +192,35 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement packed varlen attention"
+        )
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one rotated KV chunk for ring merging.
+
+        Inputs use packed ``[T, H, D]`` layout. The returned attention output
+        has the query shape and softmax LSE uses ``[H, Tq]`` layout.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement ring KV-chunk attention"
+        )
 
 
 def wrap_attention_impl_forward(attn_impl: AttentionImpl) -> AttentionImpl:

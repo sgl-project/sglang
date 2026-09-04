@@ -158,7 +158,7 @@ def test_realtime_session_cache_rejects_missing_nonzero_chunk():
 def test_lingbot_realtime_state_uses_control_script_and_prompt_queues():
     state = lingbot_realtime.LingBotWorldRealtimeState()
 
-    assert state.sample_camera_actions(3) == [[], [], []]
+    assert state.sample_camera_actions(3) is None
     state.receive_camera_action_script([["w"], ["a"], ["s"], ["d"]])
     assert state.sample_camera_actions(3) == [["w"], ["a"], ["s"]]
     assert state.sample_camera_actions(3) == [["d"], [], []]
@@ -1008,9 +1008,7 @@ def test_realtime_chunk_latent_preparation_uses_chunk_spec():
     )
 
     transformer = SimpleNamespace(
-        config=SimpleNamespace(
-            arch_config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
-        )
+        config=SimpleNamespace(out_channels=16, num_frames_per_block=3)
     )
     stage = RealtimeChunkLatentPreparationStage.__new__(
         RealtimeChunkLatentPreparationStage

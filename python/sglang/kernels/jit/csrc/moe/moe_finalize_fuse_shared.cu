@@ -35,10 +35,10 @@
  * ``DeepseekV3MoE.forward``, and gives the downstream allreduce+rmsnorm
  * a clean PDL handoff.
  *
- * Expert-weight dtype is templated on ``TypeExpW`` so we support both the
- * bf16 and fp32 topk-weight paths (DSv3/K2.5 trtllm backends use fp32
- * because their ``_routing_logits_dtype = torch.float32``; other backends
- * use bf16).
+ * Expert-weight dtype is templated on ``TypeExpW`` so we accept both bf16
+ * and fp32 topk weights. The trtllm deferred-finalize path always feeds bf16
+ * (the trtllm-gen routing kernel emits bf16 for every routing method); fp32
+ * is kept for callers that produce topk weights in fp32.
  *
  * Expert-weight scale convention: in our target backends
  * (flashinfer trtllm nvfp4 + unquantized), ``apply_routed_scaling_factor_on_output``
@@ -323,8 +323,6 @@ void dispatchFinalize(
   }
 }
 
-}  // namespace sglang
-
 // ---------------------------------------------------------------------------
 // Host launcher
 // ---------------------------------------------------------------------------
@@ -344,7 +342,7 @@ void moe_finalize_fuse_shared(
   int const numTokens = int(out.size(0));
   int const hiddenDim = int(out.size(1));
   int const hiddenDimPadded = int(gemm2_out.size(1));
-  TVM_FFI_ICHECK_LE(top_k, sglang::MAX_TOPK);
+  TVM_FFI_ICHECK_LE(top_k, MAX_TOPK);
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.size(0), numTokens * top_k);
   TVM_FFI_ICHECK_EQ(expert_weights.size(0), numTokens);
   TVM_FFI_ICHECK_EQ(expert_weights.size(1), top_k);
@@ -356,10 +354,10 @@ void moe_finalize_fuse_shared(
     TVM_FFI_ICHECK_EQ(shared_output.size(1), hiddenDim);
   }
 
-  auto const* inPtr = static_cast<sglang::BF16 const*>(gemm2_out.data_ptr());
+  auto const* inPtr = static_cast<BF16 const*>(gemm2_out.data_ptr());
   auto const* expandedIdxPtr = static_cast<int const*>(expanded_idx_to_permuted_idx.data_ptr());
-  auto const* sharedPtr = hasShared ? static_cast<sglang::BF16 const*>(shared_output.data_ptr()) : nullptr;
-  auto* outPtr = static_cast<sglang::BF16*>(out.data_ptr());
+  auto const* sharedPtr = hasShared ? static_cast<BF16 const*>(shared_output.data_ptr()) : nullptr;
+  auto* outPtr = static_cast<BF16*>(out.data_ptr());
 
   cudaSetDevice(out.device().device_id);
   cudaStream_t const stream = get_stream(out.device());
@@ -378,7 +376,7 @@ void moe_finalize_fuse_shared(
 
   auto ew_dtype = expert_weights.dtype();
   if (ew_dtype == DLDataType{kDLFloat, 32, 1}) {
-    sglang::dispatchFinalize<float>(
+    dispatchFinalize<float>(
         numTokens,
         hiddenDim,
         hiddenDimPadded,
@@ -393,7 +391,7 @@ void moe_finalize_fuse_shared(
         attrs,
         1);
   } else if (ew_dtype == DLDataType{kDLBfloat, 16, 1}) {
-    sglang::dispatchFinalize<sglang::BF16>(
+    dispatchFinalize<BF16>(
         numTokens,
         hiddenDim,
         hiddenDimPadded,
@@ -416,3 +414,5 @@ void moe_finalize_fuse_shared(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_finalize_fuse_shared, moe_finalize_fuse_shared);
+
+}  // namespace sglang

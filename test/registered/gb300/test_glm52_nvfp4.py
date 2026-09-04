@@ -2,11 +2,12 @@ import unittest
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.gb300_utils import GB300_NCCL_PORT
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
-from sglang.test.test_utils import ModelLaunchSettings
+from sglang.test.test_utils import CustomTestCase, ModelLaunchSettings
 
-register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300-glm5-nvfp4", nightly=True)
+register_cuda_ci(est_time=2280, stage="nightly", runner_config="4-gpu-gb300")
 
 MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
 
@@ -18,6 +19,8 @@ COMMON_ARGS = [
     "--moe-runner-backend=flashinfer_trtllm",
     "--mem-fraction-static=0.9",
     "--enable-metrics",
+    "--nccl-port",
+    GB300_NCCL_PORT,
 ]
 
 TP_MTP_ARGS = [
@@ -35,7 +38,7 @@ DP_MTP_ARGS = [
 ]
 
 
-class TestGlm52Nvfp4(unittest.TestCase):
+class TestGlm52Nvfp4(CustomTestCase):
     """GLM-5.2 NVFP4 on GB300 (4x GB300 NVL4, tp=4)."""
 
     def test_glm52_nvfp4(self):
@@ -61,7 +64,7 @@ class TestGlm52Nvfp4(unittest.TestCase):
             test_name="GLM-5.2-NVFP4",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_gb300",
+                result_dir="performance_results_gb300",
             ),
         )
 
