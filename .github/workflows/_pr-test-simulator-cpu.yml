@@ -94,3 +94,5 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_predictor_contract.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_infercast_predictor.py
