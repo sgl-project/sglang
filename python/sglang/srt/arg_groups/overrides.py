@@ -1373,29 +1373,12 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
     return {}
 
 
-def resolve_default_page_size(view: Any) -> int:
-    """The page size `_page_size_default` would fill in, without declaring it.
-
-    Callers that must read the page size *before* the pass runs at its slot
-    (dLLM prefill bucket sizing, which runs at memory sizing) need the value
-    without the declaration, so the two share this resolver.
-    """
-    if view.page_size is not None:
-        return view.page_size
-    platform = get_platform()
-    if (
-        platform.is_hip
-        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
-    ):
-        return 64
-    return 64 if platform.is_musa else 1
-
-
 @register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
 
+    platform = get_platform()
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
     # when the layout flag is set avoids users having to pass
@@ -1404,14 +1387,15 @@ def _page_size_default(view: Any) -> dict:
     # platforms the SHUFFLE 5D pool has no consumer kernels and the
     # env var is silently ignored (see MHATokenToKVPool).
     if (
-        get_platform().is_hip
+        platform.is_hip
         and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
     ):
         logger.info(
             "Setting page_size=64 as default for "
             "SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d."
         )
-    return {"page_size": resolve_default_page_size(view)}
+        return {"page_size": 64}
+    return {"page_size": 64 if platform.is_musa else 1}
 
 
 @register_post_process
@@ -1694,43 +1678,52 @@ def _dllm_overlap_disable(view: Any) -> dict:
     return {"disable_overlap_schedule": True}
 
 
-def resolve_dllm_page_size(
-    *,
-    page_size: int,
-    block_size: int,
-    disable_radix_cache: bool,
-) -> int:
-    if not disable_radix_cache and page_size % block_size != 0:
-        return block_size
-    return min(page_size, block_size)
-
-
 @register_post_process
 def _dllm_page_size(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
     from sglang.srt.dllm.config import DllmConfig
 
-    config = DllmConfig.from_server_args(view)
-    page_size = resolve_dllm_page_size(
-        page_size=view.page_size,
-        block_size=config.block_size,
-        disable_radix_cache=view.disable_radix_cache,
-    )
+    block_size = DllmConfig.from_server_args(view).block_size
+
+    if not view.disable_radix_cache and view.page_size % block_size != 0:
+        # The radix cache matches prefixes a page at a time, so a page size that
+        # does not divide the block size cannot express a dLLM block boundary.
+        logger.warning(f"Setting page size to {block_size} for diffusion LLM inference")
+        return {"page_size": block_size}
+
+    page_size = min(view.page_size, block_size)
+
+    # The invariant `memory_hook.dllm_prefill_graph_alignment` reads the block
+    # size on. The prefill graph captures totals aligned to lcm(page_size,
+    # block_size), so a page size that does not divide the block multiplies the
+    # capture list -- up to 31x for a 32-token block -- without giving the
+    # scheduler one extra shape it can emit. Only the radix-off path gets here
+    # (the branch above coerces otherwise), where the page size is the layout
+    # the caller asked for, so say so rather than change it silently. With no
+    # graph to capture there is nothing to multiply, hence the phase check.
+    alignment = math.lcm(page_size, block_size)
+    if alignment != block_size and (
+        view.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+    ):
+        raise ValueError(
+            f"dLLM needs a page size that divides the block size: "
+            f"page_size={view.page_size} against block_size={block_size} "
+            f"aligns the prefill graph to {alignment} instead of {block_size}, "
+            f"which multiplies the captured bucket list by {alignment // block_size}. "
+            f"Pick a divisor of {block_size}, drop --disable-radix-cache and the "
+            "page size is coerced instead, or turn the prefill CUDA graph off."
+        )
+
     if page_size == view.page_size:
         return {}
-    if not view.disable_radix_cache and view.page_size % config.block_size != 0:
-        logger.warning(
-            f"Setting page size to {config.block_size} for diffusion LLM inference"
-        )
-    else:
-        # Legacy scheduler-init fallback, folded into the pass: the page
-        # size must not exceed the dllm block size.
-        logger.warning(
-            "WARNING: "
-            f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
-            f"Page size now falls back to {config.block_size}"
-        )
+    # Legacy scheduler-init fallback, folded into the pass: the page
+    # size must not exceed the dllm block size.
+    logger.warning(
+        "WARNING: "
+        f"The page size {view.page_size} should not be larger than dllm block size {block_size}."
+        f"Page size now falls back to {block_size}"
+    )
     return {"page_size": page_size}
 
 

@@ -765,10 +765,6 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
-            # dLLM + TBO is rejected in validation (check_two_batch_overlap), so
-            # these never carry a real value here. They are still classified
-            # because every ForwardBatch field must be, and copy-as-is is the
-            # correct answer for a forward-level flag if the two ever combine.
             "dllm_config",  # shared forward-level dLLM config
             "is_dllm_prefill",  # inherited forward-level dLLM phase flag
         ]:

@@ -187,6 +187,8 @@ def check_server_args(server_args: Any):
     # Check two batch overlap backend requirement.
     check_two_batch_overlap(server_args)
 
+    check_dllm_speculative_decoding(server_args)
+
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
         raise ValueError("Communications quantization is only used with tp_size != 1")
@@ -403,6 +405,22 @@ def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+
+
+def check_dllm_speculative_decoding(server_args: Any):
+    """dLLM runs its own denoising loop, so a draft/verify path has no meaning.
+
+    It also keeps `max_running_requests` still after memory sizing: the
+    speculative handlers fill it with 48 at a later slot, which would push
+    prefill totals past the dLLM graph buckets already sized and reserved for.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.dllm_algorithm is not None and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--speculative-algorithm is not supported with diffusion LLM "
+            "inference (--dllm-algorithm): dLLM decodes a masked block per "
+            "step rather than verifying draft tokens."
+        )
 
 
 def check_two_batch_overlap(server_args: Any):

@@ -484,17 +484,13 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
-        # Only pure dLLM prefill plans a ragged custom mask, and it needs a
-        # wrapper of its own for two independent reasons:
-        #   1. FlashInfer resolves backend="auto" on the first plan and then
-        #      keeps it. On SM90 an unmasked first plan selects FA3, which does
-        #      not support a later custom mask -- hence the pinned "fa2".
-        #   2. The ragged plan() only *assigns* `_custom_mask_buf`; unlike the
-        #      paged plan() it never resets it to None when no mask is passed.
-        #      A masked plan would therefore leak its mask into every later
-        #      unmasked plan on the same wrapper.
-        # Both are about cross-plan state, so the mask never shares a wrapper
-        # with anything else. Non-dLLM runs allocate nothing.
+        # Only pure dLLM prefill plans a ragged custom mask, and it needs its
+        # own wrapper for two cross-plan reasons: FlashInfer pins
+        # backend="auto" on the first plan (unmasked picks FA3 on SM90, which
+        # rejects a later custom mask -- hence "fa2"), and ragged plan() only
+        # assigns `_custom_mask_buf`, never clearing it as paged plan() does,
+        # so one masked plan would leak its mask into later unmasked plans.
+        # Non-dLLM runs allocate nothing.
         self.prefill_wrapper_ragged_custom_mask = (
             BatchPrefillWithRaggedKVCacheWrapper(
                 self.workspace_buffer, "NHD", backend="fa2"
