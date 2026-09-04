@@ -1,5 +1,7 @@
 import asyncio
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -80,6 +82,49 @@ def test_health_encode_rechecks_busy_state_after_waiting(monkeypatch):
         assert response.status_code == 200
         assert broadcasts == []
         assert encoder.encode_calls == []
+
+    asyncio.run(run_test())
+
+
+def test_launch_server_bounds_graceful_shutdown(monkeypatch):
+    serving = SimpleNamespace(host="127.0.0.1", port=30000)
+    uvicorn_run = MagicMock()
+    monkeypatch.setattr(http_server, "dp_dispatcher", None)
+    monkeypatch.setattr(http_server, "configure_logger", MagicMock())
+    monkeypatch.setattr(http_server, "publish", MagicMock())
+    monkeypatch.setattr(http_server, "get_parallel", lambda: SimpleNamespace(dp_size=2))
+    monkeypatch.setattr(http_server, "launch_dp_runtime", MagicMock())
+    monkeypatch.setattr(
+        http_server, "get_observability", lambda: SimpleNamespace(enable_metrics=False)
+    )
+    monkeypatch.setattr(
+        http_server,
+        "get_disagg",
+        lambda: SimpleNamespace(encoder_register_urls=[]),
+    )
+    monkeypatch.setattr(http_server, "get_serving", lambda: serving)
+    monkeypatch.setattr(http_server.uvicorn, "run", uvicorn_run)
+
+    http_server.launch_server(SimpleNamespace())
+
+    uvicorn_run.assert_called_once_with(
+        http_server.app,
+        host=serving.host,
+        port=serving.port,
+        timeout_graceful_shutdown=5,
+    )
+
+
+def test_dp_lifespan_stops_dispatcher(monkeypatch):
+    async def run_test():
+        dispatcher = SimpleNamespace(start=MagicMock(), stop=AsyncMock())
+        monkeypatch.setattr(http_server, "dp_dispatcher", dispatcher)
+        monkeypatch.setattr(http_server, "local_runtime", None)
+
+        async with http_server._lifespan(http_server.app):
+            dispatcher.stop.assert_not_awaited()
+
+        dispatcher.stop.assert_awaited_once_with()
 
     asyncio.run(run_test())
 

@@ -1,9 +1,14 @@
 import asyncio
 import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import sglang.srt.disaggregation.encoder.runtime as runtime_module
 from sglang.srt.disaggregation.encoder.runtime import (
+    DPDispatcher,
+    EncoderRuntime,
     EncoderScheduler,
     PendingRequest,
     _resolve_encoder_batch_policy,
@@ -119,6 +124,41 @@ def test_scheduler_coalesces_concurrent_submissions():
 )
 def test_resolve_encoder_batch_policy(model_type, configured, explicit, expected):
     assert _resolve_encoder_batch_policy(model_type, configured, explicit) == expected
+
+
+def test_encoder_runtime_reaps_tp_workers_when_scheduler_stop_fails():
+    async def run_test():
+        process = SimpleNamespace(pid=123)
+        runtime = EncoderRuntime(
+            encoder=None,
+            scheduler=SimpleNamespace(
+                stop=AsyncMock(side_effect=RuntimeError("scheduler stop failed"))
+            ),
+            send_sockets=[],
+            zmq_context=None,
+            tp_processes=[process],
+        )
+
+        with patch.object(runtime_module, "_terminate_worker_processes") as terminate:
+            with pytest.raises(RuntimeError, match="scheduler stop failed"):
+                await runtime.stop()
+
+        terminate.assert_called_once_with([process])
+
+    asyncio.run(run_test())
+
+
+def test_dp_dispatcher_stop_reaps_workers():
+    async def run_test():
+        process = SimpleNamespace(pid=456)
+        dispatcher = DPDispatcher(1, [], None, [process])
+
+        with patch.object(runtime_module, "_terminate_worker_processes") as terminate:
+            await dispatcher.stop()
+
+        terminate.assert_called_once_with([process])
+
+    asyncio.run(run_test())
 
 
 if __name__ == "__main__":
