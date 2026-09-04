@@ -89,6 +89,11 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         ...
 
     @abstractmethod
+    def is_external_cache_stored(self, node_id: NodeId) -> bool:
+        """Whether the node is known to be stored in the external cache."""
+        ...
+
+    @abstractmethod
     def is_node_in_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:

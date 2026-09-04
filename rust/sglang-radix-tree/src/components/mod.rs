@@ -390,6 +390,15 @@ pub trait TreeComponent<K: ChildKeyType> {
         unimplemented!("TreeComponent.build_hicache_transfers")
     }
 
+    /// Build this component's direct device-to-external-store transfer for a node.
+    fn build_external_linker_offload_transfer(
+        &self,
+        _tree_core: &UnifiedTreeCore<K>,
+        _node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        None
+    }
+
     /// Post-transfer bookkeeping: store host indices, update LRU, etc.
     fn commit_hicache_transfer(
         &self,

@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentData,
     ComponentType,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     TreeComponent,
     get_and_increase_time_counter,
@@ -919,7 +920,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self.enable_external_cache_linker:
             return (
-                not node.external_cache_stored
+                self._needs_external_linker_offload(node)
                 and node.hit_count >= self.write_through_threshold
             )
 
@@ -928,6 +929,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             and not node.backuped
             and node.hit_count >= self.write_through_threshold
         )
+
+    @staticmethod
+    def _needs_external_linker_offload(node: UnifiedTreeNode) -> bool:
+        """Whether neither a confirmed nor an in-flight external copy exists."""
+        return not node.external_cache_stored and node.write_through_pending_id is None
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
@@ -2088,7 +2094,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             while (
                 ancestor is not None
                 and ancestor is not self.root_node
-                and not (ancestor.backuped or ancestor.external_cache_stored)
+                and not ancestor.backuped
+                and not ancestor.external_cache_stored
+                and (
+                    not self.enable_external_cache_linker
+                    or ancestor.write_through_pending_id is None
+                )
             ):
                 chain.append(ancestor)
                 ancestor = ancestor.parent
@@ -2202,6 +2213,69 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node.load_back_pending_id = None
             self._update_duplicate_tracking(node)
             node = node.parent
+
+    def build_external_linker_offload_transfers(
+        self, node_id: NodeId
+    ) -> Optional[list[PoolTransfer]]:
+        """Build transfers for a node with no stored or pending external copy."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            return None
+
+        transfers = []
+        for component in self.components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.OFFLOAD, node, None
+            )
+            if transfer is not None:
+                transfers.append(transfer)
+        return transfers
+
+    def mark_external_cache_stored_path(
+        self, from_node_id: NodeId, until_node_id: NodeId
+    ) -> None:
+        """Mark an externally restored path, excluding its existing anchor."""
+        until_node = self.node_by_id(until_node_id)
+        node = self.node_by_id(from_node_id)
+        path = []
+        while node is not until_node:
+            if node.parent is None:
+                raise RuntimeError(
+                    f"node {until_node_id} is not an ancestor of node {from_node_id}"
+                )
+            path.append(node)
+            node = node.parent
+
+        for node in path:
+            node.external_cache_stored = True
+
+    def mark_external_linker_offload_pending(self, node_id: NodeId) -> None:
+        """Publish an accepted external offload as pending."""
+        node = self.node_by_id(node_id)
+        if not self._needs_external_linker_offload(node):
+            raise AssertionError(
+                f"invalid external offload state for node {node_id}: "
+                f"stored={node.external_cache_stored}, "
+                f"pending={node.write_through_pending_id}"
+            )
+        node.write_through_pending_id = node_id
+
+    def finish_external_linker_offload(
+        self, node_ids: Sequence[NodeId], ack_id: NodeId, success: bool
+    ) -> None:
+        """Finalize external-store state for an offload and its split fragments."""
+        nodes = [self.node_by_id(node_id) for node_id in node_ids]
+        for node_id, node in zip(node_ids, nodes):
+            if node.write_through_pending_id != ack_id:
+                raise AssertionError(
+                    f"invalid external offload state for node {node_id}: "
+                    f"expected pending={ack_id}; got "
+                    f"stored={node.external_cache_stored}, "
+                    f"pending={node.write_through_pending_id}"
+                )
+        for node in nodes:
+            node.write_through_pending_id = None
+            node.external_cache_stored |= success
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:
         """Mark a node as having an in-flight write-through backup."""

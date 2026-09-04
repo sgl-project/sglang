@@ -7756,6 +7756,7 @@ class _InsertWalkSuite(CustomTestCase):
 
     _rid = 0
     _make_req = UnifiedRadixCacheSuite._make_req
+    _apply_match_to_req = UnifiedRadixCacheSuite._apply_match_to_req
     _alloc = UnifiedRadixCacheSuite._alloc
     _insert = UnifiedRadixCacheSuite._insert
     _init_hicache = UnifiedRadixCacheSuite._init_hicache

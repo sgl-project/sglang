@@ -1753,6 +1753,17 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         py.allow_threads(|| self.core().enable_storage)
     }
 
+    /// Enable or disable the direct external-cache linker.
+    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+        py.allow_threads(|| self.core().set_enable_external_cache_linker(value))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Whether the direct external-cache linker is wired.
+    fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+        py.allow_threads(|| self.core().enable_external_cache_linker)
+    }
+
     /// Queue the all-cleared placement event.
     fn record_all_cleared_event(&self, py: Python<'_>) {
         py.allow_threads(|| self.core().record_all_cleared_event());
@@ -1833,6 +1844,64 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Clear the in-flight H->D marks on the anchor's root path at ack time.
     fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) {
         py.allow_threads(|| self.core().finish_load_back(anchor_node_id));
+    }
+
+    /// Build transfers for a node with no stored or pending external copy.
+    fn build_external_linker_offload_transfers(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+        let transfers = py
+            .allow_threads(|| self.core().build_external_linker_offload_transfers(node_id))
+            .map_err(tree_core_runtime_error)?;
+        transfers
+            .map(|transfers| {
+                transfers
+                    .into_iter()
+                    .map(|transfer| transfer_to_py(py, transfer))
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()
+    }
+
+    /// Mark an externally restored path, excluding its existing anchor.
+    fn mark_external_cache_stored_path(
+        &self,
+        py: Python<'_>,
+        from_node_id: NodeId,
+        until_node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .mark_external_cache_stored_path(from_node_id, until_node_id)
+        })
+        .map_err(tree_core_runtime_error)
+    }
+
+    /// Publish an accepted external offload as pending.
+    fn mark_external_linker_offload_pending(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<()> {
+        py.allow_threads(|| self.core().mark_external_linker_offload_pending(node_id))
+            .map_err(tree_core_assertion_error)
+    }
+
+    /// Finalize external-store state for an offload and its split fragments.
+    fn finish_external_linker_offload(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        ack_id: NodeId,
+        success: bool,
+    ) -> PyResult<()> {
+        py.allow_threads(|| {
+            self.core()
+                .finish_external_linker_offload(&node_ids, ack_id, success)
+        })
+        .map_err(tree_core_assertion_error)
     }
 
     /// Order-sensitive digest of reclaimed coexisting host values.
@@ -1916,6 +1985,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
     ) -> Option<usize> {
         py.allow_threads(|| self.core().inspect_get_write_through_pending_id(node_id))
+    }
+
+    fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> bool {
+        py.allow_threads(|| self.core().inspect_is_external_cache_stored(node_id))
     }
 
     fn inspect_is_node_in_device_lru(
@@ -2779,6 +2852,20 @@ macro_rules! tree_core_binding {
                 self.inner.enable_storage(py)
             }
 
+            /// Enable or disable the direct external-cache linker.
+            fn set_enable_external_cache_linker(
+                &self,
+                py: Python<'_>,
+                value: bool,
+            ) -> PyResult<()> {
+                self.inner.set_enable_external_cache_linker(py, value)
+            }
+
+            /// Whether the direct external-cache linker is wired.
+            fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+                self.inner.enable_external_cache_linker(py)
+            }
+
             /// Queue the all-cleared placement event.
             fn record_all_cleared_event(&self, py: Python<'_>) {
                 self.inner.record_all_cleared_event(py)
@@ -2812,6 +2899,53 @@ macro_rules! tree_core_binding {
             /// Clear the in-flight H->D marks on the anchor's root path at ack time.
             fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) {
                 self.inner.finish_load_back(py, anchor_node_id)
+            }
+
+            /// Build transfers for a node with no stored or pending external copy.
+            fn build_external_linker_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+                self.inner
+                    .build_external_linker_offload_transfers(py, node_id)
+            }
+
+            /// Mark an externally restored path, excluding its existing anchor.
+            fn mark_external_cache_stored_path(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<()> {
+                self.inner.mark_external_cache_stored_path(
+                    py,
+                    from_node_id,
+                    until_node_id,
+                )
+            }
+
+            /// Publish an accepted external offload as pending.
+            fn mark_external_linker_offload_pending(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<()> {
+                self.inner
+                    .mark_external_linker_offload_pending(py, node_id)
+            }
+
+            /// Finalize external-store state for an offload and its split fragments.
+            fn finish_external_linker_offload(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+                success: bool,
+            ) -> PyResult<()> {
+                self.inner.finish_external_linker_offload(
+                    py, node_ids, ack_id, success,
+                )
             }
 
             /// Order-sensitive digest of reclaimed coexisting host values.
@@ -2906,6 +3040,15 @@ macro_rules! tree_core_binding {
             ) -> Option<usize> {
                 self.inner
                     .inspect_get_write_through_pending_id(py, node_id)
+            }
+
+            #[cfg(feature = "inspection")]
+            fn inspect_is_external_cache_stored(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> bool {
+                self.inner.inspect_is_external_cache_stored(py, node_id)
             }
 
             #[cfg(feature = "inspection")]

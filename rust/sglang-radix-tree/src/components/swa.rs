@@ -932,6 +932,35 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         })
     }
 
+    fn build_external_linker_offload_transfer(
+        &self,
+        tree_core: &UnifiedTreeCore<K>,
+        node_id: NodeIdx_,
+    ) -> Option<PoolTransfer> {
+        let node = tree_core.arena.node(node_id);
+        let hashes = node
+            .hash_value
+            .as_ref()
+            .filter(|hashes| !hashes.is_empty())?;
+        let value = node.try_device_value(SWA)?;
+        let num_pages = value.size()[0] as usize / tree_core.page_size;
+        if num_pages == 0 {
+            return None;
+        }
+        let num_tokens = num_pages * tree_core.page_size;
+        Some(PoolTransfer {
+            name: PoolName::Swa,
+            device_indices: Some(
+                value
+                    .narrow(0, value.size()[0] - num_tokens as i64, num_tokens as i64)
+                    .to_kind(Kind::Int64),
+            ),
+            keys: Some(hashes[hashes.len().saturating_sub(num_pages)..].to_vec()),
+            hit_policy: PoolHitPolicy::TrailingPages,
+            ..Default::default()
+        })
+    }
+
     fn commit_hicache_transfer(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
