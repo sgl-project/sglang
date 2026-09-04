@@ -146,7 +146,7 @@ def _float_open_short_side(flt, demand) -> None:
     if flt is None or flt._is_frontier_transparent():
         return  # no float involved / empty float never blocks
     if not any(pages > 0 for pages in demand.values()):
-        return  # nothing demanded — nothing to open (also keeps slack's max() total)
+        return  # nothing demanded -- nothing to open (also keeps slack's max() total)
     for band_alloc, pages in demand.items():
         if pages <= 0:
             continue
@@ -1321,6 +1321,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # `free_segment` already derived these by stride slicing.
                 free_v_pages = pages
             elif self.page_size == 1:
+                # ps == 1: token == page, and callers pass unique ids, so no dedup.
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
@@ -1625,7 +1626,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         sorted-ASCENDING snapshot) and `_pending_reuse_pages_cpu`. Returns
         `(p, j)`, or `(None, j)` if none -- the hole cursor `j` is threaded back
         in so the two-pointer membership test stays O(1). `holes_cpu`/`j_in` are
-        optional only for test fixtures; `_flush` always passes them.
+        optional only for test fixtures; `_flush` always passes them. Uncommitted
+        dsts already read p2v == -1, so no exclude set is needed.
         """
         if holes_cpu is None:
             holes_cpu = self._free_phys_pages.tolist()
@@ -1736,7 +1738,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             single_pass_absorb = urgent and len(holes_cpu) > 0
             if single_pass_absorb:
                 self._settle_inflight_forward()
-                latest_event = None  # reads/writes settled → srcs are fired
+                latest_event = None  # reads/writes settled -> srcs are fired
 
             # write_set: None = not yet materialized (do it inline on the first
             # survivor needing the check); set() = no write race; else materialized.
@@ -1792,7 +1794,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         if inflight is not None:
                             torch.cuda.current_stream().wait_event(inflight[0])
                             self._inflight_forward = None
-                        write_set = set()  # forward drained → no race
+                        write_set = set()  # forward drained -> no race
                         latest_event = None
                         # DO NOT reset cursor/j_cursor: rewinding would re-pick
                         # the just-committed srcs (now p2v=-1, not in holes_cpu)
@@ -2299,7 +2301,8 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
         means the ask is impossible now, and state is then unchanged.
         Scheduler-phase only; stream safety is owned HERE, not by the caller --
-        the entry settles the in-flight forward before the first copy.
+        the entry settles the in-flight forward before the first copy. Moves at
+        most min(L_live, G) pages: every live page when the ask exceeds them.
         """
         assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
         # Order the copies after the in-flight forward, or they carry pre-write
