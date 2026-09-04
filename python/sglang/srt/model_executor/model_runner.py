@@ -1921,14 +1921,15 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
-        if self.watermark_state is not None:
+        watermark_state = getattr(self, "watermark_state", None)
+        if watermark_state is not None:
             req_pool_indices = forward_batch.req_pool_indices[
                 : logits_output.next_token_logits.shape[0]
             ]
-            self.watermark_state.init_from_prompt(
+            watermark_state.init_from_prompt(
                 req_pool_indices, forward_batch.watermark_prompt_tail_ids
             )
-            self.watermark_state.force(
+            watermark_state.force(
                 logits_output.next_token_logits,
                 req_pool_indices,
                 forward_batch.sampling_info,
@@ -1957,8 +1958,8 @@ class ModelRunner:
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
         )
-        if self.watermark_state is not None:
-            self.watermark_state.append(req_pool_indices, next_token_ids)
+        if watermark_state is not None:
+            watermark_state.append(req_pool_indices, next_token_ids)
         return next_token_ids
 
     def compute_logprobs_only(

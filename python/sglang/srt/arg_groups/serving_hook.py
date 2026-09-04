@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.sampling.watermark_config import load_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -28,6 +29,23 @@ from sglang.srt.utils.common import (
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def handle_secret_file_configs(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is None:
+        return
+    if cfg.watermark_key is not None:
+        raise ValueError(
+            "--watermark-config and --watermark-key are mutually exclusive"
+        )
+    config = load_watermark_config(cfg.watermark_config)
+    declare_resolution(
+        server_args,
+        "handle_secret_file_configs",
+        watermark_key=config.key,
+        watermark_context_window=config.context_window,
+    )
 
 
 def handle_ssl_validation(server_args: Any):
