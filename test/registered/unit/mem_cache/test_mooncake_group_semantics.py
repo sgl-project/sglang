@@ -18,6 +18,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 class ReplicateConfigWithGroupIds:
     def __init__(self):
         self.group_ids = None
+        self.replica_num = 1
+        self.dfs_replica_num = 0
 
 
 class ReplicateConfigWithoutGroupIds:
@@ -29,6 +31,12 @@ class ReplicateConfigWithClassGroupIdsAndRequiredInit:
 
     def __init__(self, required):
         self.group_ids = required
+
+
+class ReplicateConfigWithoutDfsReplica:
+    def __init__(self):
+        self.group_ids = None
+        self.replica_num = 1
 
 
 def _fake_mooncake_modules(fake_store_cls, replicate_config_cls):
@@ -199,6 +207,11 @@ class FakeMultiBufferPool:
 def _make_config(
     *,
     enable_group_semantics=True,
+    replica_num=1,
+    dfs_replica_num=0,
+    tenant_id="default",
+    enable_ssd_offload=None,
+    ssd_offload_path=None,
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -207,11 +220,21 @@ def _make_config(
     tp_size=1,
     tp_lcm_size=None,
 ):
+    if enable_ssd_offload is None:
+        enable_ssd_offload = dfs_replica_num > 0
+    if ssd_offload_path is None and dfs_replica_num > 0:
+        ssd_offload_path = "/tmp"
+
     extra_config = {
         "master_server_address": "127.0.0.1:50051",
         "check_server": False,
         "global_segment_size": 1024 * 1024,
         "enable_group_semantics": enable_group_semantics,
+        "replica_num": replica_num,
+        "dfs_replica_num": dfs_replica_num,
+        "tenant_id": tenant_id,
+        "enable_ssd_offload": enable_ssd_offload,
+        "ssd_offload_path": ssd_offload_path,
     }
     if extra_backend_tag is not None:
         extra_config["extra_backend_tag"] = extra_backend_tag
@@ -237,6 +260,12 @@ def _make_store(
     *,
     enable_group_semantics=True,
     replicate_config_cls=ReplicateConfigWithGroupIds,
+    replica_num=1,
+    dfs_replica_num=0,
+    tenant_id="default",
+    enable_ssd_offload=None,
+    ssd_offload_path=None,
+    storage_backend_descriptor="distributed_storage_backend",
     extra_backend_tag=None,
     model_name=None,
     is_mla_model=False,
@@ -248,6 +277,11 @@ def _make_store(
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
         enable_group_semantics=enable_group_semantics,
+        replica_num=replica_num,
+        dfs_replica_num=dfs_replica_num,
+        tenant_id=tenant_id,
+        enable_ssd_offload=enable_ssd_offload,
+        ssd_offload_path=ssd_offload_path,
         extra_backend_tag=extra_backend_tag,
         model_name=model_name,
         is_mla_model=is_mla_model,
@@ -258,17 +292,21 @@ def _make_store(
     )
 
     with patch.dict(
-        "sys.modules",
-        {
-            **_fake_mooncake_modules(fake_store_cls, replicate_config_cls),
-            **_fake_host_pool_modules(),
-        },
+        "os.environ",
+        {"MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR": storage_backend_descriptor},
     ):
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-            MooncakeStore,
-        )
+        with patch.dict(
+            "sys.modules",
+            {
+                **_fake_mooncake_modules(fake_store_cls, replicate_config_cls),
+                **_fake_host_pool_modules(),
+            },
+        ):
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                MooncakeStore,
+            )
 
-        store = MooncakeStore(cfg)
+            store = MooncakeStore(cfg)
 
     return store, fake_store_cls.instances[-1]
 
@@ -311,6 +349,128 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
         self.assertEqual(fake_store.batch_put_calls[0]["args"], ())
+
+    def test_dfs_replica_config_is_forwarded(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            replica_num=1,
+            dfs_replica_num=1,
+        )
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        result = store.batch_set_v1(["page0"], torch.tensor([0]))
+
+        self.assertEqual(result, [True])
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(len(call["args"]), 1)
+        self.assertEqual(call["args"][0].replica_num, 1)
+        self.assertEqual(call["args"][0].dfs_replica_num, 1)
+
+    def test_replica_config_composes_with_group_semantics(self):
+        store, fake_store = _make_store(replica_num=2, dfs_replica_num=1)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        result = store.batch_set_v1(["page0"], torch.tensor([0]))
+
+        self.assertEqual(result, [True])
+        config = fake_store.batch_put_calls[0]["args"][0]
+        self.assertEqual(config.replica_num, 2)
+        self.assertEqual(config.dfs_replica_num, 1)
+        self.assertEqual(
+            config.group_ids,
+            ["sglang-hicache:page0", "sglang-hicache:page0"],
+        )
+
+    def test_replica_config_is_request_scoped(self):
+        store, fake_store = _make_store(dfs_replica_num=1)
+        store.register_mem_pool_host(FakeHostKVCache(objects_per_page=2))
+
+        store.batch_set_v1(["page0"], torch.tensor([0]))
+        store.batch_set_v1(["page1"], torch.tensor([1]))
+
+        first_config = fake_store.batch_put_calls[0]["args"][0]
+        second_config = fake_store.batch_put_calls[1]["args"][0]
+        self.assertIsNot(first_config, second_config)
+        self.assertEqual(
+            first_config.group_ids,
+            ["sglang-hicache:page0", "sglang-hicache:page0"],
+        )
+        self.assertEqual(
+            second_config.group_ids,
+            ["sglang-hicache:page1", "sglang-hicache:page1"],
+        )
+
+    def test_dfs_replica_config_is_forwarded_to_multi_buffer_put(self):
+        store, fake_store = _make_store(
+            enable_group_semantics=False,
+            dfs_replica_num=1,
+            is_mla_model=True,
+        )
+        store.register_mem_host_pool_v2(FakeMultiBufferPool(), PoolName.DEEPSEEK_V4_C4)
+
+        result = store.batch_set_v2(
+            [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    keys=["page0"],
+                    host_indices=torch.tensor([0]),
+                )
+            ]
+        )
+
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [True])
+        call = fake_store.batch_put_calls[0]
+        self.assertEqual(call["method"], "batch_put_from_multi_buffers")
+        self.assertEqual(call["args"][0].dfs_replica_num, 1)
+
+    def test_invalid_replica_counts_fail_during_initialization(self):
+        with self.assertRaisesRegex(ValueError, "replica_num must be at least 1"):
+            _make_store(replica_num=0)
+
+        with self.assertRaisesRegex(ValueError, "dfs_replica_num must be 0 or 1"):
+            _make_store(dfs_replica_num=2)
+
+    def test_non_integer_replica_counts_fail_during_initialization(self):
+        for field, value in (
+            ("replica_num", 1.5),
+            ("dfs_replica_num", 0.5),
+            ("replica_num", True),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, f"{field} must be an integer"):
+                    _make_store(**{field: value})
+
+    def test_dfs_replica_rejects_non_default_tenant(self):
+        with self.assertRaisesRegex(
+            ValueError, "DFS replicas currently require tenant_id='default'"
+        ):
+            _make_store(dfs_replica_num=1, tenant_id="tenant-a")
+
+    def test_embedded_dfs_replica_requires_ssd_offload(self):
+        with self.assertRaisesRegex(ValueError, "enable_ssd_offload=true"):
+            _make_store(dfs_replica_num=1, enable_ssd_offload=False)
+
+    def test_embedded_dfs_replica_requires_distributed_backend(self):
+        with self.assertRaisesRegex(
+            ValueError, "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR"
+        ):
+            _make_store(
+                dfs_replica_num=1,
+                storage_backend_descriptor="bucket_storage_backend",
+            )
+
+    def test_embedded_dfs_replica_requires_absolute_storage_path(self):
+        for path in ("", "relative/path", 123):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(ValueError, "absolute ssd_offload_path"):
+                    _make_store(dfs_replica_num=1, ssd_offload_path=path)
+
+    def test_dfs_replica_requires_new_mooncake(self):
+        with self.assertRaisesRegex(RuntimeError, "dfs_replica_num"):
+            _make_store(
+                replicate_config_cls=ReplicateConfigWithoutDfsReplica,
+                dfs_replica_num=1,
+            )
 
     def test_mha_group_ids_use_tagged_logical_page_key(self):
         store, fake_store = _make_store(extra_backend_tag="tag")
