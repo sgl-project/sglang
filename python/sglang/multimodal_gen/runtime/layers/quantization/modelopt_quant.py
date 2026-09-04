@@ -122,7 +122,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
         )
     if weight.shape[0] % 128 != 0:
         raise ValueError(
-            "Fused NVFP4 SwiGLU requires FC1 N % 128 == 0, " f"got N={weight.shape[0]}."
+            f"Fused NVFP4 SwiGLU requires FC1 N % 128 == 0, got N={weight.shape[0]}."
         )
 
     # FLUX.2 stores [gate; up].  The kernel consumes 64-row groups in

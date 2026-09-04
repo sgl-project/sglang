@@ -17,6 +17,7 @@ import zmq
 from torch.distributed import ReduceOp, all_reduce, barrier
 
 from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
@@ -164,21 +165,7 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            if self.ps.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-
-            if self.ps.attn_cp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_cp_group.rank,
-                    self.attn_cp_cpu_group,
-                    src=self.attn_cp_group.ranks[0],
-                )
+            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -190,20 +177,7 @@ class SchedulerRequestReceiver:
                 or is_ep_scale_joiner()
             )
             if _local_ctrl:
-                if self.ps.attn_tp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_tp_group.rank,
-                        self.attn_tp_cpu_group,
-                        src=self.attn_tp_group.ranks[0],
-                    )
-                if self.ps.attn_cp_size != 1:
-                    control_reqs = broadcast_pyobj(
-                        control_reqs,
-                        self.attn_cp_group.rank,
-                        self.attn_cp_cpu_group,
-                        src=self.attn_cp_group.ranks[0],
-                    )
+                control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
             elif self.ps.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
