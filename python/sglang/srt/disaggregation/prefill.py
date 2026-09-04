@@ -63,6 +63,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import (
+    complete_mm_embedding_validations,
+    decode_mm_embedding_errors,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -706,6 +710,12 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        mm_embedding_error_tensor = result.mm_embedding_errors
+        if mm_embedding_error_tensor is not None:
+            complete_mm_embedding_validations(batch.reqs, mm_embedding_error_tensor)
+        decoded_mm_embedding_errors = decode_mm_embedding_errors(
+            mm_embedding_error_tensor
+        )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -718,7 +728,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
-        assert batch.spec_info is result.next_draft_input
+        assert decoded_mm_embedding_errors or batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
@@ -746,9 +756,31 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        mm_embedding_errors = {
+            req_idx: (expected, actual)
+            for req_idx, expected, actual in decoded_mm_embedding_errors
+        }
+        failed_reqs = []
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            mm_embedding_error = mm_embedding_errors.get(i)
+            if mm_embedding_error is not None:
+                self.defer_mm_embedding_abort(req, *mm_embedding_error)
+            if mm_embedding_error is not None or req.mm_embedding_abort_pending:
+                advance_logprob_pt(i, req)
+                if req.inflight_middle_chunks > 0:
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                if (
+                    req.inflight_middle_chunks <= 0
+                    and req.mm_embedding_validation_count == 0
+                ):
+                    cleanup_finished = self._retire_aborted_prefill_result(req)
+                    if cleanup_finished and not req.finished_output:
+                        failed_reqs.append(req)
+                continue
+
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -863,6 +895,12 @@ class SchedulerDisaggregationPrefillMixin:
                 batch,
                 auxiliary_output,
                 auxiliary_output_starts,
+            )
+
+        if failed_reqs:
+            self.output_streamer.stream_output(
+                failed_reqs,
+                any(req.return_logprob for req in failed_reqs),
             )
 
         can_run_cuda_graph = result.can_run_cuda_graph
@@ -1018,6 +1056,57 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
+    def _retire_aborted_prefill_result(
+        self: Scheduler, req: Req, transport_quiesced: bool = False
+    ) -> bool:
+        """Release an aborted request still owned by a completed prefill batch."""
+        if not req.disagg_abort_cleanup_pending:
+            self.clear_pending_chunk_send(req)
+        owns_resources = (
+            req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
+        )
+        if not owns_resources:
+            req.disagg_abort_cleanup_pending = False
+            return False
+
+        if req.disagg_kv_sender is not None and not req.disagg_abort_cleanup_pending:
+            req.disagg_abort_cleanup_pending = True
+            try:
+                req.disagg_kv_sender.abort()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to abort KV transfer while retiring request %s",
+                    req.rid,
+                    exc_info=True,
+                )
+        if req.disagg_kv_sender is not None and not transport_quiesced:
+            if req not in self.disagg_prefill_inflight_queue:
+                self.disagg_prefill_inflight_queue.append(req)
+            return False
+        if req.disagg_kv_sender is not None:
+            assert req.disagg_kv_sender.is_transfer_quiesced()
+            try:
+                req.disagg_kv_sender.clear()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Failed to clear KV transfer while retiring request %s",
+                    req.rid,
+                    exc_info=True,
+                )
+        if req.to_finish is not None and not req.finished():
+            req.update_finish_state()
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        if req.mm_embedding_abort_pending:
+            self.batch_result_processor._finish_deferred_mm_embedding_abort(req)
+        else:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            if req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+        req.disagg_abort_cleanup_pending = False
+        return True
+
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
         error_message = (
@@ -1104,7 +1193,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range.end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif req.mm_embedding_validation_count == 0:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1122,6 +1211,8 @@ class SchedulerDisaggregationPrefillMixin:
                 running_batch.batch_is_full = False
 
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
+        if req.mm_embedding_validation_count > 0:
+            return
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
 

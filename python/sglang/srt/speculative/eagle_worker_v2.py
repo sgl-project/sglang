@@ -1191,7 +1191,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Extend processed L prompt tokens; next verify iter expects same L.
             batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
+            if on_publish is not None and batch_output.mm_embedding_errors is None:
                 on_publish(batch_output.new_seq_lens)
 
             # A rank that does not host the draft (prefill-side PP builds it only on

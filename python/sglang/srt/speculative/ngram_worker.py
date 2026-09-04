@@ -439,11 +439,13 @@ class NGRAMWorker(BaseSpecWorker):
 
         verify_input: NgramVerifyInput = batch.spec_info
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+        mm_embedding_errors = None
 
         if batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
+            mm_embedding_errors = batch_result.mm_embedding_errors
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -512,7 +514,7 @@ class NGRAMWorker(BaseSpecWorker):
                     accept_index=accept_index,
                 )
 
-            if on_publish is not None:
+            if on_publish is not None and mm_embedding_errors is None:
                 on_publish(new_seq_lens)
 
             self._update_ngram_corpus(batch)
@@ -531,6 +533,7 @@ class NGRAMWorker(BaseSpecWorker):
             batch_result = self.target_worker.forward_batch_generation(
                 batch, pp_proxy_tensors=pp_proxy_tensors
             )
+            mm_embedding_errors = batch_result.mm_embedding_errors
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
@@ -545,7 +548,7 @@ class NGRAMWorker(BaseSpecWorker):
             accept_tokens = accept_tokens.flatten()
             next_token_ids = predict
 
-            if on_publish is not None:
+            if on_publish is not None and mm_embedding_errors is None:
                 on_publish(new_seq_lens)
 
         # Construct the next draft input
@@ -566,4 +569,5 @@ class NGRAMWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            mm_embedding_errors=mm_embedding_errors,
         )

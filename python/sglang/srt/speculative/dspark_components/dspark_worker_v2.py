@@ -546,7 +546,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_TARGET, next_token_ids)
         new_seq_lens = batch.seq_lens
         batch_output.new_seq_lens = new_seq_lens
-        if on_publish is not None:
+        if on_publish is not None and batch_output.mm_embedding_errors is None:
             on_publish(batch_output.new_seq_lens)
 
         if logits_output.hidden_states is None:
