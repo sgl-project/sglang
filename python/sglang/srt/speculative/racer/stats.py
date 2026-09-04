@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from sglang.srt.speculative.racer.automaton import RacerAutomaton
+from sglang.srt.speculative.racer.refill_automaton import BinaryRefillRacerAutomaton
 
 
 @dataclass
@@ -27,8 +27,8 @@ class RacerProposalStats:
         return asdict(self)
 
 
-class InstrumentedRacerAutomaton(RacerAutomaton):
-    """RACER automaton with proposal-shape instrumentation only."""
+class InstrumentedRacerAutomaton(BinaryRefillRacerAutomaton):
+    """Binary-refill RACER automaton with proposal-shape instrumentation."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
