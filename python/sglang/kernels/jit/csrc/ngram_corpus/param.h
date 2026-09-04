@@ -43,7 +43,7 @@ struct Param {
   size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
-  GlobalTreeMode global_tree_mode = GlobalTreeMode::SPECIFICITY_PATH_PROBABILITY;
+  GlobalTreeMode global_tree_mode = GlobalTreeMode::DISABLED;
 
   std::vector<size_t> batch_draft_token_num;
 

@@ -352,6 +352,14 @@ add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.exte
 # --------------------------------------------------------------------------
 
 
+def _default_speculative_ngram_global_tree_mode() -> str:
+    return (
+        "specificity_path_probability"
+        if envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.get()
+        else "disabled"
+    )
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -2337,11 +2345,12 @@ class ServerArgs:
             "path_probability",
             "specificity_path_probability",
         ],
-        "Global Trie/SAM proposal allocation mode. The default ranks paths by "
-        "source-local occurrence probability weighted by match specificity; "
+        "Global Trie/SAM proposal allocation mode. Requires "
+        "SGLANG_ENABLE_NGRAM_GLOBAL_TREE=1. When enabled, the default ranks paths "
+        "by source-local occurrence probability weighted by match specificity; "
         "disabled preserves fixed source budgets and the configured BFS/PROB path.",
         NS("spec"),
-    ] = "specificity_path_probability"
+    ] = dataclasses.field(default_factory=_default_speculative_ngram_global_tree_mode)
     speculative_ngram_max_trie_depth: A[
         int, "The max trie depth for ngram speculative decoding.", NS("spec")
     ] = 18

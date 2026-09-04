@@ -1609,6 +1609,7 @@ class TestNgramExternalSamArgs(CustomTestCase):
         args.speculative_num_draft_tokens = 12
         args.device = "cuda"
         args.page_size = 1
+        args.speculative_ngram_global_tree_mode = "disabled"
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
@@ -1640,25 +1641,43 @@ class TestNgramExternalSamArgs(CustomTestCase):
             speculative_ngram_external_sam_budget=0,
             speculative_ngram_global_tree_mode="path_probability",
         )
-        handle_speculative_decoding(args)
+        with envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.override(True):
+            handle_speculative_decoding(args)
         self.assertEqual(args.speculative_ngram_global_tree_mode, "path_probability")
 
-    def test_global_tree_mode_defaults_to_specificity_path_probability(self):
-        args = prepare_server_args(["--model-path", "dummy"])
+    def test_global_tree_mode_defaults_to_disabled(self):
+        with envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.override(False):
+            args = prepare_server_args(["--model-path", "dummy"])
+        self.assertEqual(args.speculative_ngram_global_tree_mode, "disabled")
+
+    def test_global_tree_env_enables_specificity_path_probability_by_default(self):
+        with envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.override(True):
+            args = prepare_server_args(["--model-path", "dummy"])
         self.assertEqual(
             args.speculative_ngram_global_tree_mode,
             "specificity_path_probability",
         )
 
-    def test_global_tree_mode_cli_round_trip(self):
-        args = prepare_server_args(
-            [
-                "--model-path",
-                "dummy",
-                "--speculative-ngram-global-tree-mode",
-                "specificity_path_probability",
-            ]
+    def test_global_tree_mode_requires_env_gate(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_global_tree_mode="path_probability"
         )
+        with envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.override(False):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_NGRAM_GLOBAL_TREE=1"
+            ):
+                handle_speculative_decoding(args)
+
+    def test_global_tree_mode_cli_round_trip(self):
+        with envs.SGLANG_ENABLE_NGRAM_GLOBAL_TREE.override(True):
+            args = prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--speculative-ngram-global-tree-mode",
+                    "specificity_path_probability",
+                ]
+            )
         self.assertEqual(
             args.speculative_ngram_global_tree_mode,
             "specificity_path_probability",
