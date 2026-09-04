@@ -683,6 +683,139 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         return (core_attn_out, z) if return_z else core_attn_out
 
+    def _mixed_split_bounds(
+        self,
+        forward_batch: ForwardBatch,
+        seq_len: int,
+        forward_metadata,
+        layer_cache,
+        needs_state_gather: bool,
+    ) -> Optional[Tuple[int, int, int]]:
+        """Return ``(num_prefill_reqs, num_prefill_tokens, num_decodes)``
+        when the scheduler-provided MIXED layout can use the split fast path.
+
+        Breakable prefill graphs normalize MIXED to EXTEND, so boundary
+        presence is the authoritative mixed-batch marker here. Every excluded
+        feature keeps the existing all-extend path as a correctness fallback.
+        """
+        num_prefill_reqs = forward_batch.mixed_num_prefill_reqs
+        num_prefill_tokens = forward_batch.mixed_num_prefill_tokens
+        if num_prefill_reqs is None or num_prefill_tokens is None:
+            return None
+
+        num_decodes = forward_batch.batch_size - num_prefill_reqs
+        if not (
+            is_cuda()
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.spec_info is None
+            and forward_batch._original_batch_size is None
+            and forward_batch.tbo_split_seq_index is None
+            and self.kernel_dispatcher.supports_packed_decode
+            and not forward_metadata.has_mamba_track_mask
+            and forward_metadata.num_state_checkpoints == 0
+            and not needs_state_gather
+            and num_prefill_reqs > 0
+            and num_prefill_tokens > 0
+            and num_decodes > 0
+            and num_prefill_reqs + num_decodes == forward_batch.batch_size
+            and num_prefill_tokens + num_decodes == seq_len
+            and forward_batch.extend_seq_lens_cpu is not None
+            and len(forward_batch.extend_seq_lens_cpu) == forward_batch.batch_size
+            and forward_metadata.query_start_loc.shape[0]
+            == forward_batch.batch_size + 1
+            and forward_metadata.mamba_cache_indices.shape[0]
+            == forward_batch.batch_size
+            and layer_cache.replayssm_d is None
+            and layer_cache.replayssm_k is None
+            and layer_cache.replayssm_g is None
+        ):
+            return None
+        return num_prefill_reqs, num_prefill_tokens, num_decodes
+
+    def _forward_mixed_split(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        bounds: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        """Run prefill rows with extend kernels and the decode suffix recurrently."""
+        num_prefill_reqs, num_prefill_tokens, num_decodes = bounds
+        prefill_cache_indices = cache_indices[:num_prefill_reqs]
+        decode_cache_indices = cache_indices[num_prefill_reqs:]
+        prefill_query_start_loc = query_start_loc[: num_prefill_reqs + 1]
+
+        # The two request groups own disjoint state slots. Prefill updates each
+        # row's whole conv window; decode shifts/appends exactly one token.
+        prefill_qkv = causal_conv1d_fn(
+            mixed_qkv[:num_prefill_tokens].transpose(0, 1),
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states,
+            has_initial_state=(forward_batch.extend_prefix_lens[:num_prefill_reqs] > 0),
+            cache_indices=prefill_cache_indices,
+            query_start_loc=prefill_query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu[:num_prefill_reqs],
+        ).transpose(0, 1)[:num_prefill_tokens]
+        decode_qkv = causal_conv1d_update(
+            mixed_qkv[num_prefill_tokens:],
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=decode_cache_indices,
+        )
+
+        query, key, value = fused_qkv_split_gdn_prefill(
+            prefill_qkv,
+            layer.num_q_heads,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_q_dim,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+        g, beta = fused_gdn_gating(
+            layer.A_log,
+            a[:num_prefill_tokens],
+            b[:num_prefill_tokens],
+            layer.dt_bias,
+        )
+        prefill_out, _, _ = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=prefill_cache_indices,
+            query_start_loc=prefill_query_start_loc,
+            state_checkpoint_cu_starts=None,
+            num_state_checkpoints=0,
+            state_checkpoint_every_n_tokens=0,
+        )
+        decode_out = self.kernel_dispatcher.packed_decode(
+            mixed_qkv=decode_qkv,
+            a=a[num_prefill_tokens:],
+            b=b[num_prefill_tokens:],
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            ssm_states=ssm_states,
+            cache_indices=decode_cache_indices,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+        )
+        assert decode_out is not None and decode_out.shape[1] == num_decodes
+        return torch.cat((prefill_out, decode_out), dim=1)
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -748,6 +881,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
             state_cache_indices = cache_indices
+
+        mixed_split_bounds = self._mixed_split_bounds(
+            forward_batch,
+            seq_len,
+            forward_metadata,
+            mamba_cache_params,
+            needs_state_gather,
+        )
+        if mixed_split_bounds is not None:
+            return self._forward_mixed_split(
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
+                mixed_split_bounds,
+            )
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num

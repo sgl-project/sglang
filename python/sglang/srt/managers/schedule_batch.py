@@ -2327,6 +2327,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The sum of all sequence lengths
     seq_lens_sum: int = None
     extend_num_tokens: Optional[int] = None
+    # Request/token boundary of the prefill prefix in a MIXED batch. The
+    # scheduler lays out prefill requests/tokens first and one-token running
+    # decode requests second; linear-attention backends use this boundary to
+    # route the two portions to their native kernels.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
@@ -2931,6 +2937,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
     def mix_with_running(self, running_batch: ScheduleBatch):
+        # Capture the boundary before merge_batch appends the running requests.
+        # Do not infer it later from extend_lens: both real one-token prefills
+        # and appended decode rows can have an extend length of one.
+        self.mixed_num_prefill_reqs = self.batch_size()
+        self.mixed_num_prefill_tokens = self.extend_num_tokens
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -3621,6 +3632,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            mixed_num_prefill_reqs=self.mixed_num_prefill_reqs,
+            mixed_num_prefill_tokens=self.mixed_num_prefill_tokens,
         )
 
     def maybe_evict_swa(self):

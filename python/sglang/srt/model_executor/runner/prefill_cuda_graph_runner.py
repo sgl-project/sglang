@@ -1654,6 +1654,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             multi_item_delimiter_indices=forward_batch.multi_item_delimiter_indices,
             extend_num_tokens=forward_batch.extend_num_tokens,
+            mixed_num_prefill_reqs=forward_batch.mixed_num_prefill_reqs,
+            mixed_num_prefill_tokens=forward_batch.mixed_num_prefill_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,

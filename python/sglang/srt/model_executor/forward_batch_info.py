@@ -461,6 +461,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # Request/token boundary of the prefill prefix in a scheduler MIXED batch.
+    # These remain populated when breakable prefill graphs normalize MIXED to
+    # EXTEND, allowing eager linear-attention graph breaks to keep the split.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -835,6 +841,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            mixed_num_prefill_reqs=batch.mixed_num_prefill_reqs,
+            mixed_num_prefill_tokens=batch.mixed_num_prefill_tokens,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     resolve_linear_attn_backends,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -243,6 +244,92 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_mixed_split_bounds_accept_breakable_graph_extend_mode(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(supports_packed_decode=True)
+        forward_batch = SimpleNamespace(
+            mixed_num_prefill_reqs=2,
+            mixed_num_prefill_tokens=10,
+            batch_size=5,
+            forward_mode=ForwardMode.EXTEND,
+            spec_info=None,
+            _original_batch_size=None,
+            tbo_split_seq_index=None,
+            extend_seq_lens_cpu=[4, 6, 1, 1, 1],
+        )
+        metadata = SimpleNamespace(
+            has_mamba_track_mask=False,
+            num_state_checkpoints=0,
+            query_start_loc=torch.empty(6),
+            mamba_cache_indices=torch.empty(5),
+        )
+        layer_cache = SimpleNamespace(
+            replayssm_d=None,
+            replayssm_k=None,
+            replayssm_g=None,
+        )
+
+        with patch.object(gdn_backend, "is_cuda", return_value=True):
+            bounds = backend._mixed_split_bounds(
+                forward_batch,
+                seq_len=13,
+                forward_metadata=metadata,
+                layer_cache=layer_cache,
+                needs_state_gather=False,
+            )
+
+        self.assertEqual(bounds, (2, 10, 3))
+
+    def test_mixed_split_bounds_fall_back_for_unsupported_state_modes(self):
+        backend = object.__new__(GDNAttnBackend)
+        backend.kernel_dispatcher = SimpleNamespace(supports_packed_decode=True)
+        forward_batch = SimpleNamespace(
+            mixed_num_prefill_reqs=1,
+            mixed_num_prefill_tokens=8,
+            batch_size=3,
+            forward_mode=ForwardMode.MIXED,
+            spec_info=None,
+            _original_batch_size=None,
+            tbo_split_seq_index=None,
+            extend_seq_lens_cpu=[8, 1, 1],
+        )
+        metadata = SimpleNamespace(
+            has_mamba_track_mask=False,
+            num_state_checkpoints=0,
+            query_start_loc=torch.empty(4),
+            mamba_cache_indices=torch.empty(3),
+        )
+        layer_cache = SimpleNamespace(
+            replayssm_d=None,
+            replayssm_k=None,
+            replayssm_g=None,
+        )
+
+        cases = (
+            ("checkpoint", {"num_state_checkpoints": 1}, {}, False),
+            ("tracking", {"has_mamba_track_mask": True}, {}, False),
+            ("page_major", {}, {}, True),
+            ("replayssm", {}, {"replayssm_d": torch.empty(0)}, False),
+        )
+        with patch.object(gdn_backend, "is_cuda", return_value=True):
+            for name, metadata_fields, cache_fields, needs_gather in cases:
+                with self.subTest(name=name):
+                    current_metadata = SimpleNamespace(
+                        **{**vars(metadata), **metadata_fields}
+                    )
+                    current_cache = SimpleNamespace(
+                        **{**vars(layer_cache), **cache_fields}
+                    )
+                    self.assertIsNone(
+                        backend._mixed_split_bounds(
+                            forward_batch,
+                            seq_len=10,
+                            forward_metadata=current_metadata,
+                            layer_cache=current_cache,
+                            needs_state_gather=needs_gather,
+                        )
+                    )
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)
