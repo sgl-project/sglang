@@ -182,6 +182,9 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 )
+DEEPSEEK_V4_FLASH_W8A8_MTP_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp"
+)
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
 )
@@ -1080,8 +1083,18 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         Replaces the workflow's ``Backup plog`` step so each case in a suite
         gets its own plog snapshot instead of all cases sharing the suite name.
         """
-        plog_path = "/root/ascend/log/debug/plog"
-        if not os.path.isdir(plog_path):
+        # CI runners redirect Ascend logs via ASCEND_WORK_PATH; prefer it over
+        # the default local device path.
+        ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
+        candidates = []
+        if ascend_work_path:
+            candidates.append(os.path.join(ascend_work_path, "debug", "plog"))
+        candidates.append("/root/ascend/log/debug/plog")
+        plog_path = next((p for p in candidates if os.path.isdir(p)), None)
+        if not plog_path:
+            logger.warning(
+                "plog directory not found, candidates: %s", ", ".join(candidates)
+            )
             return
         tc_name = getattr(cls, "tc_name", None)
         if not tc_name:
@@ -1092,12 +1105,16 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
         os.makedirs(target, exist_ok=True)
         for name in os.listdir(plog_path):
             src = os.path.join(plog_path, name)
-            if os.path.isfile(src):
-                try:
+            try:
+                if os.path.isdir(src):
+                    shutil.copytree(
+                        src, os.path.join(target, name), dirs_exist_ok=True
+                    )
+                else:
                     shutil.copy2(src, os.path.join(target, name))
-                except Exception as e:
-                    logger.warning("Failed to copy plog %s: %s", name, e)
-        logger.info("Backed up plog to %s", target)
+            except Exception as e:
+                logger.warning("Failed to copy plog %s: %s", name, e)
+        logger.info("Backed up plog from %s to %s", plog_path, target)
 
     @classmethod
     def setUpClass(cls):

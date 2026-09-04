@@ -124,7 +124,7 @@ jobs:
 
   nightly-1-npu-a2:
     name: nightly-1-npu-a2
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -140,7 +140,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +155,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +171,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -187,7 +187,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -202,7 +202,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -217,7 +217,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +233,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -249,7 +249,7 @@ jobs:
 
   nightly-perf-8-npu-a3:
     name: nightly-perf-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -263,15 +263,32 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  nightly-perf-16-npu-a3:
-    name: nightly-perf-16-npu-a3
+  debug-nightly-perf-16-npu-a3:
+    name: debug-nightly-perf-16-npu-a3
     if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
       test_type: 'perf'
-      test_suite: nightly-perf-16-npu-a3
+      test_suite: debug-nightly-perf-16-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+      test_timeout_minutes: '180'
+
+  debug-nightly-acc-16-npu-a3:
+    name: debug-nightly-acc-16-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-16-
+      test_type: 'accuracy'
+      test_suite: debug-nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -283,7 +300,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -300,7 +317,7 @@ jobs:
 
   nightly-acc-4-npu-a3:
     name: nightly-acc-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -316,7 +333,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -332,43 +349,43 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3]
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
+    needs: [set-image-config]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
           # glm5_1 performance tests
-          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
+          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
           # mimo_v2_flash performance tests
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
+          # - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1_ttft_5s.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # - name: test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/mimo_v2_flash/test_npu_mimo_v2_flash_1p1d_12p_in16k_out1k_tpot_20ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
             prefill_size: 1
@@ -394,8 +411,8 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
-    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
+    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
+    needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, debug-nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-4-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -445,12 +462,13 @@ jobs:
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
       - nightly-perf-8-npu-a3
-      - nightly-perf-16-npu-a3
+      - debug-nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-4-npu-a3
       - nightly-acc-16-npu-a3
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
+      - debug-nightly-acc-16-npu-a3
     runs-on: ubuntu-latest
     steps:
       - name: Download all metrics
@@ -477,7 +495,7 @@ jobs:
             "${{ needs.nightly-perf-2-npu-a3.result }}" \
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-8-npu-a3.result }}" \
-            "${{ needs.nightly-perf-16-npu-a3.result }}" \
+            "${{ needs.debug-nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
             "${{ needs.nightly-acc-4-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}"; do
@@ -510,7 +528,8 @@ jobs:
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
-            "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
+            "debug-nightly-perf-16-npu-a3:${{ needs.debug-nightly-perf-16-npu-a3.result }}" \
+            "debug-nightly-acc-16-npu-a3:${{ needs.debug-nightly-acc-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
             "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
