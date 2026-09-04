@@ -115,5 +115,42 @@ def test_hpc_attention_gate_is_bf16_only(monkeypatch):
         supported.cache_clear()
 
 
+class _PPDecoderLayer(nn.Module):
+    def __init__(self, next_hidden, next_topk):
+        super().__init__()
+        self.next_hidden = next_hidden
+        self.next_topk = next_topk
+
+    def forward(self, *args):
+        return self.next_hidden, self.next_topk
+
+
+def test_non_last_pp_stage_forwards_flattened_hidden_and_shared_topk():
+    model = hunyuan_v4.HYV4Model.__new__(hunyuan_v4.HYV4Model)
+    nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+    model.start_layer = 1
+    model.end_layer = 2
+    model.send_topk_indices = True
+    model.topk_indices_width = 8
+
+    next_hidden = torch.randn(2, 4, 16)
+    next_topk = torch.ones(2, 8, dtype=torch.int32)
+    model.layers = nn.ModuleList(
+        [nn.Identity(), _PPDecoderLayer(next_hidden, next_topk)]
+    )
+
+    initial_hidden = torch.randn(2, 4, 16)
+    initial_topk = torch.zeros(2, 8, dtype=torch.int32)
+    proxy = hunyuan_v4.PPProxyTensors(
+        {"hidden_states": initial_hidden, "topk_indices": initial_topk}
+    )
+
+    result = model(None, None, object(), pp_proxy_tensors=proxy)
+
+    assert result["hidden_states"].shape == (2, 64)
+    assert result["topk_indices"] is next_topk
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

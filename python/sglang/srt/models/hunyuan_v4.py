@@ -6,17 +6,23 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
+    get_dsa_index_topk,
+)
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
@@ -30,7 +36,13 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2MoE,
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import BumpAllocator, get_device_capability, is_cuda
+from sglang.srt.utils import (
+    BumpAllocator,
+    add_prefix,
+    get_device_capability,
+    is_cuda,
+    make_layers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -614,45 +626,68 @@ class HYV4DecoderLayer(nn.Module):
 class HYV4Model(nn.Module):
     def __init__(self, config, quant_config=None, prefix=""):
         super().__init__()
-        if get_pp_group().world_size != 1:
-            raise ValueError("HYV4 pipeline parallelism is not supported")
         self.config = config
-        self.start_layer = 0
-        self.end_layer = config.num_hidden_layers
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=f"{prefix}.embed_tokens",
-            **get_embedding_tp_kwargs(),
-        )
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("embed_tokens", prefix),
+                **get_embedding_tp_kwargs(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.alt_stream = get_stream("alt") if is_cuda() else None
-        self.layers = nn.ModuleList(
-            [
-                HYV4DecoderLayer(
-                    config,
-                    i,
-                    quant_config,
-                    f"{prefix}.layers.{i}",
-                    self.alt_stream,
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: HYV4DecoderLayer(
+                config,
+                idx,
+                quant_config,
+                prefix,
+                self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
-        self.hc_head = HYV4HCHeadLayer(config, f"{prefix}.hc_head")
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.hc_head = HYV4HCHeadLayer(config, add_prefix("hc_head", prefix))
+            self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        else:
+            self.hc_head = PPMissingLayer()
+            self.norm = PPMissingLayer(return_tuple=True)
+            self.send_topk_indices = dsa_layer_skips_topk(config, self.end_layer)
+            self.topk_indices_width = (
+                get_dsa_index_topk(config) if self.send_topk_indices else None
+            )
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
-        hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        )
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
+        if self.pp_group.is_first_rank:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            initial_topk_indices = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
+
         zero_allocator = BumpAllocator(
-            buffer_size=2 * len(self.layers),
+            buffer_size=2 * (self.end_layer - self.start_layer),
             dtype=torch.float32,
             device=hidden_states.device,
         )
-        topk_share = IndexTopKShareState(forward_batch, None)
-        for layer in self.layers:
-            hidden_states, topk_indices = layer(
+        topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states, topk_indices = self.layers[i](
                 positions,
                 hidden_states,
                 forward_batch,
@@ -660,6 +695,18 @@ class HYV4Model(nn.Module):
                 topk_share.topk_indices,
             )
             topk_share.update(topk_indices)
+
+        if not self.pp_group.is_last_rank:
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.send_topk_indices:
+                topk_indices = topk_share.topk_indices
+                if topk_indices is None:
+                    topk_indices = hidden_states.new_empty(
+                        (0, self.topk_indices_width), dtype=torch.int32
+                    )
+                proxy_tensors["topk_indices"] = topk_indices
+            return PPProxyTensors(proxy_tensors)
+
         topk_share.publish()
         return self.hc_head(hidden_states, self.norm)
 
@@ -676,34 +723,59 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-        self.model = HYV4Model(config, quant_config, f"{prefix}.model")
+        self.model = HYV4Model(config, quant_config, add_prefix("model", prefix))
         self.num_fused_shared_experts = max(
             (
                 layer.mlp.num_fused_shared_experts
                 for layer in self.model.layers
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                if isinstance(layer, HYV4DecoderLayer)
+                and isinstance(layer.mlp, DeepseekV2MoE)
             ),
             default=0,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            # Keep checkpoint weights in bf16; LogitsProcessor emits fp32
-            # logits when config.enable_lm_head_fp32 is set.
-            quant_config=quant_config,
-            prefix=f"{prefix}.lm_head",
-            use_attn_tp_group=get_parallel().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                # Keep checkpoint weights in bf16; LogitsProcessor emits fp32
+                # logits when config.enable_lm_head_fp32 is set.
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
