@@ -1752,9 +1752,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if return_output_ids:
                     chunk_output_ids = content.get("output_ids")
                     if chunk_output_ids is not None:
-                        if (
-                            self.tokenizer_manager.server_args.incremental_streaming_output
-                        ):
+                        if self.tokenizer_manager.server_args.incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
                                 # Coalesce may glue real deltas onto the abort
