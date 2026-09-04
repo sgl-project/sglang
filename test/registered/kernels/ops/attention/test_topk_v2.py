@@ -25,10 +25,13 @@ included explicitly, across k in {512,1024,2048} and identity/perm page tables.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.dsv4.topk as dsv4_topk
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
@@ -276,8 +279,10 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     [
         (4, 256),  # trivial
         (8, 4096),  # register
+        (8, 8193),  # Register4
         (4, 16385),  # streaming
-        (2, 65537),  # CUDA cluster / ROCm streaming
+        (2, 65537),  # CUDA small cluster / ROCm streaming
+        (31, 131072),  # CUDA persistent cluster / ROCm streaming
     ],
 )
 @torch.inference_mode()
@@ -318,6 +323,45 @@ def test_topk_v2_paged_and_raw_outputs(batch: int, seq: int, k: int) -> None:
 
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, raw, batch, seq_lens.cpu(), k)
+
+
+def test_topk_v2_xpu_dual_output_uses_one_selection(monkeypatch) -> None:
+    xpu_ops = SimpleNamespace(
+        topk_transform=MagicMock(),
+        topk_transform_paged=MagicMock(),
+    )
+    monkeypatch.setattr(dsv4_topk, "is_xpu", lambda: True)
+    monkeypatch.setattr(
+        dsv4_topk.torch,
+        "ops",
+        SimpleNamespace(sgl_kernel=xpu_ops),
+    )
+    scores = object()
+    seq_lens = object()
+    page_table = object()
+    page_out = object()
+    metadata = object()
+    raw_out = object()
+
+    dsv4_topk.topk_transform_paged_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        metadata,
+        raw_out,
+    )
+
+    xpu_ops.topk_transform.assert_called_once_with(
+        scores,
+        seq_lens,
+        page_table,
+        page_out,
+        PAGE_SIZE,
+        raw_out,
+    )
+    xpu_ops.topk_transform_paged.assert_not_called()
 
 
 # --- ragged entry point ------------------------------------------------------

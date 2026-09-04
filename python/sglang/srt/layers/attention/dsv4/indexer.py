@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
-    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
@@ -909,9 +908,10 @@ class C4IndexerBackendMixin:
                 and rows != all_rows
                 and is_hip()
             ):
-                # The cached plan routes rows by their index in the full range,
-                # so a chunk needs one built over its own rows.
-                topk_metadata = plan_topk_v2(c4_seq_lens[rows])
+                # ROCm compiles out the cluster path and only validates the
+                # [num_rows + 1, 2] plan shape. Reuse a correctly sized view
+                # instead of allocating a no-op plan for every layer/chunk.
+                topk_metadata = topk_metadata[: logits.shape[0] + 1]
             _run_c4_topk_transform(
                 dsa_topk_backend=self.dsa_topk_backend,
                 flashinfer_topk_transform=self.flashinfer_topk_transform,

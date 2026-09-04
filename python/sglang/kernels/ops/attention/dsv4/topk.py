@@ -163,22 +163,23 @@ def topk_transform_paged_v2(
         raise ValueError("out_raw_indices requires page_tables")
     if is_xpu():
         if out_raw_indices is not None:
+            torch.ops.sgl_kernel.topk_transform(
+                scores,
+                seq_lens,
+                page_tables,
+                out_page_indices,
+                page_size,
+                out_raw_indices,
+            )
+        else:
             torch.ops.sgl_kernel.topk_transform_paged(
                 scores,
                 seq_lens,
-                None,
-                out_raw_indices,
+                page_tables,
+                out_page_indices,
                 page_size,
                 metadata,
             )
-        torch.ops.sgl_kernel.topk_transform_paged(
-            scores,
-            seq_lens,
-            page_tables,
-            out_page_indices,
-            page_size,
-            metadata,
-        )
         return
     module = _jit_topk_v2_module()
     module.topk_transform_paged(
