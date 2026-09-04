@@ -403,17 +403,22 @@ mod tests {
 
     #[test]
     fn build_policy_kind_only_covers_all_variants() {
-        for kind in [
-            PolicyKind::RoundRobin,
-            PolicyKind::Random,
-            PolicyKind::PowerOfTwo,
-            PolicyKind::LoadBased,
-            PolicyKind::CacheAwareZmq,
-            PolicyKind::SessionAware,
-            PolicyKind::CacheAware,
-            PolicyKind::Sticky,
+        for (kind, needs_load_snapshot) in [
+            (PolicyKind::RoundRobin, false),
+            (PolicyKind::Random, false),
+            (PolicyKind::PowerOfTwo, true),
+            (PolicyKind::LoadBased, true),
+            (PolicyKind::CacheAwareZmq, true),
+            (PolicyKind::SessionAware, true),
+            (PolicyKind::CacheAware, true),
+            (PolicyKind::Sticky, false),
         ] {
-            assert!(build_policy_kind_only(kind).is_ok(), "{kind:?}");
+            let policy = build_policy_kind_only(kind).unwrap();
+            assert_eq!(
+                policy.needs_load_snapshot(),
+                needs_load_snapshot,
+                "{kind:?}"
+            );
         }
         assert!(build_policy_kind_only(PolicyKind::FusedScore).is_err());
         assert!(build_policy_kind_only(PolicyKind::ScorePolicy).is_err());
@@ -427,6 +432,7 @@ mod tests {
             &BlockSizeOracle::new(),
         );
         assert!(p.can_fuse(), "prefix_cache must be usable as a --fuse term");
+        assert!(!p.needs_load_snapshot());
     }
 
     #[test]
@@ -562,6 +568,7 @@ mod tests {
             dbg.contains("CacheAwareZmqPolicy"),
             "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
         );
+        assert!(p.needs_load_snapshot());
     }
 
     #[test]
@@ -583,6 +590,7 @@ mod tests {
             dbg.contains("LoadBasedPolicy"),
             "expected LoadBasedPolicy debug repr, got: {dbg}",
         );
+        assert!(p.needs_load_snapshot());
     }
 
     #[test]

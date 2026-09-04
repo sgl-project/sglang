@@ -226,7 +226,9 @@ pub async fn chat_completions(
         .map(|tokens| tokens.ids.len().max(1))
         .unwrap_or_else(|| estimate_prefill_tokens(&body));
     let request_input_tokens = prefill_load as u64;
-    let load_snapshot = ctx.engine_load.capture_snapshot(std::time::Instant::now());
+    let needs_load_snapshot = policy.needs_load_snapshot();
+    let load_snapshot =
+        needs_load_snapshot.then(|| ctx.engine_load.capture_snapshot(std::time::Instant::now()));
 
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
@@ -249,17 +251,22 @@ pub async fn chat_completions(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty());
     let candidate_range = CandidateRange::global(&workers);
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
+    let mut selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_session_id(session_id)
         .with_candidate_range_id(candidate_range.id)
         .with_input_tokens(request_input_tokens)
         .with_request_tokens(request_tokens.as_ref().map(|tokens| tokens.ids.as_slice()))
-        .with_external_prefix(external_prefix.as_ref())
-        .with_load_snapshot(&load_snapshot);
+        .with_external_prefix(external_prefix.as_ref());
+    if let Some(snapshot) = load_snapshot.as_ref() {
+        selection_ctx = selection_ctx.with_load_snapshot(snapshot);
+    }
     let worker = match policy.propose_prefill(candidate_range.workers, &selection_ctx) {
         Some(PrefillProposal::Pair(proposal)) if policy.uses_shared_prefill_admission() => {
+            let snapshot = load_snapshot
+                .as_ref()
+                .expect("shared prefill admission requires a load snapshot");
             let decision =
-                resolve_prefill(&candidate_range, &proposal, request_input_tokens, &load_snapshot)
+                resolve_prefill(&candidate_range, &proposal, request_input_tokens, snapshot)
                     .ok_or_else(|| {
                         policy_selection_failed(
                             &ctx,
@@ -272,7 +279,10 @@ pub async fn chat_completions(
         }
         Some(PrefillProposal::Pair(proposal)) => proposal.primary,
         Some(PrefillProposal::CacheCandidates(proposal)) => {
-            let decision = resolve_cache_candidates(&proposal, request_input_tokens, &load_snapshot)
+            let snapshot = load_snapshot
+                .as_ref()
+                .expect("cache candidate resolution requires a load snapshot");
+            let decision = resolve_cache_candidates(&proposal, request_input_tokens, snapshot)
                 .ok_or_else(|| {
                     policy_selection_failed(
                         &ctx,
@@ -367,7 +377,11 @@ pub async fn chat_completions(
     // 0 here: the active-load registry's decode axis is reserved for a
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
-    let guard = worker.load_guard();
+    let guard = if needs_load_snapshot {
+        worker.timestamped_load_guard()
+    } else {
+        worker.load_guard()
+    };
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -537,8 +551,9 @@ pub async fn chat_completions(
 
         // Synchronously await the decode worker. Its response is what
         // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
+        // per-worker `active_requests` reflects decode-pool load. Decode
+        // selection reads that atomic counter directly, so it does not need
+        // the prefill policy's timestamp registry.
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =

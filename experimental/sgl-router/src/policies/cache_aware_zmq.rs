@@ -296,6 +296,10 @@ impl CacheAwareZmqPolicy {
 }
 
 impl Policy for CacheAwareZmqPolicy {
+    fn needs_load_snapshot(&self) -> bool {
+        true
+    }
+
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         if workers.is_empty() {
             return None;
@@ -1552,9 +1556,9 @@ mod tests {
         let w1 = worker("http://w1:30000", "tiny");
         // Three requests dispatched to w0 AFTER the engine's snapshot —
         // exactly the "burst the engine hasn't reported back on yet" shape.
-        let _g1 = w0.load_guard();
-        let _g2 = w0.load_guard();
-        let _g3 = w0.load_guard();
+        let _g1 = w0.timestamped_load_guard();
+        let _g2 = w0.timestamped_load_guard();
+        let _g3 = w0.timestamped_load_guard();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
         let body = serde_json::to_vec(&serde_json::json!({"prompt": text})).unwrap();
@@ -1580,11 +1584,11 @@ mod tests {
         let earlier = Instant::now();
         let w = worker("http://w:30000", "tiny");
         // Real sleeps, not synthetic `Instant` offsets: the dispatch's
-        // timestamp is captured internally by `load_guard()` and isn't
+        // timestamp is captured internally by `timestamped_load_guard()` and isn't
         // injectable (see `worker.rs`'s `slots_acquired_since` tests for the
         // same reasoning).
         std::thread::sleep(Duration::from_millis(5));
-        let _g = w.load_guard(); // dispatched strictly between earlier/later
+        let _g = w.timestamped_load_guard(); // dispatched strictly between earlier/later
         std::thread::sleep(Duration::from_millis(5));
         let later = Instant::now();
         engine_load.set("http://w:30000", 0, load_stat(1, 0), earlier);

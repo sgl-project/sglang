@@ -18,6 +18,10 @@ impl LoadBasedPolicy {
 }
 
 impl ScoringPolicy for LoadBasedPolicy {
+    fn needs_load_snapshot(&self) -> bool {
+        true
+    }
+
     /// `1.0` for the least loaded down to `0.0` for the most, min-max scaled to
     /// the CURRENT fleet -- relative, not absolute, so it cannot saturate:
     /// `1 - load/256` reads a busy fleet as all-`0.0`, tied inside
@@ -165,7 +169,7 @@ mod tests {
                 ),
             ]),
         );
-        let _after_snapshot = [w0.load_guard(), w0.load_guard()];
+        let _after_snapshot = [w0.timestamped_load_guard(), w0.timestamped_load_guard()];
         let ctx = SelectionContext::new(&model, None).with_load_snapshot(&snapshot);
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
 
@@ -181,7 +185,7 @@ mod tests {
         let model = ModelId("tiny".into());
         let w0 = worker("w0");
         let w1 = worker("w1");
-        let _before_snapshot = [w0.load_guard(), w0.load_guard()];
+        let _before_snapshot = [w0.timestamped_load_guard(), w0.timestamped_load_guard()];
         std::thread::sleep(std::time::Duration::from_millis(5));
         let captured_at = Instant::now();
         let snapshot = EngineLoadSnapshot::from_workers(

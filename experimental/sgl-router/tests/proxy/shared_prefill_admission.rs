@@ -91,6 +91,24 @@ struct CacheCandidatesPolicy {
     worker: Arc<Worker>,
 }
 
+#[derive(Debug)]
+struct SnapshotProbePolicy {
+    worker: Arc<Worker>,
+    needs_snapshot: bool,
+    observed_snapshot: Arc<Mutex<Option<bool>>>,
+}
+
+impl Policy for SnapshotProbePolicy {
+    fn select(&self, _: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        *self.observed_snapshot.lock().unwrap() = Some(ctx.load_snapshot().is_some());
+        Some(Arc::clone(&self.worker))
+    }
+
+    fn needs_load_snapshot(&self) -> bool {
+        self.needs_snapshot
+    }
+}
+
 impl Policy for CacheCandidatesPolicy {
     fn select(&self, _: &[Arc<Worker>], _: &SelectionContext<'_>) -> Option<Arc<Worker>> {
         panic!("chat routing must use the cache-candidate proposal")
@@ -113,6 +131,9 @@ impl Policy for CacheCandidatesPolicy {
         }))
     }
 
+    fn needs_load_snapshot(&self) -> bool {
+        true
+    }
 }
 
 fn config(policy: PolicyKind) -> Config {
@@ -215,6 +236,24 @@ async fn send_chat(ctx: &Arc<AppContext>) -> StatusCode {
         .await
         .unwrap()
         .status()
+}
+
+#[tokio::test]
+async fn chat_attaches_load_snapshot_only_when_the_policy_needs_it() {
+    for needs_snapshot in [false, true] {
+        let observed_snapshot = Arc::new(Mutex::new(None));
+        let fixture = fixture(PolicyKind::RoundRobin, |workers| {
+            Arc::new(SnapshotProbePolicy {
+                worker: Arc::clone(&workers[0]),
+                needs_snapshot,
+                observed_snapshot: Arc::clone(&observed_snapshot),
+            })
+        })
+        .await;
+
+        assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
+        assert_eq!(*observed_snapshot.lock().unwrap(), Some(needs_snapshot));
+    }
 }
 
 fn assert_failure_metric(ctx: &AppContext, policy: &str, expected_reason: &str) {

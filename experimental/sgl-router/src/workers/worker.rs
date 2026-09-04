@@ -36,47 +36,33 @@ fn parse_bootstrap_host(url: &str) -> String {
 /// Tracks each in-flight slot with an acquisition timestamp so a routing
 /// policy can ask how many slots were claimed recently
 /// ([`count_acquired_since`](SlotRegistry::count_acquired_since)). The
-/// shared `count` is the same `Arc<AtomicUsize>` exposed as
-/// [`Worker::active_requests`], so existing readers stay lock-free;
-/// `count` and `slots` are independently-timed reads of related but
-/// separate state (an atomic load vs. a mutex-guarded map iteration under
-/// its own lock), so a caller reading both should not assume they observe
-/// the exact same instant — each is internally consistent on its own, not
-/// jointly atomic with the other.
+/// registry is separate from [`Worker::active_requests`]: ordinary load
+/// tracking stays lock-free, while policies that correct an engine snapshot
+/// explicitly opt into timestamp tracking.
 #[derive(Debug)]
 pub struct SlotRegistry {
-    count: Arc<AtomicUsize>,
     slots: Mutex<HashMap<u64, Instant>>,
     next_id: AtomicU64,
 }
 
 impl SlotRegistry {
-    fn new(count: Arc<AtomicUsize>) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
-            count,
             slots: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
         })
     }
 
-    /// Claim a slot: increments the shared count and records the
-    /// acquisition timestamp.
-    fn claim(self: &Arc<Self>) -> LoadGuard {
-        self.count.fetch_add(1, Ordering::Relaxed);
+    /// Records one timestamped slot and returns its identity.
+    fn claim(&self) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.slots.lock().unwrap().insert(id, Instant::now());
-        LoadGuard {
-            registry: Arc::clone(self),
-            id,
-        }
+        id
     }
 
-    /// Release slot `id`. Decrements the count only if the slot is still
-    /// tracked, so a double release cannot underflow the counter.
+    /// Releases timestamped slot `id`.
     fn release(&self, id: u64) {
-        if self.slots.lock().unwrap().remove(&id).is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
+        self.slots.lock().unwrap().remove(&id);
     }
 
     /// Count of currently-claimed slots acquired at or after `since`. Used to
@@ -98,21 +84,24 @@ impl SlotRegistry {
 }
 
 /// RAII guard that increments `active_requests` on construction and decrements
-/// on drop. Obtain via [`Worker::load_guard`]. Each guard owns one timestamped
-/// slot in the worker's [`SlotRegistry`].
+/// on drop. Obtain via [`Worker::load_guard`]. Policies that need to correct
+/// an engine snapshot use the crate-private timestamped variant.
 ///
 /// `#[must_use]`: a statement-form call like `worker.load_guard();` would
 /// drop the guard on the same line, so the counter would never see the
 /// in-flight request.  The compile-time warning catches that misuse.
 #[must_use = "LoadGuard must be held for the request's lifetime; dropping it immediately decrements active_requests"]
 pub struct LoadGuard {
-    registry: Arc<SlotRegistry>,
-    id: u64,
+    active_requests: Arc<AtomicUsize>,
+    tracked_slot: Option<(Arc<SlotRegistry>, u64)>,
 }
 
 impl Drop for LoadGuard {
     fn drop(&mut self) {
-        self.registry.release(self.id);
+        if let Some((registry, id)) = &self.tracked_slot {
+            registry.release(*id);
+        }
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -149,7 +138,7 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
-    /// Timestamped ledger of the in-flight slots behind `active_requests`;
+    /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
     /// Hostname parsed from `url` at construction time and cached.
@@ -182,7 +171,7 @@ impl Worker {
         };
         let bootstrap_host = parse_bootstrap_host(&spec.url);
         let active_requests = Arc::new(AtomicUsize::new(0));
-        let slots = SlotRegistry::new(Arc::clone(&active_requests));
+        let slots = SlotRegistry::new();
         Self {
             id: spec.id,
             url: spec.url,
@@ -235,7 +224,21 @@ impl Worker {
     /// Returns a RAII guard that increments `active_requests` now and
     /// decrements when the guard is dropped.
     pub fn load_guard(&self) -> LoadGuard {
-        self.slots.claim()
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        LoadGuard {
+            active_requests: Arc::clone(&self.active_requests),
+            tracked_slot: None,
+        }
+    }
+
+    /// Returns a load guard that also records when the request was dispatched.
+    pub(crate) fn timestamped_load_guard(&self) -> LoadGuard {
+        let slot_id = self.slots.claim();
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        LoadGuard {
+            active_requests: Arc::clone(&self.active_requests),
+            tracked_slot: Some((Arc::clone(&self.slots), slot_id)),
+        }
     }
 }
 
@@ -274,6 +277,33 @@ mod tests {
         assert_eq!(w.active_load(), 1);
         drop(g2);
         assert_eq!(w.active_load(), 0);
+    }
+
+    #[test]
+    fn plain_load_guard_does_not_track_a_timestamped_slot() {
+        let w = test_worker();
+        let cutoff = Instant::now() - Duration::from_secs(1);
+        let guard = w.load_guard();
+
+        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.slots_acquired_since(cutoff), 0);
+
+        drop(guard);
+        assert_eq!(w.active_load(), 0);
+    }
+
+    #[test]
+    fn timestamped_load_guard_tracks_and_releases_its_slot() {
+        let w = test_worker();
+        let cutoff = Instant::now() - Duration::from_secs(1);
+        let guard = w.timestamped_load_guard();
+
+        assert_eq!(w.active_load(), 1);
+        assert_eq!(w.slots_acquired_since(cutoff), 1);
+
+        drop(guard);
+        assert_eq!(w.active_load(), 0);
+        assert_eq!(w.slots_acquired_since(cutoff), 0);
     }
 
     #[test]
@@ -383,7 +413,7 @@ mod tests {
     #[test]
     fn slots_acquired_since_excludes_earlier_slots() {
         let w = test_worker();
-        let _g_old = w.load_guard();
+        let _g_old = w.timestamped_load_guard();
         // A real (small) sleep, not a synthetic `Instant` offset: the slot's
         // acquisition time is captured internally by `claim()`, not
         // injectable, so the ordering guarantee has to come from wall-clock
@@ -391,8 +421,8 @@ mod tests {
         // resolution.
         std::thread::sleep(Duration::from_millis(5));
         let cutoff = Instant::now();
-        let _g_new1 = w.load_guard();
-        let _g_new2 = w.load_guard();
+        let _g_new1 = w.timestamped_load_guard();
+        let _g_new2 = w.timestamped_load_guard();
         assert_eq!(w.active_load(), 3);
         assert_eq!(
             w.slots_acquired_since(cutoff),
@@ -405,15 +435,15 @@ mod tests {
     fn slots_acquired_since_counts_all_slots_for_a_cutoff_before_every_claim() {
         let w = test_worker();
         let long_ago = Instant::now() - Duration::from_secs(3600);
-        let _g1 = w.load_guard();
-        let _g2 = w.load_guard();
+        let _g1 = w.timestamped_load_guard();
+        let _g2 = w.timestamped_load_guard();
         assert_eq!(w.slots_acquired_since(long_ago), 2);
     }
 
     #[test]
     fn slots_acquired_since_is_zero_for_a_cutoff_after_every_claim() {
         let w = test_worker();
-        let _g = w.load_guard();
+        let _g = w.timestamped_load_guard();
         std::thread::sleep(Duration::from_millis(5));
         let cutoff = Instant::now();
         assert_eq!(w.slots_acquired_since(cutoff), 0);

@@ -52,6 +52,11 @@ pub trait ScoringPolicy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether scoring reads the request-scoped Engine Load snapshot.
+    fn needs_load_snapshot(&self) -> bool {
+        false
+    }
+
     /// Optional eligibility view for policies that provide both signals.
     fn as_filter(&self) -> Option<&dyn EligibilityFilter> {
         None
@@ -132,6 +137,10 @@ impl<T: ScoringPolicy> Policy for T {
 
     fn needs_request_tokens(&self) -> bool {
         ScoringPolicy::needs_tokens(self) || self.as_filter().is_some_and(|f| f.needs_tokens())
+    }
+
+    fn needs_load_snapshot(&self) -> bool {
+        ScoringPolicy::needs_load_snapshot(self)
     }
 
     fn as_scoring(&self) -> Option<&dyn ScoringPolicy> {
@@ -268,6 +277,10 @@ impl Policy for Pipeline {
         self.inner.uses_shared_prefill_admission()
     }
 
+    fn needs_load_snapshot(&self) -> bool {
+        self.inner.needs_load_snapshot() || self.filters.iter().any(|p| p.needs_load_snapshot())
+    }
+
     fn commit_prefill_selection(
         &self,
         ctx: &SelectionContext<'_>,
@@ -353,6 +366,12 @@ impl ScoringPolicy for FusedScorePolicy {
 
     fn needs_tokens(&self) -> bool {
         self.terms.iter().map(view).any(|(t, _)| t.needs_tokens())
+    }
+
+    fn needs_load_snapshot(&self) -> bool {
+        self.terms
+            .iter()
+            .any(|(policy, _)| policy.needs_load_snapshot())
     }
 }
 
@@ -570,6 +589,39 @@ mod tests {
         )
         .unwrap();
         assert!(filtered.needs_request_tokens(), "the filter is hungry");
+    }
+
+    #[test]
+    fn composer_propagates_load_snapshot_capability() {
+        #[derive(Debug)]
+        struct LoadHungry;
+        impl ScoringPolicy for LoadHungry {
+            fn scores(&self, workers: &[Arc<Worker>], _: &SelectionContext<'_>) -> Vec<f32> {
+                vec![0.0; workers.len()]
+            }
+            fn needs_load_snapshot(&self) -> bool {
+                true
+            }
+        }
+
+        let plain = FusedScorePolicy::new(vec![term(by(1.0), None)]).unwrap();
+        assert!(!Policy::needs_load_snapshot(&plain));
+        let fused =
+            FusedScorePolicy::new(vec![term(by(1.0), None), term(LoadHungry, None)]).unwrap();
+        assert!(Policy::needs_load_snapshot(&fused));
+
+        let pipeline = Pipeline::new(
+            vec![Arc::new(Keep(vec!["a"], OnEmpty::Abstain))],
+            Arc::new(fused),
+        )
+        .unwrap();
+        assert!(pipeline.needs_load_snapshot());
+
+        let score = ScorePolicy::new(Arc::new(by(1.0)));
+        assert!(
+            score.needs_load_snapshot(),
+            "shared admission requires a snapshot"
+        );
     }
 
     #[test]

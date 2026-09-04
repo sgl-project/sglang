@@ -421,6 +421,11 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether routing needs one request-scoped Engine Load snapshot.
+    fn needs_load_snapshot(&self) -> bool {
+        self.uses_shared_prefill_admission()
+    }
+
     /// Whether this policy resolves an affinity primary within the candidate range.
     fn is_bucket_affinity_policy(&self) -> bool {
         false
@@ -540,6 +545,14 @@ mod tests {
         assert!(SessionAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
         assert!(CacheAwarePolicy::new(AffinityConfig::default()).uses_shared_prefill_admission());
         assert!(!RoundRobinPolicy::new().uses_shared_prefill_admission());
+    }
+
+    #[test]
+    fn shared_prefill_admission_policies_need_a_load_snapshot() {
+        assert!(PowerOfTwoChoicesPolicy::new().needs_load_snapshot());
+        assert!(SessionAwarePolicy::new(AffinityConfig::default()).needs_load_snapshot());
+        assert!(CacheAwarePolicy::new(AffinityConfig::default()).needs_load_snapshot());
+        assert!(!RoundRobinPolicy::new().needs_load_snapshot());
     }
 
     #[test]
