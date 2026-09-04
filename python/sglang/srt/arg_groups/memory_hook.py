@@ -59,6 +59,10 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
     decode_cuda_graph_config = cuda_graph_config.decode
     prefill_cuda_graph_config = cuda_graph_config.prefill
 
+    # ------------------------------------------------------------------
+    # GPU-dependent capacity defaults
+    # ------------------------------------------------------------------
+
     if gpu_mem is not None:
         if gpu_mem < 20 * 1024:
             # T4, 4080
@@ -149,7 +153,10 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
         if decode_cuda_graph_config.max_bs is None:
             decode_cuda_graph_config.max_bs = 160
 
-    # Set cuda graph batch sizes
+    # ------------------------------------------------------------------
+    # CUDA graph batch-size materialization
+    # ------------------------------------------------------------------
+
     if cfg.device != "cpu":
         if decode_cuda_graph_config.bs is None:
             decode_cuda_graph_config.bs = generate_decode_cuda_graph_batch_sizes(
@@ -228,8 +235,21 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             cuda_graph_config=cuda_graph_config,
         )
 
+    # ------------------------------------------------------------------
+    # Static memory and runtime headroom
+    # ------------------------------------------------------------------
+
     if cfg.mem_fraction_static is None:
-        if post_capture_kv_sizing_planned(server_args):
+        model_config = model_config_of(server_args)
+        is_vlm = (
+            model_config.is_multimodal
+            and not cfg.language_only
+            and not cfg.language_model_only
+            and cfg.disaggregation_mode != "decode"
+        )
+        post_capture_kv_sizing = post_capture_kv_sizing_planned(server_args)
+
+        if post_capture_kv_sizing:
             # Post-capture sizing measures free memory after graph capture, so
             # skip the graph/activation reserve; keep only the floor + parallel slack.
             reserved_mem = 1536
@@ -257,30 +277,31 @@ def handle_gpu_memory_settings(server_args: Any, gpu_mem):
             # Reserve headroom for DeepEP all-to-all buffers on top of the floor.
             reserved_mem += reserve_for_deepep_a2a_mb(server_args)
 
+        mem_fraction_static = (
+            round((gpu_mem - reserved_mem) / gpu_mem, 3)
+            if gpu_mem is not None
+            else 0.95
+        )
+
+        # Multimodal models need more memory for the image processing.
+        if is_vlm:
+            mem_fraction_static = adjust_mem_fraction_for_vlm(
+                mem_fraction_static,
+                model_config,
+                post_capture_kv_sizing,
+                gpu_mem,
+            )
+
         declare_resolution(
             server_args,
             "_handle_gpu_memory_settings",
-            mem_fraction_static=(
-                round((gpu_mem - reserved_mem) / gpu_mem, 3)
-                if gpu_mem is not None
-                else 0.88
-            ),
+            mem_fraction_static=mem_fraction_static,
         )
 
-        # Multimodal models need more memory for the image processing,
-        # so we adjust the mem_fraction_static accordingly. The VLM encoder
-        # only runs on the prefill stage, so PD decode engines do not need
-        # this headroom; prefill engines and normal (non-PD) engines do.
-        model_config = model_config_of(server_args)
-        if (
-            model_config.is_multimodal
-            and not cfg.language_only
-            and not cfg.language_model_only
-            and cfg.disaggregation_mode != "decode"
-        ):
-            adjust_mem_fraction_for_vlm(server_args, model_config)
+    # ------------------------------------------------------------------
+    # Symmetric-memory preallocation
+    # ------------------------------------------------------------------
 
-    # If symm mem is enabled and prealloc size is not set, set it to 4GB
     if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
         envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
         logger.warning(
@@ -349,14 +370,26 @@ def reserve_for_deepep_a2a_mb(server_args: Any) -> float:
     return 0.0
 
 
-def adjust_mem_fraction_for_vlm(server_args: Any, model_config):
-    cfg = resolving_view(server_args)
+def adjust_mem_fraction_for_vlm(
+    mem_fraction_static: float,
+    model_config,
+    post_capture_kv_sizing: bool,
+    gpu_mem,
+) -> float:
+    if post_capture_kv_sizing:
+        # Graph and activation memory will be measured after capture, so only
+        # reserve a fixed 8 GiB of VLM headroom for image-encoder execution here.
+        return (
+            mem_fraction_static - 8 * 1024 / gpu_mem
+            if gpu_mem is not None
+            else mem_fraction_static
+        )
+
     vision_config = getattr(model_config.hf_config, "vision_config", None)
     if vision_config is None:
-        return
+        return mem_fraction_static
 
     # roughly reduce the mem_fraction_static base on params of Vit
-    original_server_arg_mem_fraction = cfg.mem_fraction_static
     # a base mem_fraction_static factor for regular Vit
     base_mem_fraction_reduction_ratio = 0.95
 
@@ -382,8 +415,4 @@ def adjust_mem_fraction_for_vlm(server_args: Any, model_config):
     dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
 
     final_overall_factor = base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
-    declare_resolution(
-        server_args,
-        "adjust_mem_fraction_for_vlm",
-        mem_fraction_static=original_server_arg_mem_fraction * final_overall_factor,
-    )
+    return mem_fraction_static * final_overall_factor
