@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -94,3 +95,7 @@ def test_glm4v_uses_default_offsets_when_token_ids_are_distinct():
     assert processor.get_mm_item_offsets(input_ids, mm_tokens, Modality.VIDEO) == [
         (3, 4)
     ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
