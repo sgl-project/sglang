@@ -677,30 +677,9 @@ def should_skip_mlp_all_reduce() -> bool:
 
 
 def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether to skip the post-experts all-reduce (EP or TP) because a
-    downstream component will fuse, replace, or absorb it.
+    """Whether a downstream component will fuse, replace, or absorb the post-experts all-reduce.
 
-    Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
-        all-reduce with the next layer's residual all-reduce.
-      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
-        scatter will do reduce-scatter, which would double-reduce on top of
-        an all-reduce.
-      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
-        path replaces the all-reduce with a reduce-scatterv.
-      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
-        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
-        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
-      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
-        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
-        MoE outputs back to the source rank, so any further EP/TP all-reduce
-        would double-count and overflow BF16. Mirrors TRTLLM's
-        ``not enable_alltoall`` gate
-        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
-
-    The first two reasons come from per-layer ``ForwardFlags`` published by
-    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
-    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
     if should_skip_mlp_all_reduce():
         return True
@@ -717,6 +696,70 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         # to the source rank
         return True
     return False
+
+
+def can_merge_post_experts_all_reduce() -> bool:
+    """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
+
+    True when moe_dp_size == 1: the two groups are an orthogonal decomposition
+    of _TP, so reducing over each in turn equals one _TP reduction.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and parallel.moe_dp_size == 1
+    )
+
+
+def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Reduce the post-experts MoE output across the EP and MoE-TP groups.
+
+    When both are live and mergeable, issues one _TP all-reduce instead of two
+    sequential ones, which also restores the invariant the fused residual+LN path
+    depends on.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    parallel = get_parallel()
+    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=False
+    )
+    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    )
+
+    if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+
+    if reduce_ep:
+        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+    if reduce_tp:
+        hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the post-experts reduction that was deferred to allreduce fusion.
+
+    Called when the fused residual+LN kernel cannot service the shape. Reduces
+    over the same group ``resolve_fusion_group`` builds the workspace on.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    if can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+    if get_parallel().moe_ep_size > 1:
+        return moe_expert_parallel_all_reduce(hidden_states)
+    return moe_tensor_model_parallel_all_reduce(hidden_states)
 
 
 @contextmanager
