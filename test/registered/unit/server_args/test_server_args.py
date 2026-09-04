@@ -9,6 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+import sglang.srt.utils.aiter as aiter_utils
+from sglang.srt.arg_groups import model_override_base as model_override_base_module
+from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
@@ -1014,6 +1017,86 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
+
+
+class TestDefaultAttentionBackend(CustomTestCase):
+    @staticmethod
+    def _model_config():
+        return SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[]),
+            has_asymmetric_kv=False,
+            has_attention_sinks=False,
+        )
+
+    def _get_mha_backend(self, *, is_hip, gcn_arch, flashinfer_available=False):
+        is_aiter_supported_arch = aiter_utils.is_aiter_supported_arch
+        is_aiter_supported_arch.cache_clear()
+        self.addCleanup(is_aiter_supported_arch.cache_clear)
+
+        with (
+            override_platform(
+                is_hopper_with_cuda_12_3=False,
+                is_sm100=False,
+                is_hip=is_hip,
+                has_flashinfer=flashinfer_available,
+            ),
+            patch.object(
+                model_override_base_module.current_platform,
+                "is_out_of_tree",
+                return_value=False,
+            ),
+            patch.object(
+                model_override_base_module,
+                "is_mps",
+                return_value=False,
+            ),
+            patch.object(aiter_utils, "is_hip", return_value=is_hip),
+            patch.object(
+                aiter_utils.torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(gcnArchName=gcn_arch),
+            ),
+        ):
+            return model_override_base_module.get_default_attn_backend(
+                SimpleNamespace(_resolved_overrides=[]),
+                use_mla_backend=False,
+                model_config=self._model_config(),
+            )
+
+    def test_hip_supported_arch_defaults_to_aiter(self):
+        self.assertEqual(
+            self._get_mha_backend(is_hip=True, gcn_arch="gfx942:sramecc+:xnack-"),
+            "aiter",
+        )
+
+    def test_hip_gfx1100_defaults_to_triton(self):
+        self.assertEqual(
+            self._get_mha_backend(is_hip=True, gcn_arch="gfx1100"),
+            "triton",
+        )
+
+    def test_non_hip_default_is_unchanged(self):
+        self.assertEqual(
+            self._get_mha_backend(
+                is_hip=False,
+                gcn_arch="",
+                flashinfer_available=True,
+            ),
+            "flashinfer",
+        )
+
+    def test_explicit_aiter_skips_default_arch_gate(self):
+        view = SimpleNamespace(
+            attention_backend="aiter",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+        )
+        with patch.object(overrides_module, "get_default_attn_backend") as get_default:
+            self.assertEqual(
+                overrides_module._attention_backend_default(view),
+                {},
+            )
+        get_default.assert_not_called()
 
 
 class TestContextParallelServerArgs(CustomTestCase):
