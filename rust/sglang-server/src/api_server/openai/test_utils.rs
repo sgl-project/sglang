@@ -104,6 +104,7 @@ pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
         server_args: server_args(),
         chat_formatter: None,
         response_activity: Default::default(),
+        startup_readiness: Default::default(),
     })
 }
 
