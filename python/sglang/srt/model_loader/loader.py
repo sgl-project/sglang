@@ -124,7 +124,6 @@ from sglang.srt.model_loader.weight_utils import (
     set_runai_streamer_env,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -2895,7 +2894,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -2919,7 +2917,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -2929,7 +2926,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -2990,7 +2986,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -3002,8 +2998,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -3534,7 +3529,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -4380,22 +4375,10 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.IPC_CACHE:
         from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
-        from sglang.srt.weight_cache.protocol import (
-            compute_global_rank,
-            get_socket_path,
-        )
 
-        if load_config.weight_cache_socket:
-            socket_path = load_config.weight_cache_socket
-        else:
-            from sglang.srt.runtime_context import get_parallel
-
-            ps = get_parallel()
-            global_rank = compute_global_rank(ps.tp_size, ps.pp_rank, ps.tp_rank)
-            socket_path = get_socket_path(global_rank=global_rank)
         return IpcModelLoader(
             load_config=load_config,
-            socket_path=socket_path,
+            socket_path=load_config.weight_cache_socket,
             weight_cache_mode=load_config.weight_cache_mode,
             fallback_load_format=load_config.fallback_load_format,
         )

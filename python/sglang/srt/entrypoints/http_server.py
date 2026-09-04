@@ -231,9 +231,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     publish(server_args, role="tokenizer")
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        get_serving().api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert get_serving().api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -409,7 +409,7 @@ async def lifespan(fast_api_app: FastAPI):
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
 
-                sidecar = start_sidecar(server_args)
+                sidecar = start_sidecar()
 
         # Execute the general warmup
         warmup_thread = threading.Thread(
@@ -483,8 +483,10 @@ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
+from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_disagg,
     get_exec,
     get_lora,
@@ -817,9 +819,9 @@ async def server_info():
     HiCache mirror by `GET /hicache/storage-backend`.
     """
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -832,8 +834,8 @@ async def server_info():
             "version": __version__,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
-            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
+            # `runtime_context.describe_kv_events_publisher` for the contract.
+            "kv_events": describe_kv_events_publisher(server_args),
         }
     )
 
@@ -1521,9 +1523,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -2198,7 +2203,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    ssl_verify = server_args.ssl_verify()
+    ssl_verify = ssl_verify_of(server_args)
 
     # Wait until the server is launched
     success = False
@@ -2374,7 +2379,7 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
             server_args.url() + "/freeze_gc",
             headers=freeze_headers,
             timeout=10,
-            verify=server_args.ssl_verify(),
+            verify=ssl_verify_of(server_args),
         )
         res.raise_for_status()
     except requests.exceptions.RequestException:
@@ -2393,8 +2398,7 @@ def _wait_and_warmup(
     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
             get_exec().moe.ep_join_mode,
         )
 

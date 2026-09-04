@@ -34,6 +34,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
+    get_platform,
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -160,10 +161,8 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
     global _flashinfer_pr4266_run_direct_dense
     global _enable_bf16_splitk_gemm
 
-    from sglang.srt.utils import is_sm100_supported
-
     backend_str = server_args.bf16_gemm_backend
-    if backend_str == "auto" and is_sm100_supported():
+    if backend_str == "auto" and get_platform().is_sm100:
         backend_str = (
             "torch"
             if get_exec().deterministic.enable_deterministic_inference
@@ -190,10 +189,9 @@ def initialize_bf16_gemm_config(server_args: ServerArgs) -> None:
                 "--bf16-gemm-backend cutedsl is batch-size dependent and cannot "
                 "be combined with --enable-deterministic-inference"
             )
-        if not is_sm100_supported():
+        if not get_platform().is_sm100:
             raise ValueError(
-                f"--bf16-gemm-backend {backend.value} requires "
-                "SM100/SM103 (Blackwell)"
+                f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
             )
 
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
@@ -1080,11 +1078,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
+            assert moe_runner_config.activation == "silu", (
+                f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please drop --moe-runner-backend triton to use \
             the sgl-kernel-xpu path, which supports more activations."
+            )
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)

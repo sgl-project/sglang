@@ -115,9 +115,9 @@ class DSACPLayerCommunicator(LayerCommunicator):
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
-            assert (
-                self._context.attn_dp_size == 1
-            ), f"dp_size should be 1 when moe_runner_backend is none"
+            assert self._context.attn_dp_size == 1, (
+                f"dp_size should be 1 when moe_runner_backend is none"
+            )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
