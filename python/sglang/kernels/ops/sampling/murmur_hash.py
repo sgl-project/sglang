@@ -165,7 +165,17 @@ def _murmur_hash32_jit(
 def _murmur_hash32_triton(
     seed: torch.Tensor, positions: torch.Tensor, col_indices: torch.Tensor
 ) -> torch.Tensor:
-    """Triton reference implementation (kept as ROCm fallback)."""
+    """Triton reference implementation (kept as ROCm fallback).
+
+    The JIT path validates shapes in its C++ launcher; this path has no such
+    guard, so the checks the kernel relies on live here.
+    """
+    assert seed.ndim == 1 and positions.ndim == 1 and col_indices.ndim == 1, (
+        f"inputs must be 1D {seed.shape=} {positions.shape=} {col_indices.shape=}"
+    )
+    assert seed.shape == positions.shape, (
+        f"seed and positions must have the same shape {seed.shape=} {positions.shape=}"
+    )
     n = seed.shape[0]
     m = col_indices.shape[0]
     hashed = torch.empty((n, m), dtype=torch.uint32, device=seed.device)

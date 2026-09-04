@@ -1,3 +1,5 @@
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -112,11 +114,13 @@ struct MurmurHashKernel {
 
     const auto n = N.unwrap();
     const auto m = M.unwrap();
-    RuntimeCheck(n * m == Total.unwrap(), "out numel must equal n * m");
+    CHECK_HOST(n * m == Total.unwrap()) << "out numel must equal n * m";
     if (n == 0 || m == 0) return;
 
+    // grid.x carries one block per row; grid.y one block per kBlockSize columns.
+    CHECK_HOST(n <= 2147483647LL) << "num_rows " << n << " exceeds CUDA grid.x limit (2^31-1)";
     const auto col_blocks = div_ceil(static_cast<uint32_t>(m), kBlockSize);
-    RuntimeCheck(col_blocks <= 65535u, "num_cols too large for CUDA grid.y (65535 blocks)");
+    CHECK_HOST(col_blocks <= 65535u) << "num_cols too large for CUDA grid.y (" << col_blocks << " > 65535 blocks)";
 
     const auto params = MurmurHashParams{
         .seed = static_cast<const uint64_t*>(seed.data_ptr()),

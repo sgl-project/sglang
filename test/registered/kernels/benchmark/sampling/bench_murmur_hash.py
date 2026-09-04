@@ -22,7 +22,9 @@ FN_MAP = {
 @marker.parametrize("m", [2**14, 2**16, 2**17], [2**14])
 @marker.benchmark("impl", ["jit", "triton"])
 def benchmark(n: int, m: int, impl: str):
-    seed = torch.randint(0, torch.iinfo(torch.int64).max, (n,), dtype=torch.uint64, device="cuda")
+    seed = torch.randint(
+        0, torch.iinfo(torch.int64).max, (n,), dtype=torch.uint64, device="cuda"
+    )
     positions = torch.arange(n, dtype=torch.int64, device="cuda")
     col_indices = torch.arange(m, dtype=torch.int64, device="cuda")
     return marker.do_bench(

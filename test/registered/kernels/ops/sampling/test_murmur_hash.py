@@ -38,8 +38,12 @@ def _murmur_hash32_reference(seed, positions, col_indices):
     """Bit-exact PyTorch CPU reference implementation for a CPU oracle."""
 
     seed_np = seed.cpu().numpy().astype(np.uint64).reshape(-1, 1)
-    positions_np = positions.cpu().numpy().astype(np.uint32).astype(np.uint64).reshape(-1, 1)
-    col_indices_np = col_indices.cpu().numpy().astype(np.uint32).astype(np.uint64).reshape(1, -1)
+    positions_np = (
+        positions.cpu().numpy().astype(np.uint32).astype(np.uint64).reshape(-1, 1)
+    )
+    col_indices_np = (
+        col_indices.cpu().numpy().astype(np.uint32).astype(np.uint64).reshape(1, -1)
+    )
 
     M32 = np.uint64(0xFFFFFFFF)
     C1 = np.uint64(0xCC9E2D51)
@@ -128,7 +132,9 @@ def test_murmur_hash_entry_point_matches_jit():
 
 def test_murmur_hash_production_shapes():
     # Sampler: batch x vocab. Eagle: batch x (draft_token_num + 1).
-    seed = torch.randint(0, torch.iinfo(torch.int64).max, (8,), dtype=torch.uint64, device="cuda")
+    seed = torch.randint(
+        0, torch.iinfo(torch.int64).max, (8,), dtype=torch.uint64, device="cuda"
+    )
     positions = torch.arange(8, dtype=torch.int64, device="cuda")
     col_indices = torch.arange(32768, device="cuda", dtype=torch.int64)
     out = murmur_hash32(seed, positions, col_indices)

@@ -62,10 +62,10 @@ __all__ = ["top_k_renorm_probs", "top_p_renorm_probs"]
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
 # One backend per device: JIT on CUDA, Triton on ROCm. The ``capabilities``
-# make exactly one spec eligible per platform, and each target is the concrete
-# implementation so ``get_kernel(..., backend=...)`` can force either one. The
-# ``murmur_hash32`` entry point in murmur_hash.py does the same dispatch for
-# callers that import it directly.
+# make exactly one spec eligible per platform (so ``backend=`` only selects
+# among the specs eligible on the current device). The ``murmur_hash32`` entry
+# point in murmur_hash.py does the same device dispatch for callers that import
+# it directly.
 register_kernel(
     KernelSpec(
         op="sampling.murmur_hash32",
