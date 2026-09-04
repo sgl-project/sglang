@@ -204,6 +204,12 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`True`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`weight_name_prefixes`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Partial update: only checkpoint tensors whose name starts with one of the prefixes are updated. See [Partial (delta) weight updates](#partial-delta-weight-updates).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: list[str] | None</td>
+    </tr>
   </tbody>
 </table>
 
@@ -246,7 +252,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
   </tbody>
 </table>
 
-**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
+**Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None, weight_name_prefixes=None)`
 
 **Diffusion engine (SGLang-Diffusion):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
 
@@ -327,6 +333,56 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 </table>
 
 > **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
+
+#### Partial (delta) weight updates
+
+When only part of the model changed — a fine-tuned `lm_head` or embedding, a
+handful of layers, or an RL policy delta — pass `weight_name_prefixes` to
+update just those tensors in place, without streaming the full checkpoint:
+
+```bash
+curl -X POST http://localhost:30000/update_weights_from_disk \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_path": "/checkpoints/step_100",
+    "weight_name_prefixes": ["model.layers.30.", "model.layers.31.", "lm_head."],
+    "weight_version": "step-100"
+  }'
+```
+
+`model_path` may also be a *delta checkpoint* — an ordinary safetensors
+file/folder restricted to the changed tensors (checkpoint-format names, full
+unsharded tensors) — with `weight_name_prefixes: [""]` to select everything in
+it:
+
+```python
+from safetensors.torch import save_file
+
+changed = {
+    name: param.detach().cpu()
+    for name, param in trainer_model.state_dict().items()
+    if name.startswith(("lm_head.", "model.layers.31."))
+}
+save_file(changed, "/checkpoints/step_100_delta/model.safetensors")
+```
+
+Partial-update semantics:
+
+- Only the matching tensors are streamed and copied in place; quantization
+  post-processing re-runs only for the modules that received weights.
+- The engine keeps its original `model_path` identity (`/model_info` is not
+  repointed at the delta path), unlike a full update.
+- Graph-visible tensor storage is verified against a pre-update manifest; if
+  post-processing replaced any storage, the response warns that CUDA graphs
+  may serve stale weights (pass `recapture_cuda_graph: true` to recapture).
+- On a load failure the touched tensors are restored from the original
+  checkpoint.
+- Supply a layer's tensors together (e.g. all of `q_proj`/`k_proj`/`v_proj`
+  of a fused attention layer): its post-processing sees the mixture
+  otherwise.
+- The same `flush_cache` / `weight_version` / `pause_generation` flow as a
+  full update applies — the radix cache must still be flushed after any
+  weight change.
 
 ### Update Weights from Tensor
 

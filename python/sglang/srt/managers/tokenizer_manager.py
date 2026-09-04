@@ -2121,16 +2121,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_tmp = []
         self.model_update_result = asyncio.Future()
         self._dispatch_to_scheduler(obj)
+        # A partial update patches tensors in place; the served model keeps
+        # its identity, so the path/format readback must not be repointed.
+        is_partial = obj.weight_name_prefixes is not None
         if expected_workers == 1:
             result = await self.model_update_result
-            if result.success:
+            if result.success and not is_partial:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             return result.success, result.message, result.num_paused_requests
         else:
             result = await self.model_update_result
 
             all_success = all([r.success for r in result])
-            if all_success is True:
+            if all_success is True and not is_partial:
                 self._update_model_path_info(obj.model_path, obj.load_format)
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)

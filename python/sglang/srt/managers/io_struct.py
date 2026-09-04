@@ -1796,6 +1796,11 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     flush_cache: bool = True
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
+    # Prefixes of checkpoint weight names to update. Enables a partial in-place
+    # update of only the matching tensors; model_path may then be a delta
+    # checkpoint holding just the changed tensors (pass [""] to select all of
+    # them). The engine keeps its original model path.
+    weight_name_prefixes: Optional[List[str]] = None
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
@@ -2094,7 +2099,8 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
+    # Only numeric scheduler knobs are accepted; the allowlist is
+    # HOT_UPDATABLE_SERVER_ARGS in scheduler_components/server_args_updater.py.
     server_args: Dict[str, Union[int, float]]
 
 

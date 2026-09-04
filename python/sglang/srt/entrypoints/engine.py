@@ -1473,16 +1473,22 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        weight_name_prefixes: Optional[List[str]] = None,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
         This method allows updating the model weights from disk without restarting
         the engine. It can be used to load a different model or update weights with
-        new training.
+        new training. With `weight_name_prefixes`, only the checkpoint tensors
+        whose name starts with one of the prefixes are updated (a partial
+        update); `model_path` may then be a delta checkpoint holding just the
+        changed tensors (pass `[""]` to select all of them), and the engine
+        keeps its original model path.
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
             load_format=load_format,
+            weight_name_prefixes=weight_name_prefixes,
         )
 
         return self.loop.run_until_complete(

@@ -104,6 +104,18 @@ response = requests.get(url)
 print_highlight(response.text)
 ```
 
+## Update Server Args At Runtime
+
+`POST /set_internal_state` hot-updates a small allowlist of server args without restarting the server. The update fans out to every scheduler and lands in the resolved runtime config, so `GET /server_info` reads the new values back.
+
+Currently updatable: `schedule_conservativeness`, `stream_interval`, `pp_max_micro_batch_size`, `speculative_accept_threshold_single`, `speculative_accept_threshold_acc`, and the DSpark worker commands `dspark_force_budget_frac` / `dspark_clear_info_records`. Every other field is rejected: most server args feed derived state (memory pools, parallel groups, captured graphs) at startup and cannot change in a live process. The allowlist is `HOT_UPDATABLE_SERVER_ARGS` in `sglang/srt/managers/scheduler_components/server_args_updater.py`; a field is admitted only when all of its readers observe the new value — either every reader reads the runtime config live, or the scheduler explicitly refreshes the derived state after the update.
+
+```bash Command
+curl -s -X POST "http://127.0.0.1:30000/set_internal_state" \
+  -H "Content-Type: application/json" \
+  -d '{"server_args": {"schedule_conservativeness": 0.3, "stream_interval": 4}}'
+```
+
 ## Health Check
 - `/health`: Check the health of the server.
 - `/health_generate`: Check the health of the server by generating one token.

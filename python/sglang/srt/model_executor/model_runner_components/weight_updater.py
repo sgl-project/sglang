@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import gc
 import logging
 from dataclasses import dataclass, field
@@ -8,6 +9,15 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.model_executor.model_runner_components.partial_weight_update import (
+    ModuleTouchRecorder,
+    filter_weights_by_names,
+    filter_weights_by_prefix,
+    postprocess_touched_modules,
+)
+from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+    ModelStorageManifest,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -144,6 +154,7 @@ class WeightUpdater:
         load_format: str,
         weight_name_filter: Optional[Callable[[str], bool]] = None,
         recapture_cuda_graph: bool = False,
+        weight_name_prefixes: Optional[List[str]] = None,
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
@@ -151,12 +162,22 @@ class WeightUpdater:
         if error is not None:
             return False, error
 
+        if weight_name_prefixes is not None:
+            return self._update_weights_from_disk_partial(
+                model_path=model_path,
+                load_format=load_format,
+                weight_name_prefixes=weight_name_prefixes,
+                weight_name_filter=weight_name_filter,
+                recapture_cuda_graph=recapture_cuda_graph,
+            )
+
         logger.info(
             f"Update engine weights online from disk begin. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
         target_device = torch.device(self.device)
+        original_model_path = self.model_config.model_path
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -164,6 +185,7 @@ class WeightUpdater:
         loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
+            self.model_config.model_path = original_model_path
             return False, message
 
         def get_weight_iter(config):
@@ -186,6 +208,7 @@ class WeightUpdater:
                 iter = get_weight_iter(self.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
+                self.model_config.model_path = original_model_path
                 return False, message
             try:
                 model = model_load_weights(self.get_model(), iter)
@@ -195,8 +218,19 @@ class WeightUpdater:
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self.model_config)
-                model_load_weights(self.get_model(), iter)
+                # Roll back from the original checkpoint, not the one that
+                # just failed, and keep model_config pointing at it.
+                self.model_config.model_path = original_model_path
+                try:
+                    iter = get_weight_iter(self.model_config)
+                    model_load_weights(self.get_model(), iter)
+                except Exception as rollback_error:
+                    return False, (
+                        f"{message}\nRollback from the original checkpoint "
+                        f"also failed: {rollback_error}. Weights may be "
+                        f"inconsistent; run a full update_weights_from_disk "
+                        f"to recover."
+                    )
                 return False, message
 
         self.update_model_fields(
@@ -206,7 +240,145 @@ class WeightUpdater:
             load_config=load_config,
         )
 
-        if recapture_cuda_graph and (
+        self._maybe_recapture_cuda_graph(recapture_cuda_graph)
+
+        logger.info("Update weights end.")
+        return True, "Succeeded to update model weights."
+
+    def _update_weights_from_disk_partial(
+        self: WeightUpdater,
+        *,
+        model_path: str,
+        load_format: str,
+        weight_name_prefixes: List[str],
+        weight_name_filter: Optional[Callable[[str], bool]],
+        recapture_cuda_graph: bool,
+    ) -> tuple[bool, str]:
+        """Update only the checkpoint tensors matching the prefixes, in place.
+
+        The engine keeps its original model path; a layer's tensors must be
+        supplied together (its post-processing sees the mixture otherwise).
+        """
+        model = self.get_model()
+        model_runner = self.get_model_runner()
+        logger.info(
+            f"Partial weight update from disk begin. path={model_path} "
+            f"prefixes={weight_name_prefixes}"
+        )
+
+        target_device = torch.device(self.device)
+        load_config = LoadConfig(load_format=load_format)
+        loader = get_model_loader(load_config, self.model_config)
+        if not isinstance(loader, DefaultModelLoader):
+            return False, f"Failed to get model loader: {loader}."
+
+        def get_filtered_iter(source, name_filter):
+            iter = loader._get_weights_iterator(source)
+            if weight_name_filter is not None:
+                iter = (
+                    (name, weight) for name, weight in iter if weight_name_filter(name)
+                )
+            return name_filter(iter)
+
+        original_source = DefaultModelLoader.Source.init_new(self.model_config, model)
+        # The revision belongs to the original model, not the update path.
+        update_source = dataclasses.replace(
+            original_source, model_or_path=model_path, revision=None
+        )
+
+        manifest = ModelStorageManifest.capture(model)
+        recorder = ModuleTouchRecorder(model)
+        seen_names: List[str] = []
+
+        with set_default_torch_dtype(self.model_config.dtype):
+            try:
+                iter = get_filtered_iter(
+                    update_source,
+                    lambda it: filter_weights_by_prefix(
+                        it, weight_name_prefixes, seen_names
+                    ),
+                )
+            except Exception as e:
+                return False, f"Failed to get weights iterator: {e}."
+            try:
+                with recorder:
+                    loader.load_weights_only(model, iter, target_device)
+            except Exception as e:
+                message = f"Failed to update weights: {e}."
+                try:
+                    del iter
+                    gc.collect()
+                    rollback_iter = get_filtered_iter(
+                        original_source,
+                        lambda it: filter_weights_by_names(it, set(seen_names)),
+                    )
+                    with recorder:
+                        loader.load_weights_only(model, rollback_iter, target_device)
+                    postprocess_touched_modules(
+                        recorder.touched_modules(), target_device
+                    )
+                except Exception as rollback_error:
+                    return False, (
+                        f"{message}\nRollback from the original checkpoint also "
+                        f"failed: {rollback_error}. Weights may be inconsistent; "
+                        f"run a full update_weights_from_disk to recover."
+                    )
+                # Rollback post-processing can replace storage just like the
+                # success path, so it gets the same staleness check.
+                rollback_note = self._storage_change_note(
+                    manifest, model, recapture_cuda_graph
+                )
+                return False, (
+                    f"{message}\nRolled back to original weights.{rollback_note}"
+                )
+
+            if not seen_names:
+                if model_runner.is_draft_worker:
+                    return True, "No weights matched; draft model unchanged."
+                return False, (
+                    f"No checkpoint weights matched "
+                    f"weight_name_prefixes {weight_name_prefixes}."
+                )
+
+            touched = recorder.touched_modules()
+            postprocess_touched_modules(touched, target_device)
+
+        message = (
+            f"Succeeded to partially update {len(seen_names)} weights "
+            f"across {len(touched)} modules."
+        )
+        message += self._storage_change_note(manifest, model, recapture_cuda_graph)
+
+        logger.info("Partial weight update end.")
+        return True, message
+
+    def _storage_change_note(
+        self: WeightUpdater,
+        manifest: ModelStorageManifest,
+        model,
+        recapture_cuda_graph: bool,
+    ) -> str:
+        """The CUDA-graph staleness note for a weight update, or ""."""
+        changed_names = manifest.changed_names(model)
+        if not changed_names:
+            self._maybe_recapture_cuda_graph(recapture_cuda_graph)
+            return ""
+        if self._maybe_recapture_cuda_graph(recapture_cuda_graph):
+            return (
+                f" Graph-visible storage changed for {len(changed_names)} "
+                f"tensors; CUDA graphs recaptured."
+            )
+        storage_warning = (
+            f"Graph-visible storage changed for {len(changed_names)} "
+            f"tensors (e.g. {list(changed_names[:3])}); CUDA graphs may "
+            f"serve stale weights until recaptured. Pass "
+            f"recapture_cuda_graph=True or restart the server."
+        )
+        logger.error(storage_warning)
+        return f" WARNING: {storage_warning}"
+
+    def _maybe_recapture_cuda_graph(self: WeightUpdater, requested: bool) -> bool:
+        if requested and (
             self.device == "cuda"
             or self.device == "musa"
             or (
@@ -215,9 +387,8 @@ class WeightUpdater:
             )
         ):
             self.recapture_cuda_graph()
-
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
+            return True
+        return False
 
     def update_weights_from_distributed(
         self: WeightUpdater,
