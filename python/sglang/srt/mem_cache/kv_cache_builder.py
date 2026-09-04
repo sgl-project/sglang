@@ -144,6 +144,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     backend = disagg.disaggregation_decode_retraction_backup
     unified_hybrid_swa = memory.enable_unified_memory and tp_worker.is_hybrid_swa
+    unified_decode_radix = (
+        memory.enable_unified_memory and disagg.disaggregation_decode_enable_radix_cache
+    )
+    if backend == "host_pool" and unified_decode_radix:
+        raise ValueError(
+            "Unified-memory H2D/D2H does not support host-pool decode "
+            "retraction with decode radix cache yet."
+        )
     if backend == "host_pool" and unified_hybrid_swa:
         raise ValueError(
             "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "

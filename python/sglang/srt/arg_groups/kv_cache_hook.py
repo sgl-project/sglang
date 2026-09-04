@@ -245,6 +245,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 "supports --hicache-storage-backend=file only."
             )
             model_config = model_config_of(server_args)
+            assert not use_mla_backend(server_args), (
+                "--enable-unified-memory decode KV offload does not support "
+                "MLA models yet."
+            )
             assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory decode KV offload does not support "
                 "hybrid-Mamba models."
@@ -255,6 +259,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             )
         if cfg.disaggregation_decode_retraction_backup == "host_pool":
             model_config = model_config_of(server_args)
+            assert not cfg.disaggregation_decode_enable_radix_cache, (
+                "--enable-unified-memory host-pool decode retraction does not "
+                "support decode radix-cache H2D/D2H transfers yet."
+            )
             assert mambaish_config(model_config) is None, (
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-Mamba models."
