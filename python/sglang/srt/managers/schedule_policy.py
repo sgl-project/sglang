@@ -428,18 +428,20 @@ class SchedulePolicy:
             (accumulate batch.extend_num_tokens per forward). Pass it in as `processed_tokens`.
           - Snapshot `req.arrival_processed_tokens = counter` when the req enters waiting_queue
             (pop_bootstrapped for disagg prefill, _add_request_to_queue for unified).
+
+        Call sites that omit `processed_tokens` (dllm, disagg decode)
+        degrade to rid-lexicographic order; those queues carry no prefill work.
         """
 
         def _key(r: Req):
-            rid = getattr(r, "rid", "")
-            if r.rid in temporary_deprioritized:
+            rid = r.rid
+            if rid in temporary_deprioritized:
                 return (float("inf"), rid)
             uncached = SchedulePolicy._uncached_len(r)
             if uncached <= 0:
                 # No prefill work; drain immediately.
                 return (-float("inf"), rid)
-            arrival_processed = getattr(r, "arrival_processed_tokens", 0)
-            waited_tokens = max(0, processed_tokens - arrival_processed)
+            waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
             ratio_delta = waited_tokens / uncached
             return (-ratio_delta, rid)
 

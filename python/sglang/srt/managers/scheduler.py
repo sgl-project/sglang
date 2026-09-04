@@ -2808,6 +2808,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -3739,9 +3740,8 @@ class Scheduler(
         self._sched_idled = False
 
         # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        _ent = getattr(batch, "extend_num_tokens", None) or 0
-        if _ent > 0:
-            self.processed_tokens_counter += int(_ent)
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
