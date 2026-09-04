@@ -216,6 +216,9 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
+    DynamicChunkSizer,
+)
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -305,6 +308,9 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.uno_validation import validate_uno_request
+from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -630,6 +636,7 @@ class Scheduler(
 
         # Init chunked prefill
         self.init_chunked_prefill()
+        self.maybe_init_dynamic_chunk_sizer()
 
         # Init diffusion LLM
         self.init_diffusion_llm()
@@ -924,6 +931,30 @@ class Scheduler(
                     reasoning_parser.detector.think_end_token,
                 )
 
+            selectable_tokens = getattr(
+                reasoning_parser.detector,
+                "request_selectable_think_end_tokens",
+                (),
+            )
+            if selectable_tokens:
+                selectable_sequences = []
+                for end_token in selectable_tokens:
+                    token_ids = self.tokenizer.encode(
+                        end_token, add_special_tokens=False
+                    )
+                    if not token_ids:
+                        raise ValueError(
+                            f"Request-selectable reasoning terminator {end_token!r} "
+                            "could not be encoded"
+                        )
+                    selectable_sequences.append(token_ids)
+                self.model_config.request_selectable_think_end_id_sequences = [
+                    list(sequence)
+                    for sequence in dict.fromkeys(
+                        tuple(sequence) for sequence in selectable_sequences
+                    )
+                ]
+
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
             initialize_mamba_selective_state_update_backend(self.server_args)
@@ -1063,6 +1094,13 @@ class Scheduler(
         self.init_all_cuda_graphs()
 
         model_runner = self.tp_worker.model_runner
+        with torch.get_device_module(model_runner.device).stream(
+            model_runner.forward_stream
+        ):
+            if self.draft_worker is None:
+                model_runner.prewarm_sampling()
+            else:
+                self.draft_worker.prewarm_sampling()
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
@@ -1240,19 +1278,28 @@ class Scheduler(
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
 
-        # Init the dynamic chunking predictor for PP
-        self.enable_dynamic_chunking = (
-            get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1
+    def maybe_init_dynamic_chunk_sizer(self) -> None:
+        """Profile a PP prefill latency model that sizes chunks per stage."""
+        self.dynamic_chunk_sizer: Optional[DynamicChunkSizer] = None
+        if not (get_schedule().enable_dynamic_chunking and self.ps.pp_size > 1):
+            return
+        sizer = DynamicChunkSizer(
+            model_runner=self.tp_worker.model_runner,
+            model_config=self.model_config,
+            tree_cache=self.tree_cache,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            spec_algorithm=self.spec_algorithm,
+            chunked_prefill_size=self.chunked_prefill_size,
+            max_prefill_tokens=self.max_prefill_tokens,
+            page_size=self.page_size,
+            device=self.device,
+            pp_group=self.pp_group,
+            world_group=self.world_group,
+            pp_rank=self.ps.pp_rank,
         )
-        if self.enable_dynamic_chunking:
-            try:
-                self.profile_and_init_predictor()
-            except Exception as e:
-                logger.warning(
-                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
-                    "Dynamic chunking will be disabled."
-                )
-                self.enable_dynamic_chunking = False
+        if sizer.profile_and_fit():
+            self.dynamic_chunk_sizer = sizer
 
     def _should_defer_prefill(self) -> bool:
         if self._prefill_decode_interval_remaining == 0:
@@ -1753,6 +1800,8 @@ class Scheduler(
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
+        destroy_global_experts_capturer()
+        destroy_global_indexer_capturer()
 
         rank_consensus_checker.shutdown()
 
@@ -2167,6 +2216,9 @@ class Scheduler(
         # Park the idle loop on the request ring within the rank-0 rust-server
         self.idle_sleeper = RustServerIdleSleeper(rust_server)
 
+    def rust_server_tokenizer_path(self) -> str:
+        return get_serving().tokenizer_path
+
     def init_request_receiver(self) -> None:
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.recv_from_tokenizer,
@@ -2245,6 +2297,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_chunked_req=lambda: self.chunked_req,
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -2302,19 +2355,31 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
-            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
-                self.waiting_queue
+            waiting_queue_prefix_matched=lambda: (
+                self.policy.waiting_queue_prefix_matched(self.waiting_queue)
             ),
-            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
+            get_recent_cache_hit_rate=lambda: (
+                self.metrics_reporter.recent_cache_hit_rate
+            ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
-            get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: (
+                self.disagg_prefill_bootstrap_queue
+            ),
+            get_disagg_prefill_inflight_queue=lambda: (
+                self.disagg_prefill_inflight_queue
+            ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
-            get_spec_total_num_accept_tokens=lambda: self.metrics_reporter.spec_total_num_accept_tokens,
-            get_spec_total_num_forward_ct=lambda: self.metrics_reporter.spec_total_num_forward_ct,
-            get_total_prefill_uncached_tokens=lambda: self.total_prefill_uncached_tokens,
+            get_spec_total_num_accept_tokens=lambda: (
+                self.metrics_reporter.spec_total_num_accept_tokens
+            ),
+            get_spec_total_num_forward_ct=lambda: (
+                self.metrics_reporter.spec_total_num_forward_ct
+            ),
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
+            ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
@@ -2757,6 +2822,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_uno():
+            error_msg = validate_uno_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if (
             req.return_sampling_mask
             and self.disaggregation_mode != DisaggregationMode.NULL
@@ -3069,7 +3142,11 @@ class Scheduler(
 
     def _release_aborted_request(self, rid: str) -> None:
         """Drop the cache-side state an aborted request left behind."""
-        if self.enable_hicache_storage or self.enable_unified_cache_external_linker:
+        if (
+            self.enable_hierarchical_cache
+            or self.enable_hicache_storage
+            or self.enable_unified_cache_external_linker
+        ):
             self.tree_cache.release_aborted_request(rid)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
@@ -3099,8 +3176,6 @@ class Scheduler(
             )
             if abort_existing_req:
                 self._release_aborted_request(candidate_req.rid)
-                if self.enable_hierarchical_cache and not self.enable_hicache_storage:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
@@ -3600,9 +3675,9 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
+        if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
+            dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
@@ -3675,9 +3750,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req
                 ):
                     break
 
@@ -3686,10 +3760,17 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                # Pop the L3-loaded span. Unified cache exposes its absolute
+                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+                loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+                    req.rid
+                )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
+                    req.storage_hit_start = loaded_start
+                    # Cache-mode host memory is a resident L2 tier. Buffer mode
+                    # marks the staged span below once it is surfaced.
+                    req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
             if (
@@ -3711,6 +3792,13 @@ class Scheduler(
                 if held_tokens > 0:
                     req.host_hit_length = held_tokens
                     req.swa_host_hit_length = held_swa_tokens
+                    req.storage_hit_length = held_tokens
+                    req.storage_hit_start = len(req.prefix_indices)
+                    req.host_hit_is_storage = True
+                elif not (req.host_hit_is_storage and req.host_loaded_length > 0):
+                    req.storage_hit_length = 0
+                    req.storage_hit_start = None
+                    req.host_hit_is_storage = False
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4438,7 +4526,7 @@ class Scheduler(
                 self.decode_moment_totals,
                 batch_size,
                 step_us,
-                batch_size + result.num_correct_drafts,
+                result.get_num_generated_tokens(batch_size),
             )
 
     def maybe_send_health_check_signal(self):
