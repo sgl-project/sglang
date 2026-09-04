@@ -156,6 +156,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
+        return self.translate_loc_from_full_to_swa(kv_indices)
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():

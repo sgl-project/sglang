@@ -625,6 +625,15 @@ class UnifiedRadixCache(BasePrefixCache):
             available_size_targets=available_size_targets,
         )
 
+        return self._finish_eviction(tracker, start_time)
+
+    def _finish_eviction(
+        self,
+        tracker: dict[ComponentType, int],
+        start_time: float,
+    ) -> EvictResult:
+        """Finish write-back bookkeeping and build the public result."""
+
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
@@ -1196,10 +1205,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self, req: Req
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:
         num_tokens = req.seqlen - 1
-        full_indices = self.req_to_token_pool.req_to_token[
+        full_virtual_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :num_tokens
         ].to(torch.int64)
-        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
+        full_virtual_indices = self._pad_retraction_indices(
+            full_virtual_indices, self.page_size
+        )
+        full_device_indices = (
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                full_virtual_indices
+            )
+        )
 
         component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
         if self.supports_swa():
@@ -1214,29 +1230,30 @@ class UnifiedRadixCache(BasePrefixCache):
             assert bool((swa_indices > 0).all()), (
                 f"unmapped SWA window positions for request {req.rid}"
             )
+            swa_indices = self._pad_retraction_indices(swa_indices, self.page_size)
             component_transfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=self._pad_retraction_indices(
-                        swa_indices, self.page_size
-                    ),
+                    device_indices=swa_indices,
                 )
             ]
 
-        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_indices)
+        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_device_indices)
         extra_transfers = [
             transfer
             for transfers in component_transfers.values()
             for transfer in transfers
         ]
-        extra_transfers.extend(
-            self._build_sidecar_transfers(
-                CacheTransferPhase.BACKUP_HOST,
-                kv_transfer,
-                component_transfers,
-            )
+        sidecar_transfers = self._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST,
+            kv_transfer,
+            component_transfers,
         )
-        return full_indices, extra_transfers
+        for transfer in sidecar_transfers:
+            if transfer.name in (PoolName.DRAFT, PoolName.DRAFT_INDEXER):
+                transfer.device_indices = full_virtual_indices
+        extra_transfers.extend(sidecar_transfers)
+        return full_device_indices, extra_transfers
 
     def _reclaim_retraction_host(self, num_tokens: int) -> int:
         if self.disable:
@@ -1248,21 +1265,35 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
+        anchor_entry = self.host_pool_group.anchor_entry
+        if anchor_entry.host_pool.shared_allocation_domain is not None:
+            allocation = self.cache_controller.allocate_shared_host_transfers(
+                device_indices, extra_transfers or None
+            )
+            if allocation is None and anchor_entry.host_evict_fn is None:
+                self._reclaim_retraction_host(len(device_indices))
+                allocation = self.cache_controller.allocate_shared_host_transfers(
+                    device_indices, extra_transfers or None
+                )
+            if allocation is None:
+                return None
+            host_indices, resolved = allocation
+        else:
             host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
+            if host_indices is None:
+                self._reclaim_retraction_host(len(device_indices))
+                host_indices = self.host_pool_group.alloc(len(device_indices))
+            if host_indices is None:
+                return None
 
-        resolved = self.host_pool_group.resolve_host_transfers(
-            extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
-        )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
-            return None
+            resolved = self.host_pool_group.resolve_host_transfers(
+                extra_transfers or None,
+                primary_device_indices=device_indices,
+                primary_host_indices=host_indices,
+            )
+            if resolved is None and extra_transfers:
+                self.host_pool_group.free(host_indices)
+                return None
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1402,11 +1433,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         return self.cache_controller.write(

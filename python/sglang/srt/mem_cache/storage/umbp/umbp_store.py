@@ -589,25 +589,36 @@ class UMBPStore(HiCacheStorage):
             if "dram_page_size" in extra:
                 page_byte_size = int(extra["dram_page_size"])
             elif mem_pool_host is not None:
-                # Probe element_size from the same buffer-meta helper that
-                # batch_preprocess will actually use; this matches per-call
-                # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
-                # without per-case formulas (NSA in particular: get_ksize_per_token
-                # would over-count by the indexer buffer that is never put to UMBP).
-                dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
-                if self.is_mla_backend:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                elif storage_config is not None and getattr(
+                split_factor = 1
+                if storage_config is not None and getattr(
                     storage_config, "should_split_heads", False
                 ):
-                    sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                    split_factor = storage_config.tp_lcm_size // storage_config.tp_size
+                element_size_getter = getattr(
+                    mem_pool_host, "get_page_buffer_element_size", None
+                )
+                if element_size_getter is not None:
+                    page_byte_size = element_size_getter(split_factor)
                 else:
-                    meta = mem_pool_host.get_page_buffer_meta(dummy)
-                # meta is None for a logical-anchor group (see note above);
-                # esz is the per-page element-size list otherwise.
-                esz = meta[1] if meta else None
-                page_byte_size = int(esz[0]) if esz else 0
+                    # Probe element_size from the same buffer-meta helper that
+                    # batch_preprocess will actually use; this matches per-call
+                    # Put/Get size byte-for-byte for MHA / MHA-split / MLA / NSA
+                    # without per-case formulas (NSA in particular:
+                    # get_ksize_per_token would over-count by the indexer buffer
+                    # that is never put to UMBP).
+                    dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
+                    if self.is_mla_backend:
+                        meta = mem_pool_host.get_page_buffer_meta(dummy)
+                    elif split_factor != 1:
+                        meta = mem_pool_host.get_split_heads_page_buffer_meta(
+                            dummy, split_factor
+                        )
+                    else:
+                        meta = mem_pool_host.get_page_buffer_meta(dummy)
+                    # meta is None for a logical-anchor group (see note above);
+                    # esz is the per-page element-size list otherwise.
+                    esz = meta[1] if meta else None
+                    page_byte_size = int(esz[0]) if esz else 0
 
             if (
                 page_byte_size is not None

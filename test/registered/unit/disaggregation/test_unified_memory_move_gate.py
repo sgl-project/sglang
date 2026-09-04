@@ -56,6 +56,7 @@ class _FakeScheduler:
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
         self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.decode_offload_manager = None
 
 
 class TestDecodeMoveGate(CustomTestCase):

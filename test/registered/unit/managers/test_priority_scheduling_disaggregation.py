@@ -147,7 +147,10 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
-        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[]),
+            uses_separate_draft_kv_indices=False,
+        )
         queue.tree_cache = MagicMock()
 
         scheduler = MagicMock()

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import (
     get_memory,
@@ -255,6 +256,15 @@ def build_kv_only_group(
     )
 
 
+def _uses_unified_page_envelope_host(
+    full_kv_pool: Any, swa_kv_pool: Any, use_mla: bool
+) -> bool:
+    return not use_mla and all(
+        get_mha_host_pool_cls(pool) is UnifiedPageEnvelopeHostPool
+        for pool in (full_kv_pool, swa_kv_pool)
+    )
+
+
 def build_hybrid_swa_group(
     *,
     page_size: int,
@@ -265,6 +275,7 @@ def build_hybrid_swa_group(
     use_mla: bool,
     kv_host_size: Optional[float] = None,
     swa_host_size: Optional[float] = None,
+    host_full_evict_fn: Optional[Callable[[int], Any]] = None,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     swa_attn_allocator: Any = None,
@@ -272,21 +283,42 @@ def build_hybrid_swa_group(
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
     transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
-    kv_host_pool = build_kv_host_pool(
-        kv_pool=full_kv_pool,
-        page_size=page_size,
-        use_mla=use_mla,
-        host_size=kv_host_size,
-        pool_label="full",
-    )
-    swa_host_pool = build_kv_host_pool(
-        kv_pool=swa_kv_pool,
-        page_size=page_size,
-        use_mla=use_mla,
-        host_size=swa_host_size,
-        mtp_draft_device_pools=mtp_swa_device_pools,
-        pool_label="swa",
-    )
+    if _uses_unified_page_envelope_host(full_kv_pool, swa_kv_pool, use_mla):
+        memory = get_memory()
+        if memory.hicache_host_memory_mode == "buffer_only":
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only does not support a "
+                "shared FULL/SWA unified host arena."
+            )
+        kv_host_pool, swa_host_pool = (
+            UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+                device_pools=(full_kv_pool, swa_kv_pool),
+                host_to_device_ratio=memory.hicache_ratio,
+                host_size=memory.hicache_size,
+                page_size=page_size,
+                layout=memory.hicache_mem_layout,
+                allocator_type=_get_allocator_type(),
+                mtp_draft_device_pools=mtp_swa_device_pools,
+            )
+        )
+        has_shared_arena = True
+    else:
+        has_shared_arena = False
+        kv_host_pool = build_kv_host_pool(
+            kv_pool=full_kv_pool,
+            page_size=page_size,
+            use_mla=use_mla,
+            host_size=kv_host_size,
+            pool_label="full",
+        )
+        swa_host_pool = build_kv_host_pool(
+            kv_pool=swa_kv_pool,
+            page_size=page_size,
+            use_mla=use_mla,
+            host_size=swa_host_size,
+            mtp_draft_device_pools=mtp_swa_device_pools,
+            pool_label="swa",
+        )
     if mtp_swa_device_pools:
         swa_layer_mapping = _with_mtp_layer_mapping(
             swa_layer_mapping,
@@ -303,6 +335,7 @@ def build_hybrid_swa_group(
                 layer_mapping=full_layer_mapping,
                 transfer_layer_num=transfer_layer_num,
                 is_anchor=True,
+                host_evict_fn=host_full_evict_fn if has_shared_arena else None,
             ),
             build_pool_entry(
                 name=PoolName.SWA,
@@ -379,6 +412,7 @@ def build_hybrid_swa_stack(
     load_cache_event,
     storage_backend: Optional[str],
     use_mla: bool,
+    host_full_evict_fn: Optional[Callable[[int], Any]] = None,
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     prefetch_threshold: int = 256,
@@ -393,9 +427,12 @@ def build_hybrid_swa_stack(
     )
 
     kv_host_size = swa_host_size = None
-    if get_memory().hicache_size > 0:
+    memory = get_memory()
+    if memory.hicache_size > 0 and not _uses_unified_page_envelope_host(
+        full_kv_pool, swa_kv_pool, use_mla
+    ):
         kv_host_size, swa_host_size = _split_hicache_size(
-            get_memory().hicache_size, (full_kv_pool, swa_kv_pool)
+            memory.hicache_size, (full_kv_pool, swa_kv_pool)
         )
 
     host_pool_group = build_hybrid_swa_group(
@@ -407,6 +444,7 @@ def build_hybrid_swa_stack(
         use_mla=use_mla,
         kv_host_size=kv_host_size,
         swa_host_size=swa_host_size,
+        host_full_evict_fn=host_full_evict_fn,
         host_swa_evict_fn=host_swa_evict_fn,
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
@@ -1465,6 +1503,7 @@ class _SwaStrategy(StackStrategy):
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=False,
+            host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
             prefetch_threshold=prefetch_threshold,

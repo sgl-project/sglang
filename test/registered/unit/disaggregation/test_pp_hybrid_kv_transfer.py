@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import _transfer_start_layer
@@ -70,6 +71,7 @@ class TestTransferStartLayer(CustomTestCase):
 
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
+    get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -139,6 +141,24 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
     def test_f5_of_n12(self):
         ids = _full_attention_ids(num_layers=48, interval=4)
         self._run_case(model_full_ids=ids, stage_full_ids=ids[:5], start_offset=0)
+
+
+class TestSingleRegionSWATransfer(CustomTestCase):
+    def test_one_region_swa_generates_transfer_block(self):
+        manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        rc = MooncakeKVManager._send_kvcache_generic(
+            manager,
+            mooncake_session_id="session",
+            src_data_ptrs=[1000],
+            dst_data_ptrs=[2000],
+            item_lens=[64],
+            prefill_data_indices=np.array([3, 4], dtype=np.int32),
+            dst_data_indices=np.array([7, 8], dtype=np.int32),
+            executor=None,
+            state_type=StateType.SWA,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(manager.blocks, [(1000 + 3 * 64, 2000 + 7 * 64, 2 * 64)])
 
 
 class TestGetMhaKvPtrsWithPp(CustomTestCase):
