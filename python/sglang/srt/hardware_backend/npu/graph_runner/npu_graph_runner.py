@@ -104,6 +104,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         attn_backend=None,
         speculative_num_steps: Optional[int] = None,
         speculative_num_draft_tokens: Optional[int] = None,
+        record_nolora_graph: bool = False,
     ):
         # NPU patch_model override: monkey-patch torch_compile_decoration's
         # patch_model with the NPU-specific version.
@@ -115,6 +116,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             attn_backend=attn_backend,
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            record_nolora_graph=record_nolora_graph,
         )
         self.update_attr_name = None
         self.update_attr_type = None
@@ -367,18 +369,25 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 )
                 self._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
 
-        graph_key = self._make_graph_key(self.bs)
+        graph_key = self._make_graph_key(
+            self.bs,
+            variant_label=self._resolve_lora_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch, self.bs),
+        )
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if forward_batch.forward_mode.is_target_verify():
-                # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
-                # replay; other algorithms keep the capture-time list, so
-                # recompute from the live batch as before — reading the
-                # backend list there would replay stale capture-time lengths.
-                if self.model_runner.spec_algorithm.is_dflash():
+                # UNO carries final host lengths directly. DFlash refreshes
+                # the attention metadata list; other algorithms recompute
+                # from the live batch to avoid stale capture-time lengths.
+                if self.model_runner.spec_algorithm.is_uno():
+                    # UNO already publishes the final KV length for both passes.
+                    _meta_list = forward_batch.seq_lens_cpu[: self.raw_bs].tolist()
+                    _meta_list += [0] * (self.bs - self.raw_bs)
+                elif self.model_runner.spec_algorithm.is_dflash():
                     _attn = self._replay_attn_backend()
                     _meta = getattr(_attn, "forward_metadata", None)
                     _meta_list = getattr(_meta, "seq_lens_cpu_list", None)

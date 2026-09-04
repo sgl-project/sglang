@@ -445,7 +445,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         draft_state = batch.spec_info
 
-        if batch.seq_lens.is_cuda:
+        if batch.seq_lens.device.type != "cpu":
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -627,7 +627,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         draft_state = batch.spec_info
 
-        if batch.seq_lens.is_cuda:
+        if batch.seq_lens.device.type != "cpu":
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
