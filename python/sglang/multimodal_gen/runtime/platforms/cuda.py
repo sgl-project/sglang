@@ -289,8 +289,7 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
 
-    # Decomposed path rides FlashAttention varlen (FA3 on Hopper, FA4 on
-    # Blackwell); the static-tile path reuses the VSA-H3 Triton kernel.
+    # The window rides FlashAttention varlen (FA3 on Hopper, FA4 on Blackwell).
     supported_capabilities = {(9, 0), (10, 0), (10, 3)}
 
     @classmethod

@@ -1395,28 +1395,29 @@ and the same clip length:
 | SGLang, FP8, 1× B200, DiT resident (`--layerwise-offload-components text_encoder`) | 7.49 | 61.1 s | 9.3 s | 63,922 MB |
 | SGLang, BF16, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.53** | **20.3 s** | 3.5 s | 97,894 MB |
 | SGLang, FP8, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **2.34** | **18.7 s** | 3.4 s | 63,022 MB |
-| SGLang, FP8, 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | 1.06 | 8.4 s | 1.5 s | 76,828 MB |
-| SGLang, FP8 per-tensor (`SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM=1`), 8× B200 Ulysses8 | **0.98** | **7.8 s** | 1.5 s | 76,794 MB |
+| SGLang, FP8, 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.97** | **7.7 s** | 1.5 s | 76,796 MB |
+| SGLang, FP8 with per-channel weight scales (the online-fp8 default of other models), 8× B200 Ulysses8 | 1.05 | 8.4 s | 1.5 s | 76,828 MB |
 
-On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.98 s/NFE
-(7.8 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.97 s/NFE
+(7.7 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
 branch-parallel layout; the whole request (text encoding, 8 forwards, joint
 decode) completes in 9.5 s after warmup. At this GPU count the step is
-launch- and copy-bound in the linear branch rather than FLOP-bound, so the
-port folds the 102-frame scan chain into per-chunk composites plus one
-21-step chain with both directions per launch (the chunked window only reads
-states at chunk boundaries), moves q/k/v through three field-major
-all-to-alls so they land contiguous (no relayout copies for the window K/V
-gathers or the branch's conv), sends only the 128-wide output-gate hidden
-across the fabric (the gate's `up` runs on the head shard), reduces the frame
-mean as a reshape-sum instead of an atomic index_add, and under the
-per-tensor fp8 path fuses the SwiGLU with the fp8 absmax. OpenVDN's
-branch-parallel layout was measured slower here (1.39 s/NFE at 5+3, 1.49 at
-6+2): with 11 to 12 heads per softmax rank the window attention and its
-gathers grow faster than the linear ranks shrink; splitting each rank's heads
-into two pipelined all-to-all groups also lost (1.10 s/NFE) to smaller
-attention kernels and doubled branch launches. The profile of one rank is
-32% window FlashAttention, 24% fp8 GEMM, 10% NCCL, the rest small kernels.
+launch- and copy-bound in the linear branch rather than FLOP-bound: the scans
+fold the 102 frames into per-chunk composites plus one chain over the chunks
+with both directions per launch (the chunked window only reads states at
+chunk boundaries), q/k/v and the per-head scalars travel as four async
+field-major all-to-alls that land contiguous (no relayout copies for the
+window K/V gathers or the branch's conv), only the 128-wide output-gate
+hidden crosses the fabric (the gate's `up` runs on the head shard), the frame
+mean is a reshape-sum instead of an atomic index_add, and VDN-H3 runs online
+fp8 with one scale per tensor into cuBLASLt with the SwiGLU fused into the fp8
+absmax. OpenVDN's branch-parallel layout was measured slower here (1.39
+s/NFE at 5+3, 1.49 at 6+2): with 11 to 12 heads per softmax rank the window
+attention and its gathers grow faster than the linear ranks shrink; splitting
+each rank's heads into two pipelined all-to-all groups also lost (1.10 s/NFE)
+to smaller attention kernels and doubled branch launches. The profile of one
+rank is 31% window FlashAttention, 24% fp8 GEMM, 12% NCCL, the rest small
+kernels.
 Against the published 8× B200 headline (1.40 s/NFE, 11.2
 GPU-seconds per NFE), the SGLang 4× B200 FP8 run spends 9.8 GPU-seconds per
 NFE, with half the GPUs and half the all-to-all fan-out. On the same host and GPU count the

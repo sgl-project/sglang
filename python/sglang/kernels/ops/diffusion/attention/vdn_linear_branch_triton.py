@@ -69,7 +69,7 @@ def _tconv_act_kernel(
         r = rows + dt - 2
         ok = valid & (r >= 0) & (r < T)  # zero padding, both ends
         v = tl.load(
-            X + (r[:, None] * S_ + pid_s) * C_ + chan[None, :],
+            X + (r[:, None].to(tl.int64) * S_ + pid_s) * C_ + chan[None, :],
             mask=ok[:, None],
             other=0.0,
         ).to(tl.float32)
@@ -82,11 +82,11 @@ def _tconv_act_kernel(
         y = y * inv[:, None]
     if FRAME_MAJOR:
         # [T, HEADS, S, D]: the readout bmm reads this layout directly
-        dst = ((rows[:, None] * HEADS + pid_h) * S_ + pid_s) * D_ + tl.arange(0, D_)[
-            None, :
-        ]
+        dst = (
+            (rows[:, None].to(tl.int64) * HEADS + pid_h) * S_ + pid_s
+        ) * D_ + tl.arange(0, D_)[None, :]
     else:
-        dst = (rows[:, None] * S_ + pid_s) * C_ + chan[None, :]
+        dst = (rows[:, None].to(tl.int64) * S_ + pid_s) * C_ + chan[None, :]
     tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
@@ -156,7 +156,7 @@ def _silu_l2norm_kernel(
     valid = rows < N
     offs = tl.arange(0, D_)
     x = tl.load(
-        X + rows[:, None] * stride_n + pid_h * stride_h + offs[None, :],
+        X + rows[:, None].to(tl.int64) * stride_n + pid_h * stride_h + offs[None, :],
         mask=valid[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -168,9 +168,11 @@ def _silu_l2norm_kernel(
         # row n = frame * S_ + s -> [F, H, S_, D]
         frame = rows // S_
         pos = rows - frame * S_
-        dst = ((frame[:, None] * H + pid_h) * S_ + pos[:, None]) * D_ + offs[None, :]
+        dst = (
+            (frame[:, None].to(tl.int64) * H + pid_h) * S_ + pos[:, None]
+        ) * D_ + offs[None, :]
     else:
-        dst = (rows[:, None] * H + pid_h) * D_ + offs[None, :]
+        dst = (rows[:, None].to(tl.int64) * H + pid_h) * D_ + offs[None, :]
     tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
@@ -235,7 +237,7 @@ def _frame_stats_prep_kernel(
     valid = s < S_
     offs = tl.arange(0, D_)
     rows = f * S_ + s  # token rows
-    src = (rows[:, None] * H + h) * D_ + offs[None, :]  # [F*S, H, d]
+    src = (rows[:, None].to(tl.int64) * H + h) * D_ + offs[None, :]  # [F*S, H, d]
     dst = ((f * H + h) * S_ + s)[:, None] * D_ + offs[None, :]  # [F, H, S, d]
     k = tl.load(K + src, mask=valid[:, None], other=0.0)
     v = tl.load(V + src, mask=valid[:, None], other=0.0)
@@ -318,7 +320,7 @@ def _linear_epilogue_kernel(
     offs = tl.arange(0, D_)
     src = ((f * H + h) * S_ + s)[:, None] * D_ + offs[None, :]
     rows = f * S_ + s
-    dst = (rows[:, None] * H + h) * D_ + offs[None, :]
+    dst = (rows[:, None].to(tl.int64) * H + h) * D_ + offs[None, :]
     r = tl.load(R + src, mask=valid[:, None], other=0.0).to(tl.float32)
     ms = tl.sum(r * r, axis=1) / D_
     w = tl.load(W + offs).to(tl.float32)

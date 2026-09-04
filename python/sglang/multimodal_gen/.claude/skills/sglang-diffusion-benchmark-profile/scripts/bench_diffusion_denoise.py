@@ -512,8 +512,7 @@ MODELS = {
         ],
         "force_eager": True,
     },
-    # 8x B200 paper workload (0.98 s/NFE with
-    # SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM=1 in the environment).
+    # 8x B200 paper workload.
     "vdn-h3-fp8-8gpu": {
         "path": "OpenVDN/vdn-minimax-h3",
         "prompt": (

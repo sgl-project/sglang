@@ -12,8 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-FP8_E4M3_MAX = 448.0
-
 
 @triton.jit
 def _silu_mul_absmax_kernel(
@@ -39,7 +37,20 @@ def _silu_mul_absmax_kernel(
     prod = (act * up).to(tl.bfloat16)
     tl.store(out_ptr + r[:, None].to(tl.int64) * hidden + c[None, :], prod, mask=mask)
     amax = tl.max(tl.abs(prod.to(tl.float32)))
+    # e4m3 max is 448; same scale convention as sgl_per_tensor_quant_fp8
     tl.atomic_max(scale_ptr, tl.math.div_rn(amax, 448.0))
+
+
+def can_use_silu_mul_per_tensor_fp8(hidden: torch.Tensor) -> bool:
+    """Row-major bf16 [rows, 2 * n] on CUDA, outside torch.compile."""
+    return (
+        hidden.is_cuda
+        and hidden.ndim == 2
+        and hidden.dtype == torch.bfloat16
+        and hidden.stride(-1) == 1
+        and hidden.shape[-1] % 2 == 0
+        and not torch.compiler.is_compiling()
+    )
 
 
 def silu_mul_per_tensor_fp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -51,8 +62,8 @@ def silu_mul_per_tensor_fp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.T
         sgl_per_tensor_quant_fp8,
     )
 
-    if hidden.ndim != 2 or hidden.dtype != torch.bfloat16 or hidden.stride(-1) != 1:
-        raise ValueError("expected a row-major bf16 [rows, 2 * hidden] tensor")
+    if not can_use_silu_mul_per_tensor_fp8(hidden):
+        raise ValueError("expected a row-major bf16 CUDA [rows, 2 * hidden] tensor")
     rows, twice = hidden.shape
     n = twice // 2
     out = torch.empty(rows, n, dtype=torch.bfloat16, device=hidden.device)
@@ -76,4 +87,4 @@ def silu_mul_per_tensor_fp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return q, scale
 
 
-__all__ = ["silu_mul_per_tensor_fp8"]
+__all__ = ["can_use_silu_mul_per_tensor_fp8", "silu_mul_per_tensor_fp8"]

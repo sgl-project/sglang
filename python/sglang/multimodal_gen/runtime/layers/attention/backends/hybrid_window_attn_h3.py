@@ -24,6 +24,7 @@ a masked kernel; it differs from it by bf16 reduction order only.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -111,6 +112,98 @@ def window_mask_reference(
     return keep
 
 
+def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for a, b in sorted(ranges):
+        if out and out[-1][1] >= a:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _cat_ranges(ranges: list[tuple[int, int]], *, device: torch.device) -> torch.Tensor:
+    if not ranges:
+        return torch.empty(0, dtype=torch.long, device=device)
+    return torch.cat(
+        [torch.arange(a, b, device=device, dtype=torch.long) for a, b in ranges]
+    )
+
+
+def _chunk_groups(
+    raw_bounds: list[tuple[int, int]], dense_rows: set[int]
+) -> list[list[int]]:
+    """Consecutive window frames with identical bounds share one varlen segment."""
+    groups: list[list[int]] = []
+    for f in range(len(raw_bounds)):
+        if f in dense_rows:
+            continue
+        if (
+            groups
+            and raw_bounds[groups[-1][-1]] == raw_bounds[f]
+            and groups[-1][-1] == f - 1
+        ):
+            groups[-1].append(f)
+        else:
+            groups.append([f])
+    return groups
+
+
+def _window_passes(
+    layout: VDNH3Layout,
+    per_group: list[tuple[list[int], torch.Tensor, torch.Tensor]],
+    max_gather_rows: int,
+    device: torch.device,
+) -> list[dict]:
+    """One varlen call per pass; a pass holds consecutive chunk groups whose
+    gathered K/V rows stay under ``max_gather_rows`` (bounds the transient,
+    every query still sees exactly its kept set in one call)."""
+    passes: list[dict] = []
+    current: list[tuple] = []
+    current_rows = 0
+
+    def flush() -> None:
+        if not current:
+            return
+        q_idx = [g[1] for g in current]
+        kv_idx = [g[2] for g in current]
+        q_lens = [int(t.numel()) for t in q_idx]
+        k_lens = [int(t.numel()) for t in kv_idx]
+        flat = [f for g in current for f in g[0]]
+        zero = torch.zeros(1, dtype=torch.long)
+        contiguous = flat == list(range(flat[0], flat[0] + len(flat)))
+        passes.append(
+            dict(
+                win_q=torch.cat(q_idx),
+                # contiguous frames -> slice instead of gather/scatter
+                win_q_slice=(
+                    (layout.frame_rows(flat[0])[0], layout.frame_rows(flat[-1])[1])
+                    if contiguous
+                    else None
+                ),
+                kv_gather=torch.cat(kv_idx),
+                cu_q=torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
+                    device, torch.int32
+                ),
+                cu_k=torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
+                    device, torch.int32
+                ),
+                max_q=max(q_lens),
+                max_k=max(k_lens),
+            )
+        )
+
+    for frames, qi, ki in per_group:
+        rows = int(ki.numel())
+        if current and current_rows + rows > max_gather_rows:
+            flush()
+            current, current_rows = [], 0
+        current.append((frames, qi, ki))
+        current_rows += rows
+    flush()
+    return passes
+
+
 class _DecomposedPlan:
     """Query-row groups with identical kept key sets, as dense varlen calls.
 
@@ -128,116 +221,38 @@ class _DecomposedPlan:
         device: torch.device,
         max_gather_rows: int = 200_000,
     ) -> None:
-        used = layout.used
-        num_frames = layout.num_frames
+        used, num_frames = layout.used, layout.num_frames
         bounds, dense_rows, dense_cols = window_mask_frames(hybrid, num_frames)
-        raw_bounds = hybrid.window_bounds(num_frames)
-
-        def merge(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
-            out: list[tuple[int, int]] = []
-            for a, b in sorted(ranges):
-                if out and out[-1][1] >= a:
-                    out[-1] = (out[-1][0], max(out[-1][1], b))
-                else:
-                    out.append((a, b))
-            return out
-
-        def cat_ranges(ranges: list[tuple[int, int]]) -> torch.Tensor:
-            if not ranges:
-                return torch.empty(0, dtype=torch.long, device=device)
-            return torch.cat(
-                [torch.arange(a, b, device=device, dtype=torch.long) for a, b in ranges]
-            )
-
-        global_ranges = layout.global_ranges
-        dense_ranges = merge(
-            global_ranges + [layout.frame_rows(f) for f in sorted(dense_rows)]
+        rows = functools.partial(_cat_ranges, device=device)
+        dense_ranges = _merge_ranges(
+            layout.global_ranges + [layout.frame_rows(f) for f in sorted(dense_rows)]
         )
-        self.dense_q = cat_ranges(dense_ranges)
-        # request-static varlen bounds for the dense leg: built once here, not
-        # from Python lists (a pageable H2D copy + stream sync) in every block
+        self.dense_q = rows(dense_ranges)
+        # request-static varlen bounds: built once, not from Python lists (a
+        # pageable H2D copy + stream sync) in every block
         self.dense_cu_q = torch.tensor(
             [0, int(self.dense_q.numel())], dtype=torch.int32, device=device
         )
         self.dense_cu_k = torch.tensor([0, used], dtype=torch.int32, device=device)
-
-        groups: list[list[int]] = []
-        for f in range(num_frames):
-            if f in dense_rows:
-                continue
-            if (
-                groups
-                and raw_bounds[groups[-1][-1]] == raw_bounds[f]
-                and groups[-1][-1] == f - 1
-            ):
-                groups[-1].append(f)
-            else:
-                groups.append([f])
-
-        # One varlen call per PASS; a pass holds consecutive chunk groups whose
-        # gathered K/V rows stay under ``max_gather_rows`` (the gathered K and
-        # V of the whole window are ~10 GB at the paper workload; passes bound
-        # that transient without changing the arithmetic -- every query's
-        # softmax still spans exactly its kept set in one call).
         per_group = []
-        for frames in groups:
+        for frames in _chunk_groups(hybrid.window_bounds(num_frames), dense_rows):
             lo, hi = bounds[frames[0]]
             kv_frames = sorted(set(range(lo, hi + 1)) | dense_cols)
-            qi = cat_ranges(merge([layout.frame_rows(f) for f in frames]))
-            ki = cat_ranges(
-                merge(global_ranges + [layout.frame_rows(f) for f in kv_frames])
-            )
-            per_group.append((frames, qi, ki))
-
-        passes: list[dict] = []
-        current: list[tuple] = []
-        current_rows = 0
-
-        def flush() -> None:
-            if not current:
-                return
-            q_idx = [g[1] for g in current]
-            kv_idx = [g[2] for g in current]
-            q_lens = [int(t.numel()) for t in q_idx]
-            k_lens = [int(t.numel()) for t in kv_idx]
-            flat = [f for g in current for f in g[0]]
-            zero = torch.zeros(1, dtype=torch.long)
-            passes.append(
-                dict(
-                    win_q=torch.cat(q_idx),
-                    # contiguous frames -> slice instead of gather/scatter
-                    win_q_slice=(
-                        (
-                            layout.frame_rows(flat[0])[0],
-                            layout.frame_rows(flat[-1])[1],
+            per_group.append(
+                (
+                    frames,
+                    rows(_merge_ranges([layout.frame_rows(f) for f in frames])),
+                    rows(
+                        _merge_ranges(
+                            layout.global_ranges
+                            + [layout.frame_rows(f) for f in kv_frames]
                         )
-                        if flat == list(range(flat[0], flat[0] + len(flat)))
-                        else None
                     ),
-                    kv_gather=torch.cat(kv_idx),
-                    cu_q=torch.cat([zero, torch.tensor(q_lens).cumsum(0)]).to(
-                        device, torch.int32
-                    ),
-                    cu_k=torch.cat([zero, torch.tensor(k_lens).cumsum(0)]).to(
-                        device, torch.int32
-                    ),
-                    max_q=max(q_lens),
-                    max_k=max(k_lens),
                 )
             )
-
-        for frames, qi, ki in per_group:
-            rows = int(ki.numel())
-            if current and current_rows + rows > max_gather_rows:
-                flush()
-                current, current_rows = [], 0
-            current.append((frames, qi, ki))
-            current_rows += rows
-        flush()
-
-        self.passes = passes
-        self.has_windows = bool(passes)
-        win_rows = sum(int(p["win_q"].numel()) for p in passes)
+        self.passes = _window_passes(layout, per_group, max_gather_rows, device)
+        self.has_windows = bool(self.passes)
+        win_rows = sum(int(p["win_q"].numel()) for p in self.passes)
         covered = int(self.dense_q.numel()) + win_rows
         if covered != used:
             raise ValueError(
@@ -252,9 +267,8 @@ class HybridWindowAttentionH3Metadata(AttentionMetadata):
     # radius >= F: the window IS dense attention and the linear branch is off
     full_cover: bool
     decomposed: _DecomposedPlan | None = None
-    # Full-sequence RoPE cache (cos_sin [seq_len, rope_dim] bf16, positions
-    # [seq_len]) for QK-norm + RoPE after the Ulysses all-to-all; None when no
-    # sequence parallelism is active.
+    # (cos_sin [seq_len, rope_dim] bf16, positions [seq_len]) for QK-norm +
+    # RoPE on the head shard under Ulysses; None otherwise
     rope_cache_full: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
@@ -479,11 +493,8 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 scale=self.softmax_scale,
             )
         for p in plan.passes:
-            # index_select runs the vectorized gather; advanced indexing takes
-            # the generic index kernel at a fraction of the bandwidth. Gather
-            # from the contiguous copies: on the strided packed views (head
-            # stride 3d) index_select falls back to the generic kernel, which
-            # cost 4x more than the copy itself at the paper workload.
+            # index_select on the contiguous copies runs the vectorized gather;
+            # strided views or advanced indexing take the generic kernel
             kw = torch.index_select(key_used, 0, p["kv_gather"])
             vw = torch.index_select(value_used, 0, p["kv_gather"])
             if p["win_q_slice"] is not None:

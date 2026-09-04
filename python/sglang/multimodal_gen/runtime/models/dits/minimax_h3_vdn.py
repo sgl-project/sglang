@@ -294,8 +294,19 @@ class VDNOutputGate(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.down(x)
-        gate, _ = self.up(hidden)
-        return torch.sigmoid(gate).view(-1, self.local_heads, self.head_dim)
+        return self.up_gate(hidden)
+
+    def up_gate(self, hidden: torch.Tensor, heads: slice | None = None) -> torch.Tensor:
+        """sigmoid(up(hidden)) -> [T, h, d]; ``heads`` selects a head range of
+        the up projection (Ulysses computes the gate on its head shard from the
+        all-gathered ``down`` hidden)."""
+        if heads is None:
+            gate, _ = self.up(hidden)
+            return torch.sigmoid(gate).view(-1, self.local_heads, self.head_dim)
+        rows = slice(heads.start * self.head_dim, heads.stop * self.head_dim)
+        bias = None if self.up.bias is None else self.up.bias[rows]
+        gate = F.linear(hidden, self.up.weight[rows], bias)
+        return torch.sigmoid(gate).view(-1, heads.stop - heads.start, self.head_dim)
 
 
 class VDNSoftmaxGate(nn.Module):
@@ -539,10 +550,6 @@ def run_scans(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """prefix[t] = frames 0..t, suffix[t] = frames t..F-1 (both fp32
     [F, H, dv, dk]); both start from ``text_state`` (or zero)."""
-    # NOTE: a persistent Triton scan (one program per head and direction) was
-    # measured at 9x the cost of these cuBLAS launches on B200: a 100-step
-    # dependent chain cannot fill the GPU from one program, while each
-    # baddbmm spreads the head batch over the whole device.
     num_frames = transitions.shape[0]
     start = (
         torch.zeros_like(injections[0])
@@ -587,33 +594,70 @@ def _compose_chunk(
     return M, Cc
 
 
+@functools.lru_cache(maxsize=64)
+def _boundary_frames(
+    num_frames: int, chunk: int, frame_offset: int, device: str
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(num_chunks, prefix frames = each chunk's last frame and their chunk
+    indices, suffix frames = each chunk's first frame and their chunk indices;
+    frames outside the clip dropped).
+    Chunks are aligned on the original clip, where frame ``f`` here is
+    ``f + frame_offset``; the grid pads ``frame_offset`` leading frames and
+    fills the last chunk."""
+    padded = frame_offset + num_frames
+    num_chunks = -(-padded // chunk)
+    ends = [
+        min((c + 1) * chunk - 1, padded - 1) - frame_offset for c in range(num_chunks)
+    ]
+    starts = [c * chunk - frame_offset for c in range(num_chunks)]
+    dev = torch.device(device)
+    in_clip = lambda frames: [(f, c) for c, f in enumerate(frames) if f >= 0]  # noqa: E731
+    ends, starts = in_clip(ends), in_clip(starts)
+    return (
+        num_chunks,
+        torch.tensor([f for f, _ in ends], device=dev),
+        torch.tensor([c for _, c in ends], device=dev),
+        torch.tensor([f for f, _ in starts], device=dev),
+        torch.tensor([c for _, c in starts], device=dev),
+    )
+
+
 def run_boundary_scans(
     transitions: torch.Tensor,
     injections: torch.Tensor,
     text_state: torch.Tensor | None,
     *,
     chunk: int,
+    frame_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``run_scans`` restricted to what the chunked window gather reads:
     prefix at every chunk's last frame, suffix at every chunk's first frame
-    (other frames are zero). Each chunk's frames fold into one affine map
-    first (batched over all chunks, ``chunk - 1`` steps), then one chain over
-    the chunks with both directions in each launch: a fifth of the dependent
-    launches of the frame chain. Same fp32 math, the products are merely
-    re-associated."""
+    (other frames are zero). ``frame_offset`` is the position of frame 0 on
+    the clip the chunks are aligned to (1 when the anchor frames were dropped).
+    Each chunk's frames fold into one affine map first (batched over all
+    chunks, ``chunk - 1`` steps), then one chain over the chunks with both
+    directions in each launch: a fifth of the frame chain's dependent
+    launches. Same fp32 math, the products are merely re-associated."""
     if chunk <= 1:
         return run_scans(transitions, injections, text_state)
     num_frames, heads, dv, dk = injections.shape
-    num_chunks = -(-num_frames // chunk)
-    padded = num_chunks * chunk
-    if padded != num_frames:
-        # identity transitions / zero injections leave the state untouched
-        pad = padded - num_frames
-        eye = torch.eye(dk, device=transitions.device, dtype=transitions.dtype)
-        transitions = torch.cat([transitions, eye.expand(pad, heads, dk, dk)], dim=0)
-        injections = torch.cat(
-            [injections, injections.new_zeros(pad, heads, dv, dk)], dim=0
-        )
+    num_chunks, ends, end_chunks, starts, start_chunks = _boundary_frames(
+        num_frames, chunk, frame_offset, str(injections.device)
+    )
+    # identity transitions / zero injections leave the state untouched: they
+    # fill the leading offset and the partial last chunk
+    lead, tail = frame_offset, num_chunks * chunk - frame_offset - num_frames
+    eye = torch.eye(dk, device=transitions.device, dtype=transitions.dtype)
+    transitions = torch.cat(
+        [eye.expand(lead, heads, dk, dk), transitions, eye.expand(tail, heads, dk, dk)]
+    )
+    injections = torch.cat(
+        [
+            injections.new_zeros(lead, heads, dv, dk),
+            injections,
+            injections.new_zeros(tail, heads, dv, dk),
+        ]
+    )
     # frame-within-chunk leading: one relayout here instead of one strided
     # copy per operand per composition step
     T = transitions.view(num_chunks, chunk, heads, dk, dk).transpose(0, 1).contiguous()
@@ -623,14 +667,8 @@ def run_boundary_scans(
         if text_state is None
         else text_state.to(injections.dtype)
     )
-    prefix = torch.zeros(
-        num_frames, heads, dv, dk, dtype=injections.dtype, device=injections.device
-    )
-    suffix = torch.zeros_like(prefix)
-    # Both directions are independent chains over the chunk composites, so
-    # step i advances the forward chain on chunk i and the reverse chain on
-    # chunk C-1-i in ONE batched launch (batch 2H): half the dependent
-    # launches of two separate chains.
+    # step c advances the forward chain on chunk c and the reverse chain on
+    # chunk C-1-c in one batched launch
     Mf, Cf = _compose_chunk(T, B, reverse=False)
     Mr, Cr = _compose_chunk(T, B, reverse=True)
     M2 = torch.stack([Mf, Mr.flip(0)], dim=1)  # [C, 2, H, dk, dk]
@@ -648,10 +686,13 @@ def run_boundary_scans(
             out=flat[c],
         )
         state = boundary[c]
-    ends = [min((c + 1) * chunk - 1, num_frames - 1) for c in range(num_chunks)]
-    starts = [(num_chunks - 1 - c) * chunk for c in range(num_chunks)]
-    prefix[ends] = boundary[:, 0]
-    suffix[starts] = boundary[:, 1]
+    prefix = torch.zeros(
+        num_frames, heads, dv, dk, dtype=injections.dtype, device=injections.device
+    )
+    suffix = torch.zeros_like(prefix)
+    # step c holds chunk c's forward state and chunk C-1-c's reverse state
+    prefix.index_copy_(0, ends, boundary[end_chunks, 0])
+    suffix.index_copy_(0, starts, boundary[num_chunks - 1 - start_chunks, 1])
     return prefix, suffix
 
 
@@ -926,6 +967,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             layout.frame_size,
             text_state,
             heads,
+            frame_offset=1,
         )
         out[:per_frame].zero_()
         out[(num_frames - 1) * per_frame :].zero_()
@@ -946,6 +988,7 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         frame_size: tuple[int, int],
         text_state: torch.Tensor | None,
         heads: slice | None,
+        frame_offset: int = 0,
     ) -> torch.Tensor:
         n_heads, head_dim = q_raw.shape[1], self.head_dim
         shape = (num_frames, per_frame, n_heads, head_dim)
@@ -1000,7 +1043,11 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             self.hybrid.delta_rule, alpha, A, B, tokens_per_frame=per_frame
         )
         prefix, suffix = run_boundary_scans(
-            transitions, injections, text_state, chunk=self.hybrid.chunk
+            transitions,
+            injections,
+            text_state,
+            chunk=self.hybrid.chunk,
+            frame_offset=frame_offset,
         )
         del transitions, injections
         # 4. boundary gather

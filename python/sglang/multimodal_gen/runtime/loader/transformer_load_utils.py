@@ -1056,6 +1056,10 @@ def _resolve_quant_config(
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )
+        if server_args.quantization == "fp8":
+            quant_kwargs["per_tensor_online"] = (
+                server_args.pipeline_config.online_fp8_per_tensor
+            )
         return quant_cls(**quant_kwargs)
 
     quant_config = (

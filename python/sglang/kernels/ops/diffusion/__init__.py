@@ -578,6 +578,7 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "can_use_silu_mul_per_tensor_fp8": "activation.swiglu_per_tensor_fp8_triton",
     "silu_mul_per_tensor_fp8": "activation.swiglu_per_tensor_fp8_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",

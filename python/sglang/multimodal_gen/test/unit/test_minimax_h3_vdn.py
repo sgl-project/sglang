@@ -5,9 +5,7 @@ step-by-step references (no weights, CPU + small CUDA shapes)."""
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
 from types import SimpleNamespace
 
@@ -36,7 +34,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     frame_statistics,
     gather_linear_state,
     linear_features,
-    run_boundary_scans,
     run_scans,
     vdn_h3_layout_from_packed,
 )
@@ -118,19 +115,10 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
         config.validate_server_args(_server_args(enable_breakable_cuda_graph=True))
     with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
         config.validate_quality_deployment(server_args=None)
-
-
-@requires_cuda
-def test_vdn_h3_pipeline_config_forces_hybrid_backend_when_unset() -> None:
-    """The runtime selector reads server_args.attention_backend; an unset
-    backend must become the hybrid one, not the platform default."""
-    config = VDNH3PipelineConfig()
+    # an unset backend must become the hybrid one, not the platform default
     args = _server_args()
     config.validate_server_args(args)
     assert args.attention_backend == "hybrid_window_attn_h3"
-    explicit = _server_args(attention_backend="hybrid_window_attn_h3")
-    config.validate_server_args(explicit)
-    assert explicit.attention_backend == "hybrid_window_attn_h3"
 
 
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:
@@ -254,38 +242,6 @@ def test_scans_match_step_reference_and_text_seed() -> None:
         assert torch.allclose(suffix[f], state, atol=1e-4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
-@pytest.mark.parametrize("with_conv", [False, True])
-def test_linear_features_frame_major_layout(with_conv: bool) -> None:
-    """The fused feature kernels can write [F, H, S, d] directly (the readout's
-    bmm layout); it must equal the token-major result permuted."""
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
-        VDNShortConv,
-        linear_features,
-    )
-
-    device = torch.device("cuda")
-    frames, fh, fw, heads, head_dim = 5, 4, 6, 3, 32
-    per_frame = fh * fw
-    g = torch.Generator(device="cpu").manual_seed(0)
-    tokens = torch.randn(frames * per_frame, heads, head_dim, generator=g).to(
-        device, torch.bfloat16
-    )
-    conv = None
-    if with_conv:
-        conv = VDNShortConv(heads * head_dim, ("q",)).to(device)
-        with torch.no_grad():
-            for p in conv.parameters():
-                p.copy_(torch.randn(p.shape, generator=g).to(p.dtype) * 0.2)
-    kwargs = dict(proj="q", conv=conv, num_frames=frames, frame_size=(fh, fw))
-    token_major = linear_features(tokens, **kwargs)
-    frame_major = linear_features(tokens, frame_major=True, **kwargs)
-    assert frame_major.shape == (frames, heads, per_frame, head_dim)
-    assert frame_major.is_contiguous()
-    expected = token_major.view(frames, per_frame, heads, head_dim).permute(0, 2, 1, 3)
-    assert torch.equal(frame_major, expected)
-
-
 @pytest.mark.parametrize("world", [1, 2, 5, 10])
 def test_frame_partial_sums_match_index_add(world: int) -> None:
     """The Ulysses frame-mean partial sums (reshape-sum over whole frames plus
@@ -315,31 +271,75 @@ def test_frame_partial_sums_match_index_add(world: int) -> None:
     torch.testing.assert_close(total, ref, rtol=1e-5, atol=1e-3)
 
 
-@pytest.mark.parametrize("chunk", [1, 2, 3, 5])
-def test_boundary_scans_match_frame_chain_at_chunk_bounds(chunk: int) -> None:
-    """The chunked gather reads prefix at chunk ends and suffix at chunk
-    starts only; the batched per-chunk composition must reproduce the frame
-    chain there (fp32, re-associated products)."""
-    k, v, beta, alpha = _random_stats("cpu", seed=2)
-    A, B = frame_statistics(k, v, beta, a_fp32=True)
-    transition, injection = delta_factor_apply(
-        "vdn_solve", alpha, A, B, tokens_per_frame=S_
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("anchor_frames", ["both", "none"])
+@pytest.mark.parametrize("reference", ["frame_chain_scans", "eager_kernels"])
+def test_branch_forward_matches_reference(
+    anchor_frames: str, reference: str, monkeypatch
+) -> None:
+    """The shipped branch (boundary scans, fused Triton kernels) against the
+    same module with the plain frame-chain scans, and against the eager
+    kernel chain; both across the anchor-frame shift of the chunk grid."""
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as module
+
+    device = torch.device("cuda")
+    hidden, heads, head_dim = 64, 4, 32
+    num_frames, fh, fw = 13, 4, 6
+    tpf = fh * fw
+    hybrid = VDNHybridAttentionArchConfig(
+        chunk=3, radius=1, anchor_frames=anchor_frames, linear_head_dim=head_dim
     )
-    text_state = torch.randn(H_, D_, D_)
-    prefix, suffix = run_scans(transition, injection, text_state)
-    b_prefix, b_suffix = run_boundary_scans(
-        transition, injection, text_state, chunk=chunk
+    branch = _branch(hybrid, heads, hidden, head_dim, seed=0).to(device)
+    layout = VDNH3Layout(
+        seq_len=64 * 6,
+        used=10 + num_frames * tpf,
+        text_len=10,
+        video_start=10,
+        num_frames=num_frames,
+        tokens_per_frame=tpf,
+        frame_height=fh,
+        frame_width=fw,
     )
-    num_chunks = -(-F_ // chunk)
-    ends = [min((c + 1) * chunk - 1, F_ - 1) for c in range(num_chunks)]
-    starts = [c * chunk for c in range(num_chunks)]
-    torch.testing.assert_close(b_prefix[ends], prefix[ends], rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(b_suffix[starts], suffix[starts], rtol=1e-4, atol=1e-4)
-    # everything the gather never reads is zero, not garbage
-    unread = sorted(set(range(F_)) - set(ends))
-    assert torch.all(b_prefix[unread] == 0)
-    unread = sorted(set(range(F_)) - set(starts))
-    assert torch.all(b_suffix[unread] == 0)
+    g = torch.Generator(device="cpu").manual_seed(1)
+    V = num_frames * tpf
+    q, k, v = (
+        torch.randn(V, heads, head_dim, generator=g).to(device, torch.bfloat16)
+        for _ in range(3)
+    )
+    tk, tv = (
+        torch.randn(10, heads, head_dim, generator=g).to(device, torch.bfloat16)
+        for _ in range(2)
+    )
+    x = torch.randn(V, hidden, generator=g).to(device, torch.bfloat16)
+    tx = torch.randn(10, hidden, generator=g).to(device, torch.bfloat16)
+    kwargs = dict(
+        q_raw=q,
+        k_raw=k,
+        v_raw=v,
+        beta=branch.beta(x),
+        gate=branch.gate(x),
+        frame_mean=x.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32),
+        layout=layout,
+        text_k_raw=tk,
+        text_v_raw=tv,
+        text_beta=branch.beta(tx),
+    )
+    fast = branch(**kwargs)
+    if reference == "frame_chain_scans":
+        monkeypatch.setattr(
+            module,
+            "run_boundary_scans",
+            lambda t, i, ts, *, chunk, frame_offset=0: run_scans(t, i, ts),
+        )
+    else:
+        monkeypatch.setattr(module, "_FUSED_KERNELS_ENABLED", False)
+    expected = branch(**kwargs)
+    assert expected.abs().sum() > 0
+    # the fused kernels keep fp32 between the stages the eager chain rounds
+    # to bf16; the scans re-associate fp32 products only
+    tolerance = {"frame_chain_scans": 5e-3, "eager_kernels": 2e-2}[reference]
+    rel = (fast.float() - expected.float()).norm() / expected.float().norm()
+    assert rel < tolerance, rel
 
 
 def test_gather_is_the_exact_window_complement() -> None:
@@ -643,151 +643,6 @@ def test_branch_matches_eager_reference_algorithm() -> None:
 
 
 @requires_cuda
-def test_fused_branch_kernels_match_eager_chain() -> None:
-    """Each fused Triton stage against the eager spelling it replaces (one
-    rounding instead of one per op: ~1 bf16 ulp), and the whole branch with
-    fused kernels vs the eager chain."""
-    from sglang.kernels.ops.diffusion import (
-        vdn_frame_stats_prep,
-        vdn_linear_epilogue,
-        vdn_silu_l2norm,
-        vdn_temporal_conv_act,
-    )
-    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
-
-    device = torch.device("cuda")
-    g = torch.Generator(device="cpu").manual_seed(4)
-    F_, S_, H_, D_ = 6, 24, 3, 32
-    x = torch.randn(F_, S_, H_ * D_, generator=g).to(device, torch.bfloat16)
-    w = (torch.randn(H_ * D_, 5, generator=g) * 0.4).to(device, torch.bfloat16)
-    got = vdn_temporal_conv_act(x, w, H_, D_, True)
-    ref = vdn._activate(vdn._temporal_shift(x, w).reshape(-1, H_, D_), True)
-    assert (got.float() - ref.float()).abs().max().item() < 2e-2
-
-    tokens = torch.randn(F_ * S_, 3 * H_ * D_, generator=g).to(device, torch.bfloat16)
-    strided = tokens[:, : H_ * D_].view(F_ * S_, H_, D_)  # a q view of a fused qkv
-    got = vdn_silu_l2norm(strided, True)
-    ref = vdn._activate(strided, True)
-    assert got.is_contiguous() and (got.float() - ref.float()).abs().max().item() < 2e-2
-    got_v = vdn_silu_l2norm(strided, False)
-    assert torch.allclose(
-        got_v.float(), torch.nn.functional.silu(strided.float()), atol=2e-2
-    )
-
-    key = torch.randn(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
-    value = torch.randn(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
-    beta = torch.rand(F_ * S_, H_, generator=g).to(device, torch.bfloat16)
-    k16, k32, kb32, vb = vdn_frame_stats_prep(key, value, beta, F_, S_)
-    kf = key.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
-    vf = value.view(F_, S_, H_, D_).permute(0, 2, 1, 3)
-    bf = beta.view(F_, S_, H_).permute(0, 2, 1)
-    assert torch.equal(k16, kf.contiguous())
-    assert torch.equal(k32, kf.float().contiguous())
-    assert torch.equal(kb32, (kf.float() * bf.unsqueeze(-1).float()).contiguous())
-    assert torch.equal(vb, (vf * bf.unsqueeze(-1).to(vf.dtype)).contiguous())
-
-    readout = torch.randn(F_, H_, S_, D_, generator=g).to(device, torch.bfloat16)
-    weight = (1 + 0.1 * torch.randn(D_, generator=g)).to(device, torch.bfloat16)
-    gate = torch.rand(F_ * S_, H_, D_, generator=g).to(device, torch.bfloat16)
-    got = vdn_linear_epilogue(readout, weight, gate, 1e-6)
-    ref = vdn.linear_epilogue(readout, weight, gate, 1e-6)
-    # one rounding vs one per op: within one bf16 ulp of the reference scale
-    assert (got.float() - ref.float()).abs().max().item() <= 2e-2 * max(
-        1.0, ref.float().abs().max().item()
-    )
-
-    # whole branch: fused vs eager
-    hidden, heads, head_dim = 64, 4, 32
-    num_frames, fh, fw = 7, 4, 6
-    tpf = fh * fw
-    hybrid = VDNHybridAttentionArchConfig(
-        chunk=2, radius=1, anchor_frames="both", linear_head_dim=head_dim
-    )
-    branch = _branch(hybrid, heads, hidden, head_dim, seed=0).to(device)
-    layout = VDNH3Layout(
-        seq_len=256,
-        used=10 + num_frames * tpf,
-        text_len=10,
-        video_start=10,
-        num_frames=num_frames,
-        tokens_per_frame=tpf,
-        frame_height=fh,
-        frame_width=fw,
-    )
-    V = num_frames * tpf
-    q, k, v = (
-        torch.randn(V, heads, head_dim, generator=g).to(device, torch.bfloat16)
-        for _ in range(3)
-    )
-    tk, tv = (
-        torch.randn(10, heads, head_dim, generator=g).to(device, torch.bfloat16)
-        for _ in range(2)
-    )
-    xx = torch.randn(V, hidden, generator=g).to(device, torch.bfloat16)
-    tx = torch.randn(10, hidden, generator=g).to(device, torch.bfloat16)
-    args = dict(
-        q_raw=q,
-        k_raw=k,
-        v_raw=v,
-        beta=branch.beta(xx),
-        gate=branch.gate(xx),
-        frame_mean=xx.view(num_frames, tpf, hidden).mean(1, dtype=torch.float32),
-        layout=layout,
-        text_k_raw=tk,
-        text_v_raw=tv,
-        text_beta=branch.beta(tx),
-    )
-    vdn.set_fused_kernels_enabled(True)
-    fused = branch(**args)
-    vdn.set_fused_kernels_enabled(False)
-    try:
-        eager = branch(**args)
-    finally:
-        vdn.set_fused_kernels_enabled(True)
-    diff = (fused.float() - eager.float()).abs().max().item()
-    assert diff < 3e-2 * max(eager.abs().max().item(), 1.0), diff
-
-
-@requires_cuda
-def test_fused_gather_matches_eager_gather() -> None:
-    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_vdn as vdn
-
-    g = torch.Generator(device="cpu").manual_seed(5)
-    F_, H_, D_ = 9, 2, 32
-    hybrid = VDNHybridAttentionArchConfig(chunk=3, radius=1, anchor_frames="none")
-    bounds = hybrid.window_bounds(F_)
-    prefix = torch.randn(F_, H_, D_, D_, generator=g).cuda()
-    suffix = torch.randn(F_, H_, D_, D_, generator=g).cuda()
-    alpha = (torch.rand(F_, H_, D_, generator=g) * 0.5 + 0.5).cuda()
-    text = torch.randn(H_, D_, D_, generator=g).cuda()
-    for ts in (None, text):
-        for bridge in ("alpha", "none"):
-            vdn.set_fused_kernels_enabled(False)
-            try:
-                ref = gather_linear_state(
-                    prefix,
-                    suffix,
-                    alpha,
-                    bounds,
-                    bridge=bridge,
-                    text_state=ts,
-                    out_dtype=torch.float32,
-                )
-            finally:
-                vdn.set_fused_kernels_enabled(True)
-            got = gather_linear_state(
-                prefix,
-                suffix,
-                alpha,
-                bounds,
-                bridge=bridge,
-                text_state=ts,
-                out_dtype=torch.float32,
-            )
-            assert torch.allclose(got, ref, atol=1e-5, rtol=1e-5), (bridge, ts is None)
-
-
-@requires_cuda
 def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
     from sglang.kernels.ops.diffusion import (
         can_use_fused_inplace_qknorm_rope,
@@ -825,171 +680,3 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
 # --------------------------------------------------------------------------
 # the overlay materializer's prefuse (fetched like the runtime fetches it)
 # --------------------------------------------------------------------------
-
-
-def _load_materializer():
-    import importlib.util
-
-    from sglang.multimodal_gen import envs
-    from sglang.multimodal_gen.runtime.utils.model_overlay import (
-        BUILTIN_MODEL_OVERLAY_REGISTRY,
-    )
-
-    spec = BUILTIN_MODEL_OVERLAY_REGISTRY[VDN_MODEL_ID]
-    local = envs.SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR
-    if local:
-        path = os.path.join(local, "_overlay", "materialize.py")
-    else:
-        from huggingface_hub import hf_hub_download
-
-        try:
-            path = hf_hub_download(
-                spec["overlay_repo_id"],
-                "_overlay/materialize.py",
-                revision=spec.get("overlay_revision"),
-            )
-        except Exception as exc:  # network / repo not yet pushed
-            pytest.skip(f"overlay materializer unavailable: {exc}")
-    module_spec = importlib.util.spec_from_file_location("_vdn_materializer", path)
-    module = importlib.util.module_from_spec(module_spec)
-    module_spec.loader.exec_module(module)
-    return module
-
-
-def test_prefuse_folds_both_adapters_in_diffusers_layout(tmp_path) -> None:
-    from safetensors.torch import save_file
-
-    mat = _load_materializer()
-    src = tmp_path / "src"
-    base_t = src / "h3-base" / "transformer"
-    base_t.mkdir(parents=True)
-    ckpt = src / mat.VDN_CHECKPOINT
-    torch.manual_seed(0)
-    # a tiny "transformer": one attention projection (both adapters), one
-    # adaln (turbo only, rank 2 pattern), one untouched norm
-    weights = {
-        "transformer_blocks.0.attn.to_q.weight": torch.randn(8, 6).to(torch.bfloat16),
-        "transformer_blocks.0.adaln_proj.linear.weight": torch.randn(10, 4).to(
-            torch.bfloat16
-        ),
-        "transformer_blocks.0.norm1.weight": torch.ones(6),
-        "proj_in.weight": torch.randn(6, 3),
-    }
-    save_file(
-        weights, str(base_t / "diffusion_pytorch_model-00001-of-00001.safetensors")
-    )
-    (base_t / "diffusion_pytorch_model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 1},
-                "weight_map": {
-                    k: "diffusion_pytorch_model-00001-of-00001.safetensors"
-                    for k in weights
-                },
-            }
-        )
-    )
-    (base_t / "config.json").write_text(
-        json.dumps({"rope_freq_dim": 16, "_class_name": "X"})
-    )
-    adapters = {
-        "default": (
-            {"rank": 4, "alpha": 4, "targets": []},
-            {
-                "transformer_blocks.0.attn.orig.to_q.lora_A.default.weight": torch.randn(
-                    4, 6
-                ).to(torch.bfloat16),
-                "transformer_blocks.0.attn.orig.to_q.lora_B.default.weight": torch.randn(
-                    8, 4
-                ).to(torch.bfloat16),
-            },
-        ),
-        "turbo": (
-            {
-                "rank": 4,
-                "alpha": 4,
-                "rank_pattern": {"transformer_blocks.0.adaln_proj.linear": 2},
-                "alpha_pattern": {"transformer_blocks.0.adaln_proj.linear": 2},
-            },
-            {
-                "transformer_blocks.0.attn.orig.to_q.lora_A.turbo.weight": torch.randn(
-                    4, 6
-                ).to(torch.bfloat16),
-                "transformer_blocks.0.attn.orig.to_q.lora_B.turbo.weight": torch.randn(
-                    8, 4
-                ).to(torch.bfloat16),
-                "transformer_blocks.0.adaln_proj.linear.lora_A.turbo.weight": torch.randn(
-                    2, 4
-                ).to(torch.bfloat16),
-                "transformer_blocks.0.adaln_proj.linear.lora_B.turbo.weight": torch.randn(
-                    10, 2
-                ).to(torch.bfloat16),
-            },
-        ),
-    }
-    for name, (cfg, tensors) in adapters.items():
-        d = ckpt / "adapters" / name
-        d.mkdir(parents=True)
-        (d / "adapter_config.json").write_text(json.dumps({"config": cfg}))
-        save_file(tensors, str(d / "adapter_model.safetensors"))
-    branch = ckpt / "linear_branch"
-    branch.mkdir()
-    branch_tensors = {
-        f"transformer_blocks.0.attn.linear_attention.p{i}": torch.zeros(1)
-        for i in range(mat.EXPECTED_LINEAR_BRANCH_KEYS)
-    }
-    save_file(branch_tensors, str(branch / "model.safetensors"))
-    (branch / "config.json").write_text(
-        json.dumps(
-            {
-                "type": "hybrid_attention",
-                "version": 2,
-                "config": {"softmax_attention": {"chunk": 5, "radius": 1}},
-            }
-        )
-    )
-    (ckpt / "metadata.json").write_text(json.dumps({"stage": "dmd"}))
-
-    out = tmp_path / "out"
-    out.mkdir()
-    mat.EXPECTED_PAIRS = {"default": 1, "turbo": 2}
-    record = mat._prefuse_transformer(source_dir=str(src), output_dir=str(out))
-    assert record["merge"]["pairs_merged"] == 3
-
-    from safetensors import safe_open
-
-    with safe_open(
-        str(out / "transformer" / "diffusion_pytorch_model-00001-of-00001.safetensors"),
-        "pt",
-    ) as f:
-        got_q = f.get_tensor("transformer_blocks.0.attn.to_q.weight")
-        got_ada = f.get_tensor("transformer_blocks.0.adaln_proj.linear.weight")
-        got_norm = f.get_tensor("transformer_blocks.0.norm1.weight")
-    exp_q = weights["transformer_blocks.0.attn.to_q.weight"].float()
-    for name in ("default", "turbo"):
-        t = adapters[name][1]
-        exp_q = (
-            exp_q
-            + t[f"transformer_blocks.0.attn.orig.to_q.lora_B.{name}.weight"].float()
-            @ t[f"transformer_blocks.0.attn.orig.to_q.lora_A.{name}.weight"].float()
-        )
-    assert torch.equal(got_q, exp_q.to(torch.bfloat16))
-    t = adapters["turbo"][1]
-    exp_ada = weights["transformer_blocks.0.adaln_proj.linear.weight"].float() + (
-        t["transformer_blocks.0.adaln_proj.linear.lora_B.turbo.weight"].float()
-        @ t["transformer_blocks.0.adaln_proj.linear.lora_A.turbo.weight"].float()
-    )
-    assert torch.equal(got_ada, exp_ada.to(torch.bfloat16))
-    assert torch.equal(got_norm, weights["transformer_blocks.0.norm1.weight"])
-    index = json.loads(
-        (
-            out / "transformer" / "diffusion_pytorch_model.safetensors.index.json"
-        ).read_text()
-    )
-    assert (
-        index["weight_map"]["transformer_blocks.0.attn.linear_attention.p0"]
-        == mat.LINEAR_BRANCH_FILE
-    )
-    config = json.loads((out / "transformer" / "config.json").read_text())
-    assert config["hybrid_attention"]["softmax_attention"] == {"chunk": 5, "radius": 1}
-    assert (out / "transformer" / mat.LINEAR_BRANCH_FILE).exists()

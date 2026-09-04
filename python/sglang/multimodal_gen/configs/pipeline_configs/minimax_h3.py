@@ -331,6 +331,10 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
     no breakable CUDA graph yet.
     """
 
+    def __post_init__(self) -> None:
+        # measured 0.98 vs 1.06 s/NFE on 8x B200 at the same block-level error
+        self.online_fp8_per_tensor = True
+
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
             'quality="high" is audited only for the base MiniMax-H3 50-step '
@@ -345,18 +349,14 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "not apply. FL2VA and Ref2VA tasks were not trained; use "
                 "MiniMaxAI/MiniMax-H3 for those."
             )
-        # Force the hybrid backend when none was chosen: the runtime selector
-        # reads server_args.attention_backend, so leaving it None would run the
-        # platform default (dense FA) on these weights.
+        # an unset backend would resolve to the platform default (dense FA)
         if server_args.attention_backend is None and not (
             server_args.component_attention_backends or {}
         ).get("transformer"):
             server_args.attention_backend = "hybrid_window_attn_h3"
         selected_backend = self.resolve_transformer_attention_backend(server_args)
         if selected_backend is not AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3:
-            # The dense-equivalence smoke (section 5 of the port plan) runs the
-            # prefused weights through plain attention on purpose; everything
-            # else must not, so it is an explicit opt-in.
+            # the base-H3+LoRA equivalence smoke runs plain attention on purpose
             config = server_args.attention_backend_config or {}
             if not bool(config.get("vdn_h3_dense_smoke", False)):
                 raise ValueError(

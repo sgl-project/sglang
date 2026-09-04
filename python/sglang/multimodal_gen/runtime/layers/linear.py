@@ -91,6 +91,11 @@ def adjust_scalar_to_fused_array(
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    def accepts_fp8_per_tensor_input(self, layer: torch.nn.Module) -> bool:
+        """Whether ``apply`` takes a prequantized ``(fp8 input, per-tensor
+        scale)`` tuple for this layer (fused activation + quant producers)."""
+        return False
+
     @abstractmethod
     def create_weights(
         self,

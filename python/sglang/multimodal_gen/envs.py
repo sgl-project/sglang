@@ -36,9 +36,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
-    SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR: str | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
-    SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
@@ -261,27 +259,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CI card behaves like the consumer card a case is written for. Without
     # the cap the allocator is free to reserve past the pretended budget and
     # a peak-VRAM baseline stops meaning "fits the card".
-    # Test-only: a local checkout of the VDN-H3 overlay repo, so the
-    # materializer unit test runs against the working copy instead of the
-    # pinned hub revision.
-    "SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR": lambda: os.getenv(
-        "SGLANG_DIFFUSION_TEST_VDN_H3_OVERLAY_DIR"
-    ),
     "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB": _lazy_optional_float(
         "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB"
     ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
-    # Online fp8 (--quantization fp8, no fp8 checkpoint): quantize weights
-    # per-tensor at load and run activations through a dynamic per-tensor
-    # scale into cuBLASLt (torch._scaled_mm). On SM100 the scalar-scale GEMM
-    # runs ~25% faster than the default per-channel CUTLASS dispatch at DiT
-    # shapes (H3 qkv, 104k x 5376 x 21504: 9.2 vs 12.3 ms); it trades the
-    # per-channel weight scales for one scale per tensor.
-    "SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM": _lazy_bool(
-        "SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM"
-    ),
     # Plan slots in the MiniMax-H3 --minimax-h3-adaln-online GPU slab
     # (9.25 MiB per slot-timestep; 64 x width 4 = 2.31 GiB). A request needs
     # up to num_inference_steps - 1 slots; the default covers the 50-step
