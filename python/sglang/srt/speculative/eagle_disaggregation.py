@@ -28,6 +28,10 @@ def build_eagle_disagg_draft_input(
     num_states = spec.speculative_eagle_topk
     if spec.enable_multi_layer_eagle:
         num_states *= spec.speculative_num_steps
+    elif spec.enable_draft_prefetch:
+        # The relayed topk carries [seed | steps-1 predictions] under
+        # draft-prefetch, so it is steps * topk wide.
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [

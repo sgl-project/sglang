@@ -40,7 +40,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -158,6 +162,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        self.enable_draft_prefetch = get_spec().enable_draft_prefetch
 
         self._rebuild_topk1_chain_buffers()
 
@@ -779,6 +784,221 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         return None, None, None, None
 
+    def _pad_topk_for_draft_prefetch(self, topk_p, topk_index):
+        """Pad the prefill-side topk to the draft-prefetch candidate width
+        (steps * topk): every decode round concatenates [seed | steps-1
+        predictions] into a buffer of exactly that width, and the overlap
+        relay buffer's shape is fixed by this first (prefill) stash.
+
+        The padded slots REPEAT the last (for topk=1: the only) candidate
+        instead of zero-padding: the first decode round then verifies a
+        chain of the real prefill token -- a valid chain, of which the
+        target may accept any prefix -- rather than one built on an
+        arbitrary token id 0. Also maps the prefill seed to the TARGET id
+        space here: the concatenated buffer is consumed directly by
+        prepare_verify_input_for_draft_prefetch, which skips
+        draft_forward's hot_token_id mapping.
+        """
+        # [bs, topk] -> [bs, num_steps * topk]  (topk=1: [bs,1] -> [bs,N])
+        if self.enable_draft_prefetch and self.speculative_num_steps > 1:
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            topk_pad_size = self.speculative_num_steps * self.topk - topk_p.shape[-1]
+            if topk_pad_size > 0:
+                topk_p = torch.cat(
+                    [topk_p, topk_p[:, -1:].repeat(1, topk_pad_size)], dim=1
+                )
+                topk_index = torch.cat(
+                    [topk_index, topk_index[:, -1:].repeat(1, topk_pad_size)], dim=1
+                )
+        return topk_p, topk_index
+
+    def prepare_verify_input_for_draft_prefetch(
+        self, batch: ScheduleBatch
+    ) -> EagleVerifyInput:
+        """Draft-prefetch decode entry: build the EagleVerifyInput from the
+        pre-concatenated topk without running the draft model. The draft GPU
+        work already happened inside the previous round's draft_prefetch."""
+        assert self.speculative_num_steps > 1, (
+            "draft-prefetch requires num_steps > 1; _check_draft_prefetch "
+            "enforces this at startup"
+        )
+        draft_input: EagleDraftInput = batch.spec_info
+        topk_p = draft_input.topk_p
+        topk_index = draft_input.topk_index
+        parent_list = self._topk1_parents_prealloc[: topk_p.shape[0]]
+
+        # The buffer width is exactly num_draft_tokens - 1 (draft_prefetch
+        # concatenates [seed | N-1 predictions]; prefill pads to the same
+        # width), so this topk selects EVERY candidate. The sort restores
+        # chain order: topk returns score-ranked indices (all 1.0 in steady
+        # state, tie order arbitrary), while parent_list assumes position
+        # order.
+        top_scores = torch.topk(topk_p, self.speculative_num_draft_tokens - 1, dim=-1)
+        top_scores_index = torch.sort(top_scores.indices).values
+        maybe_detect_oob(
+            top_scores_index,
+            0,
+            topk_index.shape[1],
+            "prepare_verify_input_for_draft_prefetch: top_scores_index OOB "
+            "for gather on topk_index",
+        )
+        draft_tokens = torch.gather(topk_index, index=top_scores_index, dim=1)
+
+        return build_eagle_verify_input(
+            batch,
+            draft_input,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            None,  # draft_probs: rejection sampling is rejected at startup
+            target_worker=self.target_worker,
+            topk=self.topk,
+            num_steps=self.speculative_num_steps,
+            num_draft_tokens=self.speculative_num_draft_tokens,
+            tree_mask_mode=self.tree_mask_mode,
+            device=self.device,
+        )
+
+    def draft_prefetch(
+        self,
+        batch: ScheduleBatch,
+        batch_output: GenerationBatchResult,
+    ) -> None:
+        """Draft-prefetch: pre-run the next round's draft right after this round's
+        draft_extend, and pre-concatenate its per-step topk into
+        batch_output.next_draft_input.
+
+        Runs on the forward stream, back-to-back with draft_extend, so the GPU
+        never idles waiting for the scheduler to re-dispatch the draft. No new
+        KV allocation happens: the scheduler reserves 2x
+        max(topk * num_steps, num_draft_tokens) slots per round (see
+        get_alloc_reserve_per_decode), so prepare_for_draft's contiguous
+        assign below lands on exactly the slots the next round's normal draft
+        would take -- the req_to_token rows stay valid through the next round.
+        """
+        assert self.speculative_num_steps > 1, (
+            "draft_prefetch requires num_steps > 1; _check_draft_prefetch "
+            "enforces this at startup"
+        )
+        bs = batch.seq_lens.shape[0]
+        saved_state = (
+            batch.forward_mode,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.spec_info,
+            batch.input_ids,
+            batch.out_cache_loc,
+        )
+        try:
+            next_draft_input = batch_output.next_draft_input
+            new_seq_lens = batch_output.new_seq_lens
+
+            # draft_extend left an EagleDraftExtendInput here; rebind to the
+            # next draft input -- draft_forward reads the seed (topk_index)
+            # and hidden_states from spec_info.
+            batch.spec_info = next_draft_input
+            if not batch.forward_mode.is_idle():
+                # Disguise as the next round's decode batch: under
+                # DRAFT_EXTEND_V2, init_new would take the extend branch and
+                # misread the batch.
+                batch.forward_mode = ForwardMode.DECODE
+                # Post-verify lengths: they drive the draft KV slot
+                # assignment, positions (= seq_lens.repeat_interleave(topk))
+                # and the attention metadata.
+                batch.seq_lens = new_seq_lens
+                if getattr(
+                    self.draft_attn_backend, "needs_cpu_seq_lens", True
+                ) and getattr(
+                    self.cuda_graph_runner, "replay_graph_needs_seq_lens_cpu", True
+                ):
+                    # Two readers need the post-verify lengths on the CPU
+                    # mirror: backends consuming it for metadata (e.g.
+                    # Ascend block tables -- a stale mirror under-sizes the
+                    # tables and reads OOB) and the NPU draft graph replay
+                    # (see replay_graph_needs_seq_lens_cpu, which builds
+                    # per-step seq_lens from it).
+                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+                # Width-only placeholder: init_new reads len(input_ids) into
+                # num_token_non_padded (DP padding), and draft_extend left a
+                # bs*num_draft_tokens-wide tensor here. Content is never read
+                # (draft_forward rebinds input_ids; graph runners don't copy it).
+                batch.input_ids = torch.zeros(
+                    bs, dtype=torch.int64, device=batch.device
+                )
+
+            forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+                next_draft_input,
+                self.req_to_token_pool,
+                batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+
+            if (
+                can_run_decode_cuda_graph
+                and not batch.forward_mode.is_idle()
+                and self.seed_dsa_topk_from_draft_extend
+                and next_draft_input.dsa_topk_indices is None
+            ):
+                can_run_decode_cuda_graph = False
+
+            with spec_stage_span("draft_prefetch"):
+                if can_run_decode_cuda_graph:
+                    _parent_list, _tsi, draft_tokens, _draft_probs = (
+                        self.cuda_graph_runner.execute(forward_batch)
+                    )
+                else:
+                    if not batch.forward_mode.is_idle():
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
+                    _parent_list, _tsi, draft_tokens, _draft_probs = self.draft_forward(
+                        forward_batch
+                    )
+
+            if not batch.forward_mode.is_idle():
+                # topk=1: draft_tokens is already the full chain
+                # [seed, t1, ..., t(N-1)] in TARGET id space -- the seed
+                # column is mapped inside draft_forward -- and is already
+                # num_draft_tokens - 1 wide; the next round consumes it via
+                # prepare_verify_input_for_draft_prefetch without re-running
+                # the draft model. clone() detaches it from the graph
+                # runner's static output buffer, which the next replay
+                # overwrites. Intentional cross-round mutation:
+                # next_draft_input flows to the next round via batch_output
+                # and is NOT restored by the finally block below.
+                next_draft_input.topk_index = draft_tokens.clone()
+
+                # Greedy chain has no real branch scores; 1.0 matches the
+                # draft_extend seed convention. Keeps the seed's
+                # probability at slot 0 and pads the width-1 seed p to the
+                # chain width.
+                next_draft_input.topk_p = torch.cat(
+                    [
+                        next_draft_input.topk_p,
+                        torch.ones(
+                            (bs, self.speculative_num_steps - 1),
+                            dtype=next_draft_input.topk_p.dtype,
+                            device=next_draft_input.topk_p.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+        finally:
+            (
+                batch.forward_mode,
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                batch.spec_info,
+                batch.input_ids,
+                batch.out_cache_loc,
+            ) = saved_state
+
     def draft_extend(self):
         pass
 
@@ -885,6 +1105,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        topk_p, topk_index = self._pad_topk_for_draft_prefetch(topk_p, topk_index)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1111,6 +1332,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        self.enable_draft_prefetch = get_spec().enable_draft_prefetch
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -1229,11 +1452,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                     self.draft_worker.draft_runner
                 )
+                # Draft-prefetch pre-concatenates the per-step topk along the
+                # candidate axis: the input width is steps * topk.
+                topk = self.topk * (
+                    self.speculative_num_steps if self.enable_draft_prefetch else 1
+                )
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=hidden_size,
                     dtype=hidden_dtype,
-                    topk=self.topk,
+                    topk=topk,
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
@@ -1248,9 +1476,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
                 ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                    if self.enable_draft_prefetch:
+                        with spec_stage_span("prepare"):
+                            verify_input: EagleVerifyInput = (
+                                self.draft_worker.prepare_verify_input_for_draft_prefetch(
+                                    batch
+                                )
+                            )
+                    else:
+                        with spec_stage_span("draft"):
+                            verify_input: EagleVerifyInput = self.draft_worker.draft(
+                                batch
+                            )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
@@ -1272,6 +1510,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+
+            # Draft-prefetch: pre-run the next round's draft right after
+            # draft_extend, back-to-back on the forward stream.
+            if self.enable_draft_prefetch:
+                self.draft_worker.draft_prefetch(batch, batch_output)
 
             return batch_output
 
