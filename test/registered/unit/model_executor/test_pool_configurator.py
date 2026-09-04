@@ -83,6 +83,7 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_unified_memory=False,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -148,6 +149,7 @@ def _make_model_runner(
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
+        enable_unified_memory=enable_unified_memory,
         enable_hisparse=False,
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
@@ -297,7 +299,14 @@ class TestDefaultConfigurator(CustomTestCase):
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
-    def _make_swa_runner(self, full_layers=16, swa_layers=16, ratio=0.5, page_size=1):
+    def _make_swa_runner(
+        self,
+        full_layers=16,
+        swa_layers=16,
+        ratio=0.5,
+        page_size=1,
+        enable_unified_memory=False,
+    ):
         return _make_model_runner(
             self,
             is_hybrid_swa=True,
@@ -306,6 +315,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
             swa_num_kv_heads=4,
             page_size=page_size,
             swa_full_tokens_ratio=ratio,
+            enable_unified_memory=enable_unified_memory,
         )
 
     def _run(self, available_bytes, **kwargs):
@@ -326,6 +336,68 @@ class TestHybridSWAConfigurator(CustomTestCase):
         used = _actual_memory_used(mr, config)
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+    def test_unified_capacity_is_maximal_with_draft_pool(self):
+        page_size = 8
+        full_layers = 2
+        swa_layers = 1
+        draft_layers = 2
+        draft_swa_layers = 1
+        ratio = 0.5
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=ratio,
+            page_size=page_size,
+            enable_unified_memory=True,
+            speculative_algorithm="EAGLE",
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+        mr.spec_aux_config.eagle_draft_swa_num_layers = draft_swa_layers
+
+        full_bytes_per_token = _full_per_token(mr)
+        swa_bytes_per_token = _swa_per_token(mr)
+        target_full_bytes_per_token = full_bytes_per_token * full_layers
+        draft_bytes_per_token = (
+            full_bytes_per_token * (draft_layers - draft_swa_layers)
+            + swa_bytes_per_token * draft_swa_layers
+        )
+
+        def allocation_bytes(full_tokens, *, include_reserved_draft_page=True):
+            swa_tokens = int(full_tokens * ratio) // page_size * page_size
+            target_bytes = (
+                full_tokens * target_full_bytes_per_token
+                + swa_tokens * swa_bytes_per_token * swa_layers
+            )
+            virtual_span = max(target_bytes // target_full_bytes_per_token - 1, 0)
+            draft_tokens = (virtual_span + page_size - 1) // page_size * page_size
+            if include_reserved_draft_page:
+                draft_tokens += page_size
+            return target_bytes + draft_tokens * draft_bytes_per_token
+
+        expected_full_tokens = 10 * page_size
+        available = allocation_bytes(
+            expected_full_tokens + page_size,
+            include_reserved_draft_page=False,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size)
+
+        full_tokens = config.full_max_total_num_tokens
+        self.assertEqual(full_tokens % page_size, 0)
+        self.assertEqual(full_tokens, expected_full_tokens)
+        self.assertLessEqual(allocation_bytes(full_tokens), available)
+        self.assertGreater(allocation_bytes(full_tokens + page_size), available)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
