@@ -115,9 +115,11 @@ def namespace_of(cls) -> dict:
     """
     if not dataclasses.is_dataclass(cls):
         return {}
-    out = {}
-    # Nearest declaration wins, so walk the MRO front to back and keep the
-    # first answer: a subclass that redeclares a field owns it.
+    # An assembled record: the collector recorded who declared each field,
+    # because there are no base classes left to ask.
+    out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
+    # A class that still inherits its namespaces: nearest declaration wins, so
+    # walk the MRO front to back and keep the first answer.
     for base in cls.__mro__:
         path = base.__dict__.get("_NS_PATH")
         if path is None:
