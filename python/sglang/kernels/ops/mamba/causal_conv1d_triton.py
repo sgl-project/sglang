@@ -332,7 +332,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         matrix_w = w_col0
         matrix_x = col0
         for j in tl.static_range(KERNEL_WIDTH):
-
             if KERNEL_WIDTH == 2:
                 if j == 1:  # KERNEL_WIDTH-1:
                     matrix_w = w_col1
@@ -502,9 +501,9 @@ def causal_conv1d_fn(
             assert padded_batch == cache_indices.size(0)
         if has_initial_state is not None:
             assert has_initial_state.size() == (padded_batch,)
-            assert (
-                conv_states is not None
-            ), "ERROR: `has_initial_state` is used, which needs also `conv_states`"
+            assert conv_states is not None, (
+                "ERROR: `has_initial_state` is used, which needs also `conv_states`"
+            )
         assert weight.stride(1) == 1
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
@@ -1053,9 +1052,9 @@ def causal_conv1d_update(
 
     if validate_data:
         assert dim == weight.size(0)
-        assert (
-            conv_state.stride(-2) == 1
-        ), f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        assert conv_state.stride(-2) == 1, (
+            f"ERROR: expect contiguous along feat-dim of conv_state (currently stride={conv_state.stride()})"
+        )
         assert state_len >= width - 1
         # when above happens, we don't shift-left to keep any records in conv_state
         assert dim == conv_state.size(1)

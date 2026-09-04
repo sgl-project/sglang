@@ -70,14 +70,17 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def test_launch_sweep_only_calls_verify(self):
         """Verify sweep launch invokes only the verify kernel."""
         calls: list[str] = []
-        with patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: calls.append("verify"),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: calls.append("write"),
+        with (
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: calls.append("verify"),
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: calls.append("write"),
+            ),
         ):
             ep = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
@@ -93,14 +96,21 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def test_launch_per_forward_passes_kernel_kind(self):
         """Verify per-forward launch passes the endpoint kernel kind."""
         captured: list[tuple[str, CanaryLaunchTag]] = []
-        with patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: captured.append(("verify", kwargs["context"].kernel_kind)),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(("write", kwargs["context"].kernel_kind)),
+        with (
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: captured.append(
+                    ("verify", kwargs["context"].kernel_kind)
+                ),
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: captured.append(
+                    ("write", kwargs["context"].kernel_kind)
+                ),
+            ),
         ):
             ep = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.TAIL_V_SWA
@@ -124,16 +134,19 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def test_endpoint_shares_violation_log_across_launches(self):
         """Verify endpoints can reuse the same violation log."""
         captured_rings: list[int] = []
-        with patch.object(
-            endpoint_module,
-            "launch_canary_verify_kernel",
-            lambda **kwargs: captured_rings.append(
-                kwargs["context"].violation_ring.data_ptr()
+        with (
+            patch.object(
+                endpoint_module,
+                "launch_canary_verify_kernel",
+                lambda **kwargs: captured_rings.append(
+                    kwargs["context"].violation_ring.data_ptr()
+                ),
             ),
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: None,
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: None,
+            ),
         ):
             shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
             ep_a = _make_endpoint(
@@ -160,12 +173,15 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def test_swa_endpoint_pre_translates_out_cache_loc(self):
         """Verify SWA endpoints translate cache locations before write launch."""
         captured: list[torch.Tensor] = []
-        with patch.object(
-            endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
+        with (
+            patch.object(
+                endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
+            ),
         ):
             # LUT maps full slot i → swa slot (i + 100) so we can verify the gather happened.
             lut = torch.arange(8, dtype=torch.int64, device=self.device) + 100
@@ -214,12 +230,15 @@ class TestSelfUnitEndpoint(CustomTestCase):
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
         """Verify SWA sentinel cache rows become write-skip markers."""
         captured: list[torch.Tensor] = []
-        with patch.object(
-            endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
-        ), patch.object(
-            endpoint_module,
-            "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
+        with (
+            patch.object(
+                endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
+            ),
+            patch.object(
+                endpoint_module,
+                "launch_canary_write_kernel",
+                lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
+            ),
         ):
             # 8 in-window rows + 1 trailing sentinel row at index 8.
             lut = torch.arange(8, dtype=torch.int64, device=self.device)
