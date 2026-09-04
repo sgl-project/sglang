@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_mxfp8_dense_gemm_backend,
+    unshuffle_aiter_fp8_weight,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -142,6 +143,13 @@ def _require_fp4_dtype():
             "DeepSeek-V4 FP4 experts require torch.float4_e2m1fn_x2 support."
         )
     return fp4_dtype
+
+
+def unshuffle_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Restore the logical layout of a backend-shuffled FP8 weight."""
+    if not _use_aiter:
+        raise RuntimeError("FP8 weight unshuffle requires AITER")
+    return unshuffle_aiter_fp8_weight(weight)
 
 
 if _use_aiter or _use_hip_int4:
@@ -735,6 +743,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 t = shuffle_weight(layer.weight, (16, 16))
                 layer.weight.copy_(t)
                 del t
+                layer.weight.is_shuffled = True
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -1619,6 +1628,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
             return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
@@ -1657,6 +1668,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
         elif _use_aiter:
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
@@ -1665,6 +1678,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             t = shuffle_weight(layer.w2_weight, (16, 16))
             layer.w2_weight.copy_(t)
             del t
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
         elif _is_cpu:
             assert _is_cpu_amx_available, (
                 "Fp8MoEMethod on CPU requires that CPU has AMX support"
