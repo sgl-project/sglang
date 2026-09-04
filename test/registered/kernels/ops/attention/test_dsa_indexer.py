@@ -1041,9 +1041,14 @@ class TestDSAIndexer(CustomTestCase):
         mock_act_quant.side_effect = mock_quant
 
         def mock_paged_mqa_logits(q, kv, weights, *args, **kwargs):
-            batch_size = q.shape[0]
-            seq_len = 128
-            return torch.randn(batch_size, seq_len, dtype=torch.float32, device="cuda")
+            # In decode mode: q is (batch_size, 1) or (batch_size,)
+            # Return logits with shape (batch_size, seq_len) for scoring against cached keys
+            batch_size = q.shape[0] if len(q.shape) > 1 else q.shape[0]
+            seq_len = 128  # Context length from self.seq_len
+            logits = torch.randn(
+                batch_size, seq_len, dtype=torch.float32, device="cuda"
+            )
+            return logits
 
         mock_deep_gemm.fp8_paged_mqa_logits.side_effect = mock_paged_mqa_logits
 
