@@ -158,9 +158,9 @@ class RACERWorker(NGRAMWorker):
     def _warm_prompt_tokenbin(self, batch, hidden_states: torch.Tensor) -> None:
         """Populate TokenBin from prompt/extend hidden states without rerunning the model.
 
-        This first implementation is intentionally TP=1 only.  It computes the
+        This first implementation is intentionally TP=1 only. It computes the
         target LM-head top-k in small chunks to avoid materializing the whole
-        [prompt_tokens, vocab] matrix at once.  Chunked prefill is naturally
+        [prompt_tokens, vocab] matrix at once. Chunked prefill is naturally
         supported because each EXTEND call warms the rows it just computed.
         """
 
@@ -182,7 +182,9 @@ class RACERWorker(NGRAMWorker):
             )
             return
 
-        prompt_lens = [int(x) for x in batch.extend_seq_lens_cpu]
+        # ScheduleBatch stores the current EXTEND chunk lengths in extend_lens.
+        # extend_seq_lens_cpu belongs to ForwardBatch and is not available here.
+        prompt_lens = [int(x) for x in batch.extend_lens]
         total = sum(prompt_lens)
         if total <= 0:
             return
