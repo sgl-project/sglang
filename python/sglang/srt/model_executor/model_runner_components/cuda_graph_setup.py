@@ -547,9 +547,6 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
     )
 
-    # A platform-provided graph runner wins; in-tree platforms return None
-    # and fall back to the device-keyed defaults until they grow the hook
-    # (the "npu" entry moves into NpuSRTPlatform once it lands).
     GraphRunnerCls = current_platform.get_graph_runner_cls()
     if GraphRunnerCls is None:
         require_out_of_tree_impl(
