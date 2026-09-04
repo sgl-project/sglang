@@ -30,6 +30,13 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
+    # deepep
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "2048",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
+    # war barrier
+    "SGLANG_ENABLE_WAR_BARRIER": "1",
+    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -41,16 +48,12 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
+    # mtp
+    "SGLANG_ENABLE_SPEC_V2": "1",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
-    # deepep
-    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "DEEPEP_HCCL_BUFFSIZE": "2048",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
-    # war barrier
-    "SGLANG_ENABLE_WAR_BARRIER": "1",
-    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+    "SGLANG_DSPARK_FAST_KERNEL": "0", 
 }
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
@@ -87,6 +90,14 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
+    "--skip-server-warmup",
+    "--cuda-graph-bs",
+    1,
+    2,
+    4,
+    5,
+    6,
+    # MTP (DSPARK) configuration.
     "--speculative-algorithm",
     "DSPARK",
     "--speculative-draft-model-path",
@@ -99,13 +110,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     6,
     "--speculative-dspark-block-size",
     5,
-    "--skip-server-warmup",
-    "--cuda-graph-bs",
-    1,
-    2,
-    4,
-    5,
-    6,
 ]
 
 

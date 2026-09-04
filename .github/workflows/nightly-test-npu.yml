@@ -282,7 +282,7 @@ jobs:
 
   debug-nightly-acc-16-npu-a3:
     name: debug-nightly-acc-16-npu-a3
-    if: ${{ false }} # temporarily disabled: only debug-nightly-perf-16-npu-a3 runs
+    if: ${{ !cancelled() }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
