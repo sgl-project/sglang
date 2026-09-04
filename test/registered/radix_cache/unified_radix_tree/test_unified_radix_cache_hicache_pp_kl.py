@@ -28,9 +28,9 @@ def _assert_pp_decode_cached_tokens(result, history_len, output_len, label):
     expected = history_len + output_len
     actual = result["meta_info"]["cached_tokens"]
     lower = max(0, expected - 1)
-    assert (
-        lower <= actual <= expected
-    ), f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    assert lower <= actual <= expected, (
+        f"{label}: expected cached_tokens in [{lower}, {expected}], got {actual}"
+    )
 
 
 class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):

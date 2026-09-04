@@ -30,9 +30,15 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    get_device_core_count,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    is_hip,
+)
 
 _is_hip = is_hip()
+_is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -195,53 +201,18 @@ def _mla_launch_plan(
 
 
 def _extract_kv_strides(buf, page_size: int):
-    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a
-    KV buffer that may be:
-      - 3-D ``[max_slots, head_num, head_dim]`` (legacy / non-shared) — the
-        contiguous layout most callers use. page/tok strides are synthesized
-        so the kernel's PAGE_SIZE>1 math collapses to ``kv_loc * stride(0)``.
-      - 4-D ``[num_pages, page_size, head_num, head_dim]`` (shared
-        pool). page/tok strides come from stride(0)/stride(1) directly;
-        legacy ``stride_bs`` is set to 0 (unused at PAGE_SIZE>1).
+    """Extract (slot_stride, head_stride, page_stride, tok_stride) for a 3-D
+    ``[max_slots, head_num, head_dim]`` KV buffer.
 
     Returns a 4-tuple of ints suitable for passing as ``stride_buf_*bs``,
     ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
     """
-    if buf.ndim == 4:
-        # 4-D view ``[num_pages, page_size, head_num, head_dim]``.
-        #   stride(0) = per-PAGE stride (page_bytes/itemsize)
-        #   stride(1) = within-page per-TOKEN stride (k_row/v_row bytes/itemsize)
-        # The PAGE_SIZE>1 kernel branch uses page_stride/tok_stride and does
-        # NOT read slot_stride. slot_stride is consumed ONLY by the
-        # PAGE_SIZE==1 branch (``offs = kv_loc * stride_buf_*bs``), where one
-        # page holds exactly one slot, so the per-slot stride is the per-page
-        # stride — NOT the within-page token stride. Concretely the per-slot
-        # stride is ``page_stride // page_size`` (= entry_bytes/itemsize),
-        # which at ps=1 equals page_stride. Using ``tok_stride`` here (one
-        # layer's k_row) would make the ps=1 read address ``kv_loc * k_row``
-        # instead of ``kv_loc * entry_bytes`` and read the wrong slot.
-        page_stride = buf.stride(0)
-        tok_stride = buf.stride(1)
-        head_stride = buf.stride(2)
-        slot_stride = (
-            page_stride // page_size
-        )  # per-slot stride; == page_stride at ps=1
-        assert buf.shape[1] == page_size, (
-            f"4-D KV buffer's dim-1 must equal page_size; got "
-            f"shape[1]={buf.shape[1]}, page_size={page_size}"
-        )
-    elif buf.ndim == 3:
-        # Legacy 3-D ``[N, head, dim]``. Synthesize page/tok strides such
-        # that ``(kv_loc // ps) * page_stride + (kv_loc % ps) * tok_stride
-        # == kv_loc * slot_stride`` for the page-aware branch — this lets
-        # the same kernel handle non-shared paged-allocator buffers without
-        # any caller adjustment.
-        slot_stride = buf.stride(0)
-        head_stride = buf.stride(1)
-        page_stride = slot_stride * page_size
-        tok_stride = slot_stride
-    else:  # pragma: no cover
+    if buf.ndim != 3:
         raise ValueError(f"unexpected KV buffer ndim={buf.ndim}, shape={buf.shape}")
+    slot_stride = buf.stride(0)
+    head_stride = buf.stride(1)
+    page_stride = slot_stride * page_size
+    tok_stride = slot_stride
     return slot_stride, head_stride, page_stride, tok_stride
 
 
@@ -464,9 +435,6 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    # head_num lives in the dim immediately before the head_dim. For 3-D
-    # ``[N, head_num, head_dim]`` that's dim 1; for 4-D
-    # ``[num_pages, page_size, head_num, head_dim]`` that's dim 2.
     kv_head_num = k_buffer.shape[-2]
 
     batch, head_num = q.shape[0], q.shape[1]
@@ -577,6 +545,7 @@ def _fwd_grouped_kernel_stage1(
     Lv: tl.constexpr,
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
+    IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -651,7 +620,17 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # gfx1250: triton tl.dot(fp8, fp8) returns garbage (~1e34+) for contraction
+        # dim K>=128 (verified K=64 ok, K>=128 broken; bf16 fine at all K). The MLA
+        # nope QK dot has K=512, so an fp8 KV cache MUST NOT be consumed as an fp8 dot
+        # here: keep q in bf16 and upcast the fp8 K to bf16 for the dot. No-op for a
+        # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
+        # On all other platforms keep the original downcast of q to the KV dtype.
+        # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
+        if IS_GFX1250:
+            q_k = q
+        else:
+            q_k = q.to(K_Buffer.dtype.element_ty)
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -679,7 +658,10 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)
+            if IS_GFX1250:
+                qk = tl.dot(q_k, k.to(q_k.dtype))
+            else:
+                qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
@@ -741,7 +723,15 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            # Keep the softmax weights p in fp32 for the P·V dot (do NOT downcast p to
+            # bf16) on gfx1250. The bf16 downcast of p was the accuracy loss vs a torch
+            # fp32 SDPA reference (recovers gfx1250 R1 GSM8K ~0.82 -> ~0.92 with
+            # attention idealized). On other platforms restore the p.to(v.dtype) cast.
+            # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
+            if IS_GFX1250:
+                acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -897,6 +887,7 @@ def _decode_grouped_att_m_fwd(
         Lv=Lv,
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
+        IS_GFX1250=_is_gfx1250,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -1204,8 +1195,7 @@ def decode_attention_fwd(
     # schedule from kv_indptr on-device, so this path involves no host sync and is safe to
     # capture in a CUDA graph. Whether Lean pays off for a given shape is decided cheaply by
     # the backend's host-side seqlen gate (lean_decode_seqlen_gate) before we get here.
-    # Lean supports both the contiguous 3-D [N, head, dim] and paged 4-D
-    # [num_pages, page_size, head, dim] KV layouts (page-aware address math in the kernel).
+    # Lean handles both page sizes: the kernel does page-aware address math.
     # ROCm/AMD only: Lean is validated on MI300X/MI355X; CUDA/NVIDIA uses the standard kernel.
     if (
         _is_hip
@@ -1213,6 +1203,7 @@ def decode_attention_fwd(
         and _should_use_lean_decode(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
         )
+        and lean_locks is not None
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num
@@ -1493,7 +1484,6 @@ def _lean_attention_decode_kernel(
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
     # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
     while iter < cta_end_tile_gid:
-
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
         tile_iter = tile_row_idx * tiles_per_khead
@@ -1587,8 +1577,8 @@ def _lean_attention_decode_kernel(
 
             # Load K transposed: [BLOCK_DMODEL, BLOCK_N] so qk = q @ k directly.
             # Page-aware KV address math (mirrors the standard grouped kernel): at
-            # PAGE_SIZE==1 the slot index addresses directly; otherwise it splits into
-            # (page_id, tok_in_p) for a [num_pages, page_size, head, dim] paged buffer.
+            # PAGE_SIZE==1 the slot index addresses directly; otherwise it splits
+            # into (page_id, tok_in_p).
             if PAGE_SIZE == 1:
                 offs_buf_k = (
                     kv_loc[None, :] * stride_buf_kbs
@@ -1968,13 +1958,11 @@ def _decode_lean_attention_fwd(
     ``total_programs`` is the fixed persistent-grid size (2× device CU count). The kernel
     derives its own tile schedule from ``kv_indptr`` on-device, so no host sync is needed and
     the launch is CUDA-graph capturable. ``Mp``, ``Lp``, ``Op``, ``locks`` are pre-allocated
-    persistent-grid partial-result buffers reused across decode steps. ``page_size`` selects
-    the KV address math: 1 for a contiguous ``[N, head, dim]`` buffer, >1 for a paged
-    ``[num_pages, page_size, head, dim]`` buffer (strides via ``_extract_kv_strides``).
+    persistent-grid partial-result buffers reused across decode steps. ``page_size``
+    selects the KV address math over the ``[N, head, dim]`` buffer (strides via
+    ``_extract_kv_strides``).
     """
     batch, head_num = q.shape[0], q.shape[1]
-    # head_num lives at dim -2 for both the 3-D [N, head, dim] and 4-D paged
-    # [num_pages, page_size, head, dim] layouts.
     num_kv_heads = k_buffer.shape[-2]
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]

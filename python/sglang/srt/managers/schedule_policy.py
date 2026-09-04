@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaSWATokenToKVPoolAllocator,
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -397,23 +398,8 @@ class SchedulePolicy:
         waiting_queue: List[Req], tree_cache: BasePrefixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
-        last_node_to_reqs = defaultdict(list)
-        for req in waiting_queue:
-            last_node = tree_cache.resolve_node_handle(req.last_node)
-            last_node_to_reqs[last_node].append(req)
-
-        node_to_weight = defaultdict(int)
-        for node in last_node_to_reqs:
-            node_to_weight[node] = len(last_node_to_reqs[node])
-        SchedulePolicy._calc_weight(tree_cache.root_node, node_to_weight)
-
-        waiting_queue.clear()
-        SchedulePolicy._get_dfs_priority(
-            tree_cache.root_node,
-            node_to_weight,
-            last_node_to_reqs,
-            waiting_queue,
-        )
+        order = tree_cache.dfs_weight_order([req.last_node for req in waiting_queue])
+        waiting_queue[:] = [waiting_queue[index] for index in order]
 
     @staticmethod
     def _sort_by_longest_output(
@@ -481,27 +467,6 @@ class SchedulePolicy:
         if _ROUTING_KEY_POLICY_DEBUG_LOG:
             waiting_keys_after = [r.routing_key for r in waiting_queue]
             logger.info(f"waiting_keys_after={waiting_keys_after}")
-
-    @staticmethod
-    def _calc_weight(cur_node: TreeNode, node_to_weight: Dict[TreeNode, int]) -> None:
-        for child in cur_node.children.values():
-            SchedulePolicy._calc_weight(child, node_to_weight)
-            node_to_weight[cur_node] += node_to_weight[child]
-
-    @staticmethod
-    def _get_dfs_priority(
-        cur_node: TreeNode,
-        node_to_priority: Dict[TreeNode, int],
-        last_node_to_reqs: Dict[TreeNode, List[Req]],
-        q: List,
-    ) -> None:
-        children = [child for child in cur_node.children.values()]
-        children.sort(key=lambda x: -node_to_priority[x])
-        for child in children:
-            SchedulePolicy._get_dfs_priority(
-                child, node_to_priority, last_node_to_reqs, q
-            )
-        q.extend(last_node_to_reqs[cur_node])
 
 
 class AddReqResult(Enum):
@@ -583,15 +548,17 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
-        # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve
-        # the gap per new mamba slot or admission over-commits. Gate on the
-        # ALLOCATOR being the unified Mamba composite, NOT on `is_hybrid_ssm_cache`
-        # (False for `ChunkCache`, which would skip the reservation on the
-        # chunk-cache path): the gap coupling is a property of the byte buffer.
+        # A new state slot eats shared-gap bytes that `rem_total_tokens` counts
+        # as free, so reserve per slot or admission over-commits. Gate on the
+        # ALLOCATOR, not `is_hybrid_ssm_cache`: that is False for `ChunkCache`,
+        # which would skip the reservation on the chunk-cache path.
         self._mamba_slot_cost = 0
         if isinstance(
-            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator,
+            (
+                UnifiedMambaTokenToKVPoolAllocator,
+                UnifiedMambaSWATokenToKVPoolAllocator,
+            ),
         ):
             self._mamba_slot_cost = (
                 self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
@@ -605,9 +572,7 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
+            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -833,7 +798,7 @@ class PrefillAdder:
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        if self._mamba_slot_cost and req.mamba_pool_idx is None:
+        if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0
 
@@ -870,8 +835,6 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         mamba_gap_reserve: int = 0,
-        host_hit_len: int = 0,
-        storage_hit_len: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -911,15 +874,40 @@ class PrefillAdder:
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
-        elif prefix_len > 0:
+
+    def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
+        if req.retracted_stain:
+            # Retraction attribution is intentionally omitted for now; discard
+            # its lifecycle state so a later abort cannot report it as a drop.
+            self.tree_cache.discard_storage_prefetch_accounting(req.rid)
+            return
+
+        if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
-                host_hit_len=host_hit_len,
-                storage_hit_len=storage_hit_len,
+                host_hit_len=req.materialized_host_hit_len(),
+                storage_hit_len=req.storage_hit_length,
+                storage_hit_start=req.storage_hit_start,
+                host_hit_is_storage=req.host_hit_is_storage,
             )
             self.log_device_hit_tokens += device_hit
             self.log_host_hit_tokens += host_hit
             self.log_storage_hit_tokens += storage_hit
+
+        fulfilled_storage_hit = req.fulfilled_storage_hit_len(prefix_len)
+        reason = None
+        if fulfilled_storage_hit < req.storage_hit_length:
+            reason = (
+                "device_capacity"
+                if req.needs_host_load_back()
+                and req.host_loaded_length < req.host_hit_length
+                else "shrunk"
+            )
+        self.tree_cache.finish_storage_prefetch_admission(
+            req.rid,
+            fulfilled_tokens=fulfilled_storage_hit,
+            reason=reason,
+        )
 
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
@@ -952,9 +940,8 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-            host_hit_len=req.host_hit_length,
-            storage_hit_len=req.storage_hit_length,
         )
+        self._account_prefill_cache_admission(req, prefix_len)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -1327,6 +1314,7 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                req.host_loaded_length = len(new_indices)
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
                 req.kv.cache_protected_len = prefix_len
@@ -1349,9 +1337,9 @@ class PrefillAdder:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
 
-                assert (
-                    truncation_align_size is None
-                ), "truncation_align_size is not supported for dllm prefill"
+                assert truncation_align_size is None, (
+                    "truncation_align_size is not supported for dllm prefill"
+                )
 
                 if (
                     tile_stop := self._check_prefill_tile_budget(input_tokens)
@@ -1382,9 +1370,8 @@ class PrefillAdder:
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
             else:
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
@@ -1430,9 +1417,8 @@ class PrefillAdder:
                     0,
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
-                    host_hit_len=req.host_hit_length,
-                    storage_hit_len=req.storage_hit_length,
                 )
+                self._account_prefill_cache_admission(req, prefix_len)
 
         return self.budget_state()
 
