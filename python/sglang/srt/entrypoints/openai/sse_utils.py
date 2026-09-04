@@ -24,6 +24,9 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
     reasoning_content: Optional[str] = None
     role: Optional[str] = None
     content: Optional[str] = None
+    # Moonshot 扩展(P0.5):{"token_ids": [int, ...]},仅请求
+    # stream_options.include_internal_content=true 时携带。
+    internal_content: Optional[dict] = None
 
 
 class StreamChoice(msgspec.Struct):
@@ -62,6 +65,7 @@ def build_sse_content(
     logprobs: Optional[dict] = None,
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
+    internal_content: Optional[dict] = None,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -81,7 +85,12 @@ def build_sse_content(
     Returns:
         SSE-formatted string "data: {...}\\n\\n"
     """
-    delta = StreamDelta(role=role, content=content, reasoning_content=reasoning_content)
+    delta = StreamDelta(
+        role=role,
+        content=content,
+        reasoning_content=reasoning_content,
+        internal_content=internal_content,
+    )
     choice = StreamChoice(
         index=index,
         delta=delta,

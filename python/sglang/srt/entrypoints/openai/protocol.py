@@ -215,6 +215,9 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
+    # Moonshot 扩展(P0.5):每个增量帧附带 delta.internal_content.token_ids ——
+    # 该帧增量背后的底层 token id 序列(训练数据回流 / token 级评估用)。
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -1392,6 +1395,9 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
+    # Moonshot 扩展(P0.5):{"token_ids": [int, ...]},仅
+    # stream_options.include_internal_content=true 时携带。
+    internal_content: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):

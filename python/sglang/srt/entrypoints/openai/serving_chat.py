@@ -748,6 +748,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens: Dict[int, int],
         reasoning_tokens: Dict[int, int],
         completion_tokens: Dict[int, int],
+        internal_token_ids: Optional[List[int]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
         offset = stream_offsets.get(index, 0)
@@ -761,6 +762,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # tool-call, or content) so they aren't dropped when a parser is active
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
+
+        # P0.5:本事件的增量 token ids 附到本事件产出的第一个增量帧上
+        # (reasoning 或 content;一帧通常对应一个事件)。附着后置 None 防重复。
+        remaining_internal = (
+            {"token_ids": internal_token_ids} if internal_token_ids else None
+        )
 
         # Handle reasoning content
         if self.reasoning_parser and request.separate_reasoning:
@@ -790,8 +797,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_content=reasoning_text,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    internal_content=remaining_internal,
                 )
                 remaining_logprobs = None
+                remaining_internal = None
 
             # P1.7(Moonshot 扩展):思考结束、正文开始之前,单独发一帧
             # reasoning_content=""(空串)作为结束边界,让客户端准确切换
@@ -867,8 +876,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     content=delta,
                     logprobs=remaining_logprobs,
                     usage=usage,
+                    internal_content=remaining_internal,
                 )
                 remaining_logprobs = None
+                remaining_internal = None
 
         # Flush logprobs still unattached this step — only when a parser is
         # active, since _process_tool_call_stream may consume the delta and emit
@@ -1645,6 +1656,13 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        # P0.5(Moonshot 扩展):include_internal_content 时逐帧附带增量 token ids。
+        # 引擎流事件自带 output_ids(增量模式为 delta;否则为累计列表,按偏移切片)。
+        internal_content_on = bool(
+            request.stream_options
+            and getattr(request.stream_options, "include_internal_content", False)
+        )
+        token_id_offsets: Dict[int, int] = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -1751,6 +1769,18 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     stream_started = True
 
+                # P0.5:取本事件的增量 token ids(增量模式事件即 delta;
+                # 累计模式按已消费偏移切片)。
+                internal_token_ids = None
+                if internal_content_on:
+                    all_ids = content.get("output_ids") or []
+                    if self.tokenizer_manager.server_args.incremental_streaming_output:
+                        internal_token_ids = list(all_ids)
+                    else:
+                        prev = token_id_offsets.get(index, 0)
+                        internal_token_ids = list(all_ids[prev:])
+                        token_id_offsets[index] = len(all_ids)
+
                 # Generate streaming content (override in subclass for custom behavior)
                 async for chunk in self._generate_stream_content(
                     content=content,
@@ -1766,6 +1796,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
+                    internal_token_ids=internal_token_ids,
                 ):
                     yield chunk
 
