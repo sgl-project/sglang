@@ -2713,7 +2713,7 @@
             "expected_e2e_ms": 5648.49,
             "expected_avg_denoise_ms": 477.49,
             "expected_median_denoise_ms": 56.74,
-            "load_peak_vram_mb": 32892.0,
+            "load_peak_vram_mb": 34022.0,
             "runtime_peak_vram_mb": 61190.0,
             "estimated_full_test_time_s": 153.1
         },
@@ -2731,7 +2731,7 @@
             "expected_e2e_ms": 9086.81,
             "expected_avg_denoise_ms": 492.02,
             "expected_median_denoise_ms": 151.9,
-            "load_peak_vram_mb": 32892.0,
+            "load_peak_vram_mb": 34022.0,
             "runtime_peak_vram_mb": 62510.0,
             "estimated_full_test_time_s": 149.4
         },
