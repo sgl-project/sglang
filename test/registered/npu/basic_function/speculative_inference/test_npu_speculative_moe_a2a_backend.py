@@ -29,7 +29,6 @@ class TestAscendDistTimeout(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         os.environ["HCCL_BUFFSIZE"] = "2048"
         os.environ["SGLANG_ENABLE_OVERLAP_PLAN_STREAM"] = "1"
-        os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
         cls.env = os.environ.copy()
         cls.common_args = [
