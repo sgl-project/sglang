@@ -32,9 +32,9 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-b-tp-test-cpu",
-        "base-c-test-cpu",
+        "stage-a-test-cpu-intel",
+        "stage-a-tp-test-cpu-intel",
+        "stage-b-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -181,6 +181,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-1-gpu",
         "nightly-xpu-2-gpu",
         "nightly-xpu-4-gpu",
+        "nightly-xpu-8-gpu",
     ],
 }
 
@@ -188,12 +189,20 @@ NIGHTLY_SUITES = {
 OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
+        # `stage="weekly"`, dispatched by weekly-test-cpu.yml.
+        "weekly-test-cpu",
     ],
     HWBackend.CUDA: [
         "stress",
         # `stage="weekly"` -- same shape. The three dicts group names for
-        # readability only; validation reads their union.
+        # readability only; validation reads their union. One entry per row of
+        # the matrix in weekly-test-nvidia.yml.
+        "weekly-test-1-gpu-large",
+        "weekly-test-2-gpu-large",
+        "weekly-test-4-gpu-h100",
+        "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
+        "weekly-test-8-gpu-b200",
     ],
 }
 
@@ -395,6 +404,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        fork_worker_batch_size=args.fork_worker_batch_size,
     )
 
 
@@ -415,7 +425,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'base-b-test-cpu,base-c-test-cpu'); their tests are unioned "
+            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )
@@ -487,7 +497,19 @@ def main():
         default=None,
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
     )
+    parser.add_argument(
+        "--fork-worker-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Preload common modules, then run this many files in isolated fork "
+            "children (default: 1, preserving one exec per file)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.fork_worker_batch_size <= 0:
+        parser.error("--fork-worker-batch-size must be positive")
 
     # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):

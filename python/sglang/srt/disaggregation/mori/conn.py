@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import run_with_deadline
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -334,6 +335,7 @@ class MoriKVManager(CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.room_to_bootstrap_addr: Dict[int, str] = {}
             self._start_decode_thread()
+            self._start_heartbeat_checker_thread()
 
     def _init_engine(self) -> IOEngine:
         if self.kv_args.ib_device:
@@ -349,7 +351,11 @@ class MoriKVManager(CommonKVManager):
             f"{uuid.uuid4().hex[:8]}"
         )
 
-        engine = IOEngine(engine_key, config)
+        engine = run_with_deadline(
+            lambda: IOEngine(engine_key, config),
+            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+            what=f"Mori IOEngine({engine_key!r}, host={self.local_ip!r})",
+        )
         poll_mode = PollCqMode.POLLING
 
         qp_per_transfer = envs.SGLANG_MORI_QP_PER_TRANSFER.get()
@@ -902,6 +908,20 @@ class MoriKVManager(CommonKVManager):
         src_k_descs = src_descs[:num_local_layers]
         src_v_descs = src_descs[num_local_layers:]
 
+        # Both peers expose the same PP-local layout. Their descriptor indices
+        # are already aligned, so applying the Prefill rank's global layer
+        # offset would incorrectly index into a local list.
+        if len(src_descs) == len(dst_mem_descs):
+            dst_k_descs = dst_mem_descs[:num_local_layers]
+            dst_v_descs = dst_mem_descs[num_local_layers:]
+            return (
+                src_k_descs,
+                src_v_descs,
+                dst_k_descs,
+                dst_v_descs,
+                num_local_layers,
+            )
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         dst_total_layers = len(dst_mem_descs) // 2
@@ -910,8 +930,18 @@ class MoriKVManager(CommonKVManager):
                 "Destination KV descriptors do not match prefill pp configuration"
             )
         dst_k_descs = dst_mem_descs[start_layer:end_layer]
+        if (
+            num_local_layers < dst_total_layers
+            and dst_total_layers % num_local_layers != 0
+        ):
+            # Decode has draft-model KV while Prefill has target-model KV only:
+            # [K_main..., V_main..., draft_K..., draft_V...].
+            multiplier_ratio = dst_total_layers // num_local_layers
+            dst_v_offset = num_local_layers * multiplier_ratio
+        else:
+            dst_v_offset = dst_total_layers
         dst_v_descs = dst_mem_descs[
-            dst_total_layers + start_layer : dst_total_layers + end_layer
+            dst_v_offset + start_layer : dst_v_offset + end_layer
         ]
         return src_k_descs, src_v_descs, dst_k_descs, dst_v_descs, num_local_layers
 
@@ -920,6 +950,10 @@ class MoriKVManager(CommonKVManager):
     ) -> tuple[List[MemoryDesc], List[MemoryDesc], int]:
         src_descs = self.kv_mem_descs
         num_local_layers = len(src_descs)
+        # Same-PP peers register matching local descriptor lists.
+        if len(src_descs) == len(dst_mem_descs):
+            return src_descs, dst_mem_descs, num_local_layers
+
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + num_local_layers
         if end_layer > len(dst_mem_descs):
@@ -1083,7 +1117,7 @@ class MoriKVManager(CommonKVManager):
         statuses: List[TransferStatus] = []
         kv_item_len = self.kv_args.kv_item_lens[0]
 
-        if self.is_mla_backend:
+        if self.is_mla_backend or self.is_hybrid_mla_backend:
             src_descs, dst_descs, layers_current_pp_stage = (
                 self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
             )
@@ -1693,7 +1727,6 @@ class MoriKVSender(CommonKVSender):
 
 
 class MoriKVReceiver(CommonKVReceiver):
-
     def __init__(
         self,
         mgr: MoriKVManager,

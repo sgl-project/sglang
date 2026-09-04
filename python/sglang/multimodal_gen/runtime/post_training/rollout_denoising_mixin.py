@@ -50,7 +50,6 @@ def _kwargs_to_cpu(d: Any) -> Any:
 
 
 class RolloutDenoisingMixin:
-
     def step_latents(
         self,
         batch: Req,

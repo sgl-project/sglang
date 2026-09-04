@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStoredWithMetadata,
     StorageMedium,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -517,8 +518,7 @@ class TestRadixCache(unittest.TestCase):
         )
         cache.req_to_token_pool = ReqToTokenPool(request_indices.clone())
         req = unittest.mock.Mock(
-            req_pool_idx=0,
-            cache_protected_len=0,
+            kv=ReqKvInfo(req_pool_idx=0, cache_protected_len=0),
             extra_key=None,
             cache_salt=None,
             priority=0,

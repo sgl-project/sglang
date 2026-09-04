@@ -1465,8 +1465,7 @@ async def _extract_encoder_error(responses, endpoint, context, encode_requests=N
         if isinstance(resp, asyncio.TimeoutError):
             timeout_val = envs.SGLANG_ENCODER_HTTP_TIMEOUT.get()
             logger.error(
-                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} "
-                f"(request {i})"
+                f"Encoder {endpoint} timeout ({timeout_val}s) for {ctx} (request {i})"
             )
             return f"Encoder {endpoint} timeout ({timeout_val}s)"
         if isinstance(resp, Exception):
@@ -1692,9 +1691,9 @@ def _view_pool_buffer_by_modality(raw_buffer, embedding_data, dtype):
         if info is None:
             mod_info[mod] = [start, end, shape[0], shape[1]]
         else:
-            assert (
-                info[3] == shape[1]
-            ), f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            assert info[3] == shape[1], (
+                f"hidden_dim mismatch in modality {mod}: {info[3]} vs {shape[1]}"
+            )
             assert info[1] == start, f"non-contiguous parts in modality {mod}"
             info[1] = end
             info[2] += shape[0]
@@ -1736,7 +1735,7 @@ class MMReceiverBase(ABC):
         self.tp_rank = tp_rank
         self.tp_size = get_parallel().tp_size
         self.tp_group = tp_group
-        self.nnodes = server_args.nnodes
+        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
@@ -1838,19 +1837,19 @@ class MMReceiverBase(ABC):
 
         extra_kwargs = {}
         if getattr(server_args, "tokenizer_backend", None) is not None:
-            extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
+            extra_kwargs["tokenizer_backend"] = get_serving().tokenizer_backend
 
         _processor = get_processor(
             get_serving().tokenizer_path,
-            tokenizer_mode=server_args.tokenizer_mode,
+            tokenizer_mode=get_serving().tokenizer_mode,
             trust_remote_code=get_model().trust_remote_code,
-            revision=server_args.revision,
+            revision=get_model().revision,
             image_processor_backend=resolve_image_processor_backend(get_mm()),
             **extra_kwargs,
         )
 
         enable_adaptive_dispatch_to_encoder = (
-            server_args.enable_adaptive_dispatch_to_encoder
+            get_disagg().enable_adaptive_dispatch_to_encoder
         )
         mm_processor_kwargs = {}
         if model_config is not None:
