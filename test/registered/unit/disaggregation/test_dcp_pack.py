@@ -21,91 +21,131 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestPackedDcpGrouping(CustomTestCase):
-    def test_packed_groups_collapse_cyclic_src(self):
-        page_size = 64
-        dcp_size = 4
-        src_pages = np.arange(4, dtype=np.int32)
-        dst_pages = np.array([7], dtype=np.int32)
-        plan = build_dcp_token_transfer_plan(
-            src_pages,
-            dst_pages,
-            physical_page_size=page_size,
-            dcp_size=dcp_size,
-            dcp_rank=0,
-            num_kv_tokens=256,
-        )
-        raw_src, _ = group_concurrent_contiguous(
-            plan.target_src_token_indices, plan.target_dst_token_indices
-        )
-        self.assertEqual(len(raw_src), 64)
-        self.assertTrue(all(len(group) == 1 for group in raw_src))
-
-        packed_src = np.arange(plan.target_dst_token_indices.size, dtype=np.int64)
-        packed_groups, _ = group_concurrent_contiguous(
-            packed_src, plan.target_dst_token_indices
-        )
-        self.assertEqual(len(packed_groups), 1)
-        self.assertEqual(len(packed_groups[0]), 64)
+def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
+    return build_dcp_token_transfer_plan(
+        np.asarray(src, dtype=np.int32),
+        np.asarray(dst, dtype=np.int32),
+        physical_page_size=page_size,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        **kwargs,
+    )
 
 
-class TestReplicatedDcpPlan(CustomTestCase):
-    def test_replicated_rows_consistent_with_strided_plan(self):
-        page_size = 64
-        dcp_size = 4
-        virtual_page_size = page_size * dcp_size
-        src_pages = np.array([5, 2, 11, 4], dtype=np.int32)
-        dst_pages = np.array([7], dtype=np.int32)
-
-        offsets = np.arange(256, dtype=np.int64)
-        for dcp_rank in range(dcp_size):
-            plan = build_dcp_token_transfer_plan(
-                src_pages,
-                dst_pages,
-                physical_page_size=page_size,
-                dcp_size=dcp_size,
-                dcp_rank=dcp_rank,
-                num_kv_tokens=256,
+class TestDcpTokenTransferPlan(CustomTestCase):
+    def test_one_virtual_page_explicit_rows(self):
+        # P=2, N=4. Prefill pages 5,2,11,4; decode virtual page 7.
+        # pos 0..7 src rows: 10,11, 4,5, 22,23, 8,9
+        # draft dest page is P*N=8 → 56..63
+        # each rank stores local rows 14,15 (page P=2)
+        expected_draft_src = [10, 11, 4, 5, 22, 23, 8, 9]
+        expected_draft_dst = list(range(56, 64))
+        expected_target_src = {
+            0: [10, 22],
+            1: [11, 23],
+            2: [4, 8],
+            3: [5, 9],
+        }
+        seen_src = []
+        for rank, src in expected_target_src.items():
+            plan = _plan(
+                src=[5, 2, 11, 4],
+                dst=[7],
+                page_size=2,
+                dcp_size=4,
+                dcp_rank=rank,
+                num_kv_tokens=8,
             )
             np.testing.assert_array_equal(
-                plan.draft_src_token_indices,
-                src_pages.astype(np.int64)[offsets // page_size] * page_size
-                + offsets % page_size,
+                plan.draft_src_token_indices, expected_draft_src
             )
             np.testing.assert_array_equal(
-                plan.draft_dst_token_indices, 7 * virtual_page_size + offsets
+                plan.draft_dst_token_indices, expected_draft_dst
             )
-            owned = plan.draft_dst_token_indices % dcp_size == dcp_rank
-            np.testing.assert_array_equal(
-                plan.draft_dst_token_indices[owned] // dcp_size,
-                plan.target_dst_token_indices,
-            )
-            np.testing.assert_array_equal(
-                plan.draft_src_token_indices[owned], plan.target_src_token_indices
-            )
+            np.testing.assert_array_equal(plan.target_src_token_indices, src)
+            np.testing.assert_array_equal(plan.target_dst_token_indices, [14, 15])
+            seen_src.extend(plan.target_src_token_indices.tolist())
+        self.assertEqual(sorted(seen_src), sorted(expected_draft_src))
 
-    def test_second_chunk_continues_the_delta_space(self):
-        page_size = 64
-        dcp_size = 2
-        virtual_page_size = page_size * dcp_size
-        src_pages = np.array([9, 3], dtype=np.int32)
-        dst_pages = np.array([4, 6], dtype=np.int32)
-        plan = build_dcp_token_transfer_plan(
-            src_pages,
-            dst_pages,
-            physical_page_size=page_size,
-            dcp_size=dcp_size,
+    def test_second_chunk_crosses_dest_pages(self):
+        # Prefix already filled one virtual page (P*N=4). This chunk's 4 tokens
+        # start at dest pos 4 and spill from virtual page 4 onto page 6.
+        plan = _plan(
+            src=[9, 3],
+            dst=[4, 6],
+            page_size=2,
+            dcp_size=2,
             dcp_rank=0,
             src_page_offset=2,
-            decode_prefix_len=virtual_page_size,
-            num_kv_tokens=128,
+            decode_prefix_len=4,
+            num_kv_tokens=4,
         )
-        relative = 2 * page_size + np.arange(128, dtype=np.int64)
-        np.testing.assert_array_equal(
-            plan.draft_dst_token_indices,
-            np.where(relative < virtual_page_size, 4, 6) * virtual_page_size
-            + relative % virtual_page_size,
+        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 19, 6, 7])
+        np.testing.assert_array_equal(plan.draft_dst_token_indices, [16, 17, 26, 27])
+        np.testing.assert_array_equal(plan.target_src_token_indices, [18, 6])
+        np.testing.assert_array_equal(plan.target_dst_token_indices, [12, 13])
+
+        plan_r1 = _plan(
+            src=[9, 3],
+            dst=[4, 6],
+            page_size=2,
+            dcp_size=2,
+            dcp_rank=1,
+            src_page_offset=2,
+            decode_prefix_len=4,
+            num_kv_tokens=4,
         )
+        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [18, 19, 6, 7])
+        np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
+        np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [12, 13])
+
+    def test_rejects_unaligned_prefix(self):
+        with self.assertRaisesRegex(ValueError, "align"):
+            _plan(
+                src=[0],
+                dst=[0],
+                page_size=2,
+                dcp_size=4,
+                dcp_rank=0,
+                decode_prefix_len=1,
+                num_kv_tokens=2,
+            )
+
+    def test_empty_tokens(self):
+        plan = _plan(
+            src=[0], dst=[0], page_size=2, dcp_size=4, dcp_rank=0, num_kv_tokens=0
+        )
+        self.assertTrue(plan.empty())
+
+
+class TestPackedDcpGrouping(CustomTestCase):
+    def test_target_needs_pack_draft_does_not(self):
+        plan = _plan(
+            src=[0, 1, 2, 3],
+            dst=[0],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=0,
+            num_kv_tokens=8,
+        )
+        np.testing.assert_array_equal(plan.target_src_token_indices, [0, 4])
+        np.testing.assert_array_equal(plan.target_dst_token_indices, [0, 1])
+        target_src, _ = group_concurrent_contiguous(
+            plan.target_src_token_indices, plan.target_dst_token_indices
+        )
+        self.assertEqual(target_src, [[0], [4]])
+
+        packed_src, packed_dst = group_concurrent_contiguous(
+            np.arange(2, dtype=np.int64), plan.target_dst_token_indices
+        )
+        self.assertEqual(packed_src, [[0, 1]])
+        self.assertEqual(packed_dst, [[0, 1]])
+
+        draft_src, draft_dst = group_concurrent_contiguous(
+            plan.draft_src_token_indices, plan.draft_dst_token_indices
+        )
+        self.assertEqual(draft_src, [[0, 1, 2, 3, 4, 5, 6, 7]])
+        self.assertEqual(draft_dst, [[0, 1, 2, 3, 4, 5, 6, 7]])
 
 
 def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
