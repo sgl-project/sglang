@@ -290,9 +290,9 @@ class TemplateManager:
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of chat template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of chat template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)
@@ -319,9 +319,9 @@ class TemplateManager:
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of completion template file"
+        assert template_path.endswith(".json"), (
+            "unrecognized format of completion template file"
+        )
 
         with open(template_path, "r") as filep:
             template = json.load(filep)

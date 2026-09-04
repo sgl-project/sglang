@@ -175,9 +175,9 @@ class TestPPPdmux(ScriptedTestCase):
     def _script_pp_split_prefill_chunked_no_merge_assert(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=800)
-        assert (
-            r.finished
-        ), "engine died before req finished — merge_batch assert may have tripped"
+        assert r.finished, (
+            "engine died before req finished — merge_batch assert may have tripped"
+        )
         assert r.chunks_done >= 2, (
             f"pdmux + chunked path must produce >=2 chunks to exercise "
             f"split_prefill_batch filter; got chunks_done={r.chunks_done}"

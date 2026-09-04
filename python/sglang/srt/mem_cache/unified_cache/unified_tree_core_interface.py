@@ -35,9 +35,9 @@ class BaseEvictionResult(msgspec.Struct):
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
-        assert (
-            not self.device_frees and not self.host_frees
-        ), "BaseEvictionResult dropped with undrained values"
+        assert not self.device_frees and not self.host_frees, (
+            "BaseEvictionResult dropped with undrained values"
+        )
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -50,10 +50,12 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
+    unbacked_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
@@ -368,6 +370,10 @@ class UnifiedTreeCoreInterface(ABC):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
+
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
 
     @property
     @abstractmethod
