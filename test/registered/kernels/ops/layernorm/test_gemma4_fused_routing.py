@@ -68,9 +68,9 @@ def test_matches_reference(fused_routing, dtype, T, E, K):
         # Tie-break order may differ; require the same top-K set and weight sum.
         ref_set = ref_i.sort(dim=-1).values
         out_set = out_i.sort(dim=-1).values
-        assert torch.equal(
-            out_set, ref_set
-        ), "fused routing picked a different top-K set than reference"
+        assert torch.equal(out_set, ref_set), (
+            "fused routing picked a different top-K set than reference"
+        )
         torch.testing.assert_close(
             out_w.sum(dim=-1).to(torch.float32),
             ref_w.sum(dim=-1).to(torch.float32),

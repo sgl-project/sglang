@@ -70,7 +70,9 @@ class SWAComponent(TreeComponent):
 
         assert isinstance(
             params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-        ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+        ), (
+            f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(params.token_to_kv_pool_allocator)}"
+        )
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
@@ -239,9 +241,9 @@ class SWAComponent(TreeComponent):
         # were just allocated by the in-flight request, so every page must be
         # live; a violation means we would hand the node the sink and serve
         # zeros, which is worth a hard failure rather than silent corruption.
-        assert bool(
-            (physical > 0).all()
-        ), f"incoming swa pages must all be live, got {physical.tolist()}"
+        assert bool((physical > 0).all()), (
+            f"incoming swa pages must all be live, got {physical.tolist()}"
+        )
         swa.bind(kept_pages, physical)
         swa.virtual_to_physical.index_fill_(0, incoming_pages, -1)
         swa.clear_inverse_history()
@@ -351,12 +353,12 @@ class SWAComponent(TreeComponent):
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
-        assert (
-            node.component_data[self.component_type].lock_ref == 0
-        ), f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
-        assert (
-            swa_evicted_seqlen % self.tree_core.page_size == 0
-        ), f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        assert node.component_data[self.component_type].lock_ref == 0, (
+            f"tombstone {self.component_type} lock_ref should be 0, node {node.id}"
+        )
+        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
+            f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        )
 
         if swa_evicted_seqlen <= total_prefix_len:
             # Branch 1: entire value_slice is within SWA window — recover
@@ -427,13 +429,13 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         if node.component_data[ct].value is not None:
             return
-        assert (
-            node.component_data[ct].lock_ref == 0
-        ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        assert node.component_data[ct].lock_ref == 0, (
+            f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        )
         swa_evicted_seqlen = params.swa_evicted_seqlen
-        assert (
-            swa_evicted_seqlen % self.tree_core.page_size == 0
-        ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
+            f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+        )
 
         if swa_evicted_seqlen <= total_prefix_len:
             pass  # entire node is within the SWA window
@@ -534,9 +536,9 @@ class SWAComponent(TreeComponent):
         new_parent.component_data[self.component_type].lock_ref = child.component_data[
             self.component_type
         ].lock_ref
-        new_parent.component_data[self.component_type].session_ref = (
-            child.component_data[self.component_type].session_ref
-        )
+        new_parent.component_data[
+            self.component_type
+        ].session_ref = child.component_data[self.component_type].session_ref
         assert new_parent.component_data[self.component_type].session_ids is None
 
         child_swa_value = child.component_data[self.component_type].value
@@ -554,9 +556,9 @@ class SWAComponent(TreeComponent):
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
             split_len = len(new_parent.key)
-            new_parent.component_data[self.component_type].host_value = (
-                child_swa_host_value[:split_len].clone()
-            )
+            new_parent.component_data[
+                self.component_type
+            ].host_value = child_swa_host_value[:split_len].clone()
             child.component_data[self.component_type].host_value = child_swa_host_value[
                 split_len:
             ].clone()

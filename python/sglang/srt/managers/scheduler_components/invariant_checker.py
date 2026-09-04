@@ -58,6 +58,9 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    # The chunked-prefill request parked between chunks is in neither batch;
+    # its uncached tokens must still be counted.
+    get_chunked_req: Callable = field(default=lambda: None)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -171,14 +174,12 @@ class SchedulerInvariantChecker:
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
-            # Page-level leak diagnosis for mamba. Allocator flavors without
-            # page free-lists (free_pages is None) skip the page census — the
-            # dump must never crash the watchdog thread that calls it.
-            free_pages = self.token_to_kv_pool_allocator.free_pages
-            release_pages = self.token_to_kv_pool_allocator.release_pages
-            if free_pages is None or release_pages is None:
+            # Pools without a page free list return None; skip the census rather
+            # than crash the watchdog thread that runs this dump.
+            free_pages = self.token_to_kv_pool_allocator.get_all_free_pages()
+            if free_pages is None:
                 return leak, msg
-            free_full_pages = set(free_pages.tolist() + release_pages.tolist())
+            free_full_pages = set(free_pages.tolist())
             cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
             full_page_msg = ""
             if (
@@ -264,24 +265,31 @@ class SchedulerInvariantChecker:
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
-                if not req.kv.holds_kv:
-                    continue
+        counted: set[int] = set()
+        reqs = [req for batch in batches for req in batch.reqs]
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            reqs.append(chunked_req)
+        for req in reqs:
+            if id(req) in counted:
+                continue
+            counted.add(id(req))
+            if not req.kv.holds_kv:
+                continue
 
-                allocated_len = req.kv.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.kv.cache_protected_len % self.page_size == 0
+            allocated_len = req.kv.kv_allocated_len
+            if self.page_size > 1:
+                allocated_len = ceil_align(allocated_len, self.page_size)
+                assert req.kv.cache_protected_len % self.page_size == 0
 
-                full_uncached += allocated_len - req.kv.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
-                    )
+            full_uncached += allocated_len - req.kv.cache_protected_len
+            if self.is_hybrid_swa:
+                swa_uncached += allocated_len - max(
+                    req.kv.cache_protected_len, req.kv.swa_evicted_seqlen
+                )
 
-                if req.beam_group is not None:
-                    full_uncached += req.beam_group.extra_uncached_tokens()
+            if req.beam_group is not None:
+                full_uncached += req.beam_group.extra_uncached_tokens()
 
         return full_uncached, swa_uncached
 
@@ -386,18 +394,9 @@ class SchedulerInvariantChecker:
         if not sub_allocs:
             return
 
-        def _free_pages(a):
-            free = a.free_pages
-            release = getattr(a, "release_pages", None)
-            return (
-                torch.cat((free, release))
-                if release is not None and len(release) > 0
-                else free
-            )
-
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
-            free = _free_pages(sub)
+            free = sub.get_all_free_pages()
             uniq = torch.unique(free)
             if uniq.numel() != free.numel():
                 raise_error_or_warn(
@@ -409,7 +408,7 @@ class SchedulerInvariantChecker:
 
         # Check A: owner pages (full-pool indices) must not be in the full free
         # set (sub_allocs[0] is the full pool, even on hybrid-SWA).
-        full_unique = torch.unique(_free_pages(sub_allocs[0]))
+        full_unique = torch.unique(sub_allocs[0].get_all_free_pages())
         stale = owner_pages[torch.isin(owner_pages, full_unique)]
         if stale.numel() > 0:
             raise_error_or_warn(

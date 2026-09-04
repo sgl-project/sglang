@@ -17,7 +17,7 @@
 
 import logging
 import re
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -242,12 +242,12 @@ class LoRAManager:
         Args:
             lora_ref (LoRARef): The LoRARef object containing the LoRA name, path, and ID.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             # load configs
@@ -337,9 +337,9 @@ class LoRAManager:
 
         adapter = self.configs.get(lora_ref.lora_id)
         lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert (
-            adapter is not None and lora_ref is not None
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        assert adapter is not None and lora_ref is not None, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -379,9 +379,9 @@ class LoRAManager:
         for lora_id in lora_ids:
             if lora_id is not None:
                 lora_ref = self.lora_refs.get(lora_id)
-                assert (
-                    lora_ref is not None
-                ), f"LoRA ID {lora_id} not found in lora_refs."
+                assert lora_ref is not None, (
+                    f"LoRA ID {lora_id} not found in lora_refs."
+                )
                 pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
@@ -431,6 +431,16 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        # Some internal-only backends (currently UNO) use explicit token-row
+        # routing for their adapted forwards and want all-base batches to run
+        # through the plain model path.  Clear any routing retained by the
+        # preceding adapted forward before inspecting CUDA-graph metadata.
+        if self.lora_backend.skip_inactive_lora_batches and not any(
+            uid is not None for uid in forward_batch.lora_ids
+        ):
+            self.reset_lora_batch()
+            return
+
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
@@ -468,6 +478,39 @@ class LoRAManager:
         )
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
+        )
+
+    def prepare_lora_token_segments(
+        self,
+        *,
+        lora_ids: Sequence[Optional[str]],
+        segment_lens: Sequence[int],
+    ) -> None:
+        """Prepare eager LoRA routing independently of request batching."""
+        lora_ids = list(lora_ids)
+        segment_lens = list(segment_lens)
+        if len(lora_ids) != len(segment_lens):
+            raise ValueError("LoRA ids and segment lengths must have equal length.")
+
+        weight_indices = []
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0.0] * self.max_loras_per_batch
+        for lora_id in lora_ids:
+            weight_index = self.memory_pool.get_buffer_id(lora_id)
+            weight_indices.append(weight_index)
+            if lora_id is not None:
+                lora = self.loras[lora_id]
+                lora_ranks[weight_index] = lora.config.r
+                scalings[weight_index] = lora.scaling
+
+        self.lora_backend.prepare_lora_token_segments(
+            segment_lens=segment_lens,
+            weight_indices=weight_indices,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+        )
+        self.lora_backend.batch_info.has_active_lora = any(
+            lora_ranks[index] > 0 for index in weight_indices
         )
 
     def update_lora_info(self):
@@ -570,12 +613,18 @@ class LoRAManager:
 
         assert lora_paths or (
             max_lora_rank is not None and target_modules is not None
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        ), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         self.init_lora_adapters(lora_paths)
         self.init_lora_shapes(
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
+        )
+        self.lora_backend.validate_lora_targets(
+            base_model=self.base_model,
+            target_modules=self.target_modules,
         )
 
         if self._experts_shared_outer_override is not None:
@@ -838,12 +887,12 @@ class LoRAManager:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
-        assert (
-            lora_ref.lora_name is not None and lora_ref.lora_path is not None
-        ), "LoRARef must have both lora_name and lora_path set for loading."
-        assert (
-            lora_ref.lora_id not in self.loras
-        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
+            "LoRARef must have both lora_name and lora_path set for loading."
+        )
+        assert lora_ref.lora_id not in self.loras, (
+            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
+        )
 
         try:
             new_adapter = LoRAConfig.from_dict(
