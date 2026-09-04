@@ -117,7 +117,7 @@ def cat_pad_channels_last_3d(
     pw_l, pw_r, ph_t, ph_b, pt_front, pt_back = padding
     if pw_l != pw_r or ph_t != ph_b or pt_back != 0:
         return None
-    if x.dim() != 5 or not x.is_cuda:
+    if x.dim() != 5 or x.device.type not in ("cuda", "xpu"):
         return None
     cache_t = 0
     if cache_x is not None:
@@ -318,7 +318,10 @@ def dup_up3d_add(
         return None
     if repeats <= 0 or repeats & (repeats - 1):
         return None
-    if not main.is_cuda or not src.is_cuda:
+    if main.device.type not in ("cuda", "xpu") or src.device.type not in (
+        "cuda",
+        "xpu",
+    ):
         return None
     if main.dtype != src.dtype or main.device != src.device:
         return None

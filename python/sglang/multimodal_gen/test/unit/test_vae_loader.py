@@ -760,9 +760,20 @@ class TestVAELoader(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=False),
         ):
             server_args = _FakeServerArgs(QwenImagePipelineConfig())
             self.assertFalse(_should_use_channels_last_3d(server_args, "vae"))
+
+    def test_channels_last_3d_selected_on_xpu(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=False),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+            patch.object(vae_loader.current_platform, "is_xpu", return_value=True),
+        ):
+            server_args = _FakeServerArgs(QwenImagePipelineConfig())
+            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
@@ -776,10 +787,29 @@ class TestVAELoader(unittest.TestCase):
         with (
             patch.object(wanvae.current_platform, "is_cuda", return_value=False),
             patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=False),
         ):
             out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_uses_channels_last_3d_on_xpu(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
+            patch.object(wanvae.current_platform, "is_xpu", return_value=True),
+        ):
+            out = wanvae.match_conv3d_input_format(x, weight)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 
     @unittest.skipUnless(
         hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"

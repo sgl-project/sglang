@@ -198,6 +198,7 @@ def resolve_current_platform_cls_qualname() -> str:
             "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
             "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
             "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+            "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
             "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",

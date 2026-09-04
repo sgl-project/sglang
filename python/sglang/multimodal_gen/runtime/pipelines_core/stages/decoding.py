@@ -238,9 +238,10 @@ class DecodingStage(PipelineStage):
         latents = server_args.pipeline_config.preprocess_decoding(
             latents, server_args, vae=self.vae
         )
-        if latents.device.type == "mps":
-            torch.mps.synchronize()
-            torch.mps.empty_cache()
+        if latents.device.type in ("mps", "xpu"):
+            device_module = torch.get_device_module(latents.device)
+            device_module.synchronize()
+            device_module.empty_cache()
 
         # Decode latents
         with autocast_context(vae_dtype, server_args.disable_autocast):

@@ -13,8 +13,10 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_scale_residual_norm_scale_shift_triton,
     fuse_scale_shift_kernel,
     fused_inplace_qknorm_rope,
+    fused_scale_residual_norm_scale_shift_triton,
     triton_one_pass_rms_norm,
 )
 from sglang.kernels.ops.layernorm.norm import (
@@ -527,6 +529,20 @@ class FP32LayerNorm(CustomOp, nn.LayerNorm):
         )
         return output.to(origin_dtype)
 
+    def forward_xpu(self, inputs: torch.Tensor) -> torch.Tensor:
+        affine_matches_input = (
+            self.weight is None or self.weight.dtype == inputs.dtype
+        ) and (self.bias is None or self.bias.dtype == inputs.dtype)
+        if not affine_matches_input:
+            return self.forward_native(inputs)
+        return F.layer_norm(
+            inputs,
+            self.normalized_shape,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+
 
 ################################################################################
 # Fused norm kernel
@@ -673,10 +689,37 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    def forward_xpu(self, *args, **kwargs):
-        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
-        # so we fall back to the native PyTorch implementation.
-        return self.forward_native(*args, **kwargs)
+    def forward_xpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.norm_type == "layer":
+            weight = self.norm.weight
+            bias = self.norm.bias
+            if can_use_fused_scale_residual_norm_scale_shift_triton(
+                residual=residual,
+                x=x,
+                gate=gate,
+                shift=shift,
+                scale=scale,
+                weight=weight,
+                bias=bias,
+            ):
+                return fused_scale_residual_norm_scale_shift_triton(
+                    residual=residual,
+                    x=x,
+                    gate=gate,
+                    shift=shift,
+                    scale=scale,
+                    weight=weight,
+                    bias=bias,
+                    eps=self.eps,
+                )
+        return self.forward_native(residual, x, gate, shift, scale)
 
     @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
     def forward_native(
