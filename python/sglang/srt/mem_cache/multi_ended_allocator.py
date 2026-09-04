@@ -1276,8 +1276,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """Release physical token slots reserved by :meth:`alloc_physical`."""
         if free_index is None or free_index.numel() == 0:
             return
-        physical_pages = torch.unique(
-            free_index.detach().to(torch.int64) // self.page_size
+        assert free_index.numel() % self.page_size == 0, (
+            f"MultiEndedAllocator({self.sub_pool_name!r}).free_physical: "
+            f"{free_index.numel()} tokens must contain whole pages of "
+            f"size {self.page_size}"
+        )
+        physical_pages = (
+            free_index.detach().to(torch.int64)[:: self.page_size] // self.page_size
         )
         if self.lazy_compaction:
             num_pages = int(physical_pages.shape[0])
@@ -1291,8 +1296,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             torch.cuda.current_stream().wait_stream(self.forward_stream)
         virtual_pages = self.physical_to_virtual[physical_pages]
         bound_mask = virtual_pages >= 0
-        self.virtual_to_physical[virtual_pages[bound_mask]] = -1
-        self.physical_to_virtual[physical_pages] = -1
+        self.virtual_to_physical.index_fill_(0, virtual_pages[bound_mask], -1)
+        self.physical_to_virtual.index_fill_(0, physical_pages, -1)
         if self.lazy_compaction:
             self._free_phys_pages = torch.cat([self._free_phys_pages, physical_pages])
             self.live_page_count -= int(physical_pages.shape[0])
@@ -4099,12 +4104,12 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         full_pages = torch.unique(full_indices.to(torch.int64) // self.page_size)
         swa = self.swa_attn_allocator
         physical_pages = swa.virtual_to_physical[full_pages].clone()
-        swa.virtual_to_physical[full_pages] = -1
+        swa.virtual_to_physical.index_fill_(0, full_pages, -1)
         live = physical_pages > 0
         physical_pages = physical_pages[live]
         full_pages = full_pages[live]
         still_owned = swa.physical_to_virtual[physical_pages] == full_pages
-        swa.physical_to_virtual[physical_pages[still_owned]] = -1
+        swa.physical_to_virtual.index_fill_(0, physical_pages[still_owned], -1)
 
     # -- free-group --
 
