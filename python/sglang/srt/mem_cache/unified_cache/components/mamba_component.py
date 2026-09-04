@@ -408,10 +408,26 @@ class MambaComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
+        victim = self._thinning_victim(x)
+        if victim is not x:
+            # x stays at the LRU tail so the next step re-evaluates its chain.
+            self._tombstone_device_state(victim, tracker, device_frees, host_frees)
+            return None
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        self._tombstone_device_state(x, tracker, device_frees, host_frees)
+        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
+        return None
+
+    def _tombstone_device_state(
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
         self.tree_core._evict_component_and_detach_lru(
-            x,
+            node,
             self,
             target=EvictLayer.DEVICE,
             tracker=tracker,
@@ -419,10 +435,62 @@ class MambaComponent(TreeComponent):
             host_frees=host_frees,
         )
         self.tree_core._cascade_evict(
-            x, self, tracker, device_frees=device_frees, host_frees=host_frees
+            node, self, tracker, device_frees=device_frees, host_frees=host_frees
         )
-        self._evict_device_cursor = lru.cursor_next() if enabled else x_next
-        return None
+
+    def _thinning_victim(self, x: UnifiedTreeNode) -> UnifiedTreeNode:
+        """Pick which state of the LRU-oldest node's chain to drop.
+
+        The states below x on its single-child chain belong to the same cold
+        path and are the next to age out, so dropping the one whose removal
+        leaves the smallest gap between its neighbours keeps that path's
+        checkpoint coverage spread out; a plain tail eviction strips it
+        shallow-first, which is the inverse of what a branch match needs.
+        Forks, locked, session-referenced and leaf holders are boundaries,
+        never victims. Returns x when there is nothing better to thin.
+        """
+        ct = self.component_type
+        root = self.tree_core.root_node
+        if len(x.children) != 1:
+            return x
+        depth = 0
+        node = x
+        while node is not root:
+            depth += len(node.key)
+            node = node.parent
+        # Nearest state holder above x (else the root) bounds its gap.
+        prev_depth = 0
+        d = depth
+        node = x
+        while node.parent is not root:
+            d -= len(node.key)
+            node = node.parent
+            if node.component_data[ct].value is not None:
+                prev_depth = d
+                break
+        # (depth, node) for every state holder on the chain, x first.
+        holders = [(depth, x)]
+        node = x
+        while len(node.children) == 1:
+            node = next(iter(node.children.values()))
+            depth += len(node.key)
+            if node.component_data[ct].value is not None:
+                holders.append((depth, node))
+        chain_end = depth
+        victim = x
+        best_gap = None
+        for i, (_, node) in enumerate(holders):
+            cd = node.component_data[ct]
+            if node is not x and (
+                len(node.children) != 1 or cd.lock_ref > 0 or cd.session_ref > 0
+            ):
+                continue
+            lo = holders[i - 1][0] if i > 0 else prev_depth
+            hi = holders[i + 1][0] if i + 1 < len(holders) else chain_end
+            if best_gap is None or hi - lo < best_gap:
+                best_gap = hi - lo
+                victim = node
+        return victim
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""

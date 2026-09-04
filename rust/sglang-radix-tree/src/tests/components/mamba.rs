@@ -1227,6 +1227,73 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     tc.evict_device_end(MAMBA);
 }
 
+// One device-eviction round of one slot; returns the freed mamba slots.
+fn evict_one_mamba_slot(tc: &mut UnifiedTreeCore<Vec<i64>>) -> Vec<i64> {
+    tc.evict_device_start(MAMBA, /* request_cnt = */ 1);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    tc.evict_device_end(MAMBA);
+    assert_eq!(next, None);
+    step.device_frees[&MAMBA]
+        .iter()
+        .map(|t| t.int64_value(&[0]))
+        .collect()
+}
+
+#[test]
+fn mamba_device_eviction_thins_a_cold_chain_to_alternate_states() {
+    // Eight single-token holders; the shallowest is the LRU tail. Plain tail
+    // eviction would free 1, 2, 3, 4; thinning keeps the coverage spread.
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let nodes = chain::<8>(&mut tc);
+    for (i, &node) in nodes.iter().enumerate() {
+        set_mamba_device(&mut tc, node, i as i64 + 1);
+    }
+
+    let freed: Vec<Vec<i64>> = (0..4).map(|_| evict_one_mamba_slot(&mut tc)).collect();
+
+    assert_eq!(freed, vec![vec![1], vec![3], vec![5], vec![7]]);
+    let survivors: Vec<usize> = (0..8)
+        .filter(|&i| tc.arena.has_device_value(nodes[i], MAMBA))
+        .collect();
+    assert_eq!(survivors, vec![1, 3, 5, 7]);
+    assert_eq!(tc.mamba_evictable_size(), 4);
+}
+
+#[test]
+fn mamba_device_eviction_victim_minimizes_the_merged_gap() {
+    // Depths 4, 5, 6, 10: removing depth 5 merges a gap of 2, the others 5,
+    // so the LRU tail at depth 4 is spared. A locked depth 5 is a boundary
+    // instead, and the tie between depths 4 and 6 falls back to the tail.
+    for locked in [false, true] {
+        let mut tc = mamba_core(/* page_size = */ 1);
+        let root = tc.arena.root();
+        let mut parent = root;
+        let mut nodes = Vec::new();
+        for (i, key_len) in [4usize, 1, 1, 4].iter().enumerate() {
+            let key: Vec<i64> = vec![i as i64; *key_len];
+            let node = tc
+                .arena
+                .alloc_child(
+                    parent, key, /* priority = */ 0, /* extra_key = */ None,
+                )
+                .unwrap();
+            set_mamba_device(&mut tc, node, i as i64 + 1);
+            nodes.push(node);
+            parent = node;
+        }
+        if locked {
+            tc.arena
+                .node_mut(nodes[1])
+                .set_lock_ref_(ValueSlotIdx::device(MAMBA), 1);
+        }
+
+        let freed = evict_one_mamba_slot(&mut tc);
+
+        assert_eq!(freed, vec![if locked { 1 } else { 2 }], "locked={locked}");
+        assert!(tc.arena.has_device_value(nodes[1], MAMBA) || !locked);
+    }
+}
+
 #[test]
 fn mamba_host_eviction_skips_a_load_back_pinned_node() {
     let mut tc = mamba_core(/* page_size = */ 1);
