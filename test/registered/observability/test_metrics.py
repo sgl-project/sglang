@@ -193,6 +193,8 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:startup_available_gpu_memory_gb",
             "sglang:startup_time_seconds",
             "sglang:startup_cuda_graph_time_seconds",
+            "sglang:scheduler_idle_seconds_total",
+            "sglang:scheduler_process_cpu_seconds_total",
         ]
         mfu_metrics = [
             "sglang:estimated_flops_per_gpu_total",
@@ -229,6 +231,7 @@ class TestEnableMetrics(CustomTestCase):
             ("sglang:realtime_tokens_total", {"mode": "decode"}),
             ("sglang:forward_execution_seconds_total", {"category": "extend"}),
             ("sglang:forward_execution_seconds_total", {"category": "decode"}),
+            ("sglang:scheduler_process_cpu_seconds_total", {}),
             ("sglang:process_cpu_seconds_total", {"component": "tokenizer"}),
             ("sglang:weight_memory_usage_gb", {"model_name": _MODEL_NAME}),
             ("sglang:kv_cache_memory_usage_gb", {"model_name": _MODEL_NAME}),
