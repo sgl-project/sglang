@@ -280,6 +280,23 @@ class ServerArgs:
         # the handlers ran, not how far they got.
         self._resolution_finished = True
 
+    @property
+    def launch_command(self) -> Optional[str]:
+        """How this record was created, verbatim.
+
+        `resolved_dict` answers with what resolution decided; this answers with
+        what the operator asked for, which is a different question and the one
+        "why is this server configured like this?" usually means. The two are
+        not derivable from each other: a field the operator never set reads the
+        same as one they set to the value resolution would have picked anyway.
+
+        The launcher stores the arguments it parsed; the in-process `Engine`
+        stores the call that built the record, since there was no command line.
+        `None` on a record built directly (a fixture, a subprocess copy that
+        predates this, a config being inspected).
+        """
+        return getattr(self, "_launch_command", None)
+
     def resolved_dict(self) -> Dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
 
@@ -317,6 +334,9 @@ class ServerArgs:
         copy's deep structure in-process mutates the parent's too.
         """
         replacement = dataclasses.replace(self, **changes)
+        # Provenance, not resolution state: a copy was still launched by
+        # whatever launched its parent, resolved or not.
+        object.__setattr__(replacement, "_launch_command", self.launch_command)
         if not getattr(self, "_resolution_finished", False):
             # Not resolved yet: the copy goes through the gate itself.
             return replacement
@@ -875,7 +895,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    # Not a field: the record's fields are the configuration, and this is how
+    # the configuration was asked for. It rides along on the record so a
+    # subprocess copy can answer the same question the launcher can.
+    object.__setattr__(server_args, "_launch_command", " ".join(argv))
+    return server_args
 
 
 # --------------------------------------------------------------------------

@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import os
+import pickle
 import shutil
 import socket
 import tempfile
@@ -2932,6 +2933,55 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestLaunchCommand(CustomTestCase):
+    """The record answers what was asked for, not only what was decided.
+
+    `resolved_dict` and `launch_command` are different questions, and neither
+    recovers the other: a field the operator never set resolves to the same
+    value as one they set to what resolution would have picked anyway.
+    """
+
+    def test_the_launcher_records_what_it_parsed(self):
+        server_args = prepare_server_args(
+            ["--model-path", "/tmp/x", "--tp-size", "2", "--log-level", "warning"]
+        )
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --tp-size 2 --log-level warning",
+        )
+
+    def test_a_record_nobody_launched_has_no_command(self):
+        self.assertIsNone(ServerArgs(model_path="/tmp/x").launch_command)
+
+    def test_it_crosses_a_process_boundary(self):
+        """The scheduler and detokenizer get the record by pickle, and they
+        answer `/server_info` for their own process."""
+        server_args = prepare_server_args(["--model-path", "/tmp/x"])
+        self.assertEqual(
+            pickle.loads(pickle.dumps(server_args)).launch_command,
+            server_args.launch_command,
+        )
+
+    def test_a_copy_keeps_it(self):
+        """`replace_resolved` is how the Ray paths rewrite `dist_init_addr`;
+        the copy was launched by whatever launched its parent."""
+        server_args = prepare_server_args(["--model-path", "/tmp/x"])
+        self.assertEqual(
+            server_args.replace_resolved("test").launch_command,
+            server_args.launch_command,
+        )
+
+    def test_it_is_not_a_config_field(self):
+        """It describes how the configuration was asked for, so it is not part
+        of the configuration: no CLI flag, no namespace, not in the bags."""
+        self.assertNotIn(
+            "launch_command", {f.name for f in dataclasses.fields(ServerArgs)}
+        )
+        self.assertNotIn(
+            "launch_command", ServerArgs(model_path="/tmp/x").resolved_dict()
+        )
 
 
 class TestNoneMeansUnset(CustomTestCase):
