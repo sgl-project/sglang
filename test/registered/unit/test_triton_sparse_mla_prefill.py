@@ -74,12 +74,15 @@ class TestTritonSparseMLAAdapter(CustomTestCase):
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.dsa_triton_union = union
 
-        with patch(
-            "sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill.sparse_mla_prefill",
-            _fake_kernel,
-        ), patch(
-            "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
-            lambda: capturing,
+        with (
+            patch(
+                "sglang.kernels.ops.attention.dsa.triton_sparse_mla_prefill.sparse_mla_prefill",
+                _fake_kernel,
+            ),
+            patch(
+                "sglang.srt.model_executor.runner_utils.capture_mode.get_is_capture_mode",
+                lambda: capturing,
+            ),
         ):
             out = backend._forward_triton_sparse_mla(
                 q_all=torch.zeros(4, 8, 576, dtype=torch.bfloat16),
