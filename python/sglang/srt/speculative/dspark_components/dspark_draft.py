@@ -476,7 +476,6 @@ class DraftBlockProposer:
         # The dense DSpark draft still reuses the target batch's graph tier.
         # Set graph eligibility before the DP-MoE-only metadata early return.
         forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         device = self.draft_model_runner.device
         num_tokens = forward_batch.input_ids.numel()
         if self._num_token_non_padded is not None:
