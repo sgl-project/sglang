@@ -110,6 +110,8 @@ def murmur_hash32(seed, positions, col_indices):
     )
     device = seed.device
     if device.type == "cpu":
+        import sgl_kernel  # noqa: F401
+
         return torch.ops.sgl_kernel.murmur_hash32_cpu.default(
             seed, positions, col_indices
         )
