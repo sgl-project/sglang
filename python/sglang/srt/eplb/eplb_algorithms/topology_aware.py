@@ -20,11 +20,14 @@ many tokens each source rank sent to each expert.  This module deliberately
 keeps that distinction explicit by accepting a ``[layers, source_ranks,
 experts]`` tensor.
 
-This first version handles the no-replication case.  It seeds the placement
-with a load-balanced assignment and then applies communication-improving
-pairwise swaps without increasing the baseline's maximum rank load.  The
-implementation is deliberately small and pure PyTorch so it can run during a
-rebalance without an external optimizer.
+This first version handles the no-replication case.  It starts from the
+default node-uniform placement, applies communication-improving pairwise
+swaps, and then spends a tiny bounded communication budget on reducing the
+busiest destination rank.  The swaps never exceed that placement's
+busiest-rank load; keeping the default compute envelope matters because the
+MoE runner's kernel shape and occupancy depend on which experts share a rank.
+The implementation is deliberately small and pure PyTorch so it can run
+during a rebalance without an external optimizer.
 """
 
 from __future__ import annotations
@@ -34,6 +37,17 @@ from typing import Tuple
 import torch
 
 from sglang.srt.eplb.topology import _validate_rank_cost_matrix
+
+
+# A tiny communication budget lets the planner remove a critical-rank hot
+# spot without allowing the topology objective to drift materially.  The
+# default node-uniform fallback below still protects against a net regression.
+_MAX_COMM_REGRESSION_RATIO = 5e-4
+
+# Keep part of the bounded local-search budget for the serving critical path.
+# Without an explicit reservation, the communication phase can consume every
+# swap and leave a hot destination rank untouched.
+_COMMUNICATION_PHASE_FRACTION = 0.5
 
 
 def _validate_inputs(
@@ -115,53 +129,53 @@ def _assignment_to_maps(
     return physical_to_logical, logical_to_physical, expert_count
 
 
-def _load_balanced_seed(total_load: torch.Tensor, num_ranks: int) -> torch.Tensor:
-    """Build the same kind of load-first, equal-capacity seed as EPLB."""
-    num_experts = total_load.numel()
+def _node_uniform_seed(num_experts: int, num_ranks: int) -> torch.Tensor:
+    """Return the default contiguous expert-to-rank assignment."""
     experts_per_rank = num_experts // num_ranks
-    order = sorted(
-        range(num_experts), key=lambda expert: (-float(total_load[expert]), expert)
-    )
-    assignment = torch.empty(num_experts, dtype=torch.int64)
-    rank_load = [0.0] * num_ranks
-    rank_items = [0] * num_ranks
-    for expert in order:
-        eligible = [
-            rank for rank in range(num_ranks) if rank_items[rank] < experts_per_rank
-        ]
-        destination_rank = min(eligible, key=lambda rank: (rank_load[rank], rank))
-        assignment[expert] = destination_rank
-        rank_items[destination_rank] += 1
-        rank_load[destination_rank] += float(total_load[expert])
-    return assignment
+    return torch.arange(num_experts, dtype=torch.int64) // experts_per_rank
 
 
-def _improve_topology(
+def _rank_loads(
+    assignment: torch.Tensor, total_load: torch.Tensor, num_ranks: int
+) -> torch.Tensor:
+    """Sum logical-expert traffic for each destination rank."""
+    loads = torch.zeros(num_ranks, dtype=torch.float64)
+    loads.scatter_add_(0, assignment, total_load.to(torch.float64))
+    return loads
+
+
+def _build_swap_state(
     assignment: torch.Tensor,
     total_load: torch.Tensor,
     communication_cost: torch.Tensor,
     num_ranks: int,
-) -> torch.Tensor:
-    """Apply deterministic improving swaps within the seed's load envelope."""
-    rank_load = [0.0] * num_ranks
-    for expert, rank in enumerate(assignment.tolist()):
-        rank_load[rank] += float(total_load[expert])
-    rank_load = torch.tensor(rank_load, dtype=torch.float64)
-    max_seed_load = rank_load.max().item()
-
+    rank_load: torch.Tensor,
+    max_seed_load: float,
+    expert_ids: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Build the pairwise swap tensors for the current assignment."""
     num_experts = assignment.numel()
-    expert_ids = torch.arange(num_experts, dtype=torch.int64)
     first_rank = assignment[:, None].expand(num_experts, num_experts)
     second_rank = assignment[None, :].expand(num_experts, num_experts)
     pair_mask = torch.triu(
-        torch.ones((num_experts, num_experts), dtype=torch.bool), diagonal=1
+        torch.ones(
+            (num_experts, num_experts),
+            dtype=torch.bool,
+            device=assignment.device,
+        ),
+        diagonal=1,
     )
     pair_mask &= first_rank != second_rank
 
-    # The rank loads of all non-swapped ranks are already within the seed's
-    # envelope.  Therefore a proposed swap is feasible exactly when its two
-    # changed ranks stay below that envelope; this avoids an O(num_ranks)
-    # max-reduction for every pair.
+    # A swap only changes the loads of the two ranks that own its experts.
+    # Every other rank is already within the seed envelope.
     new_first_load = (
         rank_load[first_rank]
         - total_load[:, None]
@@ -183,55 +197,239 @@ def _improve_topology(
         - communication_cost[first_ids, first_rank]
         - communication_cost[second_ids, second_rank]
     )
+    return (
+        first_rank,
+        second_rank,
+        pair_mask,
+        new_first_load,
+        new_second_load,
+        delta,
+    )
 
-    # Rebalancing runs in the serving process.  A bounded number of swaps keeps
-    # the planner predictable for large expert counts while still allowing a
-    # full pass over the ranks on the usual 8-way EP setup.
-    for _ in range(max(1, num_ranks)):
+
+def _apply_swap(
+    assignment: torch.Tensor,
+    rank_load: torch.Tensor,
+    new_first_load: torch.Tensor,
+    new_second_load: torch.Tensor,
+    first: int,
+    second: int,
+) -> None:
+    """Apply one expert swap and update the two affected rank loads."""
+    first_rank = int(assignment[first])
+    second_rank = int(assignment[second])
+    assignment[first] = second_rank
+    assignment[second] = first_rank
+    rank_load[first_rank] = new_first_load[first, second]
+    rank_load[second_rank] = new_second_load[first, second]
+
+
+def _run_communication_swaps(
+    assignment: torch.Tensor,
+    total_load: torch.Tensor,
+    communication_cost: torch.Tensor,
+    num_ranks: int,
+    rank_load: torch.Tensor,
+    max_seed_load: float,
+    expert_ids: torch.Tensor,
+    max_swaps: int,
+) -> int:
+    """Apply the bounded phase that strictly reduces communication cost."""
+    used_swaps = 0
+    for _ in range(max_swaps):
+        (
+            _first_rank,
+            _second_rank,
+            pair_mask,
+            new_first_load,
+            new_second_load,
+            delta,
+        ) = _build_swap_state(
+            assignment,
+            total_load,
+            communication_cost,
+            num_ranks,
+            rank_load,
+            max_seed_load,
+            expert_ids,
+        )
         feasible_delta = delta.masked_fill(~pair_mask, float("inf"))
         feasible_delta = feasible_delta.masked_fill(
             feasible_delta >= -1e-12, float("inf")
         )
         best_flat = int(feasible_delta.argmin())
         if not torch.isfinite(feasible_delta.flatten()[best_flat]):
-            return assignment
+            break
 
-        first = best_flat // num_experts
-        second = best_flat % num_experts
-        first_rank_id = int(assignment[first])
-        second_rank_id = int(assignment[second])
-        assignment[first] = second_rank_id
-        assignment[second] = first_rank_id
-        rank_load[first_rank_id] = new_first_load[first, second]
-        rank_load[second_rank_id] = new_second_load[first, second]
+        first = best_flat // assignment.numel()
+        second = best_flat % assignment.numel()
+        _apply_swap(
+            assignment,
+            rank_load,
+            new_first_load,
+            new_second_load,
+            first,
+            second,
+        )
+        used_swaps += 1
+    return used_swaps
 
-        # Keep the pair tensors synchronized with the changed assignment for
-        # the next bounded iteration.
-        first_rank = assignment[:, None].expand(num_experts, num_experts)
-        second_rank = assignment[None, :].expand(num_experts, num_experts)
-        new_first_load = (
-            rank_load[first_rank]
-            - total_load[:, None]
-            + total_load[None, :]
+
+def _run_load_swaps(
+    assignment: torch.Tensor,
+    total_load: torch.Tensor,
+    communication_cost: torch.Tensor,
+    num_ranks: int,
+    rank_load: torch.Tensor,
+    max_seed_load: float,
+    expert_ids: torch.Tensor,
+    max_swaps: int,
+    used_swaps: int,
+    max_comm_regression_ratio: float,
+) -> None:
+    """Spend the explicit communication budget on critical-rank balancing."""
+    if max_comm_regression_ratio == 0.0 or used_swaps >= max_swaps:
+        return
+
+    communication_limit = (
+        communication_cost[expert_ids, assignment].sum().item()
+        * (1.0 + max_comm_regression_ratio)
+    )
+    rank_ids = torch.arange(
+        num_ranks, dtype=torch.int64, device=assignment.device
+    )[None, None, :]
+    for _ in range(max_swaps - used_swaps):
+        (
+            first_rank,
+            second_rank,
+            pair_mask,
+            new_first_load,
+            new_second_load,
+            delta_comm,
+        ) = _build_swap_state(
+            assignment,
+            total_load,
+            communication_cost,
+            num_ranks,
+            rank_load,
+            max_seed_load,
+            expert_ids,
         )
-        new_second_load = (
-            rank_load[second_rank]
-            - total_load[None, :]
-            + total_load[:, None]
-        )
-        pair_mask = torch.triu(
-            torch.ones((num_experts, num_experts), dtype=torch.bool), diagonal=1
-        )
-        pair_mask &= first_rank != second_rank
-        pair_mask &= new_first_load <= max_seed_load + 1e-12
-        pair_mask &= new_second_load <= max_seed_load + 1e-12
-        delta = (
-            communication_cost[first_ids, second_rank]
-            + communication_cost[second_ids, first_rank]
-            - communication_cost[first_ids, first_rank]
-            - communication_cost[second_ids, second_rank]
+        pair_mask &= (
+            communication_cost[expert_ids, assignment].sum()
+            + delta_comm
+            <= communication_limit + 1e-12
         )
 
+        changed_rank = (rank_ids == first_rank[:, :, None]) | (
+            rank_ids == second_rank[:, :, None]
+        )
+        other_max = rank_load[None, None, :].masked_fill(
+            changed_rank, float("-inf")
+        ).amax(dim=-1)
+        new_max = torch.maximum(
+            torch.maximum(new_first_load, new_second_load), other_max
+        )
+        old_max = rank_load.max()
+        old_sumsq = rank_load.square().sum()
+        new_sumsq = (
+            old_sumsq
+            - rank_load[first_rank].square()
+            - rank_load[second_rank].square()
+            + new_first_load.square()
+            + new_second_load.square()
+        )
+        max_improving = new_max < old_max - 1e-12
+        max_tied = (new_max - old_max).abs() <= 1e-12
+        pair_mask &= max_improving | (
+            max_tied & (new_sumsq < old_sumsq - 1e-12)
+        )
+
+        feasible_max = new_max.masked_fill(~pair_mask, float("inf"))
+        best_max = feasible_max.min()
+        if not torch.isfinite(best_max):
+            break
+        tied_mask = pair_mask & ((new_max - best_max).abs() <= 1e-12)
+        feasible_sumsq = new_sumsq.masked_fill(~tied_mask, float("inf"))
+        best_flat = int(feasible_sumsq.argmin())
+
+        first = best_flat // assignment.numel()
+        second = best_flat % assignment.numel()
+        _apply_swap(
+            assignment,
+            rank_load,
+            new_first_load,
+            new_second_load,
+            first,
+            second,
+        )
+
+
+def _improve_topology(
+    assignment: torch.Tensor,
+    total_load: torch.Tensor,
+    communication_cost: torch.Tensor,
+    num_ranks: int,
+    max_allowed_load: float | None = None,
+    max_swaps: int | None = None,
+    max_comm_regression_ratio: float = 0.0,
+) -> torch.Tensor:
+    """Apply deterministic swaps within a rank-load envelope.
+
+    The first phase only accepts communication-improving swaps.  An optional
+    small communication budget can then be spent on swaps that lower the
+    busiest destination rank.  The latter models the serving critical path:
+    one overloaded rank can hold up the whole expert-parallel step even when
+    the aggregate communication score is marginally better.
+    """
+    if max_comm_regression_ratio < 0:
+        raise ValueError("max_comm_regression_ratio must be non-negative")
+    rank_load = _rank_loads(assignment, total_load, num_ranks)
+    max_seed_load = (
+        rank_load.max().item()
+        if max_allowed_load is None
+        else float(max_allowed_load)
+    )
+    num_experts = assignment.numel()
+    expert_ids = torch.arange(
+        num_experts, dtype=torch.int64, device=assignment.device
+    )
+    if max_swaps is None:
+        # Five rounds per local expert slot reach the useful local-search basin
+        # on the observed 8-way EP workloads without a long scheduler pause.
+        max_swaps = max(1, 5 * (num_experts // num_ranks))
+
+    communication_swaps = max_swaps
+    if max_comm_regression_ratio > 0.0:
+        # Reserve the remaining rounds for the critical-rank load phase.  A
+        # communication-only search can otherwise consume the entire budget,
+        # leaving no opportunity to fix a straggling destination rank.
+        communication_swaps = max(
+            1, int(max_swaps * _COMMUNICATION_PHASE_FRACTION)
+        )
+
+    used_swaps = _run_communication_swaps(
+        assignment,
+        total_load,
+        communication_cost,
+        num_ranks,
+        rank_load,
+        max_seed_load,
+        expert_ids,
+        communication_swaps,
+    )
+    _run_load_swaps(
+        assignment,
+        total_load,
+        communication_cost,
+        num_ranks,
+        rank_load,
+        max_seed_load,
+        expert_ids,
+        max_swaps,
+        used_swaps,
+        max_comm_regression_ratio,
+    )
     return assignment
 
 
@@ -247,10 +445,12 @@ def rebalance_experts_topology_aware(
     ``tokens_per_source_expert[layer, source, expert]`` is the number of
     routed tokens originating at ``source`` for ``expert``.  Each logical
     expert is assigned to exactly one destination rank, and every rank gets
-    the same number of experts.  A load-balanced seed is improved with
-    communication-reducing swaps that keep the seed's maximum rank load as an
-    upper bound.  Ties are resolved by expert and rank id, making the result
-    deterministic.
+    the same number of experts.  The default node-uniform layout is improved
+    with communication-reducing swaps followed by a tiny, bounded
+    load-balancing phase.  The maximum rank load never exceeds the default
+    layout's busiest rank, and the default layout is used as a
+    communication-cost fallback.  Ties are resolved by expert and rank id,
+    making the result deterministic.
 
     The return value follows ``rebalance_experts``: physical-to-logical map,
     logical-to-physical map, and the per-expert replica count.
@@ -269,13 +469,36 @@ def rebalance_experts_topology_aware(
     assignment = torch.empty(
         (num_layers, num_logical_experts), dtype=torch.int64, device="cpu"
     )
+    node_uniform_assignment = _node_uniform_seed(
+        num_logical_experts, num_ranks
+    )
+    expert_ids = torch.arange(num_logical_experts, dtype=torch.int64)
     for layer in range(num_layers):
         total_load = counts[layer].sum(dim=0)
         communication_cost = counts[layer].transpose(0, 1).matmul(costs)
-        assignment[layer] = _load_balanced_seed(total_load, num_ranks)
-        assignment[layer] = _improve_topology(
-            assignment[layer], total_load, communication_cost, num_ranks
+        node_uniform_load = _rank_loads(
+            node_uniform_assignment, total_load, num_ranks
         )
+        max_allowed_load = node_uniform_load.max().item()
+        assignment[layer] = _improve_topology(
+            node_uniform_assignment.clone(),
+            total_load,
+            communication_cost,
+            num_ranks,
+            max_allowed_load=max_allowed_load,
+            max_comm_regression_ratio=_MAX_COMM_REGRESSION_RATIO,
+        )
+        # A bounded local search can stop before finding a good swap sequence.
+        # The node-uniform layout is always a valid fallback, so never return a
+        # topology placement with a higher communication objective.
+        candidate_cost = communication_cost[
+            expert_ids, assignment[layer]
+        ].sum()
+        node_uniform_cost = communication_cost[
+            expert_ids, node_uniform_assignment
+        ].sum()
+        if candidate_cost > node_uniform_cost:
+            assignment[layer] = node_uniform_assignment
 
     return _assignment_to_maps(assignment, num_ranks)
 
