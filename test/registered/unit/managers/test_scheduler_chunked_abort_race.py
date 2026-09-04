@@ -33,11 +33,11 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
     sched.waiting_queue = []
-    sched.mm_receiver = None
     sched.dllm_config = None
     sched.grammar_manager = Mock()
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
+    sched.mm_receiver = None
     sched.ps = SimpleNamespace(pp_size=1)
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
