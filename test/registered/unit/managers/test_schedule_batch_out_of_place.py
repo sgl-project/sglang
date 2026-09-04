@@ -11,8 +11,12 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
+from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    ScheduleBatch,
+    split_cached_prefix_by_tier,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -20,8 +24,69 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
 
 
+class TestCachedPrefixTierAttribution(unittest.TestCase):
+    def test_split_cached_prefix_by_tier(self):
+        cases = [
+            (
+                {"prefix_len": 100, "host_hit_len": 70, "storage_hit_len": 20},
+                (30, 50, 20),
+            ),
+            (
+                {
+                    "prefix_len": 80,
+                    "host_hit_len": 50,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (30, 50, 0),
+            ),
+            (
+                {
+                    "prefix_len": 90,
+                    "host_hit_len": 60,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (30, 50, 10),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 70,
+                    "storage_hit_len": 70,
+                    "host_hit_is_storage": True,
+                },
+                (30, 0, 70),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 0,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                },
+                (80, 0, 20),
+            ),
+            (
+                {
+                    "prefix_len": 100,
+                    "host_hit_len": 0,
+                    "storage_hit_len": 20,
+                    "storage_hit_start": 80,
+                    "host_hit_is_storage": True,
+                },
+                (80, 0, 20),
+            ),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(**kwargs):
+                self.assertEqual(split_cached_prefix_by_tier(**kwargs), expected)
+
+
 def make_schedule_batch(bs: int, **overrides) -> ScheduleBatch:
     batch = ScheduleBatch(reqs=overrides.pop("reqs"))
+    # init_new always sets a SpeculativeAlgorithm enum, never None.
+    batch.spec_algorithm = SpeculativeAlgorithm.NONE
     for field in dataclasses.fields(ScheduleBatch):
         name = field.name
         if name in overrides or name in AUTO_FILL_EXCLUDED_FIELDS:
@@ -69,6 +134,10 @@ class _FakeReq:
 
     def _refresh_fill_ids(self):
         self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
 
     def set_extend_range(self, start, end):
         self.extend_range = Range(start, end)
@@ -138,6 +207,8 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
             return_logprob=False,
             forward_mode=ForwardMode.DECODE,
             out_cache_loc=torch.arange(6, 7, dtype=torch.int64),
+            # prepare_for_decode ran: the row already counts this step's token.
+            seq_lens_cpu=torch.tensor([6], dtype=torch.int64),
         )
 
         extend_prefix_before = extend_batch.prefix_lens
@@ -153,7 +224,7 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertTrue(
             torch.equal(extend_batch.out_cache_loc, torch.arange(7, dtype=torch.int64))
         )
-        # delta is -1 without overlap: 4 origin + 2 output - 1
+        # The decode tail's prefix is its row length minus this step's token.
         self.assertEqual(extend_batch.prefix_lens, [0, 0, 5])
         self.assertEqual(extend_batch.extend_lens, [3, 3, 1])
         self.assertEqual(extend_batch.extend_num_tokens, 7)

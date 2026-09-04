@@ -1,9 +1,14 @@
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import modelscope
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
 from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     _check_index_files_for_missing_shards,
@@ -12,6 +17,35 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
 )
 from sglang.srt.environ import envs
+
+
+def test_component_override_resolves_hub_subfolder_before_loading(tmp_path):
+    repo_root = tmp_path / "FLUX.1-dev-bnb-4bit"
+    component_root = repo_root / "text_encoder_2"
+    component_root.mkdir(parents=True)
+    pipeline = SimpleNamespace(model_path="/base")
+    server_args = SimpleNamespace(
+        component_paths={
+            "text_encoder_2": "diffusers/FLUX.1-dev-bnb-4bit/text_encoder_2"
+        }
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.utils.hf_diffusers_utils.maybe_download_model",
+        return_value=str(repo_root),
+    ) as download:
+        component_path = ComposedPipelineBase._resolve_component_path(
+            pipeline,
+            server_args,
+            "text_encoder_2",
+            "text_encoder_2",
+        )
+
+    assert component_path == str(component_root)
+    download.assert_called_once_with(
+        "diffusers/FLUX.1-dev-bnb-4bit",
+        allow_patterns=["text_encoder_2/**", "text_encoder_2/*"],
+    )
 
 
 def _write_model_index(root):
@@ -261,6 +295,46 @@ def test_metadata_only_cached_lora_snapshot_is_a_usable_hit(
     calls = recording_snapshot_download(tmp_path)
 
     assert maybe_download_model("org/repo", is_lora=True) == str(tmp_path)
+    assert calls == ["probe"]
+
+
+def test_cached_lora_snapshot_downloads_missing_selected_weight(monkeypatch, tmp_path):
+    calls = []
+    selected_file = "loras/adapter.safetensors"
+
+    def fake_snapshot_download(**kwargs):
+        calls.append("probe" if kwargs.get("local_files_only") else "download")
+        if not kwargs.get("local_files_only"):
+            target = tmp_path / selected_file
+            target.parent.mkdir()
+            target.write_bytes(b"weights")
+        return str(tmp_path)
+
+    monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", fake_snapshot_download)
+
+    result = maybe_download_model(
+        "org/repo",
+        is_lora=True,
+        allow_patterns=["*.json", selected_file],
+    )
+
+    assert result == str(tmp_path)
+    assert calls == ["probe", "download"]
+
+
+def test_cached_lora_snapshot_reports_missing_selected_weight_offline(
+    recording_snapshot_download, tmp_path
+):
+    calls = recording_snapshot_download(tmp_path)
+
+    with pytest.raises(ValueError, match="loras/adapter.safetensors"):
+        maybe_download_model(
+            "org/repo",
+            download=False,
+            is_lora=True,
+            allow_patterns=["*.json", "loras/adapter.safetensors"],
+        )
+
     assert calls == ["probe"]
 
 

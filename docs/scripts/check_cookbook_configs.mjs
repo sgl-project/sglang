@@ -27,6 +27,9 @@ import { fileURLToPath } from "node:url";
 const SNIPPETS = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "snippets");
 const CONFIGS = join(SNIPPETS, "configs");
 const DIFFUSION_COOKBOOK = join(SNIPPETS, "..", "..", "cookbook", "diffusion");
+const COOKBOOK_MODEL_TEMPLATE = join(
+  SNIPPETS, "..", "..", "..", ".claude", "skills", "cookbook-add-model",
+  "templates", "config.jsx.tmpl");
 const LEGACY_DIMS = ["variants", "quantizations", "strategies", "nodesOptions"];
 
 const failures = [];
@@ -69,6 +72,19 @@ if (a && b && a !== b) {
 const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8");
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
+}
+
+const cookbookModelTemplate = readFileSync(COOKBOOK_MODEL_TEMPLATE, "utf8");
+for (const oldName of [
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS",
+  "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND",
+]) {
+  if (cookbookModelTemplate.includes(oldName)) {
+    fail("config.jsx.tmpl", `still emits removed W4A4 setting ${oldName}`);
+  }
+}
+if (!cookbookModelTemplate.includes("--enable-w4a4-mxfp4-megamoe")) {
+  fail("config.jsx.tmpl", "W4A4 MegaMoE option is missing the server flag");
 }
 
 // --------------------------------------------------------------- 3/4. Configs
@@ -256,7 +272,16 @@ for (const path of walk(CONFIGS)) {
       if (!Array.isArray(errors) || errors.length) {
         fail(where, `verifiedRecipes[${index}] fails topology validation: ${(errors || []).join("; ")}`);
       }
-      validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      // A recipe may carry `unverified: true`: it supplies the card's default
+      // shape without claiming a verification run, and must resolve that way.
+      if (recipe.unverified) {
+        const resolved = validateResolved(selection, `verifiedRecipes[${index}]`);
+        if (resolved && resolved.builder.verification?.serve === "verified") {
+          fail(where, `verifiedRecipes[${index}] is declared unverified but resolves as verified`);
+        }
+      } else {
+        validateResolved(selection, `verifiedRecipes[${index}]`, true);
+      }
     }
 
     // H3's architectural contract is important enough to pin directly: exact

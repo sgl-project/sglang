@@ -1,13 +1,16 @@
-"""Unit tests for fused shared-expert weight scaling on per-rank shared slots.
+"""Unit tests for fused shared-expert weight scaling.
 
-These tests pin the contract of ``remap_topk_for_per_rank_shared_slots`` for
-the fused shared expert's topk weight on the two paths this fix covers:
+These tests pin the fused shared expert's topk weight contract on three paths:
 
-  * aiter (HIP) path: routed_scaling_factor is folded into the routed weights and
-    the post-MoE multiply is skipped, so the shared weight must be 1.0
-    for a net 1.0x contribution.
-  * post-MoE scaling path (default): the whole MoE output is multiplied by
-    routed_scaling_factor afterward, so the shared weight must be 1/rsf.
+  * aiter (HIP) per-rank-slot path: routed_scaling_factor is folded into the
+    routed weights and the post-MoE multiply is skipped, so the shared weight
+    must be 1.0 for a net 1.0x contribution.
+  * post-MoE scaling per-rank-slot path (default): the whole MoE output is
+    multiplied by routed_scaling_factor afterward, so the shared weight must
+    be 1/rsf.
+  * standard EP path (no per-rank slots): every rank computes the fused shared
+    expert and the outputs are all-reduced, so the model-supplied 1/ep_size
+    factor must be applied to the shared weight.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -79,6 +82,49 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         # the shared weight must be 1/rsf to net out to 1.0.
         shared_weight = self._run_remap(use_aiter=False)
         self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
+
+    def _run_post_process_standard_path(self, *, scaling_factor):
+        topk_ids = torch.tensor([[5, 40, 100, 256]], dtype=torch.int32)
+        topk_weights = torch.tensor([[1.0, 0.5, 0.25, 1.0]], dtype=torch.float32)
+        topk_config = TopKConfig(
+            top_k=4,
+            num_fused_shared_experts=1,
+            fused_shared_experts_scaling_factor=scaling_factor,
+            allow_routed_experts_capture=False,
+        )
+        router_logits = torch.zeros((1, 256), dtype=torch.float32)
+        with (
+            patch.object(topk_module, "_is_cuda", False),
+            patch.object(topk_module, "_is_hip", False),
+            patch.object(topk_module, "_use_aiter", False),
+            patch.object(
+                topk_module, "has_per_rank_fused_shared_slots", return_value=False
+            ),
+        ):
+            _out_ids, out_weights, _recorder_ids = topk_module._post_process_topk_ids(
+                topk_ids.clone(),
+                topk_weights.clone(),
+                topk_config,
+                router_logits,
+                layer_id=0,
+            )
+        self.assertTrue(torch.equal(out_weights[0, :-1], topk_weights[0, :-1]))
+        return out_weights[0, -1].item()
+
+    def test_standard_ep_path_applies_shared_scaling_factor(self):
+        # Regression: models pass 1/ep_size under standard EP (every rank
+        # computes the fused shared expert and outputs are all-reduced), but
+        # the standard CUDA post-process dropped the factor, so the shared
+        # contribution was summed ep_size times (corrupt EP4 output on
+        # BailingMoeV3, BF16 and FP8 alike).
+        shared_weight = self._run_post_process_standard_path(scaling_factor=0.25)
+        self.assertAlmostEqual(shared_weight, 0.25)
+
+    def test_standard_path_without_factor_keeps_shared_weight(self):
+        # TP mode passes no factor; the shared weight must pass through
+        # unscaled (guards the predicate against degrading to always-scale).
+        shared_weight = self._run_post_process_standard_path(scaling_factor=None)
+        self.assertAlmostEqual(shared_weight, 1.0)
 
     def test_shared_expert_ids_route_to_home_rank(self):
         # Sanity: the shared slot id is placed at this rank's interleaved

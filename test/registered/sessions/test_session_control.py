@@ -293,9 +293,9 @@ class TestSessionControl(CustomTestCase):
         print(logprobs_from_session)
         print("logprobs from normal queries:")
         print(logprobs_normal)
-        assert len(logprobs_from_session) == len(
-            logprobs_normal
-        ), "logprobs must have equal length"
+        assert len(logprobs_from_session) == len(logprobs_normal), (
+            "logprobs must have equal length"
+        )
         for a, b in zip(logprobs_from_session, logprobs_normal):
             assert abs(a - b) <= 0.15, f"logprobs {a} and {b} differ by more than 0.15"
 
@@ -426,9 +426,9 @@ class TestSessionControl(CustomTestCase):
             output_no_session = response["text"]
             print("second request output without session:")
             print(output_no_session)
-            assert (
-                second_output == output_no_session
-            ), f"second_output: {second_output}, output_no_session: {output_no_session}"
+            assert second_output == output_no_session, (
+                f"second_output: {second_output}, output_no_session: {output_no_session}"
+            )
 
     @unittest.skip("broken")
     def test_session_control_backtrack_with_abort(self):
@@ -547,9 +547,9 @@ class TestSessionControl(CustomTestCase):
         print(outputs_from_session)
         print("====== outputs from normal queries: =======")
         print(outputs_normal)
-        assert (
-            outputs_from_session == outputs_normal
-        ), f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        assert outputs_from_session == outputs_normal, (
+            f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        )
 
     @unittest.skipIf(
         is_hip(),
@@ -781,9 +781,9 @@ class TestSessionControlVision(CustomTestCase):
         print(outputs_from_session)
         print("outputs from normal queries:")
         print(outputs_normal)
-        assert (
-            outputs_from_session == outputs_normal
-        ), f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        assert outputs_from_session == outputs_normal, (
+            f"outputs_from_session: {outputs_from_session}, outputs_normal: {outputs_normal}"
+        )
 
 
 if __name__ == "__main__":

@@ -6,8 +6,9 @@ from humming.layer import HummingInputSchema, HummingMethod
 from humming.schema import BaseWeightSchema
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.runtime_context import get_exec
 
 
 def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
@@ -35,44 +36,48 @@ def humming_is_layer_skipped(config: dict[str, Any], prefix: str):
     return False
 
 
-def prepare_humming_layer(layer: LinearBase, quant_config: dict):
-    weight_schema = BaseWeightSchema.from_config(quant_config)
-    input_schema = HummingInputSchema()
+def _set_humming_dispatcher_output_dtype(
+    layer: torch.nn.Module, output_dtype: str
+) -> None:
+    dispatcher = getattr(layer, "dispatcher", None)
+    if dispatcher is None:
+        return
 
-    shape_k_stacks = [layer.input_size_per_partition]
-    shape_n_stacks = layer.output_partition_sizes
+    quant_config = dict(getattr(dispatcher, "quant_config", None) or {})
+    quant_config["dispatcher_output_dtype"] = output_dtype
+    dispatcher.set_quant_config(quant_config)
 
-    # Step 1: convert weight to humming standard format
-    weight_schema, tensors = weight_schema.convert_humming(
-        tensors=layer.named_parameters(),
-        shape_n_stacks=shape_n_stacks,
-        shape_k_stacks=shape_k_stacks,
-        param_dtype=layer.params_dtype,
-    )
 
-    layer.weight_schema = weight_schema
+def configure_humming_deepep_dispatch(layer: torch.nn.Module) -> bool:
+    if not get_moe_a2a_backend().is_deepep():
+        layer._humming_uses_deepep_fp8_dispatch = False
+        _set_humming_dispatcher_output_dtype(layer, "bf16")
+        return False
 
-    for name, _ in list(layer.named_parameters()):
-        delattr(layer, name)
+    output_dtype = get_exec().moe.deepep_dispatcher_output_dtype
+    if output_dtype == "auto":
+        output_dtype = "bf16" if envs.SGLANG_DEEPEP_BF16_DISPATCH.get() else "fp8"
+    if output_dtype not in ("bf16", "fp8"):
+        raise ValueError(
+            f"Humming does not support DeepEP {output_dtype} dispatch; "
+            "use --deepep-dispatcher-output-dtype=bf16 or fp8."
+        )
 
-    for name, tensor in tensors.items():
-        param = torch.nn.Parameter(tensor, requires_grad=False)
-        setattr(layer, name, param)
+    _set_humming_dispatcher_output_dtype(layer, output_dtype)
+    use_fp8 = output_dtype == "fp8"
+    layer._humming_uses_deepep_fp8_dispatch = use_fp8
+    return use_fp8
 
-    # Step 2: transform weight (humming standard format) for forwarding
-    HummingMethod.prepare_layer_meta(
-        layer=layer,
-        shape_n=layer.output_partition_sizes_sum,
-        shape_k=layer.input_size_per_partition,
-        weight_schema=weight_schema,
-        input_schema=input_schema,
-        pad_n_to_multiple=256,
-        pad_k_to_multiple=128,
-        has_bias=layer.has_bias,
-        torch_dtype=layer.param_dtype,
-    )
 
-    HummingMethod.transform_humming_layer(layer)
+def make_humming_deepep_input_schema(
+    sublayer_name: str, shape_k: int
+) -> HummingInputSchema:
+    if shape_k % 128 != 0:
+        raise ValueError(
+            f"Humming FP8 dispatch requires {sublayer_name} K={shape_k} "
+            "to be divisible by 128."
+        )
+    return HummingInputSchema(a_dtype="float8e4m3", input_scale_group_size=128)
 
 
 def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
@@ -83,6 +88,8 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
     else:
         # TODO: read input_quant_config from quant_config
         input_schema = HummingInputSchema.from_config(input_quant_config)
+
+    use_deepep_fp8_dispatch = configure_humming_deepep_dispatch(layer)
 
     shape_config = {
         "w13": (
@@ -121,7 +128,10 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
         )
 
         layer.weight_schemas[sublayer_name] = weight_schema_new
-        layer.input_schemas[sublayer_name] = input_schema
+        sub_input_schema = input_schema
+        if use_deepep_fp8_dispatch:
+            sub_input_schema = make_humming_deepep_input_schema(sublayer_name, shape_k)
+        layer.input_schemas[sublayer_name] = sub_input_schema
 
         for name, _ in list(layer.named_parameters()):
             if not name.startswith(sublayer_name + "_"):
@@ -140,7 +150,7 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
             shape_k=shape_k,
             pad_n_to_multiple=256,
             pad_k_to_multiple=128,
-            input_schema=input_schema,
+            input_schema=sub_input_schema,
             weight_schema=weight_schema_new,
             has_bias=layer.with_bias,
             num_experts=layer.num_local_experts,

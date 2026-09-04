@@ -9,6 +9,9 @@ of the combined tensor pins the whole concatenated buffer).
 CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
 
+import logging
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -183,6 +186,103 @@ def test_tensor_cache_entries_share_storage():
         assert (
             emb.untyped_storage().nbytes() == total_tokens * HIDDEN * emb.element_size()
         )
+
+
+def test_by_item_mismatched_cache_entry_is_reencoded():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    first_item = items[0]
+    mm_schedule.embedding_cache.set(
+        first_item.hash,
+        mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
+    )
+    encoder = Mock(side_effect=_encoder_list)
+
+    chunk = mm_schedule._get_chunked_embedding_by_item(
+        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, _CPU
+    )
+
+    assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
+    encoder.assert_called_once()
+    assert mm_schedule.embedding_cache.get_single(first_item.hash).embedding.shape[
+        0
+    ] == _num_tokens(first_item)
+
+
+def test_batched_mismatched_cache_entry_is_reencoded():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    first_item = items[0]
+    mm_schedule.embedding_cache.set(
+        first_item.hash,
+        mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
+    )
+    request = mm_schedule.PerImageRequestInfo(
+        req_idx=0,
+        items=items,
+        items_offset=ITEM_OFFSETS,
+        extend_prefix_len=0,
+        extend_seq_len=TOTAL_LEN,
+    )
+    encoder = Mock(side_effect=_encoder_list)
+
+    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, [request], _CPU)
+
+    assert embeddings[(first_item.hash, _num_tokens(first_item))].shape == (
+        _num_tokens(first_item),
+        HIDDEN,
+    )
+    encoder.assert_called_once()
+
+
+def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    # Simulate the compact-hash collision that motivated the cache guard.
+    items[1].hash = items[0].hash
+    requests = [
+        mm_schedule.PerImageRequestInfo(
+            req_idx=0,
+            items=items[:2],
+            items_offset=ITEM_OFFSETS[:2],
+            extend_prefix_len=0,
+            extend_seq_len=TOTAL_LEN,
+        )
+    ]
+    encoder = Mock(side_effect=_encoder_list)
+
+    embeddings = mm_schedule._batch_encode_per_image_misses(encoder, requests, _CPU)
+
+    first_key = (items[0].hash, _num_tokens(items[0]))
+    second_key = (items[1].hash, _num_tokens(items[1]))
+    assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
+    assert embeddings[second_key].shape == (_num_tokens(items[1]), HIDDEN)
+    encoder.assert_called_once()
+
+
+def test_full_mismatched_cache_entry_is_reencoded(caplog):
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    combined_hash = mm_schedule.MultiModalStaticCache.combine_hashes(
+        [item.hash for item in items]
+    )
+    mm_schedule.embedding_cache.set(
+        combined_hash,
+        mm_schedule.EmbeddingResult(embedding=torch.zeros(1, HIDDEN)),
+    )
+    input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
+    encoder = Mock(side_effect=_encoder_tensor)
+
+    with caplog.at_level(logging.WARNING, logger=mm_schedule.logger.name):
+        chunk, _ = mm_schedule._get_chunked_embedding_full(
+            encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+        )
+
+    assert chunk.shape == (sum(_num_tokens(item) for item in items), HIDDEN)
+    encoder.assert_called_once()
+    assert "Discarding cached multimodal embedding" in caplog.text
+    assert "expected_tokens=15" in caplog.text
+    assert "cached_tokens=1" in caplog.text
 
 
 if __name__ == "__main__":

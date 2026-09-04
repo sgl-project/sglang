@@ -24,7 +24,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -42,7 +45,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
-    native_only_components = (
+    native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
         "video_vae",
@@ -85,6 +88,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
             speed_mode_enable_torch_compile_by_default=False,
+            # 61.73 GB of DiT weights. Every card that is not part of a
+            # 4xH200 set has to stream them, so the DiT has to be eligible for
+            # automatic layerwise offload -- the default here is an empty tuple,
+            # which makes the gate in _should_auto_enable_dit_layerwise_offload
+            # always false and leaves the DiT resident until it fails to load.
+            dit_layerwise_offload_modes=("auto", "memory"),
             keep_resident_min_available_gb=120,
             keep_resident_components=("dit", "text_encoder", "vae"),
             auto_enable_cfg_parallel=False,
@@ -94,6 +103,32 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     @staticmethod
     def _server_arg_value(value):
         return getattr(value, "value", value)
+
+    def resolve_transformer_attention_backend(
+        self, server_args
+    ) -> AttentionBackendEnum | None:
+        """Resolve the H3 DiT backend using the selector's precedence."""
+        selected_backend = get_global_forced_attn_backend()
+        if selected_backend is None:
+            selected_backend, _ = server_args.resolve_component_attention_backend(
+                "transformer"
+            )
+        if selected_backend is not None:
+            return selected_backend
+        attention_backend = server_args.attention_backend
+        if attention_backend is None or isinstance(
+            attention_backend, AttentionBackendEnum
+        ):
+            return attention_backend
+        attention_backend = self._server_arg_value(attention_backend)
+        return AttentionBackendEnum[str(attention_backend).strip().upper()]
+
+    def uses_subblock_attention(self, server_args) -> bool:
+        """Return whether H3 must build SubBlock-only request metadata."""
+        return (
+            self.resolve_transformer_attention_backend(server_args)
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        )
 
     def validate_quality_deployment(self, server_args) -> None:
         """Fail closed unless the resident server matches the deployment
@@ -214,17 +249,32 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "MiniMax-H3 MPS execution does not support torch.compile; "
                     "pass --enable-torch-compile false"
                 )
-        component_backends = server_args.component_attention_backends or {}
-        attention_backend = component_backends.get(
-            "transformer", self._server_arg_value(server_args.attention_backend)
-        )
-        if attention_backend is None:
+        selected_backend = self.resolve_transformer_attention_backend(server_args)
+        if (
+            int(server_args.ring_degree or 1) > 1
+            and selected_backend is not AttentionBackendEnum.FA
+        ):
+            raise ValueError(
+                "MiniMax-H3 ring parallelism requires the FlashAttention "
+                "backend for the transformer"
+            )
+        if selected_backend is None:
             return
-        selected_backend = (
-            attention_backend
-            if isinstance(attention_backend, AttentionBackendEnum)
-            else AttentionBackendEnum[str(attention_backend).strip().upper()]
-        )
+        if selected_backend is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
+            if server_args.ring_degree > 1:
+                raise ValueError(
+                    "VSA-H3 does not support --ring-degree > 1; use Ulysses "
+                    "sequence parallelism."
+                )
+            if (
+                server_args.enable_torch_compile
+                or server_args.enable_breakable_cuda_graph
+            ):
+                raise ValueError(
+                    "VSA-H3 builds per-step tile metadata eagerly and is not "
+                    "validated under torch.compile or the breakable CUDA "
+                    "graph; disable them or use --attention-backend fa."
+                )
         get_attn_backend(
             self.dit_config.arch_config.attention_head_dim,
             torch.bfloat16,
@@ -244,4 +294,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
-__all__ = ["MiniMaxH3PipelineConfig"]
+@dataclass
+class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
+    """FastH3: 4-step VSA-distilled MiniMax-H3, t2va only."""
+
+    def __post_init__(self) -> None:
+        self.dit_config.arch_config.has_gate_compress = True
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; the FastH3 4-step distilled checkpoint has no "
+            'audited high-quality deployment. Use quality="lossless".'
+        )
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "FastH3 ships one t2va-distilled weight partition; "
+                "--model-variant does not apply. FL2VA and Ref2VA tasks were "
+                "not distilled; use MiniMaxAI/MiniMax-H3 for those."
+            )
+        super().validate_server_args(server_args)
+
+
+__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
