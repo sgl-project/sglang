@@ -1755,9 +1755,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         if self.tokenizer_manager.server_args.incremental_streaming_output:
                             accumulated = output_ids.setdefault(index, [])
                             if finish_reason_type == "abort":
-                                # Coalesce may glue real deltas onto the abort
-                                # chunk's repeated last token; keep only what
-                                # brings us up to completion_tokens.
+                                # The abort chunk re-sends the last token plus any coalesced deltas;
+                                # keep only what brings the total up to completion_tokens.
                                 keep = completion_tokens[index] - len(accumulated)
                                 chunk_output_ids = chunk_output_ids[: max(keep, 0)]
                             accumulated.extend(chunk_output_ids)
@@ -1923,11 +1922,8 @@ class OpenAIServingChat(OpenAIServingBase):
             sglext_non_ids, sglext_ids = sglext_full.split_ids()
 
             if ids_framed:
-                # Emit token ids as their own named SSE event, separate from
-                # the other sglext fields, so they can be identified at the
-                # SSE framing level (by event name, no JSON parsing) and
-                # handled independently in transit. Non-id sglext fields keep
-                # the same plain data-chunk shape as the unframed path.
+                # A named SSE event lets transit hops pick the ids out without parsing JSON;
+                # the other sglext fields keep the plain data-chunk shape.
                 if sglext_non_ids is not None:
                     sglext_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],

@@ -3270,10 +3270,8 @@ class ServingChatTestCase(unittest.TestCase):
         return_raw=False,
         cached_tokens_details=None,
     ):
-        """Stream chunks whose output_ids follow incremental (delta) or
-        non-incremental (full accumulated list) semantics; return the parsed
-        sglext chunks (or the raw chunk strings if return_raw, for asserting
-        on SSE framing)."""
+        """Stream chunks with incremental or cumulative output_ids;
+        return parsed sglext chunks, or raw SSE strings when return_raw."""
         self.tm.server_args.incremental_streaming_output = incremental
         if framed:
             self.fastapi_request.headers["x-sglext-ids-framed"] = "1"

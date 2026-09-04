@@ -445,11 +445,7 @@ class SglExt(BaseModel):
     output_ids: Optional[List[List[int]]] = None
 
     def split_ids(self) -> Tuple[Optional[SglExt], Optional[SglExt]]:
-        """Partition set fields into ``(non_ids, ids)``; each is None if empty.
-
-        Used when sglext_ids_framed is set: the id fields are emitted in their
-        own named SSE event, and all other fields ride in the plain sglext chunk.
-        """
+        """Split set fields into (non_ids, ids); a side with no set fields is None."""
         non_ids: Dict[str, Any] = {}
         ids: Dict[str, Any] = {}
         for name in type(self).model_fields:

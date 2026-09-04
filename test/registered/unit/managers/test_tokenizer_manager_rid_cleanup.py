@@ -271,11 +271,8 @@ class TestRidToStateCleanupOnAbort(CustomTestCase):
 
 
 class TestAbortOutputPayload(CustomTestCase):
-    """Test the response chunk _handle_abort_req produces.
-
-    An abort chunk is often the only thing a client ever sees, so it must
-    carry the same optional fields as a normal finish chunk.
-    """
+    """An abort chunk is often the only thing a client sees;
+    it must carry the same optional fields as a normal finish chunk."""
 
     def test_abort_includes_prompt_token_ids_only_when_requested(self):
         """The abort chunk carries prompt_token_ids captured at tokenization,
