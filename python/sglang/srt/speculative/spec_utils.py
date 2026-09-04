@@ -215,14 +215,13 @@ def draft_kv_indices_used_len(
 
 
 def record_stream_each(tensors, stream):
-    """Protect accelerator tensors from allocator reuse while overlap-stream work is pending."""
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
+    non-tensor / non-cuda entries. Tells the caching allocator that the
+    tensors are also used on `stream`, so memory is not recycled while
+    queued work is still in flight after Python refs drop.
+    """
     for t in tensors:
-        if isinstance(t, torch.Tensor) and t.device.type in (
-            "cuda",
-            "npu",
-            "musa",
-            "xpu",
-        ):
+        if isinstance(t, torch.Tensor) and t.is_cuda:
             t.record_stream(stream)
 
 
