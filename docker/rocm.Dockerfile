@@ -569,10 +569,13 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry pick 8578af1 commit for v4 fp4 indexer kv-cache fix, may be removed in next aiter upgrade
+# apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
  && git cherry-pick --no-commit 8578af153f4fa1e007fede7e3c1e1b373f07af4c \
+ && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
+ && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt \
  && if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \

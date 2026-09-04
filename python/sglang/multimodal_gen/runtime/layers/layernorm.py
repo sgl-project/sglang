@@ -446,7 +446,6 @@ class LayerNorm(CustomOp):
 # FSDP's MixedPrecisionPolicy
 @CustomOp.register("fp32_layer_norm")
 class FP32LayerNorm(CustomOp, nn.LayerNorm):
-
     def __init__(
         self,
         normalized_shape,

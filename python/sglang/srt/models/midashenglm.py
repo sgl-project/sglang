@@ -33,9 +33,9 @@ _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
 
 def _resolve_tuple2(x: _Tuple2) -> tuple[int, int]:
     if isinstance(x, collections.abc.Sequence):
-        assert (
-            len(x) == 2
-        ), f"Expected a sequence of length 2, got {x} with length {len(x)}"
+        assert len(x) == 2, (
+            f"Expected a sequence of length 2, got {x} with length {len(x)}"
+        )
         return cast(tuple[int, int], tuple(x))
     return (x, x)
 
@@ -378,9 +378,9 @@ class DashengAudioTransformer(nn.Module):
         t = x.shape[-1]
         input_splits = x.split(target_length_in_patches, dim=-1)
         if x_length is not None:
-            assert len(x_length) == len(
-                x
-            ), "batchsizes of input x and x_length need to be same"
+            assert len(x_length) == len(x), (
+                "batchsizes of input x and x_length need to be same"
+            )
             assert x_length.ndim == 1, "Lengths are of size (B,)"
             scaled_lengths = (x_length / (self.hop_length * 4)).long()
             mask = self._to_mask(max_length=t, lengths=scaled_lengths)

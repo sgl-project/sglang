@@ -53,15 +53,15 @@ class TestAbortBasic(ScriptedTestCase):
             "finished",
             "unknown",
         ), f"after abort r should be finished/unknown, got {r.status}"
-        assert (
-            r.kv_pages == 0
-        ), f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
-        assert (
-            r.req is None or r.req.kv.req_pool_idx is None
-        ), f"abort must release row; r.req={r.req} after abort"
-        assert (
-            r.lock_refs == 0
-        ), f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
+        assert r.kv_pages == 0, (
+            f"abort must release KV; r.kv_pages={r.kv_pages} after abort"
+        )
+        assert r.req is None or r.req.kv.req_pool_idx is None, (
+            f"abort must release row; r.req={r.req} after abort"
+        )
+        assert r.lock_refs == 0, (
+            f"abort must release lock_refs; r.lock_refs={r.lock_refs}"
+        )
 
     def test_abort_at_chunk_0(self):
         self.server.execute_script(self._script_abort_at_chunk_0)
@@ -436,9 +436,9 @@ class TestAbortBasic(ScriptedTestCase):
         assert not r.is_chunking, "aborted gap req must stay out of chunking"
 
         if r.req is not None:
-            assert (
-                r.req.inflight_middle_chunks == 0
-            ), f"inflight_middle_chunks not cleared; got {r.req.inflight_middle_chunks}"
+            assert r.req.inflight_middle_chunks == 0, (
+                f"inflight_middle_chunks not cleared; got {r.req.inflight_middle_chunks}"
+            )
 
     def test_abort_when_chunked_only_then_idle(self):
         self.server.execute_script(self._script_abort_when_chunked_only_then_idle)
@@ -509,10 +509,10 @@ class TestAbortBasic(ScriptedTestCase):
         yield from _drain_until_released(t, r1)
 
         assert r1.kv_pages == 0, (
-            f"force_retract + abort same yield must release KV; got " f"{r1.kv_pages}"
+            f"force_retract + abort same yield must release KV; got {r1.kv_pages}"
         )
         assert r1.req is None or r1.req.kv.req_pool_idx is None, (
-            f"force_retract + abort same yield must release row; got " f"{r1.req}"
+            f"force_retract + abort same yield must release row; got {r1.req}"
         )
         assert r1.lock_refs == 0, (
             f"force_retract + abort same yield must release lock_refs; "
