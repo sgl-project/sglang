@@ -1025,6 +1025,10 @@ class ChatCompletionRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    # 流式响应的 created 时间戳:serving 层每请求设置一次并全程复用
+    # (P1.3/P1.4/P1.14 要求 created 跨帧恒等,逐帧现算会跨秒漂移)。
+    _stream_created_ts: Optional[int] = None
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):

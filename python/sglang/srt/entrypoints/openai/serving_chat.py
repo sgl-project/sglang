@@ -791,7 +791,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 yield build_sse_content(
                     chunk_id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     model=request.model,
                     index=index,
                     reasoning_content=reasoning_text,
@@ -826,7 +826,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         parser._k3_boundary_sent = True
                         yield build_sse_content(
                             chunk_id=self._wire_id(content["meta_info"]["id"]),
-                            created=int(time.time()),
+                            created=self._stream_created(request),
                             model=request.model,
                             index=index,
                             reasoning_content="",
@@ -870,7 +870,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 yield build_sse_content(
                     chunk_id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     model=request.model,
                     index=index,
                     content=delta,
@@ -900,7 +900,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             yield build_sse_content(
                 chunk_id=self._wire_id(content["meta_info"]["id"]),
-                created=int(time.time()),
+                created=self._stream_created(request),
                 model=request.model,
                 index=index,
                 logprobs=remaining_logprobs,
@@ -1761,7 +1761,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     is_firsts[index] = False
                     yield build_sse_content(
                         chunk_id=self._wire_id(content["meta_info"]["id"]),
-                        created=int(time.time()),
+                        created=self._stream_created(request),
                         model=request.model,
                         index=index,
                         role="assistant",
@@ -1830,7 +1830,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     }
                 yield build_sse_content(
                     chunk_id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     model=request.model,
                     index=idx,
                     finish_reason=final_finish_reason,
@@ -1847,7 +1847,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=self._wire_id(content["meta_info"]["id"]),
-                            created=int(time.time()),
+                            created=self._stream_created(request),
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
@@ -1899,7 +1899,7 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     choices=[],  # sglext is at response level
                     model=request.model,
                     sglext=SglExt(
@@ -1936,7 +1936,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
@@ -2213,6 +2213,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
+
+    def _stream_created(self, request: ChatCompletionRequest) -> int:
+        """流式响应的 created 时间戳:每请求固定一次(P1.3/P1.4/P1.14 要求
+        id/object/created/model 跨帧恒等 —— 逐帧现算 int(time.time()) 会在
+        跨秒的长流里漂移)。存在请求对象的私有属性上,同一请求内复用。"""
+        created = getattr(request, "_stream_created_ts", None)
+        if created is None:
+            created = int(time.time())
+            request._stream_created_ts = created
+        return created
 
     def _wire_id(self, meta_id: str) -> str:
         """API 层响应 id(P2.1):kimi_k3 口径下发 chatcmpl-<24hex>。
@@ -2744,7 +2754,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             chunk = ChatCompletionStreamResponse(
                 id=self._wire_id(content["meta_info"]["id"]),
-                created=int(time.time()),
+                created=self._stream_created(request),
                 choices=[choice_data],
                 model=request.model,
             )
@@ -2817,7 +2827,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 chunk = ChatCompletionStreamResponse(
                     id=self._wire_id(content["meta_info"]["id"]),
-                    created=int(time.time()),
+                    created=self._stream_created(request),
                     choices=[choice_data],
                     model=request.model,
                 )
@@ -2905,7 +2915,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             chunk = ChatCompletionStreamResponse(
                 id=self._wire_id(content["meta_info"]["id"]),
-                created=int(time.time()),
+                created=self._stream_created(request),
                 choices=[choice_data],
                 model=request.model,
             )
