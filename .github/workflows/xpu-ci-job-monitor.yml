@@ -127,9 +127,9 @@ jobs:
         id: parse
         run: |
           # Parse pr-test-xpu.yml and extract job names (exclude utility jobs)
-          # Excluded: check-changes, pr-gate, wait-for-stage-a, finish
+          # Excluded: check-changes, pr-gate, finish
           pr_jobs=$(yq -r '.jobs | keys | .[]' .github/workflows/pr-test-xpu.yml | \
-            grep -v -E '^(check-changes|pr-gate|wait-for-stage-a|finish)$' | \
+            grep -v -E '^(check-changes|pr-gate|finish)$' | \
             jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "pr_jobs=$pr_jobs" >> $GITHUB_OUTPUT
           echo "PR jobs: $pr_jobs"
