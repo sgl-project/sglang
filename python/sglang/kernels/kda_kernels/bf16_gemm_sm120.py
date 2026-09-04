@@ -339,7 +339,6 @@ class _Bf16GemmSm120Kernel:
         *,
         tile_m: int,
         tile_n: int,
-        has_bias: bool,
         cache_policy: bool,
         num_splits: int = 1,
     ):
@@ -357,7 +356,6 @@ class _Bf16GemmSm120Kernel:
         self.mma_tile_shape_mnk = self.tile_shape_mnk
         self.cluster_shape_mnk = (1, 1, 1)
         self.epi_tile = (self.tile_shape_mnk[0], self.tile_shape_mnk[1])
-        self.has_bias = has_bias
         self.load_path = "tma"
         # Software-pipeline depth for the steady-state k loop. The tile_k=128
         # bucket has num_k_blocks=8 per stage, so its in-stage stream already
@@ -492,7 +490,6 @@ class _Bf16GemmSm120Kernel:
         b: cute.Tensor,
         c: cute.Tensor,
         stream: cuda.CUstream,
-        bias: cute.Tensor = None,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Execute the GEMM operation.
@@ -502,8 +499,6 @@ class _Bf16GemmSm120Kernel:
             b: Input tensor B, (n, k) row-major bf16 (linear weight layout)
             c: Output tensor C, (m, n) row-major bf16
             stream: CUDA stream
-            bias: Optional bias tensor, (n,) bf16, added in the epilogue
-                before the bf16 convert when present
             epilogue_op: Elementwise epilogue function
         """
         # Setup static attributes
@@ -567,11 +562,6 @@ class _Bf16GemmSm120Kernel:
         num_n_tiles = cute.ceil_div(c.shape[1], self.tile_shape_mnk[1])
         grid = (num_m_tiles, num_n_tiles, self.num_splits)
 
-        # The split-K epilogue is plain fp32 (bias is applied once by the
-        # host-side reduction), so the workspace variant never dereferences
-        # mBias; pass c as an inert placeholder to keep the signature.
-        kernel_bias = bias if self.num_splits == 1 else c
-
         @cute.struct
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
@@ -605,7 +595,6 @@ class _Bf16GemmSm120Kernel:
             tma_tensor_b,
             tma_atom_c,
             tma_tensor_c,
-            kernel_bias,
             self.tiled_mma,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
@@ -631,7 +620,6 @@ class _Bf16GemmSm120Kernel:
         mB_nkl: cute.Tensor,
         tma_atom_c: cute.CopyAtom,  # Optional; None on the split-K SIMT path
         mC_mnl: cute.Tensor,
-        mBias: cute.Tensor,
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1042,24 +1030,10 @@ class _Bf16GemmSm120Kernel:
                                         ]
 
                             gmem_coord = (epi_m, epi_n)
-                            # Optional bias add in fp32 before the c_dtype convert.
                             tRS_rD_out = cute.make_rmem_tensor(
                                 tRS_rD_layout.shape, self.c_dtype
                             )
                             acc_vec = tRS_rD.load()
-                            if cutlass.const_expr(self.has_bias):
-                                tRS_cC = thr_copy_r2s.partition_S(
-                                    cute.make_identity_tensor(self.epi_tile)
-                                )
-                                for elem_idx in cutlass.range_constexpr(
-                                    cute.size(tRS_cC, mode=[0])
-                                ):
-                                    n_local = tRS_cC[elem_idx][1] + Int32(
-                                        epi_n * self.epi_tile[1]
-                                    )
-                                    acc_vec[elem_idx] = acc_vec[elem_idx] + mBias[
-                                        n_local
-                                    ].to(self.acc_dtype)
                             acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                             tRS_rD_out.store(acc_vec)
 
@@ -1357,7 +1331,6 @@ def _compile_decode_kernel(
     tile_m: int,
     tile_n: int,
     *,
-    has_bias: bool,
     cache_policy: bool,
     num_splits: int = 1,
 ):
@@ -1365,7 +1338,6 @@ def _compile_decode_kernel(
         device_index,
         tile_m,
         tile_n,
-        has_bias,
         cache_policy,
         num_splits,
     )
@@ -1381,7 +1353,6 @@ def _compile_decode_kernel(
         gemm = _Bf16GemmSm120Kernel(
             tile_m=tile_m,
             tile_n=tile_n,
-            has_bias=has_bias,
             cache_policy=cache_policy,
             num_splits=num_splits,
         )
@@ -1418,34 +1389,15 @@ def _compile_decode_kernel(
                 stride_order=(1, 0, 2),
                 assumed_align=16,
             )
-        bias_fake = None
-        if has_bias and num_splits == 1:
-            bias_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.BFloat16,
-                (sym_n,),
-                stride_order=(0,),
-                assumed_align=16,
-            )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        if bias_fake is not None:
-            compiled = cute.compile(
-                gemm,
-                a_fake,
-                b_fake,
-                c_fake,
-                stream_fake,
-                bias_fake,
-                options="--opt-level 2 --enable-tvm-ffi",
-            )
-        else:
-            compiled = cute.compile(
-                gemm,
-                a_fake,
-                b_fake,
-                c_fake,
-                stream_fake,
-                options="--opt-level 2 --enable-tvm-ffi",
-            )
+        compiled = cute.compile(
+            gemm,
+            a_fake,
+            b_fake,
+            c_fake,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
         _COMPILED_KERNELS[cache_key] = compiled
         return compiled
 
@@ -1460,8 +1412,7 @@ def run_bf16_gemm_sm120(
     Args:
         x: Activations, (M, K) row-major bf16.
         weight: Linear-layer weight, (N, K) row-major bf16.
-        bias: Optional (N,) bf16 vector added in the epilogue before the
-            bf16 convert.
+        bias: Optional (N,) bf16 vector. Biased calls use the PyTorch fallback.
 
     Returns:
         (M, N) bf16 tensor.
@@ -1480,6 +1431,9 @@ def run_bf16_gemm_sm120(
         bias = bias.contiguous()
         if bias.shape != (n,):
             raise ValueError(f"bias shape {tuple(bias.shape)} != ({n},)")
+        # The optimized path is benchmarked for bias-free transformer
+        # projections; retain the existing PyTorch path for biased calls.
+        return torch.nn.functional.linear(x, weight, bias)
     tile_key = _tile_key_for_shape(rows, n, k)
     tile_k = _TILE_CONFIGS[tile_key][0][2]
     if k % tile_k != 0:
@@ -1511,14 +1465,10 @@ def run_bf16_gemm_sm120(
         device_index,
         tile_m,
         tile_n,
-        has_bias=bias is not None,
         cache_policy=rows == 1,
     )
     output = torch.empty(rows, n, device=x.device, dtype=torch.bfloat16)
-    if bias is not None:
-        kernel(x, weight, output, bias)
-    else:
-        kernel(x, weight, output)
+    kernel(x, weight, output)
     return output
 
 
@@ -1546,7 +1496,6 @@ def _run_bf16_gemm_sm120_split_k(
         device_index,
         tile_m,
         tile_n,
-        has_bias=False,
         cache_policy=False,
         num_splits=2,
     )
