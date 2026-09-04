@@ -94,6 +94,57 @@ def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
     return weight_scale.shape[-1] > 1
 
 
+def _is_per_channel_dynamic_fp8(proj: torch.nn.Module) -> bool:
+    """Return True only when proj's (fp8, per-token scale) tuple may be fed
+    straight to ``gemm_a8w8_bpreshuffle``.
+
+    The layout contract is proven from the layer's own state, not inferred from
+    a global capability flag:
+      * preshuffled weight   -> the quant method sets ``_fp8_weight_preshuffled``
+        when it preshuffles the per-channel fp8 weight for gemm_a8w8_bpreshuffle
+        (see ``QuarkW8A8Fp8.process_weights_after_loading``),
+      * dynamic activation   -> proj has no static per-tensor ``input_scale``,
+      * per-channel w scale   -> exactly one scale per **output channel**:
+        ``weight_scale.numel()`` equals the proj's per-partition output size
+        (``output_size_per_partition`` if sharded, else ``output_size``), stored
+        1-D ``[N]`` or 2-D ``[N, 1]`` -- NOT merely "some weight dimension", which
+        could also equal the input dim K.
+
+    Block-scale (``[N, K/block]``), per-tensor (single-element ``weight_scale``),
+    static-input-scale, and non-preshuffled fp8 all violate this contract and
+    keep the plain bf16 + separate-quant path. The aiter bpreshuffle gfx95 flag
+    is only a *hardware kernel-availability* gate.
+    """
+    # Hardware gate: the bpreshuffle GEMM that consumes the folded tuple exists
+    # only on the aiter gfx95 path.
+    if not _use_aiter_bpreshuffle_gfx95:
+        return False
+    # Explicit preshuffled-weight/quant-method marker set at load.
+    if not getattr(proj, "_fp8_weight_preshuffled", False):
+        return False
+    weight = getattr(proj, "weight", None)
+    if weight is None or weight.dtype != torch.float8_e4m3fn:
+        return False
+    # Static per-tensor activation scaling => not the dynamic per-token path.
+    if getattr(proj, "input_scale", None) is not None:
+        return False
+    weight_scale = getattr(proj, "weight_scale", None)
+    if weight_scale is None:
+        return False
+    # Exactly one scale per output channel -- match the proj's real per-partition
+    # output size (sharded ``output_size_per_partition`` on parallel linears,
+    # else full ``output_size`` on replicated), NOT just "some weight dimension".
+    out_features = getattr(proj, "output_size_per_partition", None)
+    if out_features is None:
+        out_features = getattr(proj, "output_size", None)
+    if out_features is None or weight_scale.numel() != out_features:
+        return False
+    # Per-channel scale layout: 1-D [N] or 2-D [N, 1] (reject block-scale).
+    return weight_scale.dim() == 1 or (
+        weight_scale.dim() == 2 and weight_scale.shape[-1] == 1
+    )
+
+
 def awq_dequantize_func():
     """
     Get the AWQ dequantize function for the current device
