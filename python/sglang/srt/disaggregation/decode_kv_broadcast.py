@@ -352,7 +352,7 @@ class DecodeKVBroadcaster:
         )
         logger.info(
             f"Decode KV broadcast enabled, src attn_tp_rank={KV_BROADCAST_SRC_RANK}, "
-            f"chunk={chunk_bytes / 2 ** 20:g} MiB, "
+            f"chunk={chunk_bytes / 2**20:g} MiB, "
             "relay groups="
             + ", ".join(
                 f"{relay_group.name}: {relay_group.num_layers} layers x "
