@@ -108,6 +108,9 @@ class BaseKVManager(ABC):
     # (a receiver asks the sender to skip its KV so a peer relays it).
     supports_decode_kv_broadcast: bool = False
 
+    enable_deferred_decode_kv_release: bool = False
+
+
     @abstractmethod
     def __init__(
         self,

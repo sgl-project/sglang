@@ -59,7 +59,8 @@ features = ["python"]
 [lib]
 name = "demo_extension"
 crate-type = ["cdylib"]
-""".strip() + "\n",
+""".strip()
+            + "\n",
             encoding="utf-8",
         )
         (crate / "lib.rs").write_text("fn input() {}\n", encoding="utf-8")
@@ -542,7 +543,7 @@ crate-type = ["cdylib"]
             ),
             (
                 "sglang.srt.mem_cache.rust_tree_core.mem_cache",
-                "mem_cache",
+                "sglang-radix-tree",
                 "mem_cache",
                 ("python-extension",),
             ),

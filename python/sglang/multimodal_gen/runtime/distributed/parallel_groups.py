@@ -43,9 +43,9 @@ def set_seq_parallel_pg_by_sp_groups(
     """
     sp_degree = sp_ring_degree * sp_ulysses_degree
     assert sp_degree > 0
-    assert all(
-        len(g) == sp_degree for g in sp_groups
-    ), f"Each SP group must have size {sp_degree}, got sizes {[len(g) for g in sp_groups]}"
+    assert all(len(g) == sp_degree for g in sp_groups), (
+        f"Each SP group must have size {sp_degree}, got sizes {[len(g) for g in sp_groups]}"
+    )
 
     ulyssess_pg = None
     ring_pg = None
