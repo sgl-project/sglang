@@ -2241,6 +2241,7 @@ class MMReceiverBase(ABC):
             top_logprobs_num=recv_req.top_logprobs_num,
             token_ids_logprob=recv_req.token_ids_logprob,
             stream=recv_req.stream,
+            output_text_required=recv_req.output_text_required,
             lora_id=recv_req.lora_id,
             input_embeds=recv_req.input_embeds,
             custom_logit_processor=recv_req.custom_logit_processor,

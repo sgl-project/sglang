@@ -26,6 +26,7 @@ class _FakeReq:
         customized_info=None,
         *,
         finished=False,
+        output_text_required=True,
     ):
         self.rid = rid
         self.http_worker_ipc = None
@@ -45,6 +46,7 @@ class _FakeReq:
         )
         self.output_ids = output_ids
         self.output_ids_through_stop = output_ids
+        self.output_text_required = output_text_required
         self.send_token_offset = 0
         self.send_output_token_logprobs_offset = 0
         self.send_decode_id_offset = 0
@@ -130,6 +132,21 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
         )
+
+    def test_token_only_output_skips_incremental_decode_setup(self):
+        accumulator = _accumulator()
+        req = _FakeReq("r0", [10], output_text_required=False)
+        req.init_incremental_detokenize = Mock(
+            side_effect=AssertionError("token-only output must not initialize decode")
+        )
+
+        accumulator.accept(req=req)
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+
+        self.assertEqual(payload.output_text_required, [False])
+        self.assertEqual(payload.decoded_texts, [""])
+        self.assertEqual(payload.decode_ids, [[]])
+        self.assertEqual(payload.read_offsets, [0])
 
     def test_additional_customized_info_uses_the_existing_payload(self):
         class Streamer(SchedulerOutputStreamer):

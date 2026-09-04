@@ -2709,6 +2709,7 @@ class Scheduler(
                 return_sampling_mask=recv_req.return_sampling_mask,
                 return_flat_raw_top_logprobs=recv_req.return_flat_raw_top_logprobs,
                 stream=recv_req.stream,
+                output_text_required=recv_req.output_text_required,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
                 input_embeds=recv_req.input_embeds,
@@ -2815,6 +2816,7 @@ class Scheduler(
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                output_text_required=recv_req.output_text_required,
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)

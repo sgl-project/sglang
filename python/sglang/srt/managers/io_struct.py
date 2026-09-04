@@ -965,6 +965,9 @@ class GenerateReqInput:
                 else None
             ),
         )
+        # Preserve private response-shaping state when batch normalization or
+        # parallel sampling materializes an individual request.
+        sub._output_text_required = getattr(self, "_output_text_required", True)
         cache[i] = sub
         return sub
 
@@ -1067,6 +1070,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Internal response shaping. Appended for array-like IPC compatibility.
+    # False means the downstream caller consumes token IDs without output text.
+    output_text_required: bool = True
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1429,7 +1436,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     decoded_texts: List[str]
     decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
+    # Used by skip-tokenizer-init and internal token-only response paths.
     output_ids: Optional[List[array]]  # Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
@@ -1526,6 +1533,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Per-request response shaping. Appended for array-like IPC compatibility.
+    # None is the safe fallback and means every row must be detokenized.
+    output_text_required: Optional[List[bool]] = None
 
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):

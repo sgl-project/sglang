@@ -1394,6 +1394,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_sampling_mask=obj.return_sampling_mask,
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
+                output_text_required=getattr(obj, "_output_text_required", True),
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -2366,7 +2367,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if beam_out_dict is not None:
                 out_dict = beam_out_dict
-            elif isinstance(recv_obj, BatchStrOutput):
+            elif isinstance(recv_obj, BatchStrOutput) and getattr(
+                state.obj, "_output_text_required", True
+            ):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
@@ -2415,7 +2418,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict = None
                 if out_dict is not None and state.prompt_token_ids is not None:
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
-            elif isinstance(recv_obj, BatchTokenIDOutput):
+            elif isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
                 delta_output_ids = list(recv_obj.output_ids[i])

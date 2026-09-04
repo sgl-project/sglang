@@ -265,12 +265,29 @@ class RuntimeHandle:
         }
         return self._openai_serving_classes
 
+    def _observability_requires_output_text(self, obj) -> bool:
+        """Keep text for enabled internal consumers that can record it."""
+        request_logger = self.tokenizer_manager.request_logger
+        if request_logger.log_requests and request_logger.log_requests_level >= 2:
+            return True
+
+        if obj.log_metrics and (
+            self.tokenizer_manager.dump_requests_folder
+            or self.tokenizer_manager.crash_dump_folder
+        ):
+            return True
+
+        return (
+            self.tokenizer_manager.request_metrics_exporter_manager.exporter_enabled()
+        )
+
     def submit_request(
         self,
         *,
         req_type: str,
         req_dict: dict,
         chunk_callback,
+        output_text_required: bool = True,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         mock_request = (
@@ -282,6 +299,11 @@ class RuntimeHandle:
             from sglang.srt.managers.io_struct import GenerateReqInput
 
             obj = GenerateReqInput(**req_dict)
+            # Private bridge-only state. It is intentionally not part of the
+            # public GenerateReqInput schema.
+            obj._output_text_required = (
+                output_text_required or self._observability_requires_output_text(obj)
+            )
             stream = req_dict.get("stream", False)
             self._submit_on_tm_loop(
                 self._run_generate(obj, chunk_callback, stream, mock_request)
