@@ -237,6 +237,7 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     c128_state_pool_size: int
     c4_state_dtype: Optional[torch.dtype]
     c128_state_dtype: Optional[torch.dtype]
+    unified_memory_pool_bytes: Optional[int] = None
     unified_total_bytes: Optional[int] = None
 
 
@@ -408,6 +409,7 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            unified_memory_pool_bytes=config.unified_memory_pool_bytes,
             c4_max_total_num_tokens=c4_max_total_num_tokens,
             c128_max_total_num_tokens=c128_max_total_num_tokens,
             c4_state_pool_size=c4_state_pool_size,
@@ -470,17 +472,11 @@ class KVCacheConfigurator:
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             elif self.is_hybrid_swa and not is_dsv4:
-                if pd_enabled:
-                    raise ValueError(
-                        "--enable-unified-memory with PD disaggregation does "
-                        "not support hybrid-SWA models yet (no whole-envelope "
-                        "transfer scheme for the SWA sub-pool). Drop "
-                        "--enable-unified-memory or run without PD."
-                    )
                 bundle = self._init_unified_swa_pools(
                     max_num_reqs=sizes.max_running_requests,
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    unified_memory_pool_bytes=sizes.unified_memory_pool_bytes,
                     unified_total_bytes=sizes.unified_total_bytes,
                 )
             else:
@@ -826,8 +822,9 @@ class KVCacheConfigurator:
         self,
         *,
         max_num_reqs: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
+        full_max_total_num_tokens: Optional[int] = None,
+        swa_max_total_num_tokens: Optional[int] = None,
+        unified_memory_pool_bytes: Optional[int] = None,
         unified_total_bytes: Optional[int] = None,
     ) -> UnifiedPoolBundle:
         """Build the unified-pool stack for a hybrid-SWA model (Triton): one byte
@@ -844,16 +841,7 @@ class KVCacheConfigurator:
         assert not self.use_mla_backend, (
             "unified memory pool does not support MLA-SWA hybrid yet"
         )
-        # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if get_spec().speculative_num_draft_tokens is not None:
-            extra_max_context_len += get_spec().speculative_num_draft_tokens
-        req_to_token_pool = ReqToTokenPool(
-            size=max_num_reqs,
-            max_context_len=self.model_config.context_len + extra_max_context_len,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-        )
+        req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -888,6 +876,10 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        total_bytes = unified_memory_pool_bytes
+        if total_bytes is None and self.spec_algorithm.is_none():
+            total_bytes = unified_total_bytes
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -904,6 +896,7 @@ class KVCacheConfigurator:
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
+            total_bytes=total_bytes,
             enable_memory_saver=get_exec().features.enable_memory_saver,
             need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
             # Overlap mode: same wait_stream(forward_stream) rationale as
@@ -911,9 +904,6 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Draft workers keep the token-count byte sum (spec is asserted
-            # off under unified; belt only).
-            unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor inputs. `model_context_len` bounds the
             # sliding window term only -- the full-attention side is not
             # charged, see `_check_bs1_feasibility_floor`.
@@ -2000,6 +1990,7 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
+                assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                 uses_unified_virtual_ids = isinstance(
                     swa_allocator, UnifiedSWATokenToKVPoolAllocator
                 )

@@ -142,6 +142,12 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     fields = {}
 
     backend = disagg.disaggregation_decode_retraction_backup
+    unified_hybrid_swa = memory.enable_unified_memory and tp_worker.is_hybrid_swa
+    if backend == "host_pool" and unified_hybrid_swa:
+        raise ValueError(
+            "Unified-memory hybrid-SWA H2D/D2H does not support host-pool "
+            "decode retraction yet."
+        )
     if backend is None:
         kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
         full_tokens_per_layer = (
@@ -149,13 +155,22 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Host-pool retraction transfers full and sliding-window components
-        # only, so a model with recurrent state stays on cpu_tensor.
-        supports_host_pool = not uses_ssm_state(
-            tp_worker.model_runner.model_config
-        ) and (
-            isinstance(kv_cache, MHATokenToKVPool)
-            or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+        draft_pools = tp_worker.model_runner.mtp_draft_device_pools
+        unified_draft_host_pool_supported = (
+            not memory.enable_unified_memory
+            or not draft_pools
+            or tp_worker.model_runner.spec_algorithm.is_dspark()
+        )
+        # Host-pool retraction has no recurrent-state sidecar, so a model with
+        # recurrent state stays on cpu_tensor.
+        supports_host_pool = (
+            unified_draft_host_pool_supported
+            and not unified_hybrid_swa
+            and not uses_ssm_state(tp_worker.model_runner.model_config)
+            and (
+                isinstance(kv_cache, MHATokenToKVPool)
+                or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
+            )
         )
         schedule = get_schedule()
         priority_preemption = (

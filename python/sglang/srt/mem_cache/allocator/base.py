@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Hashable
 
 import torch
 
@@ -84,6 +84,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return []
 
+    @property
+    def current_full_capacity(self) -> int:
+        """Capacity represented by full_available_size plus live allocations."""
+        return self.size_full
+
+    @property
+    def current_swa_capacity(self) -> int:
+        """SWA counterpart of current_full_capacity for hybrid allocators."""
+        return self.size_swa
+
     def debug_print(self) -> str:
         return ""
 
@@ -126,7 +136,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Token ids as the PD-disaggregation transfer engine addresses them.
+        """Token ids as device transfer engines address them.
 
         Identity here: a static pool's token ids index its registered buffers
         directly. Virtual-id pools must override.
@@ -140,6 +150,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        """Record an asynchronous HiCache transfer completion event if needed."""
+        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

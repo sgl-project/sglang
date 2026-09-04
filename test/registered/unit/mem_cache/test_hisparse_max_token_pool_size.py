@@ -79,6 +79,7 @@ class TestMaxTokenPoolSize(CustomTestCase):
     def test_non_hisparse_hybrid_swa_prefers_full_max(self):
         instance = _make_model_runner(
             enable_hisparse=False,
+            server_args=SimpleNamespace(enable_unified_memory=False),
             token_to_kv_pool_allocator=SimpleNamespace(),
             is_hybrid_swa=True,
             max_total_num_tokens=1024,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,6 +72,47 @@ class HostPoolGroup:
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
 
+    @contextmanager
+    def layout_lease(self):
+        domains = []
+        seen = set()
+        for entry in self.entries:
+            domain = entry.host_pool.shared_allocation_domain
+            if domain is None or id(domain) in seen:
+                continue
+            seen.add(id(domain))
+            domains.append(domain)
+        for domain in domains:
+            domain.acquire_layout()
+        try:
+            yield
+        finally:
+            for domain in reversed(domains):
+                domain.release_layout()
+
+    def get_page_buffer_element_size(self, split_factor: int = 1):
+        anchor_pool = self.anchor_entry.host_pool
+        anchor_getter = getattr(anchor_pool, "get_page_buffer_element_size", None)
+        if anchor_getter is None:
+            dummy = torch.zeros(anchor_pool.page_size, dtype=torch.int64)
+            if split_factor != 1:
+                meta = anchor_pool.get_split_heads_page_buffer_meta(dummy, split_factor)
+            else:
+                meta = anchor_pool.get_page_buffer_meta(dummy)
+            sizes = meta[1] if meta else None
+            return int(sizes[0]) if sizes else None
+
+        element_sizes = set()
+        for entry in self.entries:
+            getter = getattr(entry.host_pool, "get_page_buffer_element_size", None)
+            if getter is None:
+                return None
+            element_size = getter(split_factor)
+            if element_size is None:
+                return None
+            element_sizes.add(element_size)
+        return element_sizes.pop() if len(element_sizes) == 1 else None
+
     def alloc(
         self,
         need_size: int,
@@ -135,7 +177,8 @@ class HostPoolGroup:
         for transfer in derived_transfers:
             if transfer.indices_from_pool == self.anchor_entry.name:
                 transfer.host_indices = primary_host_indices
-                transfer.device_indices = primary_device_indices
+                if transfer.device_indices is None:
+                    transfer.device_indices = primary_device_indices
                 continue
 
             source = next(
@@ -151,7 +194,8 @@ class HostPoolGroup:
                 rollback()
                 return None
             transfer.host_indices = source.host_indices
-            transfer.device_indices = source.device_indices
+            if transfer.device_indices is None:
+                transfer.device_indices = source.device_indices
         return transfers
 
     def release_transfers(self, transfers: list[PoolTransfer] | None) -> int:
@@ -170,6 +214,10 @@ class HostPoolGroup:
     @property
     def size_per_token(self):
         return self.anchor_entry.host_pool.size_per_token
+
+    @property
+    def stores_page_envelope(self) -> bool:
+        return self.anchor_entry.host_pool.stores_page_envelope
 
     def clear(self) -> None:
         for entry in self.entries:

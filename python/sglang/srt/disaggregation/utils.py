@@ -143,9 +143,14 @@ def unified_memory_disagg_move_gate(scheduler):
     if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
 
         def decode_gate() -> bool:
+            decode_offload_manager = scheduler.decode_offload_manager
             return not (
                 scheduler.disagg_decode_transfer_queue.queue
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or (
+                    decode_offload_manager is not None
+                    and decode_offload_manager.has_inflight_device_transfer()
+                )
             )
 
         return decode_gate

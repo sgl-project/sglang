@@ -1404,9 +1404,17 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """Pick the right MHA host-pool class based on the device pool's K/V dims.
 
-    Returns ``AsymmetricMHATokenToKVPoolHost`` when ``head_dim != v_head_dim``
-    (e.g. MiMo-V2), else the default ``MHATokenToKVPoolHost``.
+    Unified pools use a page-envelope mirror. Other asymmetric pools use split
+    K/V buffers, and ordinary pools use the default host implementation.
     """
+    from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
+
+    if isinstance(device_pool, UnifiedMHATokenToKVPool):
+        from sglang.srt.mem_cache.pool_host.unified import (
+            UnifiedPageEnvelopeHostPool,
+        )
+
+        return UnifiedPageEnvelopeHostPool
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
     return MHATokenToKVPoolHost

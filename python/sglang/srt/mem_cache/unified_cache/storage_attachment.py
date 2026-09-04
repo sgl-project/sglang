@@ -374,15 +374,29 @@ class StorageAttachment:
                     continue
                 completed_tokens, _ = controller.terminate_prefetch(info.operation)
                 del cache.ongoing_prefetch[req_id]
-                cache.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
+                if info.anchor_lock_params is not None:
+                    cache.dec_host_lock_ref(
+                        info.anchor_node_id, info.anchor_lock_params
+                    )
+                if cache.buffer_pipeline is not None:
+                    cache.buffer_pipeline.pop_prefix_ctx(req_id)
+                    cache.buffer_pipeline.release_anchor_lock(req_id)
                 controller.append_host_mem_release(
                     host_indices=info.host_indices[:completed_tokens],
-                    extra_pools=[
-                        x for xfers in info.comp_xfers.values() for x in xfers
-                    ],
+                    extra_pools=(
+                        [x for xfers in info.comp_xfers.values() for x in xfers]
+                        if info.operation.pool_transfers_done
+                        else None
+                    ),
                 )
                 controller.prefetch_tokens_occupied = max(
-                    0, controller.prefetch_tokens_occupied - len(info.prefetch_key)
+                    0,
+                    controller.prefetch_tokens_occupied
+                    - cache._prefetch_occupied_span(
+                        info.prefetch_key,
+                        info.host_indices,
+                        operation=info.operation,
+                    ),
                 )
             except Exception:
                 logger.exception("Failed to release pending prefetch %s", req_id)
