@@ -1514,7 +1514,14 @@ class KVarNHostKVCache(HostKVCache):
         current_platform.synchronize()
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ):
         """Copy int4 tiles from host to GPU int4 cache for one layer.
 
