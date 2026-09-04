@@ -68,7 +68,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    to_openai_style_logprobs,
+    to_responses_output_text_logprobs,
+    to_responses_text_delta_logprobs,
+    to_responses_text_done_logprobs,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -255,16 +260,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 'type="function"; other built-in tool types cannot be forced.'
             )
 
-        # harmony emits raw tokens; per-token logprobs aren't wired there.
-        if self.use_harmony and request.is_include_output_logprobs():
-            return self.create_error_response(
-                "logprobs are not supported with gpt-oss models", param="logprobs"
-            )
-        # streaming skips the logprobs build path; reject so the include doesn't silently no-op.
-        if request.stream and request.is_include_output_logprobs():
-            return self.create_error_response(
-                "logprobs are not supported in streaming mode", param="logprobs"
-            )
         # harmony output opens with <|channel|>analysis<|message|>, so a whole-output
         # json_schema forces "{" at the first token and the harmony parse then fails.
         if self.use_harmony and request.has_json_schema_constraint():
@@ -659,7 +654,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         status = "completed"
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
-            output = self._make_response_output_items_with_harmony(context)
+            final_logprobs = None
+            if request.is_include_output_logprobs():
+                final_logprobs = to_responses_output_text_logprobs(
+                    context.final_token_logprobs,
+                    context.final_top_logprobs,
+                )
+            output = self._make_response_output_items_with_harmony(
+                context, final_logprobs=final_logprobs
+            )
             # num_reasoning_tokens isn't wired through HarmonyContext yet; stays 0.
             num_prompt_tokens = context.num_prompt_tokens
             num_generated_tokens = context.num_output_tokens
@@ -964,6 +967,8 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _make_response_output_items_with_harmony(
         self,
         context: HarmonyContext,
+        *,
+        final_logprobs: Optional[list] = None,
     ):
         output_items = []
         num_init_messages = context.num_init_messages
@@ -973,6 +978,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         last_items = parse_remaining_state(context.parser)
         if last_items:
             output_items.extend(last_items)
+
+        # Every ResponseOutputText produced above is ``final``-channel (the
+        # harmony builders only create output text for the final channel), so
+        # attach the captured final-channel logprobs to each.
+        if final_logprobs:
+            for item in output_items:
+                if not isinstance(item, ResponseOutputMessage):
+                    continue
+                for content in item.content:
+                    if isinstance(content, ResponseOutputText):
+                        content.logprobs = final_logprobs
         return output_items
 
     @staticmethod
@@ -1510,6 +1526,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         current_output_index = 0
         current_item_id = f"item_{random_uuid()}"
         sent_output_item_added = False
+        wants_logprobs = request.is_include_output_logprobs()
 
         initial_response = ResponsesResponse.from_request(
             request,
@@ -1584,10 +1601,22 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
                     elif previous_item.channel == "final":
+                        done_logprobs_msg = None
+                        done_logprobs_event = None
+                        if wants_logprobs:
+                            done_logprobs_msg = to_responses_output_text_logprobs(
+                                ctx.final_token_logprobs,
+                                ctx.final_top_logprobs,
+                            )
+                            done_logprobs_event = to_responses_text_done_logprobs(
+                                ctx.final_token_logprobs,
+                                ctx.final_top_logprobs,
+                            )
                         text_content = openai_responses_types.ResponseOutputText(
                             type="output_text",
                             text=previous_item.content[0].text,
                             annotations=[],
+                            logprobs=done_logprobs_msg,
                         )
                         yield _send_event(
                             openai_responses_types.ResponseTextDoneEvent(
@@ -1596,7 +1625,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 output_index=current_output_index,
                                 content_index=current_content_index,
                                 text=previous_item.content[0].text,
-                                logprobs=[],
+                                logprobs=done_logprobs_event or [],
                                 item_id=current_item_id,
                             )
                         )
@@ -1661,6 +1690,15 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 ),
                             )
                         )
+                    delta_logprobs = []
+                    if wants_logprobs and ctx.delta_token_logprobs:
+                        delta_logprobs = (
+                            to_responses_text_delta_logprobs(
+                                ctx.delta_token_logprobs,
+                                ctx.delta_top_logprobs,
+                            )
+                            or []
+                        )
                     yield _send_event(
                         openai_responses_types.ResponseTextDeltaEvent(
                             type="response.output_text.delta",
@@ -1668,9 +1706,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             content_index=current_content_index,
                             output_index=current_output_index,
                             item_id=current_item_id,
-                            delta=ctx.parser.last_content_delta,
-                            # TODO, use logprobs from ctx.last_request_output
-                            logprobs=[],
+                            delta=ctx.delta_text,
+                            logprobs=delta_logprobs,
                         )
                     )
                 elif (
@@ -2033,6 +2070,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
 
+        wants_logprobs = request.is_include_output_logprobs()
+        n_prev_logprobs = 0
+        all_token_logprobs: list = []
+        all_top_logprobs: Optional[list] = None
+
         def _open_reasoning_item() -> str:
             nonlocal current_output_index
             current_output_index += 1
@@ -2129,8 +2171,22 @@ class OpenAIServingResponses(OpenAIServingChat):
             if not message_state["open"]:
                 return []
             text = message_state["text"]
+            done_logprobs_msg = None
+            done_logprobs_event = None
+            if wants_logprobs:
+                done_logprobs_msg = to_responses_output_text_logprobs(
+                    output_token_logprobs=all_token_logprobs,
+                    output_top_logprobs=all_top_logprobs,
+                )
+                done_logprobs_event = to_responses_text_done_logprobs(
+                    output_token_logprobs=all_token_logprobs,
+                    output_top_logprobs=all_top_logprobs,
+                )
             text_content = openai_responses_types.ResponseOutputText(
-                type="output_text", text=text, annotations=[], logprobs=None
+                type="output_text",
+                text=text,
+                annotations=[],
+                logprobs=done_logprobs_msg,
             )
             completed_item = ResponseOutputMessage(
                 id=message_state["item_id"],
@@ -2147,7 +2203,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         output_index=message_state["output_index"],
                         content_index=0,
                         text=text,
-                        logprobs=[],
+                        logprobs=done_logprobs_event or [],
                         item_id=message_state["item_id"],
                     )
                 ),
@@ -2228,6 +2284,35 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "reasoning_tokens", reasoning_tokens_meta
                 )
                 finish_reason = meta.get("finish_reason") or finish_reason
+
+                # Extract per-chunk logprobs for streaming events.
+                delta_logprobs: list = []
+                if wants_logprobs:
+                    chunk_token_lps = meta.get("output_token_logprobs", [])
+                    chunk_top_lps = meta.get("output_top_logprobs")
+                    if incremental:
+                        new_token_lps = chunk_token_lps
+                        new_top_lps = chunk_top_lps
+                    else:
+                        new_token_lps = chunk_token_lps[n_prev_logprobs:]
+                        new_top_lps = (
+                            chunk_top_lps[n_prev_logprobs:]
+                            if chunk_top_lps is not None
+                            else None
+                        )
+                        n_prev_logprobs = len(chunk_token_lps)
+                    all_token_logprobs.extend(new_token_lps)
+                    if new_top_lps is not None:
+                        if all_top_logprobs is None:
+                            all_top_logprobs = []
+                        all_top_logprobs.extend(new_top_lps)
+                    delta_logprobs = (
+                        to_responses_text_delta_logprobs(
+                            output_token_logprobs=new_token_lps,
+                            output_top_logprobs=new_top_lps,
+                        )
+                        or []
+                    )
 
                 text = chunk.get("text", "") or ""
                 if incremental:
@@ -2450,7 +2535,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 output_index=message_state["output_index"],
                                 item_id=message_state["item_id"],
                                 delta=normal_text,
-                                logprobs=[],
+                                logprobs=delta_logprobs,
                             )
                         )
 

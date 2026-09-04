@@ -344,5 +344,134 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
 
+class StreamLogprobsTestCase(CustomTestCase):
+    def _delta_events(self, events):
+        return [
+            p
+            for p in event_payloads(events)
+            if p["type"] == "response.output_text.delta"
+        ]
+
+    def _done_payload(self, events):
+        for p in event_payloads(events):
+            if p["type"] == "response.output_text.done":
+                return p
+        raise AssertionError("response.output_text.done missing")
+
+    @staticmethod
+    def _serving():
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+        return serving
+
+    def test_delta_events_carry_per_chunk_logprobs(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            top_logprobs=2,
+            include=["message.output_text.logprobs"],
+            store=False,
+        )
+        # Cumulative chunks: each re-sends all text + all logprobs so far.
+        chunk1_lp = [(-0.5, 313, "Hel")]
+        chunk1_top = [[(-0.5, 313, "Hel"), (-1.2, 999, "Hi")]]
+        chunk2_lp = [(-0.5, 313, "Hel"), (-0.3, 414, "lo")]
+        chunk2_top = [
+            [(-0.5, 313, "Hel"), (-1.2, 999, "Hi")],
+            [(-0.3, 414, "lo"), (-2.0, 888, "Lo")],
+        ]
+        chunks = [
+            engine_chunk("Hel", 1, token_logprobs=chunk1_lp, top_logprobs=chunk1_top),
+            engine_chunk("Hello", 2, token_logprobs=chunk2_lp, top_logprobs=chunk2_top),
+            # Finish chunk re-sends full text so its delta is empty (no event).
+            engine_chunk("Hello", 2, finish=True),
+        ]
+
+        events = StreamFixture(self._serving(), request).run(chunks)
+        deltas = self._delta_events(events)
+
+        # Two delta events ("Hel" then "lo"), each with its sliced logprob.
+        self.assertEqual(len(deltas), 2)
+        self.assertEqual(len(deltas[0]["logprobs"]), 1)
+        self.assertEqual(deltas[0]["logprobs"][0]["token"], "Hel")
+        self.assertEqual(deltas[0]["logprobs"][0]["logprob"], -0.5)
+        self.assertEqual(len(deltas[0]["logprobs"][0]["top_logprobs"]), 2)
+        # Second delta only carries the new token (n_prev_logprobs slicing).
+        self.assertEqual(len(deltas[1]["logprobs"]), 1)
+        self.assertEqual(deltas[1]["logprobs"][0]["token"], "lo")
+
+    def test_done_event_carries_full_accumulated_logprobs(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            top_logprobs=1,
+            include=["message.output_text.logprobs"],
+            store=False,
+        )
+        chunk1_lp = [(-0.5, 313, "Hel")]
+        chunk1_top = [[(-0.5, 313, "Hel")]]
+        chunk2_lp = [(-0.5, 313, "Hel"), (-0.3, 414, "lo")]
+        chunks = [
+            engine_chunk("Hel", 1, token_logprobs=chunk1_lp, top_logprobs=chunk1_top),
+            engine_chunk("Hello", 2, token_logprobs=chunk2_lp, top_logprobs=None),
+            engine_chunk("Hello", 2, finish=True),
+        ]
+
+        events = StreamFixture(self._serving(), request).run(chunks)
+        done = self._done_payload(events)
+
+        # The done event holds all accumulated logprobs across chunks.
+        self.assertEqual(len(done["logprobs"]), 2)
+        self.assertEqual(done["logprobs"][0]["token"], "Hel")
+        self.assertEqual(done["logprobs"][1]["token"], "lo")
+
+    def test_no_logprobs_when_not_requested(self):
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        chunks = [
+            engine_chunk("Hel", 1, token_logprobs=[(-0.5, 313, "Hel")]),
+            engine_chunk("Hello", 2, finish=True),
+        ]
+
+        events = StreamFixture(self._serving(), request).run(chunks)
+        deltas = self._delta_events(events)
+
+        self.assertTrue(deltas)
+        for d in deltas:
+            self.assertEqual(d["logprobs"], [])
+
+    def test_include_list_triggers_streaming_logprobs(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            top_logprobs=0,
+            include=["message.output_text.logprobs"],
+            store=False,
+        )
+        chunks = [
+            engine_chunk("Hi", 1, token_logprobs=[(-0.1, 42, "Hi")]),
+            engine_chunk("Hi", 1, finish=True),
+        ]
+
+        events = StreamFixture(self._serving(), request).run(chunks)
+        deltas = self._delta_events(events)
+
+        self.assertEqual(len(deltas), 1)
+        self.assertEqual(len(deltas[0]["logprobs"]), 1)
+        self.assertEqual(deltas[0]["logprobs"][0]["token"], "Hi")
+        # top_logprobs=0 requests no alternatives: tokenizer_manager only sets
+        # output_top_logprobs when top_logprobs_num > 0, so this slot must carry
+        # no top entries. Assert the None-or-empty contract directly (rather than
+        # len()==0) so the case breaks loudly -- not silently via the builder's
+        # `or []` fallback -- if the manager ever emits top-logprobs unconditionally.
+        self.assertIn(
+            deltas[0]["logprobs"][0]["top_logprobs"],
+            (None, []),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,9 +8,18 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai_harmony import Message, Role
 from utils import make_serving
 
-from sglang.srt.entrypoints.context import SimpleContext
+from sglang.srt.entrypoints.context import (
+    HarmonyContext,
+    SimpleContext,
+    StreamingHarmonyContext,
+)
+from sglang.srt.entrypoints.harmony_utils import (
+    get_streamable_parser_for_assistant,
+    render_for_completion,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     RequestResponseMetadata,
@@ -21,6 +30,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
     _should_emit_normal_text_as_message,
 )
+from sglang.srt.entrypoints.openai.utils import to_responses_output_text_logprobs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.sampling.sampling_params import (
@@ -1013,9 +1023,233 @@ class CancelIdempotencyTestCase(CustomTestCase):
             self.assertEqual(out.status, status)
 
 
-class StreamingLogprobsRejectionTestCase(CustomTestCase):
-    def test_stream_with_logprobs_include_rejected(self):
+class HarmonyLogprobsTestCase(CustomTestCase):
+    """Non-streaming harmony logprobs: capture final-channel content tokens
+    and attach them to the final ResponseOutputText."""
+
+    @staticmethod
+    def _final_answer_tokens(answer_text: str) -> list[int]:
+        """Return the assistant-generated harmony token ids (turn header +
+        final-channel content + <|return|>) for *answer_text*."""
+        sys_msg = Message.from_role_and_content(Role.SYSTEM, "x")
+        user_msg = Message.from_role_and_content(Role.USER, "q")
+        final_msg = Message.from_role_and_content(Role.ASSISTANT, answer_text)
+        final_msg = final_msg.with_channel("final")
+        all_toks = render_for_completion([sys_msg, user_msg, final_msg])
+        prompt_toks = render_for_completion([sys_msg, user_msg])
+        return all_toks[len(prompt_toks) :]
+
+    @staticmethod
+    def _engine_output(token_ids: list[int]) -> dict:
+        """Build an engine chunk whose logprob token_text is the delta each
+        token emits (from an independent parser pass) so captured texts
+        reconstruct the visible answer; structural tokens get a sentinel."""
+        parser = get_streamable_parser_for_assistant()
+        token_logprobs = []
+        for i, tok in enumerate(token_ids):
+            parser.process(tok)
+            delta = parser.last_content_delta
+            token_logprobs.append((-0.1 * i, tok, delta if delta else f"STRUCT{i}"))
+        return {
+            "output_ids": token_ids,
+            "meta_info": {
+                "output_token_logprobs": token_logprobs,
+                "output_top_logprobs": None,
+                "prompt_tokens": 5,
+                "completion_tokens": len(token_ids),
+                "cached_tokens": 0,
+            },
+        }
+
+    def test_append_output_buckets_only_final_channel_content(self):
+        gen_toks = self._final_answer_tokens("Hello!")
+        context = HarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        context.append_output(self._engine_output(gen_toks))
+
+        captured = context.final_token_logprobs
+        # Only the final-channel content tokens survive; their texts reconstruct
+        # the visible answer, proving no reasoning/structural tokens leaked in.
+        self.assertEqual("".join(lp[2] for lp in captured), "Hello!")
+        self.assertTrue(captured)
+        self.assertFalse(any(lp[2].startswith("STRUCT") for lp in captured))
+
+    def test_make_output_items_attaches_logprobs_only_when_requested(self):
+        serving = make_serving()
+        gen_toks = self._final_answer_tokens("Hello!")
+        context = HarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        context.append_output(self._engine_output(gen_toks))
+
+        final_logprobs = to_responses_output_text_logprobs(
+            context.final_token_logprobs, context.final_top_logprobs
+        )
+        items = serving._make_response_output_items_with_harmony(
+            context, final_logprobs=final_logprobs
+        )
+        msg = [i for i in items if isinstance(i, ResponseOutputMessage)]
+        self.assertEqual(len(msg), 1)
+        text_part = msg[0].content[0]
+        self.assertIsInstance(text_part, ResponseOutputText)
+        self.assertIsNotNone(text_part.logprobs)
+        self.assertEqual(len(text_part.logprobs), len(context.final_token_logprobs))
+
+        # No logprobs when the caller passes None (request didn't ask for them).
+        items_none = serving._make_response_output_items_with_harmony(
+            context, final_logprobs=None
+        )
+        text_part_none = [
+            i for i in items_none if isinstance(i, ResponseOutputMessage)
+        ][0].content[0]
+        self.assertIsNone(text_part_none.logprobs)
+
+
+class StreamingHarmonyLogprobsTestCase(CustomTestCase):
+    """Streaming harmony logprobs: bucketing across incremental and cumulative
+    chunks, plus per-chunk delta tracking for the delta event."""
+
+    @staticmethod
+    def _token_info(answer_text: str):
+        """Return (gen_toks, info) where info[i] = (delta, channel) for token i,
+        from an independent parser pass."""
+        gen_toks = HarmonyLogprobsTestCase._final_answer_tokens(answer_text)
+        parser = get_streamable_parser_for_assistant()
+        info = []
+        for tok in gen_toks:
+            parser.process(tok)
+            info.append((parser.last_content_delta, parser.current_channel))
+        return gen_toks, info
+
+    @staticmethod
+    def _lp(i: int, tok: int, delta):
+        return (-0.1 * i, tok, delta if delta else f"STRUCT{i}")
+
+    def test_incremental_chunks_bucket_and_track_delta(self):
+        gen_toks, info = self._token_info("Hello!")
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        for i, tok in enumerate(gen_toks):
+            delta, channel = info[i]
+            ctx.append_output(
+                {
+                    "output_ids": [tok],
+                    "meta_info": {"output_token_logprobs": [self._lp(i, tok, delta)]},
+                }
+            )
+            # delta_token_logprobs holds the final-content tokens added in this
+            # chunk (one token per chunk here); empty when the chunk added none.
+            if channel == "final" and delta:
+                self.assertEqual(len(ctx.delta_token_logprobs), 1)
+                self.assertEqual(
+                    ctx.delta_token_logprobs[0][2], self._lp(i, tok, delta)[2]
+                )
+            else:
+                self.assertEqual(ctx.delta_token_logprobs, [])
+
+        self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
+
+    def test_cumulative_chunks_slice_logprobs_without_duplication(self):
+        gen_toks, info = self._token_info("Hello!")
+        all_lps = [self._lp(i, tok, info[i][0]) for i, tok in enumerate(gen_toks)]
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        # Cumulative streaming: each chunk re-sends all tokens so far; the
+        # context must process only the new slice each step.
+        for n in range(1, len(gen_toks) + 1):
+            ctx.append_output(
+                {
+                    "output_ids": gen_toks[:n],
+                    "meta_info": {
+                        "output_token_logprobs": all_lps[:n],
+                        "completion_tokens": n,
+                    },
+                }
+            )
+        # Correct slicing => each final-content token captured exactly once.
+        self.assertEqual("".join(lp[2] for lp in ctx.final_token_logprobs), "Hello!")
+
+    def test_multi_token_chunk_delta_slice_keeps_every_token(self):
+        """Regression guard for the harmony streaming delta path: when a single
+        chunk carries several final-channel content tokens (normal batched
+        decode, or a multi-byte char spanning decode steps), delta_token_logprobs
+        must hold one entry per token -- not just the last. Previously the delta
+        event pinned a single logprob to the whole multi-token delta string, so
+        len(logprobs) != len(delta tokens) and aligning clients got garbage."""
+        gen_toks, info = self._token_info("Hello wonderful world")
+        final_deltas = [
+            info[i][0]
+            for i in range(len(gen_toks))
+            if info[i][1] == "final" and info[i][0]
+        ]
+        # The answer must actually span >=2 final tokens for the guard to bite.
+        self.assertGreaterEqual(len(final_deltas), 2)
+        all_lps = [self._lp(i, tok, info[i][0]) for i, tok in enumerate(gen_toks)]
+        ctx = StreamingHarmonyContext(
+            [
+                Message.from_role_and_content(Role.SYSTEM, "x"),
+                Message.from_role_and_content(Role.USER, "q"),
+            ],
+            {},
+        )
+        # Incremental mode (no completion_tokens): the whole batch is new in a
+        # single append_output call.
+        ctx.append_output(
+            {
+                "output_ids": gen_toks,
+                "meta_info": {"output_token_logprobs": all_lps},
+            }
+        )
+        # Every final-content token of this chunk is in the per-chunk slice...
+        self.assertEqual([lp[2] for lp in ctx.delta_token_logprobs], final_deltas)
+        # ...and it matches the fully-accumulated list, since this is the only
+        # chunk fed so far.
+        self.assertEqual(
+            [lp[2] for lp in ctx.delta_token_logprobs],
+            [lp[2] for lp in ctx.final_token_logprobs],
+        )
+        # The delta text is the concatenation of every final token's piece -- one
+        # per logprob entry -- not just the last token's. This is what keeps the
+        # delta string aligned with len(delta_token_logprobs); the parser's own
+        # last_content_delta would only be "world" here.
+        self.assertEqual(ctx.delta_text, "".join(final_deltas))
+        # Sanity: delta_text is strictly longer than the last token's piece, which
+        # is the value the pre-fix code would have shipped.
+        self.assertGreater(len(ctx.delta_text), len(final_deltas[-1]))
+
+
+class StreamingLogprobsAcceptedTestCase(CustomTestCase):
+    def test_stream_with_logprobs_include_not_rejected(self):
+        # Streaming + logprobs used to short-circuit to a 400 at validation
+        # ("logprobs are not supported in streaming mode"). That rejection must
+        # stay lifted. The other stream tests drive the generator directly and
+        # bypass validation, so this is the only case guarding the rejection.
+        #
+        # The mock tokenizer fails later in request prep and create_responses
+        # returns that as an ORJSONResponse -- but its message is never the
+        # logprobs-rejection text. If the rejection were re-added, this would
+        # return a 400 whose message starts with "logprobs are not supported".
         import orjson
+        from fastapi.responses import ORJSONResponse
 
         serving = make_serving()
         request = ResponsesRequest(
@@ -1026,9 +1260,12 @@ class StreamingLogprobsRejectionTestCase(CustomTestCase):
             include=["message.output_text.logprobs"],
         )
         result = asyncio.run(serving.create_responses(request))
-        self.assertEqual(result.status_code, 400)
-        body = orjson.loads(result.body)
-        self.assertIn("streaming mode", body["error"]["message"])
+
+        if isinstance(result, ORJSONResponse):
+            body = orjson.loads(result.body)
+            # Error envelope nests under "error"; read the message wherever it is.
+            err = body.get("error", body)
+            self.assertNotIn("logprobs are not supported", err["message"])
 
 
 if __name__ == "__main__":

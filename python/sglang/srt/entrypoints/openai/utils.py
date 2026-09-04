@@ -2,6 +2,11 @@ import logging
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
+from openai.types.responses import (
+    response_output_text,
+    response_text_delta_event,
+    response_text_done_event,
+)
 
 from sglang.srt.entrypoints.openai.protocol import (
     CachedTokensDetails,
@@ -50,6 +55,102 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+def _build_responses_logprobs(
+    output_token_logprobs,
+    output_top_logprobs,
+    *,
+    logprob_cls,
+    top_logprob_cls,
+    include_bytes: bool,
+) -> Optional[List[Any]]:
+    """Instantiate OpenAI Responses ``Logprob`` models from internal tuples.
+
+    Each entry in *output_token_logprobs* is a ``(logprob, token_id, token_text)``
+    tuple produced by ``TokenizerManager.detokenize_logprob_tokens``; each entry
+    in *output_top_logprobs* is the matching list of top-k tuples, or ``None``.
+
+    The OpenAI SDK defines a *separate* ``Logprob`` class per event module
+    (``response_output_text``, ``response_text_delta_event``,
+    ``response_text_done_event``). They are not interchangeable -- Pydantic
+    rejects cross-module instances -- and the content-item shape carries a
+    ``bytes`` field the event shapes lack. Callers therefore pick the exact
+    pair of classes via the three ``to_responses_*`` wrappers below, which bind
+    the right classes and byte handling for their consuming type.
+    """
+    if not output_token_logprobs:
+        return None
+
+    def entry_kwargs(logprob, token_text) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"token": token_text, "logprob": logprob}
+        if include_bytes:
+            kwargs["bytes"] = list(token_text.encode("utf-8"))
+        return kwargs
+
+    result: List[Any] = []
+    # Align by index, not zip_longest: output_top_logprobs is positionally
+    # sparse (None where a token has no top-k), and a length divergence between
+    # the two lists must not shift later top entries onto the wrong token. Pad
+    # missing/short positions with None rather than re-indexing.
+    for i, (logprob, _token_id, token_text) in enumerate(output_token_logprobs):
+        top = (
+            output_top_logprobs[i]
+            if output_top_logprobs is not None and i < len(output_top_logprobs)
+            else None
+        )
+        top_entries = []
+        if top is not None:
+            for tp_logprob, _tp_token_id, tp_token_text in top:
+                top_entries.append(
+                    top_logprob_cls(**entry_kwargs(tp_logprob, tp_token_text))
+                )
+        result.append(
+            logprob_cls(**entry_kwargs(logprob, token_text), top_logprobs=top_entries)
+        )
+    return result
+
+
+def to_responses_output_text_logprobs(
+    output_token_logprobs=None,
+    output_top_logprobs=None,
+) -> Optional[List[response_output_text.Logprob]]:
+    """Logprobs for ``ResponseOutputText`` -- content-item shape (with bytes)."""
+    return _build_responses_logprobs(
+        output_token_logprobs,
+        output_top_logprobs,
+        logprob_cls=response_output_text.Logprob,
+        top_logprob_cls=response_output_text.LogprobTopLogprob,
+        include_bytes=True,
+    )
+
+
+def to_responses_text_delta_logprobs(
+    output_token_logprobs=None,
+    output_top_logprobs=None,
+) -> Optional[List[response_text_delta_event.Logprob]]:
+    """Logprobs for ``ResponseTextDeltaEvent`` -- event shape (no bytes)."""
+    return _build_responses_logprobs(
+        output_token_logprobs,
+        output_top_logprobs,
+        logprob_cls=response_text_delta_event.Logprob,
+        top_logprob_cls=response_text_delta_event.LogprobTopLogprob,
+        include_bytes=False,
+    )
+
+
+def to_responses_text_done_logprobs(
+    output_token_logprobs=None,
+    output_top_logprobs=None,
+) -> Optional[List[response_text_done_event.Logprob]]:
+    """Logprobs for ``ResponseTextDoneEvent`` -- event shape (no bytes)."""
+    return _build_responses_logprobs(
+        output_token_logprobs,
+        output_top_logprobs,
+        logprob_cls=response_text_done_event.Logprob,
+        top_logprob_cls=response_text_done_event.LogprobTopLogprob,
+        include_bytes=False,
+    )
 
 
 def process_hidden_states_from_ret(
