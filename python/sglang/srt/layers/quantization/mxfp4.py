@@ -295,22 +295,6 @@ def dequant_mxfp4(
     return mx.dq_mxfp4(x, scale, float_dtype)
 
 
-@register_custom_op(out_shape="x")
-def quant_dequant_mxfp4(
-    x: torch.Tensor, scale_calculation_mode: str = "even"
-) -> torch.Tensor:
-    try:
-        from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP4 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from err
-
-    return mx.qdq_mxfp4(x, scale_calculation_mode)
-
-
 class Mxfp4Config(QuantizationConfig):
     def __init__(
         self,
