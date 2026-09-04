@@ -25,7 +25,7 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "1024",
     "SGLANG_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
-    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "999999999",
     "PYTHONPATH": f"{MINIMAX_M2_5_EAGLE3_MODEL_PATH}:{os.environ.get('PYTHONPATH', '')}",
 }
 
@@ -35,14 +35,14 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--mem-fraction-static",
     0.63,
     "--max-running-requests",
-    26,
+    24,
     "--reasoning-parser",
     "minimax-append-think",
     "--tool-call-parser",
     "minimax-m2",
     "--enable-prefill-delayer",
     "--prefill-delayer-max-delay-passes",
-    128,
+    30,
     "--prefill-max-requests",
     10,
     "--chunked-prefill-size",
@@ -59,7 +59,6 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     20,
     22,
     24,
-    26,
     "--moe-a2a-backend",
     "ascend_fuseep",
     "--fuseep-mode",
@@ -100,8 +99,8 @@ class TestNPUMiniMaxM2_5W8A8_4P_In64k_Out1k_Prefix90_50ms(
     other_args = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS
     envs = MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS
     dataset_name = "generated-shared-prefix"
-    max_concurrency = 26
-    num_prompts = 104
+    max_concurrency = 24
+    num_prompts = 96
     input_len = 65536
     output_len = 1024
     random_range_ratio = 1

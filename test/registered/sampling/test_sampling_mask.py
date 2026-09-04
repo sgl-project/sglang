@@ -320,8 +320,10 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         ``temperature=1.0`` these are the sampler's distribution, so
         ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
 
-        1. the sampled token is in the returned top-k-bounded mask,
-        2. every mask token is present in the returned top logprobs,
+        1. the sampled token is in the returned mask,
+        2. every mask token is in the returned top logprobs and at or above
+           the top-k cutoff (ties at the cutoff survive, so the mask may
+           exceed ``top_k``),
         3. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
         """
         top_k, top_p = _TOP_K, _TOP_P
@@ -359,8 +361,11 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             mask_set = set(mask)
 
             self.assertIn(output_id, mask_set)
-            self.assertLessEqual(len(mask_set), top_k)
             self.assertTrue(mask_set.issubset(probs))
+            top_k_cutoff = sorted(probs.values(), reverse=True)[top_k - 1]
+            for token_id in mask_set:
+                # 1e-3 slack: the kernel cuts on its own probs, not these logprobs.
+                self.assertGreaterEqual(probs[token_id], top_k_cutoff * (1 - 1e-3))
 
             support_mass = sum(probs[token_id] for token_id in mask_set)
             expected_logprob = math.log(probs[output_id] / support_mass)

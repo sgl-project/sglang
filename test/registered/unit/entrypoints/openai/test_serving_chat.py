@@ -43,6 +43,9 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.sampling.sampling_params import (
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
+)
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -793,6 +796,33 @@ class ServingChatTestCase(unittest.TestCase):
         self.chat._process_messages(req, is_multimodal=False)
 
         self.assertEqual(req.reasoning_effort, "high")
+
+    def test_k2_selected_terminator_reaches_sampling_params(self):
+        self.tm._config_overrides["reasoning_parser"] = "k2_horizon"
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.tm.tokenizer.encode.side_effect = lambda text, **_: (
+            [8, 9] if text == "</ifm|think_fast>" else [1, 2, 3]
+        )
+        req = ChatCompletionRequest(
+            model="IFM/K2-Horizon-7B",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=False)
+        self.assertEqual(processed.reasoning_end_token_ids, [8, 9])
+
+        with patch.object(self.chat, "_process_messages", return_value=processed):
+            adapted, _ = self.chat._convert_to_internal_request(req)
+        self.assertEqual(
+            adapted.sampling_params["custom_params"][
+                REQUEST_REASONING_END_TOKEN_IDS_KEY
+            ],
+            [8, 9],
+        )
 
     def test_kimi_tool_call_keeps_template_default_thinking(self):
         self.template_manager.chat_template_name = None

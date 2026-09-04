@@ -88,7 +88,7 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
         return
     try:
         parallel = get_parallel()
-        rank = f"dp={parallel.attn_dp_rank} " f"tp={parallel.tp_rank}"
+        rank = f"dp={parallel.attn_dp_rank} tp={parallel.tp_rank}"
     except Exception:
         rank = "rank=unknown"
     details = " ".join(f"{key}={value}" for key, value in fields.items())
@@ -271,6 +271,9 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
+    attn_tp_sequence_sharded: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head and LAST hidden capture use only these
@@ -324,6 +327,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,

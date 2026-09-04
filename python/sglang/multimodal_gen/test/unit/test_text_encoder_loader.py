@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -49,6 +50,31 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
+
+
+class TestTextEncoderWeightDiscovery(unittest.TestCase):
+    def test_prepare_weights_prefers_canonical_over_fp16_variant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            canonical = model_dir / "model.safetensors"
+            variant = model_dir / "model.fp16.safetensors"
+
+            canonical.touch()
+            variant.touch()
+
+            (
+                hf_folder,
+                weight_files,
+                use_safetensors,
+            ) = TextEncoderLoader()._prepare_weights(
+                str(model_dir),
+                fall_back_to_pt=True,
+                allow_patterns_overrides=None,
+            )
+
+            self.assertEqual(hf_folder, str(model_dir))
+            self.assertTrue(use_safetensors)
+            self.assertEqual(weight_files, [str(canonical)])
 
 
 class TestTextEncoderClassResolution(unittest.TestCase):
@@ -166,18 +192,22 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         }
 
         loader = TextEncoderLoader()
-        with mock.patch.object(
-            TextEncoderLoader,
-            "resolve_native_transformers_model_class",
-            return_value=transformers_model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
+        with (
+            mock.patch.object(
+                TextEncoderLoader,
+                "resolve_native_transformers_model_class",
+                return_value=transformers_model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
         ):
             encoder = loader.load_native(
                 "/model/text_encoder",
@@ -719,9 +749,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "CLIPTextModel",
             "ThirdPartyTextEncoder",
         ):
-            with self.subTest(architecture=architecture), self.assertRaisesRegex(
-                NativeComponentLoaderRequired,
-                "delegates serialized quant_method='bitsandbytes' checkpoint",
+            with (
+                self.subTest(architecture=architecture),
+                self.assertRaisesRegex(
+                    NativeComponentLoaderRequired,
+                    "delegates serialized quant_method='bitsandbytes' checkpoint",
+                ),
             ):
                 _resolve_and_configure_encoder_quantization(
                     SimpleNamespace(architectures=[architecture], quant_config=None),
