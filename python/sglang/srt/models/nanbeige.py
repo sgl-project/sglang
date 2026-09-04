@@ -77,8 +77,7 @@ class NanbeigeMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -111,21 +110,21 @@ class NanbeigeAttention(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.total_num_heads = config.num_attention_heads
-        assert (
-            self.total_num_heads % tp_size == 0
-        ), "num_attention_heads must be divisible by tp_size."
+        assert self.total_num_heads % tp_size == 0, (
+            "num_attention_heads must be divisible by tp_size."
+        )
         self.num_heads = self.total_num_heads // tp_size
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
 
         self.total_num_kv_heads = config.num_key_value_heads
-        assert (
-            self.total_num_kv_heads >= tp_size
-        ), "num_key_value_heads must be greater than tp_size."
-        assert (
-            self.total_num_kv_heads % tp_size == 0
-        ), "num_key_value_heads must be divisible by tp_size."
+        assert self.total_num_kv_heads >= tp_size, (
+            "num_key_value_heads must be greater than tp_size."
+        )
+        assert self.total_num_kv_heads % tp_size == 0, (
+            "num_key_value_heads must be divisible by tp_size."
+        )
         self.num_kv_heads = config.num_key_value_heads // tp_size
 
         self.q_size = self.num_heads * self.head_dim
@@ -267,9 +266,9 @@ class NanbeigeModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         pp_size = self.pp_group.world_size
-        assert (
-            pp_size == 1
-        ), "The NanbeigeModel only supports a pipeline parallelism (PP) value of 1."
+        assert pp_size == 1, (
+            "The NanbeigeModel only supports a pipeline parallelism (PP) value of 1."
+        )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -608,9 +607,9 @@ class NanbeigeForSequenceClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "NanbeigeForSequenceClassification is only used for embedding"
+        assert get_embedding, (
+            "NanbeigeForSequenceClassification is only used for embedding"
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         logits = self.score(hidden_states)

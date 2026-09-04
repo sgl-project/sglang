@@ -72,7 +72,7 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             elif hasattr(layer, "_forward_mamba"):
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
-        
+
         if isinstance(attn_layer, nn.ModuleList):
             attention_layers.extend(attn_layer)
             mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
