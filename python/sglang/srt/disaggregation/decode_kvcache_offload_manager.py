@@ -27,7 +27,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
 )
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -245,25 +244,9 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
-        kv_committed_len = req.effective_kv_committed_len()
-
-        # Prefill-aligned slots are freed only here, at request finish; freeing
-        # them mid-decode races with concurrent admission over live slots.
-        prefill_len = self._prefill_offloaded_len(req)
-        ranges = []
-        if prefill_len > 0:
-            ranges.append((0, prefill_len))
-        # The incremental part of the request (DSA-aware)
-        ranges.append((prefill_len, kv_committed_len))
-
-        # Over-allocated KV cache slots (e.g. from speculative decoding v2).
-        # Without spec v2, start_p == end_p so this contributes nothing.
-        start_p, end_p = kv_committed_len, req.kv.kv_allocated_len
-        if self.page_size > 1:
-            start_p = ceil_align(start_p, self.page_size)
-        if start_p < end_p:
-            ranges.append((start_p, end_p))
-        self.tree_cache.free_kv_row(req.kv, ranges)
+        # Released only at request finish; a mid-decode free races with
+        # concurrent admission over live slots.
+        self.tree_cache.free_kv_row(req.kv, [(0, req.kv.kv_allocated_len)])
 
         self.req_to_token_pool.free(req)
         req.kv.mark_kv_released()
