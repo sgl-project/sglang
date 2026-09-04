@@ -1805,6 +1805,13 @@ class Scheduler(
 
         rank_consensus_checker.shutdown()
 
+        from sglang.srt.utils.host_shared_memory import (
+            dispose_host_shared_memory_manager,
+        )
+
+        dispose_host_shared_memory_manager()
+
+
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.
 
