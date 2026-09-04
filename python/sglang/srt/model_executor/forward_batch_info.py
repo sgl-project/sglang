@@ -491,6 +491,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
+    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -846,6 +847,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
             watermark_prompt_tail_ids=(
                 model_runner.watermark_state.prompt_tails(batch)
+                if model_runner.watermark_state is not None
+                else None
+            ),
+            watermark_context_hash_history=(
+                model_runner.watermark_state.retracted_context_hashes(batch)
                 if model_runner.watermark_state is not None
                 else None
             ),

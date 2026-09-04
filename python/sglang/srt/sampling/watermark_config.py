@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
 import msgspec
+
+logger = logging.getLogger(__name__)
+
+_MAX_CONFIG_BYTES = 4096
+MAX_WATERMARK_CONTEXT_WINDOW = 64
 
 
 class WatermarkConfigError(ValueError):
@@ -36,11 +44,28 @@ def parse_watermark_key(value: Any) -> int:
 
 def load_watermark_config(path: str) -> WatermarkServerConfig:
     config_path = Path(path).expanduser()
-    if not config_path.is_file():
-        raise WatermarkConfigError("watermark config must be a readable regular file")
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+        descriptor = os.open(config_path, flags)
+        with os.fdopen(descriptor, encoding="utf-8") as config_file:
+            file_stat = os.fstat(config_file.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise WatermarkConfigError(
+                    "watermark config must be a readable regular file"
+                )
+            if stat.S_IMODE(file_stat.st_mode) & 0o077:
+                logger.warning(
+                    "watermark config is readable by group or other users; "
+                    "restrict it to the server account"
+                )
+            payload = config_file.read(_MAX_CONFIG_BYTES + 1)
+    except (OSError, UnicodeError):
+        raise WatermarkConfigError("failed to read watermark config JSON") from None
+    if len(payload.encode("utf-8")) > _MAX_CONFIG_BYTES:
+        raise WatermarkConfigError("watermark config exceeds 4096 bytes")
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as error:
         raise WatermarkConfigError("failed to read watermark config JSON") from error
     if not isinstance(raw, dict):
         raise WatermarkConfigError("watermark config must be a JSON object")
@@ -59,9 +84,9 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
     if (
         isinstance(context_window, bool)
         or not isinstance(context_window, int)
-        or context_window < 1
+        or not 1 <= context_window <= MAX_WATERMARK_CONTEXT_WINDOW
     ):
         raise WatermarkConfigError(
-            "watermark config context_window must be a positive integer"
+            "watermark config context_window must be an integer from 1 to 64"
         )
     return WatermarkServerConfig(key=key, context_window=context_window)

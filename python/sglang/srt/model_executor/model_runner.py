@@ -1927,7 +1927,9 @@ class ModelRunner:
                 : logits_output.next_token_logits.shape[0]
             ]
             watermark_state.init_from_prompt(
-                req_pool_indices, forward_batch.watermark_prompt_tail_ids
+                req_pool_indices,
+                forward_batch.watermark_prompt_tail_ids,
+                forward_batch.watermark_context_hash_history,
             )
             watermark_state.force(
                 logits_output.next_token_logits,
