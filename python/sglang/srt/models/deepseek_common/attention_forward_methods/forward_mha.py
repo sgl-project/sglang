@@ -159,9 +159,10 @@ class DeepseekMHAForwardMixin:
 
             if self.use_dsa:
                 q_lora = self.q_a_layernorm(q)
-                q = self.q_b_proj(q_lora)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
+                # Keep the projection behind the model hook so architectures
+                # with fused or otherwise specialized q_b projections can
+                # override it without branching in the common attention path.
+                q = self.q_b_proj_forward(q_lora)
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
                         self.indexer,
@@ -173,7 +174,7 @@ class DeepseekMHAForwardMixin:
                     )
             else:
                 q = self.q_a_layernorm(q)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                q = self.q_b_proj_forward(q)
 
         else:
             q = self.q_proj(hidden_states)[0].view(
