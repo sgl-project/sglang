@@ -60,6 +60,10 @@ class SRTPlatform(DeviceMixin):
         """Return the graph runner class for this platform."""
         raise NotImplementedError
 
+    def get_full_graph_backend_cls(self) -> type:
+        """Return the full device-graph backend class for this platform."""
+        raise NotImplementedError
+
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
