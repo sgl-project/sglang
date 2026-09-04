@@ -65,7 +65,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
         patch.object(mm_utils, "_get_precomputed_embedding", return_value=embedding),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
-        result, result_mask, result_input_ids = mm_utils.get_embedding_and_mask(
+        result, result_mask, result_input_ids, errors = mm_utils.get_embedding_and_mask(
             data_embedding_func=Mock(),
             embedding_items=[],
             placeholder_tensor=torch.tensor([1]),
@@ -80,6 +80,7 @@ def test_get_embedding_and_mask_uses_offset_count_without_readback():
     assert result is embedding
     assert result_mask is mask
     assert result_input_ids is input_ids
+    assert errors == []
 
 
 def test_get_embedding_and_mask_async_asserts_offset_count():
@@ -140,11 +141,11 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
         patch.object(
             mm_utils,
             "_get_chunked_prefill_embedding",
-            return_value=(embedding, rewritten_input_ids),
+            return_value=(embedding, rewritten_input_ids, []),
         ),
         patch.object(mm_utils, "_get_multimodal_mask", return_value=mask),
     ):
-        result, result_mask, result_input_ids = mm_utils.get_embedding_and_mask(
+        result, result_mask, result_input_ids, errors = mm_utils.get_embedding_and_mask(
             data_embedding_func=Mock(),
             embedding_items=[],
             placeholder_tensor=torch.tensor([1]),
@@ -160,6 +161,7 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
     assert result is embedding
     assert result_mask is mask
     assert result_input_ids is rewritten_input_ids
+    assert errors == []
 
 
 if __name__ == "__main__":
