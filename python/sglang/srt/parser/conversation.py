@@ -638,13 +638,14 @@ def generate_chat_conv(
             if isinstance(message.content, str):
                 conv.system_message = message.content
             elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
-                    raise ValueError("The system message should be a single text.")
-                else:
-                    conv.system_message = getattr(message.content[0], "text", "")
+                system_text = ""
+                for content in message.content:
+                    if getattr(content, "type", None) != "text":
+                        raise ValueError(
+                            "The system message should only contain text parts."
+                        )
+                    system_text += getattr(content, "text", "")
+                conv.system_message = system_text
         elif msg_role == "user":
             # Handle the various types of Chat Request content types here.
             if isinstance(message.content, str):
@@ -709,15 +710,12 @@ def generate_chat_conv(
             if isinstance(message.content, str):
                 parsed_content = message.content
             elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
-                    raise ValueError(
-                        "The assistant's response should be a single text."
-                    )
-                else:
-                    parsed_content = getattr(message.content[0], "text", "")
+                for content in message.content:
+                    if getattr(content, "type", None) != "text":
+                        raise ValueError(
+                            "The assistant message should only contain text parts."
+                        )
+                    parsed_content += getattr(content, "text", "")
             conv.append_message(conv.roles[1], parsed_content)
         else:
             raise ValueError(f"Unknown role: {msg_role}")
