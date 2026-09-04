@@ -1406,10 +1406,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        # One translate for this replay, before either prep branch. It must sit
-        # outside the glue's captured region: that graph records metadata prep
-        # itself, so a translate placed inside would replay frozen at its
-        # capture-time v2p.
+        # One translate per replay, before either prep branch and outside the
+        # glue's captured region: that graph records metadata prep itself, so a
+        # translate inside it would replay frozen at its capture-time v2p.
         self.model_runner.kv_index_translator.rebind_write_loc(
             fb_view, attn_backend, for_capture=True
         )
@@ -1431,9 +1430,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # req_pool_indices / out_cache_loc when the runtime mode is IDLE,
             # so IDLE and active DECODE are different python branches and must
             # not share a captured graph.
-            # Outside the glue's captured region on purpose: the glue graph
-            # records metadata prep itself, so a translate placed inside would
-            # replay frozen at its capture-time v2p.
             self._metadata_glue.run(
                 attn_backend,
                 fb_view,

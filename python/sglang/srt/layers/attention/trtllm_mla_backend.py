@@ -779,9 +779,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode=forward_mode,
             )
 
-        # `rebind_write_loc` already translated straight into the buffer this
-        # backend named via `capture_write_loc_dest`, so out_cache_loc IS that
-        # buffer's live view -- capture-stable, nothing to re-stage.
+        # `out_cache_loc` IS the live view of the buffer this backend named via
+        # `capture_write_loc_dest`, so it is already capture-stable.
         if self.kv_index_translator.is_translating and (
             forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
         ):

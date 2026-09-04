@@ -193,17 +193,6 @@ def bind_inplace(
     bind_inplace_kernel[grid](v, p, v2p, p2v, N, BLOCK=ALLOC_BIND_BLOCK)
 
 
-# ---------------------------------------------------------------------------
-# Fused virtual WRITE loc -> kernel-facing id.
-#
-# The eager form of this is a chain of ~6 torch ops (floor_divide, remainder,
-# take, mul, add, clamp), and ~12 once the DCP owner rule is resolved on top
-# (remainder, eq, floor_divide, zeros_like, where, copy). It runs per forward
-# on the write loc, OUTSIDE any cuda graph, so every op is a real launch on the
-# critical path. That is invisible next to a Hopper decode step and is not
-# next to a Blackwell one, which is why this is one kernel.
-# ---------------------------------------------------------------------------
-
 WRITE_LOC_BLOCK = 512
 
 
@@ -242,12 +231,9 @@ def write_loc_to_kernel_id_kernel(
     mask = offs < N
     loc = tl.load(loc_ptr + offs, mask=mask, other=0).to(tl.int64)
 
-    # Slot 0 is the reserved padding sink in every id space (the allocator's
-    # `min_slot_index` keeps live ids well above it), and the runner pads a
-    # write loc with zeros to mean exactly that. So 0 maps to kernel id 0 and
-    # is NOT sent through v2p: this pool grows DOWN, so `v2p[0]` can name a top
-    # physical page whose id runs past the buffer's rows -- an illegal write,
-    # not merely an out-of-range index.
+    # Slot 0 is the reserved padding sink, and a padded write loc means it, so
+    # 0 maps to kernel id 0 rather than through v2p. This pool grows DOWN, so
+    # `v2p[0]` can name a top page whose id runs past the buffer's rows.
     keep = mask & (loc > 0)
     if DCP_SIZE > 1:
         keep = keep & ((loc % DCP_SIZE) == DCP_RANK)

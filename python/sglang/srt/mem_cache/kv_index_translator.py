@@ -436,25 +436,20 @@ class KVIndexTranslator:
         for_capture: bool = False,
     ) -> None:
         """The WRITE contract's one translate: virtual `out_cache_loc` ->
-        FULL-side kernel-facing ids, exactly once per forward, at
-        attention-metadata-init time.
+        FULL-side kernel-facing ids, once per forward.
 
-        Must run at metadata init and no earlier: a capture-stable destination
-        can only be asked of a backend that is in scope here, padding runs
-        before this point and `torch.cat`s a new tensor that would strand a
-        pointer taken sooner, and a shared buffer filled sooner would race a
-        still-pending previous step under overlap scheduling.
+        Must run at attention-metadata init and no earlier. A capture-stable
+        destination can only be asked of a backend in scope here; padding runs
+        before this point and `torch.cat`s a new tensor, stranding a pointer
+        taken sooner; and a buffer filled sooner races a still-pending step
+        under overlap scheduling.
 
         REBIND, never mutate: the ScheduleBatch's aliased tensor stays VIRTUAL
         for the radix / accept / in-flight machinery that reads it.
 
-        NOT idempotent: a second call would read the ids this one produced and
-        square the page arithmetic, writing outside the pool. Exactly one call
-        site per forward path.
-
-        A missed call site does not corrupt silently: the write doors run
-        `maybe_detect_kernel_facing_loc`, which separates a virtual id from a
-        kernel-facing one (see `utils/async_probe.py`).
+        NOT idempotent, so exactly one call site per forward path: a second
+        call would re-translate its own output and write outside the pool,
+        which the write doors' `maybe_detect_kernel_facing_loc` reports.
         """
         self._index_table_memo = None
         if not self.is_translating:
