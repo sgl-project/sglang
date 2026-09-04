@@ -50,7 +50,36 @@ constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
+#ifdef USE_ROCM
+// HIP reads the second __launch_bounds__ argument as MIN_WARPS_PER_EXECUTION_UNIT
+// -- waves per SIMD -- where CUDA reads it as minBlocksPerMultiprocessor. Spell
+// the ROCm side as what the hardware actually needs: one block resident, which
+// for a 1024-thread block is 16 waves spread over 4 SIMDs, i.e. 4 per SIMD.
+//
+// Do NOT translate kOccupancy into this figure. Reading it as "kOccupancy blocks
+// per CU" gives 8 waves/SIMD, which caps the allocator at 512/8 = 64 VGPRs. On
+// current main that binds nothing -- the seven top-k kernels peak at 57 VGPRs --
+// but combined with a change that pushes them past the cap it forces spills:
+// measured at 63 VGPRs and 108 SGPR spills, of which the kLevel=2 INDICES kernel
+// accounts for 92. It buys nothing in return: the grid is batch_size, at most 72
+// blocks against 256 CUs, so a second resident block per CU is never scheduled
+// on any shape this kernel serves.
+//
+// The wave size is a literal rather than a query. __AMDGCN_WAVEFRONT_SIZE__ was
+// deprecated in ROCm 6.3 and the ROCm 7 compiler no longer defines it in either
+// the device or the host pass, and warpSize is not constexpr, so HIP offers no
+// compile-time replacement. Every target this kernel is built for is CDNA, which
+// is wave64. On a wave32 target the figure would come out too low, which only
+// makes the bound non-binding again -- never over-constrains the allocator.
+inline constexpr uint32_t kSimdsPerCu = 4;      // CDNA: 4 SIMDs per compute unit
+inline constexpr uint32_t kWavefrontSize = 64;  // CDNA: wave64
+inline constexpr uint32_t kWavesPerBlock = kBlockSize / kWavefrontSize;
+inline constexpr uint32_t kMinWavesPerSimd = kWavesPerBlock / kSimdsPerCu;
+static_assert(kMinWavesPerSimd > 0, "kBlockSize must cover at least one wave per SIMD");
+#define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kMinWavesPerSimd)
+#else
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#endif
 #ifndef USE_ROCM
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 #endif
