@@ -3,8 +3,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor import forward_batch_info
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
