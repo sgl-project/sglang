@@ -29,6 +29,8 @@ on:
       - "scripts/ci/list_stage_models.py"
       - "scripts/ci/test_list_stage_models.py"
       - "scripts/ci/stage_models_overrides.json"
+      - "scripts/ci/utils/amd_cache_audit.py"
+      - "scripts/ci/test_amd_cache_audit.py"
       - ".github/workflows/ci-model-inventory.yml"
   schedule:
     # Nightly safety net (09:00 UTC) so the artifact never goes stale even if a
@@ -48,6 +50,11 @@ jobs:
 
       - name: Run extractor unit tests
         run: python3 -m unittest discover -s scripts/ci -p 'test_list_stage_models.py'
+
+      # The AMD cache audit reuses this extractor and is run by no workflow of
+      # its own, so a refactor above would otherwise break it unnoticed.
+      - name: Run AMD cache audit unit tests
+        run: python3 -m unittest discover -s scripts/ci -p 'test_amd_cache_audit.py'
 
       - name: Generate model inventory
         run: |
