@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
 from sglang.srt.utils import (
     empty_context,
+    is_hip,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -65,6 +66,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 def _allocate_decode_buffers(
@@ -243,6 +246,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_hipblas_handle()
 
         # Model-owned communication resources may depend on the resolved
         # request pool and must be compiled/allocated before graph capture.
@@ -289,6 +293,20 @@ class BaseRunner(ABC):
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
         )
+
+    def _pre_initialize_hipblas_handle(self):
+        """Force hipBLAS handle creation before CUDA graph capture on ROCm.
+        Running one tiny matmul here creates the handle on a normal stream so
+        the fallback inside capture reuses it.
+        """
+        if not _is_hip:
+            return
+        try:
+            a = torch.zeros((1, 1), dtype=self.model_runner.dtype, device="cuda")
+            torch.matmul(a, a)
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.warning(f"hipBLAS handle pre-initialization skipped: {e}")
 
     def _pre_initialize_fi_a2a_workspace(self):
         """Allocate the FlashInfer MNNVL all-to-all workspace for the fi_a2a DCP
