@@ -3230,6 +3230,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # Empty (not None) for the leak checker.
         self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
+        self._swa_mapping_may_be_partial = False
 
         logger.info(
             "[unified-memory-pool] UnifiedSWATokenToKVPoolAllocator ready: "
@@ -3661,6 +3662,28 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.free(free_index.detach().to(torch.int64))
         self.full_attn_allocator.clear_inverse_history()
 
+    def free_swa_segment_inplace(self, free_index: torch.Tensor, *, start_pos: int):
+        """Fixed-shape free_swa for a page-aligned out-of-window range: page
+        reps via a stride slice, liveness filter skipped (first-time-freed
+        below the frontier means every virtual page is bound). Partial
+        mappings and unaligned inputs fall back to free_swa's filtering path.
+        """
+        n = free_index.numel()
+        if n == 0:
+            return
+        ps = self.page_size
+        if self._swa_mapping_may_be_partial or start_pos % ps != 0 or n % ps != 0:
+            self.free_swa(free_index, start_pos=start_pos)
+            return
+        v = free_index.detach().to(torch.int64)
+        if ps == 1:
+            reps, free_v_pages = v, v
+        else:
+            reps = v[::ps]
+            free_v_pages = torch.sort(reps // ps).values
+        self.swa_attn_allocator.free(reps, _pages=free_v_pages)
+        self.swa_attn_allocator.clear_inverse_history()
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:
@@ -3746,6 +3769,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.clear()
         self.free_group = None
         self.free_page_reps_group = None
+        self._swa_mapping_may_be_partial = False
 
     # -- Lazy compaction hooks --
 
