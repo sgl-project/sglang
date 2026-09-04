@@ -406,6 +406,27 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 self.assertIn("free_page_reps_group", inspect.getsource(cls))
 
 
+class TestUnifiedSwaFullSideGroup(unittest.TestCase):
+    """The composite skips the SWA parent's group hooks, so it must carry its
+    own full-side pile: a `free_full` inside a group defers and lands at
+    `free_group_end`."""
+
+    def test_full_only_frees_defer_until_group_end(self):
+        from test_unified_swa_shared_virtual_ids import _build
+
+        alloc = _build(64, 32, 2, 4)
+        idx = alloc.alloc(8)
+        alloc.free_swa(idx)
+        before = alloc.full_available_size()
+
+        alloc.free_group_begin()
+        alloc.free_full(idx[:4])
+        alloc.free_full_segment(idx[4:], start_pos=4)
+        self.assertEqual(alloc.full_available_size(), before)
+        alloc.free_group_end()
+        self.assertEqual(alloc.full_available_size(), before + 8)
+
+
 class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
     """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice
     with host-int, page-aligned bounds — the same shape `free_segment` was
