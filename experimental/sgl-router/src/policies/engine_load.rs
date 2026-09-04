@@ -6,11 +6,8 @@
 //! Workers publish a [`LoadStat`] gauge on their dedicated load socket (see
 //! `python/sglang/srt/managers/scheduler_components/load_publisher.py`). The
 //! load subscriber routes those into this table, keyed per
-//! `(worker_url, dp_rank)`; the
-//! cache-aware-zmq policy reads the freshest aggregate per worker as a
-//! truthful load signal, falling back to the router-side in-flight counter
-//! when no fresh snapshot exists (cold start, stale publisher, or a worker
-//! that predates load publishing).
+//! `(worker_url, dp_rank)`. Request handling captures the freshest complete
+//! aggregate and falls back to Router-local load when it is unavailable.
 //!
 //! Load is a *gauge*, not a delta: last value wins, no sequence/replay
 //! semantics. Entries older than [`EngineLoadTable::freshness`] are ignored.
@@ -25,11 +22,10 @@ use dashmap::{DashMap, DashSet};
 use serde::de::{self, Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde::Deserialize;
 
-/// V3 native Cache-Aware 实际消费的每个 rank 负载字段。
+/// Native Cache-Aware 实际消费的每个 rank 负载字段。
 ///
-/// 这组字段追加在 #34608 原有四个 gauge 后面；短帧没有该值，绝不能用于
-/// admission 或 pressure guard。Router 仍可把短帧用于只需要 queue depth 的
-/// `cache_aware_zmq`，但 native `cache_aware` 会 fail closed 到本地负载。
+/// 短帧没有这些值，不能用于 admission 或 pressure guard；native
+/// `cache_aware` 会回退到 Router 本地负载。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCacheRankLoad {
     pub num_waiting_uncached_tokens: u64,
@@ -75,7 +71,7 @@ pub struct EngineWorkerLoad {
     pub captured_at: Instant,
 }
 
-/// 完整 ZMQ monitor 聚合值，字段与 V3 native Cache-Aware 的输入保持一致。
+/// Native Cache-Aware 使用的完整 ZMQ monitor 聚合值。
 ///
 /// `prefill_throughput_tokens_per_s` 和 `estimated_prefill_queue_ms` 只在
 /// 每个 DP rank 都有两个相邻且单调递增的累计样本时出现；counter reset 或首帧
@@ -268,9 +264,8 @@ struct LoadEntry {
 type NativeRankObservation = (LoadStat, Option<NativeCacheRankLoad>, bool, Instant);
 type NativeWorkerObservations = HashMap<u32, NativeRankObservation>;
 
-/// Per-`(worker_url, dp_rank)` engine-reported load. Written by the load
-/// subscriber pump, read by the cache-aware-zmq policy. Shared out of
-/// [`super::kv_events::index::KvEventIndex`] the same way the hash tree is.
+/// Per-`(worker_url, dp_rank)` engine-reported load, written by the load
+/// subscriber pump and captured once at request ingress.
 #[derive(Debug)]
 pub struct EngineLoadTable {
     by_rank: DashMap<(String, u32), LoadEntry>,
@@ -327,9 +322,7 @@ impl EngineLoadTable {
         }
     }
 
-    /// Number of workers expected to publish load. Compared against the size
-    /// of [`Self::snapshot_fresh`] to surface a dead/misconfigured publisher
-    /// (expected > 0 but no fresh snapshots) in logs.
+    /// Number of workers expected to publish load.
     pub fn expected_count(&self) -> usize {
         self.expected
             .iter()
@@ -338,33 +331,14 @@ impl EngineLoadTable {
             .len()
     }
 
-    /// Shared accumulation pass behind [`Self::snapshot_fresh`] and
-    /// [`Self::capture_snapshot`]. It produces the #34608 fields summed across
-    /// ranks and the OLDEST snapshot timestamp — **but only for workers whose
+    /// Shared accumulation pass behind [`Self::capture_snapshot`]. It sums
+    /// fields across ranks and keeps the oldest snapshot timestamp, but only for workers whose
     /// every advertised rank is present and fresh**. A missing or stale rank is
     /// omitted, so the caller falls back to its own load signal. (Summing
     /// only the fresh ranks would make a worker whose other ranks went silent
     /// look misleadingly idle and draw *more* traffic.) Callers that never
-    /// registered expected ranks retain the legacy all-known-ranks rule.
-    /// `snapshot_fresh` and any other consumer walking this same pass can
-    /// never disagree with each other about which workers count as fresh.
-    ///
-    /// The oldest (not newest) rank's timestamp is deliberately what's kept
-    /// alongside the depth: a caller using it as a "dispatches not yet
-    /// reflected in this number" cutoff (see
-    /// `crate::policies::cache_aware_zmq::WorkerLoads::load_of`) needs a
-    /// bound that never treats an unreported dispatch as already-covered —
-    /// the freshest rank's timestamp could do exactly that for whichever
-    /// rank published less recently. This conservatism is one-sided, not
-    /// free: for a multi-rank worker with skewed publish times, a dispatch
-    /// that landed on (and was already reported by) the FRESHER rank can
-    /// get re-added by the caller's cutoff-based correction anyway, since
-    /// that correction has no way to attribute a dispatch to a specific
-    /// rank. That's an accepted, bounded over-count (it biases the wrong
-    /// direction relative to the under-count this method exists to avoid,
-    /// not a correctness hole) rather than something this method can close
-    /// on its own — closing it would require per-rank dispatch attribution,
-    /// which the router-side slot tracking below doesn't have.
+    /// registered expected ranks retain the all-known-ranks rule. The oldest
+    /// timestamp represents the freshness of the complete aggregate.
     fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineWorkerLoad> {
         // url -> rank -> (reported load, fresh, timestamp).
         let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
@@ -550,36 +524,6 @@ impl EngineLoadTable {
         }
     }
 
-    pub(crate) fn fresh_worker_state(&self, now: Instant) -> HashMap<String, (usize, Instant)> {
-        self.fresh_worker_loads(now)
-            .into_iter()
-            .map(|(url, load)| {
-                (
-                    url,
-                    (
-                        load.num_running_reqs
-                            .saturating_add(load.num_waiting_reqs)
-                            .try_into()
-                            .unwrap_or(usize::MAX),
-                        load.captured_at,
-                    ),
-                )
-            })
-            .collect()
-    }
-
-    /// Per worker URL, the summed queue depth (`num_running_reqs +
-    /// num_waiting_reqs`) across that worker's ranks, for workers whose
-    /// every advertised rank is fresh. Computed once per selection so per-worker
-    /// lookups are O(1). See [`Self::fresh_worker_state`] for the freshness
-    /// gate behind this.
-    pub fn snapshot_fresh(&self, now: Instant) -> HashMap<String, usize> {
-        self.fresh_worker_state(now)
-            .into_iter()
-            .map(|(url, (depth, _))| (url, depth))
-            .collect()
-    }
-
     /// Drop every rank entry (and the expected mark) for a worker. Called on
     /// worker removal so a re-added worker does not leave stale load behind.
     pub fn forget_worker(&self, url: &str) {
@@ -671,9 +615,10 @@ mod tests {
         let now = Instant::now();
         t.set("http://w:30000", 0, load(5, 1), now);
         t.set("http://w:30000", 1, load(3, 2), now);
-        let fresh = t.snapshot_fresh(now);
+        let fresh = t.capture_snapshot(now);
         // (5+1) + (3+2) = 11
-        assert_eq!(fresh.get("http://w:30000").copied(), Some(11));
+        let load = fresh.fresh_load_for_url("http://w:30000").unwrap();
+        assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 11);
     }
 
     #[test]
@@ -683,7 +628,10 @@ mod tests {
         t.set("http://w:30000", 0, load(9, 9), old);
         // A read far in the future sees the entry as stale -> worker absent.
         let later = old + Duration::from_secs(60);
-        assert!(!t.snapshot_fresh(later).contains_key("http://w:30000"));
+        assert!(t
+            .capture_snapshot(later)
+            .fresh_load_for_url("http://w:30000")
+            .is_none());
     }
 
     #[test]
@@ -695,8 +643,9 @@ mod tests {
         t.set("http://other:30000", 0, load(1, 0), now);
         t.forget_worker("http://w:30000");
         assert_eq!(t.entry_count(), 1);
-        assert!(!t.snapshot_fresh(now).contains_key("http://w:30000"));
-        assert!(t.snapshot_fresh(now).contains_key("http://other:30000"));
+        let snapshot = t.capture_snapshot(now);
+        assert!(snapshot.fresh_load_for_url("http://w:30000").is_none());
+        assert!(snapshot.fresh_load_for_url("http://other:30000").is_some());
     }
 
     /// A worker with any stale rank is omitted entirely (not summed over only
@@ -710,7 +659,9 @@ mod tests {
         t.set("http://w:30000", 0, load(5, 1), now); // fresh
         t.set("http://w:30000", 1, load(9, 9), stale); // stale
         assert!(
-            !t.snapshot_fresh(now).contains_key("http://w:30000"),
+            t.capture_snapshot(now)
+                .fresh_load_for_url("http://w:30000")
+                .is_none(),
             "any stale rank must drop the whole worker from the snapshot"
         );
     }
@@ -723,44 +674,30 @@ mod tests {
         t.mark_expected_rank("http://w:30000", 1);
         t.set("http://w:30000", 0, load(5, 1), now);
         assert!(
-            !t.snapshot_fresh(now).contains_key("http://w:30000"),
+            t.capture_snapshot(now)
+                .fresh_load_for_url("http://w:30000")
+                .is_none(),
             "an advertised rank without a reading must not produce a partial aggregate"
         );
 
         t.set("http://w:30000", 1, load(3, 2), now);
-        assert_eq!(t.snapshot_fresh(now).get("http://w:30000"), Some(&11));
+        let snapshot = t.capture_snapshot(now);
+        let load = snapshot.fresh_load_for_url("http://w:30000").unwrap();
+        assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 11);
     }
 
     #[test]
-    fn fresh_worker_state_picks_the_earliest_rank_timestamp() {
+    fn capture_snapshot_uses_the_earliest_rank_timestamp() {
         let t = EngineLoadTable::new();
         let earlier = Instant::now() - Duration::from_secs(2);
         let later = earlier + Duration::from_secs(1);
         t.set("http://w:30000", 0, load(5, 1), later);
         t.set("http://w:30000", 1, load(3, 2), earlier);
         let now = later + Duration::from_millis(1);
-        assert_eq!(
-            t.fresh_worker_state(now).get("http://w:30000").copied(),
-            Some((11, earlier)),
-            "must expose the OLDEST rank's timestamp, not the newest"
-        );
-    }
-
-    #[test]
-    fn fresh_worker_state_agrees_with_snapshot_fresh_on_which_workers_are_present() {
-        let t = EngineLoadTable::with_freshness(Duration::from_secs(5));
-        let now = Instant::now();
-        let stale = now - Duration::from_secs(3600);
-        t.set("http://fresh:30000", 0, load(1, 0), now);
-        t.set("http://mixed:30000", 0, load(1, 0), now);
-        t.set("http://mixed:30000", 1, load(1, 0), stale);
-
-        let depths = t.snapshot_fresh(now);
-        let state = t.fresh_worker_state(now);
-        assert!(depths.contains_key("http://fresh:30000"));
-        assert!(state.contains_key("http://fresh:30000"));
-        assert!(!depths.contains_key("http://mixed:30000"));
-        assert!(!state.contains_key("http://mixed:30000"));
+        let snapshot = t.capture_snapshot(now);
+        let load = snapshot.fresh_load_for_url("http://w:30000").unwrap();
+        assert_eq!(load.num_running_reqs + load.num_waiting_reqs, 11);
+        assert_eq!(load.captured_at, earlier);
     }
 
     #[test]

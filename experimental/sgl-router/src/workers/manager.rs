@@ -51,8 +51,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// on every worker add / remove, and an optional active-load registry
 /// that is asked to forget per-worker counters on `Removed`.
 ///
-/// When `kv_index` is `None` the cache-aware-zmq path is disabled
-/// (selection falls through to the non-cache-aware policies); when
+/// When `kv_index` is `None`, KV-event and load-subscriber state is disabled; when
 /// `active_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when

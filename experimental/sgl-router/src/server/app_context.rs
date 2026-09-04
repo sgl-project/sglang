@@ -29,8 +29,7 @@ pub struct AppContext {
     pub active_load: Arc<ActiveLoadRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
-    /// cache-aware-zmq policy (overlap_blocks), active-load registry
-    /// (active_load gauge + stale_requests_total), and PD dispatch.
+    /// active-load registry, policy-specific counters, and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
     pub engine_load: Arc<EngineLoadTable>,
@@ -76,10 +75,8 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
-        // Same rationale for the cache-aware-zmq policy's
-        // `sgl_router_overlap_blocks`: the metrics registry is built here,
-        // after the policy registry, so inject it now. No-op for policies
-        // that don't emit metrics.
+        // The metrics registry is built after the policy registry, so attach
+        // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         Self {
