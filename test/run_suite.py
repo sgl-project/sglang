@@ -32,9 +32,9 @@ HW_MAPPING = {
 PER_COMMIT_SUITES = {
     HWBackend.CPU: [
         "base-a-test-cpu",
-        "base-b-test-cpu",
-        "base-b-tp-test-cpu",
-        "base-c-test-cpu",
+        "stage-a-test-cpu-intel",
+        "stage-a-tp-test-cpu-intel",
+        "stage-b-test-cpu-intel",
         "base-b-test-cpu-arm64",
     ],
     HWBackend.AMD: [
@@ -101,12 +101,8 @@ PER_COMMIT_SUITES = {
         "base-b-test-8-npu-a3",
         "base-b-test-16-npu-a3",
         "base-c-test-acc-2-npu-a3",
-        "base-c-test-acc-4-npu-a3",
-        "base-c-test-acc-8-npu-a3",
         "base-c-test-acc-16-npu-a3",
         "base-c-test-perf-2-npu-a3",
-        "base-c-test-perf-4-npu-a3",
-        "base-c-test-perf-8-npu-a3",
         "base-c-test-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
@@ -181,6 +177,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-1-gpu",
         "nightly-xpu-2-gpu",
         "nightly-xpu-4-gpu",
+        "nightly-xpu-8-gpu",
     ],
 }
 
@@ -424,7 +421,7 @@ def main():
         required=True,
         help=(
             "Test suite to run. Accepts a comma-separated list of suites "
-            "(e.g. 'base-b-test-cpu,base-c-test-cpu'); their tests are unioned "
+            "(e.g. 'stage-a-test-cpu-intel,stage-b-test-cpu-intel'); their tests are unioned "
             "into one pool before partitioning."
         ),
     )

@@ -74,9 +74,9 @@ def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
     token_ids = key.raw_token_ids()
-    assert (
-        isinstance(token_ids, array) and token_ids.typecode == "q"
-    ), f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
+    assert isinstance(token_ids, array) and token_ids.typecode == "q", (
+        f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
+    )
     return token_ids
 
 
@@ -478,9 +478,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, is_write_back: bool
     ) -> EvictDeviceLeafResult:
         # The binding reads is_write_back from the core's construction config.
-        assert (
-            is_write_back == self.is_write_back
-        ), "is_write_back must match the core's construction config"
+        assert is_write_back == self.is_write_back, (
+            "is_write_back must match the core's construction config"
+        )
         binding_result = self._binding.evict_device_leaf(node_id)
         backup = binding_result.backup_kv
         result = EvictDeviceLeafResult(
@@ -928,8 +928,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DropSubtreeNoHostResult(is_dropped=binding_result.dropped)
         return _fill_evict_result(binding_result, result)
 
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        self._binding.mark_write_through_pending(node_id)
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        return self._binding.mark_write_through_pending(list(node_ids), ack_id)
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         self._binding.finish_write_through(list(node_ids), ack_id)
