@@ -391,8 +391,8 @@ do
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
 
         # cp
-        #--enable-nsa-prefill-context-parallel \
-        #--nsa-prefill-cp-mode in-seq-split \
+        #--enable-prefill-cp \
+        #--cp-strategy zigzag \
         #--attn-cp-size 4 \
         NODE_RANK=$i
         break

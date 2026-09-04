@@ -26,7 +26,7 @@ recommended to use v0.5.16 or a later version.
 | Tensor Parallelism            | `--tp-size 32`                                                                                |
 | Data Parallelism              | `--dp-size 8`                                                                                 |
 | Expert Parallelism            | `--ep-size 32 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode low_latency`                             |
-| Context Parallelism           | `--enable-nsa-prefill-context-parallel \`<br/>`--nsa-prefill-cp-mode in-seq-split \`<br/>`--attn-cp-size 32`  |
+| Context Parallelism           | `--enable-prefill-cp \`<br/>`--cp-strategy zigzag \`<br/>`--attn-cp-size 32`  |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4` |
