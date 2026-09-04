@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -9,10 +10,7 @@ from sglang_simulator.simulation.utils import (
     calc_kv_cache_per_layer_elems,
 )
 from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
-from sglang_simulator.time_predictor import (
-    AIConfiguratorTimePredictor,
-    InferTimePredictor,
-)
+from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -36,21 +34,15 @@ class ConfigManager:
     @classmethod
     def resolve_config_relative_path(cls, path: str | None) -> str | None:
         """Resolve predictor assets without depending on the process cwd."""
-        if not path or Path(path).is_absolute():
+        if not path:
             return path
 
-        cwd_candidate = Path(path)
-        if cwd_candidate.exists():
-            return str(cwd_candidate.resolve())
+        path = Path(os.path.expandvars(path)).expanduser()
+        if path.is_absolute():
+            return str(path)
 
         config_path = Path(Envs.config_path()).resolve()
-        for parent in config_path.parents:
-            candidate = parent / path
-            if candidate.exists():
-                return str(candidate)
-
-        # Keep the original value so predictor-specific errors remain clear.
-        return path
+        return str((config_path.parent / path).resolve())
 
     @classmethod
     def reset_config_cache(cls):
@@ -193,7 +185,12 @@ class ConfigManager:
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
-        if predictor_config.get("name") == "aiconfigurator":
+        predictor_name = predictor_config.get("name")
+        if predictor_name == "aiconfigurator":
+            from sglang_simulator.time_predictor.aiconfigurator import (
+                AIConfiguratorTimePredictor,
+            )
+
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
@@ -217,7 +214,7 @@ class ConfigManager:
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
             )
-        elif predictor_config.get("name") == "ml":
+        elif predictor_name == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor
 
             return MLTimePredictor(
@@ -229,7 +226,7 @@ class ConfigManager:
                 ),
                 latency_scale=predictor_config.get("latency_scale", 1.0),
             )
-        elif predictor_config.get("name") == "replay":
+        elif predictor_name == "replay":
             from sglang_simulator.time_predictor.replay import ReplayTimePredictor
 
             return ReplayTimePredictor(
@@ -245,8 +242,27 @@ class ConfigManager:
                 miss_strategy=predictor_config.get("miss_strategy", "zero"),
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
+        elif predictor_name == "infercast":
+            from sglang_simulator.time_predictor.infercast import (
+                InferCastTimePredictor,
+            )
+
+            return InferCastTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                model_id=predictor_config.get("model_id"),
+                systems_root=cls.resolve_config_relative_path(
+                    predictor_config.get("systems_root")
+                ),
+                database_mode=predictor_config.get("database_mode", "SILICON"),
+                attn_kernel_impl=predictor_config.get("attn_kernel_impl"),
+                attn_dtype=predictor_config.get("attn_dtype"),
+                kv_cache_dtype=predictor_config.get("kv_cache_dtype"),
+                provider_revision=predictor_config.get("provider_revision"),
+            )
         else:
             raise ValueError(
-                f"Unknown predictor name: {predictor_config.get('name')}. "
-                f"Supported: aiconfigurator, ml, replay"
+                f"Unknown predictor name: {predictor_name}. "
+                f"Supported: aiconfigurator, ml, replay, infercast"
             )
