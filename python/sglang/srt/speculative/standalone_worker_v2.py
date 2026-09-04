@@ -150,7 +150,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
 
 class StandaloneWorkerV2(EAGLEWorkerV2):
-
     def __init__(
         self,
         server_args: ServerArgs,
