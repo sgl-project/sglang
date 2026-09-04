@@ -793,6 +793,36 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 remaining_logprobs = None
 
+            # P1.7(Moonshot 扩展):思考结束、正文开始之前,单独发一帧
+            # reasoning_content=""(空串)作为结束边界,让客户端准确切换
+            # "思考中 → 正文"。状态挂在 per-index 的 parser 包装对象上:
+            # _k3_reasoning_seen = 已发过非空思考增量;_k3_boundary_sent = 边界已发。
+            # 触发条件:detector 已离开思考区(或流收尾),且之后不再有 reasoning。
+            if self.chat_encoding_spec == "kimi_k3":
+                parser = reasoning_parser_dict.get(index)
+                if parser is not None:
+                    if reasoning_text:
+                        parser._k3_reasoning_seen = True
+                    reasoning_over = not getattr(
+                        parser.detector, "_in_reasoning", False
+                    ) or (
+                        finish_reason_type is not None
+                        and finish_reason_type != "abort"
+                    )
+                    if (
+                        getattr(parser, "_k3_reasoning_seen", False)
+                        and not getattr(parser, "_k3_boundary_sent", False)
+                        and reasoning_over
+                    ):
+                        parser._k3_boundary_sent = True
+                        yield build_sse_content(
+                            chunk_id=self._wire_id(content["meta_info"]["id"]),
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            reasoning_content="",
+                        )
+
         # Handle tool calls
         if self._tool_call_parsing_active(request):
             async for chunk in self._process_tool_call_stream(
