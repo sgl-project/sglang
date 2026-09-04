@@ -742,9 +742,28 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(
-            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
-        )
+        # Only HybridController needs the producer route. Under overlap this
+        # callback is delayed by one iteration, so Hybrid results carry their
+        # route instead of reading the controller's current state. Leaf workers
+        # keep the route-free BaseSpecWorker protocol.
+        if result.spec_route is None:
+            self.model_worker.on_verify_complete_cpu(
+                result.num_correct_drafts_per_req_cpu,
+                batch_size=len(batch.reqs),
+            )
+        else:
+            self.model_worker.on_verify_complete_cpu(
+                result.num_correct_drafts_per_req_cpu,
+                batch_size=len(batch.reqs),
+                route=result.spec_route,
+            )
+
+        if hasattr(self.model_worker, "update_hybrid_stats"):
+            self.model_worker.update_hybrid_stats(
+                result.spec_route,
+                result,
+                batch.forward_mode.is_decode() and not batch.is_extend_in_batch,
+            )
 
         # Advance the grammar FSM over this batch's committed tokens (idempotent):
         # the EAGLE overlap path already did this inside verify() via the grammar
@@ -752,7 +771,6 @@ class SchedulerBatchResultProcessor:
         # grammar (the queued batch.copy() does not carry has_grammar) and consumes
         # result.grammar_retained_tokens below instead of re-advancing.
         self.advance_grammar_fsm(result, batch)
-
         predict_tokens = []
         for i, req in enumerate(batch.reqs):
             accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
@@ -762,6 +780,7 @@ class SchedulerBatchResultProcessor:
                 # kv_committed_len already holds the committed prefix.
                 pass
             else:
+                previous_kv_committed_len = req.kv.kv_committed_len
                 if req.grammar is not None:
                     # FSM already advanced + truncated by advance_grammar_fsm; reuse
                     # the retained (grammar-legal) run instead of advancing again.
@@ -781,6 +800,18 @@ class SchedulerBatchResultProcessor:
                 if cap_lens is not None:
                     req.spec_num_cap_tokens += cap_lens[i]
                     req.update_spec_cap_lens_histogram(cap_lens[i])
+
+                if req.kv.kv_committed_len > req.kv.kv_allocated_len:
+                    raise RuntimeError(
+                        "Spec result committed beyond its KV reservation: "
+                        f"rid={req.rid}, batch_index={i}, route={result.spec_route}, "
+                        f"stride={stride}, accept_lens={accept_lens}, "
+                        f"previous_kv_committed_len={previous_kv_committed_len}, "
+                        f"kv_committed_len={req.kv.kv_committed_len}, "
+                        f"kv_allocated_len={req.kv.kv_allocated_len}, "
+                        f"req_rids={[item.rid for item in batch.reqs]}, "
+                        f"req_pool_indices={batch.req_pool_indices.cpu().tolist()}"
+                    )
 
             predict_tokens.append(accept_tokens)
 

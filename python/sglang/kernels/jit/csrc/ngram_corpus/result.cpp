@@ -122,7 +122,9 @@ Result combineRootResults_(int last_token, int draft_token_num, const Result& pr
     merged_paths.emplace_back(path);
   }
 
-  return buildResultFromLeafPaths_(last_token, draft_token_num, merged_paths);
+  auto combined = buildResultFromLeafPaths_(last_token, draft_token_num, merged_paths);
+  combined.match_len = std::max(primary.match_len, secondary.match_len);
+  return combined;
 }
 
 void Result::truncate(size_t n) {

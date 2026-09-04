@@ -3,6 +3,8 @@ import os
 import tempfile
 import unittest
 import uuid
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 
@@ -50,11 +52,12 @@ def _batch_get(
     corpus: NgramCorpus,
     batch_tokens: list[list[int]],
 ):
-    return corpus.batch_get(
+    ids, masks, _match_lens = corpus.batch_get(
         req_ids=[uuid.uuid4().hex for _ in range(len(batch_tokens))],
         batch_tokens=batch_tokens,
         total_lens=[len(tokens) for tokens in batch_tokens],
     )
+    return ids, masks
 
 
 def _batch_get_with_state(
@@ -63,7 +66,8 @@ def _batch_get_with_state(
     current_tokens: list[int],
     total_len: int,
 ):
-    return corpus.batch_get([req_id], [current_tokens], [total_len])
+    ids, masks, _match_lens = corpus.batch_get([req_id], [current_tokens], [total_len])
+    return ids, masks
 
 
 class _IntTokenizer:
@@ -176,6 +180,46 @@ class TestNgramCorpusBFS(CustomTestCase):
 
     def test_masks(self):
         np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_BFS_MASKS)
+
+    def test_match_lengths(self):
+        _, _, match_lens = self.corpus.batch_get(
+            req_ids=[uuid.uuid4().hex for _ in QUERY_SEQUENCES],
+            batch_tokens=QUERY_SEQUENCES,
+            total_lens=[len(tokens) for tokens in QUERY_SEQUENCES],
+        )
+        self.assertEqual(match_lens.tolist(), [3, 2, 0])
+
+
+class TestNgramWorkerCorpusSync(CustomTestCase):
+    def test_extend_uses_request_range(self):
+        from sglang.srt.speculative.ngram_worker import NGRAMWorker
+        from sglang.srt.utils.common import Range
+
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 4
+        worker.ngram_corpus = MagicMock()
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(
+                    origin_input_ids=list(range(6)),
+                    prefix_indices=[10, 11],
+                    extend_range=Range(2, 4),
+                    extend_batch_idx=1,
+                ),
+                SimpleNamespace(
+                    origin_input_ids=list(range(10)),
+                    prefix_indices=[10, 11, 12, 13, 14],
+                    extend_range=Range(5, 8),
+                    extend_batch_idx=2,
+                ),
+            ]
+        )
+
+        worker._insert_extend_into_ngram_corpus(batch)
+
+        worker.ngram_corpus.batch_put.assert_called_once_with(
+            [[0, 1, 2, 3], [2, 3, 4, 5, 6, 7]]
+        )
 
 
 class TestNgramCorpusProb(CustomTestCase):

@@ -930,6 +930,7 @@
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",
               "docs/advanced_features/adaptive_speculative_decoding",
+              "docs/advanced_features/hybrid_speculative_decoding",
               "docs/advanced_features/structured_outputs",
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",

@@ -116,6 +116,10 @@ class EagleDraftWorkerBase(ABC):
         self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         self._capture_cuda_graphs()
 
+    def init_hybrid_draft_extend_widths(self, widths: tuple[int, ...]) -> None:
+        """Pre-initialize draft-extend resources needed for Hybrid source widths."""
+        return None
+
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
@@ -352,3 +356,33 @@ class BaseSpecWorker(ABC):
         the runtime state before each draft round.
         """
         pass
+
+    def get_retrieval_info(self, batch) -> tuple[list[int], list[int]]:
+        """Prepare retrieval drafts and return real per-request suffix continuations.
+
+        The worker owns the algorithm-specific corpus lookup. If the controller
+        selects retrieval for this batch, its subsequent forward must reuse the
+        prepared drafts rather than repeat the lookup. Returns a
+        ``(continuation_lengths, match_lens)`` pair: ``continuation_lengths`` is
+        the per-request non-padding draft length, and ``match_lens`` is the
+        per-request longest expandable corpus suffix-match depth backing that
+        draft.
+        """
+        raise NotImplementedError
+
+    def update_runtime_state_from_hybrid(
+        self,
+        batch,
+        batch_result,
+        bonus_tokens: torch.Tensor | None = None,
+        source_draft_token_num: int | None = None,
+    ) -> None:
+        """Update local runtime state after another Hybrid worker executed a batch.
+
+        ``bonus_tokens`` lets neural draft workers update draft KV and hidden
+        states after retrieval verify. Retrieval workers consume the accept path
+        in ``batch_result`` to update corpus and match-trie state; on extend
+        they index the prompt prefix visible in this batch. Implementations must
+        not execute a second target forward.
+        """
+        raise NotImplementedError

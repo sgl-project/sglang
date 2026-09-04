@@ -736,7 +736,16 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
+            # EAGLE reuses the target-side embeddings for draft prefill. The
+            # target model may mutate its input in place (for example, through
+            # fused residual/RMSNorm), so preserve the pre-forward values for
+            # the draft worker instead of handing it the aliased tensor.
+            forward_batch.mm_input_embeds = (
+                input_embeds.clone()
+                if forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_eagle()
+                else input_embeds
+            )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -77,8 +78,22 @@ def _resolve_eagle_aux_hidden_state(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
+    hybrid_neural_is_eagle3 = False
+    if spec_algorithm.is_hybrid():
+        try:
+            hybrid_config = json.loads(get_spec().speculative_hybrid_config)
+        except (TypeError, json.JSONDecodeError):
+            hybrid_config = {}
+        hybrid_neural_is_eagle3 = (
+            str(hybrid_config.get("neural", {}).get("algorithm", "")).upper()
+            == "EAGLE3"
+        )
     if (
-        (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
+        (
+            spec_algorithm.is_eagle()
+            or spec_algorithm.is_standalone()
+            or hybrid_neural_is_eagle3
+        )
         and not is_draft_worker
         and get_spec().speculative_draft_model_path
     ):
@@ -108,7 +123,7 @@ def _resolve_eagle_aux_hidden_state(
                 draft_model_config.swa_attention_layer_ids
             )
 
-        if spec_algorithm.is_eagle3():
+        if spec_algorithm.is_eagle3() or hybrid_neural_is_eagle3:
             config.eagle_use_aux_hidden_state = True
             try:
                 eagle_config = getattr(
@@ -120,7 +135,7 @@ def _resolve_eagle_aux_hidden_state(
                 config.eagle_aux_hidden_state_layer_ids = eagle_config[
                     "eagle_aux_hidden_state_layer_ids"
                 ]
-            except:
+            except (AttributeError, KeyError, TypeError):
                 # if there is no aux layer, set to None
                 config.eagle_aux_hidden_state_layer_ids = None
 

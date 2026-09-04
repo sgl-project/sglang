@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.hybrid_info import HybridVerifyInput
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -40,7 +41,7 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     algo = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    if algo.is_ngram():
+    if algo.is_ngram() or algo.is_hybrid():
         # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
         # the tree mask, regardless of the attn backend (e.g. Triton opts out).
         return True
@@ -165,6 +166,14 @@ class RelayPayload:
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
         )
+
+    @classmethod
+    def from_hybrid(cls, draft_input: HybridVerifyInput) -> RelayPayload:
+        eagle_payload = cls.from_draft_input(draft_input.eagle_draft_input)
+        ngram_payload = cls.from_ngram(draft_input.ngram_verify_input)
+        eagle_payload.accept_tokens = ngram_payload.accept_tokens
+        eagle_payload.accept_lens = ngram_payload.accept_lens
+        return eagle_payload
 
 
 class ConfidenceRelay(msgspec.Struct):
@@ -404,17 +413,29 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if self.spec_algo.is_ngram():
+        if self.spec_algo.is_hybrid():
             draft_input = batch.spec_info
-            if draft_input is None or draft_input.future_indices is None:
+            if draft_input is None:
                 return
-            indices = draft_input.future_indices
-            if indices.shape[0] == 0:
-                return
-            draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
-            draft_input.accept_lens = self.accept_lens_buf[indices]
+            self._resolve_ngram_input(draft_input.ngram_verify_input)
+            self._resolve_draft_input(draft_input.eagle_draft_input)
             return
-        draft_input: EagleDraftInput = batch.spec_info
+        if self.spec_algo.is_ngram():
+            self._resolve_ngram_input(batch.spec_info)
+            return
+
+        self._resolve_draft_input(batch.spec_info)
+
+    def _resolve_ngram_input(self, draft_input: NgramVerifyInput) -> None:
+        if draft_input is None or draft_input.future_indices is None:
+            return
+        indices = draft_input.future_indices
+        if indices.shape[0] == 0:
+            return
+        draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
+        draft_input.accept_lens = self.accept_lens_buf[indices]
+
+    def _resolve_draft_input(self, draft_input: EagleDraftInput) -> None:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
@@ -598,11 +619,25 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        if self.spec_algo.is_ngram():
-            self._maybe_init_ngram_bufs(payload)
-            self.accept_tokens_buf[indices] = payload.accept_tokens
-            self.accept_lens_buf[indices] = payload.accept_lens
+        if self.spec_algo.is_hybrid():
+            self._stash_ngram(indices, payload)
+            self._stash_draft(indices, payload)
             return
+        if self.spec_algo.is_ngram():
+            self._stash_ngram(indices, payload)
+            return
+        self._stash_draft(indices, payload)
+
+    def _stash_ngram(self, indices: torch.Tensor, payload: RelayPayload) -> None:
+        self._maybe_init_ngram_bufs(payload)
+        self.accept_tokens_buf[indices] = payload.accept_tokens.to(
+            self.accept_tokens_buf.dtype
+        )
+        self.accept_lens_buf[indices] = payload.accept_lens.to(
+            self.accept_lens_buf.dtype
+        )
+
+    def _stash_draft(self, indices: torch.Tensor, payload: RelayPayload) -> None:
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(

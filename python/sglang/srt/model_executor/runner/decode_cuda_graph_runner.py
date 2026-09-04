@@ -1521,6 +1521,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_hybrid()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

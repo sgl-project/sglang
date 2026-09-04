@@ -1630,17 +1630,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
         self.capture_aux_hidden_states = True
         self.model.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [
+            layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
-            ]  # Specific layers for EAGLE3 support
+            ]
         else:
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            layers_to_capture = [val + 1 for val in layer_ids]
+
+        if hasattr(self.model, "set_eagle3_layers_to_capture"):
+            self.model.set_eagle3_layers_to_capture(layers_to_capture)
+        else:
+            self.model.layers_to_capture = layers_to_capture
 
 
 def _require_vision(model) -> None:

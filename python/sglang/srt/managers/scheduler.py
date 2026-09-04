@@ -1025,13 +1025,17 @@ class Scheduler(
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
-        if self.spec_algorithm.is_ngram():
+        if self.spec_algorithm.is_ngram() or self.spec_algorithm.is_hybrid():
             from sglang.srt.speculative.external_corpus_manager import (
                 ExternalCorpusManager,
             )
 
             self.external_corpus_manager = ExternalCorpusManager(
-                self.draft_worker,
+                (
+                    self.draft_worker.retrieval_worker
+                    if self.spec_algorithm.is_hybrid()
+                    else self.draft_worker
+                ),
                 self.ipc_channels.send_to_tokenizer.send_output,
             )
         else:
@@ -4375,6 +4379,11 @@ class Scheduler(
         batch_result: GenerationBatchResult,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
+        if self.spec_algorithm.is_hybrid():
+            if batch_result.next_draft_input is not None:
+                payload = RelayPayload.from_hybrid(batch_result.next_draft_input)
+                self.future_map.stash(future_indices, payload)
+            return
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)

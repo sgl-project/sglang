@@ -1366,6 +1366,41 @@ class TestBuildPrefillRegistry(unittest.TestCase):
         )
         self.assertIs(fb_view.input_embeds, embeds)
 
+    def test_text_only_draft_can_allocate_registered_input_embeds(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_prefill_registry,
+        )
+        from sglang.srt.model_executor.runner_utils.buffers import (
+            PrefillInputBuffers,
+        )
+
+        buffers = PrefillInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_tokens=8,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=4,
+            dtype=torch.float32,
+            enable_mamba_track=False,
+            enable_input_embeds=True,
+        )
+        reg = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=2,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=4,
+            embed_dtype=torch.float32,
+            register_input_embeds=True,
+            share_pool=False,
+            source=buffers,
+        )
+
+        self.assertIs(reg.get_slot("input_embeds").buffer, buffers.input_embeds)
+        self.assertFalse(reg.has_slot("mrope_positions"))
+
 
 class TestPrefillNumTokenNonPaddedPostFill(unittest.TestCase):
     """The prefill registry must re-derive the attn-TP-local pad boundary from

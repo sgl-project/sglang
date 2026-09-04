@@ -524,13 +524,15 @@ def run_eagle_verify(
         # Some values such as custom_mask and position depend on the output of draft,
         # so the previous plan step used the wrong values. Here, we need to run the related
         # computation again to update them to the correct values.
-        target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+        target_attn_backend = target_worker.model_runner.attn_backend
+        cuda_graph_runner = getattr(
+            verify_forward_batch,
+            "cuda_graph_runner",
+            target_worker.model_runner.decode_cuda_graph_runner,
+        )
+        target_attn_backend.update_verify_buffers_to_fill_after_draft(
             verify_input,
-            (
-                target_worker.model_runner.decode_cuda_graph_runner.bs
-                if can_run_cuda_graph
-                else None
-            ),
+            (cuda_graph_runner.bs if can_run_cuda_graph else None),
         )
 
     # Must stay ahead of the target verify launch below.

@@ -574,18 +574,16 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
     )
 
-    # Run attention backend plan and cuda graph preparation
+    # The active speculative runtime state installs its verify graph before
+    # this preparation step, following the adaptive runtime-state contract.
+    cuda_graph_runner = target_worker.model_runner.decode_cuda_graph_runner
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
-        and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-            verify_forward_batch
-        )
+        cuda_graph_runner and cuda_graph_runner.can_run_graph(verify_forward_batch)
     )
     if can_run_cuda_graph:
-        target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-            verify_forward_batch
-        )
+        cuda_graph_runner.load_batch(verify_forward_batch)
         verify_forward_batch.mark_forward_metadata_ready()
+        verify_forward_batch.cuda_graph_runner = cuda_graph_runner
     # Non-cuda-graph: defer init to forward_extend, which runs after
     # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
     # here would use pre-pad shapes and trip DSv4 indexer shape match.
@@ -973,8 +971,6 @@ def eagle_sample(
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

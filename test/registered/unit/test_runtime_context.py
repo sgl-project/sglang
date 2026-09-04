@@ -534,6 +534,7 @@ class _FakeResolvedArgs:
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
     speculative_adaptive_config: A[str | None, Arg(help="c"), NS("spec")] = None
+    speculative_hybrid_config: A[str | None, Arg(help="hc"), NS("spec")] = None
     load_format: A[str, Arg(help="lf"), NS("model")] = "auto"
     remote_instance_weight_loader_backend: A[str, Arg(help="rb"), NS("model")] = "nccl"
     remote_instance_weight_loader_start_seed_via_transfer_engine: A[
@@ -1343,6 +1344,23 @@ class TestAdaptiveDraftBoundLifecycle(_IsolatedServerArgs):
             )
         )
         self.assertEqual(max_speculative_num_draft_tokens(), 7)
+
+
+class TestHybridDraftBound(_IsolatedServerArgs):
+    def test_largest_worker_width_wins(self):
+        get_context().set_server_args(
+            _FakeResolvedArgs(
+                speculative_algorithm="HYBRID",
+                speculative_num_draft_tokens=3,
+                speculative_hybrid_config=json.dumps(
+                    {
+                        "retrieval": {"speculative_num_draft_tokens": 5},
+                        "neural": {"speculative_num_draft_tokens": 4},
+                    }
+                ),
+            )
+        )
+        self.assertEqual(max_speculative_num_draft_tokens(), 5)
 
 
 class TestNamedAccessorsCallWhatTheyWrap(CustomTestCase):

@@ -226,6 +226,9 @@ Result Trie::buildRecency(
     MatchState& state,
     size_t total_len) const {
   auto anchors = match(context, len, state, total_len);
+  int32_t max_d = 0;
+  if (anchors.size()) max_d = anchors[0].second;
+
   const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
   double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
 
@@ -260,7 +263,9 @@ Result Trie::buildRecency(
     }
   }
 
-  return fillResult(last_token, draft_token_num + 1, tree, root);
+  auto info = fillResult(last_token, draft_token_num + 1, tree, root);
+  info.match_len = max_d;
+  return info;
 }
 
 Result Trie::buildFrequency(
@@ -272,6 +277,9 @@ Result Trie::buildFrequency(
     MatchState& state,
     size_t total_len) const {
   auto anchors = match(context, len, state, total_len);
+  int32_t max_d = 0;
+  if (anchors.size()) max_d = anchors[0].second;
+
   struct CompareByLastDouble {
     bool operator()(
         const std::tuple<double, const TrieNode*, double>& a,
@@ -327,7 +335,9 @@ Result Trie::buildFrequency(
     }
   }
 
-  return fillResult(last_token, draft_token_num + 1, tree, root);
+  auto info = fillResult(last_token, draft_token_num + 1, tree, root);
+  info.match_len = max_d;
+  return info;
 }
 
 }  // namespace ngram

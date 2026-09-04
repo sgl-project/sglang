@@ -35,6 +35,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **You have a DFlash draft checkpoint**: Use **DFLASH** with `--speculative-algorithm DFLASH` and `--speculative-draft-model-path ...`.
 - **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
+- **Acceptance varies between repetitive and open-ended batches**: Use [**Hybrid speculative decoding**](./hybrid_speculative_decoding) to route each batch between NGRAM retrieval and an EAGLE3 draft model.
 
 ### Method comparison (mini table)
 
@@ -815,6 +816,10 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+---
+
+If your workload mixes repetition-heavy and open-ended batches, see [Hybrid Speculative Decoding](./hybrid_speculative_decoding), which routes each pure-decode batch between a retrieval worker (NGRAM) and a neural worker (EAGLE3).
 
 ---
 

@@ -80,6 +80,7 @@ class _FakeBatchRegistry:
             "input_ids": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
             "positions": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
             "out_cache_loc": _FakeGraphSlot(torch.arange(4, dtype=torch.int64)),
+            "input_embeds": _FakeGraphSlot(torch.zeros(4, 8)),
         }
 
     def fill_from(self, *_args, **_kwargs):
@@ -194,7 +195,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertEqual(tuple(trimmed["hidden_states"].shape), (3, 4))
         self.assertEqual(tuple(trimmed["residual"].shape), (3, 4))
 
-    def test_static_batch_preserves_consumed_multimodal_embeddings(self):
+    def test_static_batch_uses_address_stable_draft_embeddings(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.buffer_registry = _FakeBatchRegistry()
@@ -204,6 +205,12 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.has_mha_companion_layers = False
         runner._prefill_static_buffers = None
         runner.static_draft_hidden_states = None
+        runner._use_draft_input_embeds = True
+        runner.layer_model = SimpleNamespace(
+            embed_tokens=lambda _input_ids: self.fail(
+                "multimodal draft replay must use target-composed embeddings"
+            )
+        )
         runner.capture_return_pooled_hidden_states = False
         runner._next_token_logits_buffer = lambda _rows: None
         runner._prefill_logits_buffer_rows = lambda _batch: 1
@@ -234,6 +241,20 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         static_batch = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
+        self.assertTrue(torch.equal(static_batch.input_embeds[:3], mm_input_embeds))
+
+        text_input_embeds = torch.randn(3, 8)
+        runner.layer_model.embed_tokens = lambda input_ids: (
+            text_input_embeds
+            if torch.equal(input_ids, forward_batch.input_ids)
+            else self.fail("text draft lookup received unexpected token ids")
+        )
+        forward_batch.mm_input_embeds = None
+
+        static_batch = runner.load_batch(forward_batch)
+
+        self.assertIsNone(static_batch.mm_input_embeds)
+        self.assertTrue(torch.equal(static_batch.input_embeds[:3], text_input_embeds))
 
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
