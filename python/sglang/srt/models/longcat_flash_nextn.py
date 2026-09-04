@@ -42,9 +42,7 @@ from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -227,10 +225,14 @@ class LongcatFlashModelNextN(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("eh_proj", ""),
+            prefix=add_prefix("eh_proj", prefix),
         )
         self.decoder = LongcatFlashDenseDecoderLayer(
-            config, 0, quant_config=quant_config, alt_stream=self.alt_stream
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix("decoder", prefix),
+            alt_stream=self.alt_stream,
         )
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -287,6 +289,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
         self,
         config: LongcatFlashConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
@@ -295,11 +298,16 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             if "mtp" in getattr(config, "disable_quant_module", [])
             else quant_config
         )
-        self.model = LongcatFlashModelNextN(config, self.quant_config)
+        self.model = LongcatFlashModelNextN(
+            config,
+            self.quant_config,
+            prefix=add_prefix("model", prefix),
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=self.quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

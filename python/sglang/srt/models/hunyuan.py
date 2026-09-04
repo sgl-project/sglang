@@ -20,9 +20,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.eplb.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -51,7 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import add_prefix, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 expert_distribution_recorder = ExpertDistributionRecorder()
@@ -119,6 +117,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = -1,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -159,6 +158,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             reduce_results=False,
             layer_id=layer_id,
             quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
         )
 
         self.gate = ReplicatedLinear(
@@ -179,6 +179,7 @@ class HunYuanSparseMoeBlock(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=add_prefix("shared_mlp", prefix),
             )
         else:
             self.shared_mlp = None
@@ -435,6 +436,7 @@ class HunYuanDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 layer_id=layer_id,
+                prefix=add_prefix("mlp", prefix),
             )
         else:
             self.mlp = HunYuanMLP(
@@ -580,6 +582,7 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
+            prefix="lm_head",
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight

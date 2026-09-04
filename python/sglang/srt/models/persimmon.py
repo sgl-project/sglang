@@ -29,14 +29,23 @@ from sglang.srt.utils import add_prefix, make_layers
 
 class PersimmonMLP(nn.Module):
     def __init__(
-        self, config: PersimmonConfig, quant_config: Optional[QuantizationConfig] = None
+        self,
+        config: PersimmonConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dense_h_to_4h = ColumnParallelLinear(
-            config.hidden_size, config.intermediate_size, quant_config=quant_config
+            config.hidden_size,
+            config.intermediate_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_h_to_4h", prefix),
         )
         self.dense_4h_to_h = RowParallelLinear(
-            config.intermediate_size, config.hidden_size, quant_config=quant_config
+            config.intermediate_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("dense_4h_to_h", prefix),
         )
         self.act = get_act_fn(config.hidden_act)
 
@@ -77,12 +86,14 @@ class PersimmonAttention(nn.Module):
             self.total_num_heads,
             bias=True,
             quant_config=quant_config,
+            prefix=add_prefix("query_key_value", prefix),
         )
         self.dense = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=True,
             quant_config=quant_config,
+            prefix=add_prefix("dense", prefix),
         )
         self.is_qk_layernorm = config.qk_layernorm
 
@@ -157,7 +168,11 @@ class PersimmonDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             layer_id=idx,
         )
-        self.mlp = PersimmonMLP(config, quant_config=quant_config)
+        self.mlp = PersimmonMLP(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+        )
         self.input_layernorm = nn.LayerNorm(
             config.hidden_size, eps=config.layer_norm_eps
         )
@@ -215,7 +230,7 @@ class PersimmonModel(nn.Module):
             lambda idx, prefix: PersimmonDecoderLayer(
                 config, quant_config=quant_config, prefix=prefix, idx=idx
             ),
-            prefix="model.layers",
+            prefix=add_prefix("model.layers", prefix),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
         )
@@ -272,6 +287,7 @@ class PersimmonForCausalLM(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 

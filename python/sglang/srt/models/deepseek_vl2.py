@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.utils import add_prefix
 
 
 class DeepseekVL2MlpProjector(nn.Module):
@@ -27,6 +28,7 @@ class DeepseekVL2MlpProjector(nn.Module):
         self,
         config: DeepseekVL2MlpProjectorConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
 
         super().__init__()
@@ -43,6 +45,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.input_dim,
                         config.n_embed,
                         quant_config=quant_config,
+                        prefix=add_prefix("layers.0", prefix),
                     )
                 ]
             )
@@ -55,6 +58,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.input_dim,
                         config.n_embed,
                         quant_config=quant_config,
+                        prefix=add_prefix("layers.0", prefix),
                     )
                 ]
             )
@@ -65,6 +69,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.n_embed,
                         config.n_embed,
                         quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{len(self.layers)}", prefix),
                     )
                 )
 
@@ -79,6 +84,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                         * config.downsample_ratio,
                         config.n_embed * mlp_ratio,
                         quant_config=quant_config,
+                        prefix=add_prefix("layers.0", prefix),
                     )
                 ]
             )
@@ -89,6 +95,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                         config.n_embed * mlp_ratio,
                         config.n_embed * mlp_ratio,
                         quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{len(self.layers)}", prefix),
                     )
                 )
             self.layers.append(nn.GELU())
@@ -97,6 +104,7 @@ class DeepseekVL2MlpProjector(nn.Module):
                     config.n_embed * mlp_ratio,
                     config.n_embed,
                     quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{len(self.layers)}", prefix),
                 )
             )
 
@@ -105,7 +113,10 @@ class DeepseekVL2MlpProjector(nn.Module):
 
         if config.token_pooling:
             self.token_pooling_layer = ReplicatedLinear(
-                config.input_dim * 4, config.input_dim, quant_config=quant_config
+                config.input_dim * 4,
+                config.input_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("token_pooling_layer", prefix),
             )
 
     def forward(self, x):
@@ -170,6 +181,7 @@ class DeepseekVL2ForCausalLM(nn.Module):
         self,
         config: DeepseekVL2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -179,7 +191,11 @@ class DeepseekVL2ForCausalLM(nn.Module):
 
         # ----------- vl projector ------------
         projector_config = config.projector_config
-        self.projector = DeepseekVL2MlpProjector(projector_config, quant_config)
+        self.projector = DeepseekVL2MlpProjector(
+            projector_config,
+            quant_config,
+            prefix=add_prefix("projector", prefix),
+        )
 
         self.tile_tag = config.tile_tag
         self.global_view_pos = config.global_view_pos

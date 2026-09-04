@@ -28,9 +28,7 @@ from sglang.kernels.ops.elementwise.elementwise import (
     gelu_and_mul_triton,
 )
 from sglang.kernels.ops.moe.router import fused_moe_router_shim
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -156,6 +154,7 @@ class Grok1MoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
             activation="gelu",
             reduce_results=reduce_results,
             use_presharded_weights=use_presharded_weights,

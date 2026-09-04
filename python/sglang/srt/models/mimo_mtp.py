@@ -20,6 +20,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
@@ -95,13 +96,14 @@ class MiMoMTP(nn.Module):
 
         self.model = MiMoMultiTokenPredictorLayer(
             config,
-            prefix,
+            add_prefix("model.mtp_block", prefix),
             quant_config,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 
