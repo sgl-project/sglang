@@ -233,6 +233,24 @@ class ThinkingControlTestCase(CustomTestCase):
 
 
 class ResponsesResponseFromRequestTestCase(CustomTestCase):
+    def test_background_is_echoed(self):
+        for background in (False, True, None):
+            request = ResponsesRequest(
+                model="x", input="hi", background=background, store=True
+            )
+            response = ResponsesResponse.from_request(
+                request,
+                sampling_params={},
+                model_name="x",
+                created_time=0,
+                output=[],
+                status="completed",
+                usage=None,
+            )
+
+            self.assertIs(response.background, background)
+            self.assertIs(response.model_dump()["background"], background)
+
     def test_requested_text_format_is_echoed(self):
         schema = {"type": "object", "properties": {"x": {"type": "integer"}}}
         request = ResponsesRequest(
