@@ -30,13 +30,19 @@ class StreamDelta(msgspec.Struct, omit_defaults=True):
 
 
 class StreamChoice(msgspec.Struct):
-    """A single choice in a streaming response."""
+    """A single choice in a streaming response.
+
+    注意不能开 omit_defaults:finish_reason 键必须每帧出现(null 或字符串,
+    P0.8)。usage 仅结束帧填充(P0.4,Moonshot 扩展),中间帧序列化为
+    null —— P1.15 允许中间帧 usage 为 null 或缺失。
+    """
 
     index: int
     delta: StreamDelta
     logprobs: Optional[dict] = None
     finish_reason: Optional[str] = None
     matched_stop: Union[None, int, str] = None
+    usage: Optional[dict] = None
 
 
 class StreamChunk(msgspec.Struct, omit_defaults=True):
@@ -66,6 +72,7 @@ def build_sse_content(
     matched_stop: Union[None, int, str] = None,
     usage: Optional[dict] = None,
     internal_content: Optional[dict] = None,
+    choice_usage: Optional[dict] = None,
 ) -> str:
     """Build an SSE chunk string for content/reasoning updates.
 
@@ -97,6 +104,7 @@ def build_sse_content(
         logprobs=logprobs,
         finish_reason=finish_reason,
         matched_stop=matched_stop,
+        usage=choice_usage,
     )
     chunk = StreamChunk(
         id=chunk_id,
