@@ -60,6 +60,10 @@ def is_fsdp_managed_module(module: nn.Module) -> bool:
 class ComponentResidencyStrategy:
     """Controls one component's device placement around declared use intervals."""
 
+    def supports_auto_residency(self) -> bool:
+        """Whether runtime placement may change underneath this strategy."""
+        return False
+
     def prepare_for_use(
         self,
         module: nn.Module,

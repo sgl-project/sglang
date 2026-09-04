@@ -13,13 +13,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
     MIN_VRAM_RESERVE_BYTES,
+    AppliedResidencyChange,
+    AutoResidencyPlan,
+    AutoResidencyRollbackError,
     DefaultWorkload,
     RankResidencyReport,
     ResidencyTarget,
     WarmupMemoryRecord,
     _layerwise_pin_targets,
     _layerwise_resident_targets,
+    apply_residency_changes,
     collect_residency_targets,
+    commit_residency_changes,
     component_resident_size_bytes,
     component_runtime_weight_bytes,
     current_placement_reserve_shortfall_bytes,
@@ -28,9 +33,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_default_workload_timing,
     estimate_layerwise_layer_uses,
     estimate_workload_phase_peaks,
+    format_applied_changes,
     plan_auto_residency,
     rank_candidates_by_h2d_savings,
     resolve_measured_default_workload,
+    rollback_residency_changes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
@@ -40,6 +47,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
     _resolve_auto_residency_warmup_shape,
@@ -1951,6 +1959,37 @@ class _FakeLazyLayerwiseDit(LayerwiseOffloadableModuleMixin, nn.Module):
         self.layerwise_offload_managers = [_FakeLayerwiseManager(tensors)]
 
 
+class _StubResidencyArgs:
+    """Duck-typed stand-in for the two ServerArgs hooks adjustments use."""
+
+    def __init__(self):
+        self.auto_modes: dict[str, str] = {}
+
+    def auto_residency_mode(self, component_name):
+        return self.auto_modes.get(component_name)
+
+    def residency_mode(self, component_name):
+        return self.auto_modes.get(component_name, COMPONENT_OFFLOAD)
+
+    def set_auto_residency_mode(self, component_name, mode):
+        self.auto_modes[component_name] = mode
+
+    def clear_auto_residency_mode(self, component_name):
+        self.auto_modes.pop(component_name, None)
+
+    def host_pin_budget(self):
+        return None
+
+
+def _plan_for(candidates: list[ResidencyTarget]) -> AutoResidencyPlan:
+    return AutoResidencyPlan(
+        estimated_peak_bytes=GIB_BYTES,
+        reserve_bytes=MIN_VRAM_RESERVE_BYTES,
+        budget_bytes=100 * GIB_BYTES,
+        changes=candidates,
+    )
+
+
 class TestSizeAccounting:
     def test_component_offload_counts_params_and_buffers(self):
         module = nn.Linear(8, 8)
@@ -2497,6 +2536,618 @@ class TestCollectResidencyTargets:
         assert by_mode[COMPONENT_OFFLOAD].device_transition_delta_bytes < 0
         assert by_mode[COMPONENT_OFFLOAD].host_materialize_scratch_bytes > 0
 
+    def test_layerwise_frontier_accounts_for_immediate_materialization(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            }
+        )
+        module = _FakeLayerwiseDit([manager])
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+        resident = next(
+            candidate for candidate in candidates if candidate.permanent_residency
+        )
+        assert (
+            resident.device_transition_delta_bytes == manager.offloaded_weight_bytes()
+        )
+        module.disable_offload()
+        module.register_parameter(
+            "materialized",
+            nn.Parameter(torch.zeros(manager.offloaded_weight_bytes() // 4)),
+        )
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=self._modes({"transformer": RESIDENT}),
+            baseline_residency_mode_of=self._modes({"transformer": LAYERWISE_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            auto_resident_components={"transformer"},
+        )
+        streamed = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        )
+        assert (
+            streamed.device_transition_delta_bytes == -manager.offloaded_weight_bytes()
+        )
+
+
+class TestApplyAndRollback:
+    def test_lazy_layerwise_configuration_rolls_back_to_component_offload(self):
+        module = _FakeLazyLayerwiseDit(num_layers=4)
+        args = _StubResidencyArgs()
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: COMPONENT_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+        )
+        target = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+            and candidate.target_layerwise_resident_layers == (2,)
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([target]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+
+        assert len(module.layerwise_offload_managers) == 1
+        assert module.layerwise_offload_managers[0].resident_layers == 2
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
+        manager = module.layerwise_offload_managers[0]
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert module.layerwise_offload_managers == []
+        assert args.auto_modes == {}
+        assert module.layers[0].weight.device.type == "cpu"
+        assert manager.load_all_layers_calls == 0
+
+    def test_layerwise_can_become_component_offload_and_rollback(self):
+        module = _FakeLazyLayerwiseDit(num_layers=4)
+        args = _StubResidencyArgs()
+        module.configure_layerwise_offload(args)
+        manager = module.layerwise_offload_managers[0]
+        manager.set_pinned_layers((0,))
+        args.auto_modes["text_encoder"] = LAYERWISE_OFFLOAD
+        candidates = collect_residency_targets(
+            modules={"text_encoder": module},
+            residency_mode_of=lambda _name: LAYERWISE_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=1,
+        )
+        target = next(
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == COMPONENT_OFFLOAD
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([target]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+
+        assert module.layerwise_offload_managers == []
+        assert args.auto_modes == {"text_encoder": COMPONENT_OFFLOAD}
+        assert module.layers[0].weight.device.type == "cpu"
+        assert target.target_resident_weight_bytes == 0
+        assert manager.load_all_layers_calls == 0
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert len(module.layerwise_offload_managers) == 1
+        assert args.auto_modes == {"text_encoder": LAYERWISE_OFFLOAD}
+        assert module.layerwise_offload_managers[0].pinned_layer_indices() == (0,)
+
+    def test_component_offload_promotion_materializes_before_validation(self):
+        class RecordingLinear(nn.Linear):
+            def __init__(self):
+                super().__init__(4, 4)
+                self.to_targets = []
+
+            def to(self, *args, **kwargs):
+                self.to_targets.append(args[0])
+                return super().to(*args, **kwargs)
+
+        module = RecordingLinear()
+        args = _StubResidencyArgs()
+        applied = apply_residency_changes(
+            plan=_plan_for([_candidate("text_encoder", weight_gib=1)]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert args.auto_modes == {"text_encoder": RESIDENT}
+        assert module.to_targets == [current_platform.get_local_torch_device()]
+        assert [p.component_name for p in applied] == ["text_encoder"]
+
+        rollback_residency_changes(
+            applied=applied, modules={"text_encoder": module}, server_args=args
+        )
+        assert args.auto_modes == {}
+        assert module.to_targets[-1] == "cpu"
+
+    def test_component_resident_can_be_demoted_and_rollback_restores_it(self):
+        module = nn.Linear(4, 4)
+        args = _StubResidencyArgs()
+        args.auto_modes["text_encoder"] = RESIDENT
+        candidate = ResidencyTarget(
+            component_name="text_encoder",
+            residency_mode=COMPONENT_OFFLOAD,
+            target_residency_mode=COMPONENT_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            inactive_device_delta_bytes=-GIB_BYTES,
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert args.auto_modes == {"text_encoder": COMPONENT_OFFLOAD}
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert args.auto_modes == {"text_encoder": RESIDENT}
+
+    def test_layerwise_promotion_loads_all_layers_and_rollback_rearms(self):
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidate = _candidate("transformer", mode=LAYERWISE_OFFLOAD, weight_gib=1)
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.load_all_layers_calls == 1
+        assert manager.remove_hooks_calls == 1
+        assert manager.enabled is False
+
+        rollback_residency_changes(
+            applied=applied, modules={"transformer": module}, server_args=args
+        )
+        assert manager.enabled is True
+        assert manager.register_hooks_calls == 1
+        assert args.auto_modes == {}
+
+    def test_resident_only_promotion_keeps_pins_until_validation_commit(self):
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        manager._pinned_layers = (0,)
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidate = _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=1)
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+        assert manager.enabled is False
+        assert manager.pinned_layer_indices() == (0,)
+
+        commit_residency_changes(
+            applied=applied,
+            modules={"text_encoder": module},
+            server_args=args,
+        )
+
+        assert manager.release_host_stores_calls == 1
+        assert module.layerwise_offload_managers == []
+
+    def test_partial_layerwise_promotion_restores_exact_group_counts(self):
+        managers = [
+            _FakeLayerwiseManager(
+                {
+                    "layers.0.w": torch.zeros(16),
+                    "layers.1.w": torch.zeros(16),
+                    "layers.2.w": torch.zeros(16),
+                },
+                resident_layers=1,
+            ),
+            _FakeLayerwiseManager(
+                {
+                    "layers.0.w": torch.zeros(16),
+                    "layers.1.w": torch.zeros(16),
+                }
+            ),
+        ]
+        module = _FakeLayerwiseDit(managers)
+        args = _StubResidencyArgs()
+        candidate = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=GIB_BYTES,
+            h2d_bytes_per_request=10 * GIB_BYTES,
+            target_layerwise_resident_layers=(2, 2),
+            target_layerwise_pinned_layers=((), ()),
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+
+        assert [manager.resident_layers for manager in managers] == [2, 2]
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert [manager.resident_layers for manager in managers] == [1, 0]
+
+    def test_permanent_layerwise_can_be_demoted_and_rollback_restores_it(self):
+        manager = _FakeLayerwiseManager(
+            {
+                "layers.0.w": torch.zeros(16),
+                "layers.1.w": torch.zeros(16),
+            },
+            resident_layers=2,
+        )
+        module = _FakeLayerwiseDit([manager])
+        module.disable_offload()
+        args = _StubResidencyArgs()
+        args.auto_modes["transformer"] = RESIDENT
+        candidate = ResidencyTarget(
+            component_name="transformer",
+            residency_mode=LAYERWISE_OFFLOAD,
+            target_residency_mode=LAYERWISE_OFFLOAD,
+            target_resident_weight_bytes=0,
+            h2d_bytes_per_request=0,
+            target_layerwise_resident_layers=(1,),
+            target_layerwise_pinned_layers=((),),
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for([candidate]),
+            modules={"transformer": module},
+            server_args=args,
+        )
+
+        assert manager.enabled is True
+        assert manager.resident_layers == 1
+        assert args.auto_modes == {"transformer": LAYERWISE_OFFLOAD}
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={"transformer": module},
+            server_args=args,
+        )
+        assert manager.enabled is False
+        assert manager.resident_layers == 2
+        assert args.auto_modes == {"transformer": RESIDENT}
+
+    def test_mid_failure_rolls_back_already_applied_promotions(self):
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        module = _FakeLayerwiseDit([manager])
+        args = _StubResidencyArgs()
+        candidates = [
+            _candidate("transformer", mode=LAYERWISE_OFFLOAD, weight_gib=1),
+            _candidate("missing_component", weight_gib=1),
+        ]
+        with pytest.raises(RuntimeError, match="missing_component"):
+            apply_residency_changes(
+                plan=_plan_for(candidates),
+                modules={"transformer": module},
+                server_args=args,
+            )
+        assert args.auto_modes == {}
+        assert manager.enabled is True
+        # Validation finishes before any placement is touched.
+        assert manager.register_hooks_calls == 0
+
+    def test_hostpin_handoff_releases_all_components_before_acquiring(
+        self, monkeypatch
+    ):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        source_manager._pinned_layers = (0,)
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        modules = {
+            "source": _FakeLayerwiseDit([source_manager]),
+            "target": _FakeLayerwiseDit([target_manager]),
+        }
+        candidates = [
+            ResidencyTarget(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_resident_weight_bytes=0,
+                h2d_bytes_per_request=-1,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((),),
+                pinned_host_delta_bytes=-source_manager.offloaded_weight_bytes(),
+            ),
+            ResidencyTarget(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_resident_weight_bytes=0,
+                h2d_bytes_per_request=10,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((0,),),
+                pinned_host_delta_bytes=target_manager.offloaded_weight_bytes(),
+            ),
+        ]
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "auto_residency.release_unused_pinned_memory",
+            lambda: events.append("flush"),
+        )
+
+        applied = apply_residency_changes(
+            plan=_plan_for(candidates),
+            modules=modules,
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["source:unpin", "flush", "target:pin"]
+        assert all(adjustment.pinned_host_changed for adjustment in applied)
+
+    def test_vram_handoff_releases_before_materializing(self):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        source = _FakeLayerwiseDit([source_manager])
+        target = _FakeLayerwiseDit([target_manager])
+        source.disable_offload()
+        events.clear()
+        candidates = [
+            ResidencyTarget(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_residency_mode=LAYERWISE_OFFLOAD,
+                target_resident_weight_bytes=0,
+                h2d_bytes_per_request=-1,
+                target_layerwise_resident_layers=(0,),
+                target_layerwise_pinned_layers=((),),
+                device_transition_delta_bytes=-source_manager.offloaded_weight_bytes(),
+                active_device_delta_bytes=100,
+            ),
+            ResidencyTarget(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                target_residency_mode=RESIDENT,
+                target_resident_weight_bytes=target_manager.offloaded_weight_bytes(),
+                h2d_bytes_per_request=10,
+                target_layerwise_resident_layers=(1,),
+                target_layerwise_pinned_layers=((),),
+                device_transition_delta_bytes=target_manager.offloaded_weight_bytes(),
+                active_device_delta_bytes=-100,
+            ),
+        ]
+
+        apply_residency_changes(
+            plan=_plan_for(candidates),
+            modules={"source": source, "target": target},
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["source:sync", "target:load"]
+
+    def test_vram_rollback_releases_before_restoring_resident_layers(self):
+        events: list[str] = []
+
+        class _TrackedModule(nn.Module):
+            def to(self, *args, **kwargs):
+                events.append("text_encoder:release")
+                return self
+
+        manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="transformer",
+        )
+        transformer = _FakeLayerwiseDit([manager])
+        applied = [
+            AppliedResidencyChange(
+                component_name="text_encoder",
+                residency_mode=COMPONENT_OFFLOAD,
+                applied_device_delta_bytes=10,
+            ),
+            AppliedResidencyChange(
+                component_name="transformer",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(1,),
+                previous_layerwise_pinned_layers=((),),
+                previous_layerwise_offload_enabled=False,
+                applied_device_delta_bytes=-10,
+            ),
+        ]
+
+        rollback_residency_changes(
+            applied=applied,
+            modules={
+                "text_encoder": _TrackedModule(),
+                "transformer": transformer,
+            },
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["text_encoder:release", "transformer:load"]
+
+    def test_hostpin_rollback_releases_new_owner_before_restoring_old_owner(
+        self, monkeypatch
+    ):
+        events: list[str] = []
+        source_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="source",
+        )
+        target_manager = _FakeLayerwiseManager(
+            {"layers.0.w": torch.zeros(16)},
+            event_log=events,
+            event_name="target",
+        )
+        target_manager._pinned_layers = (0,)
+        modules = {
+            "source": _FakeLayerwiseDit([source_manager]),
+            "target": _FakeLayerwiseDit([target_manager]),
+        }
+        applied = [
+            AppliedResidencyChange(
+                component_name="source",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(0,),
+                previous_layerwise_pinned_layers=((0,),),
+                pinned_host_changed=True,
+            ),
+            AppliedResidencyChange(
+                component_name="target",
+                residency_mode=LAYERWISE_OFFLOAD,
+                previous_layerwise_resident_layers=(0,),
+                previous_layerwise_pinned_layers=((),),
+                pinned_host_changed=True,
+            ),
+        ]
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.managers.memory_managers."
+            "auto_residency.release_unused_pinned_memory",
+            lambda: events.append("flush"),
+        )
+
+        rollback_residency_changes(
+            applied=applied,
+            modules=modules,
+            server_args=_StubResidencyArgs(),
+        )
+
+        assert events == ["target:unpin", "flush", "source:pin"]
+
+    def test_enable_offload_does_not_double_register_hooks(self):
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        module = _FakeLayerwiseDit([manager])
+        # never disabled: re-enabling must not stack a second set of hooks
+        module.enable_offload()
+        assert manager.register_hooks_calls == 0
+
+    def test_disable_offload_failure_rearms_the_manager(self):
+        # load_all_layers is the step most likely to OOM; a failed disable
+        # must leave the manager streaming (hooks re-registered), not in a
+        # hook-less enabled=True state serving (1,) placeholders.
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        manager.fail_load = True
+        module = _FakeLayerwiseDit([manager])
+        with pytest.raises(RuntimeError, match="out of memory"):
+            module.disable_offload()
+        assert manager.enabled is True
+        assert manager.register_hooks_calls == 1
+        assert manager.release_all_calls == 1
+
+    def test_disable_offload_failure_rearms_earlier_layer_groups(self):
+        first = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        failing = _FakeLayerwiseManager({"layers.1.w": torch.zeros(16)})
+        failing.fail_load = True
+        module = _FakeLayerwiseDit([first, failing])
+
+        with pytest.raises(RuntimeError, match="out of memory"):
+            module.disable_offload()
+
+        assert first.enabled is True
+        assert first.register_hooks_calls == 1
+        assert first.release_all_calls == 1
+        assert failing.enabled is True
+        assert failing.register_hooks_calls == 1
+        assert failing.release_all_calls == 1
+
+    def test_failed_rollback_raises_rollback_error_with_visible_cause(self):
+        class _BrokenArgs(_StubResidencyArgs):
+            def clear_auto_residency_mode(self, component_name):
+                # str(AssertionError()) is "" -- describe_error must keep it
+                # visible so no truthiness filter can drop it
+                raise AssertionError()
+
+        args = _BrokenArgs()
+        failing_manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        failing_manager.fail_load = True
+        candidates = [
+            _candidate("text_encoder", weight_gib=1),
+            _candidate("transformer", mode=LAYERWISE_OFFLOAD, weight_gib=1),
+        ]
+        with pytest.raises(AutoResidencyRollbackError) as exc_info:
+            apply_residency_changes(
+                plan=_plan_for(candidates),
+                modules={
+                    "text_encoder": nn.Linear(2, 2),
+                    "transformer": _FakeLayerwiseDit([failing_manager]),
+                },
+                server_args=args,
+            )
+        assert "AssertionError" in str(exc_info.value)
+        assert "CUDA out of memory" in str(exc_info.value)
+
+    def test_rollback_keeps_going_past_a_broken_component(self):
+        released: list[str] = []
+
+        class _PartialArgs(_StubResidencyArgs):
+            def clear_auto_residency_mode(self, component_name):
+                if component_name == "vae":
+                    raise RuntimeError("boom")
+                released.append(component_name)
+
+        args = _PartialArgs()
+        applied = [
+            AppliedResidencyChange(
+                component_name="text_encoder", residency_mode=COMPONENT_OFFLOAD
+            ),
+            AppliedResidencyChange(
+                component_name="vae", residency_mode=COMPONENT_OFFLOAD
+            ),
+        ]
+        with pytest.raises(RuntimeError, match="vae"):
+            rollback_residency_changes(
+                applied=applied,
+                modules={},
+                server_args=args,
+            )
+        # the earlier-applied adjustment was still undone
+        assert released == ["text_encoder"]
+
 
 class TestCandidateRanking:
     def test_post_request_hint_order_matches_promotion_order(self):
@@ -2521,6 +3172,21 @@ class TestCandidateRanking:
         assert [candidate.component_name for candidate in plan.changes] == [
             candidate.component_name for candidate in ranked
         ]
+
+
+class TestAppliedChangesLog:
+    def test_reports_equivalent_server_args_and_kill_switch(self):
+        plan = _plan_for(
+            [
+                _candidate("text_encoder", mode=LAYERWISE_OFFLOAD, weight_gib=7),
+                _candidate("vae", weight_gib=1),
+            ]
+        )
+        message = format_applied_changes(plan=plan)
+        assert "text_encoder: layerwise-offload -> resident" in message
+        assert "vae: component-offload -> resident" in message
+        assert "--component-residency text_encoder=resident vae=resident" in message
+        assert "SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY=1" in message
 
 
 class TestWarmupFrameAdjustment:
@@ -2782,6 +3448,38 @@ class TestAutoResidencySkipReason:
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
         reason = self._skip_reason(self._base_args(**overrides))
         assert reason is None or reason == "requires CUDA"
+
+    def test_fixed_loading_components_are_excluded_individually(self):
+        from sglang.multimodal_gen.runtime.server_args.auto_tune import (
+            fixed_loading_residency_components,
+        )
+
+        component_names = ("transformer", "transformer_2", "image_encoder", "vae")
+        assert fixed_loading_residency_components(
+            self._base_args(quantization="fp8"), component_names
+        ) == {"transformer", "transformer_2"}
+        assert fixed_loading_residency_components(
+            self._base_args(component_quantizations={"image_encoder": "fp8"}),
+            component_names,
+        ) == {"image_encoder"}
+        assert (
+            fixed_loading_residency_components(
+                self._base_args(transformer_weights_path="/x.safetensors"),
+                component_names,
+            )
+            == set()
+        )
+        assert fixed_loading_residency_components(
+            self._base_args(ltx2_two_stage_device_mode="original"),
+            component_names,
+        ) == {"transformer", "transformer_2"}
+        assert (
+            fixed_loading_residency_components(
+                self._base_args(ltx2_two_stage_device_mode="resident"),
+                component_names,
+            )
+            == set()
+        )
 
     def test_cache_dit_excluded(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)

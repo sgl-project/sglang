@@ -168,6 +168,35 @@ class ComponentResidencyManager:
             self._strategy_cache.clear()
         self.server_args = server_args
 
+    def invalidate_component_strategies(self, component_names: Iterable[str]) -> None:
+        """Drop cached strategies after an in-place residency change.
+
+        The cache only auto-invalidates when the ``server_args`` object
+        identity changes; runtime promotions mutate residency on the same
+        object and must invalidate explicitly.
+        """
+        for component_name in component_names:
+            self._strategy_cache.pop(component_name, None)
+
+    def components_with_mixed_use_dtypes(self) -> set[str]:
+        """Components whose stages request more than one runtime dtype.
+
+        Layerwise offload keeps its managed weight stores in one fixed dtype,
+        while resident placement honors each ``ComponentUse.target_dtype``.
+        Switching such a component between those strategies would therefore
+        change its numerical path, even when both placements fit.
+        """
+        dtypes_by_component: dict[str, set[torch.dtype | None]] = {}
+        for use in self._ordered_uses:
+            dtypes_by_component.setdefault(use.component_name, set()).add(
+                use.target_dtype
+            )
+        return {
+            component_name
+            for component_name, dtypes in dtypes_by_component.items()
+            if len(dtypes) > 1
+        }
+
     def begin_request(
         self,
         stages: Sequence[ComponentResidencyStage],
