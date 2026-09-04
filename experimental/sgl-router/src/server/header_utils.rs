@@ -50,7 +50,10 @@ mod tests {
             "server-timing",
             "x-request-id",
         ] {
-            assert!(should_forward_response_header(&HeaderName::from_static(n)), "{n}");
+            assert!(
+                should_forward_response_header(&HeaderName::from_static(n)),
+                "{n}"
+            );
         }
         // Dropped: hop-by-hop and proxy-synthesized headers.
         for n in [
@@ -61,7 +64,10 @@ mod tests {
             "x-sgl-decode-url",
             "set-cookie",
         ] {
-            assert!(!should_forward_response_header(&HeaderName::from_static(n)), "{n}");
+            assert!(
+                !should_forward_response_header(&HeaderName::from_static(n)),
+                "{n}"
+            );
         }
     }
 
