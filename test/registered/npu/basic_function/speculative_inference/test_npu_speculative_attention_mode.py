@@ -86,7 +86,6 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
             }
         )
@@ -150,7 +149,6 @@ class TestNpuSpeculativeAttentionMode(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
             }
         )

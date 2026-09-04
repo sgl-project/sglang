@@ -32,7 +32,6 @@ class TestAscendSpeculativeDraftAttentionAndMoeRunner(CustomTestCase):
     os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
     os.environ["HCCL_BUFFSIZE"] = "2048"
     os.environ["SGLANG_ENABLE_OVERLAP_PLAN_SITEAM"] = "1"
-    os.environ["SGLANG_ENABLE_SPEC_V2"] = "1"
     env = os.environ.copy()
 
     @classmethod
