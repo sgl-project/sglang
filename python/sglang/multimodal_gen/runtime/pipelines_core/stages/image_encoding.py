@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     align_tensor_to_module_dtype,
     autocast_context,
     autocast_enabled,
+    resolve_component_precision_override,
     resolve_precision,
     temporary_module_dtype,
 )
@@ -156,9 +157,25 @@ class ImageEncodingStage(PipelineStage):
         stage_name = self._component_stage_name(stage_name)
         uses = []
         if self.image_encoder is not None:
-            uses.append(ComponentUse(stage_name, "image_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "image_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "image_encoder"
+                    ),
+                )
+            )
         if self.text_encoder is not None:
-            uses.append(ComponentUse(stage_name, "text_encoder"))
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "text_encoder",
+                    target_dtype=resolve_component_precision_override(
+                        server_args, "text_encoder"
+                    ),
+                )
+            )
         return uses
 
     def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
@@ -322,6 +339,7 @@ class ImageEncodingStage(PipelineStage):
                             pixel_values=image_inputs.pixel_values,
                             image_grid_thw=image_inputs.image_grid_thw,
                             output_hidden_states=True,
+                            use_cache=False,
                         )
                         if batch.do_classifier_free_guidance:
                             neg_outputs = self.text_encoder(
@@ -330,6 +348,7 @@ class ImageEncodingStage(PipelineStage):
                                 pixel_values=neg_image_inputs.pixel_values,
                                 image_grid_thw=neg_image_inputs.image_grid_thw,
                                 output_hidden_states=True,
+                                use_cache=False,
                             )
 
                 prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
@@ -528,7 +547,11 @@ class LTX2ImageEncodingStage(PipelineStage):
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
-                component_names=server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if server_args.component_residency is not None
+                    else server_args.layerwise_offload_components
+                ),
                 warn_missing=False,
             )
         return True

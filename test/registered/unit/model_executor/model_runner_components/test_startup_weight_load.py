@@ -28,7 +28,7 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -203,10 +203,13 @@ class TestStartupWeightLoadSelector(CustomTestCase):
 
     def test_options_accept_current_server_args_schema(self):
         """Removed server options must not break overlap startup initialization."""
-        options = StartupWeightLoadOptions.from_server_args(
-            server_args=ServerArgs(
-                model_path="dummy", cuda_graph_config=CudaGraphConfig()
-            ),
+        server_args = ServerArgs(
+            model_path="dummy", cuda_graph_config=CudaGraphConfig()
+        )
+        # The parallel sizes come from the bags, so the config has to be published.
+        publish(server_args, role="test")
+        self.addCleanup(reset_context)
+        options = StartupWeightLoadOptions.from_published_config(
             is_draft_worker=False,
         )
 
@@ -671,6 +674,9 @@ class _SchedulerWorker:
     def __init__(self, trace, *, post_capture_active=False):
         self._trace = trace
         self.model_runner = SimpleNamespace(
+            device="cuda",
+            forward_stream=object(),
+            prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
             post_capture_resize_kv_pool=lambda: trace.append("resize"),
         )
@@ -684,7 +690,7 @@ class _SchedulerWorker:
 
 class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
     @staticmethod
-    def _scheduler(worker, trace, *, mode):
+    def _scheduler(worker, trace, *, mode, draft_worker=None):
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = Scheduler.__new__(Scheduler)
@@ -693,17 +699,38 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         )
         scheduler.init_tp_model_worker = lambda: setattr(scheduler, "tp_worker", worker)
         scheduler.maybe_init_draft_worker = lambda: setattr(
-            scheduler, "draft_worker", None
+            scheduler, "draft_worker", draft_worker
         )
         scheduler.init_memory_pools = lambda: trace.append("memory_pool")
         scheduler.init_all_attention_backends = lambda: trace.append("attention")
         scheduler.init_all_cuda_graphs = lambda: trace.append("capture")
         return scheduler
 
-    def _run_startup(self, mode):
+    def _run_startup(self, mode, *, use_draft_worker=False):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
-        scheduler = self._scheduler(worker, trace, mode=mode)
+        draft_worker = (
+            SimpleNamespace(prewarm_sampling=lambda: trace.append("draft_prewarm"))
+            if use_draft_worker
+            else None
+        )
+        scheduler = self._scheduler(
+            worker,
+            trace,
+            mode=mode,
+            draft_worker=draft_worker,
+        )
+
+        class StreamContext:
+            def __enter__(self):
+                trace.append("stream_enter")
+
+            def __exit__(self, *_args):
+                trace.append("stream_exit")
+
+        def stream_context(stream):
+            self.assertIs(stream, worker.model_runner.forward_stream)
+            return StreamContext()
 
         def stop_after_startup():
             raise RuntimeError("stop after startup")
@@ -720,6 +747,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                     )
                 ),
             ),
+            patch(
+                "sglang.srt.managers.scheduler.torch.get_device_module",
+                return_value=SimpleNamespace(stream=stream_context),
+            ),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
@@ -729,13 +760,45 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
     def test_serial_path_skips_overlap_hooks(self):
         self.assertEqual(
             self._run_startup("serial"),
-            ["memory_pool", "attention", "capture", "resize"],
+            [
+                "memory_pool",
+                "attention",
+                "capture",
+                "stream_enter",
+                "prewarm",
+                "stream_exit",
+                "resize",
+            ],
         )
 
     def test_overlap_starts_before_capture_and_finalizes_after(self):
         self.assertEqual(
             self._run_startup("overlap"),
-            ["start", "memory_pool", "attention", "capture", "resize", "finalize"],
+            [
+                "start",
+                "memory_pool",
+                "attention",
+                "capture",
+                "stream_enter",
+                "prewarm",
+                "stream_exit",
+                "resize",
+                "finalize",
+            ],
+        )
+
+    def test_draft_worker_prewarm_uses_target_forward_stream(self):
+        self.assertEqual(
+            self._run_startup("serial", use_draft_worker=True),
+            [
+                "memory_pool",
+                "attention",
+                "capture",
+                "stream_enter",
+                "draft_prewarm",
+                "stream_exit",
+                "resize",
+            ],
         )
 
 

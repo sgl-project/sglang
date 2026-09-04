@@ -11,10 +11,14 @@ closer to the actual denoising step.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
@@ -104,6 +108,15 @@ class RealtimeTextState(BaseRealtimeState):
 
 class RealtimeTextEncodingStage(TextEncodingStage):
     """Cache text encoder outputs across realtime chunks by prompt identity."""
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        # Cache hits return before encode_text reaches the declared use site.
+        return [
+            replace(use, start_at_stage_entry=False)
+            for use in super().component_uses(server_args, stage_name)
+        ]
 
     def _make_cache_key(self, batch: Req) -> tuple[Any, ...]:
         return (
