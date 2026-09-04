@@ -10,6 +10,7 @@ import torch
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
+    NPUSitu,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
@@ -101,7 +102,20 @@ class AscendRunnerCore(MoeRunnerCore):
             is_quant_kernel = isinstance(
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
-            self.activation = NPUSwigluDeepEPKernel(need_quant=is_quant_kernel)
+            if config.activation == "situ":
+                self.activation = NPUSitu(
+                    need_quant=is_quant_kernel,
+                    beta=(
+                        config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
+                    ),
+                    linear_beta=config.gemm1_clamp_limit,
+                )
+            else:
+                self.activation = NPUSwigluDeepEPKernel(
+                    need_quant=is_quant_kernel,
+                    alpha=config.gemm1_alpha,
+                    limit=config.gemm1_clamp_limit,
+                )
         else:
             # Non‑DeepEP (ascend_tp) path
             # 1. Choose the base activation according to the quant method
@@ -169,8 +183,11 @@ class AscendRunnerCore(MoeRunnerCore):
             )
 
             # --- Activation ---
-            # The DeepEP kernel expects extra dispatch metadata
-            if isinstance(self.activation, NPUSwigluDeepEPKernel):
+            # Grouped-row activations require dispatch metadata.
+            if isinstance(
+                self.activation,
+                (NPUSwigluDeepEPKernel, NPUSitu),
+            ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
                     group_list=expert_tokens,

@@ -13,11 +13,10 @@ Usage:
     python -m pytest test/registered/unit/lora/test_mem_pool_ep_unit.py -v
 """
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import ast
 import types
@@ -115,15 +114,18 @@ def _load_lora_weight_to_buffer(pool, **kwargs):
 
 def _load_moe_backend_enum():
     tree = ast.parse(MOE_UTILS_PATH.read_text())
-    backend = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "MoeRunnerBackend"
-    )
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    backend = classes["MoeRunnerBackend"]
+    body = [
+        classes[base.id]
+        for base in backend.bases
+        if isinstance(base, ast.Name) and base.id in classes
+    ]
+    body.append(backend)
     namespace = {"Enum": Enum}
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[backend], type_ignores=[])),
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
             str(MOE_UTILS_PATH),
             "exec",
         ),

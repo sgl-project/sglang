@@ -13,7 +13,11 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
 
 if TYPE_CHECKING:
@@ -38,6 +42,10 @@ class ForwardMetadata:
 
 
 class WaveAttnBackend(AttentionBackend):
+    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
+    # can never carry more seqs than the pool.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -104,7 +112,7 @@ class WaveAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
@@ -122,9 +130,9 @@ class WaveAttnBackend(AttentionBackend):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         num_group = num_token // num_seq
 
-        assert (
-            num_group * num_seq == num_token
-        ), f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        assert num_group * num_seq == num_token, (
+            f"num_seq({num_seq}), num_token({num_token}), something goes wrong!"
+        )
 
         if self.static_kv_splits or self.device_core_count <= 0:
             num_kv_splits.fill_(self.max_kv_splits)

@@ -6,7 +6,9 @@ import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
 )
+from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
 from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
     CausalSelfAttentionKVCache,
     CrossAttentionKVCache,
@@ -34,6 +36,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.realtime.states import RealtimeCausalDiTState
 
 LINGBOT_INTERACTIVE_KV_WINDOW_ENV = "SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW"
+
+
+def test_lingbot_quality_high_uses_bf16_vae_decode_only():
+    for config in (LingBotWorldCausalDMDConfig(), LingBotWorldV2CausalDMDConfig()):
+        assert config.vae_decode_precision == "fp32"
+        assert config.vae_decode_precision_high == "bf16"
 
 
 def test_lingbot_denoising_stage_does_not_own_realtime_cache_refs():
@@ -72,12 +80,16 @@ def test_lingbot_realtime_cache_config_overrides_checkpoint_defaults():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(arch_config=SimpleNamespace())
+    )
 
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=3,
             realtime_causal_kv_cache_num_frames=45,
-        )
+        ),
     )
     stage._apply_causal_cache_overrides(SimpleNamespace(), server_args)
 
@@ -93,16 +105,20 @@ def test_lingbot_realtime_cache_config_uses_request_overrides():
     stage.sink_size = 9
     stage.sliding_window_num_frames = 18
     stage.num_token_per_frame = 10
+    stage.transformer = SimpleNamespace(
+        config=SimpleNamespace(arch_config=SimpleNamespace())
+    )
 
     batch = SimpleNamespace(
         realtime_causal_sink_size=4,
         realtime_causal_kv_cache_num_frames=12,
     )
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=3,
             realtime_causal_kv_cache_num_frames=45,
-        )
+        ),
     )
     stage._apply_causal_cache_overrides(batch, server_args)
 
@@ -120,6 +136,7 @@ def test_lingbot_realtime_attention_cache_rolls_with_sink_window():
     stage.num_token_per_frame = 1
     stage.num_frames_per_block = 3
     stage.sliding_window_num_frames = 6
+    stage._kv_quant_args = QVGKVQuantArgs()
     stage.transformer = SimpleNamespace(
         num_attention_heads=1,
         attention_head_dim=1,
@@ -279,12 +296,13 @@ def test_lingbot_interactive_kv_window_samples_base_moving_and_still(monkeypatch
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             interactive_kv_window_enable=True,
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     cache_state = RealtimeCausalDiTState()
 
@@ -323,6 +341,7 @@ def test_lingbot_interactive_kv_window_none_disables_moving_window(monkeypatch):
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -330,7 +349,7 @@ def test_lingbot_interactive_kv_window_none_disables_moving_window(monkeypatch):
             interactive_kv_moving_window=None,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     cache_state = RealtimeCausalDiTState()
     batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
@@ -353,6 +372,7 @@ def test_lingbot_interactive_kv_window_zero_is_valid_moving_window(monkeypatch):
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -360,7 +380,7 @@ def test_lingbot_interactive_kv_window_zero_is_valid_moving_window(monkeypatch):
             interactive_kv_moving_window=0,
             interactive_kv_still_window=None,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     cache_state = RealtimeCausalDiTState()
     batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
@@ -385,6 +405,7 @@ def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default(
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -392,7 +413,7 @@ def test_lingbot_interactive_kv_window_updates_total_window_for_moving_default(
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
 
@@ -424,6 +445,7 @@ def test_lingbot_interactive_kv_window_resets_stage_window_between_requests(
         ),
     )
     dynamic_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -431,15 +453,16 @@ def test_lingbot_interactive_kv_window_resets_stage_window_between_requests(
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     disabled_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             interactive_kv_window_enable=False,
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
 
     dynamic_batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"]]})
@@ -469,6 +492,7 @@ def test_lingbot_interactive_kv_window_default_disabled(monkeypatch):
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -476,7 +500,7 @@ def test_lingbot_interactive_kv_window_default_disabled(monkeypatch):
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     cache_state = RealtimeCausalDiTState()
     batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
@@ -501,6 +525,7 @@ def test_lingbot_interactive_kv_window_env_can_enable_default(monkeypatch):
     stage.sliding_window_num_frames = 18
     stage.transformer = SimpleNamespace(num_attention_heads=1)
     server_args = SimpleNamespace(
+        kv_cache_quant_config=QVGKVQuantArgs(),
         pipeline_config=SimpleNamespace(
             realtime_causal_sink_size=9,
             realtime_causal_kv_cache_num_frames=18,
@@ -508,7 +533,7 @@ def test_lingbot_interactive_kv_window_env_can_enable_default(monkeypatch):
             interactive_kv_moving_window=12,
             interactive_kv_still_window=3,
             interactive_kv_still_chunks=2,
-        )
+        ),
     )
     cache_state = RealtimeCausalDiTState()
     batch = SimpleNamespace(condition_inputs={"camera_actions": [["w"], [], []]})
@@ -531,6 +556,7 @@ def test_lingbot_interactive_kv_window_allocates_expected_cache_size():
     stage.num_token_per_frame = 10
     stage.num_frames_per_block = 3
     stage.sliding_window_num_frames = 18
+    stage._kv_quant_args = QVGKVQuantArgs()
     stage.transformer = SimpleNamespace(num_attention_heads=1, attention_head_dim=1)
     policy = CausalDMDCachePolicy(
         sequence_shard_enabled=False,

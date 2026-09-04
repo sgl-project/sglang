@@ -28,12 +28,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeOpenAIServingChat:
+    native_reasoning_history = False
+
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
         self.apply_reasoning_calls: list[bool] = []
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
+
+    def supports_native_reasoning_history(self):
+        return self.native_reasoning_history
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
@@ -959,6 +964,63 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIn("<think>", joined)
         self.assertIn("ponder", joined)
         self.assertNotIn("<think>\nponder\n</think>\nponder", joined)
+
+    def test_assistant_thinking_history_uses_native_reasoning_content(self):
+        """Channel-framing encoders take thinking history as ``reasoning_content``.
+
+        Splicing the detector's markers into content would nest a reasoning block
+        inside the content channel and leave the real one empty, training the
+        model to emit raw markers as visible text.
+        """
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+            def wrap_reasoning_history(self, text):
+                raise AssertionError("must not rewrap for a native-history encoder")
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "ponder"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "hello")
+
+    def test_thinking_only_turn_keeps_native_reasoning_content(self):
+        """An assistant turn that is only thinking still carries its reasoning."""
+
+        class _NativeOpenAI(_FakeOpenAIServingChat):
+            native_reasoning_history = True
+
+        serving = AnthropicServing(_NativeOpenAI())
+        request = self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "thinking", "thinking": "ponder"}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
+        self.assertEqual(assistant_msg.reasoning_content, "ponder")
+        self.assertEqual(assistant_msg.content, "")
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""

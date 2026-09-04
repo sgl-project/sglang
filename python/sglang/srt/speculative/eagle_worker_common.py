@@ -8,7 +8,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
 from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -467,12 +467,12 @@ def run_eagle_verify(
     plan_stream: Any,
     plan_stream_ctx: Any,
     topk: int,
-    num_steps: int,
     num_draft_tokens: int,
     device: str,
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -585,7 +585,13 @@ def run_eagle_verify(
         predict,
         accept_lens,
         accept_index,
-    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    ) = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
+    )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -625,7 +631,7 @@ def run_eagle_verify(
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
+        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front

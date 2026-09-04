@@ -101,9 +101,9 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
         row_stride = ncols
     else:
         assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
-        assert (
-            full_logits.stride(1) == 1
-        ), "non-contiguous softcap requires contiguous columns"
+        assert full_logits.stride(1) == 1, (
+            "non-contiguous softcap requires contiguous columns"
+        )
         nrows, ncols = full_logits.shape
         row_stride = full_logits.stride(0)
 

@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
     StableDiffusion3TransformerConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -39,8 +40,7 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config=None,
     ):
         super().__init__(config=config, hf_config=hf_config)
-        self.config = config
-        arch_config = config.arch_config
+        arch_config = self.config
         sample_size = arch_config.sample_size
         patch_size = arch_config.patch_size
         in_channels = arch_config.in_channels
@@ -128,26 +128,37 @@ class SD3Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         else:
             interval_control = 0
 
-        for index_block, block in enumerate(self.transformer_blocks):
-            if index_block not in skip_layer_set:
-                encoder_embeddings, hidden_states = block(
-                    hidden_states=hidden_states,
-                    encoder_hidden_states=encoder_embeddings,
-                    temb=temb,
-                    joint_attention_kwargs=joint_attention_kwargs,
-                )
+        forward_batch = get_forward_context().forward_batch
+        spectrum_enabled = forward_batch is not None and forward_batch.enable_spectrum
+        run_transformer_blocks = (
+            self.begin_spectrum_step() if spectrum_enabled else True
+        )
+        if run_transformer_blocks:
+            for index_block, block in enumerate(self.transformer_blocks):
+                if index_block not in skip_layer_set:
+                    encoder_embeddings, hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_embeddings,
+                        temb=temb,
+                        joint_attention_kwargs=joint_attention_kwargs,
+                    )
 
-            # controlnet residual
-            if (
-                block_controlnet_hidden_states is not None
-                and block.context_pre_only is False
-            ):
-                hidden_states = (
-                    hidden_states
-                    + block_controlnet_hidden_states[
-                        int(index_block / interval_control)
-                    ]
-                )
+                # controlnet residual
+                if (
+                    block_controlnet_hidden_states is not None
+                    and block.context_pre_only is False
+                ):
+                    hidden_states = (
+                        hidden_states
+                        + block_controlnet_hidden_states[
+                            int(index_block / interval_control)
+                        ]
+                    )
+            if spectrum_enabled:
+                self.spectrum_record_features(hidden_states)
+        else:
+            if spectrum_enabled:
+                hidden_states = self.spectrum_predict_features(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
