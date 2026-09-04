@@ -231,7 +231,11 @@ class TestBufferModeSidecar(unittest.TestCase):
             )
             for spec in self._dsv4_specs()
         ]
-        operation = SimpleNamespace(id=23, pool_transfers=sidecars)
+        operation = SimpleNamespace(
+            id=23,
+            pool_transfers=sidecars,
+            storage_start=0,
+        )
         host_indices = torch.arange(4, dtype=torch.int64)
         req_id = "sidecar-prefetch"
 
@@ -249,6 +253,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             )
         }
         cache.prefetch_loaded_tokens_by_reqid = {}
+        cache.prefetch_loaded_storage_start_by_reqid = {}
         cache.storage_existence_cache = MagicMock()
 
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
@@ -270,6 +275,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         self.assertEqual(
             cache.prefetch_loaded_tokens_by_reqid[req_id], len(host_indices)
         )
+        self.assertEqual(cache.prefetch_loaded_storage_start_by_reqid[req_id], 0)
 
 
 if __name__ == "__main__":
