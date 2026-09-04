@@ -138,9 +138,9 @@ class TestBailingLmHeadQuantization(CustomTestCase):
     def test_quantized_head_matches_dequantized_reference(self):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
-                hidden_states = torch.arange(
-                    128, device="cuda", dtype=dtype
-                ).repeat(4, 1)
+                hidden_states = torch.arange(128, device="cuda", dtype=dtype).repeat(
+                    4, 1
+                )
                 model = self._model(
                     _quant_config(["language_model.lm_head"]),
                     prefix="language_model",
