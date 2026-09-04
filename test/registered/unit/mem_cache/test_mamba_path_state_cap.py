@@ -1,5 +1,6 @@
 """CPU-only unit tests for the per-path Mamba checkpoint cap."""
 
+from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -14,13 +15,13 @@ import torch
 from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
-from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     ComponentType,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
@@ -46,6 +47,10 @@ class _FakeTreeCore:
         }
         self.evicted = []
         self.cascaded = []
+        # The real eviction helper reports unbacked FULL evictions to the
+        # write-through drop counter; this fake never tracks a walk.
+        self._is_tracking_unbacked_tokens = False
+        self._tracked_unbacked_tokens = 0
 
     def _evict_component_and_detach_lru(self, node, component, *args, **kwargs):
         self.evicted.append(node)
@@ -103,14 +108,15 @@ class TestMambaPathStateCap(unittest.TestCase):
 
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                ValueError,
-                "must be -1 \\(unlimited\\) or a positive integer",
+            args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "must be -1 \\(unlimited\\) or a positive integer",
+                ),
             ):
-                ServerArgs(
-                    model_path="dummy",
-                    mamba_max_states_per_path=value,
-                )
+                handle_mamba_backend(args)
 
     def test_unified_cache_removes_only_shallow_mamba_state(self):
         component, nodes, core, cache = _build_unified_chain(cap=2)

@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -37,17 +35,27 @@ class BaseEvictionResult(msgspec.Struct):
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
-        assert (
-            not self.device_frees and not self.host_frees
-        ), "BaseEvictionResult dropped with undrained values"
+        assert not self.device_frees and not self.host_frees, (
+            "BaseEvictionResult dropped with undrained values"
+        )
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
+    """One device-walk step.
+
+    ``node_id`` selects a leaf for the Controller to evict. ``made_progress``
+    also covers an internal tombstone that returned no leaf, distinguishing it
+    from true walk exhaustion.
+    """
+
     node_id: Optional[NodeId] = None
+    made_progress: bool = False
+    unbacked_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
@@ -74,6 +82,22 @@ class RadixCacheWalkResult(msgspec.Struct, frozen=True, kw_only=True):
     prev_slot_indices: torch.Tensor
 
 
+class BufferBackupSnapshot(msgspec.Struct, frozen=True):
+    node_id: NodeId
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+    hash_values: list[str]
+    key: RadixKey
+    prefix_keys: Optional[list[str]]
+
+
+class BufferBackupState(msgspec.Struct, frozen=True):
+    parent_node_id: NodeId
+    parent_is_root: bool
+    parent_last_hash: Optional[str]
+
+
 class InsertStepResult(msgspec.Struct, frozen=True):
     """One step of a resumable insert: the Controller executes ``actions``, then
     resumes while ``result`` is None; ``result`` is set on the final step."""
@@ -95,6 +119,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -102,21 +127,20 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components import (
+        CacheTransferPhase,
+        ComponentType,
+    )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
         UnifiedTreeNode,
     )
-    from sglang.srt.mem_cache.unified_cache_components import (
-        CacheTransferPhase,
-        ComponentType,
-    )
 
 
-class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
+class UnifiedTreeCoreInterface(ABC):
     """Methods the Controller invokes on the Tree Core. The Controller treats the
     Tree Core as opaque behind this surface, which grows as tree operations
-    migrate onto the TreeCore. Inherits KVCacheEventMixin for the KV-event API
-    (take_events, _record_* recorders)."""
+    migrate onto the TreeCore."""
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
@@ -127,8 +151,13 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
+
+    def take_events(self) -> list:
+        """Hand the queued KV placement events to the Controller."""
+        return self.kv_events.take()
 
     @abstractmethod
     def reset(self) -> None:
@@ -166,8 +195,50 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def inc_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
-        """Bump the reference count on a node's component locks."""
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def snapshot_buffer_backup(
+        self, node_id: NodeId, pass_prefix_keys: bool
+    ) -> Optional[BufferBackupSnapshot]:
+        """Snapshot an eligible buffer-only backup node."""
+        ...
+
+    @abstractmethod
+    def validate_buffer_backup(
+        self, node_id: NodeId, expected_key_length: int
+    ) -> Optional[BufferBackupState]:
+        """Validate a queued backup and return its current parent state."""
+        ...
+
+    @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
+        ...
+
+    @abstractmethod
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+        """The NodeId anchoring matches for the namespace."""
+        ...
+
+    @abstractmethod
+    def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
+        """Return input indices in depth-first, subtree-weight order."""
+        ...
+
+    @abstractmethod
+    def inc_lock_ref(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> IncLockRefResult:
+        """Bump the reference count on a node's component locks, leaving any
+        component in skip_lock_components evictable and recorded in the result."""
         ...
 
     @abstractmethod
@@ -182,7 +253,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
 
     @abstractmethod
     def dec_swa_lock_only(
-        self, node_id: NodeId, swa_uuid_for_lock: Optional[int]
+        self,
+        node_id: NodeId,
+        swa_uuid_for_lock: Optional[int],
+        skip_lock_node_ids: Optional[dict] = None,
     ) -> DecSwaLockOnlyResult:
         """Decrease only the SWA (and lower-priority co-located) reference
         counts; the result carries the freed slots."""
@@ -201,8 +275,11 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """The next evictable node (None node_id when the walk is exhausted);
-        tracker is the caller's running totals, read for the doneness check."""
+        """Advance one eviction step.
+
+        A missing ``node_id`` is exhausted only when ``made_progress`` is also
+        false. ``tracker`` is the caller's running totals, read for doneness.
+        """
         ...
 
     @abstractmethod
@@ -294,6 +371,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
+
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
@@ -337,6 +418,17 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         """Evict a component's host-side resources; no-op if the component is absent."""
+        ...
+
+    @abstractmethod
+    def evict_excess_path_states(
+        self,
+        tail_node_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
+        tail's root path, collecting freed values into the caller's dicts."""
         ...
 
     # ==== HiCache ====
@@ -394,8 +486,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         ...
 
     @abstractmethod
@@ -432,6 +526,15 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     ) -> list[CacheAction | ComponentAction]:
         """Commit a successful H->D load-back onto the node; returns any cache actions."""
         ...
+
+    @abstractmethod
+    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+        """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
+    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
     def mark_write_through_pending(self, node_id: NodeId) -> None:

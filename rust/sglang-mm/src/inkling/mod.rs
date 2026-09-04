@@ -1,21 +1,8 @@
 use std::sync::OnceLock;
 
-use half::bf16;
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use rayon::prelude::*;
-
 use crate::common;
-
-/// `(height, width, patches_as_u16_bits)` for one decoded image.
-type Patches = (usize, usize, Vec<u16>);
-/// [`Patches`] plus the image content hash.
-type HashedPatches = (usize, usize, Vec<u16>, u64);
-/// [`Patches`] with the patch data as a numpy array bound to `'py`.
-type PyPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>);
-/// [`PyPatches`] plus the image content hash.
-type PyHashedPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>, u64);
+use crate::common::par;
+use half::bf16;
 
 const MEAN: [f32; 3] = [
     0.48145466f64 as f32,
@@ -90,9 +77,7 @@ fn patchify_into(arr: &[u8], h: usize, w: usize, ps: usize, out: &mut [u16]) {
         }
     };
 
-    common::pool().install(|| {
-        out.par_chunks_mut(row_elems).enumerate().for_each(body);
-    });
+    par::for_chunks_mut(out, row_elems, |index, chunk| body((index, chunk)));
 }
 
 fn patchify_alloc(arr: &[u8], h: usize, w: usize, ps: usize) -> Vec<u16> {
@@ -100,119 +85,6 @@ fn patchify_alloc(arr: &[u8], h: usize, w: usize, ps: usize) -> Vec<u16> {
     let mut out = vec![0u16; nph * npw * ps * ps * 3];
     patchify_into(arr, h, w, ps, &mut out);
     out
-}
-
-fn check_ps(ps: usize) -> PyResult<()> {
-    if ps == 0 {
-        return Err(PyValueError::new_err(
-            "patch_size must be greater than zero",
-        ));
-    }
-    Ok(())
-}
-
-#[pyfunction]
-fn patchify_rgb<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray3<'py, u8>,
-    patch_size: usize,
-) -> PyResult<Bound<'py, PyArray1<u16>>> {
-    check_ps(patch_size)?;
-    let shape = arr.shape();
-    let (h, w, c) = (shape[0], shape[1], shape[2]);
-    if c != 3 {
-        return Err(PyValueError::new_err(format!(
-            "expected HWC RGB array with 3 channels, got {c}"
-        )));
-    }
-    let data = arr
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
-        .to_vec();
-    let out = py.detach(move || patchify_alloc(&data, h, w, patch_size));
-    Ok(out.into_pyarray(py))
-}
-
-#[pyfunction]
-#[pyo3(signature = (data, patch_size, rescale_frac=None, rescale_cap=None))]
-fn decode_patchify<'py>(
-    py: Python<'py>,
-    data: Vec<u8>,
-    patch_size: usize,
-    rescale_frac: Option<f64>,
-    rescale_cap: Option<i64>,
-) -> PyResult<(usize, usize, Bound<'py, PyArray1<u16>>)> {
-    check_ps(patch_size)?;
-    let (h, w, out) = py
-        .detach(move || {
-            common::pool().install(|| {
-                let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
-                Ok::<_, String>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-            })
-        })
-        .map_err(PyValueError::new_err)?;
-    Ok((h, w, out.into_pyarray(py)))
-}
-
-#[pyfunction]
-#[pyo3(signature = (datas, patch_size, rescale_frac=None, rescale_cap=None))]
-fn decode_patchify_batch<'py>(
-    py: Python<'py>,
-    datas: Vec<Vec<u8>>,
-    patch_size: usize,
-    rescale_frac: Option<f64>,
-    rescale_cap: Option<i64>,
-) -> PyResult<Vec<PyPatches<'py>>> {
-    check_ps(patch_size)?;
-    let results: Vec<Result<Patches, String>> = py.detach(move || {
-        common::pool().install(|| {
-            datas
-                .par_iter()
-                .map(|data| {
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
-                })
-                .collect()
-        })
-    });
-    results
-        .into_iter()
-        .map(|r| {
-            let (h, w, v) = r.map_err(PyValueError::new_err)?;
-            Ok((h, w, v.into_pyarray(py)))
-        })
-        .collect()
-}
-
-#[pyfunction]
-#[pyo3(signature = (datas, patch_size, rescale_frac=None, rescale_cap=None))]
-fn preprocess_images<'py>(
-    py: Python<'py>,
-    datas: Vec<Vec<u8>>,
-    patch_size: usize,
-    rescale_frac: Option<f64>,
-    rescale_cap: Option<i64>,
-) -> PyResult<Vec<PyHashedPatches<'py>>> {
-    check_ps(patch_size)?;
-    let results: Vec<Result<HashedPatches, String>> = py.detach(move || {
-        common::pool().install(|| {
-            datas
-                .par_iter()
-                .map(|data| {
-                    let hash = common::sha256_u64(data);
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-                })
-                .collect()
-        })
-    });
-    results
-        .into_iter()
-        .map(|r| {
-            let (h, w, v, hash) = r.map_err(PyValueError::new_err)?;
-            Ok((h, w, v.into_pyarray(py), hash))
-        })
-        .collect()
 }
 
 /// Struct implementing ImageProcessorSpec for Inkling.
@@ -233,44 +105,158 @@ impl crate::registry::ImageProcessorSpec for InklingProcessor {
         if patch_size == 0 {
             return Err("patch_size must be greater than zero".into());
         }
-        common::pool().install(|| {
-            datas
-                .par_iter()
-                .map(|data| {
-                    let hash = common::sha256_u64(data);
-                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
-                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
-                })
-                .collect()
+        par::try_map(datas, |data| {
+            let hash = common::content_hash_u64(data);
+            let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+            Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
         })
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (arr, raw_bytes, patch_size, rescale_frac=None, rescale_cap=None))]
-fn rescale_patchify_hash<'py>(
-    py: Python<'py>,
-    arr: PyReadonlyArray3<'py, u8>,
-    raw_bytes: &[u8],
-    patch_size: usize,
-    rescale_frac: Option<f64>,
-    rescale_cap: Option<i64>,
-) -> PyResult<(usize, usize, Bound<'py, PyArray1<u16>>, u64)> {
-    check_ps(patch_size)?;
-    let shape = arr.shape();
-    let (h, w, c) = (shape[0], shape[1], shape[2]);
-    if c != 3 {
-        return Err(PyValueError::new_err(format!(
-            "expected HWC RGB array with 3 channels, got {c}"
-        )));
+// --- Python bindings (feature-gated: absent from the pure-Rust rlib) ---
+
+#[cfg(feature = "python")]
+mod python {
+    use numpy::{IntoPyArray, PyArray1, PyReadonlyArray3, PyUntypedArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+
+    use super::patchify_alloc;
+    use crate::common;
+    use crate::common::par;
+
+    /// `(height, width, patches_as_u16_bits)` for one decoded image.
+    type Patches = (usize, usize, Vec<u16>);
+    /// [`Patches`] plus the image content hash.
+    type HashedPatches = (usize, usize, Vec<u16>, u64);
+    /// [`Patches`] with the patch data as a numpy array bound to `'py`.
+    type PyPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>);
+    /// [`PyPatches`] plus the image content hash.
+    type PyHashedPatches<'py> = (usize, usize, Bound<'py, PyArray1<u16>>, u64);
+
+    fn check_ps(ps: usize) -> PyResult<()> {
+        if ps == 0 {
+            return Err(PyValueError::new_err(
+                "patch_size must be greater than zero",
+            ));
+        }
+        Ok(())
     }
-    let hash = common::sha256_u64(raw_bytes);
-    let rgb = arr
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
-        .to_vec();
-    let (oh, ow, out) = py.detach(move || {
-        common::pool().install(|| {
+
+    #[pyfunction]
+    fn patchify_rgb<'py>(
+        py: Python<'py>,
+        arr: PyReadonlyArray3<'py, u8>,
+        patch_size: usize,
+    ) -> PyResult<Bound<'py, PyArray1<u16>>> {
+        check_ps(patch_size)?;
+        let shape = arr.shape();
+        let (h, w, c) = (shape[0], shape[1], shape[2]);
+        if c != 3 {
+            return Err(PyValueError::new_err(format!(
+                "expected HWC RGB array with 3 channels, got {c}"
+            )));
+        }
+        let data = arr
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
+            .to_vec();
+        let out = py.detach(move || patchify_alloc(&data, h, w, patch_size));
+        Ok(out.into_pyarray(py))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (data, patch_size, rescale_frac=None, rescale_cap=None))]
+    fn decode_patchify<'py>(
+        py: Python<'py>,
+        data: Vec<u8>,
+        patch_size: usize,
+        rescale_frac: Option<f64>,
+        rescale_cap: Option<i64>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyArray1<u16>>)> {
+        check_ps(patch_size)?;
+        let (h, w, out) = py
+            .detach(move || {
+                let (rgb, h, w) = common::decode_rescale(&data, rescale_frac, rescale_cap)?;
+                Ok::<_, String>((h, w, patchify_alloc(&rgb, h, w, patch_size)))
+            })
+            .map_err(PyValueError::new_err)?;
+        Ok((h, w, out.into_pyarray(py)))
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (datas, patch_size, rescale_frac=None, rescale_cap=None))]
+    fn decode_patchify_batch<'py>(
+        py: Python<'py>,
+        datas: Vec<Vec<u8>>,
+        patch_size: usize,
+        rescale_frac: Option<f64>,
+        rescale_cap: Option<i64>,
+    ) -> PyResult<Vec<PyPatches<'py>>> {
+        check_ps(patch_size)?;
+        let results: Vec<Patches> = py
+            .detach(move || {
+                par::try_map(&datas, |data| -> Result<Patches, String> {
+                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size)))
+                })
+            })
+            .map_err(PyValueError::new_err)?;
+        results
+            .into_iter()
+            .map(|(h, w, v)| Ok((h, w, v.into_pyarray(py))))
+            .collect()
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (datas, patch_size, rescale_frac=None, rescale_cap=None))]
+    fn preprocess_images<'py>(
+        py: Python<'py>,
+        datas: Vec<Vec<u8>>,
+        patch_size: usize,
+        rescale_frac: Option<f64>,
+        rescale_cap: Option<i64>,
+    ) -> PyResult<Vec<PyHashedPatches<'py>>> {
+        check_ps(patch_size)?;
+        let results: Vec<HashedPatches> = py
+            .detach(move || {
+                par::try_map(&datas, |data| -> Result<HashedPatches, String> {
+                    let hash = common::content_hash_u64(data);
+                    let (rgb, h, w) = common::decode_rescale(data, rescale_frac, rescale_cap)?;
+                    Ok((h, w, patchify_alloc(&rgb, h, w, patch_size), hash))
+                })
+            })
+            .map_err(PyValueError::new_err)?;
+        results
+            .into_iter()
+            .map(|(h, w, v, hash)| Ok((h, w, v.into_pyarray(py), hash)))
+            .collect()
+    }
+
+    #[pyfunction]
+    #[pyo3(signature = (arr, raw_bytes, patch_size, rescale_frac=None, rescale_cap=None))]
+    fn rescale_patchify_hash<'py>(
+        py: Python<'py>,
+        arr: PyReadonlyArray3<'py, u8>,
+        raw_bytes: &[u8],
+        patch_size: usize,
+        rescale_frac: Option<f64>,
+        rescale_cap: Option<i64>,
+    ) -> PyResult<(usize, usize, Bound<'py, PyArray1<u16>>, u64)> {
+        check_ps(patch_size)?;
+        let shape = arr.shape();
+        let (h, w, c) = (shape[0], shape[1], shape[2]);
+        if c != 3 {
+            return Err(PyValueError::new_err(format!(
+                "expected HWC RGB array with 3 channels, got {c}"
+            )));
+        }
+        let hash = common::content_hash_u64(raw_bytes);
+        let rgb = arr
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("array must be C-contiguous"))?
+            .to_vec();
+        let (oh, ow, out) = py.detach(move || {
             let (tw, th) = common::resize::scaled_dims(w, h, rescale_frac, rescale_cap);
             let (rgb, h, w) = if (tw, th) != (w, h) {
                 (
@@ -282,18 +268,21 @@ fn rescale_patchify_hash<'py>(
                 (rgb, h, w)
             };
             (h, w, patchify_alloc(&rgb, h, w, patch_size))
-        })
-    });
-    Ok((oh, ow, out.into_pyarray(py), hash))
+        });
+        Ok((oh, ow, out.into_pyarray(py), hash))
+    }
+
+    pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
+        let m = PyModule::new(parent.py(), "inkling")?;
+        m.add_function(wrap_pyfunction!(patchify_rgb, &m)?)?;
+        m.add_function(wrap_pyfunction!(decode_patchify, &m)?)?;
+        m.add_function(wrap_pyfunction!(decode_patchify_batch, &m)?)?;
+        m.add_function(wrap_pyfunction!(preprocess_images, &m)?)?;
+        m.add_function(wrap_pyfunction!(rescale_patchify_hash, &m)?)?;
+        parent.add_submodule(&m)?;
+        Ok(())
+    }
 }
 
-pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
-    let m = PyModule::new(parent.py(), "inkling")?;
-    m.add_function(wrap_pyfunction!(patchify_rgb, &m)?)?;
-    m.add_function(wrap_pyfunction!(decode_patchify, &m)?)?;
-    m.add_function(wrap_pyfunction!(decode_patchify_batch, &m)?)?;
-    m.add_function(wrap_pyfunction!(preprocess_images, &m)?)?;
-    m.add_function(wrap_pyfunction!(rescale_patchify_hash, &m)?)?;
-    parent.add_submodule(&m)?;
-    Ok(())
-}
+#[cfg(feature = "python")]
+pub use python::register;

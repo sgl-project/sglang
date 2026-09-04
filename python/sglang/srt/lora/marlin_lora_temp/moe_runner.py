@@ -24,15 +24,15 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import silu_and_mul
 
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+        moe_sum_reduce_triton,
+    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
         _align_block_size_jit as moe_align_block_size,
     )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
-    )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
-        moe_sum_reduce_triton,
     )
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
     from sglang.srt.lora.marlin_lora_temp.activation import silu_and_mul_add_delta
@@ -261,8 +261,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     ep_active = local_experts < global_experts
     if ep_active:
         assert E == local_experts, (
-            f"Marlin has {E} local experts but runner_config declares "
-            f"{local_experts}"
+            f"Marlin has {E} local experts but runner_config declares {local_experts}"
         )
         assert (
             lora_info.gate_up_lora_b_weights.shape[1]

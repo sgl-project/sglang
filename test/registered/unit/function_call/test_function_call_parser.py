@@ -1,5 +1,7 @@
+import functools
 import json
 import unittest
+import warnings
 
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
@@ -26,14 +28,23 @@ from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
+from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=61, suite="base-c-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
+
+
+@functools.lru_cache(maxsize=None)
+def _shared_tokenizer(path: str):
+    from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+    return get_tokenizer(path)
 
 
 class TestInklingDetector(unittest.TestCase):
@@ -85,30 +96,32 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(name, "weather")
         self.assertEqual(json.loads(parameters), {"city": "SF"})
 
-    def test_mismatched_header_is_rejected(self):
+    def test_header_name_is_ignored_and_payload_name_wins(self):
+        """The message header is author metadata, not a name check: a header
+        that differs from the payload name still yields a call named by the
+        payload."""
         detector = InklingDetector()
         source = (
             "<|message_model|>other<|content_invoke_tool_json|>"
             '{"name":"weather","args":{}}<|end_message|>'
+        )
+        result = detector.detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(result.normal_text, "")
+
+    def test_raw_fallback_strips_protocol_tokens(self):
+        """When a payload cannot be parsed or recovered, the visible text is
+        surfaced as content with the <|...|> special tokens stripped."""
+        detector = InklingDetector()
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            "{not json at all<|end_message|>"
         )
         result = detector.detect_and_parse(source, self.tools)
         self.assertEqual(result.calls, [])
-
-    def test_rejected_call_does_not_leak_protocol_tokens(self):
-        """Bug regression: the no-surviving-calls path returned the RAW text,
-        so a rejected call (e.g. header/payload mismatch) leaked <|...|>
-        protocol tokens into user-visible content."""
-        detector = InklingDetector()
-        source = (
-            "<|message_model|>other<|content_invoke_tool_json|>"
-            '{"name":"weather","args":{}}<|end_message|>'
-        )
-        result = detector.detect_and_parse(source, self.tools)
         self.assertNotIn("<|", result.normal_text)
-        # Framework parity: the rejected tool-call REGION is dropped entirely
-        # (normal_text = content before the marker), like every other detector
-        # — the JSON payload must not surface as visible content either.
-        self.assertEqual(result.normal_text, "")
+        self.assertIn("{not json at all", result.normal_text)
 
     def test_headerless_legacy_tool_call_still_parses(self):
         """Spec tolerance: a bare <|content_invoke_tool_json|> block with no
@@ -188,11 +201,9 @@ class TestInklingDetector(unittest.TestCase):
         args = "".join(c.parameters for c in result.calls)
         self.assertEqual(json.loads(args), {"city": "SF"})
 
-    def test_streaming_rejected_middle_call_keeps_later_valid_call(self):
-        """Bug regression: a rejected call (header/name mismatch) cleared the
-        whole buffer, discarding a later valid call that arrived in the same
-        delta. Only the rejected call's span may be dropped; the drain must
-        continue so the trailing valid call still streams."""
+    def test_streaming_differing_headers_all_stream(self):
+        """The header is author metadata, not a name gate: three calls with
+        differing headers all stream, indexed 0/1/2 by payload name."""
         detector = InklingDetector()
         source = (
             "<|message_model|>weather<|content_invoke_tool_json|>"
@@ -207,37 +218,38 @@ class TestInklingDetector(unittest.TestCase):
             args_by_index[call.tool_index] = (
                 args_by_index.get(call.tool_index, "") + call.parameters
             )
-        self.assertEqual(sorted(args_by_index), [0, 1])
+        self.assertEqual(sorted(args_by_index), [0, 1, 2])
         self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
-        self.assertEqual(json.loads(args_by_index[1]), {"city": "NY"})
+        self.assertEqual(json.loads(args_by_index[1]), {"city": "XX"})
+        self.assertEqual(json.loads(args_by_index[2]), {"city": "NY"})
 
-    def test_streaming_rejection_does_not_collide_tool_indices(self):
-        """Bug regression: a rejected mid-stream call reset current_tool_id to
-        -1, so the NEXT valid call re-announced as tool_index 0 — colliding
-        with the first call's index and slicing its arguments against index
-        0's already-streamed args."""
+    def test_streaming_malformed_call_switches_to_raw_passthrough(self):
+        """A call that fails to frame switches the stream to raw passthrough:
+        earlier calls stay emitted (streaming cannot un-emit), and everything
+        after the failure is surfaced as content, never as further calls."""
         detector = InklingDetector()
         chunks = [
             "<|message_model|>weather<|content_invoke_tool_json|>",
             '{"name":"weather","args":{"city":"SF"}}<|end_message|>',
-            # header/payload mismatch -> rejected
-            "<|message_model|>other<|content_invoke_tool_json|>",
-            '{"name":"weather","args":{"city":"NY"}}<|end_message|>',
-            # valid again
+            # unrecoverable -> raw passthrough from here on
+            "<|message_model|>weather<|content_invoke_tool_json|>",
+            "{not json at all<|end_message|>",
+            # would-be call, now passthrough text
             "<|message_model|>weather<|content_invoke_tool_json|>",
             '{"name":"weather","args":{"city":"LA"}}<|end_message|>',
         ]
-        args_by_index: dict = {}
+        calls: list = []
+        normal_text = ""
         for chunk in chunks:
-            for call in detector.parse_streaming_increment(chunk, self.tools).calls:
-                args_by_index[call.tool_index] = (
-                    args_by_index.get(call.tool_index, "") + call.parameters
-                )
-        self.assertEqual(json.loads(args_by_index[0]), {"city": "SF"})
-        self.assertEqual(len(args_by_index), 2)
-        second_index = max(args_by_index)
-        self.assertGreater(second_index, 0)
-        self.assertEqual(json.loads(args_by_index[second_index]), {"city": "LA"})
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "weather")
+        self.assertEqual(json.loads(calls[0].parameters), {"city": "SF"})
+        self.assertNotIn("<|", normal_text)
+        self.assertIn("{not json at all", normal_text)
+        self.assertIn("LA", normal_text)
 
     def test_undeclared_tool_name_is_surfaced(self):
         """A call to a tool absent from the request's tool list surfaces as a
@@ -274,8 +286,9 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(json.loads(parameters), {"query": "q"})
         self.assertNotIn("<|", normal_text)
 
-    def test_malformed_json_does_not_leak_protocol_tokens(self):
-        """Malformed JSON must drop the protocol region and its tool header."""
+    def test_malformed_json_surfaces_as_raw_fallback(self):
+        """Malformed JSON that also fails recovery surfaces the visible payload
+        as content (special tokens stripped), not a tool call."""
         detector = InklingDetector()
         source = (
             "<|message_model|>weather<|content_invoke_tool_json|>"
@@ -283,10 +296,12 @@ class TestInklingDetector(unittest.TestCase):
         )
         result = detector.detect_and_parse(source, self.tools)
         self.assertEqual(result.calls, [])
-        self.assertEqual(result.normal_text, "")
+        self.assertNotIn("<|", result.normal_text)
+        self.assertIn("{not json at all", result.normal_text)
 
-    def test_parser_does_not_restore_malformed_tool_call_as_text(self):
-        """The parser wrapper must preserve the detector's sanitized fallback."""
+    def test_parser_preserves_raw_fallback_text(self):
+        """The parser wrapper preserves the detector's raw fallback, so the
+        visible prefix plus the failed payload reach the caller as content."""
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
 
         source = (
@@ -297,8 +312,9 @@ class TestInklingDetector(unittest.TestCase):
         normal_text, calls = FunctionCallParser(self.tools, "inkling").parse_non_stream(
             source
         )
-        self.assertEqual(normal_text, "Visible prefix.")
         self.assertEqual(calls, [])
+        self.assertTrue(normal_text.startswith("Visible prefix."))
+        self.assertIn("{not json at all", normal_text)
 
     def test_parser_preserves_text_without_tool_call_marker(self):
         from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -310,7 +326,10 @@ class TestInklingDetector(unittest.TestCase):
         self.assertEqual(normal_text, source)
         self.assertEqual(calls, [])
 
-    def test_malformed_call_does_not_discard_an_earlier_valid_call(self):
+    def test_one_malformed_call_fails_the_whole_batch(self):
+        """All-or-nothing: a single unrecoverable call fails canonical framing
+        for the whole response, so even an earlier valid call is discarded and
+        the visible text is surfaced as content."""
         source = (
             "<|message_model|>weather<|content_invoke_tool_json|>"
             '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
@@ -318,10 +337,10 @@ class TestInklingDetector(unittest.TestCase):
             "{not json at all<|end_message|>"
         )
         result = InklingDetector().detect_and_parse(source, self.tools)
-        self.assertEqual(result.normal_text, "")
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+        self.assertEqual(result.calls, [])
+        self.assertNotIn("<|", result.normal_text)
+        self.assertIn('{"name":"weather","args":{"city":"SF"}}', result.normal_text)
+        self.assertIn("{not json at all", result.normal_text)
 
     def test_clean_normal_text_strips_the_full_control_alphabet(self):
         """Fall-through text is cleaned against the whole shared control-token
@@ -339,6 +358,86 @@ class TestInklingDetector(unittest.TestCase):
         header = "<|message_model|>weather<|content_invoke_tool_json|>"
         self.assertEqual(info.trigger, header)
         self.assertTrue(info.begin.startswith(header + '{"name":"weather"'))
+
+    def test_content_after_tool_call_is_preserved(self):
+        """A tool call followed by a text block returns both: the call plus the
+        trailing visible content, not just the prefix before the marker."""
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+            "<|message_model|><|content_text|>Here you go.<|end_message|>"
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(result.normal_text, "Here you go.")
+
+    def test_empty_name_is_allowed_on_the_canonical_path(self):
+        source = '<|content_invoke_tool_json|>{"name":"","args":{}}<|end_message|>'
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "")
+
+    def test_recovery_uses_only_the_last_marker(self):
+        """Canonical framing fails on the garbage payload; recovery reads only
+        the payload after the LAST marker."""
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>garbage"
+            "<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"city":"SF"}}<|end_message|>'
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+
+    def test_recovery_requires_a_nonempty_name(self):
+        """Recovery (unlike the canonical path) rejects an empty name, falling
+        through to raw text."""
+        source = (
+            "<|message_model|>weather<|content_invoke_tool_json|>bad"
+            '<|content_invoke_tool_json|>{"name":"","args":{}}<|end_message|>'
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertNotIn("<|", result.normal_text)
+
+    def test_nonfinite_numbers_rejected_canonically_but_recovered(self):
+        """NaN/Infinity are not valid canonical JSON, so the strict pass fails;
+        recovery accepts them."""
+        source = (
+            "<|content_invoke_tool_json|>"
+            '{"name":"weather","args":{"v":NaN}}<|end_message|>'
+        )
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "weather")
+
+    def test_streaming_name_not_emitted_before_end_message(self):
+        """Atomicity: the tool name is withheld until the closing marker, so a
+        call that never completes never leaks an orphan name delta."""
+        detector = InklingDetector()
+        pre = detector.parse_streaming_increment(
+            '<|message_model|>weather<|content_invoke_tool_json|>{"name":"wea',
+            self.tools,
+        )
+        self.assertEqual(pre.calls, [])
+        post = detector.parse_streaming_increment(
+            'ther","args":{"city":"SF"}}<|end_message|>', self.tools
+        )
+        self.assertEqual(len(post.calls), 1)
+        self.assertEqual(post.calls[0].name, "weather")
+        self.assertEqual(json.loads(post.calls[0].parameters), {"city": "SF"})
+
+    def test_raw_text_tool_invocation_surfaces_as_a_call(self):
+        """A headerless <|content_invoke_tool_text|> block reaches the tool loop
+        as a call carrying the raw body, instead of being dropped."""
+        source = "<|content_invoke_tool_text|>search the web<|end_message|>"
+        result = InklingDetector().detect_and_parse(source, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"text": "search the web"}
+        )
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -390,6 +489,26 @@ class TestPythonicDetector(unittest.TestCase):
         # detect_and_parse does not exercise in isolation.
         self.assertTrue(self.detector.has_tool_call('[get_weather(location="Tokyo")]'))
         self.assertFalse(self.detector.has_tool_call("plain text only"))
+
+    def test_invalid_escape_sequence_still_parses(self):
+        """An invalid Python escape (e.g. "\\d+") must not drop the tool call.
+
+        CPython keeps the backslash and only warns; if the warning were
+        promoted to an error the whole call would fall out as normal text."""
+        text = '[search(query="\\d+")]'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "\\d+")
+        self.assertEqual(result.normal_text, "")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
 
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
@@ -659,6 +778,27 @@ class TestPythonicDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["location"], "Mars")
         self.assertEqual(params["unit"], "celsius")
+
+    def test_non_finite_argument_never_emits_invalid_json(self):
+        """A 1e999 literal overflows to inf and json.dumps rendered it as
+        Infinity — parameters no JSON parser accepts, delivered as a
+        successful call. The call is skipped instead."""
+        text = "[get_weather(location='Tokyo', unit=1e999)]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
+    def test_unconvertible_argument_skips_only_that_call(self):
+        """A bytes argument is an ast.Constant, so it passed value
+        extraction and only failed later inside json.dumps, escaping to the
+        block-level handler and dropping every parseable sibling call."""
+        text = "[get_weather(location='Tokyo'), search(query=b'raw')]"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
 
 
 class TestMistralDetector(unittest.TestCase):
@@ -1165,7 +1305,6 @@ class TestLlama32Detector(unittest.TestCase):
 
 
 class TestKimiK2Detector(unittest.TestCase):
-
     def setUp(self):
         """Set up test tools and detector."""
         self.tools = [
@@ -1234,7 +1373,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1283,7 +1421,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1318,7 +1455,6 @@ class TestKimiK2Detector(unittest.TestCase):
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for tool_call_chunk in result.calls:
                 if tool_call_chunk.tool_index is not None:
-
                     while len(tool_calls) <= tool_call_chunk.tool_index:
                         tool_calls.append({"name": "", "parameters": ""})
 
@@ -1391,7 +1527,7 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             "function<｜tool▁sep｜>",
             "get_tour",
             "ist_att",
-            "ractions\n```" 'json\n{"',
+            'ractions\n```json\n{"',
             'city": "',
             'Beijing"}\n',
             "```<｜tool▁call▁end｜>",
@@ -1469,9 +1605,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
@@ -1580,9 +1714,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -1635,9 +1769,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -1728,9 +1862,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Verify that the no-parameter function was correctly parsed
         self.assertEqual(
@@ -1788,9 +1922,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should still parse correctly even with whitespace-only content
         self.assertEqual(
@@ -1919,9 +2053,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
         self.interval = 1
 
     def test_detect_and_parse_xml_format(self):
@@ -1992,9 +2124,9 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertGreater(num_tool_call_chunks, 8)
 
@@ -2810,6 +2942,84 @@ class TestGlm4MoeDetector(unittest.TestCase):
         )
         self.assertEqual(result.normal_text, "")
 
+    def test_streaming_tool_call(self):
+        chunks = [
+            "<tool_call>get_weather\n",
+            "<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n",
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            tool_calls[0]["parameters"], '{"city": "Beijing", "date": "2024-06-27"}'
+        )
+
+    def test_streaming_tool_call_without_arguments(self):
+        chunks = [
+            "<tool_call>get_weather\n",
+            "</tool_call>",
+        ]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
+    def test_streaming_tool_call_without_arguments_single_chunk(self):
+        """Test no-argument tool call when name and end token arrive together."""
+        chunks = ["<tool_call>get_weather\n</tool_call>"]
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                if (
+                    hasattr(tool_call_chunk, "tool_index")
+                    and tool_call_chunk.tool_index is not None
+                ):
+                    while len(tool_calls) <= tool_call_chunk.tool_index:
+                        tool_calls.append({"name": "", "parameters": ""})
+                    tc = tool_calls[tool_call_chunk.tool_index]
+                    if tool_call_chunk.name:
+                        tc["name"] = tool_call_chunk.name
+                    if tool_call_chunk.parameters:
+                        tc["parameters"] += tool_call_chunk.parameters
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
     def test_streaming_multiple_tool_calls(self):
         """Test streaming incremental parsing of multiple tool calls."""
         chunks = [
@@ -3044,6 +3254,55 @@ class TestGlm4MoeDetector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
+
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>"\\C|\\."</arg_value>\n'
+            "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """PEP 515 makes ast.literal_eval strip underscores ("123_456"->123456);
+        a string-typed arg must keep the raw value. See #30644."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
+
+    def test_parse_arguments_object_with_invalid_escape(self):
+        """A dict arg containing an invalid escape ("\\d+") must stay a dict.
+
+        If safe_literal_eval raised on the escape warning, Strategy 3 would
+        fail and Strategy 4 would degrade the whole value to one string."""
+        from sglang.srt.function_call.glm4_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("{'pattern': '\\d+'}", arg_type="object")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value, {"pattern": "\\d+"})
 
 
 class TestGlm47MoeDetector(unittest.TestCase):
@@ -3310,6 +3569,51 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(params["old_string"], "    indented code")
         self.assertEqual(params["new_string"], "        also indented")
 
+    def test_quoted_string_invalid_python_escape_no_warning(self):
+        text = (
+            '<tool_call>get_weather<arg_key>city</arg_key><arg_value>"\\C|\\."</arg_value>'
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], r"\C|\.")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
+    def test_parse_arguments_preserves_underscore_in_string_args(self):
+        """Same PEP 515 guard as the GLM-4 detector, on the GLM-4.7 parser."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("123_456", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "123_456")
+
+        value, is_good = parse_arguments("1_000.5", arg_type="string")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, str)
+        self.assertEqual(value, "1_000.5")
+
+        value, is_good = parse_arguments("123_456")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, int)
+        self.assertEqual(value, 123456)
+
+    def test_parse_arguments_object_with_invalid_escape(self):
+        """Same object-arg escape guard as the GLM-4 detector."""
+        from sglang.srt.function_call.glm47_moe_detector import parse_arguments
+
+        value, is_good = parse_arguments("{'pattern': '\\d+'}", arg_type="object")
+        self.assertTrue(is_good)
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value, {"pattern": "\\d+"})
+
     def test_get_model_structural_tag(self):
         """GLM-4.7/GLM-5 use xgrammar's native "glm_4_7" structural tag."""
         import xgrammar as xgr
@@ -3372,6 +3676,119 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+
+class TestLing3Detector(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "date": {"type": "string"},
+                        },
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get current date",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+        self.detector = Ling3Detector()
+
+    def _collect_streaming_tool_calls(self, chunks):
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+        return tool_calls
+
+    def test_detect_and_parse_newline_and_compact_tool_call(self):
+        cases = {
+            "newline": (
+                "<tool_call>get_weather\n"
+                "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+                "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+                "</tool_call>",
+                '{"city": "Beijing", "date": "2024-06-27"}',
+            ),
+            "compact": (
+                "<tool_call>get_weather"
+                "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+                "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>"
+                "</tool_call>",
+                '{"city": "Shanghai", "date": "2024-06-28"}',
+            ),
+        }
+        for layout, (text, expected) in cases.items():
+            with self.subTest(layout=layout):
+                result = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 1)
+                self.assertEqual(result.calls[0].name, "get_weather")
+                self.assertEqual(result.calls[0].parameters, expected)
+
+    def test_detect_and_parse_empty_args(self):
+        result = self.detector.detect_and_parse(
+            "<tool_call>get_date</tool_call>", self.tools
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_date")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_streaming_empty_args_emits_single_empty_object(self):
+        tool_calls = self._collect_streaming_tool_calls(
+            ["<tool_call>get_date", "</tool_call>"]
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_date")
+        self.assertEqual(tool_calls[0]["parameters"], "{}")
+        self.assertEqual(self.detector.streamed_args_for_tool[0], "{}")
+
+    def test_streaming_newline_and_compact_tool_call(self):
+        cases = {
+            "newline": (
+                [
+                    "<tool_call>get_weather\n",
+                    "<arg_key>city</arg_key><arg_value>Beijing</arg_value>",
+                    "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>",
+                    "</tool_call>",
+                ],
+                '{"city": "Beijing", "date": "2024-06-27"}',
+            ),
+            "compact": (
+                [
+                    "<tool_call>get_weather",
+                    "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>",
+                    "<arg_key>date</arg_key><arg_value>2024-06-28</arg_value>",
+                    "</tool_call>",
+                ],
+                '{"city": "Shanghai", "date": "2024-06-28"}',
+            ),
+        }
+        for layout, (chunks, expected) in cases.items():
+            with self.subTest(layout=layout):
+                self.setUp()
+                tool_calls = self._collect_streaming_tool_calls(chunks)
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0]["name"], "get_weather")
+                self.assertEqual(tool_calls[0]["parameters"], expected)
 
 
 class TestJsonArrayParser(unittest.TestCase):
@@ -3616,6 +4033,22 @@ class TestLfm2Detector(unittest.TestCase):
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["city"], "Paris")
 
+    def test_detect_and_parse_pythonic_invalid_escape(self):
+        """An invalid Python escape (e.g. "\\d+") must not drop the tool call."""
+        text = '<|tool_call_start|>[search(query="\\d+")]<|tool_call_end|>'
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", SyntaxWarning)
+            result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "\\d+")
+        self.assertFalse(
+            any(isinstance(w.message, SyntaxWarning) for w in caught),
+            [str(w.message) for w in caught],
+        )
+
     def test_detect_and_parse_pythonic_multiple_args(self):
         """Test parsing with multiple arguments."""
         text = '<|tool_call_start|>[get_weather(city="London", unit="celsius")]<|tool_call_end|>'
@@ -3833,6 +4266,243 @@ class TestLfm2Detector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(result.calls[1].name, "search")
 
+    # ==================== recovery tests (dropped-call regressions) ====================
+
+    def test_multiline_string_argument_recovered(self):
+        """A raw newline inside a string argument (multi-line shell command)
+        is invalid Python, so ast.parse failed and the whole call was
+        dropped. The value must round-trip with the newline intact."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
+    def test_nul_byte_in_string_argument_recovered(self):
+        """A NUL byte anywhere makes ast.parse raise ValueError (not
+        SyntaxError), so the call was dropped with no recovery path."""
+        text = "<|tool_call_start|>[search(query='printf a\x00b')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "printf a\x00b")
+
+    def test_nested_quotes_recovered(self):
+        """Unescaped same-style quotes nested in a shell command
+        (sed -n '360,450p') read as string/number juxtaposition, a
+        SyntaxError, so the call was dropped even though only one closing
+        quote yields parseable text."""
+        text = (
+            "<|tool_call_start|>[search(query='sed -n '360,450p' f.py')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "sed -n '360,450p' f.py")
+
+    def test_ambiguous_nested_quotes_not_guessed(self):
+        """When a later string argument's closing quote is also a plausible
+        closer, the nesting is genuinely ambiguous; recovery must NOT guess
+        a reading (guards the recovery predicate degrading to greedy)."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='echo 'hi', unit='celsius')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
+    def test_reserved_keyword_parameter_recovered(self):
+        """A parameter named after a Python keyword (from=1) is a
+        SyntaxError; the call was dropped. The original parameter name must
+        be restored in the decoded arguments."""
+        text = "<|tool_call_start|>[search(query='M.md', from=1)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "M.md", "from": 1})
+
+    def test_zero_padded_int_recovered(self):
+        """Zero-padded ints (day=07) are a SyntaxError ("leading zeros in
+        decimal integer literals"); the call was dropped."""
+        text = "<|tool_call_start|>[get_weather(city='NYC', day=07)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["day"], 7)
+
+    def test_explicit_positive_number(self):
+        """An explicitly signed positive number (+7) is UnaryOp(UAdd), which
+        only had a USub branch, so the call was dropped."""
+        text = "<|tool_call_start|>[search(query='x', limit=+7)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["limit"], 7)
+
+    def test_set_argument_decoded_as_list(self):
+        """A set argument ({'a', 'b'}) raised in _get_parameter_value and
+        dropped the call; JSON has no set type so it decodes as a list."""
+        text = "<|tool_call_start|>[search(query={'a', 'b'})]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], ["a", "b"])
+
+    def test_constant_fstring_argument(self):
+        """A placeholder-free f-string (f'hello') parses as JoinedStr, not
+        Constant, and dropped the call although it is a plain string."""
+        text = "<|tool_call_start|>[search(query=f'hello')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "hello")
+
+    def test_bytes_argument_skips_only_that_call(self):
+        """A bytes argument passed _get_parameter_value (it is an
+        ast.Constant) and only failed later as TypeError inside json.dumps,
+        which escaped the per-call handler and dropped every sibling call in
+        the block."""
+        text = (
+            "<|tool_call_start|>[get_weather(city='SF'), search(query=b'z')]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_non_finite_number_never_emits_invalid_json(self):
+        """The literal 1e999 overflows to float inf, and json.dumps rendered
+        it as Infinity — parameters that no JSON parser accepts. The call
+        must be skipped instead; every emitted parameters string must be
+        valid JSON."""
+        text = "<|tool_call_start|>[search(query='x', limit=1e999)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        for call in result.calls:
+            json.loads(call.parameters)
+        self.assertEqual(result.calls, [])
+
+    def test_kwargs_unpack_merges_dict(self):
+        """**-unpacked kwargs were skipped silently, emitting the call with
+        arguments missing; a dict literal merges with later-binding-wins
+        semantics instead, and non-dict operands reject the call."""
+        text = "<|tool_call_start|>[search(**{'query': 'x'}, limit=2)]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "limit": 2})
+
+        bad = "<|tool_call_start|>[search(**[1, 2])]<|tool_call_end|>"
+        self.assertEqual(self.detector.detect_and_parse(bad, self.tools).calls, [])
+
+    def test_positional_argument_call_not_silently_corrupted(self):
+        """get_weather('Paris', unit='celsius') used to silently drop
+        'Paris' and emit a successful call with only {"unit": "celsius"} —
+        a wrong execution instead of a visible failure. The call is
+        rejected; a keyword-only sibling still comes through."""
+        text = (
+            "<|tool_call_start|>[search(query='x'), "
+            "get_weather('Paris', unit='celsius')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+
+    def test_good_call_survives_unparsable_block(self):
+        """A genuinely ambiguous nested quote makes the whole block a
+        SyntaxError, so no call list exists and the parseable sibling died
+        with the block, leaving the agent loop with no tool result."""
+        text = (
+            "<|tool_call_start|>[search(query='ok'), "
+            "get_weather(city='x 'y', unit='c')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "ok"})
+
+    def test_swallowing_reading_rejected(self):
+        """Closing the broken string late makes the text parse by absorbing
+        the sibling call into the argument value, so the tool would run with
+        corrupted arguments. Rejecting readings that lose calls leaves the
+        correct early close and recovers both calls."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y'), "
+            "get_weather(city='p 'q')]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual([c.name for c in result.calls], ["search", "get_weather"])
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "x 'y"})
+        self.assertEqual(json.loads(result.calls[1].parameters), {"city": "p 'q"})
+
+    def test_unrecoverable_block_reports_no_calls(self):
+        """Splitting must not fabricate calls: when no segment parses, the
+        block yields no tool calls at all."""
+        text = (
+            "<|tool_call_start|>[search(query='x 'y' 'z), "
+            "get_weather(city='p 'q' 'r)]<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+
+    def test_streaming_recovers_multiline(self):
+        """Streaming buffers the block and delegates to detect_and_parse;
+        an incremental rewrite of the streaming path would bypass the
+        recovery rewrites and re-drop multi-line commands."""
+        text = (
+            "<|tool_call_start|>[search(query='line one\nline two')]<|tool_call_end|>"
+        )
+        detector = Lfm2Detector()
+        calls = []
+        for i in range(0, len(text), 7):
+            result = detector.parse_streaming_increment(text[i : i + 7], self.tools)
+            calls.extend(result.calls)
+
+        self.assertEqual(len(calls), 1)
+        params = json.loads(calls[0].parameters)
+        self.assertEqual(params["query"], "line one\nline two")
+
+    def test_reserved_kwarg_suffix_parameter_not_rewritten(self):
+        """A parameter literally named in_pyreservedkw_ must survive the
+        normal parse path; only recovery-renamed kwargs get restored."""
+        text = (
+            "<|tool_call_start|>[search(query='x', in_pyreservedkw_=5)]"
+            "<|tool_call_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"query": "x", "in_pyreservedkw_": 5})
+
+    def test_reserved_kwarg_with_nested_quote_recovered(self):
+        """A keyword-named parameter holding a nested-quote command needs
+        the rename and requote rewrites to compose."""
+        text = "<|tool_call_start|>[search(from='sed -n '1,5p' f.py')]<|tool_call_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params, {"from": "sed -n '1,5p' f.py"})
+
     # ==================== structure_info tests ====================
 
     def test_supports_structural_tag(self):
@@ -4044,9 +4714,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4086,9 +4756,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4126,9 +4796,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
@@ -4165,9 +4835,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4202,9 +4872,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         # Should have name but incomplete parameters
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4240,9 +4910,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll remember that.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4285,9 +4955,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4335,9 +5005,9 @@ function call<|role_sep|>
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(accumulated_text, "I'll help you.")
         self.assertEqual(len(tool_calls_by_index), 1)
@@ -4589,9 +5259,9 @@ class TestQwen25Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -4839,9 +5509,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         return normal_text, tool_calls_by_index
 
     def test_streaming_multiple_tool_calls(self):
@@ -4880,9 +5550,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
 
         self.assertEqual(len(tool_calls_by_index), 2)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
@@ -4947,9 +5617,9 @@ class TestGemma4Detector(unittest.TestCase):
                     if call.name:
                         tool_calls_by_index[call.tool_index]["name"] = call.name
                     if call.parameters:
-                        tool_calls_by_index[call.tool_index][
-                            "parameters"
-                        ] += call.parameters
+                        tool_calls_by_index[call.tool_index]["parameters"] += (
+                            call.parameters
+                        )
         self.assertIn("Hello!", normal_text)
         self.assertIn("Let me also check", normal_text)
         self.assertEqual(len(tool_calls_by_index), 2)
@@ -4959,6 +5629,197 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestGetSchemaProperties(unittest.TestCase):
+    def test_flat_properties(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        self.assertEqual(get_schema_properties(schema), {"a": {"type": "string"}})
+
+    def test_top_level_combinators(self):
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "acme"},
+                        "payload": {"type": "object"},
+                    },
+                },
+                {"type": "object", "properties": {"kind": {"const": "other"}}},
+            ],
+        }
+        # duplicate keys resolve to the first branch that declares them
+        self.assertEqual(
+            get_schema_properties(schema),
+            {"kind": {"const": "acme"}, "payload": {"type": "object"}},
+        )
+
+    def test_anyof_allof_and_nesting(self):
+        anyof = {
+            "anyOf": [{"properties": {"x": {"type": "integer"}}}, {"type": "null"}]
+        }
+        self.assertEqual(get_schema_properties(anyof), {"x": {"type": "integer"}})
+        allof = {
+            "allOf": [
+                {"oneOf": [{"properties": {"y": {"type": "boolean"}}}]},
+                {"properties": {"z": {"type": "string"}}},
+            ]
+        }
+        self.assertEqual(
+            get_schema_properties(allof),
+            {"y": {"type": "boolean"}, "z": {"type": "string"}},
+        )
+
+    def test_non_dict_and_missing(self):
+        self.assertEqual(get_schema_properties(None), {})
+        self.assertEqual(
+            get_schema_properties(
+                {"type": "object"},
+            ),
+            {},
+        )
+        self.assertEqual(get_schema_properties({"oneOf": "not-a-list"}), {})
+
+
+class TestTopLevelCompositeToolSchema(unittest.TestCase):
+    """Parsers must resolve argument types when tool ``parameters`` declares
+    its properties under a top-level anyOf/oneOf/allOf instead of directly."""
+
+    def setUp(self):
+        self.oneof_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "acme"},
+                                    "payload": {
+                                        "type": "object",
+                                        "properties": {
+                                            "value": {"type": "string"},
+                                        },
+                                        "required": ["value"],
+                                    },
+                                },
+                                "required": ["kind", "payload"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                ),
+            ),
+        ]
+        self.flat_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="acme",
+                    description="Send a value to Acme.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "payload": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                            },
+                        },
+                        "required": ["kind", "payload"],
+                    },
+                ),
+            ),
+        ]
+        self.glm47_text = (
+            "<tool_call>acme"
+            "<arg_key>kind</arg_key><arg_value>acme</arg_value>"
+            "<arg_key>payload</arg_key>"
+            '<arg_value>{"value": "hello"}</arg_value>'
+            "</tool_call>"
+        )
+        self.glm4_text = (
+            "<tool_call>acme\n"
+            "<arg_key>kind</arg_key>\n<arg_value>acme</arg_value>\n"
+            "<arg_key>payload</arg_key>\n"
+            '<arg_value>{"value": "hello"}</arg_value>\n'
+            "</tool_call>"
+        )
+        self.qwen_text = (
+            "<tool_call><function=acme>"
+            "<parameter=kind>acme</parameter>"
+            '<parameter=payload>{"value": "hello"}</parameter>'
+            "</function></tool_call>"
+        )
+        self.expected = {"kind": "acme", "payload": {"value": "hello"}}
+
+    def _stream_arguments(self, detector, text, tools, chunk_size=8):
+        name = None
+        arguments = ""
+        for i in range(0, len(text), chunk_size):
+            result = detector.parse_streaming_increment(text[i : i + chunk_size], tools)
+            for call in result.calls:
+                if call.name:
+                    name = call.name
+                arguments += call.parameters
+        return name, arguments
+
+    def test_glm47_streaming(self):
+        detector = Glm47MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm47_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm47_streaming_object_argument_closes_outer_brace(self):
+        detector = Glm47MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm47_text, self.flat_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm4_streaming(self):
+        detector = Glm4MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm4_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_glm4_streaming_object_argument_closes_outer_brace(self):
+        detector = Glm4MoeDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.glm4_text, self.flat_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
+
+    def test_qwen3_coder_detect_and_parse(self):
+        detector = Qwen3CoderDetector()
+        result = detector.detect_and_parse(self.qwen_text, self.oneof_tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), self.expected)
+
+    def test_qwen3_coder_streaming(self):
+        detector = Qwen3CoderDetector()
+        name, arguments = self._stream_arguments(
+            detector, self.qwen_text, self.oneof_tools
+        )
+        self.assertEqual(name, "acme")
+        self.assertEqual(json.loads(arguments), self.expected)
 
 
 if __name__ == "__main__":

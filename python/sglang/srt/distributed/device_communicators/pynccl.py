@@ -16,6 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     buffer_type,
     cudaStream_t,
     ncclComm_t,
+    ncclConfig_t,
     ncclDataTypeEnum,
     ncclRedOpTypeEnum,
     ncclUniqueId,
@@ -27,12 +28,12 @@ logger = logging.getLogger(__name__)
 
 
 class PyNcclCommunicator:
-
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        is_symmetric_memory_enabled: bool = False,
     ):
         """
         Args:
@@ -42,14 +43,15 @@ class PyNcclCommunicator:
                 it will be bind to f"cuda:{local_rank}".
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
+            is_symmetric_memory_enabled: whether symmetric memory is enabled.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
-            assert (
-                dist.get_backend(group) != dist.Backend.NCCL
-            ), "PyNcclCommunicator should be attached to a non-NCCL group."
+            assert dist.get_backend(group) != dist.Backend.NCCL, (
+                "PyNcclCommunicator should be attached to a non-NCCL group."
+            )
             # note: this rank is the rank in the group
             self.rank = dist.get_rank(group)
             self.world_size = dist.get_world_size(group)
@@ -108,9 +110,18 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            if is_symmetric_memory_enabled:
+                # When symmetric memory is enabled, disable internal
+                # NCCL cuda event synchronizations to improve performance.
+                config = ncclConfig_t.create()
+                config.graphUsageMode = 1
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
+                    self.world_size, self.unique_id, self.rank, config
+                )
+            else:
+                self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                    self.world_size, self.unique_id, self.rank
+                )
             warmup_stream = torch.cuda.Stream()
 
             # A small all_reduce for warmup.
