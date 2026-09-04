@@ -120,6 +120,50 @@ class RacerDraftProvider:
         self._last_batch_stats = []
         return stats
 
+    def seed_prompt_logits(
+        self,
+        req_ids: Sequence[object],
+        prompt_tokens: np.ndarray,
+        topk_ids: np.ndarray,
+        prompt_lens: Sequence[int],
+    ) -> None:
+        """Warm each request's TokenBin from flattened prompt-position logits.
+
+        ``prompt_tokens`` and ``topk_ids`` follow SGLang's flattened extend
+        layout.  For a prompt token x_i, row i contains the target model's
+        top-k next-token predictions p(x_{i+1} | x_{<=i}), matching RACER's
+        original prompt-time ``Automaton::update(input_ids, adj_topk)`` use.
+        Repeated token ids intentionally keep the latest row, as in TokenBin.
+        """
+
+        prompt_tokens = np.asarray(prompt_tokens).reshape(-1)
+        topk_ids = np.asarray(topk_ids)
+        if topk_ids.ndim != 2:
+            raise ValueError(f"RACER prompt top-k must be rank-2, got {topk_ids.shape=}")
+
+        lengths = [int(x) for x in prompt_lens]
+        if len(lengths) != len(req_ids):
+            raise ValueError(
+                f"RACER prompt warm-up length mismatch: {len(req_ids)=}, "
+                f"{len(lengths)=}"
+            )
+        total = sum(lengths)
+        if total != len(prompt_tokens) or total != topk_ids.shape[0]:
+            raise ValueError(
+                "RACER prompt warm-up flattened shape mismatch: "
+                f"{total=}, tokens={len(prompt_tokens)}, rows={topk_ids.shape[0]}"
+            )
+
+        offset = 0
+        for rid, length in zip(req_ids, lengths):
+            end = offset + length
+            if length > 0:
+                self._state(rid).update_logits(
+                    prompt_tokens[offset:end].tolist(),
+                    topk_ids[offset:end].tolist(),
+                )
+            offset = end
+
     def update_logits(
         self,
         req_ids: Sequence[object],
