@@ -7,16 +7,13 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
     filter_dcp_local_kv_indices,
 )
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -434,33 +431,18 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            dsa_use_prefill_cp(forward_batch, self.dsa_enable_prefill_cp)
-            or mla_use_prefill_cp(forward_batch, self.mla_enable_prefill_cp)
-        ) and not is_cp_v2_active(forward_batch):
-            # CP-v1 keeps Q rank-local but gives every rank a complete KV pool, so
-            # rebuild KV in global token order against the unsplit out_cache_loc.
-            kv_a, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache.squeeze(1),
-                forward_batch,
-                kv_a.unsqueeze(1),
-                k_pe,
-            )
-        else:
-            kv_a = kv_a.unsqueeze(1)
-
         if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a, k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         elif _is_npu:
             # To reduce a time-costing split operation
             get_token_to_kv_pool().set_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a, k_pe
+                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
             )
         else:
-            latent_cache[:, :, : self.kv_lora_rank] = kv_a
+            latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
             latent_cache[:, :, self.kv_lora_rank :] = k_pe.clone()
 
             # Save latent cache

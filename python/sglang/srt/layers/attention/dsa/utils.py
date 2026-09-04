@@ -2,22 +2,10 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 import triton
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
-from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
-    attn_cp_all_gather_into_tensor,
-    is_allocation_symmetric,
-)
-from sglang.srt.layers.utils.cp_utils import (
-    ContextParallelMetadata as LegacyZigzagCPMetadata,
-)
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -180,46 +168,6 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     )
 
 
-def cp_zigzag_full_plan_rows(
-    forward_batch: "ForwardBatch", device: torch.device
-) -> torch.Tensor | None:
-    cp_meta = forward_batch.attn_cp_metadata
-    if not isinstance(cp_meta, (ZigzagContextParallelMetadata, LegacyZigzagCPMetadata)):
-        return None
-    if (
-        cp_meta.zigzag_index is None
-        or cp_meta.split_list is None
-        or forward_batch.extend_seq_lens_cpu is None
-    ):
-        return None
-
-    extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-    bs = len(extend_lens)
-    split_list = [int(x) for x in cp_meta.split_list]
-    if bs == 0 or len(split_list) % bs != 0:
-        return None
-    cp_segment_num = len(split_list) // bs
-
-    q_offsets = [0]
-    for q_len in extend_lens:
-        q_offsets.append(q_offsets[-1] + q_len)
-
-    rows: List[int] = []
-    for seg_idx in cp_meta.zigzag_index:
-        seg_idx = int(seg_idx)
-        batch_id = seg_idx // cp_segment_num
-        block_id = seg_idx % cp_segment_num
-        if batch_id >= bs:
-            return None
-        block_base = batch_id * cp_segment_num
-        block_start = sum(split_list[block_base : block_base + block_id])
-        block_len = split_list[seg_idx]
-        row_start = q_offsets[batch_id] + block_start
-        rows.extend(range(row_start, row_start + block_len))
-
-    return torch.tensor(rows, dtype=torch.long, device=device)
-
-
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
@@ -294,11 +242,6 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
-    if dsa_use_prefill_cp(forward_batch) and not can_dsa_prefill_cp_round_robin_split(
-        forward_batch
-    ):
-        return dsa_cache_seqlens
-
     attn_cp_size = get_parallel().attn_cp_size
     needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
         forward_batch
@@ -401,125 +344,6 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
-
-
-def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_parallel().attn_cp_size
-        assert input_.shape[0] % cp_size == 0, (
-            f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        )
-        return dsa_cp_round_robin_split_data(input_)
-
-    input_list = list(
-        torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
-    )
-    result = torch.cat(
-        [input_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index], dim=0
-    ).view(-1, input_.shape[-1])
-    return result
-
-
-def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_parallel().attn_cp_size
-        assert positions.shape[0] % cp_size == 0, (
-            f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
-            f"cp size {cp_size}"
-        )
-        return dsa_cp_round_robin_split_data(positions)
-
-    position_id_list = list(
-        torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
-    )
-    positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.attn_cp_metadata.zigzag_index],
-        dim=-1,
-    )
-    return positions
-
-
-def cp_attn_tp_all_gather_reorganazied_into_tensor(
-    input_: torch.Tensor, attn_tp_size, forward_batch
-):
-    # Use metadata extents: per-request remainders can make a rank longer than
-    # ceil(total_len / cp_size).
-    max_rank_len = forward_batch.attn_cp_metadata.max_rank_len
-    max_len = max_rank_len[0]
-    assert len(max_rank_len) == attn_tp_size and all(
-        rank_len == max_len for rank_len in max_rank_len
-    ), f"all-gather requires equal physical rank lengths, got {max_rank_len}"
-    assert input_.shape[0] <= max_len, (
-        f"local CP input has {input_.shape[0]} rows, exceeding the metadata "
-        f"physical extent {max_len}"
-    )
-    pad_size = max_len - input_.shape[0]
-    if pad_size > 0:
-        input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
-    input_ = input_.contiguous()
-    group = get_parallel().attn_cp_group
-    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
-        input_tensor_all = torch.empty(
-            max_len * attn_tp_size,
-            input_.shape[1],
-            device=input_.device,
-            dtype=input_.dtype,
-        )
-    attn_cp_all_gather_into_tensor(input_tensor_all, input_)
-    outputs_list_max = list(
-        torch.split(
-            input_tensor_all, forward_batch.attn_cp_metadata.max_rank_len, dim=0
-        )
-    )
-    outputs = torch.cat(
-        [
-            outputs_list_max[index][:per_rank_len]
-            for index, per_rank_len in enumerate(
-                forward_batch.attn_cp_metadata.per_rank_actual_token
-            )
-        ],
-        dim=0,
-    )
-    return outputs
-
-
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
-    if is_dsa_prefill_cp_round_robin_split():
-        with use_symmetric_memory(
-            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
-        ):
-            output_tensor = input_tensor.new_empty(
-                (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
-            )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
-        out_shape = output_tensor.shape
-        output_tensor = (
-            output_tensor.view(cp_size, -1, *out_shape[1:])
-            .transpose(0, 1)
-            .reshape(out_shape)
-        )
-        return output_tensor
-
-    bs_seq_len, hidden_size = input_tensor.shape
-    output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
-        input_tensor,
-        cp_size,
-        forward_batch,
-    )
-    outputs_list = list(
-        torch.split(
-            output_tensor, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
-        )
-    )
-    output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
-        dim=0,
-    )
-    output_tensor = output_tensor.view(-1, hidden_size)
-    return output_tensor
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

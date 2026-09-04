@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -39,7 +39,6 @@ def _is_kpool_metadata_fusion_supported(
 class _KPoolForwardInputs:
     full_real_page_table: Optional[torch.Tensor] = None
     full_seqlens_expanded: Optional[torch.Tensor] = None
-    cp_overrides: dict = field(default_factory=dict)
 
 
 class DeepseekSparseAttnBackendKPoolMixin:
@@ -113,7 +112,6 @@ class DeepseekSparseAttnBackendKPoolMixin:
                 topk_transform_method=topk_transform_method,
                 full_real_page_table=kpool_inputs.full_real_page_table,
                 full_seqlens_expanded=kpool_inputs.full_seqlens_expanded,
-                **kpool_inputs.cp_overrides,
             )
 
         if forward_mode.is_decode_or_idle():

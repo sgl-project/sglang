@@ -1382,9 +1382,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             moe_cp_size > 1
             and hidden_states.shape[0] > 0
-            and forward_batch.forward_mode.is_context_parallel_extend(
-                include_draft_extend_v2=True
-            )
+            and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
             # Zigzag split can produce unequal token counts across CP ranks
@@ -1565,9 +1563,7 @@ class CommunicateSummableTensorPairFn:
         moe_cp_size = get_moe_cp_size()
         if (
             moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend(
-                include_draft_extend_v2=True
-            )
+            and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
             moe_cp_rank = get_moe_cp_rank()

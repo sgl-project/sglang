@@ -24,7 +24,6 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_parallel,
 )
 from sglang.srt.utils import is_hip, is_npu
 
@@ -73,21 +72,6 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
     return get_dsa_mtp_topk_width(hf_config)
-
-
-def should_send_aux_metadata(
-    *,
-    attn_cp_rank: int,
-    prefill_attn_tp_size: int,
-    prefill_attn_tp_rank: int,
-    decode_attn_tp_size: int,
-    decode_attn_tp_rank: int,
-) -> bool:
-    """Choose the sole PP/CP/TP writer for replicated AUX; non-writers must still notify completion."""
-    primary_prefill_tp_rank = (
-        decode_attn_tp_rank * prefill_attn_tp_size // decode_attn_tp_size
-    )
-    return attn_cp_rank == 0 and prefill_attn_tp_rank == primary_prefill_tp_rank
 
 
 def is_dsv4_c128_online_enabled() -> bool:
@@ -169,16 +153,6 @@ def unified_memory_disagg_move_gate(scheduler):
     raise ValueError(
         "unified_memory_disagg_move_gate: scheduler is not a PD node "
         f"(mode={scheduler.disaggregation_mode})"
-    )
-
-
-def should_bypass_dsa_cp_prefix_cache() -> bool:
-    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
-    exists; without it, cache hits let attention read non-local page rows."""
-    return (
-        get_disagg().disaggregation_mode == DisaggregationMode.PREFILL.value
-        and get_parallel().attn_cp_size > 1
-        and get_parallel().enable_dsa_prefill_context_parallel
     )
 
 
@@ -846,54 +820,6 @@ def compute_mamba_state_slice_blocks(
         src_off += src_sub
         dst_off += dst_sub
     return blocks
-
-
-def resolve_linear_state_shards(
-    *,
-    prefill_attn_tp_size: int,
-    prefill_attn_tp_rank: int,
-    prefill_attn_cp_size: int,
-    prefill_attn_cp_rank: int,
-    decode_attn_tp_size: int,
-    decode_tp_rank: int,
-) -> Optional[Tuple[int, int, int, int]]:
-    """Map a prefill TP/CP head shard to decode TP; return None for disjoint ranges."""
-    values = {
-        "prefill_attn_tp_size": prefill_attn_tp_size,
-        "prefill_attn_cp_size": prefill_attn_cp_size,
-        "decode_attn_tp_size": decode_attn_tp_size,
-    }
-    for name, value in values.items():
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
-
-    if prefill_attn_cp_size > 1:
-        src_shard_size = prefill_attn_cp_size
-        src_shard_rank = prefill_attn_cp_rank
-    else:
-        src_shard_size = prefill_attn_tp_size
-        src_shard_rank = prefill_attn_tp_rank
-    dst_shard_size = decode_attn_tp_size
-    dst_shard_rank = decode_tp_rank % decode_attn_tp_size
-
-    if not 0 <= src_shard_rank < src_shard_size:
-        raise ValueError(
-            f"Prefill linear-state shard rank {src_shard_rank} is outside "
-            f"[0, {src_shard_size})"
-        )
-    if max(src_shard_size, dst_shard_size) % min(src_shard_size, dst_shard_size):
-        raise ValueError(
-            "Linear-state shard sizes must divide each other, got "
-            f"prefill={src_shard_size}, decode={dst_shard_size}"
-        )
-
-    if src_shard_size >= dst_shard_size:
-        overlaps = src_shard_rank * dst_shard_size // src_shard_size == dst_shard_rank
-    else:
-        overlaps = dst_shard_rank * src_shard_size // dst_shard_size == src_shard_rank
-    if not overlaps:
-        return None
-    return src_shard_size, src_shard_rank, dst_shard_size, dst_shard_rank
 
 
 def compute_mamba_state_slice_byte_blocks(

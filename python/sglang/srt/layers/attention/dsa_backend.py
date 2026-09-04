@@ -79,7 +79,6 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
-    cp_zigzag_full_plan_rows,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
@@ -142,15 +141,6 @@ def _all_gather_dsa_trtllm_fp8_kv(
         torch.cuda.current_stream(),
     ).view(kv_dtype)
     return kv.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
-
-
-def _should_all_gather_dsa_trtllm_fp8_kv(
-    *,
-    save_kv_cache: bool,
-    cos_sin_cache: Optional[torch.Tensor],
-    dsa_prefill_cp: bool,
-) -> bool:
-    return save_kv_cache and cos_sin_cache is not None and dsa_prefill_cp
 
 
 def materialize_full_kv_cp(
@@ -1016,7 +1006,6 @@ class DeepseekSparseAttnBackend(
                 f"got page_size={self.real_page_size}, pool_size={self.dsa_index_kpool}."
             )
         kpool_inputs = _KPoolForwardInputs()
-        zigzag_cp_split = False
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -1146,127 +1135,8 @@ class DeepseekSparseAttnBackend(
                     else 0
                 )
                 page_table = page_table[bs_idx, :max_seqlen_k]
-                if use_kpool:
-                    kpool_inputs.cp_overrides = dict(
-                        local_real_page_table=self._transform_table_1_to_real(
-                            page_table
-                        ),
-                        local_seqlens_expanded=seqlens_expanded,
-                        local_extend_seq_lens_cpu=list(extend_seq_lens_cpu),
-                        local_seq_lens_cpu=indexer_seq_lens_cpu.tolist(),
-                        local_req_pool_indices=forward_batch.req_pool_indices[bs_idx],
-                    )
 
-            elif dsa_use_prefill_cp(
-                forward_batch
-            ) and not can_dsa_prefill_cp_round_robin_split(forward_batch):
-                zigzag_cp_split = True
-                cp_meta = forward_batch.attn_cp_metadata
-                prev_q_lens = list(
-                    getattr(cp_meta, "actual_seq_q_prev_list", None)
-                    or [int(cp_meta.actual_seq_q_prev)]
-                )
-                next_q_lens = list(
-                    getattr(cp_meta, "actual_seq_q_next_list", None)
-                    or [int(cp_meta.actual_seq_q_next)]
-                )
-                prev_k_lens = list(
-                    getattr(cp_meta, "kv_len_prev_list", None)
-                    or [int(cp_meta.kv_len_prev)]
-                )
-                next_k_lens = list(
-                    getattr(cp_meta, "kv_len_next_list", None)
-                    or [int(cp_meta.kv_len_next)]
-                )
-                cp_bs = len(prev_q_lens)
-                assert (
-                    cp_bs == len(next_q_lens) == len(prev_k_lens) == len(next_k_lens)
-                ), "Mismatched zigzag CP metadata lengths"
-
-                prefix_offsets = []
-                seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
-                for i in range(cp_bs):
-                    prefix_offsets.append(
-                        max(
-                            int(seq_lens_cpu_list[i])
-                            - int(forward_batch.extend_seq_lens_cpu[i]),
-                            0,
-                        )
-                    )
-
-                local_seq_lens_cpu = [
-                    prefix_offsets[i] + int(prev_k_lens[i]) for i in range(cp_bs)
-                ] + [prefix_offsets[i] + int(next_k_lens[i]) for i in range(cp_bs)]
-                local_extend_seq_lens_cpu = [int(x) for x in prev_q_lens] + [
-                    int(x) for x in next_q_lens
-                ]
-
-                local_seqlens = []
-                for q_len, kv_len in zip(
-                    local_extend_seq_lens_cpu, local_seq_lens_cpu, strict=True
-                ):
-                    if q_len <= 0:
-                        continue
-                    local_seqlens.append(
-                        torch.arange(
-                            kv_len - q_len + 1,
-                            kv_len + 1,
-                            dtype=torch.int32,
-                            device=device,
-                        )
-                    )
-                seqlens_expanded = (
-                    torch.cat(local_seqlens)
-                    if local_seqlens
-                    else torch.empty(0, dtype=torch.int32, device=device)
-                )
-
-                extend_seq_lens_cpu = local_extend_seq_lens_cpu
-                extend_seq_lens = torch.tensor(
-                    extend_seq_lens_cpu, dtype=torch.int32, device=device
-                )
-                indexer_seq_lens_cpu = torch.tensor(
-                    local_seq_lens_cpu,
-                    dtype=forward_batch.seq_lens_cpu.dtype,
-                    device=forward_batch.seq_lens_cpu.device,
-                )
-                indexer_seq_lens = torch.tensor(
-                    local_seq_lens_cpu,
-                    dtype=forward_batch.seq_lens.dtype,
-                    device=device,
-                )
-                cache_seqlens_int32 = indexer_seq_lens.to(torch.int32)
-                cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
-                max_seqlen_k = max(local_seq_lens_cpu) if local_seq_lens_cpu else 0
-
-                local_page_table = torch.cat(
-                    [page_table[:cp_bs], page_table[:cp_bs]], dim=0
-                )
-                page_table = local_page_table[:, :max_seqlen_k]
-                local_req_pool_indices = torch.cat(
-                    [
-                        forward_batch.req_pool_indices[:cp_bs],
-                        forward_batch.req_pool_indices[:cp_bs],
-                    ],
-                    dim=0,
-                )
-
-                if use_kpool:
-                    kpool_inputs.cp_overrides = dict(
-                        local_real_page_table=self._transform_table_1_to_real(
-                            page_table
-                        ),
-                        local_seqlens_expanded=seqlens_expanded,
-                        local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
-                        local_seq_lens_cpu=local_seq_lens_cpu,
-                        local_req_pool_indices=local_req_pool_indices,
-                    )
-
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or bs_idx_cpu is not None
-                or zigzag_cp_split
-            ):
+            if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
@@ -1331,13 +1201,6 @@ class DeepseekSparseAttnBackend(
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
-        if (
-            zigzag_cp_split
-            and dsa_cache_seqlens_int32.shape[0] != seqlens_expanded.shape[0]
-        ):
-            dsa_cache_seqlens_int32 = dsa_cache_seqlens_int32[
-                : seqlens_expanded.shape[0]
-            ]
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -2870,35 +2733,16 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "fa3":
-            fa3_page_table = page_table_1
-            fa3_cache_seqlens = metadata.dsa_cache_seqlens_int32
-            fa3_cu_seqlens_q = metadata.dsa_cu_seqlens_q
-            fa3_cu_seqlens_k = metadata.dsa_cu_seqlens_k
-            fa3_max_seqlen_q = metadata.dsa_max_seqlen_q
-            if (
-                forward_batch.attn_cp_metadata is not None
-                and fa3_cache_seqlens.shape[0] > q_nope.shape[0]
-            ):
-                row_select = cp_zigzag_full_plan_rows(forward_batch, q_nope.device)
-                if row_select is not None:
-                    fa3_cache_seqlens = fa3_cache_seqlens.index_select(0, row_select)
-                    fa3_cu_seqlens_k = compute_cu_seqlens(fa3_cache_seqlens)
-                    fa3_cu_seqlens_q = self.get_device_int32_arange(
-                        fa3_cache_seqlens.shape[0] + 1
-                    )
-                    fa3_max_seqlen_q = 1
-                    if fa3_page_table.shape[0] > q_nope.shape[0]:
-                        fa3_page_table = fa3_page_table.index_select(0, row_select)
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
                 q_nope=q_nope,
-                page_table=fa3_page_table,
-                cache_seqlens=fa3_cache_seqlens,
-                cu_seqlens_q=fa3_cu_seqlens_q,
-                cu_seqlens_k=fa3_cu_seqlens_k,
-                max_seqlen_q=fa3_max_seqlen_q,
+                page_table=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                cu_seqlens_q=metadata.dsa_cu_seqlens_q,
+                cu_seqlens_k=metadata.dsa_cu_seqlens_k,
+                max_seqlen_q=metadata.dsa_max_seqlen_q,
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
@@ -3930,17 +3774,15 @@ class DeepseekSparseAttnBackend(
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
                 )
-            if _should_all_gather_dsa_trtllm_fp8_kv(
-                save_kv_cache=save_kv_cache,
-                cos_sin_cache=cos_sin_cache,
-                dsa_prefill_cp=dsa_use_prefill_cp(forward_batch),
-            ):
-                if is_cp_v2_active(forward_batch):
-                    k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
-                        forward_batch, k, k_rope
-                    )
-                else:
-                    k, k_rope = _all_gather_dsa_trtllm_fp8_kv(forward_batch, k, k_rope)
+                if save_kv_cache and dsa_use_prefill_cp(forward_batch):
+                    if is_cp_v2_active(forward_batch):
+                        k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
+                            forward_batch, k, k_rope
+                        )
+                    else:
+                        k, k_rope = _all_gather_dsa_trtllm_fp8_kv(
+                            forward_batch, k, k_rope
+                        )
             merge_query = False
 
             # Save KV cache if requested
