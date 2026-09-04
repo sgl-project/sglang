@@ -712,6 +712,28 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
 
+    def test_parallel_sampling_preserves_background(self):
+        """background=True dropped by __getitem__ causes spurious disconnect
+        aborts in _stream_one_response for Responses API background requests
+        with n>1."""
+        single = GenerateReqInput(
+            text="Hello",
+            rid="bg-single",
+            sampling_params={"n": 3},
+            background=True,
+        )
+        single.normalize_batch_and_arguments()
+        self.assertTrue(all(single[i].background for i in range(3)))
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="bg-batch",
+            sampling_params={"n": 2},
+            background=True,
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertTrue(all(batch[i].background for i in range(4)))
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
