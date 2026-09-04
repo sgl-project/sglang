@@ -299,19 +299,25 @@ def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
 
 def use_bf16_gemm_sm120(m: int, n: int, k: int) -> bool:
     """Return True when the SM120 BF16 kernel wins for this decode shape."""
-    if m < 1 or m > 16:
+    # The kernel epilogue has no M predication and always reads/stores a
+    # full tile_m-row tile. Dispatching a decode batch smaller than the
+    # tile_m=16 bucket (bs in {1,2,4,8,12}) makes the kernel read the A
+    # tail rows and write the C tail rows out of bounds: on down-proj
+    # shapes this corrupts the result (measured max err up to 2.0) and on
+    # every shape it clobbers adjacent allocations. Only the exact M=16
+    # decode bucket is out-of-bounds-free, so restrict dispatch to it;
+    # the smaller decode buckets stay on F.linear, which is also faster
+    # there (the padded host workaround measured 0.39x-0.94x vs F.linear).
+    if m != 16:
         return False
-    # The epilogue has no M/N predication (full-tile TMA store + bias
-    # indexed by the in-tile n coordinate), so N must be tile_n-divisible.
-    # The production path is intentionally limited to M <= 16: the wider
-    # decode buckets remain available to the benchmark/tuning harness, but
-    # do not consistently beat F.linear across SM120 GPU SKUs.
+    # N must be tile_n-divisible for the unpredicated full-tile TMA store;
+    # K needs 64 for the K%128!=0 tile_k=64 fallback in run_bf16_gemm_sm120.
     if n % 128 != 0 or k % 64 != 0:
         return False
-    # Down- and square projections remain faster in cuBLAS on RTX PRO 6000.
-    # Expansion projections consistently benefit on both tested SM120 SKUs.
-    if n <= k:
-        return False
+    # At exactly M=16 the kernel beats cuBLASLt on every projection family
+    # measured on the RTX 5090, including the down/o (n<=k) shapes that the
+    # previous n>k gate excluded: qkvz 1.37x, gate_up 1.81x, down 1.14x,
+    # o/gdn.out 1.12x, attn.qkv 1.33x. There is no remaining n-vs-k cutoff.
     return True
 
 
