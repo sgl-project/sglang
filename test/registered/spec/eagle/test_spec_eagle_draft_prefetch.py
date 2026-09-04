@@ -4,8 +4,8 @@ With draft prefetch, EAGLEWorkerV2 pre-runs the next round's draft decode
 back-to-back with this round's draft_extend (on the forward stream), and
 pre-concatenates the per-step topk into the next draft input. The next decode
 round then builds its verify input from the pre-concatenated candidate chain
-(prepare_verify_fully_async_decoding) instead of re-running the draft. This
-file guards that the optimization is lossless:
+(prepare_verify_input_for_draft_prefetch) instead of re-running the draft.
+This file guards that the optimization is lossless:
 
   - greedy parity vs a non-spec reference server (SpecParityKit);
   - acceptance length / verify bookkeeping (SpecCorrectnessKit);
@@ -13,9 +13,10 @@ file guards that the optimization is lossless:
   - radix / abort / grammar features with a strict memory check -- a leak from
     the extra pre-run draft would trip it (SpecFeatureKit).
 
-Constraint surface (enforced by _check_draft_prefetch): EAGLE3, topk=1,
-num_steps > 1, non-adaptive, no rejection sampling. The unit tests for that
-validation live in test/registered/unit/spec/test_spec_draft_prefetch_args.py.
+Constraint surface (enforced by _check_draft_prefetch): EAGLE family (this
+file exercises EAGLE3), topk=1, num_steps > 1, non-adaptive, no rejection
+sampling. The unit tests for that validation live in
+test/registered/unit/spec/test_spec_draft_prefetch_args.py.
 """
 
 import unittest
@@ -38,7 +39,8 @@ class _DraftPrefetchBase(Eagle3Base):
 
     extra_args = ("--enable-draft-prefetch",)
     # The pre-run draft allocates/reorders state on the forward stream every
-    # round; turn leaks into failures.
+    # round, so leaks are likely here; the strict check turns them into
+    # failures.
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

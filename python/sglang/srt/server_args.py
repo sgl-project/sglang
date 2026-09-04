@@ -2359,7 +2359,8 @@ class ServerArgs:
     ] = None
     enable_draft_prefetch: A[
         bool,
-        "pre-run the next round's draft after draft_extend (EAGLE3, topk=1 only).",
+        "pre-run the next round's draft after draft_extend (EAGLE family, "
+        "topk=1, num_steps > 1 only).",
         NS("spec"),
     ] = False
     # Decoupled speculative decoding: draft and verify run as

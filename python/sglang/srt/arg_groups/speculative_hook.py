@@ -188,6 +188,11 @@ def _check_draft_prefetch(server_args: ServerArgs) -> None:
     from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.environ import envs
 
+    # Read every field through the overlay, never the raw record: during
+    # __post_init__ the resolution pipeline stashes its decisions without
+    # writing the fields, so raw reads would miss this hook's own earlier
+    # decisions (alias/auto-params/adaptive) and model overrides
+    # (multi-layer EAGLE).
     cfg = resolved_view(server_args)
 
     if not cfg.enable_draft_prefetch:

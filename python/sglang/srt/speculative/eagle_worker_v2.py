@@ -780,15 +780,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _pad_topk_for_draft_prefetch(self, topk_p, topk_index):
         """Pad the prefill-side topk to the draft-prefetch candidate width
-        (steps * topk) so the pre-concatenation in draft_prefetch keeps a
-        uniform width across rounds.
+        (steps * topk): every decode round concatenates [seed | steps-1
+        predictions] into a buffer of exactly that width, and the overlap
+        relay buffer's shape is fixed by this first (prefill) stash.
 
         The padded slots REPEAT the last (for topk=1: the only) candidate
-        instead of zero-padding: the first decode round's tree is then built
-        from the real prefill token repeated N times -- a valid chain (verify
-        accepts at most one of the duplicates), never a bogus token id 0.
-        Also normalizes the prefill seed to the TARGET id space (the
-        concatenated draft-prefetch buffer is uniformly target-id).
+        instead of zero-padding: the first decode round then verifies a
+        chain of the real prefill token -- a valid chain, of which the
+        target may accept any prefix -- rather than one built on an
+        arbitrary token id 0. Also maps the prefill seed to the TARGET id
+        space here: the concatenated buffer is consumed directly by
+        prepare_verify_input_for_draft_prefetch, which skips
+        draft_forward's hot_token_id mapping.
         """
         # [bs, topk] -> [bs, num_steps * topk]  (topk=1: [bs,1] -> [bs,N])
         if self.enable_draft_prefetch and self.speculative_num_steps > 1:
@@ -831,7 +834,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             top_scores_index,
             0,
             topk_index.shape[1],
-            "draft_forward_for_prepare: top_scores_index OOB for gather on topk_index",
+            "prepare_verify_input_for_draft_prefetch: top_scores_index OOB "
+            "for gather on topk_index",
         )
         draft_tokens = torch.gather(topk_index, index=top_scores_index, dim=1)
 
@@ -841,7 +845,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             parent_list,
             top_scores_index,
             draft_tokens,
-            None,  # draft-prefetch: rejection sampling excluded
+            None,  # draft_probs: rejection sampling is rejected at startup
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
@@ -860,10 +864,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch_output.next_draft_input.
 
         Runs on the forward stream, back-to-back with draft_extend, so the GPU
-        never idles waiting for the scheduler to re-dispatch the draft. KV slots
-        are NOT re-allocated: the req_to_token row mapping from the scheduler's
-        per-round alloc_for_spec_decode stays valid through the next round (no
-        mid-stream free), so prepare_for_draft's assign reads valid slots.
+        never idles waiting for the scheduler to re-dispatch the draft. No new
+        KV allocation happens: the scheduler reserves 2x
+        max(topk * num_steps, num_draft_tokens) slots per round (see
+        get_alloc_reserve_per_decode), so prepare_for_draft's contiguous
+        assign below lands on exactly the slots the next round's normal draft
+        would take -- the req_to_token rows stay valid through the next round.
         """
         assert self.speculative_num_steps > 1, (
             "draft_prefetch requires num_steps > 1; _check_draft_prefetch "
@@ -883,8 +889,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input = batch_output.next_draft_input
             new_seq_lens = batch_output.new_seq_lens
 
-            # draft_extend left an EagleDraftExtendInput here; the pre-run
-            # draft decode reads the seed tokens (topk_index) from it.
+            # draft_extend left an EagleDraftExtendInput here; rebind to the
+            # next draft input -- draft_forward reads the seed (topk_index)
+            # and hidden_states from spec_info.
             batch.spec_info = next_draft_input
             if not batch.forward_mode.is_idle():
                 # Disguise as the next round's decode batch: under
@@ -900,9 +907,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ) and getattr(
                     self.cuda_graph_runner, "replay_graph_needs_seq_lens_cpu", True
                 ):
-                    # Backends consuming the CPU mirror (e.g. Ascend block
-                    # tables) need the post-verify lengths; a stale mirror
-                    # under-sizes the tables and reads OOB.
+                    # Two readers need the post-verify lengths on the CPU
+                    # mirror: backends consuming it for metadata (e.g.
+                    # Ascend block tables -- a stale mirror under-sizes the
+                    # tables and reads OOB) and the NPU draft graph replay
+                    # (see replay_graph_needs_seq_lens_cpu, which builds
+                    # per-step seq_lens from it).
                     batch.seq_lens_cpu = new_seq_lens.to("cpu")
                     batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 # Width-only placeholder: init_new reads len(input_ids) into

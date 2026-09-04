@@ -60,6 +60,9 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         return self.attr_type[AttentionArch.MLA]
 
     def _is_replay_graph_needs_seq_lens_cpu(self):
+        # Non-DSA/V4 replay goes through replay_with_input_update, which
+        # takes per-step CPU seq_lens; DSA/V4 replay reads seq_lens from
+        # the device buffers directly.
         hf_config = self.model_runner.model_config.hf_config
         return not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config))
 
@@ -86,6 +89,10 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             dtype=torch.int32,
             device="cpu",
         )
+        # CPU tensor + gloo cpu_group: a device-side reduce would force a
+        # stream sync via .item() right after draft_extend's kernels are
+        # enqueued, stalling the launch of the pre-run draft
+        # (draft_prefetch).
         torch.distributed.all_reduce(
             decision,
             op=torch.distributed.ReduceOp.MIN,
