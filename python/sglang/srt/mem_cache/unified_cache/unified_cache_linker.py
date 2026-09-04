@@ -485,7 +485,7 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
 
-        cache.tree_core.mark_write_through_pending(node_id)
+        cache.tree_core.mark_write_through_pending([node_id], ack_id=node_id)
         node.external_cache_stored = True
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
 
