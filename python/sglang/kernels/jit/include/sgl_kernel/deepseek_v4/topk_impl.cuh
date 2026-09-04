@@ -14,7 +14,8 @@
 ///  - the cluster size is fixed at 8 (dynamic persistent clusters are hard).
 ///
 /// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
-/// exact radix tie-break.
+/// exact radix tie-break, plus an exact-key refinement when the threshold bin
+/// overflows the staging buffer (refine_and_handle_tie).
 
 #pragma once
 
@@ -330,6 +331,35 @@ struct TopKConfig {
     }
   }
 
+  /// Threshold-byte search over the 256-bin refinement histogram in
+  /// `smem->histogram[0]`, by the same rule radix_tie_select uses. Publishes the
+  /// result in `smem->match`. Block-wide; ends with a barrier.
+  SGL_DEVICE static void refine_find_threshold(  //
+      const uint32_t total_active,
+      const uint32_t topk_remain,
+      TieHandleSmem* smem) {
+    const auto tx = threadIdx.x;
+    const auto lane_id = tx % kWarpSize;
+    const auto warp_id = tx / kWarpSize;
+    uint32_t hist_val = 0;
+    uint32_t warp_inc = 0;
+    if (tx < kRadixSize) {
+      hist_val = smem->histogram[0][tx];
+      warp_inc = warp_inclusive_sum(lane_id, hist_val);
+      if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
+    }
+    __syncthreads();
+    if (tx < kRadixSize) {
+      const auto inter = warp::reduce_sum(lane_id < warp_id ? smem->warp_sum[lane_id] : 0);
+      const auto prefix = inter + warp_inc;      // inclusive prefix through this bin
+      const auto above = total_active - prefix;  // active elements in bins ABOVE this one
+      if (above < topk_remain && above + hist_val >= topk_remain) {
+        smem->match = {tx, above, hist_val};
+      }
+    }
+    __syncthreads();
+  }
+
   /// Exact radix select over the tie candidates: each thread owns kItems
   /// strided elements (inactive beyond num_ties). Requires
   /// num_ties <= kItems * kBlockSize.
@@ -526,6 +556,128 @@ struct TopKRadixBase : TopKConfig {
     }
     __syncthreads();
   }
+
+  /// Exact-key refinement of a threshold coarse bin that overflows the staging
+  /// buffer. A coarse bin spans a quarter-binade, so it can hold far more than
+  /// kMaxNumTie candidates with distinct fp32 values, and phase 3 keeps only
+  /// whichever kMaxNumTie arrived first. Replaces phase 4 when
+  /// `equal_count > kMaxNumTie`; the fast path pays one comparison.
+  ///
+  /// Up to four 8-bit radix passes over the order-preserving key from
+  /// `extract_exact_bin`. Exits once the refined set fits the buffer, or once
+  /// all 32 bits are consumed -- the key is injective on fp32 bit patterns, so
+  /// the survivors are bit-identical by then and any kMaxNumTie-subset is
+  /// correct. Both exits are exact. Each pass needs `0 < remain <= active`,
+  /// which the threshold-bin invariant gives and every pass restores.
+  ///
+  /// Scores are re-read from global rather than reused from the register path's
+  /// `local_vecs`, which would perturb the fast path's register allocation.
+  /// Shared memory is borrowed from the tie machinery: footprint is unchanged.
+  SGL_DEVICE static void refine_and_handle_tie(  //
+      const TopKProblem& problem,
+      Smem* smem,
+      const float v_lo,
+      const float v_hi,
+      const uint32_t equal_count) {
+    const auto tx = threadIdx.x;
+    const auto topk = problem.topk;
+    const auto handle = &smem->tie.handle;
+
+    // Early-out for a bit-identical candidate set: the radix passes cannot
+    // separate it and would only re-derive what phase 3 already staged. One
+    // distinct exact key means the candidates are interchangeable, so any
+    // kMaxNumTie-subset is correct, including the one already in tie.values.
+    // Comparing min against max of the key is exact for any value, and costs
+    // the one scan that non-degenerate overflow rows pay on top.
+    {
+      uint32_t key_min = 0xFFFFFFFFu;
+      uint32_t key_max = 0u;
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+        if (val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          key_min = min(key_min, key);
+          key_max = max(key_max, key);
+        }
+      });
+      // Reduce per-thread extrema: two atomics per thread, not per candidate.
+      if (tx == 0) {
+        handle->histogram[0][0] = 0xFFFFFFFFu;
+        handle->histogram[0][1] = 0u;
+      }
+      __syncthreads();
+      atomicMin(&handle->histogram[0][0], key_min);
+      atomicMax(&handle->histogram[0][1], key_max);
+      __syncthreads();
+      const bool bit_identical = handle->histogram[0][0] == handle->histogram[0][1];
+      __syncthreads();  // all threads read the scratch before the loop clears it
+      if (bit_identical) {
+        // equal_count > kMaxNumTie on entry, so phase 3 filled the whole buffer.
+        const auto above_count = smem->count_gt;
+        const auto remain_topk = above_count < topk ? topk - above_count : 0;
+        handle_tie(smem->tie.values, problem, above_count, kMaxNumTie, remain_topk, handle);
+        return;
+      }
+    }
+
+    uint32_t cand_count = equal_count;
+    uint32_t remain = smem->count_gt < topk ? topk - smem->count_gt : 0;
+    uint32_t prefix = 0;  // refined key bits agreed on so far
+    uint32_t mask = 0;    // which key bits `prefix` pins down
+
+    for (uint32_t round = 0; round < 4 && cand_count > kMaxNumTie && remain > 0; ++round) {
+      const uint32_t shift = 24 - round * 8;
+
+      if (tx < kRadixSize) handle->histogram[0][tx] = 0;
+      __syncthreads();
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+        if (val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          if ((key & mask) == prefix) atomicAdd(&handle->histogram[0][(key >> shift) & 0xFFu], 1);
+        }
+      });
+      __syncthreads();
+
+      refine_find_threshold(cand_count, remain, handle);
+      const auto match = handle->match;
+
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+        if (val >= v_lo && val < v_hi) {
+          const auto key = extract_exact_bin(val);
+          if ((key & mask) == prefix && ((key >> shift) & 0xFFu) > match.bin) {
+            const auto pos = atomicAdd(&smem->count_gt, 1);
+            if (pos < topk) [[likely]]
+              problem.emit(pos, idx);
+          }
+        }
+      });
+
+      prefix |= match.bin << shift;
+      mask |= 0xFFu << shift;
+      remain -= match.above_count;
+      cand_count = match.equal_count;
+      __syncthreads();  // `match` is read above and overwritten by the next pass
+    }
+
+    // Stage the survivors for handle_tie. More than kMaxNumTie can remain, but
+    // only once all 32 bits are consumed, where they are bit-identical.
+    if (tx == 0) smem->count_eq = 0;
+    __syncthreads();
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (val >= v_lo && val < v_hi) {
+        const auto key = extract_exact_bin(val);
+        if ((key & mask) == prefix) {
+          const auto slot = atomicAdd(&smem->count_eq, 1);
+          if (slot < kMaxNumTie) smem->tie.values[slot] = {val, idx};
+        }
+      }
+    });
+    __syncthreads();
+
+    const auto above_count = smem->count_gt;
+    const auto tie_count = min(smem->count_eq, kMaxNumTie);
+    const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, handle);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -628,6 +780,11 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    if (equal_count > kMaxNumTie) [[unlikely]] {
+      // Buffer holds an arrival-order subset; refine on the exact key first.
+      refine_and_handle_tie(problem, smem, v_lo, v_hi, equal_count);
+      return;
+    }
     const auto tie_count = min(equal_count, kMaxNumTie);
     handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
   }
@@ -700,6 +857,11 @@ struct TopKStreaming : TopKRegister<2> {
     const auto above_count = smem->count_gt;
     const auto equal_count = smem->count_eq;
     const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    if (equal_count > kMaxNumTie) [[unlikely]] {
+      // See the register path.
+      refine_and_handle_tie(problem, smem, v_lo, v_hi, equal_count);
+      return;
+    }
     const auto tie_count = min(equal_count, kMaxNumTie);
     handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
   }
@@ -711,6 +873,11 @@ struct TopKStreaming : TopKRegister<2> {
 //
 // CUDA only: thread-block clusters and distributed shared memory have no CDNA
 // equivalent.
+//
+// Still truncates an overflowing threshold bin, unlike the register and
+// streaming paths: the candidate set is split across kClusterSize ranks, so
+// refining needs cluster-wide histogram and emit counters rather than the
+// block-local ones refine_and_handle_tie uses.
 // ---------------------------------------------------------------------------
 
 #ifndef USE_ROCM
