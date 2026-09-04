@@ -15,18 +15,11 @@ The window is request-static, so the metadata (row-group plan, gather indices)
 is built once per request in the MiniMax-H3 denoising stage and installed
 through ``set_forward_context`` for every step and every block.
 
-Kernel paths behind one backend (``--attention-backend-config
-{"vdn_window_kernel": ...}``):
-
-``decomposed``  (default; what VDN ships on SM100) the mask as a union of dense
-                varlen FlashAttention calls: one call for the dense-query rows
-                (text, audio, anchor frames) against all keys, one varlen call
-                over per-chunk gathered [globals | window frames | anchors]
-                K/V for the remaining frames. Same math as a masked kernel; it
-                differs from it by bf16 reduction order only.
-``tiles``       static-tile block-sparse Triton kernel (in-tree VSA-H3 tile-64
-                kernel) with index lists from the window mask. See
-                ``hybrid_window_h3_kernels.py``.
+The window runs as a union of dense varlen FlashAttention calls (what VDN
+ships on SM100): one call for the dense-query rows (text, audio, anchor
+frames) against all keys, then varlen calls over per-chunk gathered
+[globals | window frames | anchors] K/V for the remaining frames. Same math as
+a masked kernel; it differs from it by bf16 reduction order only.
 """
 
 from __future__ import annotations
@@ -52,8 +45,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
-HYBRID_WINDOW_H3_KERNELS = ("decomposed", "tiles")
 
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
@@ -258,11 +249,9 @@ class _DecomposedPlan:
 class HybridWindowAttentionH3Metadata(AttentionMetadata):
     layout: VDNH3Layout
     hybrid: VDNHybridAttentionArchConfig
-    kernel: str
     # radius >= F: the window IS dense attention and the linear branch is off
     full_cover: bool
     decomposed: _DecomposedPlan | None = None
-    tiles: Any = None
     # Full-sequence RoPE cache (cos_sin [seq_len, rope_dim] bf16, positions
     # [seq_len]) for QK-norm + RoPE after the Ulysses all-to-all; None when no
     # sequence parallelism is active.
@@ -282,38 +271,23 @@ class HybridWindowAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         layout: VDNH3Layout,
         hybrid: VDNHybridAttentionArchConfig,
         device: torch.device,
-        kernel: str = "decomposed",
         rope_cache_full: tuple[torch.Tensor, torch.Tensor] | None = None,
         current_timestep: int = 0,
         max_gather_rows: int = 200_000,
         **kwargs: dict[str, Any],
     ) -> HybridWindowAttentionH3Metadata:
-        if kernel not in HYBRID_WINDOW_H3_KERNELS:
-            raise ValueError(
-                f"vdn_window_kernel={kernel!r}; expected one of {HYBRID_WINDOW_H3_KERNELS}"
-            )
         full_cover = hybrid.full_cover(layout.num_frames)
         decomposed = None
-        tiles = None
         if not full_cover:
-            if kernel == "decomposed":
-                decomposed = _DecomposedPlan(
-                    layout, hybrid, device, max_gather_rows=max_gather_rows
-                )
-            else:
-                from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels import (
-                    build_window_tile_plan,
-                )
-
-                tiles = build_window_tile_plan(layout, hybrid, device)
+            decomposed = _DecomposedPlan(
+                layout, hybrid, device, max_gather_rows=max_gather_rows
+            )
         return HybridWindowAttentionH3Metadata(
             current_timestep=current_timestep,
             layout=layout,
             hybrid=hybrid,
-            kernel=kernel,
             full_cover=full_cover,
             decomposed=decomposed,
-            tiles=tiles,
             rope_cache_full=rope_cache_full,
         )
 
@@ -469,14 +443,8 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
                 max_seqlen=max_seqlen,
                 cu_seqlens_host=cu_seqlens_host,
             )
-        elif meta.decomposed is not None:
-            out = self._decomposed(query, key, value, meta.decomposed, used)
         else:
-            from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels import (
-                window_tile_attention,
-            )
-
-            out = window_tile_attention(query, key, value, meta.tiles, used)
+            out = self._decomposed(query, key, value, meta.decomposed, used)
 
         if softmax_gate is not None:
             out.mul_(softmax_gate.to(out.dtype).unsqueeze(-1))
@@ -512,9 +480,12 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
             )
         for p in plan.passes:
             # index_select runs the vectorized gather; advanced indexing takes
-            # the generic index kernel at a fraction of the bandwidth
-            kw = torch.index_select(key, 0, p["kv_gather"])
-            vw = torch.index_select(value, 0, p["kv_gather"])
+            # the generic index kernel at a fraction of the bandwidth. Gather
+            # from the contiguous copies: on the strided packed views (head
+            # stride 3d) index_select falls back to the generic kernel, which
+            # cost 4x more than the copy itself at the paper workload.
+            kw = torch.index_select(key_used, 0, p["kv_gather"])
+            vw = torch.index_select(value_used, 0, p["kv_gather"])
             if p["win_q_slice"] is not None:
                 start, stop = p["win_q_slice"]
                 _fa_varlen(
@@ -544,7 +515,6 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
 
 
 __all__ = [
-    "HYBRID_WINDOW_H3_KERNELS",
     "HybridWindowAttentionH3Backend",
     "HybridWindowAttentionH3Impl",
     "HybridWindowAttentionH3Metadata",

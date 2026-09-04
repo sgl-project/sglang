@@ -384,6 +384,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Ulysses destination-major QKV pack.",
     ),
     (
+        "diffusion.silu_mul_per_tensor_fp8",
+        KernelBackend.TRITON,
+        "activation.swiglu_per_tensor_fp8_triton:silu_mul_per_tensor_fp8",
+        _CUDA,
+        "SwiGLU + per-tensor fp8 absmax/quant for the fp8 per-tensor GEMM path.",
+    ),
+    (
         "diffusion.varlen_pack_qkv",
         KernelBackend.TRITON,
         "layout.varlen_pack_pad_triton:fused_pack_qkv",
@@ -571,6 +578,7 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "silu_mul_per_tensor_fp8": "activation.swiglu_per_tensor_fp8_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",

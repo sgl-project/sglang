@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from collections import defaultdict
@@ -15,6 +16,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from sglang.kernels.ops.activation.activation import (
@@ -27,6 +29,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+    silu_mul_per_tensor_fp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -62,6 +65,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -735,110 +739,122 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-def _minimax_h3_hybrid_attention_core_impl(
-    attention: MiniMaxH3Attention,
+def _vdn_frame_partial_sums(
     x: torch.Tensor,
+    *,
+    row_start: int,
+    video_start: int,
+    video_end: int,
+    num_frames: int,
+    tokens_per_frame: int,
+) -> torch.Tensor:
+    """fp32 [F, hidden] per-frame sums of this rank's video rows, without the
+    fp32 cast and the atomic index_add: complete frames reduce as one
+    [frames, tokens, hidden] sum, the two partial frames at the shard edges as
+    two row sums. Deterministic, and the bf16 rows are read once."""
+    hidden = x.shape[-1]
+    sums = torch.zeros(num_frames, hidden, dtype=_FP32_DTYPE, device=x.device)
+    lo = max(row_start, video_start)
+    hi = min(row_start + x.shape[0], video_end)
+    if lo >= hi:
+        return sums
+    rows = x[lo - row_start : hi - row_start]
+    first_frame, offset = divmod(lo - video_start, tokens_per_frame)
+    lead = (tokens_per_frame - offset) % tokens_per_frame
+    lead = min(lead, rows.shape[0])
+    if lead:
+        sums[first_frame] += rows[:lead].sum(0, dtype=_FP32_DTYPE)
+        first_frame += 1
+    full = (rows.shape[0] - lead) // tokens_per_frame
+    if full:
+        sums[first_frame : first_frame + full] = (
+            rows[lead : lead + full * tokens_per_frame]
+            .view(full, tokens_per_frame, hidden)
+            .sum(1, dtype=_FP32_DTYPE)
+        )
+    tail = lead + full * tokens_per_frame
+    if tail < rows.shape[0]:
+        sums[first_frame + full] += rows[tail:].sum(0, dtype=_FP32_DTYPE)
+    return sums
+
+
+def _vdn_a2a_rows_to_heads(
+    field: torch.Tensor, *, ulysses_ws: int, role: str, process_group
+) -> tuple[torch.distributed.Work, torch.Tensor]:
+    """Async all-to-all of one q/k/v field [L, H, d] (row shard, every head)
+    -> receive buffer readable as a contiguous [S, H / ws, d] of this rank's
+    heads (row shards are contiguous and rank-ordered, so no relayout on
+    receipt; each field lands contiguous, which the window K/V gathers and the
+    branch's conv read directly)."""
+    from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
+
+    rows, total_heads, head_dim = field.shape
+    local_heads = total_heads // ulysses_ws
+    send = _a2a_staging_buffer(
+        role + "_send",
+        (ulysses_ws, rows, local_heads, head_dim),
+        field.dtype,
+        field.device,
+    )
+    send.copy_(field.view(rows, ulysses_ws, local_heads, head_dim).permute(1, 0, 2, 3))
+    recv = _a2a_staging_buffer(
+        role + "_recv",
+        (ulysses_ws * rows, local_heads, head_dim),
+        field.dtype,
+        field.device,
+    )
+    work = torch.distributed.all_to_all_single(
+        recv, send, group=process_group, async_op=True
+    )
+    return work, recv
+
+
+def _vdn_a2a_heads_to_rows(
+    out: torch.Tensor, *, ulysses_ws: int, role: str, process_group
+) -> tuple[torch.distributed.Work, torch.Tensor]:
+    """Async inverse: [S, H / ws, d] head-shard output -> receive buffer
+    [ws, L, H / ws, d] (source rank major); :func:`_vdn_merge_heads` turns it
+    into the row shard after the wait."""
+    from sglang.multimodal_gen.runtime.layers.usp import _a2a_staging_buffer
+
+    seq_len, local_heads, head_dim = out.shape
+    rows = seq_len // ulysses_ws
+    recv = _a2a_staging_buffer(
+        role + "_recv", (ulysses_ws, rows, local_heads, head_dim), out.dtype, out.device
+    )
+    work = torch.distributed.all_to_all_single(
+        recv, out.contiguous(), group=process_group, async_op=True
+    )
+    return work, recv
+
+
+def _vdn_merge_heads(recv: torch.Tensor) -> torch.Tensor:
+    """[ws, L, h, d] (source rank major) -> [L, ws * h, d]: rank-major heads
+    are the global head order."""
+    ulysses_ws, rows, local_heads, head_dim = recv.shape
+    merged = torch.empty(
+        rows, ulysses_ws * local_heads, head_dim, dtype=recv.dtype, device=recv.device
+    )
+    merged.view(rows, ulysses_ws, local_heads, head_dim).copy_(recv.permute(1, 0, 2, 3))
+    return merged
+
+
+def _vdn_window_softmax(
+    attention: MiniMaxH3Attention,
+    meta,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_gate: torch.Tensor | None,
-    beta: torch.Tensor,
-    linear_gate: torch.Tensor,
     *,
-    rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+    softmax_gate: torch.Tensor | None,
+    rope_cache: tuple[torch.Tensor, torch.Tensor],
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
-    ulysses_active: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """VDN-H3 hybrid attention core: window softmax + linear branch.
-
-    Takes the RAW (pre-QK-norm, pre-RoPE) q/k/v because the linear branch
-    consumes them NoPE; QK-norm + RoPE run here, out of place, on the softmax
-    branch's copies. Under Ulysses one packed all-to-all moves raw q/k/v,
-    then norm + RoPE apply on the head shard over the full sequence with the
-    request's full-sequence RoPE cache (metadata); beta / gates travel by
-    head, the frame mean is one all-reduce of partial sums. The branch is
-    per-head independent given (beta, gate, alpha), so head sharding is
-    exact. Returns (gated softmax output [T_local, H, d], linear readout
-    [T_local, H * d] or None when the window covers the whole clip).
-    """
-    from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
-        HybridWindowAttentionH3Metadata,
-    )
-
-    meta = get_forward_context().attn_metadata
-    if not isinstance(meta, HybridWindowAttentionH3Metadata):
-        raise RuntimeError(
-            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
-            "forward context; the MiniMax-H3 denoising stage installs it per request "
-            f"(got {type(meta).__name__})."
-        )
-    layout = meta.layout
-    video_start, video_end = layout.video_start, layout.video_end
-    num_frames, tokens_per_frame = layout.num_frames, layout.tokens_per_frame
-    text_len = layout.text_len
-    branch = attention.linear_attention
-    hidden = x.shape[-1]
-
-    if ulysses_active:
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_group,
-        )
-        from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_input_all_to_all,
-            _usp_input_all_to_all_packed_qkv,
-            _usp_output_all_to_all,
-        )
-
-        ulysses_ws, ulysses_rank = get_ulysses_ctx()
-        local_rows = x.shape[0]
-        row_start = ulysses_rank * local_rows
-        # per-frame partial sums of this rank's video rows, reduced over SP
-        frame_sums = torch.zeros(num_frames, hidden, dtype=_FP32_DTYPE, device=x.device)
-        lo = max(row_start, video_start)
-        hi = min(row_start + local_rows, video_end)
-        if lo < hi:
-            frame_index = (
-                torch.arange(lo, hi, device=x.device) - video_start
-            ) // tokens_per_frame
-            frame_sums.index_add_(
-                0, frame_index, x[lo - row_start : hi - row_start].to(_FP32_DTYPE)
-            )
-        # launch the reduction now and let the all-to-all hide it; the branch
-        # is the first consumer of the frame mean
-        frame_work = torch.distributed.all_reduce(
-            frame_sums, group=get_sp_group().device_group, async_op=True
-        )
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
-        beta = _usp_input_all_to_all(beta[None, :, :, None], head_dim=2)[0, :, :, 0]
-        linear_gate = _usp_input_all_to_all(linear_gate[None], head_dim=2)[0]
-        if softmax_gate is not None:
-            softmax_gate = _usp_input_all_to_all(
-                softmax_gate[None, :, :, None], head_dim=2
-            )[0, :, :, 0]
-        if meta.rope_cache_full is None:
-            raise RuntimeError(
-                "VDN-H3 under Ulysses needs the full-sequence RoPE cache in the "
-                "attention metadata"
-            )
-        cos_sin_cache, positions = meta.rope_cache_full
-        frame_work.wait()
-        frame_mean = frame_sums / tokens_per_frame
-    else:
-        frame_mean = (
-            x[video_start:video_end]
-            .view(num_frames, tokens_per_frame, hidden)
-            .mean(dim=1, dtype=_FP32_DTYPE)
-        )
-        if rope_cache is None:
-            raise RuntimeError("VDN-H3 hybrid attention requires the RoPE cache")
-        cos_sin_cache, positions = rope_cache
-
-    # QK-norm + RoPE out of place: the branch keeps reading the raw q/k. The
-    # fused kernel reads the strided qkv views directly and writes contiguous
-    # softmax-branch copies (no clone pass); same arithmetic as the in-place
-    # kernel the dense path uses.
+) -> torch.Tensor:
+    """Gated window softmax on out-of-place QK-normed + RoPE'd copies of the
+    raw q/k [S, h, d] (the branch keeps reading the raw tensors)."""
+    cos_sin_cache, positions = rope_cache
     if attention._use_fused_qknorm_rope and not torch.compiler.is_compiling():
         q_sm = torch.empty(q.shape, dtype=q.dtype, device=q.device)
         k_sm = torch.empty(k.shape, dtype=k.dtype, device=k.device)
@@ -862,8 +878,7 @@ def _minimax_h3_hybrid_attention_core_impl(
             q.clone(), k.clone(), attention.q_norm, attention.k_norm, attention.head_dim
         )
         q_sm, k_sm = _apply_rope_qk(q_sm, k_sm, cos_sin_cache, positions)
-
-    softmax_out = attention._attention_impl.forward_varlen(
+    return attention._attention_impl.forward_varlen(
         q_sm,
         k_sm,
         v,
@@ -873,46 +888,210 @@ def _minimax_h3_hybrid_attention_core_impl(
         attn_metadata=meta,
         softmax_gate=softmax_gate,
     )
-    del q_sm, k_sm
 
+
+def _vdn_linear_readout(
+    attention: MiniMaxH3Attention,
+    meta,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    beta: torch.Tensor,
+    linear_gate: torch.Tensor,
+    frame_mean: torch.Tensor,
+    head_range: slice | None,
+) -> torch.Tensor:
+    """Linear branch on the raw q/k/v [S, h, d] for the ``head_range`` heads:
+    video rows in, [V, h * d] out (text rows seed the state)."""
+    layout = meta.layout
+    video = slice(layout.video_start, layout.video_end)
+    text = slice(0, layout.text_len)
+    return attention.linear_attention(
+        q_raw=q[video],
+        k_raw=k[video],
+        v_raw=v[video],
+        beta=beta[video],
+        gate=linear_gate[video],
+        frame_mean=frame_mean,
+        layout=layout,
+        text_k_raw=k[text],
+        text_v_raw=v[text],
+        text_beta=beta[text],
+        heads=head_range,
+    )
+
+
+def _minimax_h3_hybrid_attention_core_impl(
+    attention: MiniMaxH3Attention,
+    x: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_gate: torch.Tensor | None,
+    beta: torch.Tensor,
+    linear_gate: torch.Tensor,
+    *,
+    rope_cache: tuple[torch.Tensor, torch.Tensor] | None,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+    ulysses_active: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """VDN-H3 hybrid attention core: window softmax + linear branch.
+
+    Takes the RAW (pre-QK-norm, pre-RoPE) q/k/v because the linear branch
+    consumes them NoPE; QK-norm + RoPE run out of place on the softmax
+    branch's copies. Under Ulysses the three fields travel as three async
+    all-to-alls (each lands contiguous on the head shard), ``linear_gate`` is
+    the 128-wide output_gate.down hidden of the row shard (all-gathered,
+    ``up`` applied on the head shard), norm + RoPE use the request's
+    full-sequence RoPE cache, the frame mean is one all-reduce of partial
+    sums. The branch is per-head independent given (beta, gate, alpha), so head
+    sharding is exact. Returns (gated softmax output [T_local, H, d], linear
+    readout [T_local, H * d] or None when the window covers the whole clip).
+    """
+    from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
+        HybridWindowAttentionH3Metadata,
+    )
+
+    meta = get_forward_context().attn_metadata
+    if not isinstance(meta, HybridWindowAttentionH3Metadata):
+        raise RuntimeError(
+            "VDN-H3 hybrid attention needs HybridWindowAttentionH3Metadata in the "
+            "forward context; the MiniMax-H3 denoising stage installs it per request "
+            f"(got {type(meta).__name__})."
+        )
+    layout = meta.layout
+    softmax = functools.partial(
+        _vdn_window_softmax,
+        attention,
+        meta,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+    )
+    if not ulysses_active:
+        if rope_cache is None:
+            raise RuntimeError("VDN-H3 hybrid attention requires the RoPE cache")
+        softmax_out = softmax(q, k, v, softmax_gate=softmax_gate, rope_cache=rope_cache)
+        if meta.full_cover:
+            return softmax_out, None
+        frame_mean = (
+            x[layout.video_start : layout.video_end]
+            .view(layout.num_frames, layout.tokens_per_frame, x.shape[-1])
+            .mean(dim=1, dtype=_FP32_DTYPE)
+        )
+        readout = _vdn_linear_readout(
+            attention,
+            meta,
+            q,
+            k,
+            v,
+            beta=beta,
+            linear_gate=linear_gate,
+            frame_mean=frame_mean,
+            head_range=None,
+        )
+        return softmax_out, readout
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+    from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all
+
+    if meta.rope_cache_full is None:
+        raise RuntimeError(
+            "VDN-H3 under Ulysses needs the full-sequence RoPE cache in the "
+            "attention metadata"
+        )
+    sp_group = get_sp_group()
+    process_group = sp_group.ulysses_group
+    ulysses_ws, ulysses_rank = get_ulysses_ctx()
+    local_rows, head_dim = x.shape[0], q.shape[2]
+    local_heads = q.shape[1] // ulysses_ws
+    seq_len = local_rows * ulysses_ws
+
+    # the q/k/v exchange is in flight while the frame sums, the small per-head
+    # fields and the gate hidden go out
+    inflight = [
+        _vdn_a2a_rows_to_heads(
+            field,
+            ulysses_ws=ulysses_ws,
+            role=f"vdn_{name}",
+            process_group=process_group,
+        )
+        for name, field in (("q", q), ("k", k), ("v", v))
+    ]
+    frame_sums = _vdn_frame_partial_sums(
+        x,
+        row_start=ulysses_rank * local_rows,
+        video_start=layout.video_start,
+        video_end=layout.video_end,
+        num_frames=layout.num_frames,
+        tokens_per_frame=layout.tokens_per_frame,
+    )
+    frame_work = torch.distributed.all_reduce(
+        frame_sums, group=sp_group.device_group, async_op=True
+    )
+    beta = _usp_input_all_to_all(beta[None, :, :, None], head_dim=2)[0, :, :, 0]
+    if softmax_gate is not None:
+        softmax_gate = _usp_input_all_to_all(
+            softmax_gate[None, :, :, None], head_dim=2
+        )[0, :, :, 0]
+    # 3 MB all-gather of the 128-wide hidden; output_gate.up runs here on this
+    # rank's heads, so the H x d gate never crosses the fabric
+    gate_hidden = sp_group.all_gather(linear_gate.contiguous(), dim=0)
+    head_range = slice(ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads)
+    cols = slice(head_range.start * head_dim, head_range.stop * head_dim)
+    up = attention.linear_attention.output_gate.up
+    up_bias = None if up.bias is None else up.bias[cols]
+    linear_gate = torch.sigmoid(F.linear(gate_hidden, up.weight[cols], up_bias)).view(
+        seq_len, local_heads, head_dim
+    )
+    del gate_hidden
+
+    for work, _ in inflight:
+        work.wait()
+    q, k, v = (recv for _, recv in inflight)
+    softmax_out = softmax(
+        q, k, v, softmax_gate=softmax_gate, rope_cache=meta.rope_cache_full
+    )
     linear_out = None
     if not meta.full_cover:
-        head_range = None
-        if ulysses_active:
-            local_heads = q.shape[1]
-            head_range = slice(
-                ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads
-            )
-        readout = branch(
-            q_raw=q[video_start:video_end],
-            k_raw=k[video_start:video_end],
-            v_raw=v[video_start:video_end],
-            beta=beta[video_start:video_end],
-            gate=linear_gate[video_start:video_end],
-            frame_mean=frame_mean,
-            layout=layout,
-            text_k_raw=k[:text_len],
-            text_v_raw=v[:text_len],
-            text_beta=beta[:text_len],
-            heads=head_range,
+        frame_work.wait()
+        readout = _vdn_linear_readout(
+            attention,
+            meta,
+            q,
+            k,
+            v,
+            beta=beta,
+            linear_gate=linear_gate,
+            frame_mean=frame_sums / layout.tokens_per_frame,
+            head_range=head_range,
         )
-        if ulysses_active:
-            # rows go back to their owners: pad the non-video rows with zeros
-            linear_out = q.new_zeros(q.shape[0], readout.shape[-1])
-            linear_out[video_start:video_end] = readout
-        else:
-            linear_out = readout
+        # rows go back to their owners: pad the non-video rows with zeros
+        linear_out = q.new_zeros(seq_len, local_heads, head_dim)
+        linear_out[layout.video_start : layout.video_end] = readout.view(
+            -1, local_heads, head_dim
+        )
         del readout
-
-    if ulysses_active:
-        softmax_out = _usp_output_all_to_all(softmax_out[None], head_dim=2)[0]
-        if linear_out is not None:
-            linear_out = _usp_output_all_to_all(
-                linear_out.view(1, linear_out.shape[0], q.shape[1], q.shape[2]),
-                head_dim=2,
-            )[0]
-            linear_out = linear_out.reshape(linear_out.shape[0], -1)
-    return softmax_out, linear_out
+    else:
+        frame_work.wait()
+    # both return trips in flight together
+    returning = [
+        _vdn_a2a_heads_to_rows(
+            out, ulysses_ws=ulysses_ws, role=role, process_group=process_group
+        )
+        for out, role in ((softmax_out, "vdn_sm_out"), (linear_out, "vdn_lin_out"))
+        if out is not None
+    ]
+    merged = []
+    for work, recv in returning:
+        work.wait()
+        merged.append(_vdn_merge_heads(recv))
+    softmax_rows = merged[0]
+    linear_rows = merged[1].reshape(local_rows, -1) if linear_out is not None else None
+    return softmax_rows, linear_rows
 
 
 _minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
@@ -1385,7 +1564,12 @@ class MiniMaxH3Attention(nn.Module):
         assert self.linear_attention is not None
         softmax_gate = self.softmax_gate(x) if self.softmax_gate is not None else None
         beta = self.linear_attention.beta(x)
-        linear_gate = self.linear_attention.gate(x)
+        if ulysses_active:
+            # the core all-gathers the low-rank hidden and applies
+            # output_gate.up on its head shard
+            linear_gate, _ = self.linear_attention.output_gate.down(x)
+        else:
+            linear_gate = self.linear_attention.gate(x)
         attention_core = (
             _minimax_h3_hybrid_attention_core_bcg
             if self.bcg_breakpoint
@@ -1456,6 +1640,10 @@ class MiniMaxH3MLP(nn.Module):
         self.reuse_fc1_activation = quant_config is None or (
             quant_config.get_name() == "gguf"
         )
+        # fc2 takes the fused SwiGLU + per-tensor fp8 quant output directly
+        self.fc2_per_tensor_fp8 = isinstance(
+            self.fc2.quant_method, Fp8LinearMethod
+        ) and bool(self.fc2.quant_method.per_tensor_online)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type == "mps":
@@ -1471,6 +1659,17 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
+        if (
+            self.fc2_per_tensor_fp8
+            and hidden.is_cuda
+            and hidden.dtype == _BF16_DTYPE
+            and hidden.stride(-1) == 1
+            and not torch.compiler.is_compiling()
+        ):
+            # SwiGLU fused with the per-tensor fp8 absmax; fc2 takes the
+            # prequantized (fp8, scale) input
+            out, _ = self.fc2(silu_mul_per_tensor_fp8(hidden))
+            return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out

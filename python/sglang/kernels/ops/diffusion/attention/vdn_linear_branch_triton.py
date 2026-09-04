@@ -54,6 +54,8 @@ def _tconv_act_kernel(
     BLOCK_T: tl.constexpr,
     D_: tl.constexpr,
     L2: tl.constexpr,
+    HEADS: tl.constexpr,
+    FRAME_MAJOR: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
     pid_s = tl.program_id(1)
@@ -78,11 +80,14 @@ def _tconv_act_kernel(
     if L2:
         inv = 1.0 / tl.sqrt(tl.maximum(tl.sum(y * y, axis=1), 1e-12))
         y = y * inv[:, None]
-    tl.store(
-        OUT + (rows[:, None] * S_ + pid_s) * C_ + chan[None, :],
-        y.to(OUT.dtype.element_ty),
-        mask=valid[:, None],
-    )
+    if FRAME_MAJOR:
+        # [T, HEADS, S, D]: the readout bmm reads this layout directly
+        dst = ((rows[:, None] * HEADS + pid_h) * S_ + pid_s) * D_ + tl.arange(0, D_)[
+            None, :
+        ]
+    else:
+        dst = (rows[:, None] * S_ + pid_s) * C_ + chan[None, :]
+    tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
 def vdn_temporal_conv_act(
@@ -91,8 +96,10 @@ def vdn_temporal_conv_act(
     heads: int,
     head_dim: int,
     l2norm: bool,
+    frame_major: bool = False,
 ) -> torch.Tensor:
-    """x [T, S, C] bf16 contiguous, w [C, 5] -> [T * S, heads, head_dim]."""
+    """x [T, S, C] bf16 contiguous, w [C, 5] -> [T * S, heads, head_dim], or
+    [T, heads, S, head_dim] with ``frame_major``."""
     if not x.is_cuda:
         raise ValueError("vdn_temporal_conv_act is a Triton kernel; x must be on CUDA")
     _check_head_dim(head_dim)
@@ -114,9 +121,13 @@ def vdn_temporal_conv_act(
         BLOCK_T=_BLOCK_T,
         D_=head_dim,
         L2=l2norm,
+        HEADS=heads,
+        FRAME_MAJOR=frame_major,
         num_warps=4,
         num_stages=2,
     )
+    if frame_major:
+        return out.view(T, heads, S_, head_dim)
     return out.view(T * S_, heads, head_dim)
 
 
@@ -133,9 +144,11 @@ def _silu_l2norm_kernel(
     stride_n,
     stride_h,
     H,
+    S_,
     BLOCK_N: tl.constexpr,
     D_: tl.constexpr,
     L2: tl.constexpr,
+    FRAME_MAJOR: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -151,22 +164,32 @@ def _silu_l2norm_kernel(
     if L2:
         inv = 1.0 / tl.sqrt(tl.maximum(tl.sum(y * y, axis=1), 1e-12))
         y = y * inv[:, None]
-    tl.store(
-        OUT + (rows[:, None] * H + pid_h) * D_ + offs[None, :],
-        y.to(OUT.dtype.element_ty),
-        mask=valid[:, None],
-    )
+    if FRAME_MAJOR:
+        # row n = frame * S_ + s -> [F, H, S_, D]
+        frame = rows // S_
+        pos = rows - frame * S_
+        dst = ((frame[:, None] * H + pid_h) * S_ + pos[:, None]) * D_ + offs[None, :]
+    else:
+        dst = (rows[:, None] * H + pid_h) * D_ + offs[None, :]
+    tl.store(OUT + dst, y.to(OUT.dtype.element_ty), mask=valid[:, None])
 
 
-def vdn_silu_l2norm(tokens: torch.Tensor, l2norm: bool) -> torch.Tensor:
-    """tokens [N, H, d] (last dim contiguous) -> contiguous [N, H, d]."""
+def vdn_silu_l2norm(
+    tokens: torch.Tensor, l2norm: bool, per_frame: int | None = None
+) -> torch.Tensor:
+    """tokens [N, H, d] (last dim contiguous) -> contiguous [N, H, d], or
+    [N / per_frame, H, per_frame, d] when ``per_frame`` is given."""
     if not tokens.is_cuda:
         raise ValueError("vdn_silu_l2norm is a Triton kernel; tokens must be on CUDA")
     N, H, D = tokens.shape
     _check_head_dim(D)
     if tokens.stride(-1) != 1:
         tokens = tokens.contiguous()
-    out = torch.empty((N, H, D), dtype=tokens.dtype, device=tokens.device)
+    frame_major = per_frame is not None
+    if frame_major and (per_frame <= 0 or N % per_frame):
+        raise ValueError(f"per_frame={per_frame} must divide N={N}")
+    shape = (N // per_frame, H, per_frame, D) if frame_major else (N, H, D)
+    out = torch.empty(shape, dtype=tokens.dtype, device=tokens.device)
     if N == 0:
         return out
     _silu_l2norm_kernel[(triton.cdiv(N, _BLOCK_ROWS), H)](
@@ -176,9 +199,11 @@ def vdn_silu_l2norm(tokens: torch.Tensor, l2norm: bool) -> torch.Tensor:
         tokens.stride(0),
         tokens.stride(1),
         H,
+        per_frame if frame_major else 1,
         BLOCK_N=_BLOCK_ROWS,
         D_=D,
         L2=l2norm,
+        FRAME_MAJOR=frame_major,
         num_warps=4,
     )
     return out

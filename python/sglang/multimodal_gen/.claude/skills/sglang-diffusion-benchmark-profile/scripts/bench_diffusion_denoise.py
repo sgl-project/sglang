@@ -512,6 +512,37 @@ MODELS = {
         ],
         "force_eager": True,
     },
+    # 8x B200 paper workload (0.98 s/NFE with
+    # SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM=1 in the environment).
+    "vdn-h3-fp8-8gpu": {
+        "path": "OpenVDN/vdn-minimax-h3",
+        "prompt": (
+            "A curious raccoon peers through a vibrant field of yellow "
+            "sunflowers, its eyes wide with interest."
+        ),
+        "seed": 1000,
+        "config_overrides": {
+            "task": "t2va",
+            "conditions": [],
+            "target": {
+                "short_edge": 768,
+                "aspect_ratio": "16:9",
+                "duration_seconds": 14.375,
+            },
+            "num_inference_steps": 9,
+        },
+        "extra_args": [
+            "--num-gpus=8",
+            "--attention-backend=hybrid_window_attn_h3",
+            "--quantization=fp8",
+            "--performance-mode=speed",
+            "--enable-torch-compile=false",
+            "--warmup-steps=2",
+            "--warmup-num-frames=345",
+            "--warmup-resolutions=1344x768",
+        ],
+        "force_eager": True,
+    },
     # Source-tracked extras from current registry / GPU test coverage.
     "longcat-image": {
         "path": "meituan-longcat/LongCat-Image",

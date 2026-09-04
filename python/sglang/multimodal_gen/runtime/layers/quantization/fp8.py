@@ -8,9 +8,11 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
+    fp8_dtype,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -130,6 +132,14 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = force_marlin or auto_enable
 
         self.block_quant = self.quant_config.weight_block_size is not None
+        # Per-tensor online quantization: scalar weight scale at load, dynamic
+        # scalar activation scale, cuBLASLt GEMM (see envs.py).
+        self.per_tensor_online = bool(
+            envs.SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM
+            and not self.block_quant
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and current_platform.is_cuda()
+        )
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -298,7 +308,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.per_tensor_online and not self.use_marlin:
+                    qweight, weight_scale = input_to_float8(layer.weight)
+                    weight_scale = weight_scale.reshape(1)
+                elif self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
@@ -392,6 +405,10 @@ class Fp8LinearMethod(LinearMethodBase):
         # diffusion backbones routinely pass a permuted view. Normalising at the
         # producer instead would also move the unquantized path's output, by
         # changing which GEMM kernel it picks. No-op when already contiguous.
+        if isinstance(x, tuple) and self.per_tensor_online and not self.use_marlin:
+            # (fp8 input, per-tensor scale) produced by a fused activation
+            # + quant kernel upstream
+            return self._apply_per_tensor(layer, x, bias)
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -437,6 +454,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if self.per_tensor_online and not self.use_marlin:
+            return self._apply_per_tensor(layer, x, bias)
+
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -446,3 +466,36 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
+
+    @staticmethod
+    def _apply_per_tensor(
+        layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Dynamic per-tensor activation scale + scalar weight scale into
+        cuBLASLt. ``layer.weight`` is the [K, N] column-major fp8 view set at
+        load; ``layer.weight_scale`` a 1-element fp32 tensor."""
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sgl_per_tensor_quant_fp8,
+        )
+
+        if isinstance(x, tuple):
+            qinput, x_scale = x
+            lead_shape = qinput.shape[:-1]
+            qinput = qinput.reshape(-1, qinput.shape[-1])
+            out_dtype = torch.bfloat16
+        else:
+            lead_shape = x.shape[:-1]
+            x2d = x.reshape(-1, x.shape[-1])
+            qinput = torch.empty(x2d.shape, dtype=fp8_dtype, device=x.device)
+            x_scale = torch.zeros(1, dtype=torch.float32, device=x.device)
+            sgl_per_tensor_quant_fp8(x2d, qinput, x_scale, is_static=False)
+            out_dtype = x.dtype
+        out = torch._scaled_mm(
+            qinput,
+            layer.weight,
+            out_dtype=out_dtype,
+            scale_a=x_scale,
+            scale_b=layer.weight_scale,
+            bias=bias,
+        )
+        return out.view(*lead_shape, out.shape[-1])

@@ -119,7 +119,7 @@ backend.
       <td><code>--component-quantizations.&lt;component&gt; &#123;fp8,mxfp4&#125;</code></td>
       <td>Z-Image-Turbo (validated), others likely work. More support coming soon.</td>
       <td>MXFP4: <code>aiter</code> on ROCm</td>
-      <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
+      <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically. Online <code>fp8</code> uses per-channel weight scales and the CUTLASS GEMM by default; <code>SGLANG_DIFFUSION_USE_FP8_PER_TENSOR_GEMM=1</code> switches to one scale per tensor and cuBLASLt (<code>torch._scaled_mm</code>) with a fused SwiGLU + activation quant for <code>fc2</code>; on SM100 the DiT GEMMs run about 20% faster at the same block-level error (VDN-H3: both paths sit at 5.8% relative L2 from BF16; the sample changes, as with any fp8 path).</td>
     </tr>
     <tr>
       <td><code>kitchen_int8</code> (online quantization)</td>

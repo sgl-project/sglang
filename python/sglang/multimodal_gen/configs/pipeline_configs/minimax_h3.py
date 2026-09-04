@@ -373,6 +373,8 @@ class VDNH3PipelineConfig(MiniMaxH3PipelineConfig):
                 "parallelism."
             )
         if server_args.enable_torch_compile or server_args.enable_breakable_cuda_graph:
+            # BCG capture at 104k rows keeps one memory pool per captured
+            # segment and exhausts 183 GB per GPU during warmup.
             raise ValueError(
                 "VDN-H3 hybrid attention is not validated under torch.compile or "
                 "the breakable CUDA graph yet; disable them."

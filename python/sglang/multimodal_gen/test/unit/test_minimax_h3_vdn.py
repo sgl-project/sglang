@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
     frame_statistics,
     gather_linear_state,
     linear_features,
+    run_boundary_scans,
     run_scans,
     vdn_h3_layout_from_packed,
 )
@@ -251,6 +252,94 @@ def test_scans_match_step_reference_and_text_seed() -> None:
     for f in range(F_ - 1, -1, -1):
         state = state @ transition[f] + injection[f]
         assert torch.allclose(suffix[f], state, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernels need CUDA")
+@pytest.mark.parametrize("with_conv", [False, True])
+def test_linear_features_frame_major_layout(with_conv: bool) -> None:
+    """The fused feature kernels can write [F, H, S, d] directly (the readout's
+    bmm layout); it must equal the token-major result permuted."""
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import (
+        VDNShortConv,
+        linear_features,
+    )
+
+    device = torch.device("cuda")
+    frames, fh, fw, heads, head_dim = 5, 4, 6, 3, 32
+    per_frame = fh * fw
+    g = torch.Generator(device="cpu").manual_seed(0)
+    tokens = torch.randn(frames * per_frame, heads, head_dim, generator=g).to(
+        device, torch.bfloat16
+    )
+    conv = None
+    if with_conv:
+        conv = VDNShortConv(heads * head_dim, ("q",)).to(device)
+        with torch.no_grad():
+            for p in conv.parameters():
+                p.copy_(torch.randn(p.shape, generator=g).to(p.dtype) * 0.2)
+    kwargs = dict(proj="q", conv=conv, num_frames=frames, frame_size=(fh, fw))
+    token_major = linear_features(tokens, **kwargs)
+    frame_major = linear_features(tokens, frame_major=True, **kwargs)
+    assert frame_major.shape == (frames, heads, per_frame, head_dim)
+    assert frame_major.is_contiguous()
+    expected = token_major.view(frames, per_frame, heads, head_dim).permute(0, 2, 1, 3)
+    assert torch.equal(frame_major, expected)
+
+
+@pytest.mark.parametrize("world", [1, 2, 5, 10])
+def test_frame_partial_sums_match_index_add(world: int) -> None:
+    """The Ulysses frame-mean partial sums (reshape-sum over whole frames plus
+    two edge rows sums, deterministic) equal the index_add formulation."""
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        _vdn_frame_partial_sums,
+    )
+
+    frames, tpf, hidden = 12, 50, 64
+    video_start = 20
+    video_end = video_start + frames * tpf
+    seq = video_end + 30  # 650 rows, divisible by every ``world`` above
+    g = torch.Generator(device="cpu").manual_seed(0)
+    x = torch.randn(seq, hidden, generator=g).to(torch.bfloat16)
+    local = seq // world
+    total = torch.zeros(frames, hidden)
+    for rank in range(world):
+        total += _vdn_frame_partial_sums(
+            x[rank * local : (rank + 1) * local],
+            row_start=rank * local,
+            video_start=video_start,
+            video_end=video_end,
+            num_frames=frames,
+            tokens_per_frame=tpf,
+        )
+    ref = x[video_start:video_end].float().view(frames, tpf, hidden).sum(1)
+    torch.testing.assert_close(total, ref, rtol=1e-5, atol=1e-3)
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5])
+def test_boundary_scans_match_frame_chain_at_chunk_bounds(chunk: int) -> None:
+    """The chunked gather reads prefix at chunk ends and suffix at chunk
+    starts only; the batched per-chunk composition must reproduce the frame
+    chain there (fp32, re-associated products)."""
+    k, v, beta, alpha = _random_stats("cpu", seed=2)
+    A, B = frame_statistics(k, v, beta, a_fp32=True)
+    transition, injection = delta_factor_apply(
+        "vdn_solve", alpha, A, B, tokens_per_frame=S_
+    )
+    text_state = torch.randn(H_, D_, D_)
+    prefix, suffix = run_scans(transition, injection, text_state)
+    b_prefix, b_suffix = run_boundary_scans(
+        transition, injection, text_state, chunk=chunk
+    )
+    num_chunks = -(-F_ // chunk)
+    ends = [min((c + 1) * chunk - 1, F_ - 1) for c in range(num_chunks)]
+    starts = [c * chunk for c in range(num_chunks)]
+    torch.testing.assert_close(b_prefix[ends], prefix[ends], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(b_suffix[starts], suffix[starts], rtol=1e-4, atol=1e-4)
+    # everything the gather never reads is zero, not garbage
+    unread = sorted(set(range(F_)) - set(ends))
+    assert torch.all(b_prefix[unread] == 0)
+    unread = sorted(set(range(F_)) - set(starts))
+    assert torch.all(b_suffix[unread] == 0)
 
 
 def test_gather_is_the_exact_window_complement() -> None:

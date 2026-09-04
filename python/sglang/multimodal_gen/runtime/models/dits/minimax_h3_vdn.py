@@ -405,24 +405,36 @@ def linear_features(
     num_frames: int | None,
     frame_size: tuple[int, int] | None,
     heads: slice | None = None,
+    frame_major: bool = False,
 ) -> torch.Tensor:
     """[N, H, d] raw projection -> [N, H, d] branch features:
-    [short conv ->] SiLU [-> L2 norm for q, k]."""
+    [short conv ->] SiLU [-> L2 norm for q, k]. ``frame_major`` returns
+    [F, H, S, d] instead (the readout's bmm layout), written by the fused
+    kernels directly; the eager path permutes."""
     l2norm = proj != "v"
     fused = tokens.is_cuda and _use_fused_kernels()
+    heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
+    if frame_major and (num_frames is None or frame_size is None):
+        raise ValueError("frame_major needs the (frames, height, width) grid")
     if conv is not None and proj in conv.targets:
         if frame_size is None or num_frames is None:
             raise ValueError("the short conv needs the (frames, height, width) grid")
-        heads_n, head_dim = tokens.shape[-2], tokens.shape[-1]
         x, w_tm = conv.spatial(proj, tokens, num_frames, frame_size, heads=heads)
         if fused:
             # one kernel: 5 taps + SiLU + L2 norm, the conv output never hits HBM
-            return vdn_temporal_conv_act(x, w_tm, heads_n, head_dim, l2norm)
-        out = _temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim)
-        return _activate(out, l2norm)
-    if fused:
-        return vdn_silu_l2norm(tokens, l2norm)
-    return _activate(tokens, l2norm)
+            return vdn_temporal_conv_act(
+                x, w_tm, heads_n, head_dim, l2norm, frame_major=frame_major
+            )
+        out = _activate(_temporal_shift(x, w_tm).reshape(-1, heads_n, head_dim), l2norm)
+    elif fused:
+        per_frame = frame_size[0] * frame_size[1] if frame_major else None
+        return vdn_silu_l2norm(tokens, l2norm, per_frame=per_frame)
+    else:
+        out = _activate(tokens, l2norm)
+    if frame_major:
+        per_frame = frame_size[0] * frame_size[1]
+        return out.view(num_frames, per_frame, heads_n, head_dim).permute(0, 2, 1, 3)
+    return out
 
 
 _FUSED_KERNELS_ENABLED = True
@@ -547,6 +559,99 @@ def run_scans(
     for frame in range(num_frames - 1, -1, -1):
         torch.baddbmm(injections[frame], state, transitions[frame], out=suffix[frame])
         state = suffix[frame]
+    return prefix, suffix
+
+
+def _compose_chunk(
+    transitions: torch.Tensor, injections: torch.Tensor, reverse: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fold each chunk's frames into one affine map S -> S @ M + C, batched
+    over every chunk at once. transitions [n, C, H, dk, dk], injections
+    [n, C, H, dv, dk] (frame-within-chunk leading, so each step's operands
+    are contiguous slices) -> (M [C, H, dk, dk], C [C, H, dv, dk])."""
+    order = list(range(transitions.shape[0]))
+    if reverse:
+        order.reverse()
+    chunks, heads = transitions.shape[1], transitions.shape[2]
+    dk, dv = transitions.shape[-1], injections.shape[-2]
+    M = transitions[order[0]]
+    Cc = injections[order[0]]
+    for j in order[1:]:
+        T = transitions[j].view(chunks * heads, dk, dk)
+        Cc = torch.baddbmm(
+            injections[j].view(chunks * heads, dv, dk),
+            Cc.view(chunks * heads, dv, dk),
+            T,
+        ).view(chunks, heads, dv, dk)
+        M = torch.bmm(M.view(chunks * heads, dk, dk), T).view(chunks, heads, dk, dk)
+    return M, Cc
+
+
+def run_boundary_scans(
+    transitions: torch.Tensor,
+    injections: torch.Tensor,
+    text_state: torch.Tensor | None,
+    *,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``run_scans`` restricted to what the chunked window gather reads:
+    prefix at every chunk's last frame, suffix at every chunk's first frame
+    (other frames are zero). Each chunk's frames fold into one affine map
+    first (batched over all chunks, ``chunk - 1`` steps), then one chain over
+    the chunks with both directions in each launch: a fifth of the dependent
+    launches of the frame chain. Same fp32 math, the products are merely
+    re-associated."""
+    if chunk <= 1:
+        return run_scans(transitions, injections, text_state)
+    num_frames, heads, dv, dk = injections.shape
+    num_chunks = -(-num_frames // chunk)
+    padded = num_chunks * chunk
+    if padded != num_frames:
+        # identity transitions / zero injections leave the state untouched
+        pad = padded - num_frames
+        eye = torch.eye(dk, device=transitions.device, dtype=transitions.dtype)
+        transitions = torch.cat([transitions, eye.expand(pad, heads, dk, dk)], dim=0)
+        injections = torch.cat(
+            [injections, injections.new_zeros(pad, heads, dv, dk)], dim=0
+        )
+    # frame-within-chunk leading: one relayout here instead of one strided
+    # copy per operand per composition step
+    T = transitions.view(num_chunks, chunk, heads, dk, dk).transpose(0, 1).contiguous()
+    B = injections.view(num_chunks, chunk, heads, dv, dk).transpose(0, 1).contiguous()
+    start = (
+        torch.zeros(heads, dv, dk, dtype=injections.dtype, device=injections.device)
+        if text_state is None
+        else text_state.to(injections.dtype)
+    )
+    prefix = torch.zeros(
+        num_frames, heads, dv, dk, dtype=injections.dtype, device=injections.device
+    )
+    suffix = torch.zeros_like(prefix)
+    # Both directions are independent chains over the chunk composites, so
+    # step i advances the forward chain on chunk i and the reverse chain on
+    # chunk C-1-i in ONE batched launch (batch 2H): half the dependent
+    # launches of two separate chains.
+    Mf, Cf = _compose_chunk(T, B, reverse=False)
+    Mr, Cr = _compose_chunk(T, B, reverse=True)
+    M2 = torch.stack([Mf, Mr.flip(0)], dim=1)  # [C, 2, H, dk, dk]
+    C2 = torch.stack([Cf, Cr.flip(0)], dim=1)  # [C, 2, H, dv, dk]
+    state = torch.stack([start, start], dim=0)  # [2, H, dv, dk]
+    boundary = torch.empty(
+        num_chunks, 2, heads, dv, dk, dtype=injections.dtype, device=injections.device
+    )
+    flat = boundary.view(num_chunks, 2 * heads, dv, dk)
+    for c in range(num_chunks):
+        torch.baddbmm(
+            C2[c].view(2 * heads, dv, dk),
+            state.view(2 * heads, dv, dk),
+            M2[c].view(2 * heads, dk, dk),
+            out=flat[c],
+        )
+        state = boundary[c]
+    ends = [min((c + 1) * chunk - 1, num_frames - 1) for c in range(num_chunks)]
+    starts = [(num_chunks - 1 - c) * chunk for c in range(num_chunks)]
+    prefix[ends] = boundary[:, 0]
+    suffix[starts] = boundary[:, 1]
     return prefix, suffix
 
 
@@ -846,13 +951,14 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         shape = (num_frames, per_frame, n_heads, head_dim)
         conv = self.short_conv
         # 1. features (q frame-major for the bmm readout)
-        query = linear_features(
+        query_by_frame = linear_features(
             q_raw,
             proj="q",
             conv=conv,
             num_frames=num_frames,
             frame_size=frame_size,
             heads=heads,
+            frame_major=True,
         )
         key = linear_features(
             k_raw,
@@ -870,7 +976,6 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
             frame_size=frame_size,
             heads=heads,
         )
-        query_by_frame = query.view(shape).permute(0, 2, 1, 3)
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta_by_frame = beta.view(num_frames, per_frame, n_heads).permute(0, 2, 1)
@@ -894,7 +999,9 @@ class MiniMaxH3VDNLinearBranch(nn.Module):
         transitions, injections = delta_factor_apply(
             self.hybrid.delta_rule, alpha, A, B, tokens_per_frame=per_frame
         )
-        prefix, suffix = run_scans(transitions, injections, text_state)
+        prefix, suffix = run_boundary_scans(
+            transitions, injections, text_state, chunk=self.hybrid.chunk
+        )
         del transitions, injections
         # 4. boundary gather
         linear_state = gather_linear_state(
@@ -927,6 +1034,7 @@ __all__ = [
     "gather_linear_state",
     "linear_epilogue",
     "linear_features",
+    "run_boundary_scans",
     "run_scans",
     "vdn_h3_layout_from_packed",
 ]

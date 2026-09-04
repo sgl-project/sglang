@@ -339,12 +339,6 @@ so the metadata is built once per request. The checkpoint's
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vdn_window_kernel`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`str`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`decomposed`: the window as a union of dense FlashAttention varlen calls (dense-query rows against all keys, per-chunk gathered K/V for the rest). `tiles`: the in-tree tile-64 Triton block-sparse kernel with index lists from the window mask (no gather). Both are exact to bf16 rounding; `decomposed` is faster on SM100.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`decomposed`</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`vdn_h3_dense_smoke`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`bool`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Allows a dense transformer backend (`fa`) on the VDN-H3 weights for the base-H3 + LoRA equivalence smoke. The gates and the linear branch are skipped: a study, not a sample.</td>

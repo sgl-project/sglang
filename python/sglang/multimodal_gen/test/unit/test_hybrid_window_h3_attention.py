@@ -5,7 +5,7 @@ The load-bearing check: on a ragged packed layout the backend must reproduce
 a masked dense softmax with exactly the VDN mask (chunk-aligned window,
 anchor frames dense as rows and columns, text/audio dense both ways, padding
 outside everything) to bf16 rounding. radius >= F must reproduce dense
-attention. Both kernel paths share these tests.
+attention.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (
-    HYBRID_WINDOW_H3_KERNELS,
     HybridWindowAttentionH3Impl,
     HybridWindowAttentionH3MetadataBuilder,
     window_mask_frames,
@@ -83,14 +82,6 @@ def _masked_reference(q, k, v, mask: torch.Tensor, used: int) -> torch.Tensor:
     scores = qf @ kf.transpose(-2, -1) / math.sqrt(HEAD_DIM)
     scores = scores.masked_fill(~mask[None], float("-inf"))
     return (torch.softmax(scores, dim=-1) @ vf).permute(1, 0, 2)
-
-
-def _skip_if_kernel_unavailable(kernel: str) -> None:
-    if kernel == "tiles":
-        pytest.importorskip(
-            "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_h3_kernels",
-            reason="static-tile window kernel not available",
-        )
 
 
 def _prepare_flash_attention() -> None:
@@ -178,40 +169,36 @@ def test_mask_reference_partition_is_exact() -> None:
 
 
 @requires_cuda
-@pytest.mark.parametrize("kernel", HYBRID_WINDOW_H3_KERNELS)
-def test_window_matches_masked_dense(kernel: str) -> None:
-    _skip_if_kernel_unavailable(kernel)
+def test_window_matches_masked_dense() -> None:
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device)
     hybrid = _hybrid()
     meta = HybridWindowAttentionH3MetadataBuilder().build(
-        layout=layout, hybrid=hybrid, device=device, kernel=kernel
+        layout=layout, hybrid=hybrid, device=device
     )
     assert not meta.full_cover
     out = _run(_impl(), meta, layout, q, k, v)
     mask = window_mask_reference(hybrid, layout, device)
     reference = _masked_reference(q, k, v, mask, layout.used)
     diff = (out[: layout.used].float() - reference).abs().max().item()
-    assert diff < 2e-2, f"{kernel}: window vs masked dense max diff {diff}"
+    assert diff < 2e-2, f"window vs masked dense max diff {diff}"
     assert torch.all(out[layout.used :] == 0)
 
 
 @requires_cuda
-@pytest.mark.parametrize("kernel", HYBRID_WINDOW_H3_KERNELS)
-def test_full_cover_matches_dense(kernel: str) -> None:
-    _skip_if_kernel_unavailable(kernel)
+def test_full_cover_matches_dense() -> None:
     device = torch.device("cuda")
     layout, (q, k, v) = _qkv(device, seed=11)
     hybrid = _hybrid(radius=NUM_FRAMES)
     meta = HybridWindowAttentionH3MetadataBuilder().build(
-        layout=layout, hybrid=hybrid, device=device, kernel=kernel
+        layout=layout, hybrid=hybrid, device=device
     )
     assert meta.full_cover
     out = _run(_impl(), meta, layout, q, k, v)
     full = torch.ones(layout.used, layout.used, dtype=torch.bool, device=device)
     reference = _masked_reference(q, k, v, full, layout.used)
     diff = (out[: layout.used].float() - reference).abs().max().item()
-    assert diff < 2e-2, f"{kernel}: full cover vs dense max diff {diff}"
+    assert diff < 2e-2, f"full cover vs dense max diff {diff}"
 
 
 @requires_cuda
