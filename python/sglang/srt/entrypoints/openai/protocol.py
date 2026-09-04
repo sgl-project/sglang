@@ -215,8 +215,8 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = False
     continuous_usage_stats: Optional[bool] = False
-    # Moonshot 扩展(P0.5):每个增量帧附带 delta.internal_content.token_ids ——
-    # 该帧增量背后的底层 token id 序列(训练数据回流 / token 级评估用)。
+    # Moonshot extension (P0.5): attach delta.internal_content.token_ids to
+    # every increment frame — the raw token ids behind that increment.
     include_internal_content: Optional[bool] = False
 
 
@@ -676,9 +676,9 @@ class FunctionResponse(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
-        # 流式工具调用契约(Kimi 流式规范 §5.4):续块不得携带 name 键(连 null
-        # 也不行,P0.3);arguments 键必须始终出现且为字符串,首块为 ""(P1.8)。
-        # 非流式路径 name 恒非 None,不受影响。
+        # Kimi stream spec: continuation chunks must not carry a name key, not
+        # even null (P0.3); the arguments key must always be present (P1.8).
+        # Non-streaming responses always set name, so they are unaffected.
         data = handler(self)
         if data.get("name") is None:
             data.pop("name", None)
@@ -697,8 +697,9 @@ class ToolCall(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
-        # 流式续块(id 为 None)只能携带 index + function.arguments,不得出现
-        # id / type 键(包括 null,P0.3);首块与非流式响应(id 非 None)保留全部。
+        # Streaming continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null (P0.3).
+        # First chunks and non-streaming responses (id set) keep every field.
         data = handler(self)
         if data.get("id") is None:
             data.pop("id", None)
@@ -1025,8 +1026,9 @@ class ChatCompletionRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
-    # 流式响应的 created 时间戳:serving 层每请求设置一次并全程复用
-    # (P1.3/P1.4/P1.14 要求 created 跨帧恒等,逐帧现算会跨秒漂移)。
+    # Streaming created timestamp: set once per request by the serving layer
+    # and reused for every frame (P1.3/P1.4/P1.14 require it constant; computing
+    # it per frame drifts across second boundaries on long streams).
     _stream_created_ts: Optional[int] = None
 
     @model_validator(mode="before")
@@ -1399,17 +1401,17 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
-    # Moonshot 扩展(P0.5):{"token_ids": [int, ...]},仅
-    # stream_options.include_internal_content=true 时携带。
+    # Moonshot extension (P0.5): {"token_ids": [int, ...]}; only carried when
+    # stream_options.include_internal_content=true.
     internal_content: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
-        # 流式 delta 不下发 null 字段(OpenAI 口径,也是 Kimi 流式规范的硬性要求):
-        # 键的存在与否本身就是客户端状态机的信号 —— `reasoning_content: null` 会被
-        # 严格客户端判为类型违规(P0.12),结束帧必须是空对象 {}(P1.10),增量帧
-        # 不得混入无关的 null 键(P0.10)。首帧的 content 键在构造处显式给 ""
-        # (非 None,保留),不受影响(P1.5)。
+        # Never emit null fields in streaming deltas (OpenAI behavior and a hard
+        # Kimi stream-spec rule): key presence is the client's state signal —
+        # reasoning_content:null violates P0.12, the end frame must be {} (P1.10),
+        # and increment frames must not mix in unrelated null keys (P0.10). The
+        # first frame sets content="" explicitly, so it keeps its key (P1.5).
         data = handler(self)
         return {k: v for k, v in data.items() if v is not None}
 

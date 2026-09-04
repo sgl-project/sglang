@@ -763,8 +763,9 @@ class OpenAIServingChat(OpenAIServingBase):
         # nor duplicated across chunks; flush any leftover at the end.
         remaining_logprobs = choice_logprobs
 
-        # P0.5:本事件的增量 token ids 附到本事件产出的第一个增量帧上
-        # (reasoning 或 content;一帧通常对应一个事件)。附着后置 None 防重复。
+        # P0.5: attach this event's delta token ids to the first increment
+        # frame it produces (reasoning or content; one frame per event in the
+        # common case), then clear to avoid duplication.
         remaining_internal = (
             {"token_ids": internal_token_ids} if internal_token_ids else None
         )
@@ -802,11 +803,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
                 remaining_internal = None
 
-            # P1.7(Moonshot 扩展):思考结束、正文开始之前,单独发一帧
-            # reasoning_content=""(空串)作为结束边界,让客户端准确切换
-            # "思考中 → 正文"。状态挂在 per-index 的 parser 包装对象上:
-            # _k3_reasoning_seen = 已发过非空思考增量;_k3_boundary_sent = 边界已发。
-            # 触发条件:detector 已离开思考区(或流收尾),且之后不再有 reasoning。
+            # P1.7 (Moonshot extension): emit one standalone
+            # reasoning_content="" frame as the end-of-thinking boundary, after
+            # the last non-empty reasoning delta and before the first content
+            # delta. Per-index state lives on the parser wrapper:
+            # _k3_reasoning_seen / _k3_boundary_sent. Fires once the detector
+            # has left the think channel (or the stream is finishing).
             if self.chat_encoding_spec == "kimi_k3":
                 parser = reasoning_parser_dict.get(index)
                 if parser is not None:
@@ -1588,12 +1590,12 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
     def _msh_usage_headers(self, meta_info: Dict[str, Any]) -> Dict[str, str]:
-        """P0.18(Moonshot 扩展):每个响应携带 X-Msh-Usage-* 计量响应头。
+        """P0.18 (Moonshot extension): X-Msh-Usage-* accounting headers.
 
-        让客户端在流中断、没收到最终 usage 帧时仍能对账 prompt 侧 token。
-        值取自首个引擎事件的 meta_info,与最终 usage 的 prompt_tokens /
-        prompt_tokens_details.cached_tokens 一致(prompt 侧在 prefill 后不变)。
-        仅 kimi_k3 口径下发。
+        Lets clients account prompt-side tokens even when the stream drops
+        before the final usage frame. Values come from the first engine event's
+        meta_info and match the final usage (prompt-side counts are fixed after
+        prefill). Only emitted under the kimi_k3 encoding.
         """
         if self.chat_encoding_spec != "kimi_k3":
             return {}
@@ -1611,8 +1613,9 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
-        # usage_headers 由 generator 在产出首帧前(拿到首个引擎事件的 meta_info 时)
-        # 填充;下面先 await 首帧,所以 StreamingResponse 构造时头已就绪(P0.18)。
+        # The generator fills usage_headers before yielding its first chunk
+        # (from the first engine event's meta_info); the first chunk is awaited
+        # below, so the headers are ready when StreamingResponse is built (P0.18).
         usage_headers: Dict[str, str] = {}
         generator = self._generate_chat_stream(
             adapted_request, request, raw_request, usage_headers=usage_headers
@@ -1656,8 +1659,10 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
-        # P0.5(Moonshot 扩展):include_internal_content 时逐帧附带增量 token ids。
-        # 引擎流事件自带 output_ids(增量模式为 delta;否则按 completion_tokens 计数取尾部)。
+        # P0.5 (Moonshot extension): attach per-frame delta token ids when
+        # include_internal_content is set. Engine stream events already carry
+        # output_ids (a delta in incremental mode; otherwise sliced from the
+        # tail by completion_tokens count).
         internal_content_on = bool(
             request.stream_options
             and getattr(request.stream_options, "include_internal_content", False)
@@ -1749,8 +1754,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         break
                     finish_reasons[index] = finish_reason
 
-                # P0.18:首个引擎事件的 meta_info 一到就填计量头(在产出任何
-                # 字节之前;_handle_streaming_request 先 await 首帧再造响应)。
+                # P0.18: fill the accounting headers as soon as the first
+                # engine event's meta_info arrives (before any byte is yielded;
+                # _handle_streaming_request awaits the first chunk).
                 if usage_headers is not None and not usage_headers:
                     usage_headers.update(
                         self._msh_usage_headers(content["meta_info"])
@@ -1769,18 +1775,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     stream_started = True
 
-                # P0.5:取本事件的增量 token ids(增量流式模式事件即 delta)。
+                # P0.5: delta token ids for this event (incremental mode
+                # events already carry the delta).
                 internal_token_ids = None
                 if internal_content_on:
                     all_ids = content.get("output_ids") or []
                     if self.tokenizer_manager.server_args.incremental_streaming_output:
                         internal_token_ids = list(all_ids)
                     else:
-                        # 非增量模式事件携带的是累计 output_ids 的【引用】,且背压
-                        # 合并(_coalesce)会把同一引用拼接成多份重复 —— 按列表长度
-                        # 记偏移会切出垃圾。改用 meta_info.completion_tokens 计数:
-                        # 本事件新增 k 个 token,取尾部 k 个;重复拼接的尾部恒为
-                        # 真实累计序列的尾部,对两种坑都稳健。
+                        # Non-incremental events carry a REFERENCE to the
+                        # cumulative output_ids, and backlog coalescing
+                        # (_coalesce) concatenates that same reference multiple
+                        # times — length-based offsets would slice garbage. Use
+                        # the completion_tokens count instead: this event added
+                        # k tokens, take the last k; the tail of a duplicated
+                        # concatenation is still the true cumulative tail.
                         cur = content["meta_info"].get("completion_tokens", 0) or 0
                         prev = internal_prev_completion.get(index, 0)
                         k = cur - prev
@@ -1816,9 +1825,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
-                # P0.4(Moonshot 扩展):结束帧必须携带 choices[0].usage ——
-                # per-候选的精确计费,与 stream_options.include_usage 无关;
-                # 明细字段(reasoning_tokens/cached_tokens)必须为整数,没有也回 0。
+                # P0.4 (Moonshot extension): the end frame must carry
+                # choices[0].usage — per-choice accounting, independent of
+                # stream_options.include_usage; detail fields
+                # (reasoning_tokens / cached_tokens) must be ints, 0 when absent.
                 choice_usage = None
                 if self.chat_encoding_spec == "kimi_k3":
                     pt = prompt_tokens.get(idx, 0)
@@ -1980,7 +1990,7 @@ class OpenAIServingChat(OpenAIServingBase):
             int(time.time()),
         )
 
-        # P0.18:非流式同样携带 X-Msh-Usage-* 计量响应头(与 usage 一致)。
+        # P0.18: non-streaming responses carry the same X-Msh-Usage-* headers.
         usage_headers = self._msh_usage_headers(ret[0]["meta_info"])
         if usage_headers and isinstance(response, ChatCompletionResponse):
             return ORJSONResponse(
@@ -2221,9 +2231,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return ChoiceLogprobs(content=token_logprobs)
 
     def _stream_created(self, request: ChatCompletionRequest) -> int:
-        """流式响应的 created 时间戳:每请求固定一次(P1.3/P1.4/P1.14 要求
-        id/object/created/model 跨帧恒等 —— 逐帧现算 int(time.time()) 会在
-        跨秒的长流里漂移)。存在请求对象的私有属性上,同一请求内复用。"""
+        """Per-request streaming created timestamp (P1.3/P1.4/P1.14 require
+        id/object/created/model constant across frames; computing
+        int(time.time()) per frame drifts on long streams). Stored on the
+        request object and reused for every frame."""
         created = getattr(request, "_stream_created_ts", None)
         if created is None:
             created = int(time.time())
@@ -2231,11 +2242,12 @@ class OpenAIServingChat(OpenAIServingBase):
         return created
 
     def _wire_id(self, meta_id: str) -> str:
-        """API 层响应 id(P2.1):kimi_k3 口径下发 chatcmpl-<24hex>。
+        """Wire-level response id (P2.1): chatcmpl-<24hex> under kimi_k3.
 
-        由调度器 rid 确定性派生,保证同一请求所有帧恒等(P1.3);其它编码
-        口径保留 rid 原样,运维日志按 rid 关联不受影响。rid 中非 hex 字符
-        (客户端自带前缀等)被剔除,不足 24 位右补零,只求格式稳定。
+        Deterministically derived from the scheduler rid so all frames of one
+        request stay identical (P1.3); other encodings keep the raw rid so ops
+        logs still correlate. Non-hex rid chars are stripped and short ids are
+        zero-padded — format stability only.
         """
         if self.chat_encoding_spec != "kimi_k3":
             return meta_id
@@ -2249,10 +2261,11 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser == "kimi_k3":
-            # 官方 wire 形态是 `<name>_<global_index>`(P2.2,detokenize 时把底层
-            # `functions.<name>:<idx>` 的分隔符 `:` 替换为 `_`);冒号形态是底层
-            # token 格式,不应出现在 API 层。global_index 跨函数名全局计数,
-            # 保证与 history 中已有 id 不冲突(P0.14)。
+            # Official wire form is `<name>_<global_index>` (P2.2): detokenize
+            # maps the raw token form `functions.<name>:<idx>` by replacing `:`
+            # with `_`; the colon form must not reach the API layer. The global
+            # index counts history tool calls across all function names, so new
+            # ids never collide with history ids (P0.14).
             return f"{call_item.name}_{history_tool_calls_cnt + call_item.tool_index}"
         if self.tool_call_parser != "kimi_k2":
             # A simple uuid is sufficient for all models except for Kimi-K2.
@@ -2797,10 +2810,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_id = None
                 function_name = None
 
-            # 流式工具调用契约(Kimi 流式规范 §5.4):首块只立"槽位"
-            # (index+id+type+name+arguments=""),parser 已解出的初始参数拆到
-            # 紧随的续块(仅 index + function.arguments)下发 —— 首块直接带数据
-            # 是规范里点名的反例,客户端需要特判。
+            # Kimi stream spec (§5.4): the first chunk only opens the slot
+            # (index+id+type+name+arguments=""); any initial arguments the
+            # parser already extracted go into an immediate continuation chunk
+            # (index + function.arguments only). A first chunk carrying data is
+            # a spec-called-out anti-pattern clients must special-case.
             tool_call_deltas = []
             if function_name is not None:
                 tool_call_deltas.append(
