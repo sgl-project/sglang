@@ -98,16 +98,14 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             ),
         )
 
-    def test_megamoe_sparse_dp_falls_back_to_eager(self):
-        # Regression (#37561): with MegaMoE a 0-token DP rank stayed IDLE/eager
-        # under SUM_LEN while the busy rank replayed the graph, and the two
-        # collective sequences deadlocked. The sparse batch must keep MAX_LEN
-        # and take the eager fallback like every other a2a backend.
+    def test_megamoe_idle_rank_without_graph_gather_keeps_sum_len(self):
+        # Without a DP gather in the graph, an eager idle rank matches the
+        # replaying peers, so the sparse batch keeps per-rank buckets.
         runner = self._make_runner()
         flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
         with flags, a2a, dsa_cp, mla_cp:
-            self.assertFalse(prefill_graph_tolerates_sum_len([8, 0]))
-            self.assertTrue(
+            self.assertTrue(prefill_graph_tolerates_sum_len())
+            self.assertFalse(
                 runner._has_inactive_dp_rank(
                     SimpleNamespace(global_num_tokens_cpu=[8, 0])
                 )
@@ -117,7 +115,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
         flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
         with flags, a2a, dsa_cp, mla_cp:
-            self.assertTrue(prefill_graph_tolerates_sum_len([8, 16]))
+            self.assertTrue(prefill_graph_tolerates_sum_len())
             self.assertFalse(
                 runner._has_inactive_dp_rank(
                     SimpleNamespace(global_num_tokens_cpu=[8, 16])
@@ -125,15 +123,14 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
             )
 
     def test_megamoe_graph_with_dp_gather_forces_shared_bucket(self):
-        # Regression (#37561): a DP gather recorded inside the prefill graph
-        # carries MAX_LEN geometry, so per-rank buckets deadlock the NCCL
-        # all_gather even when every rank is busy (Kimi-K3 dense layer 0).
+        # A DP gather captured in the graph has fixed MAX_LEN geometry; per-rank
+        # buckets or an eager idle rank would deadlock its all_gather.
         runner = self._make_runner()
         flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp(
             graph_has_dp_gather=True
         )
         with flags, a2a, dsa_cp, mla_cp:
-            self.assertFalse(prefill_graph_tolerates_sum_len([8, 200]))
+            self.assertFalse(prefill_graph_tolerates_sum_len())
             self.assertTrue(
                 runner._has_inactive_dp_rank(
                     SimpleNamespace(global_num_tokens_cpu=[8, 0])
