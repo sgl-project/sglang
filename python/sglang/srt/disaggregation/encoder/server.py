@@ -455,7 +455,7 @@ class MMEncoder:
         self.server_args = server_args
         configure_media_url_security(
             get_mm().allowed_media_domains,
-            server_args.media_url_max_file_size_mb,
+            get_mm().media_url_max_file_size_mb,
         )
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
@@ -470,18 +470,18 @@ class MMEncoder:
         )
         self.load_config = LoadConfig(
             load_format=get_model().load_format,
-            download_dir=server_args.download_dir,
+            download_dir=get_model().download_dir,
             model_loader_extra_config=get_model().model_loader_extra_config,
-            remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=server_args.remote_instance_weight_loader_send_weights_group_ports,
+            remote_instance_weight_loader_seed_instance_ip=get_model().remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=get_model().remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=get_model().remote_instance_weight_loader_send_weights_group_ports,
         )
         self.model_type = getattr(
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
 
         self.device = get_device().device
-        self.gpu_id = server_args.base_gpu_id + rank if gpu_id is None else gpu_id
+        self.gpu_id = get_device().base_gpu_id + rank if gpu_id is None else gpu_id
 
         self.device_config = DeviceConfig(
             device=self.device,

@@ -172,7 +172,7 @@ def init_torch_distributed(
 
 def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     backend = get_default_distributed_backend(device)
-    if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
+    if device == "cuda" and get_exec().moe.elastic_ep_backend == "mooncake":
         backend = "mooncake"
     return backend
 
@@ -197,7 +197,7 @@ def _resolve_dist_init_method(*, dist_port: int) -> str:
 
 def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
-    set_mscclpp_all_reduce(server_args.enable_mscclpp)
+    set_mscclpp_all_reduce(get_exec().comm.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None
@@ -268,7 +268,7 @@ def _init_parallel_groups(
         duplicate_tp_group=get_disagg().enable_pdmux,
         duplicate_attn_cp_group=(
             is_hip()
-            and server_args.enable_two_batch_overlap
+            and get_exec().overlap.enable_two_batch_overlap
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
