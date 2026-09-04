@@ -36,20 +36,25 @@ def _recorded_all_reduces(called, *, moe_ep_size, moe_tp_size, moe_dp_size):
     def record(name):
         return lambda x: called.append(name) or x
 
-    with patch(
-        "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
-        side_effect=record("tp"),
-    ), patch(
-        "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
-        side_effect=record("ep"),
-    ), patch(
-        "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
-        side_effect=record("moe_tp"),
-    ), get_parallel().override(
-        moe_ep_size=moe_ep_size,
-        moe_tp_size=moe_tp_size,
-        moe_dp_size=moe_dp_size,
-        tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
+    with (
+        patch(
+            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce",
+            side_effect=record("tp"),
+        ),
+        patch(
+            "sglang.srt.distributed.communication_op.moe_expert_parallel_all_reduce",
+            side_effect=record("ep"),
+        ),
+        patch(
+            "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce",
+            side_effect=record("moe_tp"),
+        ),
+        get_parallel().override(
+            moe_ep_size=moe_ep_size,
+            moe_tp_size=moe_tp_size,
+            moe_dp_size=moe_dp_size,
+            tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
+        ),
     ):
         yield
 
@@ -65,13 +70,16 @@ class TestPostExpertsAllReduceMerge(CustomTestCase):
 
     def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1, skip=False):
         called = []
-        with patch.object(
-            moe_utils, "should_skip_post_experts_all_reduce", return_value=skip
-        ), _recorded_all_reduces(
-            called,
-            moe_ep_size=moe_ep_size,
-            moe_tp_size=moe_tp_size,
-            moe_dp_size=moe_dp_size,
+        with (
+            patch.object(
+                moe_utils, "should_skip_post_experts_all_reduce", return_value=skip
+            ),
+            _recorded_all_reduces(
+                called,
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                moe_dp_size=moe_dp_size,
+            ),
         ):
             post_experts_all_reduce(torch.zeros(2, 2))
         return called
@@ -161,23 +169,28 @@ class TestResolveFusionGroup(CustomTestCase):
         fake_moe_tp_group = MagicMock(name="moe_tp_group")
         tp_size = moe_ep_size * moe_tp_size * moe_dp_size
 
-        with get_parallel().override(
-            moe_ep_size=moe_ep_size,
-            moe_tp_size=moe_tp_size,
-            moe_dp_size=moe_dp_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            moe_ep_rank=tp_rank % moe_ep_size,
-            moe_tp_rank=tp_rank % moe_tp_size,
-        ), patch(
-            "sglang.srt.layers.flashinfer_comm_fusion.get_tp_group",
-            return_value=fake_tp_group,
-        ), patch(
-            "sglang.srt.layers.flashinfer_comm_fusion.get_moe_ep_group",
-            return_value=fake_ep_group,
-        ), patch(
-            "sglang.srt.layers.flashinfer_comm_fusion.get_moe_tp_group",
-            return_value=fake_moe_tp_group,
+        with (
+            get_parallel().override(
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                moe_dp_size=moe_dp_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                moe_ep_rank=tp_rank % moe_ep_size,
+                moe_tp_rank=tp_rank % moe_tp_size,
+            ),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.get_tp_group",
+                return_value=fake_tp_group,
+            ),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_ep_group",
+                return_value=fake_ep_group,
+            ),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.get_moe_tp_group",
+                return_value=fake_moe_tp_group,
+            ),
         ):
             ws = resolve_fusion_world_size(use_attn_tp_group=False)
             group_tuple = resolve_fusion_group(use_attn_tp_group=False)
