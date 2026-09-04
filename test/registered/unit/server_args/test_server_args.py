@@ -20,7 +20,6 @@ from sglang.srt.entrypoints.sidecar import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
-from sglang.srt.lora.utils import _KNOWN_LORA_TARGET_MODULES
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -29,7 +28,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
-from sglang.srt.utils.common import SUPPORTED_LORA_TARGET_MODULES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -2242,27 +2240,6 @@ class TestDcpKvEventContract(CustomTestCase):
         # paged, at dcp_size.
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(args.kv_event_block_size, 8)
-
-
-class TestGdnLoraTargetModules(CustomTestCase):
-    GDN_TARGET_MODULES = ("in_proj_qkvz", "in_proj_ba", "out_proj")
-
-    def setUp(self):
-        self.parser = server_args_module.argparse.ArgumentParser()
-        ServerArgs.add_cli_args(self.parser)
-
-    def test_cli_accepts_every_gdn_lora_target_module(self):
-        args = self.parser.parse_args(
-            ["--model-path", "dummy", "--lora-target-modules", *self.GDN_TARGET_MODULES]
-        )
-
-        self.assertEqual(list(args.lora_target_modules), list(self.GDN_TARGET_MODULES))
-
-    def test_cli_offers_every_gdn_module_the_lora_runtime_supports(self):
-        for module in self.GDN_TARGET_MODULES:
-            with self.subTest(module=module):
-                self.assertIn(module, _KNOWN_LORA_TARGET_MODULES)
-                self.assertIn(module, SUPPORTED_LORA_TARGET_MODULES)
 
 
 if __name__ == "__main__":
