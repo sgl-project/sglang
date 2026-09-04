@@ -36,10 +36,6 @@ _NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
 _NPU_ARCH35_KV_ROW_ALIGNMENT = 128
 
 
-def _is_npu_arch35() -> bool:
-    return is_npu_arch35()
-
-
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU PA_ND variant of the full / SWA / c4 / c128 single-KV pool.
 
@@ -73,7 +69,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
         if self.store_dtype != torch.bfloat16:
             return super().create_buffer(num_pages=num_pages)
-        if _is_npu_arch35():
+        if is_npu_arch35():
             kv_dim = self.a5_packed_kv_dim
             kv_dtype = torch.float8_e4m3fn
         else:
@@ -191,7 +187,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         super()._create_buffer()
         kp = self._kernel_page_size
         npu_num_pages = (self.size + kp + 1) // kp
-        if _is_npu_arch35():
+        if is_npu_arch35():
             index_k_dtype, index_scale_dtype = torch.float8_e4m3fn, torch.float32
         else:
             index_k_dtype, index_scale_dtype = torch.int8, torch.float16
@@ -339,7 +335,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # explicit-location path can share the smaller flat pool, but the A5
         # cycle ABI needs enough physical banks for every req_pool_idx.
         size = self._state_pool_size(ratio)
-        if _is_npu_arch35():
+        if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
@@ -360,7 +356,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         # slot_dim (indexer_head_dim vs attention head_dim).
         ring_size = self.get_ring_size(ratio)
         size = self.c4_state_pool_size
-        if _is_npu_arch35():
+        if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
@@ -427,7 +423,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
-        if not _is_npu_arch35():
+        if not is_npu_arch35():
             for pools in (
                 self.compress_state_pools,
                 self.indexer_compress_state_pools,
@@ -562,7 +558,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         """
         # Index by raw layer_id (see get_swa_buffer) to avoid bucket collision.
         buf = self.swa_kv_pool.kv_buffer[layer_id]
-        if _is_npu_arch35():
+        if is_npu_arch35():
             self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
@@ -676,7 +672,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             # PA_ND layout: kv_buffer[layer_id] shape = (num_pages, page_size,
             # 1, kv_dim). Flatten (num_pages, page_size) and index by `loc`.
             buf = compress_pool.kv_buffer[compress_layer_id]
-            if _is_npu_arch35():
+            if is_npu_arch35():
                 self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
