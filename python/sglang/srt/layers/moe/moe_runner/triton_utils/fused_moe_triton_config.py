@@ -177,6 +177,34 @@ def get_moe_configs(
     return None
 
 
+@functools.lru_cache(maxsize=256)
+def _get_nearest_moe_config(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: int,
+    block_k: int,
+    per_channel_quant: bool,
+    down_moe: bool,
+    M: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    configs = get_moe_configs(
+        E,
+        N,
+        dtype,
+        block_n,
+        block_k,
+        per_channel_quant=per_channel_quant,
+        down_moe=down_moe,
+    )
+    if not configs:
+        return None, None
+
+    config = configs[min(configs, key=lambda x: abs(x - M))]
+    max_block_m = max(cfg["BLOCK_SIZE_M"] for cfg in configs.values())
+    return config, max_block_m
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -284,43 +312,35 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(
+        config, _ = _get_nearest_moe_config(
             E,
             N,
             dtype,
             block_n,
             block_k,
-            per_channel_quant=per_channel_quant,
-            down_moe=False,
+            per_channel_quant,
+            False,
+            M,
         )
 
-        if configs:
-            # If an optimal configuration map has been found, look up the
-            # optimal config
-            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-        else:
+        if config is None:
             # Else use the default config
             config = get_default_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
         if return_down_config:
-            down_configs = get_moe_configs(
+            down_config, max_block_m = _get_nearest_moe_config(
                 E,
                 N,
                 dtype,
                 block_n,
                 block_k,
-                per_channel_quant=per_channel_quant,
-                down_moe=True,
+                per_channel_quant,
+                True,
+                M,
             )
-            if down_configs:
-                down_config = down_configs[
-                    min(down_configs.keys(), key=lambda x: abs(x - M))
-                ]
+            if down_config is not None:
                 down_config = dict(**down_config)
-                max_block_m = max(
-                    [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
-                )
     if return_down_config:
         if (
             down_config is not None
