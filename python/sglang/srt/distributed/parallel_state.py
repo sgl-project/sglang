@@ -222,6 +222,12 @@ def reg_reduce_scatter_tensor(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    # Backend choice belongs inside the op: aiter's custom all-reduce resolves its
+    # JIT module on first use, which shells out to shutil.which -- untraceable, and
+    # only reachable at shapes small enough for the custom path, so tracing it
+    # blows up deep into a piecewise sweep rather than on the first shape.
+    if group._maybe_aiter_reduce_scatter(output, input):
+        return
     group._reduce_scatter_tensor(output, input)
 
 
@@ -1112,8 +1118,6 @@ class GroupCoordinator:
         if _is_npu or _is_cpu:
             # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
-        elif self._maybe_aiter_reduce_scatter(output, input):
-            return
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
