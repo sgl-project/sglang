@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -48,6 +49,7 @@ if _HAS_MLX:
         SchedulerMlxOverlapMixin,
     )
     from sglang.srt.hardware_backend.mlx.tp_worker import MlxLaunch
+    from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
@@ -56,7 +58,9 @@ if _HAS_MLX:
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _set_runner_cache_layout(
@@ -1108,7 +1112,35 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxFutureMap(CustomTestCase):
+    def test_stash_matches_mps_buffer_device_and_dtype(self):
+        if not torch.backends.mps.is_available():
+            self.skipTest("requires PyTorch MPS")
+        pool = ReqToTokenPool(
+            size=4,
+            max_context_len=8,
+            device="mps",
+            enable_memory_saver=False,
+        )
+        future_map = FutureMap(
+            device=torch.device("mps"),
+            spec_algo=SpeculativeAlgorithm.NONE,
+            req_to_token_pool=pool,
+        )
+        indices = torch.tensor([1, 2], dtype=torch.int64, device="mps")
+        tokens = torch.tensor([17, 23], dtype=torch.int32, device="cpu")
+
+        future_map.stash(indices, RelayPayload(bonus_tokens=tokens))
+
+        stored = future_map.output_tokens_buf[indices]
+        self.assertEqual(stored.device.type, "mps")
+        self.assertEqual(stored.dtype, torch.int64)
+        self.assertEqual(stored.cpu().tolist(), [17, 23])
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
 class TestMlxOverlapScheduler(unittest.TestCase):
+
     def test_finalize_pending_job_updates_scheduler_last_batch(self):
         token_ids = torch.tensor([7], dtype=torch.long)
         scheduler = FakeOverlapScheduler(token_ids)
