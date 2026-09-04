@@ -231,12 +231,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 

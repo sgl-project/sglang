@@ -257,9 +257,9 @@ def describe_host_memory() -> str:
     capped = cgroup_memory_limit_bytes()
     available = host_memory_available_bytes()
     if capped is None:
-        return f"host memory available: {available / GIB_BYTES:.1f} GiB (no cgroup cap)"
+        return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
     return (
-        f"host memory available: {available / GIB_BYTES:.1f} GiB "
+        f"{available / GIB_BYTES:.1f} GiB available "
         f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
     )
