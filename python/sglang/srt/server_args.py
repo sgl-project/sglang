@@ -615,6 +615,18 @@ class ServerArgs:
         ),
         NS("model"),
     ] = "auto"
+    fp4_kv_cache_recipe: A[
+        str,
+        Arg(
+            help=(
+                "FP4 KV-cache scaling recipe. 'mxfp4' uses MX block scaling "
+                "(E8M0 block-32, no global scale); 'nvfp4' uses an FP32 tensor "
+                "scale plus E4M3 block-16 scales."
+            ),
+            choices=["nvfp4", "mxfp4"],
+        ),
+        NS("model"),
+    ] = "mxfp4"
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
     ] = False
