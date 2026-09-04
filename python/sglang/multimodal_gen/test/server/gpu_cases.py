@@ -1082,7 +1082,7 @@ TWO_GPU_CASES = [
             ulysses_degree=1,
             ring_degree=2,
         ),
-        DiffusionSamplingParams(extras={"quality": "extra-high"}),
+        replace(T2I_sampling_params, extras={"quality": "extra-high"}),
         run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
