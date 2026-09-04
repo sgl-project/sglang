@@ -3803,7 +3803,11 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Cosmos3ForConditionalGeneration",
+        "Cosmos3EdgeForConditionalGeneration",
+    )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
