@@ -370,12 +370,7 @@ def test_infer_recipe_module_level_def_shadowed_by_method_name(repo: Path) -> No
                 "        return foo(x=self.x)\n"
             ),
             "util.py": (
-                "def keep():\n"
-                "    return 1\n"
-                "\n"
-                "\n"
-                "def foo(*, x):\n"
-                "    return x + 1\n"
+                "def keep():\n    return 1\n\n\ndef foo(*, x):\n    return x + 1\n"
             ),
         },
     )
@@ -437,9 +432,7 @@ def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
     _write(
         repo,
         **{
-            "model.py": (
-                "class M:\n" "    def work(self, x):\n" "        return x + 1\n"
-            ),
+            "model.py": ("class M:\n    def work(self, x):\n        return x + 1\n"),
             "comp.py": "class C:\n    def keep(self):\n        return 1\n",
         },
     )
@@ -448,9 +441,7 @@ def test_infer_recipe_move_leaving_a_forwarding_delegate(repo: Path) -> None:
         repo,
         **{
             "model.py": (
-                "class M:\n"
-                "    def work(self, x):\n"
-                "        return self.comp.work(x)\n"
+                "class M:\n    def work(self, x):\n        return self.comp.work(x)\n"
             ),
             "comp.py": (
                 "class C:\n"

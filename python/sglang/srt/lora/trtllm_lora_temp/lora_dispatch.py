@@ -328,9 +328,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_bf16_lora(
     from sglang.srt.layers.moe.utils import RoutingMethodType
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm BF16 LoRA currently supports the gated SwiGLU path only."
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -484,9 +484,9 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp4_lora(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
-    assert (
-        runner_config.activation == "silu" and runner_config.is_gated
-    ), "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    assert runner_config.activation == "silu" and runner_config.is_gated, (
+        "experimental_sgl_trtllm NVFP4 LoRA currently supports the gated SwiGLU path only."
+    )
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
