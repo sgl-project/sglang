@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_serving,
 )
+from sglang.srt.sampling.watermark import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
@@ -429,7 +430,9 @@ class RuntimeHandle:
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
         )
-        return json.dumps(msgspec_to_builtins(result), default=str)
+        return json.dumps(
+            msgspec_to_builtins(redact_watermark_secrets(result)), default=str
+        )
 
     def health_check(self) -> bool:
         from sglang.srt.managers.tokenizer_manager import ServerStatus
@@ -545,9 +548,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

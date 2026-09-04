@@ -9,6 +9,10 @@ export const config = {
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
     "rtx6000", "rtx5090",
+    // NVIDIA DGX Spark (GB10, SM121) — Flash Official FP4 only, as a 2-node
+    // TP=2 pair over ConnectX-7 RoCE; the shared HARDWARE_CATALOG carries the
+    // entry and its multi-node Docker flags.
+    "dgx-spark",
     // AMD ROCm — MI300X (Flash FP8) + MI355X (Flash/Pro, FP4/FP8).
     "mi300x", "mi355x",
   ],
@@ -94,13 +98,13 @@ export const config = {
   --warmup-requests 64 --flush-cache`,
     accuracy: {
       gsm8k_pct:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 32`,
       gpqa_pct: {
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -108,7 +112,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -116,7 +120,7 @@ sgl-eval run gpqa \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run gpqa \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -126,7 +130,7 @@ sgl-eval run gpqa \\
       },
       aime25_pct: {
         "flash-official":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -134,7 +138,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         flash:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 200000 \\
@@ -142,7 +146,7 @@ sgl-eval run aime25 \\
   --out-dir /sgl-workspace/logs \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1`,
         pro:
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run aime25 \\
   --model {{MODEL_NAME}} --api-key <api-key> \\
   --n-repeats 16 --max-tokens 400000 \\
@@ -152,7 +156,7 @@ sgl-eval run aime25 \\
       },
       mmmu_pro_pct: {
         "flash-vision":
-`# To install sgl-eval: pip install git+https://github.com/sgl-project/sgl-eval
+`# To install sgl-eval: pip install sgl-eval
 sgl-eval run mmmu_pro \\
   --reasoning-effort max \\
   --temperature 1.0 --top-p 0.95 \\
@@ -192,6 +196,16 @@ sgl-eval run mmmu_pro \\
     // (sgl-project/sglang#37253) — until it does, the variant needs this
     // preview build on every hardware.
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
+    // DGX Spark ONLY. A dedicated preview build for the 2x GB10 pair: it bakes
+    // in the SM12x b12x MoE/attention kernels (sgl-project/sglang#34878,
+    // #35899, #34018), the b12x dual-cache image-prefill fix that makes Flash
+    // Vision serve images on SM12x, the NVFP4 MTP-layer dispatch fix, and the
+    // CuTeDSL/NCCL pins the GB10 recipe needs — none of which are in `latest`.
+    // v2 = branch b12x-vision @ 452239a74f. It is not built for, and must not
+    // be used on, any other hardware — every other row keeps its own image.
+    "dgx-spark|flash-official|fp4":   "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-official|nvfp4": "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-vision|fp4":     "lmsysorg/sglang:dev-v4f-2dgx-v2",
     // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
     // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
     // every NVFP4 cell to the nightly until a release contains that fix.
@@ -1814,6 +1828,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -1837,6 +1855,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2593,6 +2615,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2625,6 +2651,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2661,6 +2691,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2693,6 +2727,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2760,6 +2798,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2796,6 +2838,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2863,6 +2909,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2899,6 +2949,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -2966,6 +3020,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -3002,6 +3060,10 @@ sgl-eval run mmmu_pro \\
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
+        "--enable-dp-attention-local-control-broadcast",
+        "--tokenizer-worker-num 8",
+        "--stream-interval 20",
+        "--prefill-decode-interval 10",
         "--enable-two-batch-overlap",
         "--attention-backend dsv4",
         "--page-size 256",
@@ -3020,6 +3082,125 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
+    // DGX Spark (GB10 / SM121) — 2-node TP=2, Balanced: Flash Official FP4,
+    // Flash Official NVFP4, Flash Vision FP4
+    // ====================================================================
+    // Three cells, all on the GB10 recipe: SM12x b12x compressed-MLA attention
+    // with DSpark, split TP=2 across two DGX Sparks over ConnectX-7 RoCE, image
+    // `lmsysorg/sglang:dev-v4f-2dgx-v2` (b12x-vision @ 452239a74f). Every other
+    // DGX Spark combination (other strategies / single node / Flash / Pro) is
+    // intentionally absent and greys out: a single 128GB GB10 cannot hold the
+    // checkpoints, and only Balanced has been run.
+    // - Flash Official FP4: b12x W4A8 MoE (verified on the v2 image: GSM8K
+    //   96.5%; earlier same-recipe runs: ~224 tok/s plateau, AgentX c1/c2 clean,
+    //   decode microbench at parity with the qualified stack).
+    // - Flash Official NVFP4: the NVFP4 routed experts need the flashinfer
+    //   cutlass runner (b12x's MoE is MXFP4-only; trtllm-gen is sm100-only); the
+    //   DSpark draft's MTP experts stay MXFP4 and run on b12x
+    //   (--speculative-moe-runner-backend b12x); HashTopK rejects fused shared
+    //   experts under the cutlass runner (--disable-shared-experts-fusion).
+    //   Verified on the v2 image: GSM8K 97.5%, DSpark accept 3.96, throughput
+    //   at parity with the FP4 cell.
+    // - Flash Vision FP4: same flags as Flash Official; images are served
+    //   natively on b12x (dual-cache prefill gate fix in the v2 image).
+    //   Verified on the v2 image with the cookbook Reproduce commands:
+    //   sgl-eval gsm8k 97.5% (200 q), sgl-eval mmmu_pro 85% / 0% errors
+    //   (20-q subset, --reasoning-effort max, temp 1.0, top-p 0.95).
+    // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
+    // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
+    // expandable_segments avoids unified-memory fragmentation OOMs.
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "nvfp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-moe-runner-backend b12x",
+        "--disable-shared-experts-fusion",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ====================================================================
     // B200 + FP4 — Flash Vision (Exp)
     //
     // DeepSeek-V4-Flash-Vision-Exp (sgl-project/sglang#37253): the 0731
@@ -3029,7 +3210,8 @@ sgl-eval run mmmu_pro \\
     // verified on B200 via the MMMU-Pro round (4×B200, image batches).
     // Balanced / high-throughput stay target-only: those recipes run DP
     // attention, which DSpark is incompatible with on the current release.
-    // Non-B200 hardware — final verification in progress.
+    // GB300 verified via the same MMMU-Pro round (4×GB300); B300 /
+    // GB200 / H200 / H100 — final verification in progress.
     // ====================================================================
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -3047,8 +3229,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -3065,8 +3246,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "b200", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
@@ -3192,8 +3372,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "low-latency", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [],
       flags: [
@@ -3207,8 +3386,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
       flags: [
@@ -3225,8 +3403,7 @@ sgl-eval run mmmu_pro \\
     },
     {
       match: { hw: "gb300", variant: "flash-vision", quant: "fp4", strategy: "high-throughput", nodes: "single" },
-      verified: false,
-      verificationStatus: "in-progress",
+      verified: true,
       warn: "DeepSeek-V4-Flash-Vision-Exp support has not shipped in an SGLang release yet (sglang PR 37253): Docker mode already points at the preview image; for Python mode install SGLang from that PR. See [Flash Vision notes](#vision-note).",
       env: [
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
