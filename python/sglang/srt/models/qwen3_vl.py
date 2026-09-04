@@ -1595,10 +1595,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading visual/language model weights
-                if (
-                    self.config.encoder_only or self.config.language_only
-                ) and name not in params_dict:
+                # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
+                # that were remapped gate_proj -> gate_up_proj but are not params).
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader

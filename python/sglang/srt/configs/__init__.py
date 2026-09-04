@@ -2,6 +2,13 @@ from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
+from sglang.srt.configs.cosmos3 import (
+    Cosmos3Config,
+    Cosmos3EdgeConfig,
+    Cosmos3EdgeProjectorConfig,
+    Cosmos3EdgeTextConfig,
+    Cosmos3EdgeVisionConfig,
+)
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots3 import Dots3Config
@@ -74,6 +81,11 @@ __all__ = [
     "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
+    "Cosmos3Config",
+    "Cosmos3EdgeConfig",
+    "Cosmos3EdgeTextConfig",
+    "Cosmos3EdgeVisionConfig",
+    "Cosmos3EdgeProjectorConfig",
     "DbrxConfig",
     "DeepseekVL2Config",
     "LongcatFlashConfig",
