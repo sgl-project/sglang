@@ -16,9 +16,11 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from packaging import version as pkg_version
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
@@ -59,6 +61,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
+    is_hip,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -68,12 +71,83 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
     "UnquantizedLinearMethod",
     "PackWeightMethod",
 }
+
+
+def _torch_at_least(version: str) -> bool:
+    # Prerelease-aware on purpose: the rocm700 CI image ships
+    # 2.9.0a0+git7bcbafe, which must compare BELOW 2.9.0. utils.common's
+    # torch_release tuple would read that as (2, 9, 0) and get it wrong.
+    try:
+        return pkg_version.parse(torch.__version__) >= pkg_version.parse(version)
+    except pkg_version.InvalidVersion:
+        # Unparsable vendor build: assume the older behavior.
+        return False
+
+
+_TORCH_HAS_ROCM_MM_FP32_OUT = _torch_at_least("2.9.0")
+
+
+@lru_cache(maxsize=None)
+def _supports_mm_fp32_out_dtype(device_type: str, dtype: torch.dtype) -> bool:
+    """Whether ``torch.mm(..., out_dtype=torch.float32)`` works for ``dtype``.
+
+    Two distinct guards in torch reject this GEMM:
+
+    * ROCm, torch source older than pytorch#161540 (2025-09-02, first released
+      in 2.9.0): ``gemm<BFloat16, float>`` and ``gemm<Half, float>`` reject
+      unconditionally under ``#ifdef USE_ROCM``, before any backend dispatch.
+      This is what the ``rocm700`` CI images hit -- they pin a 2025-08-04 torch.
+    * CUDA, any version: ``gemm<BFloat16, float>`` requires compute capability
+      8.0 or higher. FP16 has no such restriction.
+
+    Deliberately decided from metadata rather than by probing with a real GEMM:
+    a probe costs a full BLAS algo lookup (~700 ms on MI355X/hipBLASLt) that
+    does not amortize into the first real LM head GEMM, and the LM head sits
+    inside the captured region of the decode CUDA graph.
+
+    Two cases this does NOT cover, both accepted:
+
+    * The Composable Kernel BLAS backend rejects the op on any torch version,
+      but it requires an explicit
+      ``torch.backends.cuda.preferred_blas_library("ck")`` that SGLang never
+      issues -- it is not reachable from env vars.
+    * ``gemm_and_bias`` still rejects FP32 output unconditionally on ROCm as of
+      torch 2.9.1, so a bias-fused ``addmm(out_dtype=fp32)`` would need its own
+      check.
+    """
+    if device_type != "cuda":
+        return False
+
+    if _is_hip:
+        if not _TORCH_HAS_ROCM_MM_FP32_OUT:
+            logger.info(
+                "FP32 LM head: torch %s predates pytorch#161540, which rejects "
+                "mm(out_dtype=torch.float32) on ROCm; using the explicit FP32 "
+                "cast instead.",
+                torch.__version__,
+            )
+            return False
+    elif dtype == torch.bfloat16 and torch.cuda.get_device_capability() < (8, 0):
+        logger.info(
+            "FP32 LM head: BF16 mm(out_dtype=torch.float32) needs compute "
+            "capability 8.0+; using the explicit FP32 cast instead."
+        )
+        return False
+
+    logger.debug(
+        "FP32 LM head: using torch.mm(out_dtype=torch.float32) for %s on %s.",
+        dtype,
+        device_type,
+    )
+    return True
+
 
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
@@ -874,6 +948,9 @@ class LogitsProcessor(nn.Module):
                     hidden_states.is_cuda
                     and hidden_states.dtype == lm_head.weight.dtype
                     and hidden_states.dtype in (torch.float16, torch.bfloat16)
+                    and _supports_mm_fp32_out_dtype(
+                        hidden_states.device.type, hidden_states.dtype
+                    )
                 )
                 if use_mm_out_dtype:
                     logits = torch.mm(
