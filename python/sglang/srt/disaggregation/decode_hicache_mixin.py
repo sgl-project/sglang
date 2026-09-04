@@ -12,6 +12,8 @@ import torch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+from sglang.srt.mem_cache.radix_cache import TreeNode
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -183,10 +185,39 @@ class DecodeHiCacheTransferMixin:
             and decode_req.prefix_match.prefetch_registered
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
-        if decode_req.hicache_restored_node is not None:
-            self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
-            decode_req.hicache_restored_node = None
 
+    def _trim_hicache_restored_node_to_decode_prefix(
+        self, dr: DecodeRequest, restored_node: TreeNode, rematch: MatchResult
+    ) -> None:
+        """Trim restored_node and kv_indices when device prefix exceeds decode_prefix_len.
+
+        Called when all required tokens are already on device (new_indices is empty)
+        but rematch.device_indices is longer than pm.decode_prefix_len. The
+        restored_node returned by init_load_back may correspond to a deeper prefix
+        than needed. This function walks up the tree to
+        find the ancestor matching exactly decode_prefix_len, updates
+        hicache_restored_kv_indices to the correct slice
+        [l1_prefix_len:decode_prefix_len], and re-locks the trimmed node.
+        """
+        pm = dr.prefix_match
+        self.tree_cache.dec_lock_ref(restored_node)
+        device_prefix_len = len(rematch.device_indices)
+        while restored_node.evicted:
+            device_prefix_len -= len(restored_node.value)
+            restored_node = restored_node.parent
+            assert device_prefix_len >= pm.decode_prefix_len, (
+                "device prefix length fell below decode_prefix_len while trimming, "
+                "should not happen"
+            )
+            if device_prefix_len == pm.decode_prefix_len:
+                break
+        dr.hicache_restored_kv_indices = rematch.device_indices[
+            pm.l1_prefix_len : pm.decode_prefix_len
+        ]
+        dr.hicache_restored_node = restored_node
+        self.tree_cache.inc_lock_ref(restored_node)
+        dr.req.last_node = restored_node
+        
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:
         """Queue one L2->L1 load_back op for ``dr``; True iff a DMA was queued.
 
@@ -232,17 +263,36 @@ class DecodeHiCacheTransferMixin:
                 pm.l3_storage_hit_length,
             )
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            # First abort scenario: match_prefix_for_req reassigns req.last_node. If last_node matches 
+            # more tokens than pm.last_device_node, the excess matched portion is unlocked without 
+            # being locked first, ultimately causing a memory leak. Therefore, ensure it always equals pm.last_device_node.            
+            dr.req.last_node = pm.last_device_node
             return False
 
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
+        # Second abort scenario: If poll == KVPoll.Failed, similar to the first abort scenario, 
+        # req.last_node may not equal pm.last_device_node. Freeing req.last_node would result in a memory leak.        
+        self.tree_cache.dec_lock_ref(pm.last_device_node)
         dr.hicache_restored_node = restored_node
         self.tree_cache.inc_lock_ref(restored_node)
+        dr.req.last_node = restored_node
 
         if len(new_indices) == 0:
             # Whole prefix already on device; no DMA needed.
             dr.hicache_restore_status = HiCacheRestoreResult.READY
+            # When len(rematch.device_indices) >= pm.decode_prefix_len, len(new_indices) is always 0. 
+            # The above logic holds when len(rematch.device_indices) == pm.decode_prefix_len, 
+            # but requires special handling when len(rematch.device_indices) > pm.decode_prefix_len. 
+            # Otherwise, it causes a length mismatch between slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len) 
+            # and hicache_restored_kv_indices in _commit_hicac
+            if len(rematch.device_indices) > pm.decode_prefix_len:
+                self._trim_hicache_restored_node_to_decode_prefix(
+                    dr=dr,
+                    restored_node= restored_node,
+                    rematch=rematch,
+                )
             return False
         return True
 
@@ -302,8 +352,6 @@ class DecodeHiCacheTransferMixin:
         prefix_match = decode_req.prefix_match
         if prefix_match is None or not prefix_match.needs_local_restore:
             return
-
-        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
 
         self.tree_cache.req_to_token_pool.write(
             (
