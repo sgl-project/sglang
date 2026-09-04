@@ -1,11 +1,10 @@
 """CUDA KDA packed-decode kernel (batched decode fast path).
 
-Row-streaming port of the triton fused_recurrent_kda_packed_decode_kernel:
-the triton kernel keeps a [BV, K] fp32 state tile in one warp's registers and
-tops out at ~5 TB/s; this kernel streams the state one 512B row at a time and
-reaches the in-place read+write bandwidth of the part (~9.6 TB/s probe).
-Outputs match the triton kernel to ULPs (warp-shuffle reduction order), not
-bits. Unsupported inputs fall back to triton through a covered() check.
+Row-streaming port of the Triton fused-recurrent KDA decode kernel.  Semantic
+support and the measured device performance preference are intentionally kept
+separate: unsupported inputs and unvalidated devices use the Triton path.
+Outputs match the Triton kernel to ULPs (warp-shuffle reduction order), not
+bits.
 """
 
 from __future__ import annotations
@@ -25,9 +24,11 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _WARPS: int = 8
-# The row-streaming layout needs enough (batch x head) CTAs to fill the GPU;
-# below this the triton kernel's launch cost is already the floor.
+# The row-streaming kernel arrived with the SM10x Kimi-K3 kernel port.  Keep
+# that performance domain explicit: on SM90 the Triton V-tiled implementation
+# is faster (and has a better tail) across the measured decode buckets.
 _MIN_BATCH: int = 8
+_PREFERRED_CC_MAJORS = frozenset({10})
 
 
 @cache_once
@@ -42,7 +43,7 @@ def _jit_kda_packed_decode_module() -> Module:
     )
 
 
-def covered(
+def supported(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
@@ -53,12 +54,11 @@ def covered(
     ssm_state_indices: torch.Tensor,
     num_q_heads: int,
 ) -> bool:
-    B = mixed_qkv.shape[0]
     HV, V, K = initial_state.shape[-3:]
     return (
-        B >= _MIN_BATCH
-        and K == 128
+        K == 128
         and V == 128
+        and num_q_heads > 0
         and HV % max(num_q_heads, 1) == 0
         # Per-K gate layout. A per-head scalar gate ([B, HV] / [HV], the GDN
         # shape) is a different kernel, not a slower input for this one.
@@ -84,6 +84,51 @@ def covered(
     )
 
 
+def _prefer_native_for_capability(
+    batch_size: int, compute_capability: tuple[int, int]
+) -> bool:
+    """Return the measured performance policy independently of support.
+
+    Unknown architectures deliberately keep the robust Triton path.  New
+    native fast-path entries should only be added after a same-device,
+    same-boundary benchmark shows a win across the intended batch buckets.
+    """
+    return batch_size >= _MIN_BATCH and compute_capability[0] in _PREFERRED_CC_MAJORS
+
+
+def prefer_native(mixed_qkv: torch.Tensor) -> bool:
+    if mixed_qkv.device.type != "cuda":
+        return False
+    return _prefer_native_for_capability(
+        mixed_qkv.shape[0], torch.cuda.get_device_capability(mixed_qkv.device)
+    )
+
+
+def covered(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_q_heads: int,
+) -> bool:
+    """Compatibility wrapper for callers that need support and preference."""
+    return supported(
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        initial_state,
+        out,
+        ssm_state_indices,
+        num_q_heads,
+    ) and prefer_native(mixed_qkv)
+
+
 def kda_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -99,8 +144,8 @@ def kda_packed_decode(
 ) -> None:
     """In-place KDA decode step: updates `initial_state` rows selected by
     `ssm_state_indices` and writes attention output into `out` ([B, 1, HV, V]).
-    Caller must have checked covered(); q/k l2-norm is always applied
-    (matches the production dispatch)."""
+    Caller must have checked ``supported()`` and ``prefer_native()``; q/k
+    l2-norm is always applied (matches the production dispatch)."""
     B = mixed_qkv.shape[0]
     HV, V, _ = initial_state.shape[-3:]
     state = initial_state.view(-1, *initial_state.shape[-3:])
