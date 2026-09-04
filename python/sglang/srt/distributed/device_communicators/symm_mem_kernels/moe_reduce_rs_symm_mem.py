@@ -508,7 +508,7 @@ def moe_reduce_rs_symm_mem(
     n_chunks = ctx.N // MOE_RS_CHUNK_WIDTH
     assert n_chunks >= 1, (
         f"ctx.N={ctx.N} is not a positive multiple of {MOE_RS_CHUNK_WIDTH}; "
-        "eligibility is checked in maybe_fused_shared_add_rs"
+        "eligibility is checked in dsa_prefill_cp_fused_symm_mem_eligible"
     )
 
     N = ctx.N
@@ -567,9 +567,6 @@ def maybe_fused_shared_add_rs(
     routed_scaling_factor: float,
 ) -> Optional[torch.Tensor]:
     """Fused add-shared + reduce-scatter. Returns None to fall back.
-
-    Standalone wrapper around moe_reduce_rs_symm_mem that handles
-    communicator lookup, context creation, and output allocation.
     """
     from sglang.srt.distributed.device_communicators.torch_symm_mem import (
         TorchSymmMemCommunicator,
@@ -579,23 +576,13 @@ def maybe_fused_shared_add_rs(
     if comm is None:
         return None
 
-    if shared_output is None:
-        return None
     M, _, N = final_hidden_states.shape
-    if M == 0 or (M % tp_size) != 0:
-        return None
-    # Kernel has no tail masking; non-divisible N leaves stale tail columns.
-    if N % MOE_RS_CHUNK_WIDTH != 0:
-        return None
-
     ctx = comm.get_or_create_moe_rs_ctx(
         N=N,
         num_experts=n_shared_experts,
         topk=top_k,
         dtype=final_hidden_states.dtype,
     )
-    if ctx is None:
-        return None
 
     out = torch.empty(
         (M // tp_size, N),

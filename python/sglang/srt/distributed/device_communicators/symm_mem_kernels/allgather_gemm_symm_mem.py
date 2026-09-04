@@ -480,14 +480,9 @@ def allgather_gemm_op_symm_mem(
 
 def maybe_fused_ag_shared_experts(
     hidden_states: torch.Tensor,
-    weight_block_size: Optional[List[int]],
     gate_up_proj,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Fused AG + fp8-quant + gate_up gemm. Returns (None, None) to fall back.
-
-    Standalone wrapper around allgather_gemm_op_symm_mem that handles
-    communicator lookup, context creation, and output allocation.
-    weight_block_size comes from the MoE module (None = not block-wise FP8).
     """
     from sglang.srt.distributed.device_communicators.torch_symm_mem import (
         TorchSymmMemCommunicator,
@@ -496,18 +491,13 @@ def maybe_fused_ag_shared_experts(
     comm = TorchSymmMemCommunicator.get_active_comm()
     if comm is None:
         return None, None
-    # Block-wise FP8 has weight_scale_inv (2D); per-tensor has weight_scale
-    # (scalar), which this kernel cannot consume.
-    if weight_block_size is None:
-        return None, None
 
     w_fp8 = gate_up_proj.weight
+    # Block-wise FP8 keeps a 2D weight_scale_inv; the kernel consumes only that.
     w_scale = gate_up_proj.weight_scale_inv
 
     _, K = hidden_states.shape
     ctx = comm.get_or_create_ag_gemm_ctx(K=K)
-    if ctx is None:
-        return None, None
 
     block_size = [64, 128, 128]
     allgather_output, gate_up_full = allgather_gemm_op_symm_mem(

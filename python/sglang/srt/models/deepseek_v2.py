@@ -1532,7 +1532,6 @@ class DeepseekV2MoE(nn.Module):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             ag_out, gate_up_local = maybe_fused_ag_shared_experts(
                 hidden_states,
-                self.shared_experts_weight_block_size,
                 self.shared_experts.gate_up_proj,
             )
             if ag_out is not None:
