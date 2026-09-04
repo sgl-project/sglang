@@ -1097,7 +1097,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, FreeDeviceKVFullOnly):
             for indices in action.indices:
-                self.token_to_kv_pool_allocator.free_full(indices)
+                self.token_to_kv_pool_allocator.free_full_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             if self.linker is not None:
                 self.linker.offload_nodes(action.node_ids)
