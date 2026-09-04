@@ -68,6 +68,58 @@ class TestPositionalEmbeds(CustomTestCase):
         pe = PositionalEmbeds(embeds=torch.zeros(0, HIDDEN_DIM), positions=[])
         self.assertEqual(pe.embeds.shape[0], 0)
 
+    def test_validate_hidden_dim_accepts_match(self):
+        pe = PositionalEmbeds(embeds=[_vec(1), _vec(2)], positions=[0, 5])
+        pe.validate_hidden_dim(HIDDEN_DIM)  # does not raise
+
+    def test_validate_hidden_dim_rejects_mismatch(self):
+        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        with self.assertRaises(ValueError) as ctx:
+            pe.validate_hidden_dim(HIDDEN_DIM + 1)
+        msg = str(ctx.exception)
+        self.assertIn("hidden_dim", msg)
+        self.assertIn(str(HIDDEN_DIM), msg)
+        self.assertIn(str(HIDDEN_DIM + 1), msg)
+
+
+# ========================================================================
+# TokenizerManager._validate_positional_embed_overrides_hidden_dim
+# ========================================================================
+
+
+class TestValidatePositionalEmbedOverridesHiddenDim(CustomTestCase):
+    def _tm(self):
+        tm = MagicMock()
+        tm.model_config.hidden_size = HIDDEN_DIM
+        tm._validate_positional_embed_overrides_hidden_dim = (
+            TokenizerManager._validate_positional_embed_overrides_hidden_dim.__get__(
+                tm, TokenizerManager
+            )
+        )
+        return tm
+
+    def test_none_is_noop(self):
+        self._tm()._validate_positional_embed_overrides_hidden_dim(None)
+
+    def test_single_match(self):
+        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        self._tm()._validate_positional_embed_overrides_hidden_dim(pe)
+
+    def test_single_mismatch_raises(self):
+        pe = PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 3)], positions=[0])
+        with self.assertRaises(ValueError):
+            self._tm()._validate_positional_embed_overrides_hidden_dim(pe)
+
+    def test_list_skips_none_entries(self):
+        pe = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        self._tm()._validate_positional_embed_overrides_hidden_dim([None, pe, None])
+
+    def test_list_mismatch_raises(self):
+        good = PositionalEmbeds(embeds=[_vec(1)], positions=[0])
+        bad = PositionalEmbeds(embeds=[torch.zeros(HIDDEN_DIM + 3)], positions=[0])
+        with self.assertRaises(ValueError):
+            self._tm()._validate_positional_embed_overrides_hidden_dim([good, bad])
+
 
 # ========================================================================
 # convert_embeds_to_tensors
