@@ -7,39 +7,8 @@ The document addresses how to set up the [SGLang](https://github.com/sgl-project
 Specifically, SGLang is optimized for [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/242616/intel-arc-pro-b-series-graphics.html) and [
 Intel® Arc™ B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html).
 
-## Optimized Model List
-
-A list of LLMs have been optimized on Intel GPU, and more are on the way:
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "50%"}} />
-    <col style={{width: "50%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Name</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.2-3B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.1-8B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen2.5-1.5B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B)</td>
-    </tr>
-  </tbody>
-</table>
-
-**Note:** The model identifiers listed in the table above
-have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).
+A number of popular LLMs are optimized and run efficiently on XPU, including the most notable open-source models like Llama series, Qwen series, and Diffusion model series like FLUX and Z-Image.
+Please check the [SGLang Cookbook pages](https://docs.sglang.io/cookbook/intro) in which the support status and example commands can be found.
 
 ## Installation
 
@@ -108,7 +77,6 @@ Example command to launch SGLang serving:
 sglang serve                         \
     --model-path <MODEL_ID_OR_PATH>  \
     --trust-remote-code              \
-    --disable-overlap-schedule       \
     --device xpu                     \
     --host 0.0.0.0                   \
     --tp 2                           \   # using multi GPUs

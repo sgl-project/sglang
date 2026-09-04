@@ -65,7 +65,8 @@ export const Qwen35Deployment = () => {
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
-          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 }
+          { id: 'xeon',   label: 'XEON',   default: false,     disabled: isNvfp4 },
+          { id: 'arc_b',  label: 'BMG',    default: false,     disabled: isNvfp4 }
         ];
       }
     },
@@ -76,11 +77,12 @@ export const Qwen35Deployment = () => {
         const hasFp8 = FP8_MODELS.has(values.model);
         const hasFp4 = values.model === '397b';
         const isXeon = values.hardware === 'xeon';
+        const isArcB = values.hardware === 'arc_b';
         return [
-          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon },
-          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon, disabled: !hasFp8,
+          { id: 'bf16', label: 'BF16', default: !hasFp8 || isXeon || isArcB },
+          { id: 'fp8',  label: 'FP8',  default: hasFp8 && !isXeon && !isArcB, disabled: !hasFp8 || isArcB,
             disabledReason: 'No FP8 variant available for this model' },
-          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon,
+          { id: 'fp4',  label: 'FP4',  default: false,   disabled: !hasFp4 || isXeon || isArcB,
             disabledReason: isXeon ? 'FP4 is not supported on Xeon' : 'FP4 is only available for Qwen3.5-397B-A17B' }
         ];
       }
@@ -104,7 +106,7 @@ export const Qwen35Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding (MTP)',
-      condition: (values) => values.hardware !== 'xeon',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'arc_b',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -124,7 +126,7 @@ export const Qwen35Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon',
+      condition: (values) => MOE_MODELS.has(values.model) && values.hardware !== 'xeon' && values.hardware !== 'arc_b',
       getDynamicItems: (currentValues) => {
         const amdGpus = ['mi300x', 'mi325x', 'mi355x'];
         const isAmdGpu = amdGpus.includes(currentValues.hardware);
@@ -184,7 +186,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 }, fp8: { tp: 3 } },
+      arc_b:  { bf16: { tp: 4, mem: 0.8 } }
     },
     '27b': {
       h100:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -204,7 +207,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 } },
+      arc_b:  { bf16: { tp: 1, mem: 0.8 } }
     },
     '4b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -214,7 +218,8 @@ export const Qwen35Deployment = () => {
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
-      xeon:   { bf16: { tp: 3 } }
+      xeon:   { bf16: { tp: 3 } },
+      arc_b:  { bf16: { tp: 1, mem: 0.8 } }
     },
     '2b': {
       h100:   { bf16: { tp: 1, mem: 0.8 } },
@@ -286,7 +291,17 @@ export const Qwen35Deployment = () => {
   }, [values.hardware, values.model]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => {
+      if (prev.hardware === 'arc_b' && optionName === 'model' && !['35b', '9b', '4b'].includes(value)) {
+        return prev;
+      }
+
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b' && !['35b', '9b', '4b'].includes(next.model)) {
+        next.model = '35b';
+      }
+      return next;
+    });
   };
 
   // Multi-node flag template — mirrors DeepSeek-V4 cookbook's multiNodeFlags.
@@ -354,6 +369,8 @@ export const Qwen35Deployment = () => {
     let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu`;
     }
     if (tpValue > 1) {
       cmd += ` \\\n  --tp ${tpValue}`;
@@ -378,7 +395,7 @@ export const Qwen35Deployment = () => {
     // would emit a spurious --mamba-radix-cache-strategy extra_buffer. The UI
     // radio is hidden for dense models, so users can't manually correct it.
     // MoE keeps the old behavior — the UI radio is the recovery path there.
-    const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon'];
+    const mamba_v1_dev = ['mi300x', 'mi325x', 'mi355x', 'xeon', 'arc_b'];
     const actualMambaCache = mamba_v1_dev.includes(hardware)
       ? 'v1'
       : (speculative === 'enabled' ? 'v2' : (MOE_MODELS.has(model) ? mambaCache : 'v1'));
@@ -426,7 +443,7 @@ export const Qwen35Deployment = () => {
     // benchmark only enables this for TP>=8). AMD MI GPUs use the AITER allreduce
     // fusion flag instead, handled in the AMD backend block below.
     const amdGpu = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
-    if (quantization !== 'fp4' && hardware !== 'xeon' && !amdGpu) {
+    if (quantization !== 'fp4' && hardware !== 'xeon' && hardware !== 'arc_b' && !amdGpu) {
       cmd += ` \\\n  --enable-flashinfer-allreduce-fusion`;
     }
 
@@ -569,7 +586,11 @@ export const Qwen35Deployment = () => {
             <div style={itemsStyle}>
               {items.map(item => {
                 const isChecked = values[option.name] === item.id;
-                const isDisabled = !!item.disabled;
+                const isArcBModelLocked =
+                  values.hardware === 'arc_b' &&
+                  option.name === 'model' &&
+                  !['35b', '9b', '4b'].includes(item.id);
+                const isDisabled = !!item.disabled || isArcBModelLocked;
                 return (
                   <label
                     key={item.id}
