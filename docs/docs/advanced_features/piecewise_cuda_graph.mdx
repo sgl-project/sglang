@@ -10,23 +10,24 @@ Standard CUDA graphs capture the entire model forward pass as a single graph. Th
 
 Piecewise CUDA Graph (PCG) solves this by splitting the model's computation graph into pieces (roughly one per layer) at "split points" (e.g., MoE dispatch ops). Each piece is captured as a separate CUDA graph for a set of pre-defined token lengths. At runtime, the input is padded to the nearest captured size, and each piece is replayed. This eliminates kernel launch overhead for prefill/extend while still supporting dynamic shapes.
 
-Recently we **enabled PCG by default**, which means that the old `--enable-piecewise-cuda-graph` flag is deprecated. Use `--disable-piecewise-cuda-graph` to turn it off.
+On CUDA, the **default prefill CUDA graph backend is breakable** (BCG), not PCG. Enable PCG (the `tc_piecewise` backend) explicitly with `--cuda-graph-backend-prefill=tc_piecewise`. Legacy flags such as `--enable-piecewise-cuda-graph`, `--disable-piecewise-cuda-graph`, `--enforce-piecewise-cuda-graph`, and `--piecewise-cuda-graph-\*` are removed or deprecated aliases of the per-phase `--cuda-graph-\*` flags.
 
 ## Usage
 
-PCG is enabled by default for supported configurations. No extra flags needed:
-
-```bash
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Llama-3.1-8B-Instruct
-```
-
-### Disable PCG
+Enable PCG for prefill:
 
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --disable-piecewise-cuda-graph
+    --cuda-graph-backend-prefill=tc_piecewise
+```
+
+### Disable prefill CUDA graph
+
+```bash
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-backend-prefill=disabled
 ```
 
 ### Custom capture sizes
@@ -34,7 +35,8 @@ python3 -m sglang.launch_server \
 ```bash
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --piecewise-cuda-graph-max-tokens 2048
+    --cuda-graph-backend-prefill=tc_piecewise \
+    --cuda-graph-max-bs-prefill 2048
 ```
 
 ### Server Args
@@ -54,53 +56,55 @@ python3 -m sglang.launch_server \
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--disable-piecewise-cuda-graph</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>False</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Disable PCG for extend/prefill.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-prefill=tc_piecewise</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>CUDA default: <code>breakable</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Select the tc_piecewise (PCG) prefill backend. Explicitly setting the backend skips the auto-disable cascade.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--enforce-piecewise-cuda-graph</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>False</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Force-enable PCG, skipping all auto-disable conditions. For testing only.</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--piecewise-cuda-graph-max-tokens</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>None</code> (auto)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum token count to capture. Defaults to <code>chunked_prefill_size</code> (non-MLA) or <code>2048</code> (MLA).</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--piecewise-cuda-graph-tokens</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>None</code> (auto)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Explicit list of token lengths to capture. Auto-generated if not set.</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--piecewise-cuda-graph-compiler</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>"eager"</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Compiler backend for the captured subgraphs. Choices: <code>eager</code>, <code>inductor</code>.</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><del><code>--enable-piecewise-cuda-graph</code></del></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-prefill=disabled</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Deprecated.</strong> PCG is now enabled by default. Use <code>--enforce-piecewise-cuda-graph</code> to skip auto-disable conditions.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Disable the prefill-phase CUDA graph (including PCG).</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-max-bs-prefill</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>None</code> (auto)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum token count / batch size to capture for prefill. Replaces <code>--piecewise-cuda-graph-max-tokens</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-bs-prefill</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>None</code> (auto)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Explicit list of token lengths to capture for prefill. Replaces <code>--piecewise-cuda-graph-tokens</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-tc-compiler</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>None</code> (eager)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Compiler for the tc_piecewise backend. Choices: <code>eager</code>, <code>inductor</code>. Replaces <code>--piecewise-cuda-graph-compiler</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><del><code>--disable-piecewise-cuda-graph</code> / <code>--enforce-piecewise-cuda-graph</code> / <code>--piecewise-cuda-graph-\*</code></del></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Deprecated aliases</strong> of the <code>--cuda-graph-\*</code> flags above. Prefer the new names. <code>--enable-piecewise-cuda-graph</code> has been removed.</td>
     </tr>
   </tbody>
 </table>
 
 ## Bug Report
 
-PCG is enabled by default but is still in an experimental stage. Since PCG relies on `torch.compile` to trace the model's forward pass, most bugs are introduced by torch compile tracing failures (e.g., untraceable ops, dynamic control flow, or graph breaks). If you encounter any issues related to PCG, please disable it by adding `--disable-piecewise-cuda-graph` to your launch command and report the bug at [GitHub Issues](https://github.com/sgl-project/sglang/issues/new/choose). We greatly appreciate your help in improving this feature.
+PCG (`tc_piecewise`) is opt-in and still experimental. Since PCG relies on `torch.compile` to trace the model's forward pass, most bugs are introduced by torch compile tracing failures (e.g., untraceable ops, dynamic control flow, or graph breaks). If you encounter any issues related to PCG, switch back to the CUDA default with `--cuda-graph-backend-prefill=breakable`, or disable prefill CUDA graph with `--cuda-graph-backend-prefill=disabled`, and report the bug at [GitHub Issues](https://github.com/sgl-project/sglang/issues/new/choose). We greatly appreciate your help in improving this feature.
 
 ### For Users
 
 If you see an error message like the following during server startup, it is a PCG bug:
 
 ```
-Piecewise CUDA Graph is enabled by default as an experimental feature.
-To work around this error, add --disable-piecewise-cuda-graph to your launch command.
-Please report this issue at https://github.com/sgl-project/sglang/issues/new/choose
+Fail when using backend: tc_piecewise for prefill runner.
+Possible suggestions:
+1. change to breakable by --cuda-graph-backend-prefill=breakable
+2. disable the prefill CUDA graph by --cuda-graph-backend-prefill=disabled
+...
 ```
 
-To work around it, add `--disable-piecewise-cuda-graph` to your launch command. When filing a bug report, please include:
+To work around it, use `--cuda-graph-backend-prefill=breakable` or `--cuda-graph-backend-prefill=disabled`. When filing a bug report, please include:
 1. The full error traceback
 2. Model name and quantization method
 3. Launch command with all arguments
@@ -228,7 +232,7 @@ The default capture schedule is auto-generated with increasing granularity:
   </tbody>
 </table>
 
-For the auto-generated schedule, sizes are capped at `--piecewise-cuda-graph-max-tokens`. The default cap is `chunked_prefill_size` for non-MLA models and `2048` for MLA backend models. If `--max-total-tokens` is set, the cap is further limited to not exceed it. Additionally, Llama-2 models are auto-capped at 4096 tokens as a temporary workaround.
+For the auto-generated schedule, sizes are capped at `--cuda-graph-max-bs-prefill`. The default cap is `chunked_prefill_size` for non-MLA models and `2048` for MLA backend models. If `--max-total-tokens` is set, the cap is further limited to not exceed it. Additionally, Llama-2 models are auto-capped at 4096 tokens as a temporary workaround.
 
 ## Compatibility
 
@@ -247,7 +251,7 @@ PCG is auto-disabled in the following scenarios. We are actively working on expa
 - PD disaggregation
 - Expert distribution recorder / EPLB
 
-Use `--enforce-piecewise-cuda-graph` to skip all auto-disable checks (for testing/debugging only).
+Explicitly setting `--cuda-graph-backend-prefill=tc_piecewise` skips the auto-disable cascade (the old `--enforce-piecewise-cuda-graph` alias maps to the same backend).
 
 ## Code Reference
 
