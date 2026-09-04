@@ -5,7 +5,16 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 from huggingface_hub import snapshot_download
@@ -80,6 +89,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 
 if _is_cuda:
@@ -701,11 +711,68 @@ def spec_stage_span(name: str):
     return profile_range(name)
 
 
+def compact_accept_to_front(
+    x: torch.Tensor,
+    accept_index: torch.Tensor,
+    bs: int,
+    *,
+    num_draft_tokens: int,
+) -> torch.Tensor:
+    """Gather the accepted tree path to the front of each per-req block.
+
+    ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
+    ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
+    Padded entries clamp to node 0 but land past accept_lens (never read);
+    trailing unaccepted slots stay and are freed as overshoot.
+    """
+    nd = num_draft_tokens
+    s1 = accept_index.shape[1]  # spec_steps + 1
+    safe = accept_index.to(torch.int64).clamp(min=0).reshape(-1)
+    gathered = x[safe]
+    out = x.clone()
+    out.view(bs, nd, *x.shape[1:])[:, :s1] = gathered.view(bs, s1, *x.shape[1:])
+    return out
+
+
+def _compact_state_captures_to_front(
+    state_captures: Sequence[Optional[TopkCaptureOutput]],
+    accept_index: torch.Tensor,
+    bs: int,
+) -> None:
+    """Make the pending per-token state captures follow the KV they describe.
+
+    A capture tape is keyed by KV slot: ``TopkCaptureOutput.finalize`` scatters
+    row ``i`` into ``out_cache_loc[i]``, and a verify batch's
+    ``out_cache_loc[b * num_draft_tokens + k]`` is exactly the slot this move
+    writes request ``b``'s accepted position ``k`` into. Compacting the rows the
+    same way ``predict`` / ``hidden_states`` are compacted therefore lands each
+    accepted token's capture in the slot its KV moved to. Without it the
+    committed slots keep the capture of whichever tree node was originally
+    allocated there -- the front chain, not the accepted path.
+
+    Runs on the forward stream, before ``GenerationBatchResult.copy_to_cpu``
+    maps these tensors to the host, so it also covers the overlap scheduler.
+    """
+    for capture in state_captures:
+        if capture is None:
+            continue
+        capture.topk = compact_accept_to_front(
+            capture.topk,
+            accept_index,
+            bs,
+            # The capture spans the verify batch's [bs, num_draft_tokens] block
+            # layout, the same node indexing accept_index uses.
+            num_draft_tokens=capture.out_cache_loc.shape[0] // bs,
+        )
+
+
 def move_accept_tokens_to_target_kvcache(
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
     num_correct_drafts: torch.Tensor,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    *,
+    state_captures: Sequence[Optional[TopkCaptureOutput]],
 ):
     """
     Move accepted tokens (drafts + bonus) to the target KV cache.
@@ -715,6 +782,11 @@ def move_accept_tokens_to_target_kvcache(
         accept_index: The index of the accepted tokens (incl. bonus).
         num_correct_drafts: Per-req count of correct drafts (excludes bonus);
             seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+        state_captures: Pending per-token state captures (routed experts,
+            indexer topk) whose rows are keyed by the KV slots this move
+            rewrites. Keyword-only and required: a caller with none passes
+            ``()``, so a new verify path has to decide rather than silently
+            leave the tape behind.
     """
     bs = len(batch.seq_lens)
     device = batch.seq_lens.device
@@ -764,6 +836,7 @@ def move_accept_tokens_to_target_kvcache(
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc
     )
+    _compact_state_captures_to_front(state_captures, accept_index, bs)
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:

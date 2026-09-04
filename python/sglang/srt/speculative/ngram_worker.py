@@ -503,6 +503,10 @@ class NGRAMWorker(BaseSpecWorker):
                 accept_index,
                 num_correct_drafts_per_req,
                 self.token_to_kv_pool_allocator,
+                state_captures=(
+                    batch_result.routed_experts_output,
+                    batch_result.indexer_topk_output,
+                ),
             )
             if batch.return_logprob:
                 compute_spec_logprobs(
@@ -566,4 +570,9 @@ class NGRAMWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            # Relay the target forward's pending state-capture handles: under
+            # overlap scheduling nothing else finalizes them, so dropping them
+            # leaves the host cache at its zero-initialised contents.
+            routed_experts_output=batch_result.routed_experts_output,
+            indexer_topk_output=batch_result.indexer_topk_output,
         )
