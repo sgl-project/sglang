@@ -6,11 +6,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.moe.activation import (
     AllGatherActivationWrapper,
     NPUGeluAndMul,
     NPUSitu,
+    NPUSituMXFP8Quant,
     NPUSwiglu,
     NPUSwigluDeepEPKernel,
     NPUSwigluOAI,
@@ -20,6 +21,7 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
 )
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -33,15 +35,15 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
+    )
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-        AscendTPDispatchOutput,
-        AscendTPCombineInput,
     )
 
 from sglang.srt.layers.moe.utils import (
@@ -103,13 +105,25 @@ class AscendRunnerCore(MoeRunnerCore):
                 kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod)
             )
             if config.activation == "situ":
-                self.activation = NPUSitu(
-                    need_quant=is_quant_kernel,
-                    beta=(
-                        config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
-                    ),
-                    linear_beta=config.gemm1_clamp_limit,
-                )
+                beta = config.gemm1_alpha if config.gemm1_alpha is not None else 4.0
+                if (
+                    isinstance(kernel, NPUW4A8MXFP4MoEMethod)
+                    and envs.SGLANG_NPU_MOE_SITU_MXFP8_FUSED.get()
+                ):
+                    if config.gemm1_clamp_limit is None:
+                        raise ValueError(
+                            "fused SiTU MXFP8 quantization requires gemm1_clamp_limit"
+                        )
+                    self.activation = NPUSituMXFP8Quant(
+                        beta=beta,
+                        linear_beta=config.gemm1_clamp_limit,
+                    )
+                else:
+                    self.activation = NPUSitu(
+                        need_quant=is_quant_kernel,
+                        beta=beta,
+                        linear_beta=config.gemm1_clamp_limit,
+                    )
             else:
                 self.activation = NPUSwigluDeepEPKernel(
                     need_quant=is_quant_kernel,
@@ -195,7 +209,7 @@ class AscendRunnerCore(MoeRunnerCore):
             # Grouped-row activations require dispatch metadata.
             if isinstance(
                 self.activation,
-                (NPUSwigluDeepEPKernel, NPUSitu),
+                (NPUSwigluDeepEPKernel, NPUSitu, NPUSituMXFP8Quant),
             ):
                 hidden_states, pertoken_scale = self.activation._apply_activation(
                     hidden_states,
