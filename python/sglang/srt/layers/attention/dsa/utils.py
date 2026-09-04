@@ -9,10 +9,14 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     attn_cp_all_gather_into_tensor,
     is_allocation_symmetric,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    ContextParallelMetadata as LegacyZigzagCPMetadata,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -180,11 +184,12 @@ def cp_zigzag_full_plan_rows(
     forward_batch: "ForwardBatch", device: torch.device
 ) -> torch.Tensor | None:
     cp_meta = forward_batch.attn_cp_metadata
-    if cp_meta is None or getattr(cp_meta, "zigzag_index", None) is None:
+    if not isinstance(cp_meta, (ZigzagContextParallelMetadata, LegacyZigzagCPMetadata)):
         return None
     if (
-        forward_batch.extend_seq_lens_cpu is None
-        or getattr(cp_meta, "split_list", None) is None
+        cp_meta.zigzag_index is None
+        or cp_meta.split_list is None
+        or forward_batch.extend_seq_lens_cpu is None
     ):
         return None
 
