@@ -1777,7 +1777,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         if rope_double_precision and not current_platform.is_float64_supported():
             logger.warning(
-                f"Current platform does not support float64. Falling back to float32."
+                "Current platform does not support float64. Falling back to float32."
             )
             rope_double_precision = False
 
