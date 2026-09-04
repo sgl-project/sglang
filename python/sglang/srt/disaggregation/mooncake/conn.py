@@ -875,21 +875,27 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
-        cancel() is a no-op for a running future, so with deferred release on we
-        still drain the running ones before returning (no write may outlive this
-        call, which the drain-ack relies on). Off: original early-return."""
+        cancel() is a no-op for a running future, so drain every future before
+        returning or raising; no native transfer may outlive this call."""
         ret = 0
+        first_exception = None
         for future in concurrent.futures.as_completed(futures):
             try:
                 status = future.result()
             except concurrent.futures.CancelledError:
                 continue
+            except Exception as e:
+                if first_exception is None:
+                    first_exception = e
+                    for f in futures:
+                        f.cancel()
+                continue
             if status != 0 and ret == 0:
                 ret = status
                 for f in futures:
                     f.cancel()
-                if not self.enable_deferred_decode_kv_release:
-                    return ret
+        if first_exception is not None:
+            raise first_exception
         return ret
 
     def send_kvcache(
@@ -1688,6 +1694,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            chunk_outstanding = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1702,6 +1710,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # the predicate the abort ack relies on. The flag survives
                 # re-enqueue on defer.
                 self._count_transfer_chunk(kv_chunk)
+                chunk_outstanding = True
 
                 if (
                     kv_chunk.room not in self.request_status
@@ -1717,6 +1726,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._finish_counted_transfer_chunk(kv_chunk)
+                    chunk_outstanding = False
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -1993,9 +2003,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    chunk_outstanding = False
                     continue
 
                 self._finish_counted_transfer_chunk(kv_chunk)
+                chunk_outstanding = False
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -2025,10 +2037,74 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                room = kv_chunk.room if kv_chunk is not None else None
+                logger.exception(
+                    "Transfer worker failed for room=%s on bootstrap_port=%s; "
+                    "failing the request and continuing",
+                    room,
+                    self.bootstrap_port,
                 )
+                if room is None:
+                    continue
+
+                transfer_infos = list(self.transfer_infos.get(room, {}).values())
+                try:
+                    try:
+                        self.record_failure(
+                            room,
+                            f"Prefill transfer worker raised an unexpected exception: {e}",
+                        )
+                        self.update_status(room, KVPoll.Failed)
+                    except Exception:
+                        logger.exception(
+                            "Failed to record transfer worker failure for room=%s", room
+                        )
+                    prefill_unique_rank = (
+                        self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+                        + self.pp_rank * self.attn_cp_size
+                        + self.attn_cp_rank
+                    )
+                    for failed_req in transfer_infos:
+                        if failed_req.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                failed_req.endpoint,
+                                failed_req.dst_port,
+                                failed_req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to notify decode of transfer failure for room=%s",
+                                room,
+                            )
+                finally:
+                    try:
+                        self.transfer_infos.pop(room, None)
+                        self.req_to_decode_prefix_len.pop(room, None)
+                        if self.enable_staging:
+                            for key in list(self._staging_ctx.prefetch_requested):
+                                if key[0] == room:
+                                    self._staging_ctx.prefetch_requested.discard(key)
+                            self._staging_ctx.prefetched_rooms.discard(room)
+                    except Exception:
+                        logger.exception(
+                            "Failed to clear transfer worker state for room=%s", room
+                        )
+                    finally:
+                        if chunk_outstanding:
+                            try:
+                                self._finish_counted_transfer_chunk(kv_chunk)
+                                chunk_outstanding = False
+                                if self.enable_deferred_decode_kv_release:
+                                    self._maybe_ack_drained_abort(room)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to reconcile transfer ownership for room=%s",
+                                    room,
+                                )
 
     def start_prefill_thread(self):
         def bootstrap_thread():

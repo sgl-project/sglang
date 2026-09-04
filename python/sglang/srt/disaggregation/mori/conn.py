@@ -507,9 +507,6 @@ class MoriKVManager(CommonKVManager):
             state_indices=kv_chunk.state_indices,
         )
 
-        if self._should_skip_transfer(room):
-            return
-
         failure_reason = self._wait_transfer_completion(statuses)
         if self._should_skip_transfer(room):
             return
