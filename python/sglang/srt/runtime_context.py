@@ -1347,7 +1347,13 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # The DP controller's static read set, checked against the module: the
     # elastic-EP gate, the load-balance method, the watchdog timeout, and the
     # disaggregation mode.
-    "dp_controller": frozenset({"exec", "parallel", "device", "disagg"}),
+    # `observability` and `serving` were added when the controller's metrics
+    # gate, tracing setup and worker-port broadcast stopped reading the record:
+    # under `enforce` the set is what the process may read, so a conversion
+    # that reaches a new namespace has to widen it in the same commit.
+    "dp_controller": frozenset(
+        {"exec", "parallel", "device", "disagg", "observability", "serving"}
+    ),
     # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
     # /v1/models): reads exactly {"serving"} — the per-instance managers read
     # self.server_args by design. Still declared full, because that run did not

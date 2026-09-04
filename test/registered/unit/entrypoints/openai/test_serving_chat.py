@@ -43,9 +43,11 @@ from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -196,6 +198,22 @@ class _MockTemplateManager:
 class ServingChatTestCase(unittest.TestCase):
     # ------------- common fixtures -------------
     def setUp(self):
+        # The serving layer reads its config from the bags, so the fixture has
+        # to publish one rather than hang the values off a mock manager.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                revision=None,
+                enable_cache_report=False,
+                tool_call_parser="hermes",
+                reasoning_parser=None,
+                stream_response_default_include_usage=False,
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
         self.tm = _MockTokenizerManager()
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
@@ -3643,14 +3661,14 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_continuous_usage_reports_cached_tokens(self):
         """continuous_usage_stats chunks include cached tokens when cache reporting is on."""
-        self.tm.server_args.enable_cache_report = True
+        self.enterContext(get_context().override_server_args(enable_cache_report=True))
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
-        self.tm.server_args.enable_cache_report = False
+        self.enterContext(get_context().override_server_args(enable_cache_report=False))
         usages = self._collect_continuous_usage(cached_tokens=6)
         self.assertTrue(usages, "continuous_usage_stats attached no usage")
         self.assertIsNone(usages[0].get("prompt_tokens_details"))
@@ -3666,7 +3684,9 @@ class ServingChatTestCase(unittest.TestCase):
         Regression test for https://github.com/sgl-project/sglang/issues/22510.
         """
         # Enable incremental_streaming_output on the mock
-        self.tm.server_args.incremental_streaming_output = True
+        self.enterContext(
+            get_context().override_server_args(incremental_streaming_output=True)
+        )
 
         # Simulate incremental streaming: each yield has ONLY the new text (delta),
         # NOT the full accumulated text.
@@ -4146,6 +4166,9 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
 
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         tm = _MockTokenizerManager()
         tm.server_args.tool_call_parser = "kimi_k2"
         self.chat = OpenAIServingChat(tm, _MockTemplateManager())
