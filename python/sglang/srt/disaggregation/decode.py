@@ -96,10 +96,18 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SCHEDULER_STAGE_GET_NEXT_BATCH,
+    SCHEDULER_STAGE_PROCESS_QUEUE,
+    scheduler_stage_method,
+)
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+)
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -2485,6 +2493,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
 
@@ -2528,6 +2537,7 @@ class SchedulerDisaggregationDecodeMixin:
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
 
@@ -2582,7 +2592,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
-    @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
+    @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
@@ -2690,6 +2700,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
