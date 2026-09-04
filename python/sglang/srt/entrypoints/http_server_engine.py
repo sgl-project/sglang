@@ -1,16 +1,14 @@
-import base64
 import multiprocessing
 import time
 from typing import List, Optional, Tuple
 
 import requests
-import safetensors.torch
 import torch
 
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -93,9 +91,7 @@ class HttpServerEngineAdapter(EngineBase):
             "update_weights_from_tensor",
             {
                 "serialized_named_tensors": [
-                    base64.b64encode(
-                        safetensors.torch.save(dict(named_tensors))
-                    ).decode()
+                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
                     for _ in range(self.server_args.tp_size)
                 ],
                 "load_format": load_format,
