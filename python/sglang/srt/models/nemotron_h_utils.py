@@ -62,6 +62,7 @@ def _build_layer_scatter_modes(is_sparse: bool = False) -> LayerScatterModes:
         mlp_mode=mlp_mode,
         middle_residual_mode=middle_residual_mode,
         layer_output_mode=ScatterMode.TP_ATTN_FULL,
+        is_layer_sparse=is_sparse,
     )
 
 

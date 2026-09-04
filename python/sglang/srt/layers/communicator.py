@@ -37,6 +37,11 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_shard_hidden_states,
+    is_cp_v2_active,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
@@ -390,6 +395,7 @@ class LayerScatterModes:
     mlp_mode: ScatterMode
     middle_residual_mode: ScatterMode
     layer_output_mode: ScatterMode
+    is_layer_sparse: bool = False
 
     @classmethod
     def init_new(cls, **kwargs):
@@ -400,6 +406,7 @@ class LayerScatterModes:
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
             layer_output_mode=cls._compute_layer_output_mode(context),
+            is_layer_sparse=context.is_layer_sparse,
         )
 
     @classmethod
@@ -471,6 +478,14 @@ def enable_dwdp():
     return get_parallel().dwdp_size > 1
 
 
+def _needs_cp_full_token_mlp(layer_scatter_modes, forward_batch):
+    return (
+        not getattr(layer_scatter_modes, "is_layer_sparse", False)
+        and layer_scatter_modes.mlp_mode == ScatterMode.FULL
+        and is_cp_v2_active(forward_batch)
+    )
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -517,6 +532,7 @@ class LayerCommunicator:
                     mlp_mode=ScatterMode.SCATTERED,
                     middle_residual_mode=ScatterMode.SCATTERED,
                     layer_output_mode=ScatterMode.SCATTERED,
+                    is_layer_sparse=layer_scatter_modes.is_layer_sparse,
                 ),
                 input_layernorm=input_layernorm,
                 post_attention_layernorm=post_attention_layernorm,
@@ -839,13 +855,18 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._communicate_with_all_reduce_and_layer_norm_fn(
+        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
         )
+        if _needs_cp_full_token_mlp(self.layer_scatter_modes, forward_batch):
+            # Full-TP linears reduce across ranks from different CP groups. Give
+            # every TP rank the same global token rows before entering the MLP.
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+        return hidden_states, residual
 
     def postprocess_layer(
         self,
@@ -857,13 +878,16 @@ class LayerCommunicator:
             return self._sp_variant.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-        return self._communicate_summable_tensor_pair_fn(
+        hidden_states, residual = self._communicate_summable_tensor_pair_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
+        if _needs_cp_full_token_mlp(self.layer_scatter_modes, forward_batch):
+            hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
+        return hidden_states, residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
@@ -891,6 +915,11 @@ class LayerCommunicator:
         # Without scatter, hidden_states remain at MOE_FULL size while residual is at
         # TP_ATTN_FULL size, causing a shape mismatch.
         if is_enable_moe_cp_allgather():
+            return False
+
+        # This fusion skips postprocess_layer, which must restore CP-local token
+        # rows after a full-TP MLP.
+        if _needs_cp_full_token_mlp(self.layer_scatter_modes, forward_batch):
             return False
 
         # Fusing makes the next layer's residual+LN absorb the post-experts
