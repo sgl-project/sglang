@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
 
@@ -430,9 +430,33 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    # HIP FP4 uses split scale storage and precomputed BF16 RoPE tables.
+    kvcache_scale: Optional[torch.Tensor] = None,
+    rope_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    fp4_k_write_metadata=None,
 ) -> None:
     if use_fp4:
         assert kv.shape[-1] == 128
+    if is_hip() and use_fp4:
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            aiter_k_indexer_fp4_cache_write,
+        )
+
+        cos, sin = cast(tuple[torch.Tensor, torch.Tensor], rope_cache)
+        aiter_k_indexer_fp4_cache_write(
+            k=kv,
+            norm_weight=norm_weight,
+            norm_epsilon=norm_eps,
+            cos=cos,
+            sin=sin,
+            plan=plan,
+            out_loc=out_loc,
+            k_payload=kvcache,
+            k_scale=cast(torch.Tensor, kvcache_scale),
+            write_metadata=fp4_k_write_metadata,
+        )
+        return
+
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
         compress_norm_rope_store_xpu(

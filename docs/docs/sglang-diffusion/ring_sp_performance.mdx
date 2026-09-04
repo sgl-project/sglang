@@ -303,8 +303,9 @@ See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 
 <Warning>
 Cross-node ring support is model-specific, not a property of the launch
-flags alone — see [Supported Models and Optimization Compatibility](/docs/sglang-diffusion/compatibility_matrix)
-for which models have it. Passing `--ring-degree > 1` for a model that only
+flags alone. Confirm support in the model cookbook and see
+[Parallelism](/docs/sglang-diffusion/parallelism) for topology requirements.
+Passing `--ring-degree > 1` for a model that only
 has single-node Ulysses may either raise or, in some cases, silently
 compute incorrect output; check the model's cookbook page before assuming
 cross-node scaling is supported.
