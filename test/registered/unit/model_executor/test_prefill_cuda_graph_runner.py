@@ -100,6 +100,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         # out of the bags.
         override = get_context().override_server_args(
             enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
             ),
@@ -119,6 +121,13 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             model_config=SimpleNamespace(context_len=8192, num_hidden_layers=1),
             layer_info=SimpleNamespace(start_layer=0, end_layer=1),
             req_to_token_pool=SimpleNamespace(size=1),
+            get_cuda_graph_layers=lambda _layer_model: (
+                [object()],
+                [],
+                [],
+                [],
+                [None],
+            ),
         )
         language_model = SimpleNamespace(layers=[object()])
 
@@ -126,11 +135,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
             patch.object(
                 graph_setup, "resolve_language_model", return_value=language_model
-            ),
-            patch.object(
-                graph_setup,
-                "compute_attention_and_moe_layers",
-                return_value=([object()], [], [], [], [None]),
             ),
             patch.object(
                 graph_setup,

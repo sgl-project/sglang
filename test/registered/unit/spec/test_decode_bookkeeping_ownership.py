@@ -45,6 +45,10 @@ _DFLASH_DECODE = (
     "speculative/dflash_info_v2.py",
     "DFlashDraftInputV2.prepare_for_decode",
 )
+_UNO_DECODE = (
+    "speculative/uno_info.py",
+    "UnoDraftInput.prepare_for_decode",
+)
 _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
@@ -71,6 +75,8 @@ _OWNER_SITES = {
     # one of these two owners for each speculative decode iteration.
     (*_DFLASH_DECODE, "decode_batch_idx"): 1,
     (*_DFLASH_DECODE, "evict"): 1,
+    (*_UNO_DECODE, "decode_batch_idx"): 1,
+    (*_UNO_DECODE, "evict"): 1,
     (
         "mem_cache/allocation.py",
         "alloc_for_spec_decode",
@@ -78,6 +84,13 @@ _OWNER_SITES = {
     ): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
+    # Mixed-chunk spec tails: the mixed prefill step commits the pending
+    # bonus token, advancing the watermark by exactly that one token.
+    (
+        "managers/scheduler_components/batch_result_processor.py",
+        "SchedulerBatchResultProcessor.process_batch_result_prefill",
+        "kv_committed_len",
+    ): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
