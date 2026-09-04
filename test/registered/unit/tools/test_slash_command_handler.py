@@ -96,45 +96,63 @@ class TestConfiguredTestGroups(CustomTestCase):
 
 
 class TestChangedTestFiles(CustomTestCase):
-    def test_only_live_test_files_under_test_roots_are_selected(self):
-        """`--changed` must skip deleted tests, helpers, and non-test source; a
-        predicate that degrades to always-true would dispatch undispatchable files."""
+    def test_only_dispatchable_changed_test_files_are_selected(self):
+        """`--changed` feeds the dispatcher directly, so every path it returns must
+        be runnable: no deleted tests, helpers, source, pure moves, `manual/`
+        files, or multimodal `test_*.py` that collect nothing."""
         handler = _load_handler()
+        mm = handler.MULTIMODAL_TEST_DIR
         pr = SimpleNamespace(
             get_files=lambda: [
-                SimpleNamespace(
-                    filename="test/registered/unit/mem_cache/test_radix_cache_unit.py",
-                    status="modified",
-                ),
-                SimpleNamespace(
-                    filename="python/sglang/multimodal_gen/test/server/test_server_a.py",
-                    status="added",
-                ),
-                SimpleNamespace(
-                    filename="test/registered/core/test_srt_endpoint.py",
-                    status="removed",
-                ),
-                SimpleNamespace(
-                    filename="test/registered/unit/mem_cache/helpers.py",
-                    status="modified",
-                ),
-                SimpleNamespace(
-                    filename="python/sglang/srt/mem_cache/radix_cache.py",
-                    status="modified",
-                ),
-                SimpleNamespace(
-                    filename="test/manual/test_not_registered.py",
-                    status="added",
-                ),
+                SimpleNamespace(filename=name, status=status, changes=changes)
+                for name, status, changes in [
+                    (
+                        "test/registered/unit/mem_cache/test_radix_cache_unit.py",
+                        "modified",
+                        4,
+                    ),
+                    ("test/registered/core/test_srt_endpoint.py", "removed", 12),
+                    ("test/registered/unit/mem_cache/helpers.py", "modified", 2),
+                    ("python/sglang/srt/mem_cache/radix_cache.py", "modified", 7),
+                    ("test/manual/test_not_registered.py", "added", 20),
+                    ("test/registered/spec/test_moved_untouched.py", "renamed", 0),
+                    ("test/registered/spec/test_moved_and_edited.py", "renamed", 9),
+                    (f"{mm}/server/test_server_common.py", "modified", 3),
+                    (f"{mm}/server/test_server_utils.py", "modified", 3),
+                    (f"{mm}/unit/manual/test_fp4_linear.py", "modified", 3),
+                    # Absent from the checkout, as a fork-added file is; kept so
+                    # resolve_test_file() reports `File not found` for it.
+                    (f"{mm}/server/test_server_added_by_fork.py", "added", 30),
+                ]
             ]
         )
-        self.assertEqual(
-            handler.changed_test_files(pr),
-            [
-                "python/sglang/multimodal_gen/test/server/test_server_a.py",
-                "test/registered/unit/mem_cache/test_radix_cache_unit.py",
-            ],
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / mm
+            (root / "server").mkdir(parents=True)
+            (root / "unit" / "manual").mkdir(parents=True)
+            (root / "server" / "test_server_common.py").write_text(
+                "def test_diffusion_generation():\n    pass\n"
+            )
+            (root / "server" / "test_server_utils.py").write_text(
+                "def build_server():\n    return None\n"
+            )
+            (root / "unit" / "manual" / "test_fp4_linear.py").write_text(
+                "class TestFp4Linear:\n    def test_it(self):\n        pass\n"
+            )
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                self.assertEqual(
+                    handler.changed_test_files(pr),
+                    [
+                        f"{mm}/server/test_server_added_by_fork.py",
+                        f"{mm}/server/test_server_common.py",
+                        "test/registered/spec/test_moved_and_edited.py",
+                        "test/registered/unit/mem_cache/test_radix_cache_unit.py",
+                    ],
+                )
+            finally:
+                os.chdir(previous_cwd)
 
 
 if __name__ == "__main__":

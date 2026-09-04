@@ -590,8 +590,8 @@ def expand_glob_spec(file_part):
     Globs are matched against the same locations resolve_test_file() searches
     — test/registered/ and the multimodal_gen test dir — so e.g.
     `test_*backend*.py` reruns every backend test without hand-enumerating
-    each file. Two constraints keep a broad pattern from pulling in non-tests:
-    a match must live under a known test root and be named `test_*.py`.
+    each file. `_is_rerunnable_test_path` keeps a broad pattern from pulling in
+    non-tests.
 
     glob's `*` matches path separators only via `**`, so a bare pattern is
     searched recursively under each root; a path-ful pattern is anchored.
@@ -646,24 +646,53 @@ def expand_glob_spec(file_part):
     return files, None
 
 
+def _collects_pytest_tests(path):
+    """Whether a test file defines anything pytest would collect."""
+    if not os.path.isfile(path):
+        # Fork-added file, absent from the handler's main checkout; leave it for
+        # resolve_test_file() to report as `File not found`.
+        return True
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    return (
+        re.search(r"^\s*((async )?def test_|class Test)", content, re.MULTILINE)
+        is not None
+    )
+
+
 def _is_rerunnable_test_path(path):
-    """A repo-relative `test_*.py` under one of the roots resolve_test_file() searches."""
+    """A repo-relative test file /rerun-test may select on its own (glob or --changed)."""
     under_test_root = path.startswith("test/registered/") or path.startswith(
         MULTIMODAL_TEST_DIR + "/"
     )
-    return (
-        under_test_root
-        and os.path.basename(path).startswith("test_")
-        and path.endswith(".py")
-    )
+    if (
+        not under_test_root
+        or not os.path.basename(path).startswith("test_")
+        or not path.endswith(".py")
+    ):
+        return False
+    if not path.startswith(MULTIMODAL_TEST_DIR + "/"):
+        # detect_suite() rejects an unregistered file, and a registered one may
+        # expose its cases through load_tests() rather than `def test_`.
+        return True
+    # Nothing downstream rejects a multimodal path, so a `test_*.py` helper that
+    # collects nothing reaches `pytest -x` and exits 5. manual/ is hand-run.
+    return "manual" not in path.split("/") and _collects_pytest_tests(path)
 
 
 def changed_test_files(pr):
-    """Rerunnable test files in the PR diff, as repo-relative paths (deleted files skipped)."""
+    """Rerunnable test files the PR adds or edits, as repo-relative paths.
+
+    A pure move reports `renamed` with no content change; dropping those keeps a
+    mass file move from expanding to every test it shifted, while a moved-and-
+    edited test still reruns.
+    """
     return sorted(
         f.filename
         for f in pr.get_files()
-        if f.status != "removed" and _is_rerunnable_test_path(f.filename)
+        if f.status != "removed"
+        and f.changes > 0
+        and _is_rerunnable_test_path(f.filename)
     )
 
 
@@ -1255,7 +1284,7 @@ def handle_rerun_test(
         if not changed and not test_specs:
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no test files "
+                f"⛔ `{CHANGED_TESTS_FLAG}`: this PR adds or modifies no runnable test files "
                 f"under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`."
             )
             return False
