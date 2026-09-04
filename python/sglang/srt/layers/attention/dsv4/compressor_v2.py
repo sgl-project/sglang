@@ -290,6 +290,25 @@ class CompressorBackendMixin:
                 (compressor.fp4_cos, compressor.fp4_sin) if use_hip_fp4 else None
             ),
         )
+        # Compressed K lands in unified_kv as bf16. When the aiter fp8 MLA decode
+        # is active, its fp8 mirror has to be kept in step with those rows, and
+        # the mirror must be written by the same 2-buffer packer prefill history
+        # already went through. Decode does not pack here: the backend folds the
+        # SWA and compressed rows into one pack from bf16 unified_kv.
+        if bf16_store and not compressor.is_in_indexer:
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                get_fp8 = getattr(token_to_kv_pool, "get_unified_kv_fp8", None)
+                fp8_buf = get_fp8(layer_id) if get_fp8 is not None else None
+                if fp8_buf is not None:
+                    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+                        pack_native_bf16_to_2buff,
+                    )
+
+                    rope_buf = token_to_kv_pool.get_unified_kv_rope(layer_id)
+                    loc = out_loc.long()
+                    buff, rope = pack_native_bf16_to_2buff(kv_cache[loc])
+                    fp8_buf[loc] = buff
+                    rope_buf[loc] = rope
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(

@@ -1335,6 +1335,17 @@ class DeepseekV4HipRadixBackend(
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
         unified = pool.get_unified_kv(layer_id)
+        # store-time fp8 mirror (aiter decode); None unless aiter mode is on
+        unified_fp8 = (
+            pool.get_unified_kv_fp8(layer_id)
+            if hasattr(pool, "get_unified_kv_fp8")
+            else None
+        )
+        unified_rope = (
+            pool.get_unified_kv_rope(layer_id)
+            if hasattr(pool, "get_unified_kv_rope")
+            else None
+        )
         win = pool.unified_swa_window
         ring_stride = pool.unified_swa_ring_size
         swa_pages = pool.unified_swa_pages
@@ -1362,7 +1373,10 @@ class DeepseekV4HipRadixBackend(
                 state_slot = core_attn_metadata.unified.verify_store_state_slot[:T]
             else:
                 state_slot = forward_batch.req_pool_indices[:T]
+            unified_metadata = core_attn_metadata.unified
             if save_kv_cache:
+                # bf16 SWA ring scatter (fp8 mirror is handled by the single
+                # merged pack below, so don't pass the fp8 buffers here).
                 runtime.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
@@ -1372,7 +1386,49 @@ class DeepseekV4HipRadixBackend(
                     ring_stride=ring_stride,
                     final_pos=positions,
                 )
-            unified_metadata = core_attn_metadata.unified
+
+            # Pack fp8 mirrors from bf16 unified_kv with the SGLang 2-buffer
+            # kernel decode is proven against. Always do this when the mirror
+            # exists: fused-store decode sets save_kv_cache=False (Triton
+            # already wrote the ring) and used to skip this pack, leaving
+            # decode to read stale/AITER-internal fp8. Shapes are static
+            # (T fixed per graph), so this stays cuda-graph safe.
+            if unified_fp8 is not None:
+                if compress_ratio == 128:
+                    comp_loc = getattr(unified_metadata, "c128_out_loc", None)
+                elif compress_ratio == 4:
+                    comp_loc = getattr(unified_metadata, "c4_out_loc", None)
+                else:
+                    comp_loc = None
+                if save_kv_cache:
+                    swa_src = kv
+                else:
+                    swa_loc = self.get_unified_swa_loc(forward_batch)[:T].long()
+                    swa_src = unified[swa_loc]
+                if comp_loc is not None:
+                    comp_loc = comp_loc[:T].long()
+                    rows = torch.cat([swa_src, unified[comp_loc]], dim=0)
+                else:
+                    rows = swa_src
+                from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.aiter_v4nm_decode import (
+                    pack_native_bf16_to_2buff,
+                )
+
+                buff, rope = pack_native_bf16_to_2buff(rows)
+                runtime.swa_scatter_fp8_mirror(
+                    buff=buff[:T],
+                    rope=rope[:T],
+                    state_slot=state_slot,
+                    positions=positions,
+                    unified_kv_fp8=unified_fp8,
+                    unified_kv_rope=unified_rope,
+                    win=win,
+                    ring_stride=ring_stride,
+                    final_pos=positions,
+                )
+                if comp_loc is not None:
+                    unified_fp8[comp_loc] = buff[T:]
+                    unified_rope[comp_loc] = rope[T:]
             if compress_ratio == 0:
                 kv_indices = unified_metadata.swa_indices
                 kv_indptr = unified_metadata.swa_indptr
@@ -1399,6 +1455,8 @@ class DeepseekV4HipRadixBackend(
                 kv_indptr=kv_indptr,
                 attn_sink=attn_sink,
                 softmax_scale=self.softmax_scale,
+                kv_fp8=unified_fp8,
+                kv_rope=unified_rope,
             )
 
         # prefill / extend
@@ -1497,6 +1555,8 @@ class DeepseekV4HipRadixBackend(
                 win=win,
                 ring_stride=ring_stride,
                 final_pos=_ring_final_pos,
+                unified_kv_fp8=unified_fp8,
+                unified_kv_rope=unified_rope,
             )
         return o
 

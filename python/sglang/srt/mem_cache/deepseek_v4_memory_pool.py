@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
@@ -497,8 +498,58 @@ class DeepSeekV4UnifiedKVPool:
                     )
         self.kv_buffer = bufs
 
+        # ---- store-time fp8 mirror (aiter mla_decode_fwd_v4_nm) ----------------
+        # When decode is routed through aiter's fp8 ASM MLA kernel we keep a
+        # per-layer fp8 mirror of every unified_kv row so decode reads
+        # fixed-shape fp8 (cuda-graph safe) instead of repacking on the fly.
+        #   kv_buffer_fp8[L]:  [rows, 512] fp8   (nope448 + 14 e8m0 scale + pad)
+        #   kv_buffer_rope[L]: [rows, 64]  bf16  (rope, byte-identical to
+        #                                         unified_kv[:, 448:512])
+        # Gated to aiter mode so the triton bf16 decode path pays no extra VRAM.
+        self._aiter_fp8_mirror = (
+            os.environ.get("SGLANG_USE_AITER_MLA_DECODE", "0") == "1"
+        )
+        self.kv_buffer_fp8 = None
+        self.kv_buffer_rope = None
+        if self._aiter_fp8_mirror and len(bufs) > 0:
+            from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+                quant_to_nope_fp8_rope_bf16_pack_triton,
+            )
+
+            probe = quant_to_nope_fp8_rope_bf16_pack_triton(
+                torch.zeros(1, self.head_dim, dtype=torch.bfloat16, device=device)
+            )
+            fp8_dtype = probe.k_nope_fp8.dtype
+            fp8_bufs, rope_bufs = [], []
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(custom_mem_pool)
+                    if custom_mem_pool
+                    else nullcontext()
+                ):
+                    for buf in bufs:
+                        rows = buf.shape[0]
+                        fp8_bufs.append(
+                            torch.zeros(rows, 512, dtype=fp8_dtype, device=device)
+                        )
+                        rope_bufs.append(
+                            torch.zeros(rows, 64, dtype=torch.bfloat16, device=device)
+                        )
+            self.kv_buffer_fp8 = fp8_bufs
+            self.kv_buffer_rope = rope_bufs
+
     def get_unified_kv(self, local_layer_id: int) -> torch.Tensor:
         return self.kv_buffer[local_layer_id]
+
+    def get_unified_kv_fp8(self, local_layer_id: int) -> Optional[torch.Tensor]:
+        if self.kv_buffer_fp8 is None:
+            return None
+        return self.kv_buffer_fp8[local_layer_id]
+
+    def get_unified_kv_rope(self, local_layer_id: int) -> Optional[torch.Tensor]:
+        if self.kv_buffer_rope is None:
+            return None
+        return self.kv_buffer_rope[local_layer_id]
 
     def get_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs = [b.data_ptr() for b in self.kv_buffer]
@@ -706,6 +757,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # layer's transfer before attention reads it. No-op when HiCache is off.
         self.wait_layer_transfer(layer_id)
         return self.unified_kv_pool.get_unified_kv(layer_id - self._stage_start)
+
+    def get_unified_kv_fp8(self, layer_id: int) -> Optional[torch.Tensor]:
+        return self.unified_kv_pool.get_unified_kv_fp8(layer_id - self._stage_start)
+
+    def get_unified_kv_rope(self, layer_id: int) -> Optional[torch.Tensor]:
+        return self.unified_kv_pool.get_unified_kv_rope(layer_id - self._stage_start)
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
