@@ -785,6 +785,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             )
             input_parallel = splitted_input[tp_rank].contiguous()
 
+        # K3 gates o_proj's input in a forward patch this path bypasses; apply it here
+        if hasattr(self.base_layer, "lora_input_transform"):
+            input_parallel = self.base_layer.lora_input_transform(input_parallel)
+
         bias_ = (
             None
             if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
@@ -1049,17 +1053,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
 
         if runner_backend.is_marlin():
-            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-                CompressedTensorsFusedMoEMethod,
-            )
-            from sglang.srt.layers.quantization.modelopt_quant import (
-                ModelOptNvFp4FusedMoEMethod,
-            )
-
-            assert isinstance(
-                base_layer.quant_method,
-                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
-            ), (
+            assert hasattr(base_layer.quant_method, "get_marlin_quant_info"), (
                 f"Marlin MoE backend requires a quant method exposing "
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )

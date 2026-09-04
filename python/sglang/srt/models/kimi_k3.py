@@ -1712,7 +1712,8 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            self._bfa_f_b_w = self.f_b_proj.weight
+            # .data: a second Parameter registration hides f_b_proj.weight from named_parameters()
+            self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _prepare_fused_decode(self) -> None:
@@ -1985,9 +1986,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
-            _orig_o_proj_forward = self.o_proj.forward
+            o_proj = self.o_proj
+            _orig_o_proj_forward = o_proj.forward
 
-            def _gated_o_proj_forward(x, *args, **kwargs):
+            def _apply_output_gate(x):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
                 precomputed = self._gate_precomputed
@@ -2011,9 +2013,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
-                return _orig_o_proj_forward(x, *args, **kwargs)
+                return x
 
-            self.o_proj.forward = _gated_o_proj_forward
+            def _gated_o_proj_forward(x, *args, **kwargs):
+                return _orig_o_proj_forward(_apply_output_gate(x), *args, **kwargs)
+
+            # RowParallelLinearWithLoRA bypasses forward and applies this transform itself
+            o_proj.lora_input_transform = _apply_output_gate
+            o_proj.forward = _gated_o_proj_forward
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
@@ -3122,9 +3129,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
+            # under LoRA o_proj is a BaseLayerWithLoRA; params_dtype lives on the base layer
+            o_proj = layer.self_attn.o_proj
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.params_dtype,
+                dtype=getattr(o_proj, "base_layer", o_proj).params_dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")

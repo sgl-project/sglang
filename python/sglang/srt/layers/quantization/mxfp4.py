@@ -1315,6 +1315,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         return self.runner.run(dispatch_output, quant_info)
 
+    def get_marlin_quant_info(self, layer):
+        # consumed by FusedMoEWithLoRA's marlin branch
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            build_marlin_moe_quant_info,
+        )
+
+        assert self.use_marlin, "Marlin quant info requires the Marlin backend"
+        return build_marlin_moe_quant_info(layer)
+
     def _apply_marlin(self, layer, dispatch_output):
         """MXFP4 x BF16 MoE via the Marlin runner. The quant_info (incl. the
         dispatcher's EP mapping) is shared with
