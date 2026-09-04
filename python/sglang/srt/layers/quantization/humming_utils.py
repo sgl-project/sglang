@@ -6,7 +6,6 @@ from humming.layer import HummingInputSchema, HummingMethod
 from humming.schema import BaseWeightSchema
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_exec
@@ -79,46 +78,6 @@ def make_humming_deepep_input_schema(
             "to be divisible by 128."
         )
     return HummingInputSchema(a_dtype="float8e4m3", input_scale_group_size=128)
-
-
-def prepare_humming_layer(layer: LinearBase, quant_config: dict):
-    weight_schema = BaseWeightSchema.from_config(quant_config)
-    input_schema = HummingInputSchema()
-
-    shape_k_stacks = [layer.input_size_per_partition]
-    shape_n_stacks = layer.output_partition_sizes
-
-    # Step 1: convert weight to humming standard format
-    weight_schema, tensors = weight_schema.convert_humming(
-        tensors=layer.named_parameters(),
-        shape_n_stacks=shape_n_stacks,
-        shape_k_stacks=shape_k_stacks,
-        param_dtype=layer.params_dtype,
-    )
-
-    layer.weight_schema = weight_schema
-
-    for name, _ in list(layer.named_parameters()):
-        delattr(layer, name)
-
-    for name, tensor in tensors.items():
-        param = torch.nn.Parameter(tensor, requires_grad=False)
-        setattr(layer, name, param)
-
-    # Step 2: transform weight (humming standard format) for forwarding
-    HummingMethod.prepare_layer_meta(
-        layer=layer,
-        shape_n=layer.output_partition_sizes_sum,
-        shape_k=layer.input_size_per_partition,
-        weight_schema=weight_schema,
-        input_schema=input_schema,
-        pad_n_to_multiple=256,
-        pad_k_to_multiple=128,
-        has_bias=layer.has_bias,
-        torch_dtype=layer.param_dtype,
-    )
-
-    HummingMethod.transform_humming_layer(layer)
 
 
 def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
