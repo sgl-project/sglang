@@ -1259,7 +1259,7 @@ class SchedulerDisaggregationPrefillMixin:
             def _dsa_tail_payload():
                 return get_dsa_tail_state_indices(
                     self.token_to_kv_pool_allocator.get_kvcache(),
-                    req.req_pool_idx,
+                    req.kv.req_pool_idx,
                     seq_len,
                 )
 
