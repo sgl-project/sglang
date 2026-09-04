@@ -74,26 +74,31 @@ elif is_cpu():
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """FlashInfer for the narrow SM90/SM100 GDN prefill domains we validated, else None."""
+    """FlashInfer for the narrow SM90/SM100/SM120 GDN prefill domains we validated, else None."""
     sm_major = torch.cuda.get_device_capability()[0] if is_cuda() else 0
     if (
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
         or get_exec().deterministic.enable_deterministic_inference
         or get_memory().enable_page_major_kv_layout
-        or sm_major not in (9, 10)
+        or sm_major not in (9, 10, 12)
     ):
         return None
 
-    # SM100 runs the CUDA>=13 CuTe-DSL chunk kernel on a bf16 state pool;
-    # SM90 runs the fused Hopper kernel on an fp32 state pool and tolerates
-    # larger chunks. Everything outside these validated domains keeps Triton.
+    # SM100 and SM120 share the state-pool prefill path (see gdn_flashinfer's
+    # use_state_pool) and are both validated only on CUDA>=13 with chunks up to
+    # 8192; they differ in the state dtype the kernel entry accepts. SM90 runs
+    # the fused Hopper kernel on an fp32 state pool and tolerates larger chunks.
+    # Everything outside these validated domains keeps Triton.
     cuda_version = torch.version.cuda
-    if sm_major == 10:
+    if sm_major in (10, 12):
         if cuda_version is None or int(cuda_version.split(".", 1)[0]) < 13:
             return None
         max_chunk = 8192
-        expected_state_dtype = torch.bfloat16
+        # SM100 feeds the pool dtype straight to the kernel, while the SM120
+        # chunked-prefill entry only accepts fp32 initial states (see
+        # gdn_flashinfer's _prefill_needs_fp32_state).
+        expected_state_dtype = torch.bfloat16 if sm_major == 10 else torch.float32
     else:
         max_chunk = 32768
         expected_state_dtype = torch.float32
