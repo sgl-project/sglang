@@ -1148,6 +1148,12 @@ class SchedulerDisaggregationPrefillMixin:
         if req.pending_bootstrap:
             return
 
+        requires_dcp_relayout = getattr(
+            req.disagg_kv_sender, "requires_dcp_relayout", None
+        )
+        if requires_dcp_relayout is not None and requires_dcp_relayout():
+            return
+
         # Device-resident prefix only; page-aligned so start_send_idx stays exact.
         cached_end = (
             req.early_send_prefix_end

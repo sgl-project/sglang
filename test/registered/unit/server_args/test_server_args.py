@@ -708,13 +708,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
-            disaggregation_transfer_backend="mori",
+            disaggregation_transfer_backend="ascend",
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+            ValueError, "mooncake, nixl, mori, or fake for synthetic benchmarking"
         ):
             handle_pd_disaggregation(server_args)
+
+    def test_pd_decode_dcp_allows_mori_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        self.assertTrue(resolution_result(server_args, "disable_radix_cache"))
 
     def test_pd_decode_dcp_allows_fake_transfer_backend(self):
         server_args = self._load_balance_args(
