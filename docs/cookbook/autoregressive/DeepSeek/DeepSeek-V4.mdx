@@ -307,7 +307,9 @@ fused shared expert slot.
 
 **FP4 Indexer (Experimental)**
 
-DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer on SM100 GPUs with DeepGEMM FP4 indexer support. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+DeepSeek-V4 uses the default indexer path unless `--enable-deepseek-v4-fp4-indexer` is set. Enable this flag to use the experimental FP4 C4 indexer. This path is intended for decode-heavy long-context workloads where reducing indexer cache bandwidth is beneficial.
+
+On **NVIDIA (SM100 / SM120)**, pair the flag with DeepGEMM FP4 indexer support and the FlashInfer MXFP4 MoE runner:
 
 ```bash Command
 # Please use the latest main branch for this feature.
@@ -316,6 +318,18 @@ sglang serve \
   --tp 4 \
   --moe-runner-backend flashinfer_mxfp4 \
   --enable-deepseek-v4-fp4-indexer
+```
+
+On **AMD MI355X (gfx95)**, the AITER FP4 indexer kernels are available on ROCm. Keep the standard MI355 recipe and add only the indexer flag. Do not need to pass `--moe-runner-backend flashinfer_mxfp4`:
+
+```bash Command
+# Please use the latest ROCm image for this feature.
+sglang serve \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --tp 8 \
+  --attention-backend dsv4 \
+  --enable-deepseek-v4-fp4-indexer \
+  <other args from the Deploy panel>
 ```
 
 **NVFP4 Hybrid Checkpoints**
@@ -377,9 +391,10 @@ HiCache and MegaMoE are **not** supported on RTX PRO 6000.
 
 - **Model checkpoints** — for correct accuracy, the FP4 model uses the stock `deepseek-ai/DeepSeek-V4-{Flash,Pro}`, and the FP8 model uses the repackaged `sgl-project/DeepSeek-V4-{Flash,Pro}-FP8`.
 - **Supported models** — **MI300X** supports DeepSeek-V4-Flash in FP8; **MI355X** supports DeepSeek-V4-Flash / Pro in both FP4 and FP8. All recipes run single-node.
-- **TP / DP setting** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP**, which additionally needs `--dp 8 --enable-dp-attention --enable-prefill-delayer --prefill-delayer-max-delay-ms 5000`.
+- **TP / DP setting (MI355X)** — both TP=4 and TP=8 are supported. At low concurrency we recommend **TP-only**; at high concurrency use **TP + DP** (balanced / high-throughput recipes). The verified MI355X DP recipes additionally set `--dp 8 --enable-dp-attention --enable-dp-attention-local-control-broadcast --enable-two-batch-overlap --tokenizer-worker-num 8 --stream-interval 20 --prefill-decode-interval 10`.
 - **MTP** — speculative decoding is supported; add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`.
 - **Kernels** — uses the Unified KV attention and the flydsl MoE.
+- **FP4 indexer (MI355X)** — FP4 C4 indexer is supported via `--enable-deepseek-v4-fp4-indexer` on top of the standard ROCm recipe.
 
 **MoRI EP (AMD expert parallelism)**
 
