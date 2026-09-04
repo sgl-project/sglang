@@ -1455,12 +1455,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif st == StateType.MINIMAX_INDEX_K:
-                # Equal-TP / PP=1 only. Sub-pools are compacted sparse-layer
-                # lists, so PP>1 mis-slices and heterogeneous TP is unsupported.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax sparse index yet."
-                    )
+                # Equal attention-TP only. Sparse sub-pools are compacted per
+                # pipeline stage, so pair their entries by global layer id.
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1486,6 +1482,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
