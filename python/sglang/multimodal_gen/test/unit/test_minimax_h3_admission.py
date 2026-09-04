@@ -207,31 +207,29 @@ def test_loaded_weight_partition_admits_only_its_declared_tasks(partition, tasks
 
 
 def test_synthetic_warmup_target_honors_warmup_flags():
-    # the generic builder rewrites req.num_frames (17 here); the flag wins
-    req = SimpleNamespace(num_frames=17, width=1344, height=768)
-    default = MiniMaxH3SamplingParams._synthetic_warmup_target(
-        req, SimpleNamespace(warmup_num_frames=None, warmup_resolutions=None)
-    )
-    assert default == {
-        "short_edge": 768,
-        "aspect_ratio": "16:9",
-        "duration_seconds": 5.0,
-    }
-    served = MiniMaxH3SamplingParams._synthetic_warmup_target(
-        req, SimpleNamespace(warmup_num_frames=345, warmup_resolutions=["1344x768"])
-    )
-    assert served["duration_seconds"] == 345 / 24.0
-    assert served["short_edge"] == 768 and served["aspect_ratio"] == "16:9"
-    portrait = MiniMaxH3SamplingParams._synthetic_warmup_target(
-        SimpleNamespace(num_frames=124, width=768, height=1344),
-        SimpleNamespace(warmup_num_frames=None, warmup_resolutions=["768x1344"]),
-    )
-    assert portrait["aspect_ratio"] == "9:16" and portrait["duration_seconds"] == 5.0
-    with pytest.raises(ValueError, match="aspect ratio"):
-        MiniMaxH3SamplingParams._synthetic_warmup_target(
-            SimpleNamespace(num_frames=124, width=2000, height=768),
-            SimpleNamespace(warmup_num_frames=None, warmup_resolutions=["2000x768"]),
+    def target(*, num_frames=None, resolution=None):
+        width, height = map(int, (resolution or "1344x768").split("x"))
+        # the generic builder rewrites req.num_frames (17 here); the flag wins
+        req = SimpleNamespace(num_frames=17, width=width, height=height)
+        server_args = SimpleNamespace(
+            warmup_num_frames=num_frames,
+            warmup_resolutions=None if resolution is None else [resolution],
         )
+        return MiniMaxH3SamplingParams._synthetic_warmup_target(req, server_args)
+
+    assert target() == TARGET
+    assert target(num_frames=345, resolution="1344x768") == {
+        **TARGET,
+        "duration_seconds": 345 / 24.0,
+    }
+    assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
+    # BCG seeds --warmup-resolutions with an area-capped default; the canvas
+    # keeps the released short edge.
+    assert target(resolution="832x464") == TARGET
+    with pytest.raises(ValueError, match="--warmup-num-frames 17 "):
+        target(num_frames=17)
+    with pytest.raises(ValueError, match="--warmup-resolutions 2000x768 "):
+        target(resolution="2000x768")
 
 
 def test_duration_admission_accepts_released_4_to_15_second_range():

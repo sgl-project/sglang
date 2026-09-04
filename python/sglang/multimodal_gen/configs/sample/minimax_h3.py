@@ -153,56 +153,59 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
     @staticmethod
     def _synthetic_warmup_target(req: Any, server_args: Any) -> dict[str, Any]:
-        """The canvas the synthetic warmup renders.
-
-        Default: the released 768p 16:9 5-second clip. ``--warmup-num-frames``
-        and ``--warmup-resolutions`` override the duration and the canvas so
-        warmup allocates and tunes for the shape that will be served: the first
-        request at a new clip length otherwise pays allocator growth and
-        first-call kernel setup in every DiT block (about 2-3 s per forward on
-        the 14 s paper workload).
-        """
+        """Warmup canvas: the released 5 s 768p 16:9 clip, or the served shape
+        when ``--warmup-num-frames`` / ``--warmup-resolutions`` declare it."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+            MINIMAX_H3_MAX_DURATION_SECONDS,
+            MINIMAX_H3_MIN_DURATION_SECONDS,
+            MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
+            MINIMAX_H3_SUPPORTED_FPS,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
             MINIMAX_H3_FINITE_ASPECT_RATIOS,
         )
 
         target: dict[str, Any] = {
-            "short_edge": 768,
+            "short_edge": MINIMAX_H3_RECOMMENDED_SHORT_EDGE,
             "aspect_ratio": "16:9",
             "duration_seconds": 5.0,
         }
-        warmup_num_frames = getattr(server_args, "warmup_num_frames", None)
-        if warmup_num_frames is not None:
-            # Read the flag itself: the generic builder re-derives req.num_frames
-            # from the VAE temporal geometry, which is not the H3 contract. H3
-            # delivers 24 fps and its resolver aligns the count to 17n+5.
-            num_frames = int(warmup_num_frames)
-            if num_frames <= 0:
-                raise ValueError("--warmup-num-frames must be positive for MiniMax H3")
-            target["duration_seconds"] = num_frames / 24.0
-        if getattr(server_args, "warmup_resolutions", None) is not None:
-            width, height = int(req.width), int(req.height)
-            if width <= 0 or height <= 0:
+        # Read the flag, not req.num_frames: the generic builder caps that at
+        # its video frame budget and H3 pins it to 1 until pre-queue admission.
+        num_frames = getattr(server_args, "warmup_num_frames", None)
+        if num_frames is not None:
+            duration = num_frames / MINIMAX_H3_SUPPORTED_FPS
+            if not (
+                MINIMAX_H3_MIN_DURATION_SECONDS
+                <= duration
+                <= MINIMAX_H3_MAX_DURATION_SECONDS
+            ):
                 raise ValueError(
-                    "--warmup-resolutions needs positive sizes for MiniMax H3"
+                    f"--warmup-num-frames {num_frames} is outside the MiniMax H3 "
+                    f"{MINIMAX_H3_MIN_DURATION_SECONDS:g}-"
+                    f"{MINIMAX_H3_MAX_DURATION_SECONDS:g} s range at "
+                    f"{MINIMAX_H3_SUPPORTED_FPS} fps"
                 )
-            # H3 canvases are named by their nominal ratio (1344x768 is the
-            # "16:9" 768p canvas), so snap to the nearest released ratio.
-            ratio = width / height
+            target["duration_seconds"] = duration
+        # Only the ratio comes from --warmup-resolutions. 768 is the one released
+        # short edge, and BCG seeds the flag with an area-capped default that
+        # must not shrink the canvas below it.
+        if getattr(server_args, "warmup_resolutions", None) is not None:
+            ratio = req.width / req.height
 
             def _value(name: str) -> float:
-                a, b = name.split(":")
-                return int(a) / int(b)
+                w, h = name.split(":")
+                return int(w) / int(h)
 
             aspect_ratio = min(
-                MINIMAX_H3_FINITE_ASPECT_RATIOS, key=lambda n: abs(_value(n) - ratio)
+                MINIMAX_H3_FINITE_ASPECT_RATIOS,
+                key=lambda name: abs(_value(name) - ratio),
             )
-            if abs(_value(aspect_ratio) - ratio) / ratio > 0.05:
+            if abs(_value(aspect_ratio) - ratio) > 0.05 * ratio:
                 raise ValueError(
-                    f"--warmup-resolutions {width}x{height} is not near any MiniMax H3 "
-                    f"aspect ratio {MINIMAX_H3_FINITE_ASPECT_RATIOS}"
+                    f"--warmup-resolutions {req.width}x{req.height} matches no "
+                    f"MiniMax H3 aspect ratio {MINIMAX_H3_FINITE_ASPECT_RATIOS}"
                 )
-            target["short_edge"] = min(width, height)
             target["aspect_ratio"] = aspect_ratio
         return target
 
