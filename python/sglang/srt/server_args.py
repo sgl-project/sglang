@@ -1311,7 +1311,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     api_key: A[
         Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
+        "Set API key of the server. It is also used in the OpenAI API compatible server. Accepts a comma-separated list to allow multiple keys; a request bearing any listed key (or the full raw string) is accepted.",
         NS("serving"),
     ] = None
     admin_api_key: A[
