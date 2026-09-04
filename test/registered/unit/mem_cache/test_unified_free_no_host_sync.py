@@ -407,9 +407,8 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
 
 
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):
-    """The composite skips the SWA parent's group hooks, so it must carry its
-    own full-side pile: a `free_full` inside a group defers and lands at
-    `free_group_end`."""
+    """`free_full` inside a free group must defer and land at `free_group_end`;
+    the composite carries that pile itself, not through the SWA parent's hooks."""
 
     def test_full_only_frees_defer_until_group_end(self):
         from test_unified_swa_shared_virtual_ids import _build

@@ -1077,8 +1077,7 @@ class TestFreeKvRow(CustomTestCase):
         allocator.free_swa(indices)
         after_alloc = allocator.full_available_size()
 
-        # Both rows [0, 4) and [4, 8) sit below the floor: full side only, and
-        # the paged allocator never has to rediscover the pages.
+        # Both rows [0, 4) and [4, 8) sit below the floor: full side only.
         with patch.object(
             allocator.full_attn_allocator,
             "free",

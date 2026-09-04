@@ -3669,9 +3669,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # token == page: free_full already frees by exact ids, no dedup.
             self.free_full(free_index)
             return
-        # The swa v2p IS the mapping: a tombstoned swa page drops out of the
-        # two-sided segment path by itself, so full-only is the same call, with
-        # the full side freed by page reps instead of free_full's token dedup.
+        # The swa v2p is the mapping, so a tombstoned swa page drops out of the
+        # two-sided segment path by itself; full-only is the same call.
         self.free_segment(free_index, start_pos=start_pos)
 
     def set_full_to_swa_mapping(
