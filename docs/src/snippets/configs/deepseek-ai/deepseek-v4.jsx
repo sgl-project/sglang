@@ -198,10 +198,14 @@ sgl-eval run mmmu_pro \\
     "flash-vision|fp4": "lmsysorg/sglang:dev-dsv4-flash-vision",
     // DGX Spark ONLY. A dedicated preview build for the 2x GB10 pair: it bakes
     // in the SM12x b12x MoE/attention kernels (sgl-project/sglang#34878,
-    // #35899, #34018) and CuTeDSL/NCCL pins the GB10 recipe needs, none of
-    // which are in `latest`. It is not built for, and must not be used on, any
-    // other hardware — every other row keeps its own image.
-    "dgx-spark|flash-official|fp4": "lmsysorg/sglang:dev-v4f-2dgx",
+    // #35899, #34018), the b12x dual-cache image-prefill fix that makes Flash
+    // Vision serve images on SM12x, the NVFP4 MTP-layer dispatch fix, and the
+    // CuTeDSL/NCCL pins the GB10 recipe needs — none of which are in `latest`.
+    // v2 = branch b12x-vision @ 452239a74f. It is not built for, and must not
+    // be used on, any other hardware — every other row keeps its own image.
+    "dgx-spark|flash-official|fp4":   "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-official|nvfp4": "lmsysorg/sglang:dev-v4f-2dgx-v2",
+    "dgx-spark|flash-vision|fp4":     "lmsysorg/sglang:dev-v4f-2dgx-v2",
     // NVFP4 checkpoints crash at weight load on v0.5.18 (the MXFP4-packed MTP
     // layer's FP8 delegate needs the #36275 guard, merged 2026-08-26) — route
     // every NVFP4 cell to the nightly until a release contains that fix.
@@ -3030,23 +3034,98 @@ sgl-eval run mmmu_pro \\
     },
 
     // ====================================================================
-    // DGX Spark (GB10 / SM121) — Flash Official FP4, 2-node TP=2, Balanced
+    // DGX Spark (GB10 / SM121) — 2-node TP=2, Balanced: Flash Official FP4,
+    // Flash Official NVFP4, Flash Vision FP4
     // ====================================================================
-    // One cell only: the verified GB10 recipe. It runs the SM12x b12x MoE
-    // (W4A8) + b12x compressed-MLA attention with DSpark, split TP=2 across two
-    // DGX Sparks over ConnectX-7 RoCE. Verified end to end on 2x DGX Spark with
-    // the `lmsysorg/sglang:dev-v4f-2dgx` image (GSM8K 96%, AgentX c1/c2 clean).
-    // Every other DGX Spark combination (other variants / quants / strategies /
-    // single node) is intentionally absent and greys out: a single 128GB GB10
-    // cannot hold the checkpoint, and the b12x kernels are text-only today
-    // (image prefill for Flash Vision is unsupported on SM12x).
+    // Three cells, all on the GB10 recipe: SM12x b12x compressed-MLA attention
+    // with DSpark, split TP=2 across two DGX Sparks over ConnectX-7 RoCE, image
+    // `lmsysorg/sglang:dev-v4f-2dgx-v2` (b12x-vision @ 452239a74f). Every other
+    // DGX Spark combination (other strategies / single node / Flash / Pro) is
+    // intentionally absent and greys out: a single 128GB GB10 cannot hold the
+    // checkpoints, and only Balanced has been run.
+    // - Flash Official FP4: b12x W4A8 MoE (verified on the v2 image: GSM8K
+    //   96.5%; earlier same-recipe runs: ~224 tok/s plateau, AgentX c1/c2 clean,
+    //   decode microbench at parity with the qualified stack).
+    // - Flash Official NVFP4: the NVFP4 routed experts need the flashinfer
+    //   cutlass runner (b12x's MoE is MXFP4-only; trtllm-gen is sm100-only); the
+    //   DSpark draft's MTP experts stay MXFP4 and run on b12x
+    //   (--speculative-moe-runner-backend b12x); HashTopK rejects fused shared
+    //   experts under the cutlass runner (--disable-shared-experts-fusion).
+    //   Verified on the v2 image: GSM8K 97.5%, DSpark accept 3.96, throughput
+    //   at parity with the FP4 cell.
+    // - Flash Vision FP4: same flags as Flash Official; images are served
+    //   natively on b12x (dual-cache prefill gate fix in the v2 image).
+    //   Verified on the v2 image with the cookbook Reproduce commands:
+    //   sgl-eval gsm8k 97.5% (200 q), sgl-eval mmmu_pro 85% / 0% errors
+    //   (20-q subset, --reasoning-effort max, temp 1.0, top-p 0.95).
     // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
     // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
     // expandable_segments avoids unified-memory fragmentation OOMs.
     {
       match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
       verified: true,
-      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend b12x",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "dgx-spark", variant: "flash-official", quant: "nvfp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
+      env: [
+        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
+        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
+        "SGLANG_OPT_FP8_WO_A_GEMM=1",
+        "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
+        "SGLANG_B12X_MAX_TOKENS=8192",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 2",
+        "--moe-runner-backend flashinfer_cutlass",
+        "--speculative-moe-runner-backend b12x",
+        "--disable-shared-experts-fusion",
+        "--speculative-algorithm DSPARK",
+        "--chunked-prefill-size 8192",
+        "--context-length 327680",
+        "--mem-fraction-static 0.80",
+        "--swa-full-tokens-ratio 0.2",
+        "--cuda-graph-max-bs-decode 32",
+        "--max-running-requests 32",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "dgx-spark", variant: "flash-vision", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
+      verified: true,
+      warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
       env: [
         "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
         "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
