@@ -357,7 +357,6 @@ pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 pub const DEFAULT_SESSION_ID_HEADER: &str = "x-session-id";
 
 /// Default external-indexer request limits.
-pub const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 25;
 pub const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = 32;
 
 /// Controls whether admission may select a session-affinity backup.
