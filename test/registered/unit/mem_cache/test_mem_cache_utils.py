@@ -189,7 +189,7 @@ class TestGetEvictionStrategy(unittest.TestCase):
 
 
 class TestMaybeInitCustomMemPool(unittest.TestCase):
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
+    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_CUSTOM_MEM_POOL.get")
     def test_disabled_by_default(self, mock_env_get):
         mock_env_get.return_value = None
         enabled, pool, pool_type = maybe_init_custom_mem_pool("cuda:0")
@@ -197,7 +197,7 @@ class TestMaybeInitCustomMemPool(unittest.TestCase):
         self.assertIsNone(pool)
         self.assertIsNone(pool_type)
 
-    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get")
+    @patch("sglang.srt.mem_cache.utils.envs.SGLANG_CUSTOM_MEM_POOL.get")
     def test_enabled_via_env(self, mock_env_get):
         mock_env_get.return_value = "enabled"
         mock_init = MagicMock()

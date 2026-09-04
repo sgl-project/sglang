@@ -96,7 +96,7 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool_type)
     """
-    custom_mem_pool_type = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+    custom_mem_pool_type = envs.SGLANG_CUSTOM_MEM_POOL.get()
 
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK

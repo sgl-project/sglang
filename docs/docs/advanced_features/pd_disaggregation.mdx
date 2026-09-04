@@ -143,17 +143,17 @@ PD Disaggregation with Mooncake supports the following environment variables for
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 
 ```bash Command
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export SGLANG_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
 
 To utilize Intra-Node NVLink for KV cache transfers with the Mooncake backend (recommended for A100, H20, H100, etc.), set the following environment variables. Please note that auxiliary data still needs to be transferred via TCP.
 
 ```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
+export SGLANG_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=true
 ```
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
+The `SGLANG_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. The former name `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` is still accepted with a deprecation warning.
 
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -431,6 +431,16 @@ python -m sglang.launch_server \
   --disaggregation-transfer-backend nixl \
   --port 30000
 ```
+
+#### NVLink (MNNVL) KV Transfer
+
+On multi-node NVLink systems (e.g. GB200/GB300 NVL72), set `SGLANG_CUSTOM_MEM_POOL=NVLINK` on both the prefill and decode servers. The KV cache is then allocated as fabric-exportable memory (`cuMemCreate` with `CU_MEM_HANDLE_TYPE_FABRIC`), and NIXL's UCX backend uses MNNVL for KV transfers automatically; no Mooncake-specific knobs such as `MC_FORCE_MNNVL` are needed.
+
+```bash
+export SGLANG_CUSTOM_MEM_POOL=NVLINK
+```
+
+The allocator is currently provided by the `mooncake-transfer-engine` package, which must be installed even when NIXL is the transfer backend.
 
 ## ASCEND
 
