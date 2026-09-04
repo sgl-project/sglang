@@ -78,9 +78,16 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    use_intel_amx_backend,
+)
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 logger = logging.getLogger(__name__)
@@ -470,8 +477,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        # CPU keeps the draft eager (like EAGLE); the target's own graphs are
+        # initialized elsewhere and unaffected.
         capture_decode_cuda_graph = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            not _is_cpu
+            and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = self._tp_sync.available_memory_gb(
@@ -1232,11 +1242,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        packed = use_intel_amx_backend(lm_head)
+
+        def _shard_logits(hs: torch.Tensor, start: int, end: int) -> torch.Tensor:
+            # CPU AMX prepacking blocks the weight rows, so the row range
+            # cannot be sliced before the GEMM; take it from the output.
+            if packed:
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hs,
+                    weight,
+                    None,  # bias
+                    True,  # is_vnni
+                )
+                return logits[:, start:end]
+            return torch.matmul(hs, weight[start:end].T)
+
         if not hasattr(lm_head, "shard_indices"):
             for start in range(0, num_tokens, int(chunk_size)):
                 end = min(num_tokens, start + int(chunk_size))
                 hs = _cast_hs(hidden_states[start:end])
-                logits = torch.matmul(hs, weight.T)
+                logits = _shard_logits(hs, 0, weight.shape[0])
                 out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
             return out_tokens
 
@@ -1291,7 +1316,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 end = min(num_tokens, start + fast_chunk_size)
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
-                    base_logits = torch.matmul(hs, weight[:num_org].T)
+                    base_logits = _shard_logits(hs, 0, num_org)
                     local_max, local_arg = _ensure_local_reduce_buffers(
                         end - start, base_logits.dtype, hs.device
                     )
@@ -1309,7 +1334,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_logits = _shard_logits(hs, 0, num_org)
                 local_max, local_arg = _ensure_local_reduce_buffers(
                     chunk_len, base_logits.dtype, hs.device
                 )
@@ -1329,9 +1354,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if num_added > 0:
                 added_slice_start = num_org_padded
                 added_slice_end = num_org_padded + num_added
-                added_logits = torch.matmul(
-                    hs, weight[added_slice_start:added_slice_end].T
-                )
+                added_logits = _shard_logits(hs, added_slice_start, added_slice_end)
                 added_max, added_arg = torch.max(added_logits, dim=-1)
                 use_added = added_max > local_max
                 local_max = torch.where(use_added, added_max, local_max)
@@ -1972,9 +1995,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        if not _is_cpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
 
         bs = len(batch.seq_lens)
         device = self.device

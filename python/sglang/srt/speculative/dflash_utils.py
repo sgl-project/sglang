@@ -20,7 +20,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_musa,
+    is_npu,
+    use_intel_amx_backend,
+)
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -36,6 +42,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
+        "IntelAMXAttnBackend",
     }
 )
 
@@ -736,6 +743,10 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
         )
     if not hasattr(qkv_proj, "weight"):
         return False, "qkv weight tensor is missing"
+    # CPU AMX prepacking rewrites the weight into the packed GEMM layout
+    # (amx_utils.convert_weight_packed), so row-slicing it computes garbage.
+    if use_intel_amx_backend(qkv_proj):
+        return False, "intel_amx prepacked qkv weight cannot be sliced"
     return True, ""
 
 

@@ -13,6 +13,7 @@ from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.utils import is_cpu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+_is_cpu = is_cpu()
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
@@ -36,13 +39,15 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags.
     """
+    fallback = (
+        "intel_amx" if _is_cpu else ("triton" if torch.version.hip else "flashinfer")
+    )
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return fallback
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
-        fallback = "triton" if torch.version.hip else "flashinfer"
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
