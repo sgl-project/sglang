@@ -50,6 +50,20 @@ class StreamState(str, Enum):
     IN_VALUE = "IN_VALUE"
 
 
+def _get_argument_schema(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> Optional[Dict[str, Any]]:
+    """Return an argument's JSON Schema definition, if available."""
+    name2tool = {tool.function.name: tool for tool in defined_tools}
+    tool = name2tool.get(func_name)
+    if not tool:
+        return None
+
+    params = getattr(tool.function, "parameters", None)
+    arg_spec = get_schema_properties(params).get(arg_key)
+    return arg_spec if isinstance(arg_spec, dict) else None
+
+
 def get_argument_type(
     func_name: str, arg_key: str, defined_tools: List[Tool]
 ) -> Optional[str]:
@@ -71,22 +85,40 @@ def get_argument_type(
     Returns:
         The type string (e.g., 'string', 'number', 'object') or None if not found
     """
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-
-    # Check if function exists
-    tool = name2tool.get(func_name)
-    if not tool:
-        return None
-
-    # Get parameters safely using getattr
-    params = getattr(tool.function, "parameters", None)
-
-    arg_spec = get_schema_properties(params).get(arg_key)
-    if isinstance(arg_spec, dict):
+    arg_spec = _get_argument_schema(func_name, arg_key, defined_tools)
+    if arg_spec is not None:
         # Use the new type inference function for complex JSON Schema support
         return infer_type_from_json_schema(arg_spec)
 
     return None
+
+
+def _argument_schema_allows_null(
+    func_name: str, arg_key: str, defined_tools: List[Tool]
+) -> bool:
+    """Return whether an argument's JSON Schema explicitly allows null."""
+    return _schema_allows_null(_get_argument_schema(func_name, arg_key, defined_tools))
+
+
+def _schema_allows_null(schema: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(schema, dict):
+        return False
+
+    argument_types = schema.get("type")
+    if argument_types == "null" or (
+        isinstance(argument_types, list) and "null" in argument_types
+    ):
+        return True
+
+    # pydantic/OpenAPI emit Optional[X] as anyOf/oneOf with a null branch
+    for keyword in ("anyOf", "oneOf"):
+        sub_schemas = schema.get(keyword)
+        if isinstance(sub_schemas, list) and any(
+            _schema_allows_null(sub) for sub in sub_schemas
+        ):
+            return True
+
+    return False
 
 
 def _convert_to_number(value: str) -> Any:
@@ -210,6 +242,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._cached_value_allows_null = False
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
 
@@ -325,16 +358,23 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Default to string (safest fallback)
         return "string"
 
-    def _format_value_complete(self, value: str, value_type: str) -> str:
+    def _format_value_complete(
+        self, value: str, value_type: str, allows_null: bool = False
+    ) -> str:
         """Format complete value based on type.
 
         Args:
             value: Raw value string
             value_type: Expected type ('string', 'number', 'object')
+            allows_null: Whether the argument schema permits JSON null. When
+                true, an unquoted ``null`` value must remain a JSON null token
+                instead of being formatted as the string ``"null"``.
 
         Returns:
             Properly formatted JSON value string
         """
+        if allows_null and value.strip() == "null":
+            return "null"
         if value_type == "string":
             # Ensure proper JSON string formatting with quotes
             return json.dumps(value, ensure_ascii=False)
@@ -401,6 +441,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._cached_value_type = self._get_value_type(
                         func_name, self._current_key, tools
                     )
+                    self._cached_value_allows_null = (
+                        self._cached_value_type == "string"
+                        and _argument_schema_allows_null(
+                            func_name, self._current_key, tools
+                        )
+                    )
 
             elif self._stream_state == StreamState.IN_VALUE:
                 if self._xml_tag_buffer.endswith("</arg_value>"):
@@ -410,7 +456,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                     # Use cached value type for consistency
                     value_type = self._cached_value_type or "string"
 
-                    if self._value_started:
+                    if self._cached_value_allows_null:
+                        json_output += self._format_value_complete(
+                            self._current_value,
+                            value_type,
+                            allows_null=True,
+                        )
+                    elif self._value_started:
                         # Output any remaining content
                         if final_value:
                             if value_type == "string":
@@ -433,6 +485,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     self._current_value = ""
                     self._value_started = False
                     self._cached_value_type = None  # Reset cached type
+                    self._cached_value_allows_null = False
                 else:
                     closing_tag = "</arg_value>"
                     is_potential_closing = len(self._xml_tag_buffer) <= len(
@@ -444,7 +497,13 @@ class Glm47MoeDetector(BaseFormatDetector):
                         # Use cached value type for consistency
                         value_type = self._cached_value_type or "string"
 
-                        if value_type == "string":
+                        # A nullable string cannot be quoted until the complete value
+                        # distinguishes the JSON null token from ordinary text.
+                        if self._cached_value_allows_null:
+                            if content:
+                                self._current_value += content
+                                self._xml_tag_buffer = ""
+                        elif value_type == "string":
                             if not self._value_started:
                                 json_output += '"'
                                 self._value_started = True
@@ -789,6 +848,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         for arg_key, arg_value in pairs:
             arg_key = arg_key.strip()
             arg_type = get_argument_type(func_name, arg_key, tools)
+            allows_null = _argument_schema_allows_null(func_name, arg_key, tools)
+            if allows_null and arg_value.strip() == "null":
+                arguments[arg_key] = None
+                continue
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
             if arg_type == "string":
@@ -798,6 +861,8 @@ class Glm47MoeDetector(BaseFormatDetector):
                 elif isinstance(parsed_value, (dict, list)):
                     # If parsed as dict/list but schema says string, convert to JSON string
                     arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
+                elif parsed_value is None:
+                    arguments[arg_key] = arg_value.strip()
                 else:
                     arguments[arg_key] = str(parsed_value)
             elif arg_type is None:
