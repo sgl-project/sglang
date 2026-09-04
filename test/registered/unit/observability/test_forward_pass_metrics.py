@@ -197,6 +197,27 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metrics.queued_requests.num_prefill_requests, 1)
         self.assertEqual(metrics.queued_requests.num_decode_requests, 1)
 
+    def test_emit_decode_batch_without_cpu_seq_lens(self):
+        """Decode metrics emit when a speculative backend omits CPU sequence lengths."""
+        decode_reqs = [_FakeReq(8, output_len=3), _FakeReq(13, output_len=5)]
+        batch = self._make_batch(reqs=decode_reqs, seq_lens_cpu=None)
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic",
+            return_value=101.0,
+        ):
+            self.reporter._emit_forward_pass_metrics(batch)
+
+        self.assertEqual(len(self.scheduler._fpm_publisher.metrics), 1)
+        metrics = self.scheduler._fpm_publisher.metrics[0]
+        self.assertEqual(metrics.scheduled_requests.num_prefill_requests, 0)
+        self.assertEqual(metrics.scheduled_requests.num_decode_requests, 2)
+        self.assertEqual(
+            metrics.scheduled_requests.sum_decode_kv_tokens,
+            sum(req.seqlen for req in decode_reqs),
+        )
+        self.assertAlmostEqual(metrics.scheduled_requests.var_decode_kv_tokens, 12.25)
+
     def test_emit_uses_device_timer_gpu_time(self):
         self.scheduler._fpm_uses_device_timer = True
         self.scheduler._fpm_gpu_time_acc = 0.042
