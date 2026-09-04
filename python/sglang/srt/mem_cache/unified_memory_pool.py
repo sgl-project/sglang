@@ -593,6 +593,9 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         )
         self.kernel_page_blocks = spec.blocks_per_page()
 
+    def _kv_tokens_per_row(self) -> int:
+        return 1
+
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
