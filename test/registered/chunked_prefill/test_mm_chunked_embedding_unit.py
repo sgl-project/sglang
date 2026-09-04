@@ -285,6 +285,65 @@ def test_full_mismatched_cache_entry_is_reencoded(caplog):
     assert "cached_tokens=1" in caplog.text
 
 
+def _encoder_window_item(item_hash, offset, *, cacheable=True):
+    return MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=item_hash,
+        feature=torch.zeros(1),
+        offsets=[offset],
+        use_embedding_cache=cacheable,
+        separate_encoder_batch=True,
+    )
+
+
+def _request(items, req_idx=0):
+    offsets = [item.offsets[0] for item in items]
+    return mm_schedule.PerImageRequestInfo(
+        req_idx=req_idx,
+        items=items,
+        items_offset=offsets,
+        extend_prefix_len=0,
+        extend_seq_len=max(end for _, end in offsets) + 1,
+    )
+
+
+def test_chunked_prefill_routes_encoder_windows_across_a_chunk_boundary():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    complete = _encoder_window_item(2500, (2, 5))
+    tail = _encoder_window_item(2501, (9, 14), cacheable=False)
+    items = [complete, tail]
+    encoder_calls = []
+
+    def encoder(batch):
+        encoder_calls.append([item.hash for item in batch])
+        return _encoder_tensor(batch)
+
+    expected = torch.cat(
+        [
+            _item_embedding(complete)[2:],
+            _item_embedding(tail)[:2],
+        ],
+        dim=0,
+    )
+    input_ids = torch.zeros(16, dtype=torch.long)
+    for _ in range(2):
+        embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            items_size=[0, len(items)],
+            prefix_length=[4],
+            extend_length=[7],
+            items_offset_list=[[item.offsets[0] for item in items]],
+            input_ids=input_ids,
+        )
+
+        torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+    assert encoder_calls == [[complete.hash, tail.hash], [tail.hash]]
+    assert mm_schedule.embedding_cache.has(complete.hash)
+    assert not mm_schedule.embedding_cache.has(tail.hash)
+
+
 if __name__ == "__main__":
     import sys
 
