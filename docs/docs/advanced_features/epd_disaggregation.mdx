@@ -168,7 +168,7 @@ prefill process so it uses the gRPC receiver.
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-8B-Instruct \
   --encoder-only \
-  --grpc-mode \
+  --smg-grpc-mode \
   --encoder-transfer-backend zmq_to_scheduler \
   --port 30000
 
