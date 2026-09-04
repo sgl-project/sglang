@@ -61,6 +61,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_triton_kernels_available,
+    is_xpu,
     next_power_of_2,
     round_up,
     set_weight_attrs,
@@ -98,7 +99,12 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    elif x.shape[-1] != hidden_size or _is_sm107_supported():
+    # FlashInfer handles SM107 inputs unless K3 reaches this fallback with an
+    # exact-width FP32 tensor, which its quantizer rejects. Use SGLang's compatible
+    # MXFP8/UE8M0 quantizer for that case; padded inputs still need alignment.
+    elif x.shape[-1] != hidden_size or (
+        _is_sm107_supported() and x.dtype != torch.float32
+    ):
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
@@ -151,6 +157,13 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
+def _aiter_situ_uses_gu_interleaved_weights() -> bool:
+    """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
+    a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
+    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
+    return a8w4 or not a4w4
+
+
 def _get_flashinfer_mxfp4_device_permute_indices(
     x: torch.Tensor,
     epilogue_tile_m: int,
@@ -193,6 +206,7 @@ if TYPE_CHECKING:
 
 _is_cpu = is_cpu()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -283,24 +297,7 @@ def dequant_mxfp4(
     return mx.dq_mxfp4(x, scale, float_dtype)
 
 
-@register_custom_op(out_shape="x")
-def quant_dequant_mxfp4(
-    x: torch.Tensor, scale_calculation_mode: str = "even"
-) -> torch.Tensor:
-    try:
-        from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP4 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from err
-
-    return mx.qdq_mxfp4(x, scale_calculation_mode)
-
-
 class Mxfp4Config(QuantizationConfig):
-
     def __init__(
         self,
         ignored_layers: Optional[list[str]] = None,
@@ -322,7 +319,6 @@ class Mxfp4Config(QuantizationConfig):
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
-
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
@@ -381,7 +377,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-
     def __init__(
         self,
         prefix: str,
@@ -526,6 +521,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
+            )
+        elif _is_xpu:
+            # The XPU grouped GEMM recovers K/N from the packed weight shapes and
+            # the group size from the scale shape, so it takes the checkpoint
+            # dims. Keep this ahead of the triton_kernels branch so an installed
+            # triton_kernels does not pad the XPU layout.
+            #
+            # Align to mxfp4_block anyway: gpt_oss.py shards the intermediate by
+            # whole mxfp4 blocks (ceil(blocks / tp) * 32), so a rank's slice can
+            # exceed intermediate_size / tp -- 736 vs 720 for gpt-oss-20b at
+            # tp=4, which overflows an unaligned buffer during load. round_up to
+            # 32 reproduces the loader's shard exactly, so no rows are wasted and
+            # the kernel still sees the true dims.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
             )
         elif has_triton_kernels:
             intermediate_size_per_partition_after_pad = round_up(
@@ -949,12 +959,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .view(-1, n)
                     )
 
-            k3_situ_a8w4 = (
-                os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-                and getattr(layer.moe_runner_config, "activation", None) == "situ"
-            )
-            use_aiter_gu_interleave = k3_situ_a8w4 or (
-                envs.SGLANG_USE_AITER_MOE_GU_ITLV.get() and gate_up_interleaved
+            # AITER selects the activation dtype at runtime. A8W4 takes precedence
+            # and, together with A16W4, uses the preshuffled GU-interleaved layout.
+            # A4W4 uses the generic separated layout instead; feeding it the
+            # A16/A8 layout makes real-checkpoint MoE outputs nearly orthogonal.
+            k3_situ = getattr(layer.moe_runner_config, "activation", None) == "situ"
+            use_aiter_gu_interleave = (
+                k3_situ and _aiter_situ_uses_gu_interleaved_weights()
+            ) or (
+                not k3_situ
+                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                and gate_up_interleaved
             )
             if use_aiter_gu_interleave:
                 layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
@@ -1007,7 +1022,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_kernels:
-
             from triton_kernels.matmul import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
@@ -1059,6 +1073,24 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_bias = Parameter(
                         layer.w2_weight_bias.float(), requires_grad=False
                     )
+            return
+        elif _is_xpu:
+            # sgl-kernel-xpu's W4A16 grouped GEMM consumes the checkpoint MXFP4
+            # layout: packed e2m1 [E, N, K/2] plus N-outer ue8m0 scales
+            # [E, N, K/32] uint8, with GPT-OSS's interleaved
+            # [gate_0, up_0, gate_1, up_1, ...] w13 row order (which is exactly
+            # what the swiglu epilogue expects). Scales and biases are already in
+            # the expected dtypes (uint8 / bf16 -- the launcher promotes bias to
+            # fp32 since the kernel accumulates it in fp32), so the only step is
+            # reinterpreting the packed nibbles as int8, matching the dtype the
+            # kernel keys the 4-bit path on. That is a free view, and crucially
+            # there is no bf16 upcast -- the whole point of MXFP4 on XPU.
+            layer.w13_weight = Parameter(
+                layer.w13_weight.data.view(torch.int8), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                layer.w2_weight.data.view(torch.int8), requires_grad=False
+            )
             return
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
@@ -1579,6 +1611,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
             return StandardCombineInput(hidden_states=output)
 
+        if _is_xpu:
+            # sgl-kernel-xpu path: moe_grouped_mm_nt_xe20_w4a16 consumes the
+            # packed MXFP4 weights directly, so no dequantization happens.
+            from sgl_kernel import fused_experts as sgl_fused_experts
+
+            assert TopKOutputChecker.format_is_standard(topk_output)
+            topk_weights, topk_ids, _ = topk_output
+            moe_runner_config = self.moe_runner_config
+            output = sgl_fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_mxfp4_w4a16=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=moe_runner_config.activation,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                # GPT-OSS clamped swiglu: gate*sigmoid(gate*alpha)*(up+1). Passing
+                # gemm1_alpha selects it, and gemm1_limit is required with it.
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         if self.use_marlin:
             assert TopKOutputChecker.format_is_standard(topk_output)
             return self._apply_marlin(layer, dispatch_output)
@@ -1623,13 +1684,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             is_standard = TopKOutputChecker.format_is_standard(topk_output)
             # The situ path accepts precomputed (standard) routing; the
             # public path below is logits-only.
-            assert is_standard or TopKOutputChecker.format_is_bypassed(
-                topk_output
-            ), f"unsupported topk format: {topk_output.format}"
+            assert is_standard or TopKOutputChecker.format_is_bypassed(topk_output), (
+                f"unsupported topk format: {topk_output.format}"
+            )
             if is_standard:
-                assert (
-                    self.moe_runner_config.activation == "situ"
-                ), "standard topk output only wired for the situ path"
+                assert self.moe_runner_config.activation == "situ", (
+                    "standard topk output only wired for the situ path"
+                )
                 top_k = topk_output.topk_ids.shape[1]
                 router_logits = None
             else:
@@ -1732,9 +1793,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                             expanded_idx_to_permuted_idx=expanded_idx,
                             top_k=packed_topk.shape[1],
                         )
-                    else:
-                        result = result[0]
-                    return StandardCombineInput(hidden_states=result)
+                        return StandardCombineInput(hidden_states=result)
+                    # The finalized kernel writes to its explicit output
+                    # argument. Do not propagate the FFI return tensor: some
+                    # SiTU runner versions return a distinct wrapper/allocation
+                    # even though symm_output contains the published result.
+                    # Returning the destination makes the pointer contract
+                    # explicit for K3's zero-copy latent buffer.
+                    return StandardCombineInput(hidden_states=symm_output)
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
@@ -1823,9 +1889,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 TritonKernelsQuantInfo,
             )
 
-            assert (
-                layer.moe_ep_size == 1
-            ), "Expert parallel is not supported when using triton kernels"
+            assert layer.moe_ep_size == 1, (
+                "Expert parallel is not supported when using triton kernels"
+            )
             quant_info = TritonKernelsQuantInfo(
                 w13_weight=(
                     self.w13_weight_triton_tensor

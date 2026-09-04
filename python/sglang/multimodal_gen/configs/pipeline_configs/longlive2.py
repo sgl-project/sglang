@@ -17,7 +17,6 @@ logger = init_logger(__name__)
 
 @dataclass
 class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
-
     is_causal: bool = True
     task_type: ModelTaskType = ModelTaskType.TI2V
     vae_precision: str = "bf16"
