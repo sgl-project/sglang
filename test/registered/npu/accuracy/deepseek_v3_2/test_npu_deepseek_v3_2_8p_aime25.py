@@ -32,7 +32,6 @@ OTHER_ARGS = [
 
 
 class TestNPUDeepSeek_V3_2_8P_AIME2025(TestNpuAccuracyTestCaseBase):
-
     model = DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH
     other_args = OTHER_ARGS
     accuracy = 0.936

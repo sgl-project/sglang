@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,6 +26,7 @@ class TestDraftRunnerSkipsLoRA(CustomTestCase):
         runner = ModelRunner.__new__(ModelRunner)
         runner.is_draft_worker = is_draft_worker
         runner.lora_manager = None
+        runner.spec_algorithm = SpeculativeAlgorithm.NONE
         with patch.object(ModelRunner, "init_lora_manager") as init_lora:
             with patch("sglang.srt.model_executor.model_runner.get_lora") as get_lora:
                 get_lora.return_value.enable_lora = enable_lora

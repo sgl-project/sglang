@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.multimodal_gen.configs.models.encoders.clip import CLIPVisionConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -109,8 +110,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
     def test_native_only_quantized_architecture_does_not_fall_back(self):
         self.server_args.pipeline_config.native_only_components = ("image_encoder",)
         config = self._component_config("UnknownVisionModel", quantized=True)
-        with self._config_patch(config), self.assertRaises(
-            NativeComponentLoaderRequired
+        with (
+            self._config_patch(config),
+            self.assertRaises(NativeComponentLoaderRequired),
         ):
             self._load()
         self.load_native.assert_not_called()
@@ -120,8 +122,9 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
             "architectures": ["UnknownVisionModel"],
             "quantization_config": {"quant_method": "not-a-format"},
         }
-        with self._config_patch(config), self.assertRaises(
-            ComponentCheckpointUnsupportedError
+        with (
+            self._config_patch(config),
+            self.assertRaises(ComponentCheckpointUnsupportedError),
         ):
             self._load()
         self.load_native.assert_not_called()
@@ -135,7 +138,7 @@ class TestImageEncoderQuantizationAdmission(unittest.TestCase):
 
 class TestImageEncoderNativeLoading(unittest.TestCase):
     def test_bnb4_uses_shared_transformers_path_and_image_precision(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["CLIPVisionModelWithProjection"],
             quantization_config={
@@ -158,18 +161,22 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
         ):
             component = loader.load_native(
                 "/model/image_encoder",
@@ -193,7 +200,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
 
     def test_explicit_offload_is_rejected_before_transformers_load(self):
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},
@@ -210,16 +217,20 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), self.assertRaisesRegex(
-            ComponentCheckpointUnsupportedError, "requires resident placement"
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "requires resident placement"
+            ),
         ):
             loader.load_native(
                 "/model/image_encoder",
@@ -236,7 +247,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             def to(self, *args, **kwargs):
                 raise AssertionError("quantized component must not be moved again")
 
-        component_config = SimpleNamespace(
+        component_config = PretrainedConfig(
             is_encoder_decoder=False,
             architectures=["ThirdPartyVisionModel"],
             quantization_config={"quant_method": "fp8"},
@@ -246,6 +257,7 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
             from_pretrained=mock.Mock(return_value=loaded_encoder)
         )
         server_args = SimpleNamespace(
+            component_weights_paths={},
             component_quantizations={},
             component_precisions={},
             pipeline_config=SimpleNamespace(
@@ -264,34 +276,42 @@ class TestImageEncoderNativeLoading(unittest.TestCase):
         )
         loader = ImageEncoderLoader()
 
-        with mock.patch.object(
-            loader,
-            "load_customized",
-            side_effect=NativeComponentLoaderRequired("use Transformers"),
-        ), mock.patch.object(
-            loader,
-            "resolve_native_transformers_model_class",
-            return_value=model_class,
-        ), mock.patch.object(
-            loader,
-            "target_device",
-            return_value=torch.device("cuda:0"),
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_hf_config",
-            return_value=component_config,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.current_platform.get_available_gpu_memory",
-            return_value=10.0,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.get_memory_usage_of_component",
-            return_value=0.0,
-        ), mock.patch(
-            "sglang.multimodal_gen.runtime.loader.component_loaders."
-            "component_loader.format_component_residency",
-            return_value="resident",
+        with (
+            mock.patch.object(
+                loader,
+                "load_customized",
+                side_effect=NativeComponentLoaderRequired("use Transformers"),
+            ),
+            mock.patch.object(
+                loader,
+                "resolve_native_transformers_model_class",
+                return_value=model_class,
+            ),
+            mock.patch.object(
+                loader,
+                "target_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_hf_config",
+                return_value=component_config,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.current_platform.get_available_gpu_memory",
+                return_value=10.0,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.get_memory_usage_of_component",
+                return_value=0.0,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders."
+                "component_loader.format_component_residency",
+                return_value="resident",
+            ),
         ):
             component, _ = loader.load(
                 "/model/image_encoder",

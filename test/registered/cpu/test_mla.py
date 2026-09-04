@@ -109,6 +109,8 @@ class TestMLA(CustomTestCase):
             q,
             k_buffer2,
             v_buffer2,
+            1.0,
+            1.0,
             o,
             key,
             value,

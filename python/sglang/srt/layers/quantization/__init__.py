@@ -3,20 +3,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
 from __future__ import annotations
 
-import builtins
-import inspect
-from typing import TYPE_CHECKING, Dict, Optional, Type
-
-import torch
-
-
-# Define empty classes as placeholders when vllm is not available
-class DummyConfig:
-    def override_quantization_method(self, *args, **kwargs):
-        return None
-
-
-CompressedTensorsConfig = DummyConfig
+from typing import Dict, Type
 
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import (
@@ -71,9 +58,6 @@ from sglang.srt.utils import (
 )
 
 _is_gfx95_supported = is_gfx95_supported()
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -184,6 +168,3 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             return config
 
     return QUANTIZATION_METHODS[quantization]
-
-
-original_isinstance = builtins.isinstance

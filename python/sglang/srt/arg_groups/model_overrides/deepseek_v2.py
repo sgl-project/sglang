@@ -59,12 +59,12 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
                 else:
-                    assert (
-                        cfg.dp_size == 1
-                    ), "interleave DSA CP does not support DP attention."
-                assert (
-                    cfg.tp_size <= 8
-                ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    assert cfg.dp_size == 1, (
+                        "interleave DSA CP does not support DP attention."
+                    )
+                assert cfg.tp_size <= 8, (
+                    "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # DSACPLayerCommunicator does not all-reduce attention-TP
                 # partial o_proj outputs before replicated dense FFNs.
