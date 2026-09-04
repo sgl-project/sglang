@@ -30,7 +30,6 @@ TORCH_DTYPES = [torch.float16]
 
 
 class TestXPUEncoderEmbeddingModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -91,9 +90,9 @@ class TestXPUEncoderEmbeddingModels(CustomTestCase):
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
 
             if len(truncated_prompts[i]) <= 1000:
-                assert torch.all(
-                    abs(similarity - 1) < prefill_tolerance
-                ), "embeddings are not all close"
+                assert torch.all(abs(similarity - 1) < prefill_tolerance), (
+                    "embeddings are not all close"
+                )
 
     def test_prefill_logits(self):
         models_to_test = MODELS
