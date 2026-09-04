@@ -1436,6 +1436,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             response = self.response_store.get(response_id)
             if response is None:
                 return self._make_not_found_error(response_id)
+            if response.background is not True:
+                return self.create_error_response(
+                    "Only responses created with background=true can be cancelled.",
+                    param="response_id",
+                )
 
             prev_status = response.status
             if prev_status not in ("queued", "in_progress"):
