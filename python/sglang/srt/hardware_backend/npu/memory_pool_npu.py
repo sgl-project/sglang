@@ -22,11 +22,18 @@ if is_npu():
     import torch_npu
 
 
-def _pd_prefill_conv_draft_tokens() -> Optional[int]:
-    """PD prefill has no DSPARK worker, so ``speculative_num_draft_tokens`` is
-    None. Infer Decode's verify width (gamma+1) the same way ``_handle_dspark``
-    does, without loading draft weights.
+def resolve_npu_state_layout_draft_tokens(
+    speculative_num_draft_tokens: Optional[int],
+) -> Optional[int]:
+    """Resolve the draft width that controls persistent NPU state layout.
+
+    PD prefill has no DSPARK worker, but its conv window and temporal layout
+    must match Decode. Infer Decode's verify width (gamma+1) from the shared
+    block-size knob without enabling DSPARK or allocating verify scratch.
     """
+    if speculative_num_draft_tokens is not None:
+        return speculative_num_draft_tokens
+
     from sglang.srt.runtime_context import (
         get_disagg,
         get_spec,
@@ -50,8 +57,6 @@ def _init_npu_conv_state(
     speculative_num_draft_tokens: Optional[int] = None,
     is_kda: bool = False,
 ):
-    if speculative_num_draft_tokens is None:
-        speculative_num_draft_tokens = _pd_prefill_conv_draft_tokens()
     extra_conv_len = 0
     if speculative_num_draft_tokens is not None:
         extra_conv_len = speculative_num_draft_tokens - 1

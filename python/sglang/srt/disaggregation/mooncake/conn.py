@@ -1534,8 +1534,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "Prefill/Decode mamba slot size mismatch "
                     f"(src item_len={src_item_len}, dst item_len={dst_item_len}). "
                     "NPU KDA + DSPARK needs the same conv window on both sides; "
-                    "on Prefill set --speculative-num-draft-tokens to Decode's "
-                    "gamma+1 without enabling DSPARK."
+                    "set the same --speculative-dspark-block-size on Prefill and "
+                    "Decode, without enabling DSPARK on Prefill."
                 )
             src_addr = src_state_data_ptrs[i] + src_item_len * int(
                 prefill_mamba_index[0]
