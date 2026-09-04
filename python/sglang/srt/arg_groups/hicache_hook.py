@@ -26,9 +26,24 @@ def handle_hicache(server_args: Any):
        above may have rewritten.
     """
     cfg = resolving_view(server_args)
-    # Step 0: L3 key-scheme validation. Runs before the early return so
-    # unified flags are never silently inert.
+    # Step 0: L3 key-scheme validation. A no-op for the default rank-suffix
+    # scheme, so it runs ahead of every early return below and a unified flag
+    # is never silently inert -- including under the external linker, which
+    # has no L3 of its own.
     resolve_hicache_key_scheme(server_args)
+
+    if cfg.enable_unified_cache_external_linker:
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-unified-cache-external-linker and "
+                "--enable-hierarchical-cache are mutually exclusive."
+            )
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not use "
+                "--hicache-storage-backend."
+            )
+        return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
