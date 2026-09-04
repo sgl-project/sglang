@@ -4,6 +4,8 @@
 import functools
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Mapping
 
 import torch
 
@@ -11,8 +13,6 @@ try:
     from vsa import video_sparse_attn
 except ImportError:
     video_sparse_attn = None
-
-from typing import Any
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -173,6 +173,125 @@ def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
     return max(1, min(cur_topk, num_kv_blocks))
 
 
+def _compressed_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the VSA compressed branch and return its direct top-k metadata."""
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    block_elements = math.prod(VSA_TILE_SIZE)
+    denominator = variable_block_sizes.view(1, 1, -1, 1)
+    compressed = [
+        (
+            tensor.view(
+                batch_size,
+                num_heads,
+                seq_len // block_elements,
+                block_elements,
+                head_dim,
+            )
+            .float()
+            .sum(dim=3)
+            / denominator
+        ).to(tensor.dtype)
+        for tensor in (query, key, value)
+    ]
+    query_compress, key_compress, value_compress = compressed
+    scores = torch.matmul(query_compress, key_compress.transpose(-2, -1))
+    scores /= math.sqrt(head_dim)
+    probabilities = torch.softmax(scores, dim=-1)
+    output = torch.matmul(probabilities, value_compress)
+    output = (
+        output.view(batch_size, num_heads, -1, 1, head_dim)
+        .repeat(1, 1, 1, block_elements, 1)
+        .view(batch_size, num_heads, seq_len, head_dim)
+    )
+    topk_indices = torch.topk(probabilities, topk, dim=-1).indices
+    return output, topk_indices
+
+
+def _plan_cake_vsa(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    from flashinfer.cake_vsa import plan_cake_vsa
+
+    return plan_cake_vsa(*args, **kwargs)
+
+
+def _run_cake_vsa(*args: Any, **kwargs: Any) -> Any:
+    from flashinfer.cake_vsa import run_cake_vsa
+
+    return run_cake_vsa(*args, **kwargs)
+
+
+def _cake_stream_key(device: torch.device) -> tuple[int, int]:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream = torch.cuda.current_stream(device)
+    return device_index, int(stream.cuda_stream)
+
+
+@dataclass(frozen=True)
+class _CakePlanSignature:
+    sequence: int
+    num_heads: int
+    head_dim: int
+    topk: int
+    dtype: torch.dtype
+    device: torch.device
+    dit_seq_shape: tuple[int, int, int]
+    sm_scale: float
+
+
+@dataclass(frozen=True)
+class _CakePlanTemplate:
+    signature: _CakePlanSignature
+    static_fields: Mapping[str, Any]
+
+
+def _validate_cake_q2k_indices(
+    q2k_indices: torch.Tensor,
+    signature: _CakePlanSignature,
+) -> None:
+    expected_shape = (
+        signature.num_heads,
+        signature.sequence // math.prod(VSA_TILE_SIZE),
+        signature.topk,
+    )
+    if (
+        q2k_indices.dtype != torch.int32
+        or q2k_indices.device != signature.device
+        or not q2k_indices.is_contiguous()
+        or tuple(q2k_indices.shape) != expected_shape
+    ):
+        raise ValueError(
+            "Cake q2k_indices must be contiguous int32 "
+            "[num_heads, num_query_blocks, topk] on the query device"
+        )
+
+
+def _validate_cake_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate_compress: torch.Tensor,
+) -> None:
+    if query.device.type != "cuda":
+        raise ValueError("Cake VSA requires CUDA inputs")
+    if torch.cuda.get_device_capability(query.device) not in ((10, 0), (10, 3)):
+        raise ValueError("Cake VSA requires SM100 or SM103")
+    if not (query.shape == key.shape == value.shape == gate_compress.shape):
+        raise ValueError("Cake VSA requires matching Q/K/V/gate shapes")
+    if query.shape[0] != 1:
+        raise ValueError("Cake VSA currently requires batch size 1")
+    if query.shape[-1] != 128:
+        raise ValueError("Cake VSA currently requires head size 128")
+    if not (query.dtype == key.dtype == value.dtype == torch.bfloat16):
+        raise ValueError("Cake VSA currently requires BF16 Q/K/V")
+
+
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self):
         pass
@@ -243,8 +362,145 @@ class VideoSparseAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
+        self.softmax_scale = softmax_scale
         sp_group = get_sp_group()
         self.sp_size = sp_group.world_size
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        config = get_global_server_args().attention_backend_config or {}
+        self.stage2_backend = str(config.get("stage2_backend", "vsa")).lower()
+        if self.stage2_backend not in ("vsa", "cake"):
+            raise ValueError(
+                "video sparse attention stage2_backend must be 'vsa' or 'cake', "
+                f"got {self.stage2_backend!r}"
+            )
+        raw_cake_steps = config.get("cake_step_indices")
+        if raw_cake_steps is None:
+            self.cake_step_indices: frozenset[int] | None = None
+        else:
+            if not isinstance(raw_cake_steps, (list, tuple)) or not raw_cake_steps:
+                raise ValueError(
+                    "cake_step_indices must be a non-empty list of denoising step "
+                    "indices"
+                )
+            self.cake_step_indices = frozenset(int(step) for step in raw_cake_steps)
+        self._cake_q2k_num: dict[tuple[int, ...], torch.Tensor] = {}
+        self._cake_plan_templates: dict[_CakePlanSignature, _CakePlanTemplate] = {}
+        self._cake_plan_workspaces: dict[
+            tuple[_CakePlanSignature, int, int], dict[str, Any]
+        ] = {}
+
+    def _forward_cake(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate_compress: torch.Tensor,
+        attn_metadata: VideoSparseAttentionMetadata,
+        cur_topk: int,
+    ) -> torch.Tensor:
+        _validate_cake_inputs(query, key, value, gate_compress)
+        query_hsd, key_hsd, value_hsd, gate_hsd = [
+            tensor.transpose(1, 2).contiguous()
+            for tensor in (query, key, value, gate_compress)
+        ]
+        output_compress, topk_indices = _compressed_attention(
+            query_hsd,
+            key_hsd,
+            value_hsd,
+            attn_metadata.variable_block_sizes,
+            cur_topk,
+        )
+
+        # Native VSA converts its boolean block map back to q2k metadata by
+        # scanning KV block ids in ascending order. Preserve that visitation
+        # order so Cake and native VSA accumulate the same selected blocks in
+        # the same order; score-ordered ``torch.topk`` metadata can otherwise
+        # amplify BF16 reduction-order drift over diffusion steps.
+        q2k_indices = topk_indices[0].sort(dim=-1).values.to(torch.int32).contiguous()
+        q2k_shape = tuple(q2k_indices.shape)
+        q2k_num = self._cake_q2k_num.get(q2k_shape)
+        if q2k_num is None or q2k_num.device != query.device:
+            q2k_num = torch.full(
+                q2k_shape[:2],
+                q2k_shape[2],
+                dtype=torch.int32,
+                device=query.device,
+            )
+            self._cake_q2k_num[q2k_shape] = q2k_num
+
+        sequence = query.shape[1]
+        num_heads = query.shape[2]
+        signature = _CakePlanSignature(
+            sequence=sequence,
+            num_heads=num_heads,
+            head_dim=self.head_size,
+            topk=q2k_shape[2],
+            dtype=query.dtype,
+            device=query.device,
+            dit_seq_shape=tuple(attn_metadata.dit_seq_shape),
+            sm_scale=float(self.softmax_scale),
+        )
+        # q2k is regenerated from torch.topk for every invocation. The public
+        # planner validates its values on the first invocation; later calls
+        # retain the host-checkable tensor contract without another GPU sync.
+        _validate_cake_q2k_indices(q2k_indices, signature)
+        template = self._cake_plan_templates.get(signature)
+        if template is None:
+            plan = _plan_cake_vsa(
+                indptr=None,
+                indices=None,
+                block_mask=None,
+                kv_block_lens=attn_metadata.variable_block_sizes,
+                q2k_indices=q2k_indices,
+                q2k_num=q2k_num,
+                M=sequence,
+                N=sequence,
+                R=math.prod(VSA_TILE_SIZE),
+                C=math.prod(VSA_TILE_SIZE),
+                num_qo_heads=num_heads,
+                num_kv_heads=num_heads,
+                head_dim=self.head_size,
+                q_data_type=query.dtype,
+                sm_scale=self.softmax_scale,
+                device=query.device,
+            )
+            static_fields = {
+                key: value
+                for key, value in plan.items()
+                if key not in ("q2k_indices", "workspace")
+            }
+            template = _CakePlanTemplate(
+                signature=signature,
+                static_fields=MappingProxyType(static_fields),
+            )
+            self._cake_plan_templates[signature] = template
+
+        device_index, stream_handle = _cake_stream_key(query.device)
+        workspace = self._cake_plan_workspaces.setdefault(
+            (signature, device_index, stream_handle), {}
+        )
+        # Never write the dynamic q2k pointer into the shared template. A
+        # call-local plan prevents cross-stream aliasing, while each stream's
+        # ordered launches can safely reuse its private scratch workspace.
+        call_plan = dict(template.static_fields)
+        call_plan["q2k_indices"] = q2k_indices
+        call_plan["workspace"] = workspace
+        output_select = _run_cake_vsa(
+            call_plan,
+            query[0],
+            key[0],
+            value[0],
+            out=None,
+            lse=None,
+            return_lse=False,
+            backend="cake",
+        )
+        output_select_hsd = output_select.transpose(0, 1).unsqueeze(0)
+        return (output_compress * gate_hsd + output_select_hsd).transpose(1, 2)
 
     def tile(
         self,
@@ -304,12 +560,24 @@ class VideoSparseAttentionImpl(AttentionImpl):
         gate_compress: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
+        cur_topk = _compute_cur_topk(attn_metadata)
+        if self.stage2_backend == "cake" and (
+            self.cake_step_indices is None
+            or attn_metadata.current_timestep in self.cake_step_indices
+        ):
+            return self._forward_cake(
+                query,
+                key,
+                value,
+                gate_compress,
+                attn_metadata,
+                cur_topk,
+            )
+
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
         gate_compress = gate_compress.transpose(1, 2).contiguous()
-
-        cur_topk = _compute_cur_topk(attn_metadata)
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")
