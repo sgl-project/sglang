@@ -821,8 +821,8 @@ class XPUAttentionBackend(AttentionBackend):
             return q_rows.new_zeros(
                 (q_rows.shape[0], q_rows.shape[1], value_cache.shape[-1])
             )
-        # page_size=1 view of the KV pool: PR #454 detects k_cache.shape[1] == 1
-        # and routes flash_attn_with_kvcache to the varlen gather internally.
+        # page_size=1 view of the KV pool: PR #454 detects if page size dim is 1
+        # i.e. k_cache.shape[1] == 1 and routes flash_attn_with_kvcache to varlen gather.
         k_cache = key_cache.reshape(-1, 1, layer.tp_k_head_num, layer.head_dim)
         v_cache = value_cache.reshape(-1, 1, layer.tp_v_head_num, layer.head_dim)
         return flash_attn_with_kvcache(
