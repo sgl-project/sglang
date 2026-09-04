@@ -4,7 +4,6 @@
 mod zmq_helpers;
 
 mod bucket_domains;
-mod cache_aware_zmq;
 mod cache_prefix_provider;
 mod decode;
 mod fused_score;

@@ -70,16 +70,6 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- legacy cache-aware-zmq tuning ----
-    /// Min `matched_blocks / total_blocks` for a cache match to win.
-    #[arg(long)]
-    pub cache_threshold: Option<f32>,
-    /// Absolute load spread above which the cache check is skipped.
-    #[arg(long)]
-    pub balance_abs_threshold: Option<usize>,
-    /// Multiplicative load spread gating the absolute balance check.
-    #[arg(long)]
-    pub balance_rel_threshold: Option<f32>,
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -255,14 +245,6 @@ impl Cli {
                  enabled by --cb-threshold)"
             ));
         }
-        let tuned_legacy_cache_aware = self.cache_threshold.is_some()
-            || self.balance_abs_threshold.is_some()
-            || self.balance_rel_threshold.is_some();
-        if tuned_legacy_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
-            return Err(anyhow!(
-                "cache-aware tuning flags require --policy cache_aware_zmq"
-            ));
-        }
         let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
             if self.kv_indexer_endpoint.is_some() {
                 CachePrefixProvider::Indexer
@@ -297,17 +279,14 @@ impl Cli {
         }
         let cache_aware_uses_indexer = self.policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
-        if self.kv_indexer_endpoint.is_some()
-            && !cache_aware_uses_indexer
-            && self.policy != PolicyKind::CacheAwareZmq
-        {
+        if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
             if self.policy == PolicyKind::CacheAware {
                 return Err(anyhow!(
                     "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
                 ));
             }
             return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware or cache_aware_zmq"
+                "--kv-indexer-endpoint requires --policy cache_aware"
             ));
         }
         if cache_aware_uses_indexer && self.kv_indexer_endpoint.is_none() {
@@ -315,9 +294,7 @@ impl Cli {
                 "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
             ));
         }
-        let tuned_cache_aware = tuned_legacy_cache_aware
-            || self.policy == PolicyKind::CacheAware
-            || self.kv_indexer_endpoint.is_some();
+        let tuned_cache_aware = self.policy == PolicyKind::CacheAware;
         let affinity_policy = matches!(
             self.policy,
             PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -578,9 +555,8 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // Only build a CacheAwareConfig when the operator tuned at least
-        // one knob; otherwise leave it None so the policy uses its own
-        // defaults. Unset knobs fall back to the per-field defaults.
+        // Keep the selected prefix provider and optional Indexer settings
+        // together with the native Cache-Aware policy.
         let kv_indexer_query_timeout_ms = self
             .kv_indexer_query_timeout_ms
             .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
@@ -588,20 +564,12 @@ impl Cli {
             .kv_indexer_query_max_inflight
             .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
         let cache_aware = if tuned_cache_aware {
-            let d = CacheAwareConfig::default();
             let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
                 url,
                 query_timeout_ms: kv_indexer_query_timeout_ms,
                 query_max_inflight: kv_indexer_query_max_inflight,
             });
             Some(CacheAwareConfig {
-                cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
-                balance_abs_threshold: self
-                    .balance_abs_threshold
-                    .unwrap_or(d.balance_abs_threshold),
-                balance_rel_threshold: self
-                    .balance_rel_threshold
-                    .unwrap_or(d.balance_rel_threshold),
                 prefix_provider: cache_prefix_provider,
                 kv_indexer_endpoint,
             })
@@ -1028,6 +996,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_removed_cache_aware_zmq_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cache_aware_zmq"), "got: {err}");
+    }
+
+    #[test]
     fn policy_accepts_only_routing_strategies() {
         for value in ["prefix_cache", "overloaded"] {
             let err = into_config_owned(with_model(&[
@@ -1134,23 +1115,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_aware_knob_builds_partial_config() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--cache-threshold",
-            "0.7",
-        ]))
-        .unwrap();
-        let ca = c.model.cache_aware.expect("cache_aware set");
-        assert_eq!(ca.cache_threshold, 0.7);
-        // Untouched knobs fall back to defaults.
-        assert_eq!(ca.balance_abs_threshold, 32);
-    }
-
-    #[test]
     fn kv_indexer_reuses_cache_aware_policy_config() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
@@ -1194,26 +1158,6 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
         assert_eq!(indexer.query_max_inflight, 32);
-    }
-
-    #[test]
-    fn kv_indexer_is_accepted_by_cache_aware_zmq() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-            "--kv-indexer-endpoint",
-            "http://indexer:50051",
-        ]))
-        .unwrap();
-        let indexer = c
-            .model
-            .cache_aware
-            .expect("cache-aware config")
-            .kv_indexer_endpoint
-            .expect("Indexer config");
-        assert_eq!(indexer.url, "http://indexer:50051");
     }
 
     #[test]
@@ -1274,36 +1218,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("must be greater than zero"));
-    }
-
-    #[test]
-    fn no_cache_aware_flags_leaves_none() {
-        let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--policy",
-            "cache_aware_zmq",
-        ]))
-        .unwrap();
-        assert!(c.model.cache_aware.is_none());
-    }
-
-    #[test]
-    fn rejects_cache_aware_knob_without_cache_aware_policy() {
-        // Default policy is round_robin, so a cache knob has no effect —
-        // reject rather than silently ignore it.
-        let err = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--cache-threshold",
-            "0.7",
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("require --policy cache_aware_zmq"),
-            "got: {err}"
-        );
     }
 
     #[test]
@@ -1372,7 +1286,13 @@ mod tests {
         for value in ["round_robin", "random", "power_of_two", "load_based"] {
             assert!(choices.contains(value), "missing {value}: {choices}");
         }
-        for value in ["fused_score", "cache_aware_zmq", "sticky"] {
+        for value in [
+            "fused_score",
+            "score_policy",
+            "session_aware",
+            "cache_aware",
+            "sticky",
+        ] {
             assert!(!choices.contains(value), "unexpected {value}: {choices}");
         }
     }
@@ -1521,14 +1441,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cache_aware_zmq_as_sticky_fallback() {
+    fn rejects_cache_aware_as_sticky_fallback() {
         let err = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
             "--policy",
             "sticky",
             "--sticky-fallback-policy",
-            "cache_aware_zmq",
+            "cache_aware",
         ]))
         .unwrap_err()
         .to_string();

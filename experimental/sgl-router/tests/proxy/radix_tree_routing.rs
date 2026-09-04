@@ -9,7 +9,6 @@ use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_router::config::{AffinityConfig, CachePrefixProvider, PolicyKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::engine_load::EngineLoadTable;
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
@@ -66,16 +65,7 @@ async fn radix_tree_routes_cache_aware_request_to_cached_worker() {
     }
     let oracle = BlockSizeOracle::new();
     oracle.try_set(1).unwrap();
-    let policies = Arc::new(
-        build_registry(
-            &cfg,
-            Arc::clone(&tree),
-            Arc::clone(&tokenizers),
-            Arc::clone(&oracle),
-            EngineLoadTable::new(),
-        )
-        .unwrap(),
-    );
+    let policies = Arc::new(build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap());
     let mut ctx = AppContext::new(
         cfg,
         tokenizers,
