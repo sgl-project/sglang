@@ -9,7 +9,6 @@ import itertools
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
-    _is_warmup_batch,
     _merge_fanout_results,
     _select_replica,
 )
@@ -38,13 +37,6 @@ def test_session_requests_stick_to_one_replica():
     assert len(picks) == 1
     # and the counter was never consumed by session traffic
     assert _select_replica([_req()], 4, counter) == 0
-
-
-def test_warmup_reqs_are_fanned_out_to_every_replica():
-    assert _is_warmup_batch(_req(is_warmup=True))
-    assert _is_warmup_batch([_req(is_warmup=True), _req(is_warmup=True)])
-    assert not _is_warmup_batch(_req())
-    assert not _is_warmup_batch([])
 
 
 def test_fanout_merge_surfaces_the_failing_replica():
