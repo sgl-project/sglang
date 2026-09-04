@@ -86,6 +86,7 @@ def _run(proc, batch, chunked, chunk_size):
         pruned_states=pruned_states,
         sample_indices=sample_indices,
         input_logprob_indices=input_logprob_indices,
+        input_logprob_temperatures=None,
         token_to_seq_idx=t2s,
         lm_head=None,
         get_logits_fn=get_logits_fn,
