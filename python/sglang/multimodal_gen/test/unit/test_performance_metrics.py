@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -6,6 +7,9 @@ import torch
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    WarmupPhasePeak,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -33,6 +37,27 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
         total_duration_ms=1.0,
         memory_snapshots=memory_snapshots,
     )
+
+
+def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
+    metrics = RequestMetrics("request")
+    metrics.active_stage_name = "ShapeStage"
+
+    metrics.record_step(0.1)
+    metrics.record_stage_iterations(4, 50)
+    metrics.active_stage_name = "PaintStage"
+    metrics.record_step(0.2)
+    metrics.record_stage_iterations(4, 30)
+
+    assert metrics.steps == [100.0, 200.0]
+    assert metrics.steps_by_stage == {
+        "ShapeStage": [100.0],
+        "PaintStage": [200.0],
+    }
+    assert metrics.stage_iterations == {
+        "ShapeStage": (4, 50),
+        "PaintStage": (4, 30),
+    }
 
 
 def test_performance_summary_separates_load_and_runtime_peaks():
@@ -87,6 +112,87 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert worker._runtime_peak_reserved_mb == 3072.0
     assert metrics.memory_snapshots["load_peak"].peak_reserved_mb == 5120.0
     assert metrics.memory_snapshots["runtime_peak"].peak_reserved_mb == 3584.0
+
+
+def test_server_warmup_preserves_peak_after_managed_stage_timeline():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+    }
+    residency_manager.current_device_components.return_value = ("transformer",)
+    device_module = Mock()
+    device_module.max_memory_allocated.return_value = 9
+    device_module.max_memory_reserved.return_value = 12
+    req = SimpleNamespace(
+        width=64,
+        height=64,
+        num_frames=1,
+        num_inference_steps=1,
+        metrics=None,
+    )
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            workload=(128, 96, 9, 2),
+            baseline_allocated_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert record.peak_allocated_bytes == 9
+    assert record.peak_reserved_bytes == 12
+    assert (record.width, record.height, record.num_frames) == (128, 96, 9)
+    assert record.num_inference_steps == 2
+    assert record.phase_peak_allocated_bytes["request:untracked"] == 9
+    assert record.phase_active_components["request:untracked"] == ("transformer",)
+
+
+def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+    }
+    residency_manager.current_device_components.return_value = ("transformer",)
+    device_module = Mock()
+    device_module.max_memory_allocated.return_value = 8
+    device_module.max_memory_reserved.return_value = 12
+    req = SimpleNamespace(
+        width=64,
+        height=64,
+        num_frames=1,
+        num_inference_steps=1,
+        metrics=None,
+    )
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            workload=(64, 64, 1, 1),
+            baseline_allocated_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert "request:untracked" not in record.phase_peak_allocated_bytes
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):

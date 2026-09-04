@@ -218,9 +218,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
-        timesteps = timesteps.to(device)
         logger.info("Using timesteps: %s", timesteps)
-        return timesteps
+        return timesteps.to(device)
 
     def _prepare_causal_dmd_image_kwargs(
         self,
@@ -1253,6 +1252,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
             start_index = 0
+
+        total_iterations = len(block_sizes) * len(timesteps)
+        batch.record_stage_iterations(total_iterations, total_iterations)
 
         def prepare_context_input(current_latents):
             return current_latents

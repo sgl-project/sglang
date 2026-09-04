@@ -1936,6 +1936,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        batch.record_stage_iterations(num_timesteps)
         # Re-resolve the explicit-range gate so the per-step markers
         # below honor this request's is_warmup state. Layer hooks are
         # registered by the residency manager at the use-site.

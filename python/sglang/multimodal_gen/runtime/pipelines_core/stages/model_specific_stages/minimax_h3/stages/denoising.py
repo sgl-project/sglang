@@ -679,6 +679,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
+        batch.record_stage_iterations(len(sigmas_video) - 1)
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
             batch,

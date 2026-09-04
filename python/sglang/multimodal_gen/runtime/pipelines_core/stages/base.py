@@ -383,7 +383,14 @@ class PipelineStage(StageDedupMixin, ABC):
 
         # Execute the actual stage logic with unified profiling.
         previous_batch_is_warmup = self._current_batch_is_warmup
+        metrics = batch.metrics
+        warmup_metrics = metrics if batch.is_warmup else None
+        previous_active_stage = (
+            warmup_metrics.active_stage_name if warmup_metrics is not None else None
+        )
         self._current_batch_is_warmup = batch.is_warmup
+        if warmup_metrics is not None:
+            warmup_metrics.active_stage_name = self._component_stage_name()
         try:
             with StageProfiler(
                 stage_name,
@@ -395,6 +402,8 @@ class PipelineStage(StageDedupMixin, ABC):
             ):
                 result = self.forward(batch, server_args)
         finally:
+            if warmup_metrics is not None:
+                warmup_metrics.active_stage_name = previous_active_stage
             self._current_batch_is_warmup = previous_batch_is_warmup
             self._current_use_nvtx = False
 

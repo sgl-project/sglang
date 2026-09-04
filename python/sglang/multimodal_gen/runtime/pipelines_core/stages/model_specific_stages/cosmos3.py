@@ -1488,6 +1488,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         action_fps = getattr(batch.sampling_params, "action_fps", None)
         timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
+        batch.record_stage_iterations(len(timesteps))
 
         # Seed the scheduler's stochastic (SDE) noise from the request seed so it
         # is identical on every sequence-parallel rank; otherwise each rank draws

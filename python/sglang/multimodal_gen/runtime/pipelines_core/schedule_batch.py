@@ -341,12 +341,38 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
+        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
         self.num_inference_steps = warmup_steps
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
+
+    def record_stage_iterations(
+        self,
+        measured_iterations: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        """Record a stage loop against its full default-request work."""
+        if not self.is_warmup or self.metrics is None:
+            return
+        measured = max(1, int(measured_iterations))
+        if target_iterations is None:
+            measured_request_steps = max(1, int(self.num_inference_steps))
+            target_request_steps = int(
+                self.extra.get(
+                    "stage_target_num_inference_steps",
+                    self.extra.get(
+                        "warmup_target_num_inference_steps",
+                        measured_request_steps,
+                    ),
+                )
+            )
+            target_iterations = (
+                measured * max(1, target_request_steps) + measured_request_steps - 1
+            ) // measured_request_steps
+        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
