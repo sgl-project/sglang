@@ -433,3 +433,57 @@ def test_unsupported_compiled_graph_falls_back_as_one_torch_region():
     torch.testing.assert_close(actual, model(value))
     assert len(backend.plans) == 1
     assert not backend.plans[0].fully_supported
+
+
+@pytest.mark.skipif(
+    not _HAS_WHOLE_GRAPH_MLX_RUNTIME,
+    reason="requires Torch 2.13 and MLX on MPS",
+)
+def test_review_flagged_ops_match_eager_through_the_export_path():
+    """mm routing, add/sub alpha, slice bounds, and plain-attribute get_attr.
+
+    Each construct was flagged in review: a bare ``mm`` must compute
+    ``a @ b`` rather than ride the transposing linear lowering; ``add`` and
+    ``sub`` must honour ``alpha``; negative and sentinel slice bounds must
+    match Torch's normalization; and a constant tensor hung directly on the
+    module (neither parameter nor registered buffer) must resolve as a
+    ``get_attr``.
+    """
+
+    class ReviewOps(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shift = torch.full((4, 4), 0.25, device="mps", dtype=torch.bfloat16)
+
+        def forward(self, x, w):
+            product = torch.mm(x, w)
+            subbed = torch.sub(product, self.shift, alpha=2.0)
+            added = torch.add(product, self.shift, alpha=0.5)
+            return added, subbed, x[:, :-1], x[:, 1:], x[:, -3:]
+
+    model = ReviewOps().eval()
+    x = torch.randn(4, 8, device="mps", dtype=torch.bfloat16)
+    w = torch.randn(8, 4, device="mps", dtype=torch.bfloat16)
+    expected = model(x, w)
+
+    graph_module = torch.export.export(model, (x, w), strict=False).module()
+    # The export guard submodule is dead weight the consumer erases before
+    # planning; do the same here.
+    for node in tuple(graph_module.graph.nodes):
+        if node.op == "call_module" and str(node.target) == "_guards_fn":
+            assert not node.users
+            graph_module.graph.erase_node(node)
+    graph_module.recompile()
+    plan = build_mlx_fx_plan(
+        graph_module, MlxFxLoweringRegistry.standard_export_decoder()
+    )
+    plan.require_fully_supported()
+    executor = make_mlx_fx_executor(plan, [x, w])
+    actual = executor(x, w)
+
+    torch.mps.synchronize()
+    assert len(actual) == len(expected)
+    for actual_item, expected_item in zip(actual, expected):
+        torch.testing.assert_close(
+            actual_item.cpu(), expected_item.cpu(), atol=0.008, rtol=0.03
+        )
