@@ -858,13 +858,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     @staticmethod
-    def _has_prefix_hit(forward_batch: ForwardBatch) -> bool:
-        prefix_lens = forward_batch.extend_prefix_lens_cpu
-        return prefix_lens is not None and any(
-            int(length) > 0 for length in prefix_lens
-        )
-
-    @staticmethod
     def _max_addressable_prefix_len(model_runner) -> int:
         table_width = model_runner.req_to_token_pool.req_to_token.shape[1]
         # This runner's own resolved context (a draft runs at the target's
@@ -899,32 +892,39 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefix_chunk_len = max(requested_capacity // capture_req_slots, 1)
         return prefix_chunk_len, prefix_chunk_len * capture_req_slots
 
-    def _select_prefix_capture_chunks(
-        self, prefix_lens: Sequence[int]
-    ) -> Optional[int]:
-        """Smallest captured variant covering the batch's max prefix, or None."""
-        max_prefix_len = max(int(length) for length in prefix_lens)
+    def _select_prefix_capture_chunks(self, max_prefix_len: int) -> Optional[int]:
+        """Smallest captured variant covering max_prefix_len, or None."""
         real_n = _ceil_div(max_prefix_len, self._prefix_chunk_len)
         return next((n for n in self._prefix_capture_variants if n >= real_n), None)
 
     def _has_uncapturable_chunked_prefix(
         self, prefix_lens: Sequence[int] | None
     ) -> bool:
+        if not self._capture_chunked_prefix or prefix_lens is None:
+            return False
+        max_prefix_len = max(prefix_lens, default=0)
         return (
-            self._capture_chunked_prefix
-            and prefix_lens is not None
-            and any(int(length) > 0 for length in prefix_lens)
-            and self._select_prefix_capture_chunks(prefix_lens) is None
+            max_prefix_len > 0
+            and self._select_prefix_capture_chunks(max_prefix_len) is None
         )
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
-        if self._capture_chunked_prefix and self._has_prefix_hit(forward_batch):
-            captured_n = self._select_prefix_capture_chunks(
-                forward_batch.extend_prefix_lens_cpu
+        if self._capture_chunked_prefix:
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            local_max_prefix_len = (
+                max(prefix_lens, default=0) if prefix_lens is not None else 0
             )
-            assert captured_n is not None, "prefix batch has no captured FullCG variant"
-            variant = _chunked_prefix_variant(captured_n)
+            max_prefix_len = max(
+                local_max_prefix_len,
+                forward_batch.dp_prefill_cuda_graph_max_prefix_len,
+            )
+            if max_prefix_len > 0:
+                captured_n = self._select_prefix_capture_chunks(max_prefix_len)
+                assert captured_n is not None, (
+                    "prefix batch has no captured FullCG variant"
+                )
+                variant = _chunked_prefix_variant(captured_n)
         return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
