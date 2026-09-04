@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     mamba_lazy_spec_in_window,
 )
+from sglang.srt.managers.utils import batch_convert_2d_tensors_to_lists
 from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -480,7 +481,7 @@ class SchedulerBatchResultProcessor:
             if isinstance(embeddings, torch.Tensor):
                 embeddings = embeddings.tolist()
             else:
-                embeddings = [tensor.tolist() for tensor in embeddings]
+                embeddings = batch_convert_2d_tensors_to_lists(embeddings)
         return embeddings
 
     def move_logprobs_to_cpu(
