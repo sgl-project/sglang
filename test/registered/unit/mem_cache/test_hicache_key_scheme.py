@@ -64,8 +64,7 @@ def _assert_chunk_bytes(case, got, want, label=""):
             (j for j, (a, b) in enumerate(zip(g, w)) if a != b), min(len(g), len(w))
         )
         case.fail(
-            f"{label}: chunk {i} differs at byte {where} "
-            f"({len(g)} vs {len(w)} bytes)"
+            f"{label}: chunk {i} differs at byte {where} ({len(g)} vs {len(w)} bytes)"
         )
 
 
@@ -795,10 +794,10 @@ class TestControllerGuards(CustomTestCase):
         parallel = mock.Mock(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
         memory = mock.Mock(hicache_storage_key_scheme=key_scheme)
         mod = "sglang.srt.managers.cache_controller"
-        with mock.patch(
-            f"{mod}.is_dp_attention_enabled", return_value=False
-        ), mock.patch(f"{mod}.get_parallel", return_value=parallel), mock.patch(
-            f"{mod}.get_memory", return_value=memory
+        with (
+            mock.patch(f"{mod}.is_dp_attention_enabled", return_value=False),
+            mock.patch(f"{mod}.get_parallel", return_value=parallel),
+            mock.patch(f"{mod}.get_memory", return_value=memory),
         ):
             return HiCacheController._generate_storage_config(
                 controller, model_name="m", storage_backend_extra_config=extra or {}
