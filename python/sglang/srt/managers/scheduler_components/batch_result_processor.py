@@ -320,6 +320,19 @@ class SchedulerBatchResultProcessor:
                 if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
+                    # The flat input-logprob array carries a block for every
+                    # request in the batch, including this one, so step over it
+                    # or every later request reads a shifted slice.
+                    if batch.return_logprob:
+                        assert extend_input_len_per_req is not None
+                        assert extend_logprob_start_len_per_req is not None
+                        logprob_pt += (
+                            self.logprob_result_processor.calculate_num_input_logprobs(
+                                req,
+                                extend_input_len_per_req[i],
+                                extend_logprob_start_len_per_req[i],
+                            )
+                        )
                     # Decode req in a mixed batch, or a retracted req. Keep an
                     # aborted middle chunk in the chunked branch long enough to
                     # drain its accounting without streaming it.
