@@ -1371,10 +1371,13 @@ class DeltaMessage(BaseModel):
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
+        # 流式 delta 不下发 null 字段(OpenAI 口径,也是 Kimi 流式规范的硬性要求):
+        # 键的存在与否本身就是客户端状态机的信号 —— `reasoning_content: null` 会被
+        # 严格客户端判为类型违规(P0.12),结束帧必须是空对象 {}(P1.10),增量帧
+        # 不得混入无关的 null 键(P0.10)。首帧的 content 键在构造处显式给 ""
+        # (非 None,保留),不受影响(P1.5)。
         data = handler(self)
-        if self.hidden_states is None:
-            data.pop("hidden_states", None)
-        return data
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
