@@ -159,12 +159,14 @@ class TestPrefillCudaGraphVote(CustomTestCase):
 
         self.assertTrue(vote)
         runner.can_replay_locally.assert_called_once()
+        self.assertFalse(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
-    def test_mixed_batch_forces_eager_fallback(self):
+    def test_mixed_batch_delegates_to_runner_policy(self):
         vote, runner = self._vote(ForwardMode.MIXED)
 
-        self.assertFalse(vote)
-        runner.can_replay_locally.assert_not_called()
+        self.assertTrue(vote)
+        runner.can_replay_locally.assert_called_once()
+        self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
 
 if __name__ == "__main__":

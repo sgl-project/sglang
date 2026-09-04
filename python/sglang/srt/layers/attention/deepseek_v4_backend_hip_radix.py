@@ -541,6 +541,8 @@ class DeepseekV4HipRadixBackend(
     tbo_supports_cuda_graph = False
     supports_ragged_verify_graph: bool = True
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
+    # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
     def __init__(
         self,
@@ -689,6 +691,16 @@ class DeepseekV4HipRadixBackend(
             extend_seq_lens,
             num_tokens,
             need_compress=need_compress,
+            repeat_output_size=(
+                num_tokens
+                if (
+                    need_compress
+                    and not attach_decode_streams
+                    and extend_seq_lens_cpu is not None
+                    and sum(extend_seq_lens_cpu) == num_tokens
+                )
+                else None
+            ),
         )
         if attach_decode_streams:
             # Target-verify runs through the unified_kv DECODE kernel, so build
@@ -1279,6 +1291,7 @@ class DeepseekV4HipRadixBackend(
                 num_tokens=sum(extend_seq_lens_cpu),
                 extend_seq_lens=extend_seq_lens,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=not is_draft,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
@@ -1447,6 +1460,7 @@ class DeepseekV4HipRadixBackend(
         extend_seq_lens: torch.Tensor,
         num_tokens: int,
         need_compress: bool = True,
+        repeat_output_size: Optional[int] = None,
     ) -> None:
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
@@ -1458,10 +1472,10 @@ class DeepseekV4HipRadixBackend(
         bs = req_pool_indices.shape[0]
         seq_lens = seq_lens.to(torch.int64)
         extend_seq_lens = extend_seq_lens.to(torch.int64)
-        # token -> req index (length L = sum(extend_seq_lens)).
-        # output_size skips the implicit sum() D2H on draft-extend. dropping it on the
-        # target-extend path triggers a GPU memory access fault.
-        if need_compress:
+        # Draft extend already supplies an exact output size. Target prefill may
+        # opt in when its CPU length mirror proves the actual query count;
+        # GPU-only/ragged paths retain the established fallback.
+        if need_compress and repeat_output_size is None:
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
@@ -1470,7 +1484,9 @@ class DeepseekV4HipRadixBackend(
             bid = torch.repeat_interleave(
                 torch.arange(bs, device=device, dtype=torch.int64),
                 extend_seq_lens,
-                output_size=num_tokens,
+                output_size=(
+                    num_tokens if repeat_output_size is None else repeat_output_size
+                ),
             )
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
@@ -1920,10 +1936,11 @@ class DeepseekV4HipRadixBackend(
                 (0, pad_size),
                 value=1,
             )
-            req_pool_indices_repeated = torch.nn.functional.pad(
-                req_pool_indices_repeated,
-                (0, pad_size),
-                value=req_pool_indices_repeated[-1].item(),
+            req_pool_indices_repeated = torch.cat(
+                (
+                    req_pool_indices_repeated,
+                    req_pool_indices_repeated[-1:].expand(pad_size),
+                )
             )
 
         return seq_lens_casual, req_pool_indices_repeated

@@ -1,3 +1,4 @@
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -22,6 +23,18 @@ register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd-mi35x")
 class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
     @staticmethod
     def _make_core_metadata(base: int) -> DSV4AttnMetadata:
+        def tensor(offset: int) -> torch.Tensor:
+            return torch.tensor([base + offset], dtype=torch.int32)
+
+        def fill_optional_tensors(metadata, start: int) -> int:
+            for metadata_field in dataclasses.fields(metadata):
+                if "Tensor" not in str(metadata_field.type):
+                    continue
+                if getattr(metadata, metadata_field.name, None) is None:
+                    setattr(metadata, metadata_field.name, tensor(start))
+                    start += 1
+            return start
+
         metadata = DSV4AttnMetadata(
             page_size=256,
             page_table=torch.tensor([[base + 1, base + 2]], dtype=torch.int32),
@@ -33,16 +46,10 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             swa_topk_lengths=torch.tensor([base + 8], dtype=torch.int32),
             c4_sparse_topk=512,
             swa_out_cache_loc=torch.tensor([base + 9], dtype=torch.int32),
-            unified=UnifiedKvMetadata(
-                swa_loc=torch.tensor([base + 10], dtype=torch.int32)
-            ),
+            unified=UnifiedKvMetadata(),
         )
-        metadata.c4_sparse_topk_lengths = torch.tensor([base + 11], dtype=torch.int32)
-        metadata.c4_sparse_topk_lengths_raw = torch.tensor(
-            [base + 12], dtype=torch.int32
-        )
-        metadata.c4_sparse_page_indices = torch.tensor([[base + 13]], dtype=torch.int32)
-        metadata.c4_sparse_raw_indices = None
+        next_offset = fill_optional_tensors(metadata, 10)
+        fill_optional_tensors(metadata.unified, next_offset)
         metadata.c1_flashmla_metadata = None
         metadata.c4_flashmla_metadata = None
         metadata.c128_flashmla_metadata = None
@@ -51,6 +58,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
     def test_backend_opts_into_captured_bcg_metadata(self):
         self.assertTrue(
             DeepseekV4HipRadixBackend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.assertTrue(
+            DeepseekV4HipRadixBackend.prefer_eager_mixed_prefill_under_dp_attention
         )
 
     def test_non_unified_metadata_matches_underfilled_bucket(self):
@@ -70,10 +80,17 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         core.positions_casual = torch.tensor([0, 1, 2, 0], dtype=torch.int32)
         core.unified = None
 
-        with mock.patch(
-            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
-            "is_unified_kv_triton",
-            return_value=True,
+        with (
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+                "is_unified_kv_triton",
+                return_value=True,
+            ),
+            mock.patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+                "torch.repeat_interleave",
+                wraps=torch.repeat_interleave,
+            ) as repeat_interleave,
         ):
             backend._attach_unified_kv_prefill_meta(
                 core,
@@ -82,12 +99,72 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 seq_lens=torch.tensor([1, 3], dtype=torch.int32),
                 extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
                 num_tokens=3,
+                repeat_output_size=3,
             )
 
+        repeat_interleave.assert_called_once()
+        self.assertEqual(repeat_interleave.call_args.kwargs["output_size"], 3)
         self.assertEqual(core.unified.pf_state_slot.tolist(), [7, 9, 9, 9])
         self.assertEqual(core.unified.pf_chunk_start.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_cu_q.tolist(), [0, 1, 1, 0])
         self.assertEqual(core.unified.pf_final_pos.tolist(), [0, 2, 2, 128])
+
+    def test_eager_prefill_uses_host_proven_repeat_output_size(self):
+        backend = object.__new__(DeepseekV4HipRadixBackend)
+        backend.req_to_token = torch.zeros((2, 8), dtype=torch.int32)
+        backend.token_to_kv_pool = object()
+        core = self._make_core_metadata(0)
+        extend_start_loc = torch.tensor([0, 1], dtype=torch.int32)
+        backend.expand_prefill_casually = mock.Mock(
+            return_value=(
+                core.seq_lens_casual,
+                torch.tensor([7, 9, 9], dtype=torch.int32),
+            )
+        )
+        backend.make_core_attn_metadata = mock.Mock(return_value=core)
+        backend._attach_unified_kv_prefill_meta = mock.Mock()
+        backend.init_forward_metadata_indexer = mock.Mock(return_value=None)
+
+        with (
+            mock.patch(
+                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "ExpandPrefillCausally.execute",
+                return_value=SimpleNamespace(
+                    seq_lens_casual=core.seq_lens_casual,
+                    req_pool_indices_repeated=torch.tensor(
+                        [7, 9, 9], dtype=torch.int32
+                    ),
+                ),
+            ) as expand_prefill,
+            mock.patch(
+                "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix."
+                "create_paged_compressor_data",
+                return_value=None,
+            ),
+        ):
+            backend.init_forward_metadata_prefill(
+                max_seq_len=4096,
+                req_pool_indices=torch.tensor([7, 9], dtype=torch.int32),
+                seq_lens=torch.tensor([1, 3], dtype=torch.int32),
+                seq_lens_cpu=[1, 3],
+                out_cache_loc=torch.zeros(3, dtype=torch.int64),
+                num_tokens=3,
+                extend_seq_lens=torch.tensor([1, 2], dtype=torch.int32),
+                extend_seq_lens_cpu=[1, 2],
+                extend_start_loc=extend_start_loc,
+                use_prefill_cuda_graph=False,
+            )
+
+        self.assertIs(
+            expand_prefill.call_args.kwargs["extend_start_loc"], extend_start_loc
+        )
+        backend.expand_prefill_casually.assert_not_called()
+        self.assertEqual(
+            backend._attach_unified_kv_prefill_meta.call_args.kwargs[
+                "repeat_output_size"
+            ],
+            3,
+        )
 
     def test_prefill_bcg_uses_bucket_sized_gpu_compressor_plans(self):
         backend = object.__new__(DeepseekV4HipRadixBackend)
@@ -201,40 +278,83 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             ),
             fp4_q_positions=torch.tensor([116], dtype=torch.int64),
         )
-        captured_tensors = {
-            "raw_out_loc": capture_metadata.core_attn_metadata.raw_out_loc,
-            "swa_out_cache_loc": (
-                capture_metadata.core_attn_metadata.swa_out_cache_loc
-            ),
-            "unified_swa_loc": capture_metadata.core_attn_metadata.unified.swa_loc,
+        capture_core = capture_metadata.core_attn_metadata
+        replay_core = replay_metadata.core_attn_metadata
+        captured_core_tensors = {
+            field.name: getattr(capture_core, field.name)
+            for field in dataclasses.fields(capture_core)
+            if torch.is_tensor(getattr(capture_core, field.name))
+        }
+        captured_unified_tensors = {
+            field.name: getattr(capture_core.unified, field.name)
+            for field in dataclasses.fields(capture_core.unified)
+            if torch.is_tensor(getattr(capture_core.unified, field.name))
+        }
+        captured_fp4_tensors = {
             "fp4_k_positions": capture_metadata.fp4_k_write_metadata[0],
             "fp4_k_slots": capture_metadata.fp4_k_write_metadata[1],
             "fp4_q_positions": capture_metadata.fp4_q_positions,
         }
-
-        capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
-
-        current_tensors = {
-            "raw_out_loc": capture_metadata.core_attn_metadata.raw_out_loc,
-            "swa_out_cache_loc": (
-                capture_metadata.core_attn_metadata.swa_out_cache_loc
-            ),
-            "unified_swa_loc": capture_metadata.core_attn_metadata.unified.swa_loc,
-            "fp4_k_positions": capture_metadata.fp4_k_write_metadata[0],
-            "fp4_k_slots": capture_metadata.fp4_k_write_metadata[1],
-            "fp4_q_positions": capture_metadata.fp4_q_positions,
+        expected_core_tensors = {
+            name: getattr(replay_core, name).clone() for name in captured_core_tensors
         }
-        replay_tensors = {
-            "raw_out_loc": replay_metadata.core_attn_metadata.raw_out_loc,
-            "swa_out_cache_loc": replay_metadata.core_attn_metadata.swa_out_cache_loc,
-            "unified_swa_loc": replay_metadata.core_attn_metadata.unified.swa_loc,
+        expected_unified_tensors = {
+            name: getattr(replay_core.unified, name).clone()
+            for name in captured_unified_tensors
+        }
+        replay_fp4_tensors = {
             "fp4_k_positions": replay_metadata.fp4_k_write_metadata[0],
             "fp4_k_slots": replay_metadata.fp4_k_write_metadata[1],
             "fp4_q_positions": replay_metadata.fp4_q_positions,
         }
-        for name, captured_tensor in captured_tensors.items():
-            self.assertIs(current_tensors[name], captured_tensor)
-            self.assertTrue(torch.equal(captured_tensor, replay_tensors[name]), name)
+        expected_fp4_tensors = {
+            name: tensor.clone() for name, tensor in replay_fp4_tensors.items()
+        }
+
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+
+        for field_name, captured_tensor in captured_core_tensors.items():
+            current = getattr(capture_core, field_name)
+            self.assertIs(current, captured_tensor, field_name)
+            self.assertTrue(
+                torch.equal(current, expected_core_tensors[field_name]), field_name
+            )
+            self.assertTrue(
+                torch.equal(
+                    getattr(replay_core, field_name),
+                    expected_core_tensors[field_name],
+                ),
+                f"{field_name} replay source",
+            )
+        for field_name, captured_tensor in captured_unified_tensors.items():
+            current = getattr(capture_core.unified, field_name)
+            self.assertIs(current, captured_tensor, field_name)
+            self.assertTrue(
+                torch.equal(current, expected_unified_tensors[field_name]),
+                field_name,
+            )
+            self.assertTrue(
+                torch.equal(
+                    getattr(replay_core.unified, field_name),
+                    expected_unified_tensors[field_name],
+                ),
+                f"{field_name} replay source",
+            )
+
+        current_fp4_tensors = {
+            "fp4_k_positions": capture_metadata.fp4_k_write_metadata[0],
+            "fp4_k_slots": capture_metadata.fp4_k_write_metadata[1],
+            "fp4_q_positions": capture_metadata.fp4_q_positions,
+        }
+        for name, captured_tensor in captured_fp4_tensors.items():
+            self.assertIs(current_fp4_tensors[name], captured_tensor)
+            self.assertTrue(
+                torch.equal(captured_tensor, expected_fp4_tensors[name]), name
+            )
+            self.assertTrue(
+                torch.equal(replay_fp4_tensors[name], expected_fp4_tensors[name]),
+                f"{name} replay source",
+            )
         self.assertIs(capture_metadata.fp4_prefill_workspace, capture_workspace)
 
     def test_replay_refreshes_captured_metadata_and_workspace(self):

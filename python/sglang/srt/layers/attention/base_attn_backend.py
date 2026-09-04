@@ -151,6 +151,10 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
+    # Backends may keep MIXED prefill eager under DP attention when replaying
+    # the EXTEND graph is a known serving-performance regression.
+    prefer_eager_mixed_prefill_under_dp_attention: bool = False
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
         Override only for audited deviations from this conservative default."""
