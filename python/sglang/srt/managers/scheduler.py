@@ -1419,6 +1419,15 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+        self.init_slow_pass_tracer()
+
+    def init_slow_pass_tracer(self):
+        from sglang.srt.managers.scheduler_components.slow_pass_tracer import (
+            SlowPassTracer,
+        )
+
+        self.slow_pass_tracer = SlowPassTracer()
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1885,9 +1894,10 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with self.slow_pass_tracer.trace("get_next_batch_to_run"):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
@@ -1895,7 +1905,8 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                with self.slow_pass_tracer.trace("process_batch_result"):
+                    self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
@@ -1916,7 +1927,8 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
+            with self.slow_pass_tracer.trace("process_batch_result"):
+                self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             if self.gracefully_exit:
@@ -1932,9 +1944,10 @@ class Scheduler(
                 continue
 
             # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
+            with self.slow_pass_tracer.trace("get_next_batch_to_run"):
+                plan = self.get_next_batch_to_run(
+                    running_batch=self.running_batch, last_batch=self.last_batch
+                )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
