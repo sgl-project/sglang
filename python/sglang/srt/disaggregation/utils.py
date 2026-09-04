@@ -231,6 +231,17 @@ def poll_and_all_reduce_attn_cp_tp_group(
     return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
+def all_reduce_transfer_quiesced_attn_cp_tp_group(
+    pollers,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[bool]:
+    quiesced = [int(poller.is_transfer_quiesced()) for poller in pollers]
+    quiesced = _all_reduce_polls(quiesced, attn_tp_cpu_group)
+    quiesced = _all_reduce_polls(quiesced, attn_cp_cpu_group)
+    return [bool(value) for value in quiesced]
+
+
 def poll_and_all_reduce_with_staging(
     decode_reqs,
     staging_handler,

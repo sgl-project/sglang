@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_transfer_quiesced_attn_cp_tp_group,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsv4_c128_state_indices,
@@ -928,10 +929,26 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
+        if any(
+            req.disagg_abort_cleanup_pending
+            for req in self.disagg_prefill_inflight_queue
+        ):
+            transfer_quiesced = all_reduce_transfer_quiesced_attn_cp_tp_group(
+                [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+            )
+        else:
+            transfer_quiesced = [True] * len(self.disagg_prefill_inflight_queue)
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        for req, poll, globally_quiesced in zip(
+            self.disagg_prefill_inflight_queue,
+            polls,
+            transfer_quiesced,
+            strict=True,
+        ):
             if rids_to_check is not None:
                 if req.rid not in rids_to_check:
                     undone_reqs.append(req)
@@ -951,6 +968,14 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     undone_reqs.append(req)
                     continue
+
+            if req.disagg_abort_cleanup_pending:
+                if not globally_quiesced:
+                    undone_reqs.append(req)
+                    continue
+                if self._retire_aborted_prefill_result(req, transport_quiesced=True):
+                    done_reqs.append(req)
+                continue
 
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
