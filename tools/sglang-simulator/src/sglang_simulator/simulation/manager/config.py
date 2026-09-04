@@ -252,6 +252,7 @@ class ConfigManager:
                 hw=hw,
                 config=sched_config,
                 model_id=predictor_config.get("model_id"),
+                system=config.get("platform", {}).get("accelerator", {}).get("name"),
                 systems_root=cls.resolve_config_relative_path(
                     predictor_config.get("systems_root")
                 ),
