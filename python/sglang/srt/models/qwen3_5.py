@@ -1627,7 +1627,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 rms_epsilon=config.rms_norm_eps,
                 # Every layer was checked above.
                 can_defer_finalize=lambda layer: True,
-                # Qwen3.5's final GemmaRMSNorm closes out the last handoff.
+                # The final GemmaRMSNorm closes out the last layer's handoff.
                 final_norm_consumes_handoff=True,
                 label="Qwen3.5",
             )

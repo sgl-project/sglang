@@ -34,24 +34,20 @@ def _import_kernel_backend():
     )
 
 
-# Warp size and the bf16 elements per 16-byte vector, mirroring the constants
-# the FlashInfer HT device kernel derives its shard split from.
+# Mirrors the constants the FlashInfer HT device kernel derives its shard split
+# from: warp size, and bf16 elements per 16-byte vector.
 _WARP_SIZE = 32
 _VEC_BF16 = 8
 
-# The HT kernel dedicates two warps plus the reduction warps to non-consumer
-# roles, so the consumer count has this much headroom under the 1024 limit.
+# The HT kernel spends two warps plus the reduction warps on non-consumer roles.
 _HT_MAX_CONSUMER_THREADS = 1024 - 3 * _WARP_SIZE
 
 
 def _ht_shard_split(hidden_size: int) -> tuple[int, int] | None:
     """``(consumer_threads, vectors_per_thread)`` for the HT persistent kernel.
 
-    The kernel splits a token into ``consumer_threads * 8 * vectors_per_thread``
-    element shards and additionally requires ``consumer_threads`` to divide the
-    token's 16-byte vector count. FlashInfer's H=8192 presets use 512 threads x 2
-    vectors; this reproduces that shape for any hidden size by taking the widest
-    consumer count that still leaves at least two vectors per thread.
+    The kernel shards a token into consumer_threads * 8 * vectors_per_thread
+    elements, and consumer_threads must divide its 16-byte vector count.
     """
     packs = hidden_size // _VEC_BF16
     limit = min(_HT_MAX_CONSUMER_THREADS, packs // 2)
@@ -66,9 +62,8 @@ def _ht_shard_split(hidden_size: int) -> tuple[int, int] | None:
 def _ht_reduction_warps(hidden_size: int, tp_size: int, preferred: int) -> int | None:
     """Reduction warps that evenly cover one rank's slice of a token.
 
-    The HT reduction shard is ``hidden / 8 / tp`` vectors wide and must divide
-    across ``reduction_warps * 32`` threads; ``preferred`` is FlashInfer's tuned
-    value, which we only ever step down from.
+    The HT reduction shard is hidden / 8 / tp vectors wide and must divide across
+    reduction_warps * 32 threads. Only ever steps down from ``preferred``.
     """
     packs_per_shard = (hidden_size // _VEC_BF16) // tp_size
     for warps in (8, 4, 2, 1):
@@ -115,14 +110,9 @@ def _ht_tunings(hidden_size: int, tp_size: int):
 def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     """A single-profile routing config for a shape FlashInfer does not ship.
 
-    ``DEFAULT_CONFIG`` carries GB300 profiles for H=8192 / top-k=10 only, and
-    ``MNNVLCuteDSLConfig.resolve`` matches ``(tp, hidden, top_k, dtype)``
-    exactly -- so every other model raises "No MNNVL CuTe DSL profile supports
-    this static shape". This rebuilds one profile at the running shape, reusing
-    the shipped presets and their measured GB300 LL/BT/HT crossovers. Those
-    crossovers were measured at H=8192 and are therefore approximate here; only
-    the kernel-shape parameters are recomputed. Returns None when the hidden
-    size admits no valid HT shard split.
+    Reuses the shipped presets and their GB300 crossovers, recomputing only the
+    kernel-shape parameters; the crossovers were measured at H=8192 and are
+    approximate elsewhere. None when the hidden size admits no HT shard split.
     """
     from flashinfer.comm.mnnvl_cutedsl import (
         KernelTarget,
@@ -198,7 +188,11 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
 
 
 def _config_for_shape(default_config, *, tp_size: int, hidden_size: int, top_k: int):
-    """The shipped config when it covers this shape, else one rebuilt for it."""
+    """The shipped config when it covers this shape, else one rebuilt for it.
+
+    MNNVLCuteDSLConfig.resolve matches (tp, hidden, top_k, dtype) exactly and
+    DEFAULT_CONFIG ships GB300 H=8192/K=10 only, so every other shape needs one.
+    """
     for profile in default_config.profiles:
         if profile.matches(
             tp_size=tp_size,
@@ -312,9 +306,6 @@ class FlashInferMNNVLCuteDSLARFusion:
                 self._patterns,
                 default_config,
             ) = _import_kernel_backend()
-            # FlashInfer ships GB300 H=8192/K=10 profiles and resolves the
-            # profile by exact (tp, hidden, top_k, dtype); anything else needs a
-            # profile rebuilt at its own shape.
             tp_size = dist.get_world_size(process_group)
             shaped_config = _config_for_shape(
                 default_config,

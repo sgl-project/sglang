@@ -1035,10 +1035,8 @@ class DeepseekV2MoE(nn.Module):
         current_stream.wait_stream(self.alt_stream)
 
         if deferred_finalize and get_forward().defer_moe_finalize:
-            # The next layer's fused collective absorbs the finalize, including
-            # the shared add. deferred_finalize already excluded the replicated
-            # _shared_expert_tp1 output, which must be added after the
-            # all-reduce rather than folded into it.
+            # deferred_finalize already excluded the replicated
+            # _shared_expert_tp1 output, so the shared add folds in safely.
             assert shared_output is not None
             from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
@@ -2438,8 +2436,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
         else:
-            # Prefill-CP layers keep the ordinary path: DSACPLayerCommunicator's
-            # gates are unrelated to this fusion and it is handled above.
             if (
                 isinstance(self.mlp, DeepseekV2MoE)
                 and not is_nextn
@@ -2575,8 +2571,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        # should_defer_moe_finalize() implies fuse_mlp_allreduce, so the cheap
-        # flag short-circuits the eligibility walk on every ineligible layer.
+        # should_defer_moe_finalize() implies fuse_mlp_allreduce; the cheap flag
+        # short-circuits the eligibility walk on every ineligible layer.
         may_defer_moe_finalize = (
             fuse_mlp_allreduce
             and self.layer_communicator.should_defer_moe_finalize(forward_batch)
@@ -2594,12 +2590,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                     gemm_output_zero_allocator,
                 )
 
-        # Keyed off what came back, not off the flag: the flag only permits the
-        # handoff, and the MoE still declines it whenever its own
-        # deferred_finalize predicate is False (non-bypassed topk, a runner that
-        # cannot defer, a TP1-replicated shared expert). prepare_attn consumes
-        # the handoff; postprocess_layer and _sglang_needs_allreduce_fusion both
-        # want a tensor.
+        # The flag only permits a handoff; the MoE still declines it per forward
+        # (non-bypassed topk, no deferring runner), so key off what came back.
         if not isinstance(hidden_states, torch.Tensor):
             return hidden_states, residual, topk_indices
 
@@ -2832,23 +2824,19 @@ class DeepseekV2Model(nn.Module):
                 "final norm that consumes it"
             )
         self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
-            # PP pads self.layers with PPMissingLayer; only the local slice has
-            # a layer_communicator.
+            # PP pads self.layers with PPMissingLayer, which has no communicator.
             self.layers[self.start_layer : self.end_layer],
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
             rms_epsilon=config.rms_norm_eps,
-            # The finalize pattern needs a runner that can hand back an
-            # unfinalized output (FlashInfer TRT-LLM NVFP4 today), and a shared
-            # expert that is not TP1-replicated -- a replicated one is added
-            # after the all-reduce, so folding it in would count it per rank.
+            # A TP1-replicated shared expert is added after the all-reduce, so
+            # folding it into the fused add would count it once per rank.
             can_defer_finalize=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE)
                 and layer.mlp.experts.supports_deferred_finalize
                 and not layer.mlp._shared_expert_tp1
             ),
-            # The model's final norm takes a plain tensor: the last layer
-            # finalizes in the MoE like it always did.
+            # The final norm takes a plain tensor, not a handoff.
             final_norm_consumes_handoff=False,
             label="DeepSeek-V3/GLM",
         )
@@ -3191,8 +3179,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         return None
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        # BaseRunner looks the hook up here; the handle lives on the inner model,
-        # which is DeepseekModelNextN (handle always None) for the MTP entry.
+        # BaseRunner looks the hook up here; the handle lives on the inner model.
         from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
 
         prepare_cutedsl_fusion(

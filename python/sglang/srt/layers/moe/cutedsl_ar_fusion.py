@@ -1,16 +1,8 @@
-"""Model-agnostic FlashInfer MNNVL CuTe DSL AllReduce fusion.
+"""FlashInfer MNNVL CuTe DSL AllReduce fusion, shared across architectures.
 
-Two fusion patterns share one workspace, both consumed at the *next* layer's
-input RMSNorm:
-
-* AllReduce + residual add + RMSNorm, replacing ``prepare_mlp``'s collective.
-* MoE finalize + shared-expert add + AllReduce + residual add + RMSNorm, when
-  the MoE runner hands back an unfinalized :class:`MoeFinalizeHandoff` instead
-  of a tensor.
-
-Nothing here is per-architecture. The only thing that differs between model
-families is which attribute of their RMSNorm holds the gamma the fused kernel
-reads, and :func:`fused_norm_gamma` answers that from the norm module itself.
+Two patterns share one workspace, both consumed at the next layer's input
+RMSNorm: AR + residual + RMSNorm, and the same with the MoE finalize and the
+shared-expert add folded in when the runner hands back a MoeFinalizeHandoff.
 """
 
 from __future__ import annotations
@@ -40,14 +32,8 @@ logger = logging.getLogger(__name__)
 def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
     """The gamma the fused RMSNorm reads, or None for a norm it cannot serve.
 
-    The kernel computes ``x * (gamma + weight_bias)`` with ``weight_bias=0``, so
-    the gamma has to be the multiplier as applied. ``GemmaRMSNorm`` keeps that
-    as ``gemma_weight`` (the checkpoint weight pre-folded to ``w + 1``) while a
-    plain ``RMSNorm`` applies ``weight`` directly.
-
-    Returning None rather than raising is load-bearing: the eligibility
-    predicates call this to decline a layer whose norm is a flavour the kernel
-    has no gamma for.
+    The kernel wants the multiplier as applied, so GemmaRMSNorm hands over its
+    pre-folded w + 1. None is how the eligibility predicates decline a layer.
     """
     if isinstance(layernorm, GemmaRMSNorm):
         return layernorm.gemma_weight
@@ -155,8 +141,7 @@ class CuteDSLFusionService:
             top_k=self.top_k,
             max_m=int(max_m),
             rms_epsilon=self.rms_epsilon,
-            # fused_norm_gamma() hands over the multiplier as applied, so the
-            # kernel's x * (gamma + weight_bias) wants no bias for any flavour.
+            # fused_norm_gamma() already returns the multiplier as applied.
             weight_bias=0.0,
         )
         self._workspace = workspace
@@ -251,18 +236,13 @@ class CuteDSLFusionService:
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
-    """Fusion hooks; the generic LayerCommunicator stays backend agnostic."""
+    """The only communicator that runs the CuTe DSL fused patterns."""
 
     fusion_service: CuteDSLFusionService | None = None
 
-    # Whether this layer's MoE runner can hand back an unfinalized output.
-    # Recorded by install_cutedsl_fusion(); the finalize pattern is unreachable
-    # without one, while the plain AR+RMSNorm pattern stays available.
+    # Both recorded by install_cutedsl_fusion(). Without either, the layer
+    # keeps the plain AR+RMSNorm pattern and never defers.
     experts_can_defer_finalize: bool = False
-
-    # Whether a handoff produced here would actually be consumed: the next
-    # layer takes one in prepare_attn, or -- for the last layer -- the model's
-    # own final norm does. Recorded by install_cutedsl_fusion().
     handoff_has_consumer: bool = False
 
     def prepare_attn(
@@ -346,10 +326,8 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         )
 
     def should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
-        """Consumer side: whether prepare_attn here can absorb a handoff.
-
-        Deliberately independent of this layer's own MoE runner -- consuming is
-        a property of the fused kernel and the topology, not of who produced.
+        """Consumer side. Independent of this layer's own MoE runner: consuming
+        is a property of the fused kernel and the topology, not of who produced.
         """
         parallel = get_parallel()
         return (
@@ -361,14 +339,11 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
-        """Producer side: whether this layer's MoE may hand one off.
+        """Producer side. Deferring skips the post-experts all-reduce on the
+        promise of a handoff, so a layer with no consumer must not defer.
 
-        Beyond consumer eligibility this needs a runner that can produce a
-        handoff and somewhere for it to land. Deferring skips the post-experts
-        all-reduce on the promise of a handoff, so a layer whose successor
-        cannot consume must not defer -- nothing would perform the collective.
-        The producer's own eligibility stands in for the successor's; every
-        fusion layer of a model shares its scatter modes and topology.
+        Stands in its own eligibility for the successor's; every fusion layer of
+        a model shares its scatter modes and topology.
         """
         if not (self.experts_can_defer_finalize and self.handoff_has_consumer):
             return False
@@ -394,8 +369,6 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         self, forward_batch: ForwardBatch
     ) -> bool:
         if self.should_defer_moe_finalize(forward_batch):
-            # True even on the last layer when the model's final norm consumes
-            # the handoff; handoff_has_consumer is what decides that.
             return True
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
@@ -410,23 +383,13 @@ def install_cutedsl_fusion(
     final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
-    """Give every fusion-enabled layer in ``layers`` one shared workspace handle.
+    """Give every fusion-enabled layer one shared workspace handle, or None.
 
-    ``layers`` are the decoder layers this rank actually built -- each must carry
-    a ``layer_communicator``, so a PP-padded list is sliced to the local range
-    before it gets here.
-
-    The workspace compiles per ``(hidden_size, top_k, rms_epsilon)``, which every
-    MoE layer of a model shares, so one handle serves the whole model. Returns it,
-    or None when no layer got a fusion communicator.
-
-    ``can_defer_finalize(layer) -> bool`` says whether that layer's MoE runner can
-    hand back an unfinalized output; layers where it cannot keep the plain
-    AR+RMSNorm fusion and never advertise the finalize pattern.
-
-    ``final_norm_consumes_handoff`` says the model's own final norm closes out
-    the last layer's handoff. Without it the last layer never defers, because
-    nothing would perform the all-reduce that deferring skips.
+    The workspace compiles per (hidden_size, top_k, rms_epsilon), which every MoE
+    layer of a model shares. Every entry of ``layers`` must carry a
+    ``layer_communicator``, so a PP-padded list is sliced to the local range
+    first. Set ``final_norm_consumes_handoff`` only when the model's final norm
+    closes out the last layer's handoff.
     """
     fusion_layers = [
         layer
@@ -445,9 +408,6 @@ def install_cutedsl_fusion(
         communicator = layer.layer_communicator
         if not isinstance(communicator, CuteDSLFusionLayerCommunicator):
             continue
-        # A handoff is consumed by the next layer's prepare_attn, so the next
-        # layer must have a communicator that can absorb one. The last layer
-        # falls to the model's final norm.
         successor = layers[index + 1] if index + 1 < len(layers) else None
         if successor is None:
             has_consumer = final_norm_consumes_handoff

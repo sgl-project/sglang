@@ -199,8 +199,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
-        # The CuTe DSL backend runs its own fused path from the fusion
-        # communicator, not this one.
+        # cute-dsl runs its own fused path from the fusion communicator.
         and not uses_cutedsl_ar_fusion()
         and not is_flashinfer_allreduce_unavailable()
         # Symbolic size checks stay last: under Dynamo tracing they guard on
@@ -803,12 +802,10 @@ class LayerCommunicator:
         return self._finish_prepare_attn(hidden_states, residual, forward_batch)
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run: move the hidden states to the
-        attention scatter mode and publish the inputs ``fetch_qkv_latent`` reads.
-
-        Subclasses that produce the post-norm hidden states themselves (the CuTe
-        DSL fused finalize) return through here rather than short-circuiting;
-        skipping it leaves ``attn_inputs`` unset and the attention layer asserts.
+        """Tail every prepare_attn path must run. A subclass producing the
+        post-norm hidden states itself returns through here rather than
+        short-circuiting; skipping it leaves ``attn_inputs`` unset and
+        ``fetch_qkv_latent`` asserts.
         """
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
@@ -899,17 +896,15 @@ class LayerCommunicator:
         return False
 
     def should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
-        """Whether this layer can fold an unfinalized MoE output into the next
-        layer's fused collective. Only the CuTe DSL fusion communicator has such
-        a collective; see ``layers/moe/cutedsl_ar_fusion.py``."""
+        """Whether this layer can absorb an unfinalized MoE output into its own
+        fused collective. Only ``layers/moe/cutedsl_ar_fusion.py`` has one."""
         return False
 
     def should_defer_moe_finalize(
         self, forward_batch: ForwardBatch, m: int | None = None
     ) -> bool:
         """Whether this layer's MoE may hand back an unfinalized output for the
-        next layer's fused collective to absorb. ``m`` defaults to the forward's
-        token count, for callers asking before the MLP input exists."""
+        next layer to absorb. ``m`` defaults to the forward's token count."""
         return False
 
     # NOTE: This function will cause torch recompilation
