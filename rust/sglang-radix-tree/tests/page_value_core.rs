@@ -47,6 +47,10 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
         }),
         2
     );
+    assert_eq!(
+        tree.prefix_match_atoms_len(&partial_key, KeyNamespaceRef::default()),
+        2
+    );
 
     let prefix_key = vec![10, 20];
     let prefix = tree.match_prefix(&MatchPrefixParams {
@@ -57,13 +61,13 @@ fn page_value_core_supports_read_only_match_and_continuation_insert() {
     tree.inc_lock_ref(prefix.last_device_node_id);
     assert_eq!(tree.protected_size(), 2);
 
-    let result = tree.insert_from_node(
+    let result = tree.insert_suffix_from_node(
         prefix.last_device_node_id,
         2,
         &InsertParams {
             key: &partial_key,
             namespace: KeyNamespaceRef::default(),
-            value: PageValue::from_vec(vec![100, 101, 5, 6]),
+            value: PageValue::from_vec(vec![5, 6]),
             prev_prefix_len: 2,
             swa_evicted_seqlen: 0,
             mamba_value: None,
@@ -166,9 +170,9 @@ fn continuation_insert_shares_immutable_value_storage() {
     });
 
     let extended_key = vec![10, 20, 30, 40];
-    let extended_value = PageValue::from_vec(vec![page(100), page(101), page(3), page(4)]);
+    let extended_value = PageValue::from_vec(vec![page(3), page(4)]);
     clone_count.store(0, Ordering::Relaxed);
-    tree.insert_from_node(
+    tree.insert_suffix_from_node(
         prefix.last_device_node_id,
         2,
         &InsertParams {

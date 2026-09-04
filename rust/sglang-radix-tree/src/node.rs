@@ -764,8 +764,10 @@ pub enum TreeCoreRuntimeError {
     /// A non-root continuation stays inside the anchor's namespace.
     #[error("insert continuation namespace does not match non-root anchor {node_id}")]
     InsertContinuationNamespaceMismatch { node_id: NodeId },
-    /// Device indices must cover every page-aligned key atom.
-    #[error("insert value length {value_len} is shorter than aligned key length {aligned_key_len}")]
+    /// Device indices must cover the aligned key span consumed by the insert API.
+    #[error(
+        "insert value length {value_len} is shorter than required aligned span {aligned_key_len}"
+    )]
     InsertValueTooShort {
         value_len: usize,
         aligned_key_len: usize,
