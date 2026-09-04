@@ -118,7 +118,11 @@ class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
                 str(self.concurrency),
                 "--model",
                 self.model,
-                *(["--max-samples", str(self.max_samples)] if self.max_samples > 0 else []),
+                *(
+                    ["--max-samples", str(self.max_samples)]
+                    if self.max_samples > 0
+                    else []
+                ),
                 "--bench-dir",
                 str(self.bench_dir),
                 "--output-dir",

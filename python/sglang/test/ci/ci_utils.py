@@ -429,9 +429,7 @@ def run_unittest_files(
                     "duration": round(file_elapsed[filename], 2),
                 }
                 if not file_passed:
-                    reason = next(
-                        (r for f, r in failed_tests if f == filename), None
-                    )
+                    reason = next((r for f, r in failed_tests if f == filename), None)
                     if reason:
                         incremental_record["error"] = reason
                 with open(metrics_path, "a") as f:
