@@ -53,7 +53,7 @@ from sglang.srt.runtime_context import get_resources
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 
 
 # Per-token byte layout
@@ -473,12 +473,22 @@ class TestEntryPointDispatch(CustomTestCase):
         """FlashInfer SM120 sparse MLA decode matches Triton reference."""
         import importlib
 
-        if importlib.util.find_spec("flashinfer.sparse_mla_sm120") is None:
+        try:
+            flashinfer_sm120_spec = importlib.util.find_spec(
+                "flashinfer.mla._sparse_mla_sm120"
+            )
+        except (AttributeError, ImportError):
+            flashinfer_sm120_spec = None
+        if flashinfer_sm120_spec is None:
             self.skipTest("FlashInfer SM120 sparse MLA not available")
 
         k_cache, _ = _build_kvcache(4, 64, device=self.device, seed=5)
-        q, indices = _build_q_indices(1, 4, 32, 4, 64, device=self.device, seed=13)
-        topk_length = torch.tensor([32], dtype=torch.int32, device=self.device)
+        # Smallest FlashInfer DSV4 decode specialization: (num_heads, topk)=(8, 128).
+        q, indices = _build_q_indices(1, 8, 128, 4, 64, device=self.device, seed=13)
+        # Avoid saturated synthetic logits where harmless backend rounding can
+        # select a different near-tied token and dominate the output comparison.
+        q.mul_(0.001)
+        topk_length = torch.tensor([128], dtype=torch.int32, device=self.device)
 
         kwargs = dict(
             q=q,
