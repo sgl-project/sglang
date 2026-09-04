@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     _cutedsl_prefill_backend_fill,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_dsa_topk_backend,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
     _intel_xpu_page_constraint,
@@ -553,6 +554,7 @@ def handle_deterministic_inference(server_args: Any):
         # (arg_groups/overrides.py), invoked at their legacy slots.
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
+        run_post_process_pass(server_args, _deterministic_dsa_topk_backend)
         is_deepseek_model = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
