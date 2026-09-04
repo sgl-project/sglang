@@ -248,6 +248,16 @@ class MRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
         self._match_cos_sin_cache_dtype(query)
+        if (
+            positions.ndim == 1
+            and self.mrope_section
+            and fused_set_kv_buffer_arg is None
+        ):
+            # Text-only callers hand over plain 1-D positions (for instance a
+            # VLM served with --language-model-only). The mrope axes are then
+            # all equal, so replicate them and take the fused Triton kernel
+            # instead of the much slower native fallback.
+            positions = positions.unsqueeze(0).expand(3, -1)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
