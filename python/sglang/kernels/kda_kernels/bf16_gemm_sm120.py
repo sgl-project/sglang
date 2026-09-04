@@ -97,10 +97,14 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 
 
 # Decode tile buckets: (tile_m, tile_n) -> (tile_shape_mnk, atom_layout_mnk,
-# num_mma_warps). mma.sync has a 16-row minimum M atom, so M <= 16 buckets
-# share tile_m=16 and scale the N width / warp count instead. Decode GEMM is
-# weight (B) streaming bound, so for M in (16, 48] the fastest shape is the
-# NARROW tile_n=64 with every warp N-split (atom_n = warps): each warp then
+# num_mma_warps). mma.sync has a 16-row minimum M atom. Production M <= 16
+# uses eight N-split warps with tile_n=128, widening to tile_n=256 when N is
+# large enough to retain CTA parallelism. These configs win across RTX 5090
+# and RTX PRO 6000 Blackwell; the larger-M buckets below remain available for
+# direct kernel benchmarking but are excluded from automatic dispatch.
+# Decode GEMM is weight (B) streaming bound, so for M in (16, 48] the fastest
+# direct-benchmark shape uses the narrow tile_n=64 with every warp N-split
+# (atom_n = warps): each warp then
 # holds a thin tile_n/atom_n/8-wide accumulator whose smem->reg ldmatrix
 # traffic the small warp count can hide, while the CTA count doubles to
 # spread the weight stream across more SMs. The old (32/64,128) buckets
@@ -109,8 +113,7 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # 4 warps could not hide, and the M=48 rows padded to tile_m=64 still ran
 # mma.sync on 16 dead rows; M=48 was 0.26x-0.98x vs F.linear there.
 # (48,64) covers M=48 exactly (3x16, zero padded rows) and (32,64) keeps
-# atom_n=4 for the M<=32 fast path. The M<=16 buckets are untouched, so the
-# existing 1.10x-1.31x wins are preserved.
+# atom_n=4 for the M<=32 direct benchmark path.
 # Wide-N/large-K fallback for M=48: (48,64) atom_layout (3,2,1) splits the
 # tile_n=64 stream across 2 N-warps (MMA_N=4 each) and caps the grid at
 # N/64 CTAs, which on N=4096 is only 64 CTAs / 170 SMs = 38% util in a
@@ -208,7 +211,8 @@ def _make_evict_last_policy(*, loc=None, ip=None) -> Int64:
 # (48,128); N=8192 is unreachable (n>=8192 routes first).
 _TILE_CONFIGS: dict[tuple[int, int], tuple[tuple[int, int, int], tuple, int]] = {
     (16, 64): ((16, 64, 64), (1, 2, 1), 2),
-    (16, 128): ((16, 128, 64), (1, 4, 1), 4),
+    (16, 128): ((16, 128, 64), (1, 8, 1), 8),
+    (16, 256): ((16, 256, 64), (1, 8, 1), 8),
     (32, 64): ((32, 64, 64), (1, 4, 1), 4),
     (48, 64): ((48, 64, 128), (3, 2, 1), 6),
     (48, 96): ((48, 96, 128), (3, 4, 1), 12),
@@ -224,8 +228,6 @@ def _tile_key_for_m(m: int) -> tuple[int, int]:
         raise ValueError(
             f"M={m} is outside the SM120 BF16 decode range (M <= {_MAX_DECODE_M})"
         )
-    if m <= 8:
-        return (16, 64)
     if m <= 16:
         return (16, 128)
     if m <= 32:
@@ -234,6 +236,15 @@ def _tile_key_for_m(m: int) -> tuple[int, int]:
 
 
 def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
+    # Small-M projections use eight N-split warps on both RTX 5090 (170 SMs)
+    # and RTX PRO 6000 Blackwell (188 SMs).  Very wide outputs have enough
+    # N-parallel CTAs for a 256-column tile, which halves the streamed-weight
+    # CTA count without under-filling either GPU.
+    if m <= 16:
+        if n >= 24576 and n % 256 == 0:
+            return (16, 256)
+        return (16, 128)
+
     # Per-row routing for M in (32, 48], from measured M=48 bench rows:
     #   (48,11008,4096): (48,128) = 1.26x vs (48,64) = 0.96x  -> (48,128)
     #   (48,4096,11008): (48,32)  = 0.70x vs (48,128) = 0.35x -> (48,32)
@@ -287,36 +298,19 @@ def _tile_key_for_shape(m: int, n: int, k: int) -> tuple[int, int]:
 
 
 def use_bf16_gemm_sm120(m: int, n: int, k: int) -> bool:
-    """Return True when the SM120 BF16 kernel covers this decode shape."""
-    if m < 1 or m > 48:
+    """Return True when the SM120 BF16 kernel wins for this decode shape."""
+    if m < 1 or m > 16:
         return False
     # The epilogue has no M/N predication (full-tile TMA store + bias
-    # indexed by the in-tile n coordinate), so N must be tile_n-divisible
-    # -- every M<=32 bucket has tile_n >= 64, and the M>32 tiles are
-    # (48,96) and (48,128) -- while M stays safe because M <= 48 <=
-    # tile_m. K needs 64 only: run_bf16_gemm_sm120 falls back to the
-    # tile_k=64 bucket when K % 128 != 0 for M > 32.
+    # indexed by the in-tile n coordinate), so N must be tile_n-divisible.
+    # The production path is intentionally limited to M <= 16: the wider
+    # decode buckets remain available to the benchmark/tuning harness, but
+    # do not consistently beat F.linear across SM120 GPU SKUs.
     if n % 128 != 0 or k % 64 != 0:
         return False
-    # Perf-gated coverage (measured on RTX 5090 vs F.linear, Qwen3.5-4B):
-    #   M=16: all shapes WIN (1.1-1.5x). M=32: gate_up & o_proj WIN, down-proj
-    #   (small-N large-K) LOSES (0.60x). M=48: ALL shapes LOSE (0.64-0.93x) --
-    #   the M=48 tiles cannot beat cuBLAS on 5090, so bs=32 decode must fall
-    #   back to F.linear. Restrict M>32 coverage to nothing (M in (32,48]
-    #   disabled) except the shapes that demonstrably win.
-    if m > 32:
-        return False
-    if m > 24 and k >= 8192:
-        # M in (24,32] down-proj family (large K, small N) loses to F.linear.
-        return False
-    if m > 32 and k % 128 != 0:
-        # Every M in (32, 48] bucket has tile_m=48, and the k-tile count is
-        # floor(K/tile_k) with no predicated tail. The tile_k=128 (48,64)
-        # config would silently drop the trailing 64-wide K slab for
-        # 64-but-not-128-divisible K, and the tile_k=64 (48,32) fallback
-        # requires N % 32 only -- but routing M>32 at odd N to (48,32)
-        # halves the CTA count on shapes never benchmarked, so keep the
-        # kernel's coverage strictly 128-divisible for M > 32.
+    # Down- and square projections remain faster in cuBLAS on RTX PRO 6000.
+    # Expansion projections consistently benefit on both tested SM120 SKUs.
+    if n <= k:
         return False
     return True
 
