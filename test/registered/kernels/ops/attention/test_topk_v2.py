@@ -37,6 +37,7 @@ from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.topk import (
     _COOP_TOPK_MIN_FLOOR,
     _coop_topk_floor,
+    _coop_topk_workspace,
     plan_topk_v2,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -287,6 +288,33 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
 # leaves -1 padding, two writers duplicate output slots.
 COOP_FLOOR = _COOP_TOPK_MIN_FLOOR  # the lowest floor either side accepts
 
+# CoopWorkspace::parity as an int32 word index -- the witness that the cooperative
+# kernel ran. The result comparisons below are satisfied by the official kernel too,
+# so by themselves they cannot see arming fail; the lone exception is the 4096-NaN
+# case, where the official path selects NaN once the tie buffer overflows.
+# Layout from topk_coop.cuh:59-62: hist[3][4096] = 12288 words,
+# then Counters cnt[2] = 4 words, then parity. Written only at topk_coop.cuh:293,
+# after the last grid.sync(); the below-floor guard (:193) returns before the first,
+# so a row under the floor must leave it untouched.
+_COOP_WS_PARITY_WORD = 3 * 4096 + 2 * 2
+
+# Same layout, total size: 49,172 bytes through parity, padded to 49,176 because
+# TieValue is alignas(8) (topk_impl.cuh:170), then ties[2048] -> 65,560.
+_COOP_WS_BYTES = 65560
+
+
+def _coop_parity(ws: torch.Tensor) -> int:
+    # sizeof(CoopWorkspace) as the compiled module reports it, so reordering or
+    # extending the struct goes red here instead of silently reading another field;
+    # a size-preserving reorder is caught instead by callers comparing
+    # {before, after} == {0, 1} rather than !=, which no wrong offset satisfies.
+    assert ws.numel() * 4 == _COOP_WS_BYTES, (
+        f"workspace is {ws.numel() * 4} bytes, expected {_COOP_WS_BYTES}: the "
+        f"CoopWorkspace layout changed, so parity is not at word "
+        f"{_COOP_WS_PARITY_WORD}"
+    )
+    return int(ws[_COOP_WS_PARITY_WORD].item())
+
 
 @contextlib.contextmanager
 def _coop_enabled(floor: int = COOP_FLOOR):
@@ -356,9 +384,21 @@ def test_topk_v2_coop_short_row_in_wide_buffer(seq: int, k: int) -> None:
     page_table, inv_cpu = _make_page_table(1, width // PAGE_SIZE, "perm", device)
 
     with _coop_enabled():
+        ws = _coop_topk_workspace(torch.cuda.current_device())
+        before = _coop_parity(ws)
         our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
+        after = _coop_parity(ws)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+    # Every seq is at or below the floor while the buffer is wide enough to arm, so
+    # the coop kernel launches and must return at its below-floor guard without
+    # reaching the barrier that writes parity. The comparison above passes whichever
+    # kernel wrote the row, so nothing else here can see an inverted guard.
+    assert after == before and before in (0, 1), (
+        f"parity moved from {before} to {after} on a row at or below the floor: the "
+        f"cooperative kernel did work it must leave to the official kernel, so the "
+        f"two guards are not complementary"
+    )
 
 
 @pytest.mark.parametrize("k", [512, 2048])
@@ -398,12 +438,21 @@ def test_topk_v2_coop_reuses_workspace() -> None:
     page_table, inv_cpu = _make_page_table(1, seq // PAGE_SIZE + 1, "perm", device)
 
     with _coop_enabled():
+        ws = _coop_topk_workspace(torch.cuda.current_device())
         for trial in range(4):
             torch.manual_seed(1234 + trial)
             scores = torch.randn(1, width, dtype=torch.float32, device=device)[:, :seq]
+            before = _coop_parity(ws)
             our_raw = _run(scores, seq_lens, page_table, inv_cpu, k)
             ref_raw = _reference(scores, seq_lens, k)
             _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+            # The comparison above is satisfied by either kernel; this says which one
+            # produced it, and so is what puts the alternating-slot protocol on test.
+            assert {before, _coop_parity(ws)} == {0, 1}, (
+                f"trial {trial}: parity did not toggle, so the cooperative kernel "
+                f"never reached its final barrier -- the self-clean handoff this test "
+                f"exists to check was not exercised, and the results cannot show that"
+            )
 
 
 @pytest.mark.parametrize("head", [0, 300])
@@ -508,6 +557,9 @@ def test_topk_v2_coop_graph_capture_and_replay() -> None:
         # Eager first: the workspace allocation refuses to run under capture, and
         # the plan synchronizes, so both have to be done before the graph opens.
         _run(scores, seq_lens, page_table, inv_cpu, k)
+        # Already allocated by the eager run above, so this is a cache hit and cannot
+        # trip the under-capture raise. Read outside the graph, per replay.
+        ws = _coop_topk_workspace(torch.cuda.current_device())
         metadata = _plan(seq_lens)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -518,8 +570,17 @@ def test_topk_v2_coop_graph_capture_and_replay() -> None:
             torch.manual_seed(555 + trial)
             scores.copy_(torch.randn(1, seq, dtype=torch.float32, device=device))
             out.fill_(-1)  # so a partial write shows up as missing slots
+            before = _coop_parity(ws)
             graph.replay()
             torch.cuda.synchronize()
+            # A graph that dropped the cooperative attribute, or never contained the
+            # launch, still replays and still returns the right answer; without this
+            # the assertions below cannot tell that apart from a captured launch.
+            assert {before, _coop_parity(ws)} == {0, 1}, (
+                f"replay {trial}: parity did not flip, so the captured graph contains "
+                f"no completed cooperative launch -- which is exactly what this test "
+                f"claims to rule out"
+            )
             our_raw = [_invert(out.cpu().tolist()[0], inv_cpu[0])]
             ref_raw = _reference(scores, seq_lens, k)
             _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
