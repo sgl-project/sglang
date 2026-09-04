@@ -10,40 +10,29 @@ returns the rank-local ``(out, lse)`` needed by the cross-rank merge in
 ``deepseek_common/attention_forward_methods/forward_mla.py``.
 
 Non-DCP (``dcp_size == 1``) decode falls through to the base cute-dsl path
-unchanged. The DCP metadata helpers below are intentionally duplicated from
-:mod:`tokenspeed_mla_backend` (they are kernel-agnostic) so that TokenSpeed
-stays untouched; both should collapse into the base once the cute-dsl decode
-path is stable (see the TODO in tokenspeed_mla_backend.py).
+unchanged. The DCP metadata helpers live on :class:`TRTLLMMLABackend`; this
+module only supplies the cute-dsl kernel call and its decode forward.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dcp_kernels import (
-    create_mla_kv_page_table_for_dcp,
-)
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     mla_quantize_without_rope_for_fp8,
 )
-from sglang.kernels.ops.kvcache.kv_indices import (
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.dcp.layout import get_dcp_lens
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
@@ -52,22 +41,10 @@ if is_flashinfer_available():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-# The flashinfer cute-dsl MLA decode kernel returns a natural-log (base-e) LSE,
-# whereas sglang's DCP cross-rank merge (forward_mla: dcp_a2a_lse_reduce /
-# cp_lse_ag_out_rs_mla) assumes the FlashInfer-MLA/FlashMLA base-2 convention
-# (is_lse_base_on_e=False). Multiplying a natural-log LSE by log2(e) rebases it
-# to base-2 (the softmax output is base-invariant; only the LSE value changes).
-# CONFIRMED base-e (not base-2), so this rebase is required, not optional:
-# the flashinfer-dcp-backport public-API unit test asserts the public
-# trtllm_batch_decode_with_kv_cache_mla LSE against a torch.logsumexp
-# (natural-log) reference at atol=1e-2 and passes (a base-2 LSE would be
-# off by 1/ln2 ~= 44%). GPU job 467640:
-# tests/attention/test_cute_dsl_mla_dcp*.py 27/27 + 17/17 pass.
-_LSE_BASE2_FROM_NATURAL_LOG = math.log2(math.e)
 
 
 class CuteDslMLABackend(TRTLLMMLABackend):
@@ -87,195 +64,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
             backend="cute-dsl",
         )
-
-    # ------------------------------------------------------------------
-    # DCP metadata (rank-local KV lengths + page table).
-    # Duplicated from TokenspeedMLABackend — kernel-agnostic, keyed only on
-    # dcp_size / dcp_rank / page_size / req_to_token.
-    # ------------------------------------------------------------------
-    def _get_dcp_local_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
-            return seq_lens
-        return get_dcp_lens(seq_lens, parallel.dcp_size, parallel.dcp_rank).to(
-            torch.int32
-        )
-
-    def _get_dcp_local_max_seq_len(self, max_seq_len: int) -> int:
-        parallel = get_parallel()
-        if not parallel.dcp_enabled:
-            return max_seq_len
-        local_max = max_seq_len // parallel.dcp_size + int(
-            parallel.dcp_rank < max_seq_len % parallel.dcp_size
-        )
-        # A positive scheduling bound is required even when every sequence in a
-        # padded graph row is empty on this rank.
-        return max(local_max, 1)
-
-    def _fill_dcp_block_kv_indices(
-        self,
-        block_kv_indices: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        local_seq_lens: torch.Tensor,
-    ) -> None:
-        parallel = get_parallel()
-        pages_per_block = get_num_page_per_block_flashmla(self.page_size)
-        create_mla_kv_page_table_for_dcp[
-            (
-                block_kv_indices.shape[0],
-                get_num_kv_index_blocks_flashmla(
-                    block_kv_indices.shape[1], self.page_size
-                ),
-            )
-        ](
-            self.req_to_token,
-            req_pool_indices,
-            local_seq_lens,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            block_kv_indices.stride(0),
-            PHYSICAL_PAGE_SIZE=self.page_size,
-            DCP_SIZE=parallel.dcp_size,
-            DCP_RANK=parallel.dcp_rank,
-            PAGES_PER_BLOCK=pages_per_block,
-        )
-
-    def _create_block_kv_indices(
-        self,
-        batch_size: int,
-        max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        if not get_parallel().dcp_enabled:
-            return super()._create_block_kv_indices(
-                batch_size,
-                max_blocks,
-                req_pool_indices,
-                seq_lens,
-                device,
-            )
-        block_kv_indices = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
-        )
-        self._fill_dcp_block_kv_indices(
-            block_kv_indices,
-            req_pool_indices,
-            self._get_dcp_local_seq_lens(seq_lens),
-        )
-        return block_kv_indices
-
-    def _init_cuda_graph_metadata(
-        self,
-        bs: int,
-        num_tokens: int,
-        forward_mode,
-        seq_lens: torch.Tensor,
-        device: torch.device,
-    ):
-        super()._init_cuda_graph_metadata(
-            bs, num_tokens, forward_mode, seq_lens, device
-        )
-        if get_parallel().dcp_enabled:
-            metadata = self.forward_decode_metadata
-            if metadata.global_seq_lens_k is None:
-                # Plain decode under DCP also keeps the int32 GLOBAL lens in a
-                # capture-stable buffer (super allocates it only for verify):
-                # the DCP kernel consumes both the rank-local and the global
-                # lens every MLA layer, so both are maintained once per step.
-                metadata.global_seq_lens_k = torch.zeros(
-                    (bs,), dtype=torch.int32, device=device
-                )
-            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
-                self.max_context_len
-                + (self.num_draft_tokens if forward_mode.is_target_verify() else 0)
-            )
-
-    def _apply_cuda_graph_metadata(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_mode,
-    ):
-        if not get_parallel().dcp_enabled:
-            return super()._apply_cuda_graph_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                forward_mode,
-            )
-
-        metadata = self.decode_cuda_graph_metadata[bs]
-        if forward_mode.is_target_verify():
-            torch.add(
-                seq_lens[:bs],
-                self.num_draft_tokens,
-                out=metadata.global_seq_lens_k,
-            )
-            metadata.seq_lens_k.copy_(
-                self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
-            )
-            local_seq_lens = metadata.seq_lens_k
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
-            seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
-        else:
-            seq_lens = seq_lens[:bs]
-            # Hoist: refresh the int32 global + rank-local lens once per step
-            # into the capture-stable buffers; forward_decode reads them
-            # instead of recomputing get_dcp_lens + two int32 casts per MLA
-            # layer.
-            metadata.global_seq_lens_k.copy_(seq_lens)
-            metadata.seq_lens_k.copy_(self._get_dcp_local_seq_lens(seq_lens))
-            local_seq_lens = metadata.seq_lens_k
-
-        self._fill_dcp_block_kv_indices(
-            metadata.block_kv_indices,
-            req_pool_indices[:bs],
-            local_seq_lens,
-        )
-
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
-        if (
-            get_parallel().dcp_enabled
-            and self.forward_decode_metadata is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
-        ):
-            if forward_batch.forward_mode.is_target_verify():
-                metadata = self.forward_decode_metadata
-                metadata.global_seq_lens_k = metadata.seq_lens_k
-                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
-                    metadata.global_seq_lens_k
-                )
-            elif (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and self.forward_decode_metadata.seq_lens_k is not None
-            ):
-                # Same hoist as verify: the parent stored the int32 GLOBAL
-                # lens in seq_lens_k; keep it as global_seq_lens_k and derive
-                # the rank-local view once per step (forward_decode consumes
-                # both every MLA layer).
-                metadata = self.forward_decode_metadata
-                metadata.global_seq_lens_k = metadata.seq_lens_k
-                metadata.seq_lens_k = self._get_dcp_local_seq_lens(
-                    metadata.global_seq_lens_k
-                )
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.forward_decode_metadata.max_seq_len_k
-                )
-            )
 
     # ------------------------------------------------------------------
     # Kernel + decode forward.
@@ -299,11 +87,20 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
         With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
-        rank-local ``(out, lse)`` (LSE rebased to base-2 for the sglang merge).
+        rank-local ``(out, lse)``, the LSE in natural log.
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(
-                query, kv_cache, block_tables, seq_lens, max_seq_len, layer
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                layer,
+                causal_seqs=causal_seqs,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                return_lse=return_lse,
             )
         if causal_seqs is None:
             raise ValueError(
@@ -336,7 +133,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             ),
             return_lse=True,  # DCP requires the rank-local LSE for the merge
         )
-        return raw_out, lse * _LSE_BASE2_FROM_NATURAL_LOG
+        return raw_out, lse
 
     def forward_decode(
         self,
@@ -353,6 +150,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         parallel = get_parallel()
+        if parallel.dcp_enabled and get_in_autotune_dummy_run():
+            return self._dummy_dcp_decode_for_autotune(q, layer)
         if not parallel.dcp_enabled:
             return super().forward_decode(
                 q,
@@ -375,22 +174,17 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if self.data_type == torch.float8_e4m3fn:
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                if (
-                    save_kv_cache
-                    and self._fused_set_kv_concat_q_fp8
-                    and not self._unified_mla
-                ):
-                    # Static pool: out_cache_loc is already the physical loc.
-                    # Fused: bf16->fp8 quantize + KV scatter + q concat in one
-                    # launch; None when not covered.
-                    query = self._set_kv_and_concat_q_fp8_fused(
-                        layer=layer,
-                        loc=forward_batch.out_cache_loc,
-                        q=q,
-                        q_rope=q_rope,
-                        k=k,
-                        k_rope=k_rope,
-                    )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
                 if query is None:
                     q, k, k_rope = mla_quantize_without_rope_for_fp8(
                         q, q_rope, k.squeeze(1), k_rope.squeeze(1)
@@ -412,7 +206,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer, self._kv_write_loc(forward_batch), k, k_rope
             )
 
         if query is not None:

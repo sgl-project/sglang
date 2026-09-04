@@ -59,7 +59,6 @@ def tl_gemm(
             bx,
             by,
         ):
-
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype)
             C_shared = T.alloc_shared(C_shared_shape, out_dtype)

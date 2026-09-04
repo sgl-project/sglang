@@ -9,7 +9,7 @@ scheduler/test_scheduler_control.py.
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -28,7 +28,10 @@ class _FakeReq:
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
         self.to_finish = None
+        self.beam_group = None
         self._finished = is_finished
+        self.output_ids = []
+        self.weight_version_events = []
         self.time_stats = SimpleNamespace(
             wait_queue_entry_time=wait_entry,
             forward_entry_time=forward_entry,
@@ -48,12 +51,51 @@ def _req(
 def _scheduler(waiting_queue):
     s = Scheduler.__new__(Scheduler)
     s.waiting_queue = waiting_queue
+    s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+    s.beam_coordinator = MagicMock()
     return s
 
 
+class TestQueuedLimitAbort(CustomTestCase):
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_hicache_without_storage_uses_common_abort_cleanup(self):
+        candidate = _req("candidate", wait_entry=1.0)
+        candidate.priority = 0
+        incoming = _req("incoming", wait_entry=2.0)
+        incoming.priority = 1
+
+        s = _scheduler([candidate])
+        s.max_queued_requests = 1
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.enable_hierarchical_cache = True
+        s.tree_cache = MagicMock(spec=["release_aborted_request"])
+
+        self.assertFalse(s._abort_on_queued_limit(incoming))
+
+        s.tree_cache.release_aborted_request.assert_called_once_with("candidate")
+        self.assertEqual(s.waiting_queue, [])
+
+
 class TestWaitingTimeout(CustomTestCase):
+    def setUp(self):
+        patcher = patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_drops_only_reqs_past_the_deadline(self):
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)

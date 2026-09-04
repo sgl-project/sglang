@@ -10,6 +10,9 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -20,6 +23,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -238,12 +244,18 @@ class DecodingStage(PipelineStage):
 
         # Decode latents
         with autocast_context(vae_dtype, server_args.disable_autocast):
-            try:
-                # TODO: make it more specific
-                if server_args.pipeline_config.vae_tiling:
+            # not every VAE supports toggling tiling at runtime; say so instead
+            # of dropping the request, since the OOM advice below points here
+            if server_args.pipeline_config.vae_tiling:
+                try:
                     self.vae.enable_tiling()
-            except Exception:
-                pass
+                except AttributeError:
+                    logger.warning(
+                        "--vae-tiling has no effect: %s does not support "
+                        "enabling tiling at runtime. Whether it tiles is fixed "
+                        "by its VAE config.",
+                        type(self.vae).__name__,
+                    )
             should_cast_vae = not vae_autocast_enabled
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
@@ -254,16 +266,24 @@ class DecodingStage(PipelineStage):
                     decode_output = self._get_vae_decode_fn(vae, server_args)(latents)
                 except Exception as error:
                     if "out of memory" in str(error).lower():
+                        # decode runs after denoising, so the DiT and encoders
+                        # are idle but may still hold VRAM; freeing them is the
+                        # lever here. --vae-cpu-offload is not: it moves VAE
+                        # weights, not the activations that overflow.
                         if not server_args.pipeline_config.vae_tiling:
                             logger.warning(
-                                "OOM detected during VAE decoding. Please enable "
-                                "--vae-tiling to reduce peak memory usage."
+                                "OOM detected during VAE decoding. Enable "
+                                "--vae-tiling to bound the decode working set, "
+                                "and free the components that finished earlier "
+                                "with --cpu-offload-components dit,text_encoder."
                             )
                         else:
                             logger.warning(
                                 "OOM detected during VAE decoding with tiling enabled. "
-                                "Please reduce the resolution or enable "
-                                "--vae-cpu-offload."
+                                "Free the components that finished earlier with "
+                                "--cpu-offload-components dit,text_encoder, then "
+                                "lower the tile size in the model's VAE config, "
+                                "then reduce resolution or frame count."
                             )
                     raise
                 image = _ensure_tensor_decode_output(decode_output)
@@ -304,7 +324,11 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
-        vae_dtype = resolve_decode_precision(server_args, self.component_name)
+        vae_dtype = resolve_decode_precision(
+            server_args,
+            self.component_name,
+            quality=batch.sampling_params.quality,
+        )
         with self.use_declared_component(
             component_name=self.component_name,
             module=self.vae,
@@ -312,21 +336,17 @@ class DecodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
-            # Request-scoped VAE fast-path gate (see flux2_vae_cuda_opt):
-            # quality == "high" opts this decode into the near-lossless fast
-            # paths; the "lossless" default keeps the bit-exact original
-            # module path. VAEs without installed wrappers have no gate.
-            gate = getattr(vae, "_sgl_vae_fast_path_gate", None)
-            if gate is not None:
-                gate.enabled = getattr(batch.sampling_params, "quality", None) == "high"
-            try:
+            with use_vae_fast_path(
+                vae,
+                quality_allows_kernel_fusions(batch.sampling_params.quality),
+            ):
                 frames = self.decode(batch.latents, server_args, vae_dtype=vae_dtype)
 
                 # decode trajectory latents if needed
                 if batch.return_trajectory_decoded:
-                    assert (
-                        batch.trajectory_latents is not None
-                    ), "batch should have trajectory latents"
+                    assert batch.trajectory_latents is not None, (
+                        "batch should have trajectory latents"
+                    )
 
                     # 1. Batch trajectory decoding to improve GPU utilization
                     # batch.trajectory_latents is [batch_size, timesteps, channels, frames, height, width]
@@ -348,9 +368,6 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
                 else:
                     trajectory_decoded = None
-            finally:
-                if gate is not None:
-                    gate.enabled = False
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
 

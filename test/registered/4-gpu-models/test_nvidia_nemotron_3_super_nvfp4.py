@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=810, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=1200, stage="nightly", runner_config="4-gpu-b200")
 
 NEMOTRON_3_SUPER_NVFP4_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 
