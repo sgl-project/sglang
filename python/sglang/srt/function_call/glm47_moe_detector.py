@@ -193,6 +193,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._skipping_unknown_tool = False
         self._tool_call_completed = False  # Track if tool call has been completed
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
@@ -642,6 +643,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._last_arguments = ""
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._skipping_unknown_tool = False
         self._reset_streaming_state()
 
         return calls
@@ -712,6 +714,24 @@ class Glm47MoeDetector(BaseFormatDetector):
                 partial_match
             )
 
+            has_arg_key = "<arg_key" in current_text
+            is_func_name_complete = has_arg_key or is_tool_end == self.eot_token
+            if (
+                is_func_name_complete
+                and not self._skipping_unknown_tool
+                and not self._should_forward_tool_name(func_name, self._tool_indices)
+            ):
+                self._skipping_unknown_tool = True
+            if self._skipping_unknown_tool:
+                if is_tool_end == self.eot_token:
+                    self._buffer = current_text[partial_match.end() :]
+                    self._skipping_unknown_tool = False
+                    if self._buffer:
+                        following = self.parse_streaming_increment("", tools)
+                        following.normal_text = normal_text + following.normal_text
+                        return following
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
                 self.current_tool_id = 0
@@ -737,8 +757,6 @@ class Glm47MoeDetector(BaseFormatDetector):
 
             # Determine if function name is complete by checking for <arg_key> in the full text
             # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
-
             # Send tool name if needed
             tool_name_item = self._send_tool_name_if_needed(
                 func_name, has_arg_key, is_tool_end
