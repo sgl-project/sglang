@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
-indexer_weight_stream = None
 gva_is_inited = False
 
 
@@ -289,11 +288,17 @@ def npu_format_cast(
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
-def get_indexer_weight_stream():
-    global indexer_weight_stream
-    if indexer_weight_stream is None:
-        indexer_weight_stream = torch.npu.Stream()
-    return indexer_weight_stream
+from sglang.srt.hardware_backend.npu.stream_management import (
+    get_indexer_weight_stream,
+    get_routed_stream,
+    get_share_stream,
+    process_routed_expert,
+    process_shared_expert,
+    set_routed_stream,
+    set_share_stream,
+    wait_routed_stream,
+    wait_share_stream,
+)
 
 
 def init_zbal(world_size, gpu_id, world_rank, do_check=True):
@@ -386,65 +391,3 @@ def lazy_init_zbal_gva_mem(
     return res
 
 
-share_stream = None
-routed_stream = None
-
-
-def get_share_stream():
-    global share_stream
-    return share_stream
-
-
-def set_share_stream(stream):
-    global share_stream
-    share_stream = stream
-    # TODO LKL: set stream limit has impact on precision
-    # torch.npu.set_stream_limit(share_stream, 8, 16)
-
-
-def get_routed_stream():
-    global routed_stream
-    return routed_stream
-
-
-def set_routed_stream(stream):
-    global routed_stream
-    routed_stream = stream
-    # TODO LKL: set stream limit has impact on precision
-    # torch.npu.set_stream_limit(routed_stream, 16, 32)
-
-
-def wait_share_stream():
-    stream = get_share_stream()
-    if stream is not None:
-        cur_stream = torch.get_device_module().current_stream()
-        cur_stream.wait_stream(stream)
-
-
-def wait_routed_stream():
-    stream = get_routed_stream()
-    if stream is not None:
-        cur_stream = torch.get_device_module().current_stream()
-        cur_stream.wait_stream(stream)
-
-
-def process_shared_expert(hidden_states, forward_func):
-    stream = get_share_stream()
-    if stream is None:
-        stream = torch.get_device_module().Stream()
-        set_share_stream(stream)
-    stream.wait_stream(torch.get_device_module().current_stream())
-    with torch.get_device_module().stream(stream):
-        shared_output = forward_func(hidden_states)
-    return shared_output
-
-
-def process_routed_expert(hidden_states, topk_output, forward_func):
-    stream = get_routed_stream()
-    if stream is None:
-        stream = torch.get_device_module().Stream()
-        set_routed_stream(stream)
-    stream.wait_stream(torch.get_device_module().current_stream())
-    with torch.get_device_module().stream(stream):
-        shared_output = forward_func(hidden_states, topk_output)
-    return shared_output
