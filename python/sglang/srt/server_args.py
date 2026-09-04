@@ -3598,12 +3598,21 @@ class ServerArgs:
     ] = False
     watermark_key: A[
         Optional[str],
-        "Default hex-encoded 64-bit watermark key.",
+        Arg(
+            help="Default hex-encoded 64-bit watermark key. This value is visible "
+            "in the process command line; prefer --watermark-config.",
+            resolvable=True,
+        ),
         NS("exec.features"),
-    ] = None
+    ] = dataclasses.field(default=None, repr=False)
+    watermark_config: A[
+        Optional[str],
+        "Path to a JSON file containing the default watermark key and context_window.",
+        NS("exec.features"),
+    ] = dataclasses.field(default=None, repr=False)
     watermark_context_window: A[
         int,
-        "Default and maximum watermark context window.",
+        Arg(help="Default and maximum watermark context window.", resolvable=True),
         NS("exec.features"),
     ] = 4
     enable_return_hidden_states: A[

@@ -151,7 +151,7 @@ class SamplingBatchInfo:
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         features = get_exec().features
-        if features.enable_watermark:
+        if getattr(features, "enable_watermark", False):
             (
                 watermark_keys,
                 watermark_context_windows,

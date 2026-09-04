@@ -228,8 +228,15 @@ def check_server_args(server_args: Any):
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
 
+    if (cfg.watermark_key is not None or cfg.watermark_config is not None) and not (
+        cfg.enable_watermark
+    ):
+        raise ValueError(
+            "--watermark-key and --watermark-config require --enable-watermark"
+        )
+
     if cfg.enable_watermark:
-        from sglang.srt.sampling.watermark import parse_watermark_key
+        from sglang.srt.sampling.watermark_config import parse_watermark_key
 
         if cfg.device != "cuda":
             raise ValueError(

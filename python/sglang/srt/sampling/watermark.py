@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.srt.sampling.watermark_config import parse_watermark_key
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -19,7 +21,8 @@ def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -
         return {
             key: (
                 "<redacted>"
-                if key == "watermark_key" or (in_watermark_config and key == "key")
+                if key in {"watermark_key", "watermark_config"}
+                or (in_watermark_config and key == "key")
                 else redact_watermark_secrets(
                     item,
                     in_watermark_config=in_watermark_config or key == "watermark",
@@ -69,18 +72,6 @@ def normalize_watermark_request(value: Any) -> Optional[WatermarkRequestConfig]:
     ):
         raise ValueError("watermark context_window must be a positive integer")
     return WatermarkRequestConfig(key=key, context_window=context_window)
-
-
-def parse_watermark_key(value: Any) -> int:
-    if not isinstance(value, str):
-        raise ValueError("watermark key must be a hex string")
-    digits = value[2:] if value.lower().startswith("0x") else value
-    if not 1 <= len(digits) <= 16:
-        raise ValueError("watermark key must contain 1 to 16 hex digits")
-    if any(character not in "0123456789abcdefABCDEF" for character in digits):
-        raise ValueError("watermark key must contain only hex digits")
-    key = int(digits, 16)
-    return key if key < (1 << 63) else key - (1 << 64)
 
 
 def build_watermark_batch_config(

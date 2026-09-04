@@ -93,6 +93,24 @@ fn max_new_tokens_default() -> Option<i64> {
     Some(128)
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatermarkRequestConfig {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<i64>,
+}
+
+impl fmt::Debug for WatermarkRequestConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatermarkRequestConfig")
+            .field("key", &"<redacted>")
+            .field("context_window", &self.context_window)
+            .finish()
+    }
+}
+
 /// The sampling parameters of one `/generate` request. Deserialized from the
 /// client's `sampling_params` object (unknown keys are a 400, mirroring Python's
 /// `SamplingParams(**kwargs)` TypeError) and serialized by field name into the
@@ -212,6 +230,8 @@ pub struct SamplingParams {
     /// Python's `CustomParamValue` exactly.
     #[serde(default)]
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
+    #[serde(default)]
+    pub watermark: Option<WatermarkRequestConfig>,
 
     // Normalized internal fields.
     //
@@ -372,6 +392,7 @@ impl Default for SamplingParams {
             spaces_between_special_tokens: bool_true::default(),
             no_stop_trim: bool_false::default(),
             custom_params: None,
+            watermark: None,
             stream_interval: None,
             logit_bias: None,
             sampling_seed: None,
@@ -826,6 +847,7 @@ mod tests {
         "logit_bias",
         "sampling_seed",
         "custom_params",
+        "watermark",
         "stop_strs",
         "stop_regex_strs",
         "stop_str_max_len",
@@ -904,9 +926,26 @@ mod tests {
         assert!(arr[at("stop")].is_nil());
         assert!(arr[at("logit_bias")].is_nil());
         assert!(arr[at("custom_params")].is_nil());
+        assert!(arr[at("watermark")].is_nil());
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn watermark_key_is_typed_and_debug_redacted() {
+        let key = "0123456789abcdef";
+        let sampling = norm(
+            &serde_json::json!({
+                "watermark": {"key": key, "context_window": 4}
+            })
+            .to_string(),
+        );
+        let watermark = sampling.watermark.as_ref().expect("watermark parsed");
+
+        assert_eq!(watermark.key.as_deref(), Some(key));
+        assert_eq!(watermark.context_window, Some(4));
+        assert!(!format!("{sampling:?}").contains(key));
     }
 
     #[test]
