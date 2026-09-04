@@ -432,8 +432,8 @@ def _lower_reshape(mx, args, kwargs):
 @_lowering("flatten", aten=(torch.ops.aten.flatten.using_ints,))
 def _lower_flatten(mx, args, kwargs):
     value = args[0]
-    start = args[1] if len(args) > 1 else 0
-    end = args[2] if len(args) > 2 else -1
+    start = _arg(args, kwargs, 1, "start_dim", 0)
+    end = _arg(args, kwargs, 2, "end_dim", -1)
     if end < 0:
         end += value.ndim
     flattened = 1
@@ -484,10 +484,14 @@ def _lower_empty_like(mx, args, kwargs):
 @_lowering("slice", aten=(torch.ops.aten.slice.Tensor,))
 def _lower_slice(mx, args, kwargs):
     value = args[0]
-    axis = args[1] if len(args) > 1 else 0
-    start = args[2] if len(args) > 2 else 0
-    stop = args[3] if len(args) > 3 else value.shape[axis]
-    step = args[4] if len(args) > 4 else 1
+    axis = _arg(args, kwargs, 1, "dim", 0)
+    start = _arg(args, kwargs, 2, "start", 0)
+    stop = _arg(args, kwargs, 3, "end")
+    step = _arg(args, kwargs, 4, "step", 1)
+    if start is None:
+        start = 0
+    if stop is None:
+        stop = value.shape[axis]
     width = value.shape[axis]
     if start >= 0:
         start = min(start, width)
