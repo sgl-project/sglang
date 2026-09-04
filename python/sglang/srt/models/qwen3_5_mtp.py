@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import QWEN3_5_KV_SCALE_MAPPER, Qwen3_5ForCausalLM
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
@@ -162,8 +163,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
         if self.config.tie_word_embeddings:
@@ -323,6 +324,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            # The last-stage MTP draft cannot share the target embedding on PP0.
+            # Load the checkpoint embedding into its retained local copy instead
+            # of leaving the torch.empty() allocation uninitialized.
+            if name in (
+                "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
+            ):
+                param_name = "model.embed_tokens.weight"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(param_name)
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
