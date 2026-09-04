@@ -263,6 +263,32 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     assert worker.draft_model.lm_head is None
 
 
+def test_worker_skips_graph_folded_sampler_above_capture_limit():
+    """A batch above the captured graph limit must use the eager sampler.
+
+    max-running-requests can exceed cuda-graph-max-bs-decode.  Such a batch is
+    valid, but staging it into graph-sized static buffers would overflow them
+    before the model runner gets a chance to fall back to eager execution.
+    """
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    staged = []
+    sampler = SimpleNamespace(
+        max_bs=8,
+        stage_sampling_params=lambda **kwargs: staged.append(kwargs),
+    )
+    worker = SimpleNamespace(_draft_sampler=sampler, selector=object())
+    batch = SimpleNamespace(sampling_info=object())
+
+    assert worker_mod.DFlashWorkerV2._prepare_draft_sampler(worker, batch=batch, bs=8)
+    assert staged == [{"bs": 8, "sampling_info": batch.sampling_info}]
+
+    assert not worker_mod.DFlashWorkerV2._prepare_draft_sampler(
+        worker, batch=batch, bs=9
+    )
+    assert len(staged) == 1
+
+
 def test_grouped_conv_supports_runtime_block_sizes():
     """The conv indexes a position inside the block, so it must follow whatever
     block size the worker resolved -- including one that is not a power of two."""
