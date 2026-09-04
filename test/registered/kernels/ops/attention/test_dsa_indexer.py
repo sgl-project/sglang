@@ -26,7 +26,11 @@ from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAMetadata,
 )
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.indexer import (
+    C4IndexerBackendMixin,
+    _run_c4_topk_transform,
+    topk_transform_pytorch_vectorized,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -298,6 +302,70 @@ class TestDSAIndexer(CustomTestCase):
         self.config = DEFAULT_CONFIG.copy()
         self.device = "cuda"
         self.dtype = torch.bfloat16
+
+    def test_c4_paged_topk_v2_fills_raw_indices_without_v1_fallback(self):
+        from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+        batch_size = 3
+        seq_len = 4096
+        topk = 2048
+        page_size = 64
+        torch.manual_seed(37892)
+        scores = torch.randn(
+            batch_size, seq_len, dtype=torch.float32, device=self.device
+        )
+        expected_scores = scores.clone()
+        seq_lens = torch.tensor(
+            [seq_len, seq_len - 17, seq_len // 2],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        page_table = (
+            torch.arange(
+                (seq_len + page_size - 1) // page_size,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            + 1000
+        )
+        page_table = page_table.unsqueeze(0).expand(batch_size, -1).contiguous()
+        raw_indices = torch.full(
+            (batch_size, topk), -1, dtype=torch.int32, device=self.device
+        )
+        page_indices = torch.full_like(raw_indices, -1)
+        topk_metadata = plan_topk_v2(seq_lens)
+        torch.cuda.synchronize()
+
+        with envs.SGLANG_OPT_USE_TOPK_V2.override(True):
+            _run_c4_topk_transform(
+                dsa_topk_backend=DSATopKBackend.SGL_KERNEL,
+                flashinfer_topk_transform=topk_transform_pytorch_vectorized,
+                logits=scores,
+                c4_seq_lens=seq_lens,
+                page_table=page_table,
+                c4_sparse_page_indices=page_indices,
+                page_size=page_size,
+                topk_metadata=topk_metadata,
+                raw_indices=raw_indices,
+            )
+        torch.cuda.synchronize()
+
+        # Legacy top-k v1 only supports topk <= 1024. Using topk=2048 makes this
+        # a real dispatch regression test without mocking kernel calls.
+        page_bias = int(page_table[0, 0]) * page_size
+        for row in range(batch_size):
+            length = int(seq_lens[row])
+            expected = set(
+                torch.topk(expected_scores[row, :length], topk, sorted=False)
+                .indices.cpu()
+                .tolist()
+            )
+            actual_raw = set(raw_indices[row].cpu().tolist())
+            self.assertEqual(actual_raw, expected)
+
+            expected_pages = {idx + page_bias for idx in expected}
+            actual_pages = set(page_indices[row].cpu().tolist())
+            self.assertEqual(actual_pages, expected_pages)
 
     def _init_model_runner(self, config_override=None):
         """Initialize model runner with optional config override."""
