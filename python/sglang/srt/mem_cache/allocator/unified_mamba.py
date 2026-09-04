@@ -37,10 +37,9 @@ logger = logging.getLogger(__name__)
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
 
-    The token-slot surface delegates to the full-attn side (`alloc(N)` →
-    MHA token slots). The Mamba sub-pool's per-request `alloc(1)` is driven
-    separately by `UnifiedHybridReqToTokenPool`. Both sub-allocators are id-owners
-    of their own (independent) virtual-id spaces.
+    The token-slot surface is the full-attn side; the mamba sub-pool's per-request
+    `alloc(1)` is driven separately by `UnifiedHybridReqToTokenPool`. The two
+    sub-allocators own independent virtual-id spaces.
     """
 
     def __init__(
@@ -70,9 +69,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size * dcp_size
         self.lazy_compaction = lazy_compaction
 
-        # FULL is page-aware; MAMBA stays page_size=1 (state is per-request,
-        # orthogonal to the full side's per-token paging), and only FULL shards
-        # under DCP: mamba state is replicated on every rank.
+        # Only FULL shards under DCP; the mamba state is replicated on every rank
+        # and stays page_size=1, orthogonal to the full side's per-token paging.
         self.full_attn_allocator = MultiEndedAllocator(
             kvcache=kvcache.full_kv_pool,
             unified_buffer=unified_buffer,
@@ -99,11 +97,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
-        # The mamba slot allocator (PHYSICAL view) is built later by
-        # `init_unified_mamba_pools`, which wraps `self.mamba_allocator` in a
-        # `UnifiedMambaSlotAllocator` owning the v2p translate; the mamba pool is a
-        # pure PHYSICAL store. The full-attn KV pool needs no allocator either —
-        # write locations are resolved in the attention metadata.
+        # `init_unified_mamba_pools` later wraps `self.mamba_allocator` in a
+        # `UnifiedMambaSlotAllocator` owning the v2p translate; the KV pools get no
+        # allocator (write locations resolve in the attention metadata).
 
         self.free_group = None
         self.free_page_reps_group: Optional[List[torch.Tensor]] = None
@@ -129,9 +125,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # -- size: dynamic --
     @property
     def size(self) -> int:
-        # TOKENS. MUST use the SAME available view as `available_size()` so the
-        # leak invariant self-cancels (available term cancels → check reduces to
-        # `evictable + ... == allocated`, independent of peer-hole credit).
+        # TOKENS. MUST use the SAME available view as `available_size()`, so the
+        # available term cancels out of the leak invariant.
         return (
             self.full_attn_allocator.schedulable_available_size()
             + self.full_attn_allocator.allocated_count()
@@ -143,10 +138,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     # -- token-slot surface: MHA side --
 
-    # Realizable-with-compaction view so the retract gate / evict / schedule_policy
-    # don't over-retract when the mamba peer holds drainable holes an urgent flush
-    # would convert into shared-gap room. Per-side alloc gates still use the
-    # un-credited `available_size()` so they flush before extending.
+    # Realizable-with-compaction view, so the retract gate / evict / schedule_policy
+    # do not over-retract while the mamba peer holds drainable holes.
     def available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
@@ -154,18 +147,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.schedulable_available_size()
 
     def mamba_slot_full_token_cost(self) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
-
-        full and mamba share one byte buffer, so a mamba slot removes that many
-        full-KV tokens from the gap; the prefill planner reserves this so admission
-        stays inside the JOINT budget. = mamba bytes/slot ÷ full bytes/token, rounded
-        UP (conservative). Only on the shared composite (non-shared pools are separate,
-        so the planner sources this via `getattr(..., None)`).
-
-        The planner charges this against `rem_total_tokens`, which is fed by
-        `available_size()` -- widened under DCP. One widened token is
-        `entry_bytes / dcp_size` local bytes, so the conversion carries the same
-        `dcp_size`; leaving it out under-reserves the shared gap by that factor.
+        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
+        prefill planner reserves this so admission stays inside the JOINT budget,
+        rounded UP. The `dcp_size` factor is there because that budget is in widened
+        tokens, one of which is `entry_bytes / dcp_size` local bytes.
         """
         return -(
             -self.mamba_allocator.entry_bytes_per_page
@@ -240,10 +225,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full-pool virtual TOKEN ids -> physical TOKEN ids. Delegates to the
-        full-side sub-allocator. Supports ``out=`` for cuda-graph buffer stability.
-        `-1` inputs map to `-1` (treated as padding downstream).
-        """
+        """Full-pool virtual TOKEN ids -> physical TOKEN ids; `-1` passes through as
+        `-1` (padding downstream). ``out=`` supports cuda-graph buffer stability."""
         result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
         return result
 
@@ -254,10 +237,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def full_v2p_page_table(self) -> torch.Tensor:
         """Page-level virtual->physical table of the full sub-pool. Kernels that
-        build the MLA block table directly from req_to_token (e.g. trtllm_mla,
-        flashmla) gather through this to turn a VIRTUAL page into a physical one,
-        then scale by `kernel_page_multiplier` to reach the per-page block.
-        """
+        build the MLA block table straight from req_to_token gather through this,
+        then scale by `kernel_page_multiplier` to reach the per-page block."""
         return self.full_attn_allocator.virtual_to_physical
 
     @property
@@ -287,10 +268,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
         """Virtual TOKEN ids -> PHYSICAL token ids for the PD transfer engine.
-
         PHYSICAL, not kernel-facing: the transfer registers page ENVELOPES (see
-        `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`).
-        """
+        `UnifiedMLATokenToKVPool.get_contiguous_buf_infos`)."""
         # Defensive: `_validate_unified_memory_dcp` rejects this pairing at
         # argument validation, so reaching it means a config path got past that.
         assert get_parallel().attn_dcp_size == 1, (
@@ -333,11 +312,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
 
     def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Fixed-shape counterpart of `free()`; see
-        `MultiEndedAllocator._page_reps`. The mamba sub-pool is
-        slot-granular and untouched by a token free, so only the full side
-        needs the representatives.
-        """
+        """Fixed-shape counterpart of `free()`; see `MultiEndedAllocator._page_reps`.
+        The mamba sub-pool is slot-granular and untouched by a token free."""
         if free_index is None or free_index.numel() == 0:
             return
         if self.page_size == 1:
@@ -391,10 +367,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
-        """Hand the forward's metadata to BOTH sub-pools. Full derives its write-set
-        from `out_cache_loc`; the Mamba state pool isn't written via `out_cache_loc`
-        (mamba kernels, not `set_kv_buffer`), so it gets `None`.
-        """
+        """Hand the forward's metadata to BOTH sub-pools; the mamba state is written
+        by mamba kernels, not `set_kv_buffer`, so its write-set is `None`."""
         with record_function("UnifiedMambaAlloc.set_inflight_forward"):
             self.full_attn_allocator.set_inflight_forward(
                 forward_done, out_cache_loc_virtual
@@ -402,9 +376,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.set_inflight_forward(forward_done, None)
 
     def flush_opportunistic(self) -> int:
-        """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set
-        fast-path skips both calls when neither side has work.
-        """
+        """Non-urgent flush of BOTH sub-allocators; sync-free."""
         with record_function("UnifiedMambaAlloc.flush_opportunistic"):
             fa = self.full_attn_allocator
             ma = self.mamba_allocator
