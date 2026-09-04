@@ -31,8 +31,8 @@ EVERY backend, Triton included. MLA models are exempt -- their sub-pool keeps
 one latent row per layer, and several MLA configs (Kimi-Linear: head_dim 72,
 v_head_dim 128) report asymmetric dims while running the unified pool today.
 
-Pinned here so no arm silently widens to an unwired backend (`cutlass_mla`,
-`aiter`) and no arm silently narrows: `fa3` is the resolved default on
+Pinned here so no arm silently widens to an unwired backend (`aiter`) and no
+arm silently narrows: `fa3` is the resolved default on
 pre-Blackwell hosts, so its absence from an arm makes `--enable-unified-memory`
 fail to boot under its own default configuration.
 
@@ -113,7 +113,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
     # No kernel-facing-id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("cutlass_mla", "aiter")
+    UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither

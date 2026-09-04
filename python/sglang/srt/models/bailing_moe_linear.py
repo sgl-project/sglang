@@ -98,7 +98,7 @@ if _use_aiter_gfx95:
     pass
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
