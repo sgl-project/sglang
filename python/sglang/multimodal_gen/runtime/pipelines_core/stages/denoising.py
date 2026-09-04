@@ -315,6 +315,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def role_affinity(self):
         return RoleType.DENOISER
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        return num_inference_steps
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
@@ -1936,7 +1941,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        batch.record_stage_iterations(num_timesteps)
         # Re-resolve the explicit-range gate so the per-step markers
         # below honor this request's is_warmup state. Layer hooks are
         # registered by the residency manager at the use-site.

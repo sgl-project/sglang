@@ -459,3 +459,62 @@ def test_results_json_merges_retry_sessions(tmp_path):
 
     results = json.loads(path.read_text(encoding="utf-8"))
     assert {item["test_name"] for item in results} == {"first", "second"}
+
+
+def _warmup_batch_for_iterations(steps: int, target_steps: int):
+    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+
+    metrics = RequestMetrics(request_id="probe")
+    metrics.suppress_stage_breakdown = False
+    metrics.active_stage_name = "DenoisingStage"
+    return SimpleNamespace(
+        metrics=metrics,
+        num_inference_steps=steps,
+        extra={"warmup_target_num_inference_steps": target_steps},
+        is_warmup=True,
+    )
+
+
+def test_stage_formula_records_probe_and_default_iterations():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+        record_default_workload_iterations,
+    )
+
+    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
+    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps - 1)
+    record_default_workload_iterations(stage, batch)
+    assert batch.metrics.stage_iterations == {"DenoisingStage": (3, 49)}
+
+
+def test_fixed_schedule_formula_records_the_same_count_twice():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+        record_default_workload_iterations,
+    )
+
+    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
+    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: 8)
+    record_default_workload_iterations(stage, batch)
+    assert batch.metrics.stage_iterations == {"DenoisingStage": (8, 8)}
+
+
+def test_explicit_loop_record_wins_over_the_formula():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+        record_default_workload_iterations,
+    )
+
+    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
+    batch.metrics.record_stage_iterations(12, 12)
+    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps)
+    record_default_workload_iterations(stage, batch)
+    assert batch.metrics.stage_iterations == {"DenoisingStage": (12, 12)}
+
+
+def test_stage_without_a_formula_records_nothing():
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+        record_default_workload_iterations,
+    )
+
+    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
+    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: None)
+    record_default_workload_iterations(stage, batch)
+    assert batch.metrics.stage_iterations == {}
