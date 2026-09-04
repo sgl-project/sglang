@@ -687,6 +687,7 @@ class Engine(EngineScoreMixin, EngineBase):
             compute_global_rank,
             compute_local_gpu_id,
             get_ready_path,
+            get_socket_path,
         )
 
         for pp_rank in pp_rank_range:
@@ -781,7 +782,16 @@ class Engine(EngineScoreMixin, EngineBase):
                         f"tp_rank={tp_rank} is ready"
                     )
         except BaseException:
-            cls._terminate_weight_cache_daemons(daemon_procs)
+            for pp_rank in pp_rank_range:
+                for tp_rank in tp_rank_range:
+                    global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+                    ready_path = get_ready_path(global_rank)
+                    socket_path = get_socket_path(global_rank)
+                    cls._terminate_weight_cache_daemon(
+                        daemon_procs[pp_rank * tp_rank_range + tp_rank],
+                        ready_path,
+                        socket_path,
+                    )
             raise
 
         logger.info(
@@ -791,8 +801,10 @@ class Engine(EngineScoreMixin, EngineBase):
         return daemon_procs
 
     @staticmethod
-    def _terminate_weight_cache_daemons(procs, timeout: float = 10.0):
-        """Gracefully stop engine-spawned weight cache daemons.
+    def _terminate_weight_cache_daemon(
+        p, ready_path, socket_path, timeout: float = 10.0
+    ):
+        """Gracefully stop engine-spawned weight cache daemon.
 
         Send SIGTERM first so each daemon's signal handler can unlink its
         ``.sock``/``.ready`` files, then SIGKILL any straggler. This matters
@@ -802,20 +814,19 @@ class Engine(EngineScoreMixin, EngineBase):
         confusing "socket exists but connection refused" instead of a clean
         "no daemon" path.
         """
-        if not procs:
-            return
-        for p in procs:
-            if p.poll() is None:
-                p.terminate()  # SIGTERM -> daemon cleanup handler runs
-        for p in procs:
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"Weight cache daemon (pid={p.pid}) did not exit within "
-                    f"{timeout}s of SIGTERM; sending SIGKILL."
-                )
-                p.kill()
+        if p.poll() is None:
+            p.terminate()  # SIGTERM -> daemon cleanup handler runs
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                f"Weight cache daemon (pid={p.pid}) did not exit within "
+                f"{timeout}s of SIGTERM; sending SIGKILL."
+            )
+            for path in (ready_path, socket_path):
+                if os.path.exists(path):
+                    os.unlink(path)
+            p.kill()
 
     @classmethod
     def _launch_scheduler_processes(
