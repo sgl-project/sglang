@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, replace
-from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -451,53 +450,18 @@ _WORKSPACES: dict[_WorkspaceSignature, FlashInferMNNVLCuteDSLARFusion] = {}
 _WORKSPACES_LOCK = threading.RLock()
 
 
-@lru_cache(maxsize=1)
-def _max_workspace_instances() -> int:
-    from sglang.srt.environ import envs
-
-    value = int(envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES.get())
-    if value < 1:
-        raise ValueError(
-            "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES must be positive"
-        )
-    return value
-
-
 def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     *,
-    hidden_size: int | None = None,
-    top_k: int | None = None,
-    max_m: int | None = None,
-    rms_epsilon: float | None = None,
-    weight_bias: float | None = None,
+    hidden_size: int,
+    top_k: int,
+    max_m: int,
+    rms_epsilon: float,
+    weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
-    """Lookup, or before graph capture create, the process-local workspace."""
-    supplied = (hidden_size, top_k, max_m, rms_epsilon, weight_bias)
-    if all(value is None for value in supplied):
-        with _WORKSPACES_LOCK:
-            if len(_WORKSPACES) == 1:
-                return next(iter(_WORKSPACES.values()))
-            if not _WORKSPACES:
-                raise RuntimeError(
-                    "MNNVL CuTe DSL fusion workspace was not initialized before use"
-                )
-            raise RuntimeError(
-                "multiple MNNVL CuTe DSL fusion workspaces exist; configuration "
-                "arguments are required"
-            )
-    if any(value is None for value in supplied):
-        raise TypeError(
-            "hidden_size, top_k, max_m, rms_epsilon, and weight_bias must be "
-            "supplied together"
-        )
+    """Look up, or before graph capture create, the process-local workspace."""
     if not torch.cuda.is_available():
         raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
 
-    assert hidden_size is not None
-    assert top_k is not None
-    assert max_m is not None
-    assert rms_epsilon is not None
-    assert weight_bias is not None
     from sglang.srt.distributed.parallel_state import get_tp_group
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -534,11 +498,11 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
                 "creating an MNNVL CuTe DSL fusion workspace during CUDA Graph "
                 "capture is forbidden"
             )
-        if len(_WORKSPACES) >= _max_workspace_instances():
+        if _WORKSPACES:
+            # Each workspace rendezvouses its own NVLS symmetric-memory region.
             raise RuntimeError(
-                "MNNVL CuTe DSL fusion workspace instance limit exceeded; "
-                "increase SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES "
-                "only when multiple model configurations intentionally coexist"
+                "a second MNNVL CuTe DSL fusion workspace was requested; one "
+                "model configuration per process"
             )
 
         signature = _WorkspaceSignature(
