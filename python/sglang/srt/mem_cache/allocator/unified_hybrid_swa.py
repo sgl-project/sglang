@@ -31,6 +31,8 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     _chain_byte_accounting_violations,
     _end_pair_chain,
     _float_open_short_side,
+    _flush_deferred_free_group,
+    _full_tokens_before_mamba_recheck,
     _relieve_for_alloc,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
@@ -837,30 +839,28 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
                 flt = b
         _float_open_short_side(flt, demand)
 
-
-
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
         return self
 
-
     def flush_deferred_full_frees(self) -> None:
         """Expose grouped composite frees while preserving the group scope."""
-        if self.free_group is None or (
-            not self.free_group and not self.free_page_reps_group
-        ):
-            return
-        self.free_group_end()
-        self.free_group_begin()
+        _flush_deferred_free_group(
+            self,
+            (self.free_group, self.free_page_reps_group, self.full_free_group),
+        )
 
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        return _full_tokens_before_mamba_recheck(
+            self.full_attn_allocator, self.mamba_allocator, target_size
+        )
 
     def prepare_mamba_allocation(self, target_size: int) -> None:
         """Expose Full reclaim, then move the SWA float away from Mamba."""
         self.flush_deferred_full_frees()
         if target_size <= self.mamba_allocator.available_size():
             return
-        self.full_attn_allocator._flush(urgent=True)
+        self.full_attn_allocator.flush_for_allocation()
         _relieve_for_alloc(self.mamba_allocator, target_size)
-
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared buffer:

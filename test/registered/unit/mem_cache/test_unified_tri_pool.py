@@ -24,11 +24,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-import sglang.srt.mem_cache.allocator.unified_sub_pool as mea
-from sglang.srt.mem_cache.unified_cache.components import ComponentType
-
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
@@ -36,6 +31,8 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -464,14 +461,16 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
-    def test_mamba_donor_flushes_group_without_closing_it(self):
-        _, allocator = self._build_paged()
+    def test_mamba_donor_flushes_full_only_group_without_closing_it(self):
+        _, allocator = self._build_paged(page_size=1)
         full_indices = allocator.alloc(8)
         self.assertIsNotNone(full_indices)
+        allocator.free_swa(full_indices)
+        allocated_before = allocator.full_attn_allocator.allocated_count()
 
         allocator.free_group_begin()
-        allocator.free_segment(full_indices, start_pos=0)
-        self.assertTrue(allocator.free_page_reps_group)
+        allocator.free_full_segment(full_indices, start_pos=0)
+        self.assertTrue(allocator.full_free_group)
 
         donor = allocator.mamba_full_cache_donor()
         self.assertIsNotNone(donor)
@@ -479,6 +478,10 @@ class TestTriPagedFreeGroup(unittest.TestCase):
 
         self.assertEqual(allocator.free_group, [])
         self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.full_free_group, [])
+        self.assertLess(
+            allocator.full_attn_allocator.allocated_count(), allocated_before
+        )
         self.assertEqual(allocator.verify_byte_accounting(), [])
         allocator.free_group_end()
 

@@ -29,6 +29,10 @@ class MambaFullCacheDonor(Protocol):
 
     def flush_deferred_full_frees(self) -> None: ...
 
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        """Lower bound on new Full tokens before preparation can help."""
+        ...
+
     def prepare_mamba_allocation(self, target_size: int) -> None:
         """Expose layout-specific reclaim so Mamba capacity is queryable."""
         ...

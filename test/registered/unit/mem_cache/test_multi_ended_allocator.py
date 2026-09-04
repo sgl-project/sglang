@@ -29,8 +29,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -41,6 +39,7 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -3081,6 +3080,36 @@ class TestDcpWidening(unittest.TestCase):
                     # The un-scaled cost -- the bug -- would not have covered it.
                     self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
 
+    def test_mamba_donor_recheck_bound_is_aggregate_and_dcp_widened(self):
+        missing_slots = 7
+        for dcp_size in (1, 2, 4):
+            with self.subTest(dcp_size=dcp_size), self._dcp(dcp_size):
+                allocator = self._build_composite(page_size=1)
+                allocator.mamba_allocator.schedulable_available_size = MagicMock(
+                    return_value=3
+                )
+
+                bound = allocator.full_tokens_before_mamba_recheck(3 + missing_slots)
+
+                mamba_bytes = allocator.mamba_allocator.entry_bytes_per_page
+                full_bytes = allocator.full_attn_allocator.entry_bytes
+                minimum_missing_bytes = (missing_slots - 1) * mamba_bytes + 1
+                expected = -(-minimum_missing_bytes * dcp_size // full_bytes)
+                self.assertEqual(bound, expected)
+                self.assertLessEqual(
+                    bound,
+                    missing_slots * allocator.mamba_slot_full_token_cost(),
+                )
+
+    def test_allocation_flush_public_wrapper_is_urgent(self):
+        with self._dcp(1):
+            allocator = self._build_composite(page_size=1)
+            full = allocator.full_attn_allocator
+            full._flush = MagicMock(return_value=3)
+
+            self.assertEqual(full.flush_for_allocation(), 3)
+            full._flush.assert_called_once_with(urgent=True)
+
     def test_full_donor_flushes_paged_free_group_without_closing_it(self):
         with self._dcp(2):
             allocator = self._build_composite(page_size=2)
@@ -3180,6 +3209,44 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(allocator.free_group, [])
                     self.assertEqual(allocator.free_page_reps_group, [])
                     allocator.free_group_end()
+
+    def test_full_donor_batches_urgent_compaction_for_large_shortfall(self):
+        with self._dcp(1):
+            allocator = self._build_composite(
+                page_size=1,
+                lazy_compaction=True,
+            )
+            mamba_slots = UnifiedMambaSlotAllocator(
+                allocator.mamba_allocator,
+                max_size=allocator.size_mamba,
+                device=_DEV,
+            )
+
+            full_leaves = []
+            while True:
+                indices = allocator.alloc(1)
+                if indices is None:
+                    break
+                full_leaves.append(indices)
+            residual_mamba = mamba_slots.schedulable_available_size()
+            if residual_mamba:
+                self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
+
+            cache, walk = self._build_donor_cache(allocator, mamba_slots, full_leaves)
+            full = allocator.full_attn_allocator
+            original_flush = full.flush_for_allocation
+            full.flush_for_allocation = MagicMock(wraps=original_flush)
+            allocator.free_group_begin()
+
+            result = cache.evict_for_alloc(EvictParams(mamba_num=4))
+
+            self.assertGreater(walk["freed_leaves"], 1)
+            self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])
+            self.assertEqual(full.flush_for_allocation.call_count, 1)
+            self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 4)
+            self.assertIsNotNone(mamba_slots.alloc(4))
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+            allocator.free_group_end()
 
 
 if __name__ == "__main__":

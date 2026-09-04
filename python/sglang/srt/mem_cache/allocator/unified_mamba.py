@@ -26,9 +26,11 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.base import MambaFullCacheDonor
 from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     MultiEndedAllocator,
-    _relieve_for_alloc,
     _chain_byte_accounting_violations,
     _end_pair_chain,
+    _flush_deferred_free_group,
+    _full_tokens_before_mamba_recheck,
+    _relieve_for_alloc,
 )
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -148,28 +150,25 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
-
-
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor:
         return self
 
-
     def flush_deferred_full_frees(self) -> None:
         """Expose grouped Full frees without ending the caller's free group."""
-        if self.free_group is None or (
-            not self.free_group and not self.free_page_reps_group
-        ):
-            return
-        self.free_group_end()
-        self.free_group_begin()
+        _flush_deferred_free_group(self, (self.free_group, self.free_page_reps_group))
 
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        return _full_tokens_before_mamba_recheck(
+            self.full_attn_allocator, self.mamba_allocator, target_size
+        )
 
     def prepare_mamba_allocation(self, target_size: int) -> None:
         """Make deferred Full reclaim visible to the Mamba capacity view."""
         self.flush_deferred_full_frees()
+        if target_size > self.mamba_allocator.schedulable_available_size():
+            return
         if target_size > self.mamba_allocator.available_size():
             _relieve_for_alloc(self.mamba_allocator, target_size)
-
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the

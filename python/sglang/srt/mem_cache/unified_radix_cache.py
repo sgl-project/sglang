@@ -772,21 +772,36 @@ class UnifiedRadixCache(BasePrefixCache):
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
         # after its recompute.
+        last_mamba_donor_check = 0
+        mamba_donor_prepared = False
 
         def target_reached(component_type: ComponentType) -> bool:
+            nonlocal last_mamba_donor_check, mamba_donor_prepared
             if available_size_targets is None:
                 return False
             target = available_size_targets.get(component_type)
             if target is None:
                 return False
             target_component, target_size = target
+            # A Full-leaf cascade can release Mamba or SWA state directly.
+            if self._component_available_size(target_component) >= target_size:
+                return True
             if (
                 component_type == ComponentType.FULL
                 and target_component == ComponentType.MAMBA
             ):
                 donor = self.token_to_kv_pool_allocator.mamba_full_cache_donor()
                 assert donor is not None, "Mamba target requires a Full donor"
+                recheck_after = (
+                    1
+                    if mamba_donor_prepared
+                    else donor.full_tokens_before_mamba_recheck(target_size)
+                )
+                if tracker[component_type] - last_mamba_donor_check < recheck_after:
+                    return False
                 donor.prepare_mamba_allocation(target_size)
+                last_mamba_donor_check = tracker[component_type]
+                mamba_donor_prepared = True
             # Schedulable capacity includes donor holes that allocation can compact.
             return self._component_available_size(target_component) >= target_size
 
@@ -798,16 +813,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
-                while not target_reached(ct):
+                while True:
                     node_id, made_progress = self._evict_device_next_node(ct, tracker)
                     if node_id is None:
-                        if made_progress:
-                            # Internal tombstone frees are now allocator-visible;
-                            # recheck the allocation target before walking again.
-                            continue
-                        break
-                    backup_kv = self._evict_device_leaf(node_id, tracker)
-                    if backup_kv is not None:
+                        if not made_progress:
+                            break
+                    else:
+                        backup_kv = self._evict_device_leaf(node_id, tracker)
+                    if node_id is not None and backup_kv is not None:
                         # Deferred demote: run the D->H backup, demote only on success.
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
@@ -829,6 +842,8 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
+                    if target_reached(ct):
+                        break
             finally:
                 self.tree_core.evict_device_end(ct)
 
