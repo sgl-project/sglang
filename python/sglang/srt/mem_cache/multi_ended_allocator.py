@@ -3759,10 +3759,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """Translate virtual token ids to raw full-pool physical token ids."""
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
-    def translate_swa_kv_indices_for_transfer(
+    def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Translate shared virtual ids to raw SWA physical token ids."""
+        """Virtual token ids -> physical, not kernel-facing, SWA ids for PD."""
         return self.swa_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
     def set_disagg_move_gate(self, gate: Callable[[], bool]) -> None:

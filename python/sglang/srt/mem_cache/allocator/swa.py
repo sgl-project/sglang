@@ -149,6 +149,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
+    def translate_swa_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
+        return self.translate_loc_from_full_to_swa(kv_indices)
+
     def alloc(self, need_size: int):
         assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
@@ -342,16 +348,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full_indices = full_indices.to(torch.int64)
         swa_indices = swa_indices.to(self.full_to_swa_index_mapping.dtype)
         self.full_to_swa_index_mapping[full_indices] = swa_indices
-
-    def recover_swa_with_locked_full(
-        self, kept_full: torch.Tensor, incoming_full: torch.Tensor
-    ) -> torch.Tensor:
-        """Keep locked FULL slots and transfer the incoming SWA slots to them."""
-        swa_value = self.translate_loc_from_full_to_swa(incoming_full)
-        self.set_full_to_swa_mapping(kept_full, swa_value)
-        self.clear_full_to_swa_mapping(incoming_full)
-        self.full_attn_allocator.free(incoming_full)
-        return swa_value
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         if full_indices.numel() == 0:

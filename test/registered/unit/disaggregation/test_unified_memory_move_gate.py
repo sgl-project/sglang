@@ -146,6 +146,7 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         def __init__(self, gate):
             self.lazy_compaction = True
             self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
+            self._pending_hicache_load_pages = 0
             self.entry_bytes_per_page = 512
             self.disagg_move_gate = gate
 

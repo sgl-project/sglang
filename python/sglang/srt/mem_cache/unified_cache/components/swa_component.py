@@ -941,7 +941,7 @@ class SWAComponent(TreeComponent):
                 full_value = node.component_data[BASE_COMPONENT_TYPE].value
                 assert full_value is not None
                 assert len(full_value) == len(cd.value)
-                device_indices = allocator.translate_swa_kv_indices_for_transfer(
+                device_indices = allocator.translate_swa_indices_for_transfer(
                     full_value
                 )
             else:
