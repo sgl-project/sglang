@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -15,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -653,6 +655,21 @@ def run_eagle_verify(
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
     # batch.input_ids rebind in prepare_for_draft_extend.
     # Scheduler pins it in batch_record_buf for the 2-iter window.
+    # Close the spec_verify span for both EAGLE workers, which share this
+    # verify body. The device read stays inside the tracing guard:
+    # accept_lens is a device tensor that overlap_utils deliberately keeps
+    # off the host. This sits outside the `with plan_stream_ctx:` block
+    # above, so the copy does not land inside the plan stream.
+    if get_global_tracing_enabled():
+        # accept_lens includes the bonus token; correct drafts exclude it.
+        num_correct_drafts_cpu = (accept_lens - 1).tolist()
+        verify_end_ts = time.perf_counter()
+        for idx, req in enumerate(batch.reqs):
+            req.time_stats.set_spec_verify_end_time(
+                verify_end_ts,
+                num_correct_drafts=num_correct_drafts_cpu[idx],
+            )
+
     return GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=predict,
