@@ -94,8 +94,12 @@ def should_include_usage(
 ) -> tuple[bool, bool]:
     # When stream_options are specified in the request
     if stream_options:
+        # An explicit include_usage wins in BOTH directions; only an unset
+        # (None) value defers to the server default (P2.3).
         include_usage = (
-            stream_options.include_usage or stream_response_default_include_usage
+            stream_response_default_include_usage
+            if stream_options.include_usage is None
+            else bool(stream_options.include_usage)
         )
         continuous_usage_stats = bool(stream_options.continuous_usage_stats)
     else:
