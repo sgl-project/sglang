@@ -24,7 +24,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
