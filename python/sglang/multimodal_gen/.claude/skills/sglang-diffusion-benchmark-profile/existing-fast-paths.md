@@ -47,6 +47,7 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/models/vaes/fast_path_gate.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py`
 - `python/sglang/multimodal_gen/runtime/breakable_cuda_graph/runner.py`
 - `test/registered/kernels/ops/diffusion/test_qwen_image_modulation.py`
 - `test/registered/kernels/ops/diffusion/test_group_norm_silu.py`
@@ -128,8 +129,10 @@ framework-specific optimization workflow.
   Wan cublasLt/NVFP4 GELU, Qwen added-QKV, GLM/Qwen/Hunyuan/LTX fused GELU,
   LTX RMSNorm+modulate, Hunyuan QK RMSNorm, Ideogram gated RMSNorm,
   LingBot RMSNorm, SANA-Video linear attention, generic KL VAE
-  decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan VAE
-  RMSNorm+SiLU.
+  decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan / Qwen-Image
+  VAE RMSNorm+SiLU (the Qwen-Image VAE is the Wan 2.1 VAE; its gate also
+  re-expresses the `Resample` upsample input with canonical NHWC strides so
+  the 2D conv runs channels_last end-to-end).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test_quality_gate.py`, `test_fused_ln_modulate.py`,
@@ -223,7 +226,12 @@ framework-specific optimization workflow.
 - Numerical contract: these are bit-exact data-movement / same-order-add
   replacements and run independently of the request-gated Wan RMSNorm+SiLU
   path. Unsupported layouts or padding fall back to the aten chain.
-- Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`.
+- The Qwen-Image VAE (`autoencoder_kl_qwenimage.py`) uses the same
+  `cat_pad_channels_last_3d` + compact-cache helper for every causal conv
+  slot; single-frame image decodes keep the compact cache at the reference
+  size (one frame) so peak memory does not grow.
+- Validation: `test/registered/kernels/ops/diffusion/test_wan_causal_cache.py`
+  and the `test_qwen_vae_*` cases in `test_model_fast_paths.py`.
 
 15. Helios paired transposed RoPE
 - Kernel: `fused_inplace_helios_qk_rope`.
