@@ -162,10 +162,11 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         # FlashMLA uses the 584-byte packed layout; the PD handshake only
         # compares kv_cache_dtype, so mismatched prefill/decode backends would
         # pass the check and transfer garbage. Reject until the handshake
-        # carries a layout identifier and the path is tested.
+        # carries a layout identifier and the path is tested (#37838).
         assert cfg.disaggregation_mode == "null", (
             "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
-            "(uniform-FP8 KV layout is not part of the PD handshake)."
+            "(uniform-FP8 KV layout is not part of the PD handshake; see "
+            "https://github.com/sgl-project/sglang/issues/37838)."
         )
         # The trtllm-gen semaphore buffer is sized from the prefill chunk
         # bound; with chunking disabled a single long request has no bound.
