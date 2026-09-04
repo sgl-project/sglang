@@ -21,6 +21,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.chat_encoding import (
@@ -2524,6 +2525,76 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_pre_stream_bad_request_returns_http_400_and_closes_generator(self):
+        closed = False
+
+        async def _mock_pre_stream_bad_request(*args, **kwargs):
+            nonlocal closed
+            try:
+                yield (
+                    'data: {"error":{"message":"context length exceeded",'
+                    '"type":"BadRequestError","param":"prompt","code":"400"}}\n\n'
+                )
+                yield "data: [DONE]\n\n"
+            finally:
+                closed = True
+
+        self.chat._generate_chat_stream = Mock(
+            return_value=_mock_pre_stream_bad_request()
+        )
+        adapted_request = Mock(spec=GenerateReqInput)
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, self.stream_req, self.fastapi_request
+            )
+        )
+
+        self.assertIsInstance(response, ORJSONResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "object": "error",
+                "message": "context length exceeded",
+                "type": "BadRequestError",
+                "param": "prompt",
+                "code": HTTPStatus.BAD_REQUEST.value,
+            },
+        )
+        self.assertTrue(closed)
+        self.tm.create_abort_task.assert_not_called()
+
+    def test_post_start_bad_request_remains_an_sse_chunk(self):
+        async def _mock_post_start_bad_request(*args, **kwargs):
+            yield 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+            yield (
+                'data: {"error":{"message":"late failure",'
+                '"type":"BadRequestError","code":400}}\n\n'
+            )
+            yield "data: [DONE]\n\n"
+
+        self.chat._generate_chat_stream = Mock(
+            return_value=_mock_post_start_bad_request()
+        )
+        adapted_request = Mock(spec=GenerateReqInput)
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, self.stream_req, self.fastapi_request
+            )
+        )
+
+        self.assertIsInstance(response, StreamingResponse)
+
+        async def collect_chunks():
+            return [chunk async for chunk in response.body_iterator]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect_chunks())
+        self.assertIn("late failure", chunks[1])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.tm.create_abort_task.assert_called_once_with(adapted_request)
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

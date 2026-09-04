@@ -15,6 +15,7 @@ from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -312,6 +313,40 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_pre_stream_bad_request_returns_http_400_and_closes_generator(self):
+        closed = False
+
+        async def _mock_pre_stream_bad_request(*args, **kwargs):
+            nonlocal closed
+            try:
+                yield (
+                    'data:{"error":{"message":"too many tokens",'
+                    '"type":"BadRequestError","code":"400"}}\n\n'
+                )
+                yield "data: [DONE]\n\n"
+            finally:
+                closed = True
+
+        self.sc._generate_completion_stream = Mock(
+            return_value=_mock_pre_stream_bad_request()
+        )
+        request = CompletionRequest(
+            model="x", prompt="Hello world", max_tokens=100, stream=True
+        )
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.sc._handle_streaming_request(Mock(), request, self.fastapi_request)
+        )
+
+        self.assertIsInstance(response, ORJSONResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
+        self.assertEqual(json.loads(response.body)["type"], "BadRequestError")
+        self.assertTrue(closed)
+        self.sc.tokenizer_manager.create_abort_task.assert_not_called()
+
+    def test_pre_stream_converter_ignores_non_object_json(self):
+        self.assertIsNone(self.sc.maybe_convert_pre_stream_bad_request("data: []\n\n"))
 
     def test_streaming_token_ids_deltas_cover_output_exactly(self):
         req = CompletionRequest(
