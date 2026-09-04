@@ -158,8 +158,7 @@ def test_h3_generation_runs_video_lifecycle_and_preserves_audio():
             return_value=request,
         ),
         patch(
-            "sglang.multimodal_gen.apps.webui.minimax_h3."
-            "sync_scheduler_client.forward",
+            "sglang.multimodal_gen.apps.webui.minimax_h3.sync_scheduler_client.forward",
             return_value=result,
         ),
         patch(
@@ -195,8 +194,7 @@ def test_h3_generation_cleans_up_after_scheduler_error():
             return_value=request,
         ),
         patch(
-            "sglang.multimodal_gen.apps.webui.minimax_h3."
-            "sync_scheduler_client.forward",
+            "sglang.multimodal_gen.apps.webui.minimax_h3.sync_scheduler_client.forward",
             return_value=SimpleNamespace(error="generation failed"),
         ),
         pytest.raises(RuntimeError, match="generation failed"),
