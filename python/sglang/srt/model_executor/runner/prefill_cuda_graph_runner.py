@@ -1320,20 +1320,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         def _slot(name):
             return registry.get_slot(name).slice_for(bs, num_tokens)
 
+        # The dummy batch never returns logprobs, so its logprob token count is
+        # one per request -- the same invariant the scheduler asserts in
+        # _dp_gather_info. Reusing num_tokens here makes the logits-side DP
+        # gather read num_tokens rows out of a pruned_states that only has bs,
+        # which walks off the end of the buffer.
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.dp_size
+            global_num_tokens_for_logprob_cpu = [bs] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [bs]
         else:
             global_num_tokens_cpu = None
+            global_num_tokens_for_logprob_cpu = None
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
-            num_tokens_tensor = torch.tensor(
+            global_num_tokens_gpu = torch.tensor(
                 global_num_tokens_cpu, dtype=torch.int32, device=self.device
             )
-            global_num_tokens_gpu = num_tokens_tensor
-            global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob_cpu, dtype=torch.int32, device=self.device
+            )
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
