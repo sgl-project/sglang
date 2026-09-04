@@ -261,6 +261,14 @@ class Engine(EngineScoreMixin, EngineBase):
                 # Do not print logs by default
                 kwargs["log_level"] = "error"
             server_args = self.server_args_class(**kwargs)
+            # There was no command line, so the call is what the operator
+            # asked for. `log_level` is filled in above when absent, so it
+            # shows here even when the caller did not pass it.
+            object.__setattr__(
+                server_args,
+                "_launch_command",
+                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+            )
         self.server_args = server_args
         logger.info(f"server_args={server_args.resolved_dict()}")
 
@@ -1362,6 +1370,7 @@ class Engine(EngineScoreMixin, EngineBase):
         return msgspec_to_builtins(
             {
                 **self.tokenizer_manager.server_args.resolved_dict(),
+                "launch_command": self.tokenizer_manager.server_args.launch_command,
                 **self._scheduler_init_result.scheduler_infos[0],
                 "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
