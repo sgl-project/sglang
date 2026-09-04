@@ -1761,15 +1761,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Note the unit change: milliseconds -> seconds.",
     ),
     # Removed without replacement.
-    "SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION": _DeprecatedEnv(
-        note="Experimental DSA metadata optimization has been removed; this setting has no effect."
-    ),
-    "SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA": _DeprecatedEnv(
-        note="Experimental DSA metadata optimization has been removed; this setting has no effect."
-    ),
-    "SGLANG_EXPERIMENTAL_DSA_INGRAPH_VERIFY_METADATA_DG_OUT_OF_GRAPH": _DeprecatedEnv(
-        note="Experimental DSA metadata optimization has been removed; this setting has no effect."
-    ),
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
