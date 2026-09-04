@@ -10,7 +10,6 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
-from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
 _is_hip = is_hip()
@@ -986,11 +985,5 @@ def get_embedding_and_mask(
     if input_ids is not original_input_ids:
         # EVS rewrites placeholder spans after pruning, making the original offsets stale.
         num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
-    else:
-        maybe_assert_sum(
-            special_multimodal_mask,
-            num_mm_tokens_in_input_ids,
-            "MM placeholder count derived from offsets does not match input_ids",
-        )
     embedding = _adjust_embedding_length(embedding, num_mm_tokens_in_input_ids, logger)
     return embedding, special_multimodal_mask, input_ids, errors

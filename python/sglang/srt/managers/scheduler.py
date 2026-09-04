@@ -274,6 +274,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    has_mm_embedding_failures,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -4244,13 +4245,9 @@ class Scheduler(
                                 publish_indices = publish_indices[keep]
                                 publish_seq_lens = publish_seq_lens[keep]
                             self.future_map.publish(publish_indices, publish_seq_lens)
-                        elif batch_result.mm_embedding_errors is not None:
-                            keep = self._mm_embedding_success_mask(
-                                batch_result, len(batch.reqs), future_indices.device
-                            )
-                            self.future_map.publish(
-                                future_indices[keep],
-                                batch_result.new_seq_lens[keep],
+                        else:
+                            self._publish_speculative_overlap_result(
+                                batch, future_indices, batch_result
                             )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -4433,6 +4430,22 @@ class Scheduler(
         if pending is not None:
             self.ipc_channels.send_to_tokenizer.send_output(pending)
             model_runner._pending_elastic_scale_update = None
+
+    def _publish_speculative_overlap_result(
+        self,
+        batch: ScheduleBatch,
+        future_indices: torch.Tensor,
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        if not has_mm_embedding_failures(batch_result.mm_embedding_errors):
+            return
+        keep = self._mm_embedding_success_mask(
+            batch_result, len(batch.reqs), future_indices.device
+        )
+        self.future_map.publish(
+            future_indices[keep],
+            batch_result.new_seq_lens[keep],
+        )
 
     def _relay_forward_payload(
         self,
