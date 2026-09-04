@@ -223,9 +223,9 @@ class MambaMixer1(nn.Module):
     ) -> Tuple[torch.Tensor, None]:
         # Matches the call contract of Mamba2AttnBackend.forward. Falcon-Mamba
         # has no speculative-decode / radix-track support yet.
-        assert (
-            not metadata.is_target_verify
-        ), "Mamba-1 (Falcon-Mamba) does not support speculative decoding yet"
+        assert not metadata.is_target_verify, (
+            "Mamba-1 (Falcon-Mamba) does not support speculative decoding yet"
+        )
 
         conv_state = layer_cache.conv[0]
         ssm_state = layer_cache.temporal  # (slots, intermediate/tp, 1, state)
