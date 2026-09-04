@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_shm_available,
+    is_shm_gather_available,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -1268,8 +1269,15 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_cpu:
-            # TODO: add optimized all_gather_into_tensor kernel for cpu
+        # The shm region is sized to the TP group, so a degenerate group must not
+        # reach it -- the kernel would gather over the initialized world instead.
+        if (
+            _is_cpu
+            and self.world_size > 1
+            and is_shm_gather_available(self.world_size, self.local_size)
+        ):
+            torch.ops.sgl_kernel.shm_allgather_into_tensor(output, input)
+        elif _is_npu or _is_cpu:
             self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
@@ -1335,7 +1343,7 @@ class GroupCoordinator:
 
         # All-gather.
         if input_.is_cpu:
-            if is_shm_available(input_.dtype, self.world_size, self.local_size):
+            if is_shm_gather_available(self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
                 torch.distributed.all_gather_into_tensor(

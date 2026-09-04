@@ -4245,13 +4245,21 @@ def get_cpu_ids_by_node():
     return cpu_ids
 
 
-def is_shm_available(dtype, world_size, local_size):
+def is_shm_gather_available(world_size, local_size):
+    # Gather collectives only move bytes, so unlike allreduce they are dtype-agnostic.
     return (
         (cpu_has_amx_support() or is_host_cpu_arm64())
-        and dtype in [torch.bfloat16, torch.float16, torch.float]
         and world_size >= 1
         and world_size == local_size
     )
+
+
+def is_shm_available(dtype, world_size, local_size):
+    return is_shm_gather_available(world_size, local_size) and dtype in [
+        torch.bfloat16,
+        torch.float16,
+        torch.float,
+    ]
 
 
 def lru_cache_frozenset(maxsize=128):
