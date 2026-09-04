@@ -59,6 +59,25 @@ class _FakeCPGroup:
         torch.cat(self.all_rank_tensors, dim=0, out=output)
 
 
+class _SendbufCPGroup:
+    """All-gather fake that honors the caller's sendbuf and records it.
+
+    ``_FakeCPGroup`` ignores ``input_tensor``; this one places it in its own rank slot,
+    so the gathered result depends on what the sender actually staged.
+    """
+
+    def __init__(self, all_rank_tensors, rank):
+        self.all_rank_tensors = all_rank_tensors
+        self.rank = rank
+        self.sent = None
+
+    def all_gather_into_tensor(self, output, input_tensor):
+        self.sent = input_tensor
+        parts = list(self.all_rank_tensors)
+        parts[self.rank] = input_tensor
+        torch.cat(parts, dim=0, out=output)
+
+
 class TestCPStrategyUnit(CustomTestCase):
     def tearDown(self):
         init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="zigzag")
@@ -589,6 +608,94 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             self.assertTrue(torch.equal(gathered, kv))
 
+    def test_zigzag_packed_sendbuf_reaches_the_collective_unchanged(self):
+        """The packed sendbuf must be handed to the collective as the very same tensor.
+
+        ``_pack_local_kv_for_gather`` allocates in the NCCL symmetric-memory pool
+        precisely so the collective sees a window-resident sendbuf. The generic gather
+        path re-slices to ``local_len`` and re-pads to ``max_len``, which hands NCCL a
+        fresh out-of-window tensor of the exact same shape -- the gathered tokens still
+        come out right, so identity is the only observable difference. Padded metadata
+        (``per_rank_logical_token != per_rank_actual_token``) is required for the two
+        paths to diverge at all, and only ranks whose logical rows are below
+        ``max_len`` can tell them apart.
+        """
+        cp_size = 4
+        seq_lens = [11, 13]
+        extend_seq_lens = [9, 10]
+        total = sum(extend_seq_lens)
+        align = cp_size * 2
+        kv_lora_rank = 4
+        kv = torch.arange(total * 1 * 6).view(total, 1, 6).float()
+
+        metas, physical_shards = [], []
+        for rank in range(cp_size):
+            meta = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            with patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=align,
+            ):
+                pad_logical_token_to_physical(meta)
+            metas.append(meta)
+            physical_shards.append(
+                ZigzagCPStrategy(cp_size=cp_size).shard_hidden_states(
+                    kv, self._forward_batch(meta, extend_seq_lens)
+                )
+            )
+
+        # Logical [6, 5, 4, 4] padded up to 8 physical rows: only rank 0 already sends
+        # max_len rows, so ranks 1-3 are the ones that expose a re-pad in the gather.
+        self.assertEqual(metas[0].per_rank_logical_token, [6, 5, 4, 4])
+        self.assertEqual(metas[0].per_rank_actual_token, [align] * cp_size)
+        max_len = max(metas[0].per_rank_logical_token)
+
+        for rank in range(cp_size):
+            shard = physical_shards[rank]
+            group = _SendbufCPGroup(
+                [other[:max_len] for other in physical_shards], rank
+            )
+            strategy = ZigzagCPStrategy(cp_size=cp_size)
+            real_pack = strategy._pack_local_kv_for_gather
+            packed = {}
+
+            def pack_spy(**kwargs):
+                packed["buf"] = real_pack(**kwargs)
+                return packed["buf"]
+
+            written = {}
+            forward_batch = self._forward_batch(metas[rank], extend_seq_lens)
+            forward_batch.out_cache_loc = torch.arange(total)
+
+            with (
+                get_parallel().override(attn_cp_rank=rank, attn_cp_group=group),
+                patch.object(strategy, "_pack_local_kv_for_gather", pack_spy),
+                patch(
+                    "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
+                    return_value=SimpleNamespace(
+                        set_mla_kv_buffer=lambda layer, loc, nope, rope: written.update(
+                            nope=nope, rope=rope
+                        )
+                    ),
+                ),
+            ):
+                strategy.materialize_full_mla_kv(
+                    forward_batch,
+                    "layer",
+                    shard[..., :kv_lora_rank],
+                    shard[..., kv_lora_rank:],
+                )
+
+            self.assertEqual(tuple(packed["buf"].shape), (max_len, 1, 6))
+            self.assertIs(group.sent, packed["buf"])
+            self.assertTrue(
+                torch.equal(torch.cat([written["nope"], written["rope"]], dim=-1), kv)
+            )
+
     def test_zigzag_padding_aligns_local_tensors(self):
         cp_size = 2
         metadata = SimpleNamespace(
@@ -637,6 +744,10 @@ class TestCPZigzagStrategy(CustomTestCase):
         forward_batch = SimpleNamespace(
             out_cache_loc=cache_loc,
             encoder_out_cache_loc=torch.arange(3) + 32,
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_actual_token=[3, 3],
+                per_rank_logical_token=None,
+            ),
         )
         layer = SimpleNamespace(
             is_cross_attention=False,
@@ -648,6 +759,7 @@ class TestCPZigzagStrategy(CustomTestCase):
         strategy = ZigzagCPStrategy(cp_size=2)
 
         with (
+            get_parallel().override(attn_cp_rank=0),
             patch.object(strategy, "gather_kv_cache", return_value=local_kv) as gather,
             patch(
                 "sglang.srt.layers.cp.zigzag.get_token_to_kv_pool",
@@ -1096,6 +1208,135 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 )
 
             self.assertTrue(torch.equal(gathered, kv))
+
+    def test_interleave_gather_sends_from_its_own_output_slice(self):
+        """The all-gather sendbuf must be this rank's own slice of the output.
+
+        NCCL only picks the symmetric-memory kernel when both buffers live in the
+        registered window; the gather relies on the in-place form
+        (sendbuff == recvbuff + rank * sendcount) to get there with a single
+        symmetric allocation. A rewrite that stages into a separate padded buffer
+        still returns the right tokens but silently falls back to the ring kernel.
+        """
+        cp_size, rank, total_tokens = 4, 2, 10
+        x = torch.arange(total_tokens * 2).view(total_tokens, 2)
+        metadata = self._metadata_for_rank(
+            rank,
+            cp_size=cp_size,
+            seq_lens=[total_tokens],
+            extend_seq_lens=[total_tokens],
+        )
+        # [3, 3, 2, 2]: rank 2 sends 2 logical rows inside a 3-row physical slice.
+        self.assertEqual(metadata.per_rank_actual_token, [3, 3, 2, 2])
+        local_x = x[rank::cp_size]
+
+        recorded = {}
+
+        def record(output, input_tensor):
+            recorded["output"] = output
+            recorded["input"] = input_tensor
+
+        fb = self._forward_batch(metadata, [total_tokens])
+        with (
+            patch(
+                "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+                side_effect=record,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+                return_value=torch.no_grad(),
+            ),
+            get_parallel().override(
+                attn_cp_rank=rank, attn_cp_size=cp_size, attn_cp_group=object()
+            ),
+        ):
+            InterleaveCPStrategy(cp_size=cp_size).gather_kv_cache(local_x, fb)
+
+        gathered, send = recorded["output"], recorded["input"]
+        physical_rank_len = max(metadata.per_rank_actual_token)
+        self.assertEqual(gathered.shape[0], cp_size * physical_rank_len)
+        self.assertEqual(tuple(send.shape), (physical_rank_len, 2))
+        self.assertTrue(send.is_contiguous())
+        self.assertEqual(
+            send.untyped_storage().data_ptr(),
+            gathered.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            send.storage_offset(), rank * physical_rank_len * gathered.stride(0)
+        )
+        self.assertTrue(torch.equal(send[: local_x.shape[0]], local_x))
+
+    def test_interleave_gather_never_reads_padding_rows(self):
+        """Padding rows of the all-gather output must never reach the result.
+
+        The sendbuf is this rank's slice of the output and only its first
+        per_rank_logical_token[rank] rows get written -- there is no full-width zero
+        fill any more. That is only safe because index_select reads exactly
+        ceil((total_tokens - rank) / cp_size) rows out of each rank's slice. Here the
+        collective is faked so that *every* rank's padding rows, including this one's,
+        arrive as NaN, so any off-by-one in that derivation shows up as garbage in the
+        gathered tokens.
+        """
+        cp_size, total_tokens, align = 4, 10, 8
+        x = torch.arange(total_tokens * 3).view(total_tokens, 3).float()
+
+        for rank in range(cp_size):
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=[total_tokens],
+                extend_seq_lens=[total_tokens],
+            )
+            with patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=align,
+            ):
+                pad_logical_token_to_physical(metadata)
+            # Logical [3, 3, 2, 2] aligned up to 8 rows: 5-6 rows per slice are junk.
+            self.assertEqual(metadata.per_rank_logical_token, [3, 3, 2, 2])
+            self.assertEqual(metadata.per_rank_actual_token, [align] * cp_size)
+
+            logical_lens = metadata.per_rank_logical_token
+            local_x = x.new_full((align, x.shape[1]), float("nan"))
+            local_x[: logical_lens[rank]] = x[rank::cp_size]
+
+            def all_gather(output, input_tensor, rank=rank):
+                # Faithful either way: a self-copy when the sendbuf already is this
+                # rank's slice, a real staging copy when it is a separate buffer.
+                output[rank * align : (rank + 1) * align].copy_(input_tensor)
+                for other in range(cp_size):
+                    base = other * align
+                    if other != rank:
+                        output[base : base + logical_lens[other]] = x[other::cp_size]
+                    output[base + logical_lens[other] : base + align] = float("nan")
+
+            fb = self._forward_batch(metadata, [total_tokens])
+            with (
+                patch(
+                    "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+                    side_effect=all_gather,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+                    return_value=torch.no_grad(),
+                ),
+                get_parallel().override(
+                    attn_cp_rank=rank, attn_cp_size=cp_size, attn_cp_group=object()
+                ),
+            ):
+                gathered = InterleaveCPStrategy(cp_size=cp_size).gather_kv_cache(
+                    local_x, fb
+                )
+
+            self.assertTrue(torch.equal(gathered, x))
 
     def test_interleave_materializes_full_mla_kv(self):
         strategy = InterleaveCPStrategy(cp_size=2)
