@@ -445,15 +445,24 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     ):
         return
     arch = model_config_of(server_args).hf_config.architectures[0]
-    if arch in (
+    if arch not in (
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
     ):
-        declare_resolution(
-            server_args,
-            "_apply_inkling_prefill_cuda_graph_default",
-            cuda_graph_backend_prefill=Backend.FULL,
-        )
+        return
+    # Only fa4 can capture a prefill graph; TritonAttnBackend rejects the EXTEND
+    # forward mode, so opting in off SM100 dies in capture.
+    from sglang.srt.arg_groups.model_overrides.inkling import (
+        resolve_inkling_attention_backend,
+    )
+
+    if resolve_inkling_attention_backend(server_args) != "fa4":
+        return
+    declare_resolution(
+        server_args,
+        "_apply_inkling_prefill_cuda_graph_default",
+        cuda_graph_backend_prefill=Backend.FULL,
+    )
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
