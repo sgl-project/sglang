@@ -1933,6 +1933,8 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
+        if not config.num_experts:
+            return None
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.num_experts,
@@ -2706,6 +2708,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         text_config = getattr(config, "text_config", config)
+        if not text_config.num_experts:
+            return None
         return ModelConfigForExpertLocation(
             num_layers=text_config.num_hidden_layers,
             num_logical_experts=text_config.num_experts,
