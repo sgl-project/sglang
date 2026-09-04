@@ -33,7 +33,6 @@ class Mod(nn.Module):
 
 
 class TestGemm(CustomTestCase):
-
     @parametrize(
         M=[1, 101],
         N=[16, 32 * 13],
