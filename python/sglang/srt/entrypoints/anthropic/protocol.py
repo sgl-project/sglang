@@ -328,9 +328,9 @@ class AnthropicTaskBudget(BaseModel):
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
-    ``effort`` maps to the OpenAI ``reasoning_effort`` knob (``xhigh`` →
-    ``max`` because the OpenAI Literal does not include ``xhigh``).
-    ``task_budget`` is propagated as a custom-param hint.
+    ``effort`` maps directly onto the OpenAI ``reasoning_effort`` knob,
+    which accepts every tier in this Literal. ``task_budget`` is
+    propagated as a custom-param hint.
     """
 
     effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
