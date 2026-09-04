@@ -433,7 +433,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
 
   m.def("ggml_moe_get_block_size(int type) -> int");
-  m.impl("ggml_moe_get_block_size", torch::kCUDA, &ggml_moe_get_block_size);
+  // This scalar-only helper has no Tensor argument for backend dispatch.
+  m.impl("ggml_moe_get_block_size", &ggml_moe_get_block_size);
+
+  m.def("ggml_supports_iq_mmq() -> bool");
+  // This scalar-only capability query has no Tensor argument for dispatch.
+  m.impl("ggml_supports_iq_mmq", &ggml_supports_iq_mmq);
 
   /*
    * From csrc/mamba

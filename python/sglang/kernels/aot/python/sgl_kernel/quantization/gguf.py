@@ -60,3 +60,10 @@ def ggml_moe_a8_vec(
 
 def ggml_moe_get_block_size(type: int) -> int:
     return torch.ops.sgl_kernel.ggml_moe_get_block_size.default(type)
+
+
+def ggml_supports_iq_mmq() -> bool:
+    try:
+        return bool(torch.ops.sgl_kernel.ggml_supports_iq_mmq.default())
+    except (AttributeError, RuntimeError):
+        return False

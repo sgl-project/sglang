@@ -750,6 +750,8 @@ torch::Tensor ggml_moe_a8_vec(
 
 int64_t ggml_moe_get_block_size(int64_t type);
 
+bool ggml_supports_iq_mmq();
+
 /*
  * From csrc/spatial
  */
