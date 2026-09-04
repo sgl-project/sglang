@@ -132,7 +132,6 @@ QUANTIZATION_CHOICES = [
     "fp8",  # MOE + linear online quantization.
     "mxfp8",  # MOE + linear online quantization.
     "gptq",
-    "marlin",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",
@@ -2067,7 +2066,12 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK, UNO. Or any name registered via `SpeculativeAlgorithm.register`.",
+        NS("spec"),
+    ] = None
+    uno_lora_path: A[
+        Optional[str],
+        "Path to the UNO draft LoRA checkpoint.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2815,6 +2819,23 @@ class ServerArgs:
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
         NS("memory"),
     ] = 4
+
+    # -------------------------------------------------------------------------
+    # Unified Radix Cache
+    # -------------------------------------------------------------------------
+    enable_unified_cache_external_linker: A[
+        bool,
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        NS("memory"),
+    ] = False
+    unified_cache_external_linker_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-cache-external-linker.",
+            choices=["mooncake"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
 
     # -------------------------------------------------------------------------
     # Hierarchical sparse attention
