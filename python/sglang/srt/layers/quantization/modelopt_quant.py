@@ -376,6 +376,27 @@ class ModelOptQuantConfig(QuantizationConfig):
         if prefix.startswith("language_model."):
             prefixes_to_check.append(prefix.removeprefix("language_model."))
 
+        # Expand fused module names to their checkpoint shard names. The exclude
+        # list may reference per-projection names (e.g. "q_proj") while the model
+        # builds a fused module (e.g. "qkv_proj"), so matching must consider the
+        # unfused constituents.
+        if self.packed_modules_mapping:
+            expanded = []
+            for p in prefixes_to_check:
+                head, _, tail = p.rpartition(".")
+                for shard_name in self.packed_modules_mapping.get(tail, []):
+                    expanded_prefix = f"{head}.{shard_name}" if head else shard_name
+                    expanded.append(expanded_prefix)
+                    if expanded_prefix.startswith("language_model."):
+                        expanded.append(expanded_prefix.removeprefix("language_model."))
+            prefixes_to_check.extend(expanded)
+
+        # Vision-language checkpoints sometimes rename "model.visual.*" to
+        # "visual.*" during load; also test the "model."-prefixed variant.
+        prefixes_to_check.extend(
+            "model." + p for p in prefixes_to_check if not p.startswith("model.")
+        )
+
         # Fused module patterns: the exclude list may reference a sub-component
         # (e.g., "q_a_proj") that is fused into a combined parameter name
         # (e.g., "fused_qkv_a_proj_with_mqa"). We check if the last segment of

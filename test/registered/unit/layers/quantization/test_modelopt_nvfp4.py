@@ -17,6 +17,55 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class TestModelOptIsLayerExcluded(unittest.TestCase):
+    def test_exact_match(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["lm_head"],
+        )
+        self.assertTrue(config.is_layer_excluded("lm_head"))
+        self.assertFalse(config.is_layer_excluded("embed_tokens"))
+
+    def test_language_model_prefix_stripping(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0.self_attn.q_proj"],
+        )
+        self.assertTrue(
+            config.is_layer_excluded("language_model.model.layers.0.self_attn.q_proj")
+        )
+
+    def test_packed_modules_mapping_expansion(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0.self_attn.q_proj"],
+            packed_modules_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+        )
+        self.assertTrue(config.is_layer_excluded("model.layers.0.self_attn.qkv_proj"))
+
+    def test_model_prefix_variant(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.visual.encoder.layers.0.attn.qkv_proj"],
+            packed_modules_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+        )
+        self.assertTrue(
+            config.is_layer_excluded("visual.encoder.layers.0.attn.qkv_proj")
+        )
+
+    def test_wildcard_pattern(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.visual.*"],
+        )
+        self.assertTrue(config.is_layer_excluded("visual.encoder.layers.0.attn.q_proj"))
+
+
 class TestModelOptNvfp4(CustomTestCase):
     def _make_layer(self):
         return MergedColumnParallelLinear(
