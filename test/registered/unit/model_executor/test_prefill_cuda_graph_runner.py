@@ -492,6 +492,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             forward_mode=SimpleNamespace(is_target_verify=lambda: False),
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
+            dp_prefill_cuda_graph_max_prefix_len=0,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
         )
