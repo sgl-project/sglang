@@ -45,6 +45,11 @@ def handle_flashinfer_megamoe(server_args: ServerArgs) -> None:
     if cfg.moe_runner_backend != "flashinfer_megamoe":
         return
 
+    if cfg.enable_two_batch_overlap:
+        raise ValueError(
+            "--moe-runner-backend flashinfer_megamoe does not support "
+            "--enable-two-batch-overlap yet; disable TBO for this backend."
+        )
     if cfg.moe_a2a_backend not in ("none", "megamoe"):
         raise ValueError(
             "--moe-runner-backend flashinfer_megamoe owns dispatch and combine; "

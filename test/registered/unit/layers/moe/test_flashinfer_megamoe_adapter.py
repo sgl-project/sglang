@@ -38,6 +38,11 @@ def test_flashinfer_megamoe_rejects_eplb():
         _resolve_dummy(enable_eplb=True)
 
 
+def test_flashinfer_megamoe_rejects_tbo():
+    with pytest.raises(ValueError, match="does not support.*two-batch-overlap"):
+        _resolve_dummy(enable_two_batch_overlap=True)
+
+
 def test_mxfp4_weight_view_is_zero_copy():
     storage = torch.arange(16, dtype=torch.uint8)
     viewed = _view_byte_dtype(storage, torch.float4_e2m1fn_x2)
