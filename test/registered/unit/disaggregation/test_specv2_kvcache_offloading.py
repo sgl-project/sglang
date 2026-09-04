@@ -20,6 +20,8 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -47,6 +49,31 @@ def _make_mock_req(
     return req
 
 
+class _RecordingAllocator(BaseTokenToKVPoolAllocator):
+    """Single-pool double. Subclassing the base routes free_full / free_segment /
+    free_segments into free(), so a new free API cannot slip past the recorder."""
+
+    def __init__(self, page_size: int):
+        super().__init__(
+            size=1024,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.freed = []
+
+    def clear(self):
+        self.freed = []
+
+    def alloc(self, need_size: int):
+        raise NotImplementedError
+
+    def free(self, free_index: torch.Tensor):
+        self.freed.append(free_index.clone())
+
+
 def _make_manager(pool_size: int, page_size: int = 1):
     """Create a DecodeKVCacheOffloadManager with mock pools for testing."""
     # Build a real req_to_token tensor so indexing works
@@ -55,15 +82,16 @@ def _make_manager(pool_size: int, page_size: int = 1):
     req_to_token_pool = MagicMock()
     req_to_token_pool.req_to_token = req_to_token
 
-    freed_indices = []
-
-    allocator = MagicMock()
-    allocator.free = MagicMock(
-        side_effect=lambda idx: freed_indices.append(idx.clone())
-    )
+    allocator = _RecordingAllocator(page_size)
+    freed_indices = allocator.freed
 
     tree_cache = MagicMock()
     tree_cache.protected_size_ = 0
+    tree_cache.req_to_token_pool = req_to_token_pool
+    tree_cache.token_to_kv_pool_allocator = allocator
+    tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
+        tree_cache, owner, ranges
+    )
 
     # Bypass __init__ entirely and set attributes directly
     manager = object.__new__(DecodeKVCacheOffloadManager)
@@ -99,14 +127,12 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Prefill [0:8] and committed [8:20]; no overalloc free.
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 8, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(8, 20, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
     def test_with_overallocation(self):
-        """With spec v2, overallocated slots [committed:allocated] must be freed."""
+        """With spec v2, the over-allocated slots go back with the row."""
         manager, freed = _make_manager(pool_size=32)
         req = _make_mock_req(
             req_pool_idx=0,
@@ -117,15 +143,12 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Prefill [0:8], committed [8:20], overallocated [20:28].
-        self.assertEqual(len(freed), 3)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 8, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(8, 20, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[2], torch.arange(20, 28, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
 
-    def test_overallocation_with_page_alignment(self):
-        """With page_size > 1, start of overallocated range is ceil-aligned."""
+    def test_unaligned_committed_len_frees_the_whole_row(self):
+        """A mid-page committed length needs no alignment arithmetic here."""
         page_size = 4
         manager, freed = _make_manager(pool_size=32, page_size=page_size)
         req = _make_mock_req(
@@ -137,30 +160,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Prefill [0:4], committed [4:10],
-        # overallocated: start_p = ceil_align(10, 4) = 12, end_p = 28 => [12:28]
-        self.assertEqual(len(freed), 3)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(4, 10, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[2], torch.arange(12, 28, dtype=torch.int64)))
-
-    def test_overallocation_page_aligned_noop(self):
-        """When ceil_align(committed, page_size) >= allocated, no overalloc free."""
-        page_size = 4
-        manager, freed = _make_manager(pool_size=32, page_size=page_size)
-        req = _make_mock_req(
-            req_pool_idx=0,
-            kv_committed_len=10,  # ceil_align(10, 4) = 12
-            kv_allocated_len=12,  # same as aligned start
-            origin_len=4,
-        )
-
-        manager._release_finished_req(req)
-
-        # Prefill [0:4] and committed [4:10]; no overalloc since start_p == end_p
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(4, 10, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 28, dtype=torch.int64)))
 
     def test_prefix_indices_decremented(self):
         """protected_size_ is decremented by len(req.prefix_indices)."""
@@ -195,10 +196,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._release_finished_req(req)
 
-        # Two frees in order: prefill [0:8] then committed [8:20].
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 8, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(8, 20, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         # State entry is removed at the end of _release_finished_req.
         self.assertNotIn(req, manager.offloaded_state)
 
@@ -239,12 +238,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager.finalize_release_on_finish(req)
 
-        # _release_finished_req frees prefill [0:12] then committed [12:13].
-        self.assertEqual(len(freed), 2)
-        expected_prefill = torch.arange(0, 12, dtype=torch.int64)
-        expected_committed = torch.arange(12, 13, dtype=torch.int64)
-        self.assertTrue(torch.equal(freed[0], expected_prefill))
-        self.assertTrue(torch.equal(freed[1], expected_committed))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 13, dtype=torch.int64)))
         # No state entry is left behind.
         self.assertNotIn(req, manager.offloaded_state)
 
@@ -424,9 +419,8 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         manager._check_offload_progress(1)
 
-        self.assertEqual(len(freed), 2)
-        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
-        self.assertTrue(torch.equal(freed[1], torch.arange(4, 20, dtype=torch.int64)))
+        self.assertEqual(len(freed), 1)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 20, dtype=torch.int64)))
         manager.req_to_token_pool.free.assert_called_once_with(req)
         self.assertNotIn(req, manager.offloaded_state)
         self.assertNotIn(req, manager.offload_inflight)
