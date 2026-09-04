@@ -65,6 +65,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extend_prefill_causal(layer) -> bool:
+    return not (
+        layer.is_cross_attention
+        or layer.attn_type
+        in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+    )
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
@@ -1343,10 +1351,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
-            causal = (
-                not layer.is_cross_attention
-                and layer.attn_type != AttentionType.ENCODER_ONLY
-            )
+            causal = _extend_prefill_causal(layer)
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
@@ -1382,12 +1387,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
-            causal = True
-            if (
-                layer.is_cross_attention
-                or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
+            causal = _extend_prefill_causal(layer)
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
