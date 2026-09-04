@@ -79,7 +79,20 @@ def _ordered_gguf_shard_ids(shard_ids: list) -> list:
         shard_ids
     ) == set(range(len(shard_ids))):
         return sorted(shard_ids)
-    return list(shard_ids)
+
+    # A single fused GGUF tensor can span several logical shards and arrive
+    # with a tuple shard id (e.g. in_proj_qkv -> in_proj_qkvz shards
+    # (0,1,2)). Order mixed shard ids by their first logical index so the
+    # fused tensor lands in front of trailing single-shard tensors (e.g.
+    # in_proj_z -> 3), regardless of the GGUF file's tensor order.
+    def _logical_index(shard_id):
+        if isinstance(shard_id, tuple):
+            return min(shard_id)
+        if isinstance(shard_id, str):
+            return {"q": 0, "k": 1, "v": 2}.get(shard_id, 999)
+        return 999 if shard_id is None else shard_id
+
+    return sorted(shard_ids, key=_logical_index)
 
 
 class GGUFConfig(QuantizationConfig):
