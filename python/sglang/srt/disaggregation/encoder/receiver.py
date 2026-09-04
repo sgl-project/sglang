@@ -54,6 +54,7 @@ from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
     get_zmq_socket_on_host,
+    try_bind_socket,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,6 @@ class EncoderBootstrapServer:
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
         self._lock = threading.Lock()
-        self._server: Optional[uvicorn.Server] = None  # set in _run_server
         self._health_check_interval = (
             health_check_interval
             if health_check_interval is not None
@@ -176,6 +176,17 @@ class EncoderBootstrapServer:
         async def _list():
             return {"encoder_urls": self.list_urls()}
 
+        self._socket = try_bind_socket(self.host, self.port, listen=True)
+        self.port = self._socket.getsockname()[1]
+        config = uvicorn.Config(
+            self.app,
+            host=self.host,
+            port=self.port,
+            log_level="warning",
+            access_log=False,
+            loop="auto",
+        )
+        self._server = uvicorn.Server(config)
         self.thread = threading.Thread(
             target=self._run_server, daemon=True, name="EncoderBootstrap"
         )
@@ -310,31 +321,22 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
-        config = uvicorn.Config(
-            self.app,
-            host=self.host,
-            port=self.port,
-            log_level="warning",
-            access_log=False,
-            loop="auto",
-        )
-        self._server = uvicorn.Server(config)
         logger.info(
             f"EncoderBootstrapServer starting on {self.host}:{self.port} "
             f"(health_check every {self._health_check_interval}s, "
             f"timeout {self._health_check_timeout}s)"
         )
         try:
-            self._server.run()
+            self._server.run(sockets=[self._socket])
         except Exception as e:
             logger.error(f"EncoderBootstrapServer error: {e}", exc_info=True)
+        finally:
+            self._socket.close()
 
     def close(self):
-        if self._server is not None:
-            # uvicorn polls should_exit on its own event loop; thread-safe.
-            self._server.should_exit = True
-            logger.info("Stopping EncoderBootstrapServer...")
+        # uvicorn polls should_exit on its own event loop; thread-safe.
+        self._server.should_exit = True
+        logger.info("Stopping EncoderBootstrapServer...")
         if self.thread.is_alive():
             self.thread.join(timeout=5)
             logger.info("EncoderBootstrapServer thread stopped")

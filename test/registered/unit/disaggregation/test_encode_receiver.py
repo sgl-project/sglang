@@ -1,10 +1,15 @@
 """Unit tests for request construction in the encode-disaggregation path."""
 
+import http.client
+import socket
 import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
+from sglang.srt.disaggregation.encoder.receiver import (
+    EncoderBootstrapServer,
+    MMReceiverBase,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,6 +60,39 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+
+
+class TestEncoderBootstrapLifecycle(CustomTestCase):
+    def _server(self, port=0):
+        return EncoderBootstrapServer("127.0.0.1", port, health_check_interval=0)
+
+    def test_constructor_rejects_an_occupied_port(self):
+        with socket.create_server(("127.0.0.1", 0)) as occupied:
+            with self.assertRaisesRegex(OSError, "Could not bind port"):
+                self._server(occupied.getsockname()[1])
+
+    def test_publishes_served_port_and_releases_listener(self):
+        first = self._server()
+        port = first.port
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.read()), (200, b"OK"))
+        finally:
+            connection.close()
+        first.close()
+
+        replacement = self._server(port)
+        replacement.close()
+
+    def test_close_releases_listener_for_restart(self):
+        first = self._server()
+        port = first.port
+        first.close()
+
+        replacement = self._server(port)
+        replacement.close()
 
 
 if __name__ == "__main__":
