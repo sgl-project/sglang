@@ -215,13 +215,14 @@ def draft_kv_indices_used_len(
 
 
 def record_stream_each(tensors, stream):
-    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
-    non-tensor / non-cuda entries. Tells the caching allocator that the
-    tensors are also used on `stream`, so memory is not recycled while
-    queued work is still in flight after Python refs drop.
-    """
+    """Protect accelerator tensors from allocator reuse while overlap-stream work is pending."""
     for t in tensors:
-        if isinstance(t, torch.Tensor) and t.is_cuda:
+        if isinstance(t, torch.Tensor) and t.device.type in (
+            "cuda",
+            "npu",
+            "musa",
+            "xpu",
+        ):
             t.record_stream(stream)
 
 
@@ -1022,17 +1023,68 @@ def commit_mamba_states_after_verify(
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        speculative_eagle_topk = get_spec().speculative_eagle_topk
+        mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+        track_indices_to_pass = batch.mamba_track_indices
+        if _is_cuda and not _is_hip and speculative_eagle_topk in (None, 1):
+            # For topk=1, accepted node indices equal per-request step indices, so both eager gathers are identities.
+            from sglang.kernels.ops.speculative.eagle import (
+                nextn_mamba_commit_prologue_func,
+            )
+
+            has_track = track_indices_to_pass is not None
+            if has_track:
+                # If pre + max accepted tokens stays in the same interval, no tracking snapshot can be needed.
+                seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+                interval = mamba_track_interval
+                if seq_lens_cpu is not None and seq_lens_cpu.numel() == bs:
+                    if bool(
+                        torch.all(
+                            seq_lens_cpu // interval
+                            == (seq_lens_cpu + draft_token_num) // interval
+                        )
+                    ):
+                        has_track = False
+                        track_indices_to_pass = None
+                elif interval > 0:
+                    # The host counter may lag one overlap cycle; skip only when the conservative 3x max-draft bound stays in one interval.
+                    reqs = getattr(batch, "reqs", None)
+                    if reqs is not None and len(reqs) == bs:
+                        max_draft = (
+                            max_speculative_num_draft_tokens() or draft_token_num
+                        )
+                        reach = 3 * max_draft
+                        skip_track = True
+                        for req in reqs:
+                            lb = getattr(req, "kv_committed_len", None)
+                            if lb is None or lb // interval != (lb + reach) // interval:
+                                skip_track = False
+                                break
+                        if skip_track:
+                            has_track = False
+                            track_indices_to_pass = None
+            last_correct_step_indices, mamba_steps_to_track = (
+                nextn_mamba_commit_prologue_func(
+                    accept_lens,
+                    batch.seq_lens,
+                    mamba_track_interval if has_track else 0,
+                    has_track,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
                 last_correct_step_indices=last_correct_step_indices,
-                mamba_track_indices=batch.mamba_track_indices,
+                mamba_track_indices=track_indices_to_pass,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[:bs],
