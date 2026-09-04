@@ -1836,7 +1836,7 @@ class MMReceiverBase(ABC):
         import_processors("sglang.srt.multimodal.processors")
 
         extra_kwargs = {}
-        if getattr(server_args, "tokenizer_backend", None) is not None:
+        if get_serving().tokenizer_backend is not None:
             extra_kwargs["tokenizer_backend"] = get_serving().tokenizer_backend
 
         _processor = get_processor(
