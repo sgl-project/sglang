@@ -432,11 +432,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
 
-    # Trailing synthetic request rows of a padded CUDA-graph replay. Stamped by
-    # the graph runners for backends whose seq-len fill value is ambiguous
-    # (QSA's fill is 1, a legal real length); None outside replay.
-    num_padding: Optional[int] = None
-
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
     # For token embedding overrides (sparse replacement at specific positions)
