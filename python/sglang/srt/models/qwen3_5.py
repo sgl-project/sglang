@@ -1576,6 +1576,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
                 enable_tp=not is_dp_attention_enabled(),
             )
         else:
