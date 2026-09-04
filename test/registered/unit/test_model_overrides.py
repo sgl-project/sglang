@@ -3050,6 +3050,20 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
     @patch.object(
         qwen3_vl_module,
         "large_hopper_qwen3_vl_model_type",
+        side_effect=AssertionError("must not load model config without GPU memory"),
+    )
+    def test_decode_graph_expansion_skips_unknown_gpu_memory(self, _mock_model_type):
+        decode_config = SimpleNamespace(max_bs=256)
+
+        qwen3_vl_module.expand_multimodal_decode_graph_to_running_limit(
+            self._args(), decode_config, gpu_mem=None
+        )
+
+        self.assertEqual(decode_config.max_bs, 256)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
         return_value="qwen3_vl",
     )
     def test_explicit_choices_are_not_replaced(self, _mock_model_type):

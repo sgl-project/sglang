@@ -44,7 +44,7 @@ def expand_multimodal_decode_graph_to_running_limit(
     locked = getattr(server_args, "_cuda_graph_config_locked", set())
     max_running_requests = cfg.max_running_requests
     if not (
-        large_hopper_qwen3_vl_model_type(server_args, gpu_mem) is not None
+        gpu_mem is not None
         and max_running_requests is not None
         and max_running_requests <= 512
         and decode_config.max_bs is not None
@@ -52,6 +52,8 @@ def expand_multimodal_decode_graph_to_running_limit(
         and (Phase.DECODE, "max_bs") not in locked
         and (Phase.DECODE, "bs") not in locked
     ):
+        return
+    if large_hopper_qwen3_vl_model_type(server_args, gpu_mem) is None:
         return
 
     logger.info(
