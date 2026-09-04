@@ -27,7 +27,7 @@ class _Eagle3ParityBase(Eagle3Base):
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")
 class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
-    """EAGLE3 spec v2 (flashinfer, overlap) greedy output == non-spec reference.
+    """EAGLE3 (flashinfer, overlap) greedy output == non-spec reference.
 
     SpecParityKit is first so its setUpClass runs the reference server (and tears
     it down) before the fixture launches the spec server -- sequential, one model
@@ -47,6 +47,9 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     # (via XPUCudaGraphBackend). Opt in explicitly now that it is disabled
     # by default so the coverage is preserved.
     extra_args = ("--cuda-graph-config", '{"decode":{"backend":"full"}}')
+    # EAGLE3 + full CUDA-graph decode capture on XPU takes >600s from cold on
+    # Arc-class GPUs; the 600s default trips a spurious launch timeout here.
+    server_launch_timeout = 1800
 
 
 if __name__ == "__main__":

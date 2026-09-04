@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,10 +9,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mamba2_attention import (
     DEFAULT_CONV_KERNEL,
@@ -36,6 +30,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
     run_mamba2_eagle_verify_case,
     run_mamba2_eagle_verify_cuda_graph_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
