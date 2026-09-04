@@ -1491,6 +1491,14 @@ def tilelang_fp8_paged_mqa_logits(
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
+    if q_fp8.dtype != FP8_DTYPE:
+        assert _is_fp8_fnuz and q_fp8.dtype == torch.float8_e4m3fn, (
+            f"Unsupported mixed FP8 formats: query={q_fp8.dtype}, "
+            f"kernel={FP8_DTYPE}"
+        )
+        # Support E4M3FNUZ on gfx942.
+        q_fp8 = q_fp8.view(torch.uint8).view(FP8_DTYPE)
+        weight = weight * 2.0
     assert head_dim == 128, "TODO"
     assert block_size == 64, "TODO"
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
