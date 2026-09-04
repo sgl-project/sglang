@@ -3677,13 +3677,10 @@ class HybridLinearKVPool(KVCache):
         self._mamba_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
-            # Pre-built full-attention pool: the unified-memory path's
-            # UnifiedMHATokenToKVPool aliasing the shared byte buffer.
+            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
+            # aliasing the shared byte buffer.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
-            # In-tree default; ``full_kv_pool_class`` carries the
-            # caller-selected layout variant (e.g. the page-major
-            # PageMajorMHATokenToKVPool).
             TokenToKVPoolClass = (
                 full_kv_pool_class
                 if full_kv_pool_class is not None

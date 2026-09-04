@@ -65,10 +65,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            # A platform-provided paged allocator class wins here too, so
-            # out-of-tree platforms are not silently bypassed inside the SWA
-            # composite. The _is_npu branch moves into NpuSRTPlatform once
-            # it lands.
             platform_allocator_cls = current_platform.get_paged_allocator_cls()
             if platform_allocator_cls is not None:
                 PagedTokenToKVPoolAllocatorClass = platform_allocator_cls

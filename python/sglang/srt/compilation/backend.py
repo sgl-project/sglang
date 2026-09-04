@@ -53,9 +53,6 @@ def make_backend(
     sglang_backend,
 ):
 
-    # A platform-provided piecewise backend wins; in-tree platforms return
-    # None and fall back to the device-keyed defaults until they grow the
-    # hook (the is_npu branch moves into NpuSRTPlatform once it lands).
     backend_cls = current_platform.get_piecewise_backend_cls()
     if backend_cls is None:
         require_out_of_tree_impl(

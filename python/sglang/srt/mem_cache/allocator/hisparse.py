@@ -13,10 +13,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import get_num_new_pages
 
 
-def _paged_allocator_cls() -> type:
-    return current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
-
-
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
         self,
@@ -37,7 +33,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.page_size = page_size
         self.need_sort = need_sort
 
-        self.logical_attn_allocator = _paged_allocator_cls()(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.logical_attn_allocator = paged_allocator_cls(
             self._size_full,
             self.page_size,
             self.dtype,
@@ -45,7 +44,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        self.hisparse_attn_allocator = _paged_allocator_cls()(
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.page_size,
             self.dtype,
@@ -296,7 +295,10 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self.logical_attn_allocator = logical_attn_allocator
         self._kvcache = logical_attn_allocator._kvcache
-        self.hisparse_attn_allocator = _paged_allocator_cls()(
+        paged_allocator_cls = (
+            current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
+        )
+        self.hisparse_attn_allocator = paged_allocator_cls(
             self._size_hisparse,
             self.hisparse_page_size,
             self.dtype,
