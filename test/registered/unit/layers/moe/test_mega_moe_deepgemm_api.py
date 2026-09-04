@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe import mega_moe
+from sglang.srt.layers.moe import mega_moe, mega_moe_sm90
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -25,7 +25,133 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     def tearDown(self):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+        mega_moe_sm90._KERNEL_ACTIVE_LOGGED = False
         super().tearDown()
+
+    @staticmethod
+    def _moe_with_weight_markers(*, built: bool = True):
+        return SimpleNamespace(
+            experts=SimpleNamespace(
+                _mega_moe_weights_built=built,
+                _mega_moe_sm90_fp8_weights=built,
+            )
+        )
+
+    def test_fail_closed_rejects_missing_weights(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "MegaMoE fail-closed: MegaMoE weights were not built"
+            ):
+                mega_moe.should_use_mega_moe(
+                    self._moe_with_weight_markers(built=False), torch.zeros((1, 4))
+                )
+
+    def test_best_effort_mode_preserves_missing_weight_fallback(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=False,
+            ),
+        ):
+            self.assertFalse(
+                mega_moe.should_use_mega_moe(
+                    self._moe_with_weight_markers(built=False), torch.zeros((1, 4))
+                )
+            )
+
+    def test_fail_closed_rejects_missing_sm90_abi(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        deep_gemm = ModuleType("deep_gemm")
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(mega_moe, "_device_sm", 90),
+            patch.object(mega_moe_sm90, "_device_sm", 90),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing required SM90 MegaMoE"):
+                mega_moe.should_use_mega_moe(
+                    self._moe_with_weight_markers(), torch.zeros((1, 4))
+                )
+
+    def test_fail_closed_rejects_token_cap_overflow(self):
+        backend = SimpleNamespace(is_megamoe=lambda: True)
+        with (
+            patch.object(mega_moe, "get_moe_a2a_backend", return_value=backend),
+            patch.object(mega_moe, "_device_sm", 100),
+            patch.object(mega_moe, "get_is_capture_mode", return_value=False),
+            patch.object(mega_moe, "get_dp_global_num_tokens", return_value=[9, 17]),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK,
+                "get",
+                return_value=16,
+            ),
+            patch.object(
+                mega_moe.envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED,
+                "get",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "token requirement 17 exceeds"):
+                mega_moe.should_use_mega_moe(
+                    self._moe_with_weight_markers(), torch.zeros((1, 4))
+                )
+
+    def test_sm90_active_marker_requires_positive_tokens(self):
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.mega_moe_pre_dispatch_sm90 = MagicMock()
+        deep_gemm.fp8_mega_moe = MagicMock()
+        moe = SimpleNamespace(
+            experts=SimpleNamespace(
+                should_fuse_routed_scaling_factor_in_topk=True,
+                mega_l1_weights=object(),
+                mega_l2_weights=object(),
+            ),
+            config=SimpleNamespace(hidden_size=4, swiglu_limit=None),
+            routed_scaling_factor=1.0,
+        )
+        buf = SimpleNamespace(
+            x=object(),
+            x_sf=object(),
+            topk_idx=object(),
+            topk_weights=object(),
+        )
+
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            mega_moe_sm90.run_sm90_mega_routed(
+                moe,
+                torch.empty((0, 4)),
+                torch.empty((0, 2), dtype=torch.int32),
+                torch.empty((0, 2), dtype=torch.float32),
+                buf,
+                num_tokens=0,
+            )
+            self.assertFalse(mega_moe_sm90._KERNEL_ACTIVE_LOGGED)
+
+            mega_moe_sm90.run_sm90_mega_routed(
+                moe,
+                torch.empty((1, 4)),
+                torch.empty((1, 2), dtype=torch.int32),
+                torch.empty((1, 2), dtype=torch.float32),
+                buf,
+                num_tokens=1,
+            )
+            self.assertTrue(mega_moe_sm90._KERNEL_ACTIVE_LOGGED)
 
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = ModuleType("deep_gemm")

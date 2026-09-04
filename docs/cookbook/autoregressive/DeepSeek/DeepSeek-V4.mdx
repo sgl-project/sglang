@@ -412,6 +412,7 @@ feature.**
 Enable the MegaMoE path with `--moe-a2a-backend megamoe`
 ```bash Command
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED=1 \
 SGLANG_DSV4_FP4_EXPERTS=0 \
 sglang serve \
   --model-path sgl-project/DeepSeek-V4-Flash-FP8 \
@@ -424,6 +425,12 @@ sglang serve \
 the MegaMoE path processes per rank (i.e. per GPU); the MegaMoE path is only used
 for batches at or below this cap. The right value depends on your parallelism /
 token-split scheme, and larger values reserve more HBM.
+
+Set `SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED=1` when validating or benchmarking
+the MegaMoE path. With this opt-in, missing transformed weights, an incompatible
+DeepGEMM SM90 ABI, or a batch above the configured token capacity raises an
+error instead of silently continuing through ordinary MoE. The default remains
+best-effort fallback for backward compatibility.
 
 **GB300 PD-Disagg cross-pod MNNVL**
 

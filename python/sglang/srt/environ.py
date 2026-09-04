@@ -1126,6 +1126,11 @@ class Envs:
     # DeepGEMM Mega MoE
     # ===================================================================
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(8192)
+    # Make an explicitly selected MegaMoE backend fail instead of falling back
+    # to the ordinary MoE path when its weights, runtime ABI, or token capacity
+    # are unavailable. This remains opt-in for compatibility with deployments
+    # that intentionally use MegaMoE as a best-effort acceleration.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_FAIL_CLOSED = EnvBool(False)
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)

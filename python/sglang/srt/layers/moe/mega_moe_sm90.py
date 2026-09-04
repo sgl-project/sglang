@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,19 +27,38 @@ if TYPE_CHECKING:
 
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+logger = logging.getLogger(__name__)
 
-def is_sm90_fp8_mega_moe_available(experts) -> bool:
+_WEIGHTS_READY_LOGGED = False
+_KERNEL_ACTIVE_LOGGED = False
+
+
+def sm90_fp8_mega_moe_unavailable_reason(experts) -> str | None:
     if _device_sm != 90:
-        return False
+        return f"SM90 FP8 MegaMoE requires compute capability 9.0, got SM{_device_sm}"
     try:
         import deep_gemm
-    except ImportError:
-        return False
-    return (
-        hasattr(deep_gemm, "fp8_mega_moe")
-        and hasattr(deep_gemm, "mega_moe_pre_dispatch_sm90")
-        and getattr(experts, "_mega_moe_sm90_fp8_weights", False)
-    )
+    except ImportError as exc:
+        return f"deep_gemm import failed: {exc}"
+
+    missing = [
+        symbol
+        for symbol in (
+            "get_symm_buffer_for_mega_moe",
+            "fp8_mega_moe",
+            "mega_moe_pre_dispatch_sm90",
+        )
+        if not hasattr(deep_gemm, symbol)
+    ]
+    if missing:
+        return f"deep_gemm is missing required SM90 MegaMoE symbols: {missing}"
+    if not getattr(experts, "_mega_moe_sm90_fp8_weights", False):
+        return "SM90 FP8 MegaMoE weights were not built"
+    return None
+
+
+def is_sm90_fp8_mega_moe_available(experts) -> bool:
+    return sm90_fp8_mega_moe_unavailable_reason(experts) is None
 
 
 def run_sm90_mega_routed(
@@ -49,6 +69,8 @@ def run_sm90_mega_routed(
     buf: SymmBuffer,
     num_tokens: int,
 ) -> torch.Tensor:
+    global _KERNEL_ACTIVE_LOGGED
+
     import deep_gemm
 
     if moe.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -84,6 +106,14 @@ def run_sm90_mega_routed(
         activation_clamp=getattr(moe.config, "swiglu_limit", None),
         fast_math=True,
     )
+    if num_tokens > 0 and not _KERNEL_ACTIVE_LOGGED:
+        logger.info(
+            "SM90_FP8_MEGAMOE_KERNEL_ACTIVE "
+            "pre_dispatch=mega_moe_pre_dispatch_sm90 kernel=fp8_mega_moe "
+            "recipe=128x128x128 num_tokens=%d",
+            num_tokens,
+        )
+        _KERNEL_ACTIVE_LOGGED = True
     y = y[:num_tokens]
 
     return y
@@ -98,6 +128,8 @@ def _interleave_l1_weight_only(weight: torch.Tensor, gran: int = 8) -> torch.Ten
 
 
 def build_sm90_mega_moe_experts_weights(experts) -> None:
+    global _WEIGHTS_READY_LOGGED
+
     if getattr(experts, "_mega_moe_weights_built", False):
         return
 
@@ -151,3 +183,12 @@ def build_sm90_mega_moe_experts_weights(experts) -> None:
 
     experts._mega_moe_sm90_fp8_weights = True
     experts._mega_moe_weights_built = True
+    if not _WEIGHTS_READY_LOGGED:
+        logger.info(
+            "SM90_FP8_MEGAMOE_WEIGHTS_READY "
+            "experts=%d w13_shape=%s w2_shape=%s scale_group=128x128",
+            num_groups,
+            tuple(w13.shape),
+            tuple(w2.shape),
+        )
+        _WEIGHTS_READY_LOGGED = True
