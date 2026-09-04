@@ -19,8 +19,6 @@ import torch.nn.functional as F
 from sglang.kernels.ops.diffusion import (
     can_use_helios_qk_rope,
     fused_inplace_helios_qk_rope,
-)
-from sglang.kernels.ops.diffusion import (
     mark_helios_gated_residual_site,
     try_helios_gated_residual,
 )
@@ -536,9 +534,7 @@ class HeliosTransformerBlock(nn.Module):
         hidden_states = (
             fused
             if fused is not None
-            else (hidden_states.float() + attn_output * gate_msa).type_as(
-                hidden_states
-            )
+            else (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
         )
 
         # 2. Cross-attention
@@ -577,9 +573,9 @@ class HeliosTransformerBlock(nn.Module):
         hidden_states = (
             fused
             if fused is not None
-            else (
-                hidden_states.float() + ff_output.float() * c_gate_msa
-            ).type_as(hidden_states)
+            else (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(
+                hidden_states
+            )
         )
 
         return hidden_states
