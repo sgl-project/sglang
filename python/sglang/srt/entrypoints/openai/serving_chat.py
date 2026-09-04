@@ -1546,6 +1546,23 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
+    def _msh_usage_headers(self, meta_info: Dict[str, Any]) -> Dict[str, str]:
+        """P0.18(Moonshot 扩展):每个响应携带 X-Msh-Usage-* 计量响应头。
+
+        让客户端在流中断、没收到最终 usage 帧时仍能对账 prompt 侧 token。
+        值取自首个引擎事件的 meta_info,与最终 usage 的 prompt_tokens /
+        prompt_tokens_details.cached_tokens 一致(prompt 侧在 prefill 后不变)。
+        仅 kimi_k3 口径下发。
+        """
+        if self.chat_encoding_spec != "kimi_k3":
+            return {}
+        prompt = self._reported_prompt_tokens(meta_info)
+        cached = meta_info.get("cached_tokens", 0) or 0
+        return {
+            "X-Msh-Usage-Prompt-Tokens": str(prompt),
+            "X-Msh-Usage-Cached-Tokens": str(cached),
+        }
+
     async def _handle_streaming_request(
         self,
         adapted_request: GenerateReqInput,
@@ -1553,7 +1570,12 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
         """Handle streaming chat completion request"""
-        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+        # usage_headers 由 generator 在产出首帧前(拿到首个引擎事件的 meta_info 时)
+        # 填充;下面先 await 首帧,所以 StreamingResponse 构造时头已就绪(P0.18)。
+        usage_headers: Dict[str, str] = {}
+        generator = self._generate_chat_stream(
+            adapted_request, request, raw_request, usage_headers=usage_headers
+        )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         # If validation fails (e.g., context length exceeded), we can still return
@@ -1571,6 +1593,7 @@ class OpenAIServingChat(OpenAIServingBase):
         return StreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
+            headers=usage_headers or None,
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
@@ -1579,6 +1602,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
+        usage_headers: Optional[Dict[str, str]] = None,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         # Parsers for tool calls and reasoning
@@ -1676,6 +1700,13 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {error}\n\n"
                         break
                     finish_reasons[index] = finish_reason
+
+                # P0.18:首个引擎事件的 meta_info 一到就填计量头(在产出任何
+                # 字节之前;_handle_streaming_request 先 await 首帧再造响应)。
+                if usage_headers is not None and not usage_headers:
+                    usage_headers.update(
+                        self._msh_usage_headers(content["meta_info"])
+                    )
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -1862,6 +1893,13 @@ class OpenAIServingChat(OpenAIServingBase):
             ret,
             int(time.time()),
         )
+
+        # P0.18:非流式同样携带 X-Msh-Usage-* 计量响应头(与 usage 一致)。
+        usage_headers = self._msh_usage_headers(ret[0]["meta_info"])
+        if usage_headers and isinstance(response, ChatCompletionResponse):
+            return ORJSONResponse(
+                content=response.model_dump(), headers=usage_headers
+            )
 
         return response
 
