@@ -1,11 +1,22 @@
 """Unit tests for request construction in the encode-disaggregation path."""
 
+import gc
 import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.encoder.receiver import MMReceiverBase
+import torch
+import zmq
+
+from sglang.srt.disaggregation.encoder.receiver import (
+    EmbeddingData,
+    MMReceiverBase,
+    MultiModalEmbeddingData,
+    SegmentedEmbedding,
+    WaitingZmqRequest,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -55,6 +66,72 @@ class TestEncodeReceiverRequestConstruction(CustomTestCase):
 
         self.assertEqual(req.extra_key, "classification")
         self.assertEqual(req.cache_salt, "tenant-a")
+
+
+class TestSegmentedReceiverEmbedding(CustomTestCase):
+    @staticmethod
+    def _part(part_idx, embedding):
+        return EmbeddingData(
+            req_id="request-1",
+            num_parts=2,
+            part_idx=part_idx,
+            grid_dim=torch.tensor([[1, 1, embedding.shape[0]]]),
+            modality=Modality.IMAGE,
+            embedding=embedding,
+        )
+
+    def test_segmented_embedding_slices(self):
+        first = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        second = torch.arange(16, 28, dtype=torch.float32).reshape(3, 4)
+        data = MultiModalEmbeddingData.from_embedding_data(self._part(0, first))
+        data.add(self._part(1, second))
+
+        segmented = data.get_embedding()[Modality.IMAGE]
+        self.assertIsInstance(segmented, SegmentedEmbedding)
+
+        item = segmented[4:7]
+        self.assertTrue(torch.equal(item, second))
+        self.assertEqual(
+            item.untyped_storage().data_ptr(), second.untyped_storage().data_ptr()
+        )
+        self.assertTrue(
+            torch.equal(segmented[3:5], torch.cat([first[3:4], second[:1]]))
+        )
+
+    def test_zmq_frame_tensor_survives_later_receives(self):
+        context = zmq.Context()
+        pull = context.socket(zmq.PULL)
+        push = context.socket(zmq.PUSH)
+        endpoint = "inproc://test-zmq-frame-tensor-lifetime"
+        pull.bind(endpoint)
+        push.connect(endpoint)
+        try:
+            expected = torch.arange(1024, dtype=torch.int32)
+            push.send(expected.numpy().tobytes())
+            frame = pull.recv(copy=False)
+            frame_view = torch.frombuffer(frame.buffer, dtype=torch.int32)
+            recv_obj = SimpleNamespace(dtype=torch.int32, shape=expected.shape)
+
+            WaitingZmqRequest._extract_embedding_from_buffer(
+                None, recv_obj, [None, frame]
+            )
+            self.assertEqual(recv_obj.embedding.data_ptr(), frame_view.data_ptr())
+            del frame_view
+            del frame
+            gc.collect()
+
+            for value in range(8):
+                push.send(bytes([value]) * 8192)
+                pull.recv(copy=False)
+
+            torch.testing.assert_close(recv_obj.embedding, expected)
+        finally:
+            pull.close()
+            push.close()
+            context.term()
+
+        gc.collect()
+        torch.testing.assert_close(recv_obj.embedding, expected)
 
 
 if __name__ == "__main__":
