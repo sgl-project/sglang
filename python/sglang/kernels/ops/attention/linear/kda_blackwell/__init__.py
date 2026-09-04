@@ -173,13 +173,20 @@ def chunk_kda_cutedsl(
     # injected through the cutedsl KKT/Aqk MMAs as an identity-right-operand pass:
     # with kL'=M (M in the first 64 K-slots) and kR'=onehot(chunk-pos), the MMA
     # kL'@kR'.T == M, so kkt_inv_uw/kernel_o see the correct matrix without overflow.
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
+    from sglang.kernels.ops.attention.fla.kda import (
+        RCP_LN2,
+        chunk_kda_scaled_dot_kkt_fwd,
+    )
 
     ones_beta = q.new_ones(1, T, Hv, dtype=torch.float32)
+    # The FLA kkt kernels consume log2-space gate cumsums (exp2-based); g_cu must
+    # stay natural-log for the cutedsl kernels below, so let the kernels apply
+    # gk_scale=RCP_LN2 at load time instead of materializing a scaled copy.
     M_kk, M_qk = chunk_kda_scaled_dot_kkt_fwd(
         q.unsqueeze(0).contiguous(),
         k.unsqueeze(0).contiguous(),
         gk=g_cu.unsqueeze(0),
+        gk_scale=RCP_LN2,
         beta=ones_beta,
         scale=float(scale),
         cu_seqlens=cu_seqlens,

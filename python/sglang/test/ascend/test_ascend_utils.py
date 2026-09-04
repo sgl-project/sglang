@@ -53,7 +53,7 @@ BAICHUAN2_13B_CHAT_WEIGHTS_PATH = os.path.join(
 C4AI_COMMAND_R_V01_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "CohereForAI/c4ai-command-r-v01"
 )
-C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/ascend/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
+C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/npu/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
 CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b")
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
@@ -149,6 +149,7 @@ META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
 MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
+MIMO_V2_5_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "solinliu/MiMo-V2.5-W8A8")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "mistralai/Mistral-7B-Instruct-v0.2"
@@ -211,7 +212,7 @@ QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Next-80B-A3B-Instruct"
 )
 QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Qwen3-32B-Eagle3"
+    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh"
 )
 QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
@@ -377,10 +378,10 @@ INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
 # fmt: on
 
 # Other
-DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
+DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/npu/basic_function/parameter/deepseek_coder.json"
 FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
 CONFIG_YAML_PATH = (
-    "/__w/sglang/sglang/test/registered/ascend/basic_function/config/config.yaml"
+    "/__w/sglang/sglang/test/registered/npu/basic_function/config/config.yaml"
 )
 
 

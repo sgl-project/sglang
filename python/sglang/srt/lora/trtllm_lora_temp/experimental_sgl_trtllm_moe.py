@@ -70,7 +70,7 @@ def sgl_trtllm_fp8_block_scale_moe_wrapper(
             "TRTLLM enums and cubin-loader utilities."
         ) from e
 
-    from sglang.jit_kernel.trtllm_lora_temp import trtllm_fp8_block_scale_moe
+    from sglang.kernels.ops.moe.trtllm_lora_temp import trtllm_fp8_block_scale_moe
 
     kwargs = {
         "routing_logits": routing_logits,
@@ -168,7 +168,7 @@ def sgl_trtllm_fp8_block_scale_routed_moe_wrapper(
             "TRTLLM enums and cubin-loader utilities."
         ) from e
 
-    from sglang.jit_kernel.trtllm_lora_temp import (
+    from sglang.kernels.ops.moe.trtllm_lora_temp import (
         trtllm_fp8_block_scale_routed_moe,
     )
 

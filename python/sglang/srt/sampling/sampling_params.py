@@ -15,7 +15,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
@@ -38,45 +38,84 @@ CustomParamValue = Union[
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+MAX_STOP_COUNT = 32
+MAX_STOP_REGEX_LEN = 256
+MAX_STOP_REGEX_COUNT = 32
 
 logger = logging.getLogger(__name__)
 
 
-def raise_if_tokenizer_required(
-    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
-):
-    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
+# Private transport from the OpenAI request renderer to scheduler-side
+# reasoning grammar/accounting.  It lives in custom_params so the selected
+# delimiter follows every existing tokenizer/session/disaggregation path
+# without changing the public SamplingParams wire layout.
+REQUEST_REASONING_END_TOKEN_IDS_KEY = "__sglang_reasoning_end_token_ids"
+MAX_REQUEST_REASONING_END_TOKEN_IDS = 32
 
-    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
-    to convert output token IDs to text for matching. min_new_tokens requires the
-    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
-    be used.
-    """
-    if tokenizer is not None:
+
+def get_request_reasoning_end_token_ids(
+    custom_params: Optional[Dict[str, CustomParamValue]],
+    *,
+    allowed_sequences: Optional[Sequence[Sequence[int]]] = None,
+    vocab_size: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[List[int]]:
+    """Return a validated request-selected reasoning terminator, if present."""
+    if not isinstance(custom_params, dict):
+        return None
+    if REQUEST_REASONING_END_TOKEN_IDS_KEY not in custom_params:
+        return None
+    token_ids = custom_params.get(REQUEST_REASONING_END_TOKEN_IDS_KEY)
+    invalid = (
+        not isinstance(token_ids, list)
+        or not token_ids
+        or len(token_ids) > MAX_REQUEST_REASONING_END_TOKEN_IDS
+        or any(type(token_id) is not int or token_id < 0 for token_id in token_ids)
+        or (
+            vocab_size is not None
+            and isinstance(token_ids, list)
+            and any(
+                type(token_id) is int and token_id >= vocab_size
+                for token_id in token_ids
+            )
+        )
+    )
+    if invalid:
+        if strict:
+            raise ValueError(
+                "request reasoning end token IDs must be a non-empty, "
+                f"vocabulary-bounded list of at most "
+                f"{MAX_REQUEST_REASONING_END_TOKEN_IDS} integers"
+            )
+        return None
+    if allowed_sequences is None or tuple(token_ids) not in {
+        tuple(sequence) for sequence in allowed_sequences
+    }:
+        return None
+    return list(token_ids)
+
+
+def set_request_reasoning_end_token_ids(
+    sampling_params: Dict,
+    token_ids: Optional[List[int]],
+) -> None:
+    """Attach the renderer-selected reasoning terminator to a request."""
+    if token_ids is None:
         return
-
-    if stop_strs:
-        raise ValueError(
-            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer to decode tokens to text for matching)."
-        )
-    if stop_regex_strs:
-        raise ValueError(
-            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer to decode tokens to text for matching)."
-        )
-    if min_new_tokens > 0:
-        raise ValueError(
-            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
-            "(requires tokenizer for eos_token_id)."
-        )
+    if not token_ids or any(
+        type(token_id) is not int or token_id < 0 for token_id in token_ids
+    ):
+        raise ValueError("reasoning end token IDs must be non-empty integers")
+    custom_params = dict(sampling_params.get("custom_params") or {})
+    custom_params[REQUEST_REASONING_END_TOKEN_IDS_KEY] = list(token_ids)
+    sampling_params["custom_params"] = custom_params
 
 
-class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
+class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -98,6 +137,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     repetition_penalty: float = 1.0
     min_new_tokens: int = 0
     n: int = 1
+    # beam_width > 1 turns the request into a beam search request; n then means
+    # "number of returned sequences" rather than parallel samples (n <= beam_width).
+    beam_width: Optional[int] = None
     json_schema: Optional[str] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
@@ -106,10 +148,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
     skip_special_tokens: bool = True
     spaces_between_special_tokens: bool = True
     no_stop_trim: bool = False
-    custom_params: Optional[Dict[str, CustomParamValue]] = None
     stream_interval: Optional[int] = None
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
+    custom_params: Optional[Dict[str, CustomParamValue]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -164,6 +206,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
 
+        # An empty grammar constraint means "unset", not "constrain to nothing".
+        self.json_schema = self.json_schema or None
+        self.regex = self.regex or None
+        self.ebnf = self.ebnf or None
+        self.structural_tag = self.structural_tag or None
+
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
@@ -173,6 +221,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self, vocab_size):
+        if self.beam_width is not None and self.beam_width < 1:
+            raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."
@@ -187,12 +237,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(
-                "frequency_penalty must be in [-2, 2], got "
-                f"{self.frequency_penalty}."
+                f"frequency_penalty must be in [-2, 2], got {self.frequency_penalty}."
             )
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise ValueError(
-                "presence_penalty must be in [-2, 2], got " f"{self.presence_penalty}."
+                f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
         if not 0.0 < self.repetition_penalty <= 2.0:
             raise ValueError(
@@ -222,13 +271,22 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
                         f"{token_id}."
                     )
 
+        get_request_reasoning_end_token_ids(
+            self.custom_params,
+            vocab_size=vocab_size,
+            strict=True,
+        )
+
         grammars = [
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings
@@ -238,6 +296,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
         else:
             if isinstance(self.stop_strs, str):
                 self.stop_strs = [self.stop_strs]
+            if len(self.stop_strs) > MAX_STOP_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_COUNT} stop strings are allowed, "
+                    f"got {len(self.stop_strs)}"
+                )
 
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
@@ -255,9 +318,20 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
         else:
             if isinstance(self.stop_regex_strs, str):
                 self.stop_regex_strs = [self.stop_regex_strs]
+            if len(self.stop_regex_strs) > MAX_STOP_REGEX_COUNT:
+                raise ValueError(
+                    f"at most {MAX_STOP_REGEX_COUNT} stop_regex patterns are allowed, "
+                    f"got {len(self.stop_regex_strs)}"
+                )
 
             stop_regex_max_len = 0
             for stop_regex in self.stop_regex_strs:
+                stop_regex_len = len(stop_regex.encode("utf-8"))
+                if stop_regex_len > MAX_STOP_REGEX_LEN:
+                    raise ValueError(
+                        f"stop_regex is {stop_regex_len} bytes, over the "
+                        f"{MAX_STOP_REGEX_LEN}-byte limit"
+                    )
                 stop_regex_max_len = max(
                     stop_regex_max_len, get_max_seq_length(stop_regex)
                 )
@@ -269,7 +343,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, omit_defaults=True):
             tokenizer, self.stop_strs, self.stop_regex_strs, self.min_new_tokens
         )
 
-        # Clear API input aliases so omit_defaults=True drops them from the wire.
+        # Clear API input aliases after normalizing them into internal fields.
         self.stop = None
         self.stop_regex = None
         self.is_normalized = True
@@ -321,3 +395,33 @@ def _max_length_from_subpattern(subpattern: sre_parse.SubPattern):
             total += MAX_LEN
 
     return total
+
+
+def raise_if_tokenizer_required(
+    tokenizer, stop_strs, stop_regex_strs, min_new_tokens=0
+):
+    """Raise ValueError if tokenizer-dependent features are used without a tokenizer.
+
+    String-based stop conditions (stop_strs, stop_regex_strs) require tokenizer.decode()
+    to convert output token IDs to text for matching. min_new_tokens requires the
+    tokenizer's eos_token_id to penalize. When skip_tokenizer_init=True, these cannot
+    be used.
+    """
+    if tokenizer is not None:
+        return
+
+    if stop_strs:
+        raise ValueError(
+            f"stop={stop_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if stop_regex_strs:
+        raise ValueError(
+            f"stop_regex={stop_regex_strs!r} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer to decode tokens to text for matching)."
+        )
+    if min_new_tokens > 0:
+        raise ValueError(
+            f"min_new_tokens={min_new_tokens} is unavailable when skip_tokenizer_init=True "
+            "(requires tokenizer for eos_token_id)."
+        )

@@ -26,7 +26,9 @@ class LoRAOverlapLoader:
         self.load_stream_context: CudaStreamContext = self.device_module.stream(
             self.load_stream
         )
-        self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = {}
+        self.lora_to_overlap_load_event: Dict[Optional[str], CudaEvent] = (
+            self.lora_manager.pending_lora_load_events
+        )
 
     def try_overlap_load_lora(
         self, lora_id: Optional[str], running_loras: set[Optional[str]]

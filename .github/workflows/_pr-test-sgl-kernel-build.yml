@@ -40,7 +40,6 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
-  FORCE_REBUILD_DEEPEP: '1'
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
@@ -100,19 +99,19 @@ jobs:
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
-          cd sgl-kernel
+          cd python/sglang/kernels/aot
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
         env:
           USE_CCACHE: 1
 
       - name: Verify wheel artifacts
         run: |
-          ls -alh sgl-kernel/dist
-          ls -alh sgl-kernel/dist/*.whl
+          ls -alh python/sglang/kernels/aot/dist
+          ls -alh python/sglang/kernels/aot/dist/*.whl
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ inputs.arch_suffix }}
-          path: sgl-kernel/dist/*
+          path: python/sglang/kernels/aot/dist/*
           if-no-files-found: error

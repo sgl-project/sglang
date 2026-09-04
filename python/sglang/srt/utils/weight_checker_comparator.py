@@ -132,9 +132,9 @@ def compare_weights(
     for (expect_dq, expect_tol), (actual_dq, actual_tol) in zip(
         expect.iter_chunks(), actual.iter_chunks(), strict=True
     ):
-        assert (
-            expect_dq.shape == actual_dq.shape
-        ), f"{expect_dq.shape=} {actual_dq.shape=}"
+        assert expect_dq.shape == actual_dq.shape, (
+            f"{expect_dq.shape=} {actual_dq.shape=}"
+        )
         numel += expect_dq.numel()
         abs_diff = (actual_dq.float() - expect_dq.float()).abs()
         if torch.all(abs_diff == 0):
@@ -161,7 +161,13 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and not quant_method.use_mxfp8
     ):
         return Fp8BlockComparable
-    if isinstance(quant_method, (ModelOptFp4LinearMethod, ModelOptNvFp4FusedMoEMethod)):
+    if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
+        if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):
+            return None
+        raise NotImplementedError(
+            f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
+        )
+    if isinstance(quant_method, ModelOptFp4LinearMethod):
         raise NotImplementedError(
             f"weight checker has no ComparableWeight for {type(quant_method).__name__}"
         )
