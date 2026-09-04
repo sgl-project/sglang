@@ -9,7 +9,6 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _reference(accept_index, accept_lens, seq_lens, draft_token_num, track_interval):
