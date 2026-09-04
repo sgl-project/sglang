@@ -201,7 +201,9 @@ Each var matters:
 
 - **`ANTHROPIC_BASE_URL`** — points Claude Code at your SGLang server instead of the Anthropic API.
 - **`ANTHROPIC_AUTH_TOKEN`** — Claude Code requires a non-empty auth token; SGLang accepts any value
-  when launched without `--api-key`.
+  when launched without `--api-key`. If the server uses `--api-key`, set either
+  `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` to that value; SGLang accepts the resulting
+  `Authorization: Bearer` and `x-api-key` headers, respectively.
 - **`API_TIMEOUT_MS`** — raise it; reasoning models with long outputs and 1M-context turns routinely
   exceed the default timeout.
 - **`ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`** — the model name Claude Code sends for each tier.
