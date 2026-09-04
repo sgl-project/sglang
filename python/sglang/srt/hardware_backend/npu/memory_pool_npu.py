@@ -27,8 +27,11 @@ def _pd_prefill_conv_draft_tokens() -> Optional[int]:
     None. Infer Decode's verify width (gamma+1) the same way ``_handle_dspark``
     does, without loading draft weights.
     """
-    from sglang.srt.arg_groups.overrides import max_speculative_num_draft_tokens
-    from sglang.srt.runtime_context import get_disagg, get_spec
+    from sglang.srt.runtime_context import (
+        get_disagg,
+        get_spec,
+        max_speculative_num_draft_tokens,
+    )
 
     if get_disagg().disaggregation_mode != "prefill":
         return None
