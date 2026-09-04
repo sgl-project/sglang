@@ -106,8 +106,8 @@ class FullComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         if match_device_only:
-            return (
-                lambda node: node.component_data[self.component_type].value is not None
+            return lambda node: (
+                node.component_data[self.component_type].value is not None
             )
 
         # HiCache: evicted + backuped nodes are valid match boundaries.
@@ -290,9 +290,9 @@ class FullComponent(TreeComponent):
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            assert cd.value is not None, (
+                f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
+            )
             if cd.lock_ref == 0:
                 key_len = len(cd.value)
                 self.tree_core.component_evictable_size_[ct] -= key_len
@@ -487,7 +487,10 @@ class FullComponent(TreeComponent):
         if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
             return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
 
+        assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
