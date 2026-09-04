@@ -8,7 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4 import silu_and_mul_masked_post_quant
+from sglang.kernels.ops.attention.dsv4 import (
+    silu_and_mul_clamp,
+    silu_and_mul_masked_post_quant,
+)
 from sglang.kernels.ops.quantization import per_token_group_quant
 
 logger = logging.getLogger(__name__)
@@ -469,19 +472,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 sglang_per_token_group_quant_fp8,
             )
 
-            if self.swiglu_limit is not None:
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-
             if not _is_musa:
                 down_input = torch.empty(
                     (all_tokens, N // 2),
                     device=gateup_output.device,
                     dtype=torch.bfloat16,
                 )
-                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+                if self.swiglu_limit is not None:
+                    silu_and_mul_clamp(
+                        gateup_output.view(-1, N),
+                        down_input,
+                        self.swiglu_limit,
+                    )
+                else:
+                    _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
             else:
+                if self.swiglu_limit is not None:
+                    gateup_output = _apply_swiglu_limit(
+                        gateup_output, swiglu_limit=self.swiglu_limit
+                    )
                 down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
             del gateup_output
 
