@@ -8,6 +8,7 @@
 # Copyright 2023 The vLLM team.
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
+import pkgutil
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -57,6 +58,35 @@ def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
 
     return current_platform.get_local_torch_device()
+
+
+def _resolve_device_communicator_cls() -> type[DeviceCommunicatorBase]:
+    """Pick the device communicator class for the active platform.
+
+    Out-of-tree platforms are asked for their own class through
+    ``Platform.get_device_communicator_cls()``; in-tree platforms keep the
+    existing CUDA-alike / CPU split (MPS included, whose base-class default
+    must not be used).
+    """
+    if current_platform.is_cuda_alike():
+        from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator,
+        )
+
+        return CudaCommunicator
+
+    if current_platform.is_out_of_tree():
+        qualname = current_platform.get_device_communicator_cls()
+        cls = pkgutil.resolve_name(qualname)
+        if not isinstance(cls, type) or not issubclass(cls, DeviceCommunicatorBase):
+            raise TypeError(
+                f"Expected a DeviceCommunicatorBase subclass, got {type(cls)}: "
+                f"{qualname}"
+            )
+        return cls
+
+    # For MPS and CPU, use the CPU communicator
+    return CpuCommunicator
 
 
 def _get_unique_name(name: str) -> str:
@@ -210,25 +240,13 @@ class GroupCoordinator:
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
-            if current_platform.is_cuda_alike():
-                from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
-                    CudaCommunicator,
-                )
-
-                self.device_communicator = CudaCommunicator(
-                    cpu_group=self.cpu_group,
-                    device=self.device,
-                    device_group=self.device_group,
-                    unique_name=self.unique_name,
-                )
-            else:
-                # For MPS and CPU, use the CPU communicator
-                self.device_communicator = CpuCommunicator(
-                    cpu_group=self.cpu_group,
-                    device=self.device,
-                    device_group=self.device_group,
-                    unique_name=self.unique_name,
-                )
+            communicator_cls = _resolve_device_communicator_cls()
+            self.device_communicator = communicator_cls(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+                unique_name=self.unique_name,
+            )
 
         self.mq_broadcaster = None
         self.srt_custom_allreduce = None

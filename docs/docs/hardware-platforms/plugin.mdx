@@ -43,6 +43,8 @@ The framework provides two plugin types, both discovered via Python's standard `
 - **Zero configuration**: Plugins are automatically discovered after `pip install`, no sglang code changes required.
 - **Environment variable control**: `SGLANG_PLATFORM` selects or validates the active platform plugin; `SGLANG_PLUGINS` (comma-separated) controls which general plugins to load.
 
+The diffusion engine mirrors both plugin types under its own entry point groups (`sglang.multimodal_gen.platforms` and `sglang.multimodal_gen.plugins`) — see [Diffusion Engine Plugins](#diffusion-engine-plugins) below.
+
 ### Current Scope & Future Direction
 
 The plugin system currently targets **out-of-tree (OOT) hardware platforms** — enabling new devices to integrate with SGLang without any changes to the main repository. The main-repo hardware paths (CUDA, ROCm, NPU, XPU, etc.) continue to use the existing `is_cuda()`/`is_npu()`/… utility functions.
@@ -821,6 +823,142 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
 
 ---
 
+## Diffusion Engine Plugins
+
+The diffusion engine (`sglang-diffusion`, package `sglang.multimodal_gen`) has its own platform hierarchy and its own process tree, so it exposes a parallel pair of entry point groups. The discovery machinery and the hook registry are shared with SRT — only the group names and the selection env vars differ.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "37.5%"}} />
+    <col style={{width: "37.5%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Plugin Type</th>
+      <th>Entry Point Group</th>
+      <th>Callable</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Diffusion Platform Plugin</strong></td>
+      <td><code>sglang.multimodal_gen.platforms</code></td>
+      <td><code>activate() -&gt; str | None</code> returning the qualname of a <code>sglang.multimodal_gen.runtime.platforms.interface.Platform</code> subclass, or <code>None</code> when the hardware is absent</td>
+    </tr>
+    <tr>
+      <td><strong>Diffusion General Plugin</strong></td>
+      <td><code>sglang.multimodal_gen.plugins</code></td>
+      <td><code>register() -&gt; None</code> registering hooks on the shared <code>HookRegistry</code></td>
+    </tr>
+  </tbody>
+</table>
+
+### Environment Variables
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Variable</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>SGLANG_DIFFUSION_PLATFORM</code></td>
+      <td>Select the diffusion platform plugin by entry_point name. Same semantics as <code>SGLANG_PLATFORM</code>: front-loading filter (only the named plugin is imported), and general plugins from unselected platform dists are skipped. Required when several plugins would activate.</td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_DIFFUSION_PLUGINS</code></td>
+      <td>Comma-separated whitelist of diffusion general plugin names. Unset loads all discovered ones. <code>SGLANG_PLUGINS</code> does not gate this group.</td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_DIFFUSION_PLATFORM_OVERRIDE</code></td>
+      <td>Escape hatch that bypasses detection and plugins: a built-in short name (<code>cpu</code>, <code>cuda</code>, <code>rocm</code>, <code>mps</code>, <code>npu</code>, <code>musa</code>, <code>xpu</code>) or an explicit <code>module.Class</code> / <code>module:Class</code> qualname.</td>
+    </tr>
+  </tbody>
+</table>
+
+### Platform Resolution Order
+
+```
+SGLANG_DIFFUSION_PLATFORM_OVERRIDE set → use it (short name or qualname), no discovery
+  │
+SGLANG_DIFFUSION_PLATFORM set (front-loading filter):
+  ├─ name not in entry_points          → RuntimeError
+  ├─ activate() returns a qualname      → use it
+  └─ activate() returns None / raises   → RuntimeError
+  │
+SGLANG_DIFFUSION_PLATFORM unset (activate every discovered plugin):
+  ├─ 1 activated  → use it
+  ├─ N activated  → RuntimeError (must set SGLANG_DIFFUSION_PLATFORM)
+  └─ 0 activated  → built-in chain: mps → xpu → rocm → cuda → npu → musa → cpu
+```
+
+The resolved qualname is loaded through `_load_platform_class()`, which rejects anything that is not a `Platform` subclass.
+
+### Plugin Load Point
+
+`load_diffusion_plugins()` runs from `sglang/multimodal_gen/__init__.py`, before the package binds `PipelineConfig`, `SamplingParams` and `DiffGenerator`. Every diffusion process imports that package — including workers spawned by the multiproc executor — so no explicit call site is needed. It is idempotent per process.
+
+Two consequences for plugin authors:
+
+- `register()` must not do `from sglang.multimodal_gen import <top-level name>`: those names are not bound yet, and the resulting `ImportError` is swallowed into a log line that silently disables the plugin. Importing *submodules* is fine, and hook targets are dotted strings resolved later.
+- Because SRT's `load_plugins()` and `load_diffusion_plugins()` share one process-global `HookRegistry`, a target patched by whichever loader ran first is not patched again. `apply_hooks()` logs a warning naming the plugin sources of any hook that arrives too late.
+
+### Quick Start
+
+```python
+# my_diffusion_plugin/__init__.py
+from sglang.srt.plugins.hook_registry import HookRegistry, HookType
+
+
+def activate() -> str | None:
+    """Platform plugin: return the Platform qualname when the device is present."""
+    import torch
+
+    if not torch.foo.is_available():
+        return None
+    return "my_diffusion_plugin.platform.MyDiffusionPlatform"
+
+
+def _after_build(result, *args, **kwargs):
+    return result
+
+
+def register() -> None:
+    """General plugin: register hooks."""
+    HookRegistry.register(
+        "sglang.multimodal_gen.runtime.pipelines_core.build_pipeline",
+        _after_build,
+        HookType.AFTER,
+    )
+```
+
+```toml
+# pyproject.toml
+[project.entry-points."sglang.multimodal_gen.platforms"]
+mydev = "my_diffusion_plugin:activate"
+
+[project.entry-points."sglang.multimodal_gen.plugins"]
+mydev_hooks = "my_diffusion_plugin:register"
+```
+
+### Out-of-Tree Platform Requirements
+
+An out-of-tree diffusion platform subclasses `Platform` and sets `_enum = PlatformEnum.OOT`, which makes `is_out_of_tree()` true. Two dispatch points consult it:
+
+- `CustomOp.dispatch_forward()` routes to `forward_oot()` before the in-tree `is_hip()` / `is_npu()` / `is_xpu()` / `is_musa()` branches, so a vendor torch build that also answers those predicates still lands on the OOT implementation.
+- `GroupCoordinator` asks the platform for `get_device_communicator_cls()` (validated as a `DeviceCommunicatorBase` subclass); in-tree platforms keep the CUDA-alike / CPU split.
+
+Out-of-tree *models and pipelines* are a separate, lighter mechanism — see [Support New Diffusion Models](/docs/sglang-diffusion/support_new_models) for `register_pipeline()`, `ModelRegistry.register_model()` and `SGLANG_EXTERNAL_MODEL_PACKAGE`.
+
+---
+
 ## File Reference
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -854,6 +992,14 @@ Target paths use fully-qualified dotted notation. Both formats are supported:
     <tr>
       <td><code>sglang/srt/plugins/hook_registry.py</code></td>
       <td><code>HookRegistry</code>, <code>HookType</code>, <code>plugin_hook</code> decorator</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/plugins/__init__.py</code></td>
+      <td><code>load_diffusion_plugins()</code> + <code>discover_diffusion_plugins()</code> (diffusion entry point groups)</td>
+    </tr>
+    <tr>
+      <td><code>sglang/multimodal_gen/runtime/platforms/__init__.py</code></td>
+      <td>Diffusion <code>current_platform</code> lazy singleton + platform plugin discovery</td>
     </tr>
   </tbody>
 </table>
