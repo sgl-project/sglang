@@ -2111,6 +2111,17 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         super().free_group_begin()
         self.free_page_reps_group = []
 
+    def flush_deferred_frees(self) -> None:
+        # Cash in both tiers (tokens in the base class, page reps here) but
+        # leave the group open so later batch frees still coalesce.
+        pending = self.free_page_reps_group
+        if pending:
+            self.free_page_reps_group = []
+        super().flush_deferred_frees()
+        if pending:
+            reps = torch.cat(pending)
+            self.free(reps, _pages=reps // self.page_size)
+
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
         super().free_group_end()
@@ -2860,6 +2871,9 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
+    def full_tokens_for_mamba_slots(self, slots: int) -> int:
+        return slots * self.mamba_slot_full_token_cost()
+
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
 
@@ -3072,6 +3086,16 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_group_begin(self) -> None:
         super().free_group_begin()
         self.free_page_reps_group = []
+
+    def flush_deferred_frees(self) -> None:
+        # Cash in both tiers (tokens in the base class, page reps here) but
+        # leave the group open so later batch frees still coalesce.
+        pending = self.free_page_reps_group
+        if pending:
+            self.free_page_reps_group = []
+        super().flush_deferred_frees()
+        if pending:
+            self._release_page_reps(pending)
 
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
@@ -3695,6 +3719,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_page_reps_group = []
         self.full_free_group = []
 
+    def flush_deferred_frees(self) -> None:
+        # Cash in both tiers (tokens in the base class, page reps here) but
+        # leave the group open so later batch frees still coalesce.
+        pending = self.free_page_reps_group
+        if pending:
+            self.free_page_reps_group = []
+        super().flush_deferred_frees()
+        if pending:
+            self._release_page_reps(pending)
+
     def free_group_end(self) -> None:
         pending, self.free_page_reps_group = self.free_page_reps_group, None
         full_free_group, self.full_free_group = self.full_free_group, []
@@ -4024,6 +4058,9 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             if isinstance(b, FloatMultiEndedAllocator):
                 flt = b
         _float_open_short_side(flt, demand)
+
+    def full_tokens_for_mamba_slots(self, slots: int) -> int:
+        return slots * self.mamba_slot_full_token_cost()
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared

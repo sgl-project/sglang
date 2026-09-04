@@ -90,6 +90,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def full_tokens_for_mamba_slots(self, slots: int) -> int:
+        """Full-side tokens to evict so `slots` mamba states fit. Zero unless the
+        two pools share one byte buffer, where freeing one is the only way to
+        fund the other."""
+        return 0
+
     def get_kvcache(self):
         return self._kvcache
 
@@ -104,6 +110,17 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
+
+    def flush_deferred_frees(self):
+        """Apply frees queued by the current group without closing it.
+
+        A caller that must observe its own free before the group ends (an
+        evict-then-retry) needs the rows back in the allocator now; keeping
+        the group open lets later batch frees coalesce as before.
+        """
+        if self.free_group:
+            queued, self.free_group = self.free_group, []
+            self.free(torch.cat(queued))
 
     def free_group_end(self):
         pending, self.free_group = self.free_group, None
