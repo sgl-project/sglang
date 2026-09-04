@@ -61,20 +61,17 @@ _KNOWN_BROKEN_AUTOMODEL_ERROR = "Could not find VoxtralRealtimeTextModel"
 
 
 class LlavaBaseForCausalLM(nn.Module):
-    @staticmethod
-    def _infer_image_aspect_ratio(mm_items):
+    def _infer_image_aspect_ratio(self, mm_items):
         """Determine image_aspect_ratio from processor metadata or item count."""
-        # Check if processor stored the aspect_ratio it used
         for item in mm_items:
             ar = item.model_specific_data.get("image_aspect_ratio")
             if ar is not None:
                 return ar
-        # Fallback: multi-image or video → pad, single image → anyres
         image_items = [item for item in mm_items if item.is_image()]
         has_video = any(item.is_video() for item in mm_items)
         if len(image_items) > 1 or has_video:
             return "pad"
-        return "anyres"
+        return self.image_aspect_ratio
 
     def pad_input_ids(
         self, input_ids: array[int], image_inputs: MultimodalInputs
@@ -740,18 +737,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         if not hasattr(self.config, "vocab_size"):
             self.config.vocab_size = self.text_config.vocab_size
         if not hasattr(self.config, "image_aspect_ratio"):
-            self.config.image_aspect_ratio = "anyres"
+            self.config.image_aspect_ratio = "pad"
         if not hasattr(self.config, "image_grid_pinpoints"):
-            # from transformers.models.llava_onevision.configuration_llava_onevision import LlavaOnevisionConfig
-            # self.config.image_grid_pinpoints = LlavaOnevisionConfig().image_grid_pinpoints
-            self.config.image_grid_pinpoints = [
-                [96, 96],
-                [224, 224],
-                [384, 384],
-                [512, 512],
-                [768, 768],
-                [1024, 1024],
-            ]
+            self.config.image_grid_pinpoints = None
         if not hasattr(self.config, "mm_patch_merge_type"):
             self.config.mm_patch_merge_type = "flat"
         if not hasattr(self.config, "image_token_index"):
@@ -859,10 +847,7 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        if (
-            self.vision_feature_select_strategy == "patch"
-            or self.vision_feature_select_strategy == "full"
-        ):
+        if self.vision_feature_select_strategy in ("default", "patch", "full"):
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
@@ -879,6 +864,8 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             for part in ("language_model", "vision_tower"):
                 if name.startswith(part):
                     name = name[len(part + ".") :]
+                    if part == "vision_tower" and name.startswith("vision_model."):
+                        name = name[len("vision_model.") :]
                     getattr(self, part).load_weights([(name, loaded_weight)])
                     break
             else:

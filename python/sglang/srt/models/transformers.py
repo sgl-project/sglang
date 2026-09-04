@@ -629,15 +629,15 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        self.vocab_size = getattr(
-            self.text_config,
-            "vocab_size",
-            self.model.get_input_embeddings().num_embeddings,
-        )
+        input_embeddings = self.model.get_input_embeddings()
+        if hasattr(self.text_config, "vocab_size"):
+            self.vocab_size = self.text_config.vocab_size
+        elif isinstance(input_embeddings, nn.Embedding):
+            self.vocab_size = input_embeddings.num_embeddings
+        else:
+            self.vocab_size = 0
         self.unpadded_vocab_size = self.vocab_size
 
-        # Embedding scale (e.g. Whisper)
-        input_embeddings = self.model.get_input_embeddings()
         self.embed_scale = getattr(input_embeddings, "embed_scale", None)
 
         self.start_layer = 0
@@ -958,6 +958,8 @@ class TransformersBase(nn.Module):
     def replace_vocab_embed_class(self, module: nn.Module):
         old_module = self.model.get_input_embeddings()
         if old_module is None or isinstance(old_module, PPMissingLayer):
+            return
+        if not isinstance(old_module, nn.Embedding):
             return
         embedding_dim = getattr(old_module, "embedding_dim", None)
         if embedding_dim is None:
