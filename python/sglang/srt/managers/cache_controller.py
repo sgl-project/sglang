@@ -720,6 +720,13 @@ class HiCacheController:
         use_shared_cp_storage = (
             storage_backend == "file"
             and is_compressed_mla_model
+            and bool(
+                getattr(
+                    self.mem_pool_device,
+                    "supports_hicache_shared_cp_storage",
+                    False,
+                )
+            )
             and attn_cp_size > 1
             and self.pp_size == 1
         )
