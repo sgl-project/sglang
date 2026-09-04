@@ -24,11 +24,14 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    defer_symmetric_memory_graph_registration,
     set_graph_pool_id,
+    set_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+    should_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend.cuda_graph_dedup_mixin import (
     DedupedCudaGraphMixin,
@@ -75,6 +78,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._use_symmetric_memory_graph_pool = (
+            should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -95,6 +101,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+        set_use_dedicated_symmetric_memory_graph_pool(
+            self._use_symmetric_memory_graph_pool
+        )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
@@ -106,6 +115,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             try:
                 self.end_cuda_graph_capture()
             finally:
+                set_graph_pool_id(None)
+                set_use_dedicated_symmetric_memory_graph_pool(False)
                 self._capture_stream = None
 
     def capture_one(
@@ -124,10 +135,36 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
+        prime_graph = None
+        with defer_symmetric_memory_graph_registration(
+            self._tp_group,
+            enabled=self._use_symmetric_memory_graph_pool,
+        ) as should_prime:
+            if should_prime:
+                # Keep lazy/JIT work from the final warmup out of this extra capture.
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                prime_graph = BreakableCUDAGraph(None)
+                with (
+                    graph_pool_capture_scope(),
+                    BreakableCUDAGraphCapture(
+                        cuda_graph=prime_graph,
+                        pool=self._pool,
+                        stream=self._capture_stream,
+                        barrier_fn=self._tp_group.barrier,
+                    ),
+                ):
+                    captured_fn()
+
+        if should_prime and post_warmup_hook is not None:
+            post_warmup_hook()
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+
+        graph = BreakableCUDAGraph(self.deduped_cuda_graph)
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
@@ -144,6 +181,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+        del prime_graph
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
         self._graphs[shape_key] = graph

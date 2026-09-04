@@ -25,10 +25,13 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    defer_symmetric_memory_graph_registration,
     set_graph_pool_id,
+    set_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
+    should_use_dedicated_symmetric_memory_graph_pool,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -64,6 +67,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._use_symmetric_memory_graph_pool = (
+            should_use_dedicated_symmetric_memory_graph_pool(cuda_graph_runner)
+        )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
@@ -75,11 +81,16 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def capture_session(self, stream: torch.cuda.Stream):
         if self._pool is None:
             self._pool = get_or_create_global_graph_memory_pool(self._device_module)
+        set_use_dedicated_symmetric_memory_graph_pool(
+            self._use_symmetric_memory_graph_pool
+        )
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         try:
             yield
         finally:
+            set_graph_pool_id(None)
+            set_use_dedicated_symmetric_memory_graph_pool(False)
             self._capture_stream = None
 
     def capture_one(
@@ -116,8 +127,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
-        graph = torch.cuda.CUDAGraph()
-
         graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
@@ -130,12 +139,39 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
+        prime_graph = None
+        with defer_symmetric_memory_graph_registration(
+            self._tp_group,
+            enabled=self._use_symmetric_memory_graph_pool,
+        ) as should_prime:
+            if should_prime:
+                # Keep lazy/JIT work from the final warmup out of this extra capture.
+                self._device_module.synchronize()
+                self._tp_group.barrier()
+                prime_graph = torch.cuda.CUDAGraph()
+                with (
+                    graph_pool_capture_scope(),
+                    graph_ctx(
+                        cuda_graph=prime_graph,
+                        pool=self._pool,
+                        stream=self._capture_stream,
+                    ),
+                ):
+                    forward_fn()
+
+        if should_prime and post_warmup_hook is not None:
+            post_warmup_hook()
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+
+        graph = torch.cuda.CUDAGraph()
         with (
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             self._precarve.mint()
             out = forward_fn()
+        del prime_graph
 
         if profiler is not None:
             profiler.step()

@@ -3,7 +3,7 @@ import logging
 import os
 import tempfile
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -147,7 +147,11 @@ int nccl_allocator_register_segments_with_comm(uintptr_t comm_ptr) {
 
 _allocator = None
 _mem_pool = None
+_graph_mem_pool = None
 _graph_pool_id = None
+_use_dedicated_graph_mem_pool = False
+_defer_graph_registration = False
+_deferred_graph_comm_ptrs = []
 _cur_device = None
 _active_symmetric_memory_context = None
 
@@ -167,32 +171,39 @@ def set_graph_pool_id(graph_pool_id):
     _graph_pool_id = graph_pool_id
 
 
+def set_use_dedicated_symmetric_memory_graph_pool(enable: bool):
+    global _use_dedicated_graph_mem_pool
+    _use_dedicated_graph_mem_pool = enable
+
+
 def disable_symmetric_memory_context():
     if _active_symmetric_memory_context is None:
         return None
     saved_context = _active_symmetric_memory_context
-    saved_context.__exit__(None, None, None)
+    saved_context.suspend()
     return saved_context
 
 
 def restore_symmetric_memory_context(saved_context):
     if saved_context is not None:
-        saved_context.__enter__()
+        saved_context.resume()
 
 
-def get_nccl_mem_pool() -> torch.cuda.MemPool:
+def get_nccl_mem_pool(*, graph_capture: bool = False) -> torch.cuda.MemPool:
     """
-    Get the shared MemPool for all groups.
+    Get the eager or CUDA graph MemPool shared by all groups.
 
-    All groups share the same pool to avoid memory fragmentation.
-    Comm registration is handled at context exit time.
+    CUDA graph allocations must not inherit rank-dependent allocator history from
+    eager warmup and kernel compilation. The graph pool is therefore isolated
+    from the eager pool and kept alive for the lifetime of the process. Comm
+    registration is handled at context exit time for both pools.
     """
     assert after_2_8_0, (
         "--enable-symm-mem requires torch>=2.8 "
         "(torch._C._cuda_beginAllocateCurrentThreadToPool was added there)."
     )
 
-    global _allocator, _mem_pool, _cur_device, _register_func
+    global _allocator, _mem_pool, _graph_mem_pool, _cur_device, _register_func
     if _allocator is None:
         import torch.utils.cpp_extension
 
@@ -224,6 +235,7 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
             "nccl_free_plug",
         ).allocator()
         _mem_pool = torch.cuda.MemPool(_allocator)
+        _graph_mem_pool = torch.cuda.MemPool(_allocator)
         _cur_device = torch.cuda.current_device()
 
         # Setup the C function for registration with correct arg types
@@ -231,35 +243,56 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
         _register_func.restype = ctypes.c_int
         _register_func.argtypes = [ctypes.c_uint64]
 
-    return _mem_pool
+    return _graph_mem_pool if graph_capture else _mem_pool
+
+
+@contextmanager
+def defer_symmetric_memory_graph_registration(
+    group_coordinator: GroupCoordinator,
+    *,
+    enabled: bool,
+):
+    """Prime graph-private segments, then register them outside capture."""
+    global _defer_graph_registration, _deferred_graph_comm_ptrs
+
+    if (
+        not enabled
+        or not is_symmetric_memory_enabled()
+        or group_coordinator.world_size == 1
+    ):
+        yield False
+        return
+
+    assert not _defer_graph_registration
+    _deferred_graph_comm_ptrs = []
+    _defer_graph_registration = True
+    try:
+        yield True
+        _defer_graph_registration = False
+        for comm_ptr in _deferred_graph_comm_ptrs:
+            result = _register_func(comm_ptr)
+            assert result == 0, (
+                "nccl_allocator_register_segments_with_comm failed after "
+                f"priming the CUDA graph pool with return code: {result}"
+            )
+    finally:
+        _defer_graph_registration = False
+        _deferred_graph_comm_ptrs = []
 
 
 class SymmetricMemoryContext:
-    """
-    Context manager for using symmetric memory with pynccl.
-
-    To Utilize the symmetric memory feature in NCCL, the buffers need to be allocated
-    by `ncclMemAlloc` and registered by `ncclCommWindowRegister`. Due to this, we introduce
-    this context manager. All tensors created under this context will be correctly
-    allocated and registered with a custom allocator.
-
-    Key design:
-    - All groups share a single MemPool to avoid memory fragmentation.
-    - At allocation time, ptrs are tracked but NOT registered with any comm.
-    - At context exit time, nccl_allocator_register_segments_with_comm is called
-      to register all tracked segments with the current comm. The C++ layer
-      tracks per-comm registration state using index-based tracking to avoid
-      re-registration of already-registered segments.
-    """
+    """Allocate symmetric buffers and register their segments with pynccl."""
 
     def __init__(
         self,
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
-        self._pool_id = get_nccl_mem_pool().id
-        self._device_index = torch.cuda.current_device()
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
+        self._pool_id = get_nccl_mem_pool(
+            graph_capture=(self.is_graph_capture and _use_dedicated_graph_mem_pool)
+        ).id
+        self._device_index = torch.cuda.current_device()
 
         # Get comm ptr for tracking registrations
         # Use the comm pointer value as unique identifier
@@ -270,6 +303,37 @@ class SymmetricMemoryContext:
             f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
         )
 
+        self.resume()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
+        try:
+            self._register_segments_for_comm()
+        finally:
+            self._restore_graph_pool()
+            torch._C._cuda_releasePool(self._device_index, self._pool_id)
+
+            global _active_symmetric_memory_context
+            _active_symmetric_memory_context = None
+
+    def suspend(self):
+        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
+        self._restore_graph_pool()
+
+        global _active_symmetric_memory_context
+        _active_symmetric_memory_context = None
+
+    def _restore_graph_pool(self):
+        if self.is_graph_capture:
+            if after_2_8_0:
+                torch._C._cuda_beginAllocateCurrentThreadToPool(
+                    _cur_device, _graph_pool_id
+                )
+            else:
+                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
+
+    def resume(self):
         if self.is_graph_capture:
             assert _graph_pool_id is not None, (
                 "graph_pool_id is not set under graph capture"
@@ -289,26 +353,6 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = self
 
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        torch._C._cuda_endAllocateToPool(self._device_index, self._pool_id)
-        torch._C._cuda_releasePool(self._device_index, self._pool_id)
-        # Register all unregistered segments
-        # with the current comm
-        self._register_segments_for_comm()
-
-        if self.is_graph_capture:
-            if after_2_8_0:
-                torch._C._cuda_beginAllocateCurrentThreadToPool(
-                    _cur_device, _graph_pool_id
-                )
-            else:
-                torch._C._cuda_beginAllocateToPool(_cur_device, _graph_pool_id)
-
-        global _active_symmetric_memory_context
-        _active_symmetric_memory_context = None
-
     def _register_segments_for_comm(self):
         """
         Register all tracked segments with the current comm.
@@ -318,6 +362,11 @@ class SymmetricMemoryContext:
         2. Only registering new segments (avoiding re-registration)
         3. Thread-safe access to the segment registry
         """
+
+        if self.is_graph_capture and _defer_graph_registration:
+            if self._comm_ptr not in _deferred_graph_comm_ptrs:
+                _deferred_graph_comm_ptrs.append(self._comm_ptr)
+            return
 
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
@@ -351,10 +400,11 @@ def is_tensor_in_symmetric_mempool(tensor: torch.Tensor) -> bool:
 
     data_ptr = tensor.untyped_storage().data_ptr()
 
-    for segment in _mem_pool.snapshot():
-        for block in segment["blocks"]:
-            if block["address"] == data_ptr:
-                return True
+    for pool in (_mem_pool, _graph_mem_pool):
+        for segment in pool.snapshot():
+            for block in segment["blocks"]:
+                if block["address"] == data_ptr:
+                    return True
     return False
 
 

@@ -22,7 +22,17 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        BaseCudaGraphRunner,
+    )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+
+def should_use_dedicated_symmetric_memory_graph_pool(
+    cuda_graph_runner: BaseCudaGraphRunner,
+) -> bool:
+    # Ordinary graphs keep one capture because kernels may retain graph-scoped state.
+    return cuda_graph_runner.model_runner.spec_algorithm.is_speculative()
 
 
 class BaseCudaGraphBackend(ABC):

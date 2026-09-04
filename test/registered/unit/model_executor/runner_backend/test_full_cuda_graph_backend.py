@@ -48,7 +48,7 @@ class _FakeGraphCtx:
         return False
 
 
-def _make_backend(runner):
+def _make_backend(runner, *, use_symmetric_memory_graph_pool=False):
     """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
     touch CUDA), wiring just the attributes ``capture_one`` reads."""
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
@@ -63,6 +63,7 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = runner.model_runner.tp_group
+    backend._use_symmetric_memory_graph_pool = use_symmetric_memory_graph_pool
     return backend
 
 
@@ -106,6 +107,26 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         # Graph + output are recorded against the shape key.
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
+
+    def test_resets_state_after_disposable_prime(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner, use_symmetric_memory_graph_pool=True)
+        forward_fn = mock.Mock(return_value=object())
+        post_warmup_hook = mock.Mock()
+
+        with mock.patch(
+            "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend."
+            "defer_symmetric_memory_graph_registration",
+            return_value=contextlib.nullcontext(True),
+        ), mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
+            backend.capture_one(
+                ShapeKey(size=4),
+                forward_fn,
+                post_warmup_hook=post_warmup_hook,
+            )
+
+        self.assertEqual(forward_fn.call_count, 4)
+        self.assertEqual(post_warmup_hook.call_count, 3)
 
     def test_enable_flag_set_but_no_profiler_attr_does_not_step(self):
         # The runner advertises the flag but never created a profiler; the
