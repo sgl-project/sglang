@@ -600,6 +600,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         is_gguf_weight = getattr(param, "is_gguf_weight", False)
         is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
         if is_gguf_weight_type:
+            # param.data[loaded_shard_id] is a 0-dim slot.  A checkpoint whose
+            # fused shards are split by a packed weight loader hands one
+            # 1-element (not 0-dim) chunk per shard, which copy_ rejects with
+            # "output with shape [] doesn't match the broadcast shape [1]".
+            # The next line already treats the value as a scalar.
+            if loaded_weight.numel() == 1:
+                loaded_weight = loaded_weight.reshape(())
             param.data[loaded_shard_id].copy_(loaded_weight)
             param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
             return

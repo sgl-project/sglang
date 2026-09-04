@@ -501,7 +501,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            # GGUF spells the packed weight "qweight" and carries an accompanying
+            # "qweight_type"; without them the tuple shard id (0, 1, 2) that
+            # in_proj_qkv needs never reaches _make_packed_weight_loader and
+            # MergedColumnParallelLinear.weight_loader dies on param.data[(0,1,2)].
+            "qweight",
+            "qweight_type",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -1577,6 +1588,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()

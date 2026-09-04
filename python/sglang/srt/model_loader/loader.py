@@ -3218,9 +3218,28 @@ class GGUFModelLoader(BaseModelLoader):
         return gguf_to_hf_name_map
 
     def _get_weights_iterator(
-        self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
+        self,
+        model_name_or_path: str,
+        gguf_to_hf_name_map: Dict[str, str],
+        model_config: Optional[ModelConfig] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        from sglang.srt.model_loader.gguf_name_maps import (
+            apply_gguf_weight_transform,
+            get_gguf_weight_transform,
+        )
+
+        weights = gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
+        # Some architectures need the *values* converted, not just renamed:
+        # llama.cpp may store a tensor in a different head order or a different
+        # value domain from the HF checkpoint it was converted from.
+        transform = (
+            None
+            if model_config is None
+            else get_gguf_weight_transform(model_config.hf_config)
+        )
+        if transform is None:
+            return weights
+        return apply_gguf_weight_transform(weights, transform)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(model_config.model_path)
@@ -3246,7 +3265,9 @@ class GGUFModelLoader(BaseModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(
-                self._get_weights_iterator(local_model_path, gguf_weights_map)
+                self._get_weights_iterator(
+                    local_model_path, gguf_weights_map, model_config
+                )
             )
 
             for _, module in model.named_modules():
