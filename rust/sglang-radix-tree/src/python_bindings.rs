@@ -431,7 +431,6 @@ impl TreeCoreInitParamsBinding {
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
             write_through_threshold: self.write_through_threshold,
-            device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
@@ -848,7 +847,7 @@ pub struct HostEvictionResultBinding {
 }
 
 impl HostEvictionResultBinding {
-    fn from_eviction_step(py: Python<'_>, result: EvictionStepResult) -> PyResult<Self> {
+    fn from_eviction_step(py: Python<'_>, result: EvictionStepResult<Tensor>) -> PyResult<Self> {
         Ok(Self {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -860,7 +859,7 @@ impl HostEvictionResultBinding {
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
 struct TreeCoreBinding<K: ChildKeyType> {
-    core: Mutex<UnifiedTreeCore<K>>,
+    core: Mutex<UnifiedTreeCore<K, Tensor>>,
     /// The core's construction device, kept outside the Mutex for pre-lock validation.
     device: Device,
     /// The core's page size, kept outside the Mutex for pre-lock validation.
@@ -908,11 +907,15 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                  'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
             )));
         }
+        let device = parse_device(&init_params.device)?;
         let params = init_params.to_cache_init_params()?;
-        let device = params.device;
         let page_size = params.page_size;
         Ok(TreeCoreBinding {
-            core: Mutex::new(UnifiedTreeCore::new(params, component_types)),
+            core: Mutex::new(UnifiedTreeCore::new_on_device(
+                params,
+                component_types,
+                device,
+            )),
             device,
             page_size,
         })
@@ -920,7 +923,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 
     /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
     /// so a poisoned core is never reused.
-    fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K>> {
+    fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K, Tensor>> {
         self.core.lock().unwrap_or_else(|_| {
             panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
         })

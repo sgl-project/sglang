@@ -3,14 +3,13 @@
 
 use std::collections::HashMap;
 
-use tch::Tensor;
-
 use crate::node::{ChildKeyType, NodeArena, NodeIdx_, TreeCoreRuntimeError};
 use crate::unified_tree_core::{
     CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertParams,
     InsertResult, LRURefreshPhase, MatchPrefixParams, MatchResult, PoolTransfer,
     PoolTransferResult, UnifiedTreeCore,
 };
+use crate::value::{DefaultRadixValue, RadixValue};
 
 mod full;
 mod mamba;
@@ -22,8 +21,8 @@ pub use swa::SwaComponent;
 
 /// Whether `node_id` holds the component's data on `target`, checking its
 /// device or host slot.
-pub(crate) fn node_has_component_data<K: ChildKeyType>(
-    arena: &NodeArena<K>,
+pub(crate) fn node_has_component_data<K: ChildKeyType, V: RadixValue>(
+    arena: &NodeArena<K, V>,
     node_id: NodeIdx_,
     component_type: ComponentType,
     target: EvictLayer,
@@ -36,11 +35,11 @@ pub(crate) fn node_has_component_data<K: ChildKeyType>(
 }
 
 /// Every device value of the component across all roots, concatenated.
-pub(crate) fn all_values_flatten<K: ChildKeyType>(
-    tree_core: &UnifiedTreeCore<K>,
+pub(crate) fn all_values_flatten<K: ChildKeyType, V: RadixValue>(
+    tree_core: &UnifiedTreeCore<K, V>,
     component_type: ComponentType,
-) -> Tensor {
-    let mut values: Vec<Tensor> = Vec::new();
+) -> V {
+    let mut values: Vec<V> = Vec::new();
     let mut stack: Vec<NodeIdx_> = vec![tree_core.arena.root()];
     while let Some(node_id) = stack.pop() {
         let node = tree_core.arena.node(node_id);
@@ -52,18 +51,18 @@ pub(crate) fn all_values_flatten<K: ChildKeyType>(
     if values.is_empty() {
         return tree_core.empty_device_indices.shallow_clone();
     }
-    Tensor::cat(&values, 0)
+    V::concat(&values)
 }
 
 /// A per-component lock/value/eviction driver over the shared `UnifiedTreeCore`.
-pub trait TreeComponent<K: ChildKeyType> {
+pub trait TreeComponent<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
     /// The component this driver serves.
     fn component_type(&self) -> ComponentType;
 
     /// Whether this component has device data that still needs a host backup.
     fn needs_incremental_backup(
         &self,
-        _tree_core: &UnifiedTreeCore<K>,
+        _tree_core: &UnifiedTreeCore<K, V>,
         _node_id: NodeIdx_,
     ) -> bool {
         false
@@ -72,7 +71,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Refresh this component's LRU position for `node_id` at the given walk phase.
     fn refresh_lru(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         phase: LRURefreshPhase,
         node_id: NodeIdx_,
     ) {
@@ -121,19 +120,19 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         ...
     fn create_match_validator(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
+        tree_core: &UnifiedTreeCore<K, V>,
         match_device_only: bool,
-    ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool>;
+    ) -> Box<dyn FnMut(&UnifiedTreeCore<K, V>, NodeIdx_) -> bool>;
 
     /// Tree-side post-processing inside the match walk (no cache access).
     fn finalize_match_result_in_tree_core(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
-        result: MatchResult,
+        tree_core: &UnifiedTreeCore<K, V>,
+        result: MatchResult<V>,
         params: &MatchPrefixParams<'_, K>,
-        value_chunks: &[Tensor],
+        value_chunks: &[V],
         best_value_len: usize,
-    ) -> MatchResult {
+    ) -> MatchResult<V> {
         result
     }
 
@@ -145,14 +144,14 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// portion: `value_slice[dup_start..consumed_from]`.
     fn update_component_on_insert_overlap(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         prefix_len: usize,
         total_prefix_len: usize,
-        value_slice: Tensor,
-        params: &InsertParams<'_, K>,
-        result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        value_slice: V,
+        params: &InsertParams<'_, K, V>,
+        result: &mut InsertResult<V>,
+        cache_actions: &mut Vec<CacheAction<V>>,
     ) -> usize {
         prefix_len
     }
@@ -163,13 +162,13 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// is still tombstoned. Default no-op.
     fn recover_after_unevict(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         prefix_len: usize,
         total_prefix_len: usize,
-        params: &InsertParams<'_, K>,
-        result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        params: &InsertParams<'_, K, V>,
+        result: &mut InsertResult<V>,
+        cache_actions: &mut Vec<CacheAction<V>>,
     ) {
     }
 
@@ -187,12 +186,12 @@ pub trait TreeComponent<K: ChildKeyType> {
     ///   has mamba data, resets its LRU position instead.
     fn commit_insert_component_data(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         is_new_leaf: bool,
-        params: &InsertParams<'_, K>,
-        result: &mut InsertResult,
-        cache_actions: &mut Vec<CacheAction>,
+        params: &InsertParams<'_, K, V>,
+        result: &mut InsertResult<V>,
+        cache_actions: &mut Vec<CacheAction<V>>,
     ) {
     }
 
@@ -200,10 +199,10 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// tail's root path; only the Mamba component caps its states.
     fn evict_excess_path_states(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         tail_node_id: NodeIdx_,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
     }
 
@@ -225,7 +224,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         ...
     fn redistribute_on_node_split(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         new_parent_id: NodeIdx_,
         child_id: NodeIdx_,
     );
@@ -255,10 +254,10 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         ...
     fn evict_component(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
         target: EvictLayer,
     ) -> (usize, usize);
 
@@ -269,7 +268,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     }
 
     /// Begin this component's device-eviction walk (build its cursor/heap).
-    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize);
+    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K, V>, request_cnt: usize);
 
     /// Advance one eviction step and return a device leaf, if selected.
     ///
@@ -277,14 +276,14 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// mutation so the caller can drain pending frees before continuing.
     fn evict_device_next_node(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) -> Option<NodeIdx_>;
 
     /// Clear this component's device-eviction walk state.
-    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>);
+    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K, V>);
 
     /// Increment component lock refs, protecting nodes from eviction.
     // Python reference — tree_component.py::TreeComponent.acquire_component_lock:
@@ -312,7 +311,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         ...
     fn acquire_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         result: IncLockRefResult,
         lock_host: bool,
@@ -340,7 +339,7 @@ pub trait TreeComponent<K: ChildKeyType> {
     //         ...
     fn release_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         params: Option<&DecLockRefParams>,
         lock_host: bool,
@@ -350,11 +349,11 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// the other components' locks intact; only the SWA component supports it.
     fn release_window_lock(
         &self,
-        _tree_core: &mut UnifiedTreeCore<K>,
+        _tree_core: &mut UnifiedTreeCore<K, V>,
         _node_id: NodeIdx_,
         _swa_uuid_for_lock: Option<i64>,
-        _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        _host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
         unimplemented!("release_window_lock is SWA-only")
     }
@@ -363,15 +362,15 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// the component has nothing to transfer.
     fn build_hicache_transfers(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
+        tree_core: &UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        mamba_pool_idx: Option<Tensor>,
-        host_indices: Option<Tensor>,
+        mamba_pool_idx: Option<V>,
+        host_indices: Option<V>,
         token_ids: Option<&[i64]>,
         prefetch_tokens: usize,
         last_hash: Option<&str>,
-    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
+    ) -> Result<Option<Vec<PoolTransfer<V>>>, TreeCoreRuntimeError> {
         // Python reference — tree_component.py::TreeComponent.build_hicache_transfers:
         //     def build_hicache_transfers(
         //         self,
@@ -393,12 +392,12 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Post-transfer bookkeeping: store host indices, update LRU, etc.
     fn commit_hicache_transfer(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
-        insert_result: Option<&mut InsertResult>,
+        transfers: Vec<PoolTransfer<V>>,
+        cache_actions: &mut Vec<CacheAction<V>>,
+        insert_result: Option<&mut InsertResult<V>>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
         // Python reference — tree_component.py::TreeComponent.commit_hicache_transfer:
@@ -421,11 +420,11 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// host eviction. Called only under the write-back policy.
     fn reclaim_coexisting_host_values(
         &self,
-        _tree_core: &mut UnifiedTreeCore<K>,
+        _tree_core: &mut UnifiedTreeCore<K, V>,
         _num_tokens: usize,
         _tracker: &mut HashMap<ComponentType, usize>,
-        _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        _host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
     }
 
@@ -434,11 +433,11 @@ pub trait TreeComponent<K: ChildKeyType> {
     /// Default no-op for components without host storage.
     fn drive_host_eviction(
         &self,
-        _tree_core: &mut UnifiedTreeCore<K>,
+        _tree_core: &mut UnifiedTreeCore<K, V>,
         _num_tokens: usize,
         _tracker: &mut HashMap<ComponentType, usize>,
-        _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        _host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
     }
 }
@@ -486,6 +485,6 @@ impl ComponentType {
         }
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "../tests/components/base.rs"]
 mod tests;

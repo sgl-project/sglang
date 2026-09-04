@@ -2,6 +2,7 @@ use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_lru_list::UnifiedLRUList;
+use tch::Tensor;
 
 fn mamba_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
     mamba_core_with_chunk(page_size, /* chunk = */ 256)

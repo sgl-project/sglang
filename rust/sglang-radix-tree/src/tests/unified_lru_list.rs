@@ -1,6 +1,7 @@
 use super::*;
 use crate::components::FULL;
 use crate::node::{NodeArena, NodeIdx_, ValueSlotIdx};
+use tch::Tensor;
 
 fn order(list: &UnifiedLRUList) -> Vec<NodeIdx_> {
     list.iter().collect()
@@ -656,7 +657,7 @@ fn get_eviction_strategy_resolves_each_policy_name() {
     ];
     for (policy, expected) in cases {
         assert_eq!(
-            get_eviction_strategy::<Vec<i64>>(policy).get_priority(node),
+            get_eviction_strategy::<Vec<i64>, Tensor>(policy).get_priority(node),
             expected,
             "policy {policy}"
         );
@@ -669,11 +670,11 @@ fn eviction_policy_names_are_case_insensitive() {
     let node = arena.node(NodeIdx_(a.0));
     // Mixed-case names resolve to the same strategies as their lowercase forms.
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("LRU").get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("LRU").get_priority(node),
         PriorityKey(5, 0)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("Priority").get_priority(node),
+        get_eviction_strategy::<Vec<i64>, Tensor>("Priority").get_priority(node),
         PriorityKey(9, 5)
     );
 }
@@ -681,7 +682,7 @@ fn eviction_policy_names_are_case_insensitive() {
 #[test]
 fn get_eviction_strategy_slru_default_threshold_is_two() {
     let (mut arena, a) = arena_with_node();
-    let slru = get_eviction_strategy::<Vec<i64>>("slru");
+    let slru = get_eviction_strategy::<Vec<i64>, Tensor>("slru");
     // Exactly 2 hits is protected under the factory default; 1 is not.
     arena.node_mut(NodeIdx_(a.0)).hit_count = 2;
     assert_eq!(
@@ -698,7 +699,7 @@ fn get_eviction_strategy_slru_default_threshold_is_two() {
 #[test]
 #[should_panic(expected = "Unknown eviction policy: random. Supported policies:")]
 fn get_eviction_strategy_panics_on_an_unknown_policy() {
-    get_eviction_strategy::<Vec<i64>>("Random");
+    get_eviction_strategy::<Vec<i64>, Tensor>("Random");
 }
 
 #[test]

@@ -2,6 +2,7 @@ use super::*;
 use crate::components::FULL;
 use crate::test_utils::accumulate_step;
 use crate::unified_tree_core::CacheInitParams;
+use tch::{Kind, Tensor};
 
 fn core() -> UnifiedTreeCore<Vec<i64>> {
     UnifiedTreeCore::new(CacheInitParams::default(), vec![FULL])

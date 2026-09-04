@@ -7,12 +7,11 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
+use crate::value::{DefaultRadixValue, RadixValue};
 use hashbrown::hash_map::Entry;
 use hashbrown::{Equivalent, HashMap as HashBrownMap};
 use sha2::{Digest, Sha256};
-use tch::Tensor;
-
-use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
 
 /// The two independent dimensions that partition a radix tree.
 #[derive(Debug)]
@@ -150,9 +149,9 @@ impl<K: ChildKeyType> Equivalent<(KeyNamespace, K)> for ChildEdgeRef<'_, K> {
 }
 
 /// A radix-tree node, generic over the child-key type `K` (single-token or bigram).
-pub struct Node<K: ChildKeyType> {
+pub struct Node<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
     /// Parent handle; `None` for the root or a not-yet-attached child.
-    pub parent: Option<NodeIdx_>,
+    pub(crate) parent: Option<NodeIdx_>,
     /// Own arena slot; stamped by the arena on allocation (hand-built nodes
     /// default it to the id value).
     pub(crate) idx: NodeIdx_,
@@ -160,14 +159,14 @@ pub struct Node<K: ChildKeyType> {
     pub namespace: KeyNamespace,
     /// Child edges keyed by (namespace, the child's page key); the namespace
     /// component mirrors the child's namespace at every level.
-    pub children: ChildMap<K>,
+    pub(crate) children: ChildMap<K>,
     /// The page key labelling the edge from the parent (also this node's key in the
     /// parent's `children`); empty for the root.
     pub key: K,
     /// Per-(component × tier) value state, indexed by `ValueSlotIdx` (device
     /// slots first, host after); device states also sit at plain component
     /// indices.
-    pub values: [ValueState; NUM_VALUE_SLOTS],
+    pub values: [ValueState<V>; NUM_VALUE_SLOTS],
     /// SWA lock-window uuid; stamped where a device lock walk fills the window.
     pub swa_uuid: Option<i64>,
     /// SWA lock-window uuid for host locks; stamped where a host lock walk fills the window.
@@ -191,7 +190,7 @@ pub struct Node<K: ChildKeyType> {
     pub id: NodeId,
 }
 
-impl<K: ChildKeyType> Node<K> {
+impl<K: ChildKeyType, V: RadixValue> Node<K, V> {
     /// Whether this is the root (no parent).
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
@@ -199,13 +198,13 @@ impl<K: ChildKeyType> Node<K> {
 
     /// The parent's id; panics on a root.
     #[track_caller]
-    pub fn parent(&self) -> NodeIdx_ {
+    pub(crate) fn parent(&self) -> NodeIdx_ {
         self.parent
             .unwrap_or_else(|| panic!("node {} is a root and has no parent", self.id))
     }
 
     /// The parent's id, or `None` on a root.
-    pub fn try_parent(&self) -> Option<NodeIdx_> {
+    pub(crate) fn try_parent(&self) -> Option<NodeIdx_> {
         self.parent
     }
 
@@ -233,12 +232,12 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// The component's device value; panics if unset.
-    pub fn device_value(&self, component_type: ComponentType) -> &Tensor {
+    pub fn device_value(&self, component_type: ComponentType) -> &V {
         self.value_(ValueSlotIdx::device(component_type))
     }
 
     /// The component's device value, or None when unset.
-    pub fn try_device_value(&self, component_type: ComponentType) -> Option<&Tensor> {
+    pub fn try_device_value(&self, component_type: ComponentType) -> Option<&V> {
         self.try_value_(ValueSlotIdx::device(component_type))
     }
 
@@ -253,12 +252,12 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// Set the component's device value; panics if already set.
-    pub fn set_device_value(&mut self, component_type: ComponentType, value: Tensor) {
+    pub fn set_device_value(&mut self, component_type: ComponentType, value: V) {
         self.set_value_(ValueSlotIdx::device(component_type), value);
     }
 
     /// Take the component's device value; panics if unset.
-    pub fn take_device_value(&mut self, component_type: ComponentType) -> Tensor {
+    pub fn take_device_value(&mut self, component_type: ComponentType) -> V {
         self.take_value_(ValueSlotIdx::device(component_type))
     }
 
@@ -278,15 +277,15 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// Copy the component's device lock refcount from `src_node`.
-    pub fn copy_device_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K>) {
+    pub fn copy_device_lock_ref(&mut self, component_type: ComponentType, src_node: &Node<K, V>) {
         let slot = ValueSlotIdx::device(component_type);
         self.set_lock_ref_(slot, src_node.lock_ref_(slot));
     }
 
     /// Split the component's device value between a new parent and the child.
     pub fn redistribute_child_device_value(
-        parent_node: &mut Node<K>,
-        child_node: &mut Node<K>,
+        parent_node: &mut Node<K, V>,
+        child_node: &mut Node<K, V>,
         component_type: ComponentType,
         split_len: i64,
     ) {
@@ -299,12 +298,12 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// The component's host value; panics if unset.
-    pub fn host_value(&self, component_type: ComponentType) -> &Tensor {
+    pub fn host_value(&self, component_type: ComponentType) -> &V {
         self.value_(ValueSlotIdx::host(component_type))
     }
 
     /// The component's host value, or None when unset.
-    pub fn try_host_value(&self, component_type: ComponentType) -> Option<&Tensor> {
+    pub fn try_host_value(&self, component_type: ComponentType) -> Option<&V> {
         self.try_value_(ValueSlotIdx::host(component_type))
     }
 
@@ -319,12 +318,12 @@ impl<K: ChildKeyType> Node<K> {
     }
 
     /// Set the component's host value; panics if already set.
-    pub fn set_host_value(&mut self, component_type: ComponentType, value: Tensor) {
+    pub fn set_host_value(&mut self, component_type: ComponentType, value: V) {
         self.set_value_(ValueSlotIdx::host(component_type), value);
     }
 
     /// Take the component's host value; panics if unset.
-    pub fn take_host_value(&mut self, component_type: ComponentType) -> Tensor {
+    pub fn take_host_value(&mut self, component_type: ComponentType) -> V {
         self.take_value_(ValueSlotIdx::host(component_type))
     }
 
@@ -345,8 +344,8 @@ impl<K: ChildKeyType> Node<K> {
 
     /// Split the component's host value between a new parent and the child.
     pub fn redistribute_child_host_value(
-        parent_node: &mut Node<K>,
-        child_node: &mut Node<K>,
+        parent_node: &mut Node<K, V>,
+        child_node: &mut Node<K, V>,
         component_type: ComponentType,
         split_len: i64,
     ) {
@@ -433,7 +432,7 @@ impl<K: ChildKeyType> Node<K> {
     /// The caller sets `child.namespace` first; the edge key mirrors it.
     pub(crate) fn attach_child(
         &mut self,
-        child: &mut Node<K>,
+        child: &mut Node<K, V>,
         page_size: usize,
     ) -> Result<(), TreeCoreRuntimeError> {
         // Only fresh, detached nodes are ever attached.
@@ -459,7 +458,7 @@ impl<K: ChildKeyType> Node<K> {
 
     /// Unlink this node from `parent`: drop it from `parent.children` and clear its own
     /// parent link; panics on a broken parent<->child link (an internal invariant).
-    pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K>, page_size: usize) {
+    pub(crate) fn detach_from_parent(&mut self, parent: &mut Node<K, V>, page_size: usize) {
         // A live child is always registered under its namespaced page key.
         match parent.children.remove(&self.edge_key(page_size)) {
             Some(idx) if idx == self.idx => self.parent = None,
@@ -473,22 +472,22 @@ impl<K: ChildKeyType> Node<K> {
     // ==== Internal slot-keyed lookups ====
 
     /// The slot's value state (internal slot-keyed lookup).
-    pub fn state_(&self, slot: ValueSlotIdx) -> &ValueState {
+    pub fn state_(&self, slot: ValueSlotIdx) -> &ValueState<V> {
         &self.values[slot.idx()]
     }
 
     /// The slot's mutable value state (internal slot-keyed lookup).
-    pub fn state_mut_(&mut self, slot: ValueSlotIdx) -> &mut ValueState {
+    pub fn state_mut_(&mut self, slot: ValueSlotIdx) -> &mut ValueState<V> {
         &mut self.values[slot.idx()]
     }
 
     /// The slot's value, or None when unset (internal slot-keyed lookup).
-    pub fn try_value_(&self, slot: ValueSlotIdx) -> Option<&Tensor> {
+    pub fn try_value_(&self, slot: ValueSlotIdx) -> Option<&V> {
         self.state_(slot).value.as_ref()
     }
 
     /// The slot's value; panics if no value is set (internal slot-keyed lookup).
-    pub fn value_(&self, slot: ValueSlotIdx) -> &Tensor {
+    pub fn value_(&self, slot: ValueSlotIdx) -> &V {
         self.try_value_(slot).unwrap_or_else(|| {
             panic!(
                 "value: {:?}/{} slot has no value on node {}",
@@ -506,17 +505,14 @@ impl<K: ChildKeyType> Node<K> {
 
     /// The slot's value length, or 0 when value-less (internal slot-keyed lookup).
     pub fn value_len_(&self, slot: ValueSlotIdx) -> usize {
-        self.state_(slot)
-            .value
-            .as_ref()
-            .map_or(0, |v| v.size()[0] as usize)
+        self.state_(slot).value.as_ref().map_or(0, RadixValue::len)
     }
 
     /// Set the slot's value; panics if a value is already set (internal slot-keyed lookup).
-    pub fn set_value_(&mut self, slot: ValueSlotIdx, value: Tensor) {
+    pub fn set_value_(&mut self, slot: ValueSlotIdx, value: V) {
         if slot.component_type().single_value_per_node() {
             assert_eq!(
-                value.size()[0],
+                value.len(),
                 1,
                 "set_value: {:?}/{} expects a single state slot on node {}",
                 slot.component_type(),
@@ -525,7 +521,7 @@ impl<K: ChildKeyType> Node<K> {
             );
         } else {
             assert_eq!(
-                value.size()[0] as usize,
+                value.len(),
                 self.key.atom_len(),
                 "set_value: {:?}/{} value length differs from the key on node {}",
                 slot.component_type(),
@@ -546,7 +542,7 @@ impl<K: ChildKeyType> Node<K> {
 
     /// Take the slot's value, leaving it value-less; panics if no value is set
     /// (internal slot-keyed lookup).
-    pub fn take_value_(&mut self, slot: ValueSlotIdx) -> Tensor {
+    pub fn take_value_(&mut self, slot: ValueSlotIdx) -> V {
         let node_id = self.id;
         self.state_mut_(slot).value.take().unwrap_or_else(|| {
             panic!(
@@ -561,21 +557,20 @@ impl<K: ChildKeyType> Node<K> {
     /// rows land on `parent_node`, the tail rows replace the value on `child_node`
     /// (internal slot-keyed lookup).
     pub fn redistribute_child_value_(
-        parent_node: &mut Node<K>,
-        child_node: &mut Node<K>,
+        parent_node: &mut Node<K, V>,
+        child_node: &mut Node<K, V>,
         slot: ValueSlotIdx,
         split_len: i64,
     ) {
         let child_node_id = child_node.id;
         let value = child_node.take_value_(slot);
-        let len = value.size()[0];
+        let len = value.len();
         // A boundary split would leave one side with a present-but-empty value.
         assert!(
-            0 < split_len && split_len < len,
+            0 < split_len && (split_len as usize) < len,
             "redistribute_child_value: split_len {split_len} out of range (0, {len}) on node {child_node_id}"
         );
-        let head = value.narrow(0, 0, split_len).copy();
-        let tail = value.narrow(0, split_len, len - split_len).copy();
+        let (head, tail) = value.split_owned(split_len as usize);
         child_node.set_value_(slot, tail);
         parent_node.set_value_(slot, head);
     }
@@ -678,12 +673,20 @@ impl ValueSlotIdx {
 
 /// Per-(component × tier) node state: the KV-index `value` (held opaquely)
 /// and the in-flight `lock_ref`.
-#[derive(Default)]
-pub struct ValueState {
+pub struct ValueState<V = DefaultRadixValue> {
     /// KV pool indices; `None` = value-less (root) or tombstone (evicted / out-of-window).
-    pub value: Option<Tensor>,
+    pub value: Option<V>,
     /// In-flight request refcount; a host slot's own `lock_ref` IS the host lock.
     pub lock_ref: u32,
+}
+
+impl<V> Default for ValueState<V> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            lock_ref: 0,
+        }
+    }
 }
 
 // Tree-core runtime errors.
@@ -702,22 +705,22 @@ pub enum TreeCoreRuntimeError {
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
-    /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
+    /// An arena slot beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
-    NodeAccessOutOfBound { id: NodeIdx_, size: usize },
+    NodeAccessOutOfBound { id: usize, size: usize },
     /// `free` called on an in-range slot that is already free — a double free.
     #[error("double free: node {id} is already free")]
-    NodeDoubleFree { id: NodeIdx_ },
+    NodeDoubleFree { id: usize },
     /// `free` called on a root (no parent) — roots are protected.
     #[error("cannot free node {id}: it is a root (protected)")]
-    RootNotFreeable { id: NodeIdx_ },
+    RootNotFreeable { id: usize },
     /// `free` called on a non-leaf node — only leaves are freeable.
     #[error("cannot free non-leaf node {id}: it has {num_children} children")]
-    FreeNonLeafNode { id: NodeIdx_, num_children: usize },
+    FreeNonLeafNode { id: usize, num_children: usize },
     /// `alloc_child` under an in-range parent slot that holds no live node.
     #[error("alloc_child: parent {id} is not allocated")]
-    ParentNotAllocated { id: NodeIdx_ },
+    ParentNotAllocated { id: usize },
     /// `alloc_child` under a parent that already has a child at the same key.
     #[error("cannot add a child under parent {parent}: key {key} already has a child")]
     DuplicateChildKey { parent: NodeId, key: String },
@@ -736,6 +739,37 @@ pub enum TreeCoreRuntimeError {
     /// A host insert below a non-root anchor must remain in that anchor's namespace.
     #[error("insert_host namespace does not match non-root anchor {node_id}")]
     InsertHostNamespaceMismatch { node_id: NodeId },
+    /// Continuation inserts must start at the exact page-aligned prefix boundary.
+    #[error(
+        "insert continuation prefix length {prefix_len} is not aligned to page size {page_size}"
+    )]
+    InsertPrefixNotPageAligned { prefix_len: usize, page_size: usize },
+    /// The retained prefix cannot extend beyond the aligned input key.
+    #[error(
+        "insert continuation prefix length {prefix_len} exceeds aligned key length {aligned_key_len}"
+    )]
+    InsertPrefixExceedsKey {
+        prefix_len: usize,
+        aligned_key_len: usize,
+    },
+    /// The retained node must end at the supplied prefix boundary.
+    #[error(
+        "insert continuation anchor {node_id} ends at {node_prefix_len}, expected {prefix_len}"
+    )]
+    InsertAnchorPrefixMismatch {
+        node_id: NodeId,
+        node_prefix_len: usize,
+        prefix_len: usize,
+    },
+    /// A non-root continuation stays inside the anchor's namespace.
+    #[error("insert continuation namespace does not match non-root anchor {node_id}")]
+    InsertContinuationNamespaceMismatch { node_id: NodeId },
+    /// Device indices must cover every page-aligned key atom.
+    #[error("insert value length {value_len} is shorter than aligned key length {aligned_key_len}")]
+    InsertValueTooShort {
+        value_len: usize,
+        aligned_key_len: usize,
+    },
 }
 
 // Unigram and bigram child keys.
@@ -1011,9 +1045,9 @@ pub fn split_node_hash_value(
 
 /// Owns every `Node`; parent/children/LRU hold `NodeIdx_`s into it, with a freelist
 /// and a single root; child edges are keyed by (namespace, page key).
-pub struct NodeArena<K: ChildKeyType> {
+pub struct NodeArena<K: ChildKeyType, V: RadixValue = DefaultRadixValue> {
     /// Node store indexed by `NodeIdx_`; `None` marks a freed slot.
-    nodes: Vec<Option<Node<K>>>,
+    nodes: Vec<Option<Node<K, V>>>,
     /// Freed slot ids available for reuse.
     free: Vec<NodeIdx_>,
     /// External handle -> live slot; a freed `NodeId` leaves the map, so a
@@ -1031,7 +1065,7 @@ pub struct NodeArena<K: ChildKeyType> {
     page_size: usize,
 }
 
-impl<K: ChildKeyType> NodeArena<K> {
+impl<K: ChildKeyType, V: RadixValue> NodeArena<K, V> {
     /// Build an arena for the given component types and install a fresh root.
     pub fn new(component_types: Vec<ComponentType>, page_size: usize) -> Self {
         let mut arena = NodeArena {
@@ -1252,8 +1286,12 @@ impl<K: ChildKeyType> NodeArena<K> {
         // rejected add reserves nothing.
         let size = self.nodes.len();
         match self.nodes.get(parent.0) {
-            None => return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id: parent, size }),
-            Some(None) => return Err(TreeCoreRuntimeError::ParentNotAllocated { id: parent }),
+            None => {
+                return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id: parent.0, size });
+            }
+            Some(None) => {
+                return Err(TreeCoreRuntimeError::ParentNotAllocated { id: parent.0 });
+            }
             Some(Some(_)) => {}
         }
         let idx = self
@@ -1325,14 +1363,14 @@ impl<K: ChildKeyType> NodeArena<K> {
         let size = self.nodes.len();
         // Validate and take the leaf out in one step.
         let mut child_node = match self.nodes.get_mut(id.0) {
-            None => return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, size }),
-            Some(None) => return Err(TreeCoreRuntimeError::NodeDoubleFree { id }),
+            None => return Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id: id.0, size }),
+            Some(None) => return Err(TreeCoreRuntimeError::NodeDoubleFree { id: id.0 }),
             Some(Some(node)) if node.is_root() => {
-                return Err(TreeCoreRuntimeError::RootNotFreeable { id });
+                return Err(TreeCoreRuntimeError::RootNotFreeable { id: id.0 });
             }
             Some(Some(node)) if !node.is_leaf() => {
                 return Err(TreeCoreRuntimeError::FreeNonLeafNode {
-                    id,
+                    id: id.0,
                     num_children: node.children.len(),
                 });
             }
@@ -1355,7 +1393,7 @@ impl<K: ChildKeyType> NodeArena<K> {
 
     /// Shared access to a live node; panics on a dead or out-of-range id.
     #[track_caller]
-    pub fn node(&self, id: NodeIdx_) -> &Node<K> {
+    pub fn node(&self, id: NodeIdx_) -> &Node<K, V> {
         let size = self.nodes.len();
         self.nodes
             .get(id.0)
@@ -1366,7 +1404,7 @@ impl<K: ChildKeyType> NodeArena<K> {
 
     /// Mutable access to a live node; panics on a dead or out-of-range id.
     #[track_caller]
-    pub fn node_mut(&mut self, id: NodeIdx_) -> &mut Node<K> {
+    pub fn node_mut(&mut self, id: NodeIdx_) -> &mut Node<K, V> {
         let size = self.nodes.len();
         self.nodes
             .get_mut(id.0)
@@ -1376,12 +1414,12 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 
     /// The node's device value for the component; panics if unset.
-    pub fn device_value(&self, id: NodeIdx_, component_type: ComponentType) -> &Tensor {
+    pub fn device_value(&self, id: NodeIdx_, component_type: ComponentType) -> &V {
         self.node(id).device_value(component_type)
     }
 
     /// The node's device value for the component, or None when unset.
-    pub fn try_device_value(&self, id: NodeIdx_, component_type: ComponentType) -> Option<&Tensor> {
+    pub fn try_device_value(&self, id: NodeIdx_, component_type: ComponentType) -> Option<&V> {
         self.node(id).try_device_value(component_type)
     }
 
@@ -1396,12 +1434,12 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 
     /// Set the node's device value for the component; panics if already set.
-    pub fn set_device_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: Tensor) {
+    pub fn set_device_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: V) {
         self.node_mut(id).set_device_value(component_type, value);
     }
 
     /// Take the node's device value for the component; panics if unset.
-    pub fn take_device_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> Tensor {
+    pub fn take_device_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> V {
         self.node_mut(id).take_device_value(component_type)
     }
 
@@ -1411,7 +1449,7 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 
     /// The node's host value for the component; panics if unset.
-    pub fn host_value(&self, id: NodeIdx_, component_type: ComponentType) -> &Tensor {
+    pub fn host_value(&self, id: NodeIdx_, component_type: ComponentType) -> &V {
         self.node(id).host_value(component_type)
     }
 
@@ -1426,12 +1464,12 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 
     /// Set the node's host value for the component; panics if already set.
-    pub fn set_host_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: Tensor) {
+    pub fn set_host_value(&mut self, id: NodeIdx_, component_type: ComponentType, value: V) {
         self.node_mut(id).set_host_value(component_type, value);
     }
 
     /// Take the node's host value for the component; panics if unset.
-    pub fn take_host_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> Tensor {
+    pub fn take_host_value(&mut self, id: NodeIdx_, component_type: ComponentType) -> V {
         self.node_mut(id).take_host_value(component_type)
     }
 
@@ -1462,7 +1500,7 @@ impl<K: ChildKeyType> NodeArena<K> {
         &mut self,
         parent_node_id: NodeIdx_,
         child_node_id: NodeIdx_,
-    ) -> (&mut Node<K>, &mut Node<K>) {
+    ) -> (&mut Node<K, V>, &mut Node<K, V>) {
         assert_ne!(
             parent_node_id, child_node_id,
             "node_pair_mut: distinct nodes required, got {parent_node_id} twice"
@@ -1566,6 +1604,6 @@ impl EvictableNodeSet {
         self.nodes.is_empty()
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "tests/node.rs"]
 mod tests;

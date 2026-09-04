@@ -1,6 +1,7 @@
 use super::*;
 use crate::components::FULL;
 use crate::unified_tree_core::CacheInitParams;
+use tch::Tensor;
 
 // Test-only component exercising the trait defaults; abstract hooks stay unimplemented.
 struct DefaultComponentForTest;

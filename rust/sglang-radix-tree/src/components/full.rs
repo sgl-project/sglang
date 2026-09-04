@@ -4,8 +4,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use tch::{Kind, Tensor};
-
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL};
 use crate::node::ChildKeyType;
@@ -16,6 +14,7 @@ use crate::unified_tree_core::{
     CacheAction, CacheTransferPhase, DecLockRefParams, EvictLayer, IncLockRefResult, InsertResult,
     MatchPrefixParams, MatchResult, PoolName, PoolTransfer, PoolTransferResult, UnifiedTreeCore,
 };
+use crate::value::RadixValue;
 
 /// FULL attention component driver; owns the FULL device/host value slots.
 pub struct FullComponent;
@@ -27,32 +26,34 @@ impl FullComponent {
     pub const HOST: ValueSlotIdx = ValueSlotIdx::host(FULL);
 }
 
-impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
+impl<K: ChildKeyType, V: RadixValue> TreeComponent<K, V> for FullComponent {
     fn component_type(&self) -> ComponentType {
         FULL
     }
 
     fn create_match_validator(
         &self,
-        _tree_core: &UnifiedTreeCore<K>,
+        _tree_core: &UnifiedTreeCore<K, V>,
         match_device_only: bool,
-    ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
+    ) -> Box<dyn FnMut(&UnifiedTreeCore<K, V>, NodeIdx_) -> bool> {
         // Device value present -> always a boundary; otherwise a backuped (host-resident)
         // node also matches, unless the match is restricted to device.
-        Box::new(move |tree_core: &UnifiedTreeCore<K>, node_id: NodeIdx_| {
-            let node = tree_core.arena.node(node_id);
-            node.has_device_value(FULL) || (!match_device_only && node.has_host_value(FULL))
-        })
+        Box::new(
+            move |tree_core: &UnifiedTreeCore<K, V>, node_id: NodeIdx_| {
+                let node = tree_core.arena.node(node_id);
+                node.has_device_value(FULL) || (!match_device_only && node.has_host_value(FULL))
+            },
+        )
     }
 
     fn finalize_match_result_in_tree_core(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
-        mut result: MatchResult,
+        tree_core: &UnifiedTreeCore<K, V>,
+        mut result: MatchResult<V>,
         params: &MatchPrefixParams<'_, K>,
-        value_chunks: &[Tensor],
+        value_chunks: &[V],
         best_value_len: usize,
-    ) -> MatchResult {
+    ) -> MatchResult<V> {
         // Compute Full KV host hit length: walk from last_host_node up to
         // last_device_node, summing host_value lengths of evicted nodes.
         let mut kv_host_hit = 0;
@@ -78,7 +79,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn redistribute_on_node_split(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         new_parent_id: NodeIdx_,
         child_id: NodeIdx_,
     ) {
@@ -95,10 +96,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn evict_component(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
         target: EvictLayer,
     ) -> (usize, usize) {
         let node = tree_core.arena.node_mut(node_id);
@@ -131,7 +132,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         if is_leaf { 0 } else { 2 }
     }
 
-    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
+    fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K, V>, request_cnt: usize) {
         tree_core.set_evict_device_start(FULL, request_cnt);
         tree_core.full_evict_device_heap.clear();
         let arena = &tree_core.arena;
@@ -146,10 +147,10 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn evict_device_next_node(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         tracker: &mut HashMap<ComponentType, usize>,
-        _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        _host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) -> Option<NodeIdx_> {
         let ct = FULL;
         assert!(
@@ -186,18 +187,18 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         None
     }
 
-    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
+    fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K, V>) {
         tree_core.set_evict_device_end(FULL);
         tree_core.full_evict_device_heap.clear();
     }
 
     fn reclaim_coexisting_host_values(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         num_tokens: usize,
         tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
         for spare_imminent_demotes in [true, false] {
             if tracker[&FULL] >= num_tokens {
@@ -234,11 +235,11 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     /// Evict host leaves to free KV host pool space.
     fn drive_host_eviction(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         num_tokens: usize,
         tracker: &mut HashMap<ComponentType, usize>,
-        device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
-        host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        device_frees: &mut HashMap<ComponentType, Vec<V>>,
+        host_frees: &mut HashMap<ComponentType, Vec<V>>,
     ) {
         let ct = FULL;
         let arena = &tree_core.arena;
@@ -271,7 +272,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn acquire_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         mut result: IncLockRefResult,
         lock_host: bool,
@@ -291,7 +292,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         }
 
         // Skip the bottom evicted segment, recording it for the matching release.
-        let on_boundary = |node: &Node<K>| node.is_root() || node.has_device_value(FULL);
+        let on_boundary = |node: &Node<K, V>| node.is_root() || node.has_device_value(FULL);
         let mut cur = node_id;
         let mut node = tree_core.arena.node(cur);
         if !on_boundary(node) {
@@ -338,7 +339,7 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn release_component_lock(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         params: Option<&DecLockRefParams>,
         lock_host: bool,
@@ -400,24 +401,24 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn build_hicache_transfers(
         &self,
-        tree_core: &UnifiedTreeCore<K>,
+        tree_core: &UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        _mamba_pool_idx: Option<Tensor>,
-        _host_indices: Option<Tensor>,
+        _mamba_pool_idx: Option<V>,
+        _host_indices: Option<V>,
         _token_ids: Option<&[i64]>,
         _prefetch_tokens: usize,
         _last_hash: Option<&str>,
-    ) -> Result<Option<Vec<PoolTransfer>>, TreeCoreRuntimeError> {
+    ) -> Result<Option<Vec<PoolTransfer<V>>>, TreeCoreRuntimeError> {
         Ok(match phase {
             // Full KV backup is handled by the main flow
             // (cache_controller.write on host_value directly).
-            // No extra PoolTransfer needed.
+            // No extra PoolTransfer<V> needed.
             CacheTransferPhase::BackupHost => None,
             CacheTransferPhase::LoadBack => {
                 // `node` is best_match_node. FULL device evict only from leaves,
                 // so once we hit a device-on node, everything above is also device-on.
-                let mut backed_up: Vec<Tensor> = Vec::new();
+                let mut backed_up: Vec<V> = Vec::new();
                 let mut nodes_to_load: Vec<NodeId> = Vec::new();
                 let mut cur = tree_core.arena.node(node_id);
                 while cur.evicted() {
@@ -428,11 +429,11 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 backed_up.reverse();
                 nodes_to_load.reverse();
                 let host_indices = if backed_up.is_empty() {
-                    Tensor::empty([0], (Kind::Int64, tch::Device::Cpu))
+                    V::empty()
                 } else {
-                    Tensor::cat(&backed_up, 0)
+                    V::concat(&backed_up)
                 };
-                Some(vec![PoolTransfer {
+                Some(vec![PoolTransfer::<V> {
                     name: PoolName::Kv,
                     host_indices: Some(host_indices),
                     nodes_to_load: Some(nodes_to_load),
@@ -445,12 +446,12 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn commit_hicache_transfer(
         &self,
-        tree_core: &mut UnifiedTreeCore<K>,
+        tree_core: &mut UnifiedTreeCore<K, V>,
         node_id: NodeIdx_,
         phase: CacheTransferPhase,
-        transfers: Vec<PoolTransfer>,
-        cache_actions: &mut Vec<CacheAction>,
-        insert_result: Option<&mut InsertResult>,
+        transfers: Vec<PoolTransfer<V>>,
+        cache_actions: &mut Vec<CacheAction<V>>,
+        insert_result: Option<&mut InsertResult<V>>,
         pool_storage_result: Option<&PoolTransferResult>,
     ) {
         match phase {
@@ -460,23 +461,25 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 {
                     tree_core
                         .arena
-                        .set_host_value(node_id, FULL, host_indices.copy());
+                        .set_host_value(node_id, FULL, host_indices.copy_for_adoption());
                 }
             }
             CacheTransferPhase::LoadBack => {
                 if let Some(transfer) = transfers.first()
                     && let Some(device_indices) = &transfer.device_indices
                 {
-                    let mut offset = 0i64;
+                    let mut offset = 0usize;
                     for &loaded_id in transfer.nodes_to_load.iter().flatten() {
                         let loaded_idx = tree_core.arena.resolve(loaded_id);
                         let loaded = tree_core.arena.node_mut(loaded_idx);
-                        let n_len = loaded.host_value_len(FULL) as i64;
-                        loaded
-                            .set_device_value(FULL, device_indices.narrow(0, offset, n_len).copy());
+                        let n_len = loaded.host_value_len(FULL);
+                        loaded.set_device_value(
+                            FULL,
+                            device_indices.slice(offset, n_len).copy_for_adoption(),
+                        );
                         offset += n_len;
                         // Full uses leaf sets, not LRU.
-                        tree_core.inc_evictable_size(FULL, n_len as usize);
+                        tree_core.inc_evictable_size(FULL, n_len);
                         tree_core.update_evictable_leaf_sets_(loaded_idx);
                     }
                 }
@@ -488,6 +491,6 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "../tests/components/full.rs"]
 mod tests;

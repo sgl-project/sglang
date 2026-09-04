@@ -2,6 +2,7 @@ use super::*;
 use crate::components::{FULL, MAMBA, SWA};
 use crate::test_utils::{accumulate_step, action_kinds};
 use crate::unified_tree_core::CacheInitParams;
+use tch::{Kind, Tensor};
 
 #[test]
 fn component_type_is_swa() {

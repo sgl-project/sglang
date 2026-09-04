@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use tch::Tensor;
+use tch::{Kind, Tensor};
 
 use super::*;
 use crate::components::{FULL, MAMBA, SWA};
@@ -1837,11 +1837,11 @@ fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'
 
 #[test]
 fn adopted_ranges_are_opt_in_and_coalesce() {
-    let mut untracked = InsertResult::default();
+    let mut untracked = InsertResult::<Tensor>::default();
     untracked.record_adopted_range(FULL, 0, 2);
     assert_eq!(untracked.adopted_ranges, None);
 
-    let mut tracked = InsertResult {
+    let mut tracked = InsertResult::<Tensor> {
         adopted_ranges: Some(HashMap::new()),
         ..InsertResult::default()
     };
@@ -7619,7 +7619,7 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 // Insert-while-locked churn, the cache_finished_req shape.
                 let matched = tc.match_prefix(&match_params(&key));
                 let anchor = matched.best_match_node_id;
-                let matched_len = matched.device_indices.numel() as usize;
+                let matched_len = matched.device_indices.numel();
                 let lock = tc.inc_lock_ref(anchor);
                 tc.insert(&sequence_insert_params(
                     &key,

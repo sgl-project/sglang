@@ -44,6 +44,8 @@ class TestSGLangRadixTreeCargo(CustomTestCase):
                 str(SGLANG_RADIX_TREE_MANIFEST),
                 "--locked",
                 "--no-default-features",
+                "--features",
+                "torch",
             ],
             cwd=RUST_WORKSPACE,
             env=build.environment,

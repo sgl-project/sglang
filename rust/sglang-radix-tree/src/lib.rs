@@ -1,4 +1,5 @@
-//! Rust radix tree core for SGLang's KV cache, exposed to Python as `mem_cache`.
+//! Reusable Rust radix-tree core for SGLang's KV cache, with an optional
+//! Tensor/PyO3 production backend.
 // TODO(Jialin): Replace recoverable panics with explicit Rust errors and map
 // them to PyErr at the Python boundary.
 #![allow(
@@ -20,8 +21,20 @@ mod components;
 mod node;
 #[cfg(feature = "python-extension")]
 mod python_bindings;
-#[cfg(test)]
+#[cfg(all(test, feature = "torch"))]
 #[path = "tests/test_utils.rs"]
 pub(crate) mod test_utils;
 mod unified_lru_list;
 mod unified_tree_core;
+mod value;
+
+pub use components::{ComponentType, FULL, MAMBA, SWA};
+pub use node::{ChildKeyType, KeyNamespace, KeyNamespaceRef, NodeId, TreeCoreRuntimeError};
+pub use unified_tree_core::{
+    BackupKV, BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams,
+    CacheTransferPhase, DecLockRefParams, DecLockRefResult, EvictLayer, EvictionStepResult,
+    IncLockRefResult, InsertParams, InsertResult, InsertStepResult, KvCacheEvent,
+    KvCanaryWalkResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer,
+    PoolTransferResult, Req, StorageBackupSpec, StorageMedium, UnifiedTreeCore,
+};
+pub use value::{DefaultRadixValue, PageValue, RadixValue};

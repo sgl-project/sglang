@@ -1448,11 +1448,11 @@ fn out_of_bounds_id_returns_out_of_bound_err() {
     let bogus = NodeIdx_(999);
     assert!(matches!(
         arena.free_leaf(bogus),
-        Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, .. }) if id == bogus
+        Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, .. }) if id == bogus.0
     ));
     assert!(matches!(
         arena.alloc_child(bogus, /* key = */ vec![1], /* priority = */ 0, /* extra_key = */ None),
-        Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, .. }) if id == bogus
+        Err(TreeCoreRuntimeError::NodeAccessOutOfBound { id, .. }) if id == bogus.0
     ));
 }
 
@@ -1469,7 +1469,7 @@ fn double_free_returns_err() -> Result<(), TreeCoreRuntimeError> {
     arena.free_leaf(a)?;
     assert!(matches!(
         arena.free_leaf(a),
-        Err(TreeCoreRuntimeError::NodeDoubleFree { id }) if id == a
+        Err(TreeCoreRuntimeError::NodeDoubleFree { id }) if id == a.0
     ));
     // The rejected free did not re-push the slot onto the freelist.
     assert_eq!(arena.len(), 1);
@@ -1482,7 +1482,7 @@ fn free_root_returns_err() -> Result<(), TreeCoreRuntimeError> {
     let root = arena.root();
     assert!(matches!(
         arena.free_leaf(root),
-        Err(TreeCoreRuntimeError::RootNotFreeable { id }) if id == root
+        Err(TreeCoreRuntimeError::RootNotFreeable { id }) if id == root.0
     ));
     // The root survives and stays accessible.
     assert!(arena.node(root).is_root());
@@ -1496,7 +1496,7 @@ fn free_the_root_returns_err() {
     let r = arena.root();
     assert!(matches!(
         arena.free_leaf(r),
-        Err(TreeCoreRuntimeError::RootNotFreeable { id }) if id == r
+        Err(TreeCoreRuntimeError::RootNotFreeable { id }) if id == r.0
     ));
 }
 
@@ -1538,7 +1538,7 @@ fn free_node_with_children_returns_err() -> Result<(), TreeCoreRuntimeError> {
     assert!(matches!(
         arena.free_leaf(parent),
         Err(TreeCoreRuntimeError::FreeNonLeafNode { id, num_children })
-            if id == parent && num_children == 1
+            if id == parent.0 && num_children == 1
     ));
     Ok(())
 }
@@ -1731,7 +1731,7 @@ fn alloc_child_under_freed_parent_returns_err() -> Result<(), TreeCoreRuntimeErr
     arena.free_leaf(a)?;
     assert!(matches!(
         arena.alloc_child(a, /* key = */ vec![2], /* priority = */ 0, /* extra_key = */ None),
-        Err(TreeCoreRuntimeError::ParentNotAllocated { id }) if id == a
+        Err(TreeCoreRuntimeError::ParentNotAllocated { id }) if id == a.0
     ));
     // The rejected alloc_child consumed no slot.
     assert_eq!(arena.len(), 1);
