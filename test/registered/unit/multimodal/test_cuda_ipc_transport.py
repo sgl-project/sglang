@@ -128,6 +128,58 @@ class TestCudaIpcTransport(CustomTestCase):
                     producer.join(timeout=10)
             self.assertEqual(producer.exitcode, 0)
 
+    def test_pooled_tensor_can_be_borrowed_until_current_stream_release(self):
+        ctx = mp.get_context("spawn")
+        proxy_queue = ctx.Queue()
+        producer_results = ctx.Queue()
+        consumer_done = ctx.Event()
+        producer = ctx.Process(
+            target=_produce_pooled_tensor,
+            args=(proxy_queue, consumer_done, producer_results),
+        )
+        producer.start()
+        proxy = borrowed = consumed = None
+        producer_result = None
+        try:
+            try:
+                proxy, expected = proxy_queue.get(timeout=60)
+            except queue.Empty:
+                producer_result = producer_results.get(timeout=5)
+                _status, payload = producer_result
+                self.fail(
+                    f"CUDA IPC producer failed before sending its proxy: {payload}"
+                )
+
+            borrowed = proxy.borrow_on_target_device(0)
+            self.assertIsNotNone(borrowed)
+            consumed = borrowed + 1
+            proxy.release_borrowed_on_current_stream()
+            torch.cuda.synchronize()
+
+            self.assertEqual(
+                consumed.cpu().tolist(),
+                (torch.tensor(expected) + 1).tolist(),
+            )
+            self.assertTrue(proxy._consumer_acknowledged)
+            self.assertIsNone(proxy._borrowed_storage)
+        finally:
+            del consumed, borrowed, proxy
+            _pool_handle_cache_clear()
+            gc.collect()
+            torch.cuda.ipc_collect()
+            consumer_done.set()
+            producer.join(timeout=60)
+            try:
+                if producer_result is None:
+                    producer_result = producer_results.get(timeout=5)
+                status, payload = producer_result
+                self.assertEqual(status, "ok", payload)
+            finally:
+                if producer.is_alive():
+                    producer.terminate()
+                    producer.join(timeout=10)
+            self.assertEqual(producer.exitcode, 0)
+
     def test_failed_reconstruction_releases_pooled_tensor(self):
         ctx = mp.get_context("spawn")
         proxy_queue = ctx.Queue()

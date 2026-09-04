@@ -1561,7 +1561,17 @@ class OpenAIServingChat(OpenAIServingBase):
         if use_cache:
             try:
                 cache_key = orjson.dumps(
-                    (messages, tools, template_kwargs, encode_kwargs),
+                    (
+                        getattr(
+                            self.tokenizer_manager.tokenizer,
+                            "chat_template",
+                            None,
+                        ),
+                        messages,
+                        tools,
+                        template_kwargs,
+                        encode_kwargs,
+                    ),
                     option=orjson.OPT_SORT_KEYS,
                 )
             except TypeError:
