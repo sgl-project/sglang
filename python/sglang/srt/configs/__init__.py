@@ -44,6 +44,8 @@ from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.configs.locate_anything import LocateAnythingConfig
 from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
 from sglang.srt.configs.minimax_vl import MiniMaxM3VLConfig
@@ -117,7 +119,10 @@ __all__ = [
     "DotsOCRConfig",
     "Dots3Config",
     "FalconH1Config",
+    "FalconMambaConfig",
     "GraniteMoeHybridConfig",
+    "MambaConfig",
+    "Mamba2Config",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
