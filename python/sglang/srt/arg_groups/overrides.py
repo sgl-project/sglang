@@ -636,11 +636,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "auto":
         kv_cache_dtype = (
-            "bfloat16"
-            if has_attention_sinks
-            else "fp8_e4m3"
-            if major >= 10
-            else "bfloat16"
+            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
         )
         logger.warning(
             f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."

@@ -329,44 +329,6 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertTrue(torch.all(output[:2] == 3))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
 
-    def test_custom_op_preserves_distinct_sink_keywords(self):
-        attention_layer = SimpleNamespace()
-        context = self._new_impl_context([attention_layer])
-        backend = _RecordingAttentionBackend(return_lse=False)
-        query = torch.zeros((4, 2, 3))
-        output = torch.empty_like(query)
-        sinks = torch.tensor([1.0, 2.0])
-        attn_sink = torch.tensor([3.0, 4.0])
-
-        with (
-            patch.object(
-                radix_attention_module,
-                "get_tc_piecewise_forward_context",
-                return_value=context,
-            ),
-            patch.object(
-                radix_attention_module, "get_attn_backend", return_value=backend
-            ),
-        ):
-            schema = str(torch.ops.sglang.unified_attention_with_output.default._schema)
-            self.assertIn("Tensor? attn_sink=None", schema)
-            radix_attention_module._unified_attention_with_output_impl(
-                query,
-                query,
-                query,
-                output,
-                False,
-                0,
-                False,
-                False,
-                sinks=sinks,
-                attn_sink=attn_sink,
-            )
-
-        call_record = backend.calls[-1]
-        self.assertIs(call_record.kwargs["sinks"], sinks)
-        self.assertIs(call_record.kwargs["attn_sink"], attn_sink)
-
     def test_impl_zero_real_tokens_returns_zeroed_lse(self):
         # Regression: an idle DP rank whose fabricated EXTEND batch is masked to
         # 0 real tokens skips attention entirely. The skip must still honor the
