@@ -19,6 +19,7 @@ from aiohttp import web
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -176,9 +177,9 @@ async def serve_grpc(server_args, model_info=None):
     sidecar_app = web.Application()
     sidecar_runner = None
     sidecar_port = (
-        server_args.smg_http_sidecar_port
-        if server_args.smg_http_sidecar_port is not None
-        else server_args.port + 1
+        get_observability().smg_http_sidecar_port
+        if get_observability().smg_http_sidecar_port is not None
+        else get_serving().port + 1
     )
 
     # Metrics setup: must set PROMETHEUS_MULTIPROC_DIR before scheduler

@@ -40,7 +40,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.runtime_context import get_flags, get_forward
+from sglang.srt.runtime_context import (
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils.common import ceil_align
 
 # Architectures whose decoder layers route attention/MLP through
@@ -55,7 +59,7 @@ def initialize_layernorm_sp(*, server_args, model_config) -> None:
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
     get_flags().sp.enabled = bool(
-        server_args.enable_layernorm_sp
+        get_parallel().enable_layernorm_sp
         and architectures
         and architectures[0] in SP_SUPPORTED_ARCHITECTURES
     )

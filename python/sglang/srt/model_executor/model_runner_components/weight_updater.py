@@ -12,6 +12,7 @@ from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     dynamic_import,
@@ -128,7 +129,7 @@ class WeightUpdater:
         param.data is the daemon's master copy shared with every co-attached
         engine, so an in-place update would silently corrupt them all.
         """
-        mode = self.get_model_runner().server_args.weight_cache_mode
+        mode = get_model().weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} is not supported while the weight cache is "
