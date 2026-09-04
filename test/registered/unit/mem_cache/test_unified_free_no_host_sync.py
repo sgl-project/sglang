@@ -492,6 +492,25 @@ class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
             alloc.free_swa(v[: 4 * self.PS], start_pos=0)
             alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
 
+    def test_full_only_segment_free_never_syncs(self):
+        """The request-finish dead half (swa already tombstoned) frees the full
+        side by page reps: no unique from free_full's token dedup."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(8 * self.PS)
+        alloc.free_swa(v, start_pos=0)
+        before = alloc.full_available_size()
+        with (
+            mock.patch.object(
+                torch, "unique", side_effect=AssertionError("unique = host sync")
+            ),
+            mock.patch.object(
+                torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+            ),
+        ):
+            alloc.free_full_segment(v[: 4 * self.PS], start_pos=0)
+            alloc.free_full_segment(v[4 * self.PS :], start_pos=4 * self.PS)
+        self.assertEqual(alloc.full_available_size(), before + 8 * self.PS)
+
     def test_unaligned_start_pos_is_rejected(self):
         """A mid-page start must fail loudly, not release the head page whole."""
         alloc = self._swa_composite(lazy=True)

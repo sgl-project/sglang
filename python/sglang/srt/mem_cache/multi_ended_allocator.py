@@ -3663,9 +3663,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.clear_inverse_history()
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        # Virtual-id pool: the full side dedups by v2p and there is no mapping
-        # tensor for the parent's peer check to read.
-        self.free_full(free_index)
+        if free_index is None or free_index.numel() == 0:
+            return
+        if self.page_size == 1:
+            # token == page: free_full already frees by exact ids, no dedup.
+            self.free_full(free_index)
+            return
+        # The swa v2p IS the mapping: a tombstoned swa page drops out of the
+        # two-sided segment path by itself, so full-only is the same call, with
+        # the full side freed by page reps instead of free_full's token dedup.
+        self.free_segment(free_index, start_pos=start_pos)
 
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
