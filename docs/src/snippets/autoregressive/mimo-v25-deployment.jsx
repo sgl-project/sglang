@@ -269,7 +269,6 @@ export const MiMoV25Deployment = () => {
         flags.push("  --swa-full-tokens-ratio 0.25");
         flags.push("  --log-level info");
       } else {
-        flags.push("  --max-seq-len 4096");
         flags.push("  --max-prefill-tokens 16384");
         flags.push("  --mem-fraction-static 0.92");
         flags.push("  --swa-full-tokens-ratio 0.15");
