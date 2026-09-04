@@ -22,6 +22,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# These target architectures carry MTP/EAGLE draft weights in the target
+# checkpoint, so they can intentionally use the target path for the draft.
+_BUNDLED_EAGLE3_DRAFT_ARCHITECTURES = {
+    "DeepseekV32ForCausalLM",
+    "DeepseekV3ForCausalLM",
+    "DeepseekV4ForCausalLM",
+    "Glm4MoeForCausalLM",
+    "Glm4MoeLiteForCausalLM",
+    "GlmMoeDsaForCausalLM",
+    "BailingMoeForCausalLM",
+    "BailingMoeV2ForCausalLM",
+    "BailingMoeV2_5ForCausalLM",
+    "MistralLarge3ForCausalLM",
+    "PixtralForConditionalGeneration",
+    "HYV3ForCausalLM",
+}
+
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
@@ -849,6 +866,17 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         )
 
     model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if (
+        cfg.speculative_algorithm == "EAGLE3"
+        and cfg.speculative_draft_model_path is None
+        and model_arch not in _BUNDLED_EAGLE3_DRAFT_ARCHITECTURES
+    ):
+        raise ValueError(
+            "EAGLE3 speculative decoding requires setting "
+            "--speculative-draft-model-path. Only target architectures with "
+            "bundled MTP/EAGLE3 draft weights may omit it."
+        )
+
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
