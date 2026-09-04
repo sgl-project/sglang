@@ -439,7 +439,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             swa = self.components.get(ComponentType.SWA)
             validate_buffer_only_stack(
-                sidecar_pool_specs=self.sidecar_pool_specs, swa_component=swa
+                sidecar_pool_specs=self.sidecar_pool_specs,
+                host_pool_group=self.host_pool_group,
+                swa_component=swa,
             )
             self.buffer_pipeline = BufferModePipeline(
                 cache=self,
