@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_context,
     get_disagg,
     get_exec,
@@ -87,6 +88,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
+    cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
@@ -103,6 +105,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
         not memory_config.enable_hisparse
         and not is_draft_worker
         and not memory_config.enable_hierarchical_cache
+        and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
 
@@ -298,12 +301,28 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
+    def _build_mha_quant_method(self, *, num_layers: int):
+        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+            return get_kv_cache_quant_method("cpu_fp8_e4m3")
+        return self._build_fp4_quant_method(num_layers=num_layers)
+
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if self.use_mla_backend:
+                raise ValueError("CPU FP8 KV cache is only supported for MHA.")
+            if not cpu_has_amx_support():
+                raise ValueError("CPU FP8 KV cache requires Intel AMX support.")
+            configured_backends = set(attention_backends())
+            if configured_backends - {"intel_amx"}:
+                raise ValueError(
+                    "CPU FP8 KV cache requires the intel_amx attention backend."
+                )
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
             config = self.memory_pool_config
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
@@ -704,9 +723,9 @@ class KVCacheConfigurator:
         config = self.mambaish_config
         assert config is not None and self.is_hybrid_swa
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified tri-pool does not support an MLA full side yet"
+        assert not self.use_mla_backend, (
+            "unified tri-pool does not support an MLA full side yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -819,9 +838,9 @@ class KVCacheConfigurator:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-SWA hybrid yet"
+        )
         req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
@@ -1231,13 +1250,14 @@ class KVCacheConfigurator:
                     mha_pool_class=mha_pool_class,
                 )
             else:
-                quant_method = None
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
-                    quant_method = self._build_fp4_quant_method(
-                        num_layers=self.layer_info.num_effective_layers
+                quant_method = self._build_mha_quant_method(
+                    num_layers=self.layer_info.num_effective_layers
+                )
+                if quant_method is not None and is_float4_e2m1fn_x2(
+                    self.kv_cache_dtype
+                ):
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
                     )
                 token_to_kv_pool = self._build_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1743,7 +1763,7 @@ class KVCacheConfigurator:
                 if self.layer_info.start_layer <= i < self.layer_info.end_layer
             ]
         )
-        quant_method = self._build_fp4_quant_method(
+        quant_method = self._build_mha_quant_method(
             num_layers=len(full_attention_layer_ids)
         )
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
@@ -2071,9 +2091,9 @@ class KVCacheConfigurator:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert (
-                    not mamba_extra_buffer_lazy_enabled()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                assert not mamba_extra_buffer_lazy_enabled(), (
+                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
@@ -2424,9 +2444,9 @@ def calculate_mla_kv_cache_dim(
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
-        assert (
-            kv_lora_rank % quant_block_size == 0
-        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        assert kv_lora_rank % quant_block_size == 0, (
+            f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        )
 
         return (
             kv_lora_rank

@@ -102,6 +102,7 @@ class BaseKVManager(ABC):
     """Base class for managing transfer states"""
 
     uses_separate_draft_kv_indices: bool = False
+    enable_deferred_decode_kv_release: bool = False
 
     @abstractmethod
     def __init__(

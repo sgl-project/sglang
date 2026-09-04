@@ -179,8 +179,8 @@ class TestDecodeRetractionBackup(unittest.TestCase):
             torch.arange(self.pool_size, device=self.device),
             shifts=self.pool_size // 2,
         )
-        allocator.translate_kv_indices_for_transfer = (
-            lambda indices: virtual_to_physical[indices]
+        allocator.translate_kv_indices_for_transfer = lambda indices: (
+            virtual_to_physical[indices]
         )
         source_physical_indices = allocator.translate_kv_indices_for_transfer(
             source_indices

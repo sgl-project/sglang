@@ -15,7 +15,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeResponse:
-
     def __init__(self) -> None:
         self.read_called = False
 
@@ -25,7 +24,6 @@ class _FakeResponse:
 
 
 class _FakePostCM:
-
     def __init__(self, response: _FakeResponse) -> None:
         self._response = response
 
@@ -37,7 +35,6 @@ class _FakePostCM:
 
 
 class _FakeSession:
-
     def __init__(self) -> None:
         self.closed = False
         self.calls: list[tuple[str, object]] = []
@@ -52,7 +49,6 @@ class _FakeSession:
 
 
 class TestBackgroundHttpPosterLifecycle(CustomTestCase):
-
     def test_init_starts_running_loop_on_daemon_thread(self):
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
@@ -80,7 +76,6 @@ class TestBackgroundHttpPosterLifecycle(CustomTestCase):
 
 
 class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
-
     def test_submit_coro_runs_on_background_loop_thread(self):
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
@@ -134,7 +129,6 @@ class TestBackgroundHttpPosterSubmitCoro(CustomTestCase):
 
 
 class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
-
     def test_ensure_session_creates_reuses_then_recreates_when_closed(self):
         poster = BackgroundHttpPoster()
         self.addCleanup(poster.close)
@@ -160,7 +154,6 @@ class TestBackgroundHttpPosterEnsureSession(CustomTestCase):
 
 
 class TestBackgroundHttpPosterPost(CustomTestCase):
-
     def _run_on_loop(self, poster: BackgroundHttpPoster, coro) -> None:
         asyncio.run_coroutine_threadsafe(coro, poster._loop).result(timeout=5.0)
 

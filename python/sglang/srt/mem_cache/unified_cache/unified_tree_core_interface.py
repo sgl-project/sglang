@@ -35,9 +35,9 @@ class BaseEvictionResult(msgspec.Struct):
 
     def __del__(self) -> None:
         # Drop tripwire: every returned value must be drained before disposal.
-        assert (
-            not self.device_frees and not self.host_frees
-        ), "BaseEvictionResult dropped with undrained values"
+        assert not self.device_frees and not self.host_frees, (
+            "BaseEvictionResult dropped with undrained values"
+        )
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -50,10 +50,12 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
 
     node_id: Optional[NodeId] = None
     made_progress: bool = False
+    unbacked_tokens: int = 0
 
 
 class EvictDeviceLeafResult(BaseEvictionResult):
     backup_kv: Optional[BackupKV] = None
+    unbacked_tokens: int = 0
 
 
 class DemoteResult(BaseEvictionResult):
@@ -369,6 +371,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    def supports_fast_match_prefix(self) -> bool:
+        """Whether matching every waiting request is cheap enough for scheduling."""
+        return False
+
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:
@@ -531,8 +537,11 @@ class UnifiedTreeCoreInterface(ABC):
     write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
-    def mark_write_through_pending(self, node_id: NodeId) -> None:
-        """Mark a node as having an in-flight write-through backup."""
+    def mark_write_through_pending(
+        self, node_ids: list[NodeId], ack_id: NodeId
+    ) -> list[NodeId]:
+        """Mark every node covered by one in-flight write-through backup, and return
+        them ancestors first: publish links each host store event to its parent."""
         ...
 
     @abstractmethod
