@@ -27,12 +27,14 @@ fn config_for(_worker_url: &str) -> Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy: None,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -87,6 +89,34 @@ async fn non_streaming_returns_200() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "ok");
+}
+
+#[tokio::test]
+async fn raw_completions_route_forwards_prompt_body_unchanged() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+    let body = serde_json::json!({
+        "model": "tiny",
+        "prompt": "raw prompt",
+        "stream": false,
+        "min_tokens": 7,
+        "max_tokens": 7
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let captured = worker.captured.lock().unwrap();
+    let forwarded: serde_json::Value =
+        serde_json::from_slice(captured.last_body.as_ref().unwrap()).unwrap();
+    assert_eq!(forwarded, body);
 }
 
 #[tokio::test]

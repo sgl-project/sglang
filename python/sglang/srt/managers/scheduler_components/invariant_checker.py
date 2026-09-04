@@ -12,6 +12,8 @@ from typing import (
     Tuple,
 )
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -54,6 +56,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_pd_flip_held_reqs: Callable = field(default=lambda: (lambda: ()))
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -113,13 +116,61 @@ class SchedulerInvariantChecker:
             uncached,
         )
 
+    def _get_pd_flip_held_mamba_slot_count(self) -> int:
+        """Count PD Flip-owned Mamba slots not already owned by the radix tree."""
+        held_slots = set()
+        for req in self.get_pd_flip_held_reqs() or ():
+            values = (
+                getattr(req, "mamba_pool_idx", None),
+                getattr(req, "mamba_ping_pong_track_buffer", None),
+            )
+            for value in values:
+                if value is None:
+                    continue
+                if hasattr(value, "detach"):
+                    value = value.detach()
+                if hasattr(value, "cpu"):
+                    value = value.cpu()
+                if hasattr(value, "reshape"):
+                    value = value.reshape(-1)
+                if hasattr(value, "tolist"):
+                    value = value.tolist()
+                if not isinstance(value, (list, tuple)):
+                    value = [value]
+                for slot in value:
+                    slot = int(slot)
+                    if slot > 0:
+                        held_slots.add(slot)
+
+        # A matched radix Mamba state can also be referenced by a request. It
+        # is already counted as evictable/protected tree ownership and must not
+        # be counted twice as PD Flip-held ownership.
+        cached_slots = set()
+        all_mamba_values = getattr(self.tree_cache, "all_mamba_values_flatten", None)
+        if callable(all_mamba_values):
+            values = all_mamba_values()
+            if hasattr(values, "detach"):
+                values = values.detach()
+            if hasattr(values, "cpu"):
+                values = values.cpu()
+            if hasattr(values, "reshape"):
+                values = values.reshape(-1)
+            if hasattr(values, "tolist"):
+                values = values.tolist()
+            if not isinstance(values, (list, tuple)):
+                values = [values]
+            cached_slots = {int(slot) for slot in values if int(slot) > 0}
+        return len(held_slots - cached_slots)
+
     def _check_mamba_pool(self, ps: PoolStats) -> Tuple[bool, str]:
+        session_held = self.pool_stats_observer.session_held_mamba_slots()
+        session_held += self._get_pd_flip_held_mamba_slot_count()
         leak, msg = self._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            self.pool_stats_observer.session_held_mamba_slots(),
+            session_held,
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -150,9 +201,48 @@ class SchedulerInvariantChecker:
             )
         return leak, msg
 
-    def _get_total_uncached_sizes(
-        self,
-    ) -> Tuple[int, int]:
+    def _req_uncached_sizes(self, req) -> Tuple[int, int]:
+        assert req.kv_committed_freed == req.kv_overallocated_freed
+        if req.kv_committed_freed or req.req_pool_idx is None:
+            return 0, 0
+
+        allocated_len = req.kv_allocated_len
+        if self.page_size > 1:
+            allocated_len = ceil_align(allocated_len, self.page_size)
+            assert req.cache_protected_len % self.page_size == 0
+
+        full_uncached = allocated_len - req.cache_protected_len
+        swa_uncached = 0
+        if self.is_hybrid_swa:
+            swa_uncached = allocated_len - max(
+                req.cache_protected_len, req.swa_evicted_seqlen
+            )
+        return full_uncached, swa_uncached
+
+    def _get_pd_flip_held_uncached_sizes(self) -> Tuple[int, int]:
+        full_uncached = 0
+        swa_uncached = 0
+        seen = set()
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_id = id(req)
+            if req_id in seen:
+                continue
+            seen.add(req_id)
+            req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+            full_uncached += req_full_uncached
+            swa_uncached += req_swa_uncached
+        return full_uncached, swa_uncached
+
+    def _get_pd_flip_held_req_count(self) -> int:
+        seen_req_pool_indices = set()
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_pool_idx = getattr(req, "req_pool_idx", None)
+            if req_pool_idx is None:
+                continue
+            seen_req_pool_indices.add(req_pool_idx)
+        return len(seen_req_pool_indices)
+
+    def _get_total_uncached_sizes(self) -> Tuple[int, int]:
         """Sum uncached tokens for full and SWA pools across all active batches.
 
         Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
@@ -176,22 +266,25 @@ class SchedulerInvariantChecker:
 
         full_uncached = 0
         swa_uncached = 0
+        seen = set()
         for batch in batches:
             for req in batch.reqs:
-                assert req.kv_committed_freed == req.kv_overallocated_freed
-                if req.kv_committed_freed or req.req_pool_idx is None:
+                req_id = id(req)
+                if req_id in seen:
                     continue
+                seen.add(req_id)
+                req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+                full_uncached += req_full_uncached
+                swa_uncached += req_swa_uncached
 
-                allocated_len = req.kv_allocated_len
-                if self.page_size > 1:
-                    allocated_len = ceil_align(allocated_len, self.page_size)
-                    assert req.cache_protected_len % self.page_size == 0
-
-                full_uncached += allocated_len - req.cache_protected_len
-                if self.is_hybrid_swa:
-                    swa_uncached += allocated_len - max(
-                        req.cache_protected_len, req.swa_evicted_seqlen
-                    )
+        for req in self.get_pd_flip_held_reqs() or ():
+            req_id = id(req)
+            if req_id in seen:
+                continue
+            seen.add(req_id)
+            req_full_uncached, req_swa_uncached = self._req_uncached_sizes(req)
+            full_uncached += req_full_uncached
+            swa_uncached += req_swa_uncached
 
         return full_uncached, swa_uncached
 
@@ -232,18 +325,26 @@ class SchedulerInvariantChecker:
     def _check_req_pool(self):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
-                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+                self.req_to_token_pool.size
+                + int(getattr(self.req_to_token_pool, "pre_alloc_size", 0))
             )
         else:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        pd_flip_held_req_count = self._get_pd_flip_held_req_count()
+        if (
+            len(self.req_to_token_pool.free_slots)
+            + session_req_count
+            + pd_flip_held_req_count
+            != req_total_size
+        ):
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
+                f"pd_flip_held={pd_flip_held_req_count}, "
+                f"total_size={req_total_size}\n"
             )
             raise_error_or_warn(
                 self,
@@ -253,6 +354,75 @@ class SchedulerInvariantChecker:
             )
 
     def _report_leak(self, pool_name: str, token_msg: str):
+        if pool_name == "pool":
+            token_msg += (
+                f"\nallocator_class={type(self.token_to_kv_pool_allocator).__name__}, "
+                f"tree_cache_class={type(self.tree_cache).__name__}"
+            )
+            free_parts = []
+            seen_allocators = set()
+            pending_allocators = [self.token_to_kv_pool_allocator]
+            while pending_allocators:
+                allocator = pending_allocators.pop()
+                if id(allocator) in seen_allocators:
+                    continue
+                seen_allocators.add(id(allocator))
+                for name in ("free_pages", "release_pages"):
+                    part = getattr(allocator, name, None)
+                    if isinstance(part, torch.Tensor) and part.numel() > 0:
+                        free_parts.append(part.flatten())
+                for name in (
+                    "full_attn_allocator",
+                    "logical_attn_allocator",
+                    "allocator",
+                ):
+                    child = getattr(allocator, name, None)
+                    if child is not None:
+                        pending_allocators.append(child)
+            if free_parts:
+                free_indices = torch.cat(free_parts)
+                unique, counts = torch.unique(free_indices, return_counts=True)
+                token_msg += (
+                    f"\nallocator_free_entries={free_indices.numel()}, "
+                    f"allocator_free_unique={unique.numel()}, "
+                    f"allocator_free_min={int(unique.min().item())}, "
+                    f"allocator_free_max={int(unique.max().item())}"
+                )
+                duplicate = unique[counts > 1]
+                if duplicate.numel() > 0:
+                    token_msg += (
+                        f"\nallocator_duplicate_free_entries="
+                        f"{int((counts[counts > 1] - 1).sum().item())}, "
+                        f"duplicate_index_sample={duplicate[:16].cpu().tolist()}"
+                    )
+                root = getattr(self.tree_cache, "root_node", None)
+                tree_parts = []
+                pending_nodes = [root] if root is not None else []
+                while pending_nodes:
+                    node = pending_nodes.pop()
+                    value = getattr(node, "value", None)
+                    if isinstance(value, torch.Tensor) and value.numel() > 0:
+                        tree_parts.append(value.flatten())
+                    pending_nodes.extend(getattr(node, "children", {}).values())
+                if tree_parts:
+                    tree_values = torch.cat(tree_parts)
+                    tree_indices = torch.unique(tree_values)
+                    token_msg += (
+                        f"\ntree_value_entries={tree_values.numel()}, "
+                        f"tree_value_unique={tree_indices.numel()}, "
+                        f"tree_value_min={int(tree_indices.min().item())}, "
+                        f"tree_value_max={int(tree_indices.max().item())}"
+                    )
+                    free_tree_overlap = tree_indices[
+                        torch.isin(tree_indices, unique)
+                    ]
+                    if free_tree_overlap.numel() > 0:
+                        token_msg += (
+                            f"\nallocator_tree_overlap="
+                            f"{free_tree_overlap.numel()}, "
+                            f"overlap_index_sample="
+                            f"{free_tree_overlap[:16].cpu().tolist()}"
+                        )
         msg = f"{pool_name} memory leak detected! {token_msg}"
         raise_error_or_warn(
             self,
@@ -268,12 +438,19 @@ class SchedulerInvariantChecker:
         has_leak = False
         messages = []
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
+        held_full_uncached, held_swa_uncached = (
+            self._get_pd_flip_held_uncached_sizes()
+        )
+        full_leak, full_msg = self._check_full_pool(
+            ps, uncached=uncached + held_full_uncached
+        )
         has_leak |= full_leak
         messages.append(full_msg)
 
         if self.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
+            swa_leak, swa_msg = self._check_swa_pool(
+                ps, uncached=held_swa_uncached
+            )
             has_leak |= swa_leak
             messages.append(swa_msg)
 

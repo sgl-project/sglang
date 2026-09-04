@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -29,6 +30,16 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         ComponentType,
     )
+
+
+# Prometheus collectors are process-global even though prefix-cache objects are
+# replaceable.  PD runtime role switching intentionally rebuilds the tree cache
+# in the same Scheduler process, so constructing a second collector with the
+# same labels would otherwise fail with "Duplicated timeseries".  Keep one
+# collector per implementation/label set and attach it to every replacement
+# cache object.
+_RADIX_CACHE_METRICS_COLLECTORS = {}
+_RADIX_CACHE_METRICS_COLLECTORS_LOCK = threading.Lock()
 
 
 @runtime_checkable
@@ -226,7 +237,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             STAT_LOGGER_ROLE_RADIX_CACHE,
             RadixCacheMetricsCollector,
         )
-        self.metrics_collector = radix_cache_cls(labels=labels)
+        collector_key = (
+            radix_cache_cls,
+            tuple(sorted((str(key), str(value)) for key, value in labels.items())),
+        )
+        with _RADIX_CACHE_METRICS_COLLECTORS_LOCK:
+            collector = _RADIX_CACHE_METRICS_COLLECTORS.get(collector_key)
+            if collector is None:
+                collector = radix_cache_cls(labels=labels)
+                _RADIX_CACHE_METRICS_COLLECTORS[collector_key] = collector
+        self.metrics_collector = collector
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -312,6 +332,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
         Lightweight operation that only processes finished write acks.
         No-op for caches without hierarchical write-through support.
+        """
+        pass
+
+    def shutdown(self) -> None:
+        """Release background cache resources before dropping this cache plane.
+
+        Most cache implementations have no background resources. Hierarchical
+        caches override this hook to drain writes and stop storage workers.
         """
         pass
 

@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -38,6 +39,9 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
+)
+from sglang.srt.disaggregation.mooncake.registration import (
+    SHARED_MOONCAKE_BUFFER_REGISTRY,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
@@ -160,8 +164,16 @@ class MooncakeKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self._hot_reconfigure_shutdown = threading.Event()
+        self._transport_threads = []
+        self._transport_close_lock = threading.Lock()
+        self._transport_closed = False
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # Let the bootstrap receiver observe a hot-reconfigure shutdown instead
+        # of blocking forever in recv_multipart().
+        self.server_socket.setsockopt(zmq.RCVTIMEO, 1000)
         self.init_engine()
+        self._registered_buffer_keys = set()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
@@ -200,7 +212,7 @@ class MooncakeKVManager(CommonKVManager):
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
-                threading.Thread(
+                thread = threading.Thread(
                     target=self.transfer_worker,
                     args=(
                         queue,
@@ -213,7 +225,9 @@ class MooncakeKVManager(CommonKVManager):
                         i,
                     ),
                     daemon=True,
-                ).start()
+                )
+                thread.start()
+                self._transport_threads.append(thread)
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
             )
@@ -239,23 +253,88 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+        if self._registered_buffer_keys:
+            return
+        pairs = list(
+            zip(
+                self.kv_args.kv_data_ptrs or [],
+                self.kv_args.kv_data_lens or [],
             )
-
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
+        )
+        pairs.extend(
+            zip(
+                self.kv_args.aux_data_ptrs or [],
+                self.kv_args.aux_data_lens or [],
             )
-
+        )
         for ptrs, lens in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+            self.kv_args.state_data_ptrs or [], self.kv_args.state_data_lens or []
         ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+            pairs.extend(zip(ptrs, lens))
+        self._registered_buffer_keys = SHARED_MOONCAKE_BUFFER_REGISTRY.register(
+            self.engine, self, pairs
+        )
+
+    def deregister_buffer_to_engine(self):
+        SHARED_MOONCAKE_BUFFER_REGISTRY.release(
+            self.engine, self, self._registered_buffer_keys
+        )
+        self._registered_buffer_keys = set()
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
+
+    def preserve_buffer_registration_for_reuse(self):
+        """Detach this manager while retaining in-place hot-switch buffers."""
+        SHARED_MOONCAKE_BUFFER_REGISTRY.release(
+            self.engine,
+            self,
+            self._registered_buffer_keys,
+            preserve_for_process=True,
+        )
+        self._registered_buffer_keys = set()
+        if hasattr(self, "connection_pool"):
+            with self.connection_lock:
+                self.connection_pool.clear()
+
+    def close_for_hot_reconfigure(self):
+        """Stop the old manager transport plane after an idle role switch.
+
+        ModelRunner keeps the CUDA allocation at the same address, so its
+        Mooncake registration remains process-pinned.  Manager-local ZMQ
+        sockets, queues, executors, and receiver threads must not survive,
+        however: a later manager must be the sole consumer of bootstrap
+        messages for the new role epoch.
+        """
+        with self._transport_close_lock:
+            if self._transport_closed:
+                return
+            self._transport_closed = True
+            self._hot_reconfigure_shutdown.set()
+            failed_probe_shutdown = getattr(
+                self, "_failed_session_probe_shutdown", None
+            )
+            if failed_probe_shutdown is not None:
+                failed_probe_shutdown.set()
+            for queue in getattr(self, "transfer_queues", ()):
+                queue.put(None)
+
+        for thread in list(self._transport_threads):
+            if thread is not threading.current_thread():
+                thread.join(timeout=2)
+
+        for executor in getattr(self, "executors", ()):
+            executor.shutdown(wait=True)
+
+        with self._socket_lock:
+            for monitor in self._monitor_cache.values():
+                monitor.close()
+            for socket in self._socket_cache.values():
+                socket.close(linger=0)
+            self._monitor_cache.clear()
+            self._socket_cache.clear()
+        self.server_socket.close(linger=0)
+        self._zmq_ctx.term()
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1149,9 +1228,11 @@ class MooncakeKVManager(CommonKVManager):
                 dp_rank=self.attn_dp_rank,
             )
 
-        while True:
+        while not self._hot_reconfigure_shutdown.is_set():
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk is None:
+                    break
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1364,6 +1445,8 @@ class MooncakeKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
+                if self._hot_reconfigure_shutdown.is_set():
+                    break
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
@@ -1373,8 +1456,15 @@ class MooncakeKVManager(CommonKVManager):
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
-            while True:
-                waiting_req_bytes = self.server_socket.recv_multipart()
+            while not self._hot_reconfigure_shutdown.is_set():
+                try:
+                    waiting_req_bytes = self.server_socket.recv_multipart()
+                except zmq.Again:
+                    continue
+                except zmq.ZMQError:
+                    if self._hot_reconfigure_shutdown.is_set():
+                        break
+                    raise
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -1465,12 +1555,21 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
 
-        threading.Thread(target=bootstrap_thread).start()
+        thread = threading.Thread(target=bootstrap_thread, daemon=True)
+        thread.start()
+        self._transport_threads.append(thread)
 
     def start_decode_thread(self):
         def decode_thread():
-            while True:
-                msg = self.server_socket.recv_multipart()
+            while not self._hot_reconfigure_shutdown.is_set():
+                try:
+                    msg = self.server_socket.recv_multipart()
+                except zmq.Again:
+                    continue
+                except zmq.ZMQError:
+                    if self._hot_reconfigure_shutdown.is_set():
+                        break
+                    raise
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -1536,7 +1635,9 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     self.update_status(bootstrap_room, status)
 
-        threading.Thread(target=decode_thread).start()
+        thread = threading.Thread(target=decode_thread, daemon=True)
+        thread.start()
+        self._transport_threads.append(thread)
         self._start_heartbeat_checker_thread()
 
     def add_transfer_request(
@@ -1860,6 +1961,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            packed_state_indices = (
+                pack_int_lists(
+                    [(idx if idx is not None else []) for idx in state_indices], "i"
+                )
+                if not is_dummy and state_indices is not None
+                else b""
+            )
 
             with lock:
                 sock.send_multipart(
@@ -1870,11 +1978,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         self.session_id.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            pack_int_lists(state_indices, "i")
-                            if not is_dummy and state_indices
-                            else b""
-                        ),
+                        packed_state_indices,
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
                     ]

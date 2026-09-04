@@ -127,6 +127,33 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PDFlipMigrationAbortReq,
+    PDFlipMigrationOutputRelayReq,
+    PDFlipMigrationSourceDeltaReq,
+    PDFlipMigrationSourceFallbackReq,
+    PDFlipMigrationSourceFinishReq,
+    PDFlipMigrationSourceStartReq,
+    PDFlipMigrationStatusReq,
+    PDFlipMigrationTargetActivateReq,
+    PDFlipMigrationTargetAbortReq,
+    PDFlipMigrationTargetCommitReq,
+    PDFlipMigrationTargetDeltaPrepareReq,
+    PDFlipMigrationTargetFallbackPrepareReq,
+    PDFlipMigrationTargetPrepareReq,
+    PDFlipPrefillHandoffAbortReq,
+    PDFlipPrefillHandoffDecodeRebindReq,
+    PDFlipPrefillHandoffSourceFinishReq,
+    PDFlipPrefillHandoffSourceStartReq,
+    PDFlipPrefillHandoffStatusReq,
+    PDFlipPrefillHandoffTargetActivateReq,
+    PDFlipPrefillHandoffTargetPrepareReq,
+    PDFlipPrefillDonorAbortReq,
+    PDFlipPrefillDonorStartReq,
+    PDFlipPrefillDonorStatusReq,
+    PDRuntimePrefillPeerInvalidateReq,
+    PDRuntimeRoleAdmissionReq,
+    PDRuntimeRoleSetReq,
+    PDRuntimeRoleStatusReq,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -691,6 +718,242 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+@app.post("/pd_flip/migration/source/start")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_migration_source(
+    obj: PDFlipMigrationSourceStartReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source(obj)
+
+
+@app.post("/pd_flip/migration/target/prepare")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def prepare_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target(obj)
+
+
+@app.post("/pd_flip/prefill_handoff/source/start")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_prefill_handoff_source(
+    obj: PDFlipPrefillHandoffSourceStartReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_prefill_handoff_source(
+        obj
+    )
+
+
+@app.post("/pd_flip/prefill_handoff/target/prepare")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def prepare_pd_flip_prefill_handoff_target(
+    obj: PDFlipPrefillHandoffTargetPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_prefill_handoff_target(
+        obj
+    )
+
+
+@app.post("/pd_flip/prefill_handoff/target/activate")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def activate_pd_flip_prefill_handoff_target(
+    obj: PDFlipPrefillHandoffTargetActivateReq, request: Request
+):
+    return await _global_state.tokenizer_manager.activate_pd_flip_prefill_handoff_target(
+        obj
+    )
+
+
+@app.post("/pd_flip/prefill_handoff/decode/rebind")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def rebind_pd_flip_prefill_handoff_decode(
+    obj: PDFlipPrefillHandoffDecodeRebindReq, request: Request
+):
+    return await _global_state.tokenizer_manager.rebind_pd_flip_prefill_handoff_decode(
+        obj
+    )
+
+
+@app.post("/pd_flip/prefill_handoff/source/finish")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def finish_pd_flip_prefill_handoff_source(
+    obj: PDFlipPrefillHandoffSourceFinishReq, request: Request
+):
+    return await _global_state.tokenizer_manager.finish_pd_flip_prefill_handoff_source(
+        obj
+    )
+
+
+@app.post("/pd_flip/prefill_handoff/abort")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def abort_pd_flip_prefill_handoff(
+    obj: PDFlipPrefillHandoffAbortReq, request: Request
+):
+    return await _global_state.tokenizer_manager.abort_pd_flip_prefill_handoff(obj)
+
+
+@app.get("/pd_flip/prefill_handoff/status")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def get_pd_flip_prefill_handoff_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_flip_prefill_handoff_status(
+        PDFlipPrefillHandoffStatusReq(
+            session_id=request.query_params.get("session_id")
+        )
+    )
+
+
+@app.post("/pd_flip/migration/prefill-donor/start")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_prefill_donor(
+    obj: PDFlipPrefillDonorStartReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_prefill_donor(obj)
+
+
+@app.get("/pd_flip/migration/prefill-donor/status")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def get_pd_flip_prefill_donor_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_flip_prefill_donor_status(
+        PDFlipPrefillDonorStatusReq(
+            session_id=request.query_params.get("session_id")
+        )
+    )
+
+
+@app.post("/pd_flip/migration/prefill-donor/abort")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def abort_pd_flip_prefill_donor(
+    obj: PDFlipPrefillDonorAbortReq, request: Request
+):
+    return await _global_state.tokenizer_manager.abort_pd_flip_prefill_donor(obj)
+
+
+@app.post("/pd_flip/migration/target/commit")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def commit_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetCommitReq, request: Request
+):
+    return await _global_state.tokenizer_manager.commit_pd_flip_migration_target(obj)
+
+
+@app.post("/pd_flip/migration/target/activate")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def activate_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetActivateReq, request: Request
+):
+    return await _global_state.tokenizer_manager.activate_pd_flip_migration_target(obj)
+
+
+@app.post("/pd_flip/migration/target/abort")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def abort_pd_flip_migration_target(
+    obj: PDFlipMigrationTargetAbortReq, request: Request
+):
+    return await _global_state.tokenizer_manager.abort_pd_flip_migration_target(obj)
+
+
+@app.get("/pd_flip/migration/status")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def get_pd_flip_migration_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_flip_migration_status(
+        _pd_flip_status_req_from_request(request)
+    )
+
+
+def _pd_flip_status_req_from_request(request: Request) -> PDFlipMigrationStatusReq:
+    return PDFlipMigrationStatusReq(session_id=request.query_params.get("session_id"))
+
+
+@app.post("/pd_flip/migration/source/finish")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def finish_pd_flip_migration_source(
+    obj: PDFlipMigrationSourceFinishReq, request: Request
+):
+    return await _global_state.tokenizer_manager.finish_pd_flip_migration_source(obj)
+
+
+@app.post("/pd_flip/migration/source/delta")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_migration_source_delta(
+    obj: PDFlipMigrationSourceDeltaReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source_delta(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/target/delta/prepare")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def prepare_pd_flip_migration_target_delta(
+    obj: PDFlipMigrationTargetDeltaPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target_delta(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/source/fallback")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def start_pd_flip_migration_source_fallback(
+    obj: PDFlipMigrationSourceFallbackReq, request: Request
+):
+    return await _global_state.tokenizer_manager.start_pd_flip_migration_source_fallback(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/target/fallback/prepare")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def prepare_pd_flip_migration_target_fallback(
+    obj: PDFlipMigrationTargetFallbackPrepareReq, request: Request
+):
+    return await _global_state.tokenizer_manager.prepare_pd_flip_migration_target_fallback(
+        obj
+    )
+
+
+@app.post("/pd_flip/migration/abort")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def abort_pd_flip_migration(obj: PDFlipMigrationAbortReq, request: Request):
+    return await _global_state.tokenizer_manager.abort_pd_flip_migration(obj)
+
+
+@app.post("/pd_flip/migration/output/relay")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def relay_pd_flip_migration_output(
+    obj: PDFlipMigrationOutputRelayReq, request: Request
+):
+    return await _global_state.tokenizer_manager.relay_pd_flip_migration_output(obj)
+
+
+@app.get("/pd_flip/runtime_role/status")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def get_pd_runtime_role_status(request: Request):
+    return await _global_state.tokenizer_manager.get_pd_runtime_role_status(
+        PDRuntimeRoleStatusReq()
+    )
+
+
+@app.post("/pd_flip/runtime_role/set")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def set_pd_runtime_role(obj: PDRuntimeRoleSetReq, request: Request):
+    return await _global_state.tokenizer_manager.set_pd_runtime_role(obj)
+
+
+@app.post("/pd_flip/runtime_role/admission")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def set_pd_runtime_admission(obj: PDRuntimeRoleAdmissionReq, request: Request):
+    return await _global_state.tokenizer_manager.set_pd_runtime_admission(obj)
+
+
+@app.post("/pd_flip/runtime_role/invalidate_prefill_peer")
+@auth_level(AuthLevel.ADMIN_REQUIRED)
+async def invalidate_pd_runtime_prefill_peer(
+    obj: PDRuntimePrefillPeerInvalidateReq, request: Request
+):
+    return await _global_state.tokenizer_manager.invalidate_pd_runtime_prefill_peer(obj)
 
 
 # Do not import `dumper.py` to avoid dependency

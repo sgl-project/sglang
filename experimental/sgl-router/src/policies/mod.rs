@@ -79,6 +79,7 @@ pub trait Policy: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct PolicyRegistry {
     by_model: DashMap<ModelId, Arc<dyn Policy>>,
+    decode_by_model: DashMap<ModelId, Arc<dyn Policy>>,
 }
 
 impl PolicyRegistry {
@@ -90,11 +91,22 @@ impl PolicyRegistry {
         self.by_model.get(model).map(|p| p.clone())
     }
 
+    pub fn insert_decode(&self, model: ModelId, policy: Arc<dyn Policy>) {
+        self.decode_by_model.insert(model, policy);
+    }
+
+    pub fn get_decode(&self, model: &ModelId) -> Option<Arc<dyn Policy>> {
+        self.decode_by_model.get(model).map(|p| p.clone())
+    }
+
     /// Inject the metrics registry into every registered policy. Called once
     /// at startup (after the registry is built) so metrics-emitting policies
     /// can record into the shared registry.
     pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         for entry in self.by_model.iter() {
+            entry.value().attach_metrics(Arc::clone(&metrics));
+        }
+        for entry in self.decode_by_model.iter() {
             entry.value().attach_metrics(Arc::clone(&metrics));
         }
     }

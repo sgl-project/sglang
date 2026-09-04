@@ -128,6 +128,19 @@ pub fn build_registry(
             Arc::clone(&block_size_oracle),
         ),
     );
+    if let Some(decode_policy) = m.decode_policy {
+        let mut decode_model = m.clone();
+        decode_model.policy = decode_policy;
+        reg.insert_decode(
+            ModelId(m.id.clone()),
+            build_policy(
+                &decode_model,
+                Arc::clone(&tree),
+                Arc::clone(&tokenizers),
+                Arc::clone(&block_size_oracle),
+            ),
+        );
+    }
     Ok(reg)
 }
 
@@ -163,12 +176,14 @@ mod tests {
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
+                pd_flip_router_admin_api_key: None,
             },
             observability: Default::default(),
             model: ModelConfig {
                 id: id.into(),
                 tokenizer_path: "/tmp/x".into(),
                 policy,
+                decode_policy: None,
                 circuit_breaker: None,
                 cache_aware: None,
                 sticky: None,
@@ -200,6 +215,22 @@ mod tests {
         let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
         assert!(reg.get(&ModelId("qwen".into())).is_some());
         assert!(reg.get(&ModelId("missing".into())).is_none());
+        assert!(reg.get_decode(&ModelId("qwen".into())).is_none());
+    }
+
+    #[test]
+    fn registry_assigns_independent_decode_policy() {
+        let mut cfg = cfg_with_model("qwen", PolicyKind::CacheAwareZmq);
+        cfg.model.decode_policy = Some(PolicyKind::PowerOfTwo);
+        let reg = build_registry(
+            &cfg,
+            Arc::new(HashTree::new()),
+            Arc::new(TokenizerRegistry::default()),
+            BlockSizeOracle::new(),
+        )
+        .unwrap();
+        let decode = reg.get_decode(&ModelId("qwen".into())).unwrap();
+        assert!(format!("{decode:?}").contains("PowerOfTwoChoicesPolicy"));
     }
 
     #[test]

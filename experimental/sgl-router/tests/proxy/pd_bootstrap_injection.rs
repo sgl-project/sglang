@@ -35,17 +35,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
 
-fn config() -> Config {
+fn config_with_decode_policy(decode_policy: Option<PolicyKind>) -> Config {
     Config {
         server: ServerConfig {
             host: "0".into(),
             port: 0,
+            pd_flip_router_admin_api_key: None,
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
             policy: PolicyKind::RoundRobin,
+            decode_policy,
             circuit_breaker: None,
             cache_aware: None,
             sticky: None,
@@ -59,7 +61,14 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_decode_policy(specs, None)
+}
+
+fn build_ctx_with_decode_policy(
+    specs: Vec<WorkerSpec>,
+    decode_policy: Option<PolicyKind>,
+) -> Arc<AppContext> {
+    let cfg = config_with_decode_policy(decode_policy);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -79,6 +88,76 @@ fn chat_request() -> Request<Body> {
             serde_json::to_vec(&serde_json::json!({
                 "model": "tiny",
                 "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn decode_power_of_two_avoids_loaded_same_host_decode() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let hot_decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let idle_decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let idle_url = idle_decode.url.replace("127.0.0.1", "localhost");
+    let ctx = build_ctx_with_decode_policy(
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d-hot".into()),
+                url: hot_decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+            WorkerSpec {
+                id: WorkerId("d-idle".into()),
+                url: idle_url,
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+        Some(PolicyKind::PowerOfTwo),
+    );
+    let hot = ctx
+        .registry
+        .workers_for(&ModelId("tiny".into()))
+        .into_iter()
+        .find(|worker| worker.id == WorkerId("d-hot".into()))
+        .unwrap();
+    let _hot_load = hot.load_guard();
+    let app = build_router(ctx);
+
+    let response = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        hot_decode.captured.lock().unwrap().last_body.is_none(),
+        "loaded same-host Decode must not receive the request"
+    );
+    assert!(
+        idle_decode.captured.lock().unwrap().last_body.is_some(),
+        "power-of-two must select the idle Decode"
+    );
+}
+
+fn completions_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "prompt": "raw prompt",
+                "min_tokens": 7,
+                "max_tokens": 7,
             }))
             .unwrap(),
         ))
@@ -184,6 +263,48 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     // bootstrap_port on both sides == prefill's configured bootstrap_port.
     assert_eq!(bootstrap_port(&pj), Some(8997));
     assert_eq!(bootstrap_port(&dj), Some(8997));
+}
+
+/// Raw-completions traffic follows the same PD fan-out contract while keeping
+/// the original prompt and fixed-output fields intact.
+#[tokio::test]
+async fn pd_mode_completions_preserves_prompt_and_injects_bootstrap_fields() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(completions_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let pj = parse_body(&prefill_body);
+    let dj = parse_body(&decode_body);
+
+    for body in [&pj, &dj] {
+        assert_eq!(body["prompt"], "raw prompt");
+        assert_eq!(body["min_tokens"], 7);
+        assert_eq!(body["max_tokens"], 7);
+        assert_eq!(bootstrap_host(body), Some("127.0.0.1"));
+        assert_eq!(bootstrap_port(body), Some(8997));
+    }
+    assert_eq!(bootstrap_room(&pj), bootstrap_room(&dj));
 }
 
 /// Plain-mode (non-PD) requests do NOT carry any `bootstrap_*` field.
