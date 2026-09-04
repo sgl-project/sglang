@@ -279,6 +279,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import (
+    free_swa_out_of_window_slots,
     maybe_cache_unfinished_req,
     release_kv_cache,
     retraction_discard,
@@ -3633,6 +3634,46 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _evict_swa_before_chunked_admission(self, req: Req) -> None:
+        """Release the chunked request's out-of-window SWA slots before admission.
+
+        `ScheduleBatch.maybe_evict_swa` runs inside `alloc_for_extend`, i.e.
+        after the PrefillAdder has already sized the next chunk, so the slots it
+        is about to free are invisible to the SWA budget. On a small SWA pool
+        that livelocks: the chunked request pins the pool, `add_chunked_req` sees
+        `rem_swa_tokens <= page_size` and defers it, and with an empty running
+        batch nothing else will ever free a slot -- the server hangs with
+        `#running-req: 0` and a non-empty queue.
+
+        Freeing here is the same point in the iteration, only earlier, and holds
+        back the in-flight chunk plus its window exactly like maybe_evict_swa.
+        """
+        if not self.is_hybrid_swa or req.kv is None:
+            return
+        tree_cache = self.tree_cache
+        if not tree_cache.supports_swa() or not tree_cache.is_chunk_cache():
+            return
+
+        pre_len = len(req.prefix_indices)
+        if self.enable_overlap:
+            # The previous chunk is still running; its slots must stay pinned.
+            if req.extend_batch_idx < 2:
+                return
+            pre_len -= req.prev_extend_chunk_len or self.chunked_prefill_size
+        if pre_len <= 0:
+            return
+
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=tree_cache.sliding_window_size,
+            page_size=tree_cache.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=True,
+            retain_floor=tree_cache.swa_retain_floor(req),
+        )
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -3735,6 +3776,7 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            self._evict_swa_before_chunked_admission(self.chunked_req)
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:

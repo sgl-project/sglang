@@ -1011,6 +1011,14 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
+        # Length of the previously scheduled extend chunk. Under the overlap
+        # scheduler that chunk is still in flight while the next one is being
+        # prepared, so its SWA slots must stay pinned. `maybe_evict_swa` needs
+        # the real length: the configured chunked_prefill_size is only an upper
+        # bound, and subtracting the bound instead of the actual length
+        # under-evicts and pins the SWA pool.
+        self.prev_extend_chunk_len = 0
+
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
@@ -1841,6 +1849,7 @@ class Req(ReqDllmMixin):
         self.kv.kv_committed_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.prev_extend_chunk_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -2612,6 +2621,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
+            # Recorded after `alloc_for_extend` (which runs `maybe_evict_swa`),
+            # so during the next chunk's eviction this still holds the length of
+            # the chunk that is then in flight.
+            req.prev_extend_chunk_len = seq_len - pre_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -3676,11 +3689,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
-                            )
+                            # Hold back only the chunk that is actually still in
+                            # flight. `chunked_prefill_size` is just its upper
+                            # bound: when the previous chunk was shrunk (e.g. by
+                            # the SWA chunk cap) subtracting the bound evicts
+                            # nothing and keeps the pool pinned.
+                            in_flight_len = req.prev_extend_chunk_len
+                            if in_flight_len <= 0:
+                                in_flight_len = max(
+                                    get_schedule().chunked_prefill_size, 0
+                                )
+                            pre_len = pre_len - in_flight_len
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)

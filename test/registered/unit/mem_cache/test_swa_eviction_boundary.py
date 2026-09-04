@@ -15,6 +15,7 @@ Tests use real tree/allocator/pool with mock Req/ScheduleBatch wrappers.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -25,6 +26,9 @@ from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_schedule
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -547,6 +551,62 @@ class TestSWAEvictionBoundary(unittest.TestCase):
                 req, is_insert=True, kv_len_to_handle=req._kv_committed_len
             )
             tree.sanity_check()
+
+    # -- Chunked prefill: hold back the real in-flight chunk, not the bound --
+
+    def test_chunk_cache_evicts_using_actual_in_flight_chunk_len(self):
+        """`maybe_evict_swa` must hold back only the chunk that is really in
+        flight. It used to subtract the configured `chunked_prefill_size`, which
+        is merely an upper bound: once SWA pressure shrinks a chunk, subtracting
+        the bound puts the frontier below what is already evicted, so nothing is
+        freed and the request keeps the SWA pool pinned. With an empty running
+        batch nothing else can free a slot, so the scheduler then spins forever
+        with `#running-req: 0` and a non-empty queue."""
+        page_size, window = 8, 16
+        configured_chunk, in_flight_chunk = 64, 16
+        pre_len = 80  # two committed chunks: 64 + 16
+
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", chunked_prefill_size=configured_chunk)
+        )
+        self.assertEqual(get_schedule().chunked_prefill_size, configured_chunk)
+
+        tree, allocator, pool = _build_swa_tree(
+            page_size=page_size, sliding_window_size=window
+        )
+        kv = _swa_alloc(allocator, pre_len)
+        pool.write((0, slice(0, pre_len)), kv)
+
+        req = _make_req(0, list(range(pre_len)), 0, tree)
+        req.extend_batch_idx = 2
+        req.prev_extend_chunk_len = in_flight_chunk
+
+        chunk_cache = MagicMock()
+        chunk_cache.supports_swa.return_value = True
+        chunk_cache.is_chunk_cache.return_value = True
+        chunk_cache.sliding_window_size = window
+        chunk_cache.page_size = page_size
+        chunk_cache.swa_retain_floor.return_value = None
+
+        batch = SimpleNamespace(
+            tree_cache=chunk_cache,
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+            reqs=[req],
+            prefix_lens=[pre_len],
+            enable_overlap=True,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        batch._evict_swa = lambda r, p: ScheduleBatch._evict_swa(batch, r, p)
+
+        ScheduleBatch.maybe_evict_swa(batch)
+
+        # Everything older than the in-flight chunk and its window is freed.
+        expected = (pre_len - in_flight_chunk - window) // page_size * page_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, expected)
+        # Subtracting the configured bound instead would have freed nothing.
+        self.assertGreater(expected, 0)
+        self.assertEqual((pre_len - configured_chunk - window) // page_size, 0)
 
 
 if __name__ == "__main__":
