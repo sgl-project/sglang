@@ -19,12 +19,14 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
+    plan_topk_v2,
     topk_transform_paged,
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
+    logits_rows_per_chunk,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -873,7 +875,13 @@ class C4IndexerBackendMixin:
                     page_table[rows],
                     c4_sparse_page_indices[rows],
                     indexer_metadata.c4_page_size,
-                    indexer_metadata.topk_metadata,
+                    # The cached plan routes rows by their index in the full
+                    # range, so a chunk needs one built over its own rows.
+                    (
+                        indexer_metadata.topk_metadata
+                        if rows == all_rows or not is_hip()
+                        else plan_topk_v2(c4_seq_lens[rows])
+                    ),
                 )
             else:
                 topk_transform_paged(
@@ -897,24 +905,46 @@ class C4IndexerBackendMixin:
             run_topk_transform(all_rows, logits)
         elif use_aiter_fp4:
             q_fp4, q_scale = q
-            logits = aiter_fp4_paged_mqa_logits(
-                q_fp4=q_fp4,
-                q_scale=q_scale,
-                k_payload=token_to_kv_pool.get_index_k_fp4_payload_buffer(
-                    c4_indexer.layer_id
-                ),
-                k_scale=token_to_kv_pool.get_index_k_fp4_scale_buffer(
-                    c4_indexer.layer_id
-                ),
-                weights=weights,
-                page_table=page_table,
-                c4_seq_lens=c4_seq_lens,
-                weight_scale=c4_indexer.weight_scale,
-                is_decode=forward_batch.forward_mode.is_decode(),
-                decode_workspace=metadata.fp4_decode_workspace,
-                prefill_workspace=metadata.fp4_prefill_workspace,
+            is_decode = forward_batch.forward_mode.is_decode()
+            # Hoisted: these await this layer's KV transfer, which every chunk
+            # would otherwise re-await.
+            k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
+                c4_indexer.layer_id
             )
-            run_topk_transform(all_rows, logits)
+            k_scale = token_to_kv_pool.get_index_k_fp4_scale_buffer(c4_indexer.layer_id)
+
+            def run_fp4_indexer(rows: slice) -> None:
+                logits = aiter_fp4_paged_mqa_logits(
+                    q_fp4=q_fp4[rows],
+                    q_scale=q_scale[rows],
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    weights=weights[rows],
+                    page_table=page_table[rows],
+                    c4_seq_lens=c4_seq_lens[rows],
+                    weight_scale=c4_indexer.weight_scale,
+                    is_decode=is_decode,
+                    decode_workspace=metadata.fp4_decode_workspace,
+                    prefill_workspace=metadata.fp4_prefill_workspace,
+                )
+                run_topk_transform(rows, logits)
+
+            # The scores are the layer's largest transient and their width tracks
+            # context length, so prefill splits the rows into whatever fits the
+            # pooled logits block and reduces each chunk before the next one
+            # reuses it. Rows are scored and reduced independently, so this
+            # matches a single pass. Decode's rectangle is bounded by its capture
+            # shapes, so it always stays whole.
+            rows_per_chunk = (
+                query_rows if is_decode else logits_rows_per_chunk(page_table)
+            )
+            if rows_per_chunk >= query_rows:
+                run_fp4_indexer(all_rows)
+            else:
+                for start in range(0, query_rows, max(1, rows_per_chunk)):
+                    run_fp4_indexer(
+                        slice(start, min(start + rows_per_chunk, query_rows))
+                    )
         else:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
