@@ -192,6 +192,23 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         Starts sit on page boundaries, ends may fall mid-page, and the page
         ranges of consecutive segments do not overlap -- so in page units the
         segments are aligned and disjoint, and every page is released once."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_segment(free_index, start_pos=start_pos)
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """free_full() for a kv-row segment; same start-alignment contract as
+        free_segment(). Default: plain free_full()."""
+        assert start_pos % self.page_size == 0, (
+            f"segment start {start_pos} is not page-aligned"
+        )
+        self.free_full(free_index)
+
+    def free_full_segments(self, segments):
+        """free_segments() for the full side alone; see free_full()."""
+        for free_index, start_pos in self._page_disjoint(segments):
+            self.free_full_segment(free_index, start_pos=start_pos)
+
+    def _page_disjoint(self, segments):
         ps = self.page_size
         prev_end = None
         for free_index, start_pos in segments:
@@ -202,4 +219,4 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 f"segment at {start_pos} shares a page with the one ending at {prev_end}"
             )
             prev_end = start_pos + n
-            self.free_segment(free_index, start_pos=start_pos)
+            yield free_index, start_pos
