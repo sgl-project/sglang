@@ -237,7 +237,12 @@ class IpcA2AState:
 
     def exchange(self, group, send, recv_shape):
         """Symmetric exchange: write my contiguous `send` into the peer's
-        staging slot, return my staging slot viewed as `recv_shape`."""
+        staging slot, return my staging slot viewed as `recv_shape`.
+
+        Returns None if the peer never published within the spin budget: the
+        staging slot then holds incomplete data, so callers must fall back to
+        NCCL instead of consuming it.
+        """
         n_send = send.numel()
         n_recv = 1
         for v in recv_shape:
@@ -248,7 +253,9 @@ class IpcA2AState:
         local, peer = pair
         slot = self.next_slot()
         peer[slot].narrow(0, 0, n_send).copy_(send.view(-1), non_blocking=True)
-        self.signal_and_wait()
+        self.signal()
+        if self.wait_and_check():
+            return None
         return local[slot].narrow(0, 0, n_recv).view(recv_shape)
 
     def next_slot(self):
@@ -271,6 +278,25 @@ class IpcA2AState:
             self.peer_timed_out,
             self.budget_ns,
         )
+
+    def wait_and_check(self) -> bool:
+        """``wait()`` then report whether the exchange timed out.
+
+        A timed-out spin returns without the peer's half of the data, so the
+        caller must discard the staging view and fall back to NCCL. The device
+        read is skipped while a CUDA graph is being captured: there the spin
+        kernel is only recorded, never executed, so no timeout can fire.
+
+        This only reports; it does not retire the transport. Retiring must
+        happen together on every rank at a request boundary via
+        ``check_timeout`` -- a rank that flipped ``failed`` mid-step would post
+        collectives its peer (still on IPC) never posts, and the NCCL watchdog
+        would take the process down.
+        """
+        self.wait()
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        return bool(self.timed_out.item())
 
     def check_timeout(self) -> None:
         """Retire the transport on every rank if any rank's spin expired.
