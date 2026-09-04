@@ -232,9 +232,11 @@ class Cosmos3EdgeProcessor(SGLangBaseProcessor):
         )
 
     async def _process_preprocessed_mm_data(self, base_output):
-        mm_items, input_ids, processor_output = (
-            await self.process_and_combine_mm_data_async(base_output, self.mm_tokens)
-        )
+        (
+            mm_items,
+            input_ids,
+            processor_output,
+        ) = await self.process_and_combine_mm_data_async(base_output, self.mm_tokens)
         image_grid_thw = self._get_grid_from_output_or_items(
             processor_output,
             mm_items,
