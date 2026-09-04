@@ -35,7 +35,10 @@ from sglang.srt.model_loader.loader import (
     ModelOptModelLoader,
     get_model_loader,
 )
-from sglang.srt.model_loader.weight_utils import get_quant_config
+from sglang.srt.model_loader.weight_utils import (
+    _modelopt_quant_section,
+    get_quant_config,
+)
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
@@ -924,6 +927,50 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
         self.assertEqual(result["quant_method"], "modelopt_mixed")
+
+    def test_flat_hf_quant_config_without_quantization_key(self):
+        """Diffusion/unified ModelOpt exports use a flat hf_quant_config.json.
+
+        Regression for Cosmos3-style checkpoints that put quant_algo at the top
+        level (no nested ``quantization`` key).
+        """
+        model_config = ModelConfig.__new__(ModelConfig)
+
+        result = model_config._parse_modelopt_quant_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "FP8",
+                "quant_type": "FP8_FP8",
+                "ignore": ["lm_head", "visual*"],
+            }
+        )
+
+        self.assertEqual(result["quant_method"], "modelopt_fp8")
+        self.assertEqual(result["quant_algo"], "FP8")
+
+    def test_hf_quant_config_missing_quant_algo_returns_none(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        self.assertIsNone(
+            model_config._parse_modelopt_quant_config(
+                {"quant_method": "modelopt", "producer": {"name": "modelopt"}}
+            )
+        )
+
+    def test_modelopt_quant_section_supports_nested_and_flat(self):
+        nested = {"quantization": {"quant_algo": "FP8", "exclude_modules": ["lm_head"]}}
+        self.assertEqual(
+            _modelopt_quant_section(nested)["quant_algo"],
+            "FP8",
+        )
+
+        flat = {
+            "quant_method": "modelopt",
+            "quant_algo": "FP8",
+            "ignore": ["lm_head"],
+            "producer": {"name": "modelopt"},
+        }
+        self.assertIs(_modelopt_quant_section(flat), flat)
+        self.assertEqual(_modelopt_quant_section(flat)["quant_algo"], "FP8")
 
     def test_mixed_precision_override_does_not_hijack_w4afp8(self):
         self.assertIsNone(
