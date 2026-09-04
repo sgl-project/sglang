@@ -9,6 +9,14 @@ Provides two fused kernels:
 Both kernels use register-cache optimization: Phase 2 (scale·shift)
 reuses f32 intermediate values from Phase 1 (norm) registers instead
 of re-reading from HBM, saving ~20% bandwidth.
+
+Written against the FlyDSL v0.3.0 stable public API only; see
+docs/api_stability.md in the FlyDSL tree for the classification rules.
+Raw MLIR dialect builders, compiler-internal contexts, private expr
+submodules, and anything under the FlyDSL source-only kernel tree are all
+outside the shipped wheel or the stability contract -- do not reintroduce
+them here. CI greps this file for those names, so avoid spelling them even
+in comments.
 """
 
 from typing import Optional, Tuple
@@ -16,35 +24,132 @@ from typing import Optional, Tuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as arith_ops
-from flydsl._mlir.dialects import gpu as _gpu
-from flydsl._mlir.dialects import math as math_ops
-from flydsl._mlir.dialects import memref as _memref
-from flydsl._mlir.dialects import (
-    scf,
-)
-from flydsl._mlir.dialects import vector as _vector
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import Int32, T
-
-try:
-    from flydsl.expr import buffer_ops
-except ImportError:
-    # flydsl 0.3.0 removed flydsl.expr.buffer_ops and pushed the buffer-resource
-    # layer down to its consumers; AITER carries the same module, same API.
-    from aiter.ops.flydsl.kernels import buffer_ops
+from flydsl.expr import const_expr, range_constexpr
 
 WARP_SIZE = 64
 _VEC = 8
 _NUM_WAVES = 10
 FLYDSL_NORM_MIN_ALIGNED_DIM = WARP_SIZE * _NUM_WAVES * _VEC  # 5120
 
+# Kernel-side epsilon. The public `eps` argument is intentionally ignored, as it
+# was before the stable-API migration; changing that is a separate correctness fix.
+_EPS = 1e-6
 
-def _v(x):
-    return buffer_ops._unwrap_value(x)
+# 128-bit vector copies over bf16 elements.
+_ELEM_BITS = 16
+
+# Reduction order is part of the numerical contract; keep the descending sequence.
+_SHUFFLE_OFFSETS = (32, 16, 8, 4, 2, 1)
+
+
+def _require_stable_api() -> None:
+    """Fail as ImportError when the installed FlyDSL predates the v0.3.0 surface.
+
+    Callers in multimodal_gen/runtime/layers/layernorm.py guard this module with
+    `except ImportError` and fall back to the native path, so a missing symbol
+    must surface as ImportError rather than AttributeError.
+    """
+    required = {
+        "flydsl.expr": (
+            "Tensor",
+            "Stream",
+            "Int32",
+            "Float32",
+            "BFloat16",
+            "ReductionOp",
+            "SharedAllocator",
+            "struct",
+            "Array",
+            "make_layout",
+            "logical_divide",
+            "slice",
+            "make_copy_atom",
+            "copy_atom_call",
+            "make_rmem_tensor",
+            "memref_load_vec",
+            "memref_store_vec",
+            "memref_load",
+            "memref_store",
+        ),
+        "flydsl.expr.gpu": ("barrier", "shuffle_xor", "block_idx", "thread_idx"),
+        "flydsl.expr.math": ("rsqrt",),
+        "flydsl.expr.rocdl": ("make_buffer_tensor", "BufferCopy128b"),
+        "flydsl.compiler": ("kernel", "jit", "compile"),
+    }
+    roots = {
+        "flydsl.expr": fx,
+        "flydsl.expr.gpu": fx.gpu,
+        "flydsl.expr.math": fx.math,
+        "flydsl.expr.rocdl": fx.rocdl,
+        "flydsl.compiler": flyc,
+    }
+    missing = [
+        f"{mod}.{name}"
+        for mod, names in required.items()
+        for name in names
+        if not hasattr(roots[mod], name)
+    ]
+    if missing:
+        raise ImportError(
+            "FlyDSL is too old for sglang's fused norm kernels; missing stable "
+            f"v0.3.0 APIs: {', '.join(missing)}"
+        )
+
+
+_require_stable_api()
+
+
+def _make_reduction_storage(slots: int):
+    """LDS layout for the two-stage block reduction.
+
+    s_sum/s_sq hold one partial per wave; s_final holds the two broadcast values
+    so the final write never aliases a slot that is still being read.
+    """
+
+    @fx.struct
+    class SharedStorage:
+        s_sum: fx.Array[fx.Float32, slots, 16]
+        s_sq: fx.Array[fx.Float32, slots, 16]
+        s_final: fx.Array[fx.Float32, 2, 16]
+
+    return SharedStorage
+
+
+def _load_vec(copy_atom, div_tensor, idx):
+    r = fx.make_rmem_tensor(_VEC, fx.BFloat16)
+    fx.copy_atom_call(copy_atom, fx.slice(div_tensor, (None, idx)), r)
+    return fx.memref_load_vec(r)
+
+
+def _store_vec(copy_atom, div_tensor, idx, val):
+    r = fx.make_rmem_tensor(_VEC, fx.BFloat16)
+    fx.memref_store_vec(val, r)
+    fx.copy_atom_call(copy_atom, r, fx.slice(div_tensor, (None, idx)))
+
+
+def _row_div(tensor, row):
+    """Vector-partitioned view of one row of a rank-2 tensor."""
+    return fx.logical_divide(
+        fx.slice(fx.rocdl.make_buffer_tensor(tensor), (row, None)),
+        fx.make_layout(_VEC, 1),
+    )
+
+
+def _flat_div(tensor):
+    """Vector-partitioned view of a rank-1 tensor."""
+    return fx.logical_divide(
+        fx.rocdl.make_buffer_tensor(tensor), fx.make_layout(_VEC, 1)
+    )
+
+
+def _bcast_row(row, stride):
+    """Row index honoring a runtime broadcast stride.
+
+    A broadcast operand arrives as a dense (1, C) tensor and the host signals it
+    with stride == 0, so selecting row 0 reproduces the previous `row * stride`
+    addressing exactly.
+    """
+    return (stride != 0).select(row, 0)
 
 
 def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
@@ -55,6 +160,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
     )
     NUM_ITERS = D // (BLOCK * VEC)
+    SharedStorage = _make_reduction_storage(NUM_WAVES)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def flydsl_fused_residual_norm_ss_kernel(
@@ -67,258 +173,124 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         bias_ptr: fx.Tensor,
         scale_ptr: fx.Tensor,
         shift_ptr: fx.Tensor,
-        total_rows: Int32,
-        gate_stride: Int32,
-        scale_stride: Int32,
-        shift_stride: Int32,
+        total_rows: fx.Int32,
+        gate_stride: fx.Int32,
+        scale_stride: fx.Int32,
+        shift_stride: fx.Int32,
     ):
         row = fx.block_idx.x
         tid = fx.thread_idx.x
+        lane_id = tid % WARP_SIZE
+        wave_id = tid // WARP_SIZE
 
-        i32 = T.i32
-        f32 = T.f32
-        bf16 = T.bf16
-        vec_f32_t = ir.VectorType.get([VEC], f32)
-        vec_bf16_t = ir.VectorType.get([VEC], bf16)
+        n_float = float(D)
+        c_zero = fx.Float32(0.0)
 
-        y_rsrc = buffer_ops.create_buffer_resource(y_ptr, max_size=True)
-        ro_rsrc = buffer_ops.create_buffer_resource(res_out_ptr, max_size=True)
-        r_rsrc = buffer_ops.create_buffer_resource(res_ptr, max_size=True)
-        x_rsrc = buffer_ops.create_buffer_resource(x_ptr, max_size=True)
-        g_rsrc = buffer_ops.create_buffer_resource(gate_ptr, max_size=True)
-        w_rsrc = buffer_ops.create_buffer_resource(weight_ptr, max_size=True)
-        b_rsrc = buffer_ops.create_buffer_resource(bias_ptr, max_size=True)
-        sc_rsrc = buffer_ops.create_buffer_resource(scale_ptr, max_size=True)
-        sh_rsrc = buffer_ops.create_buffer_resource(shift_ptr, max_size=True)
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        s_sum = lds.s_sum.view(fx.make_layout(NUM_WAVES, 1))
+        s_sq = lds.s_sq.view(fx.make_layout(NUM_WAVES, 1))
+        s_final = lds.s_final.view(fx.make_layout(2, 1))
 
-        row_i32 = ArithValue(row)
-        tid_i32 = ArithValue(tid)
-        D_i32 = arith.constant(D, type=i32)
-        row_off = row_i32 * D_i32
-        gate_row_off = row_i32 * ArithValue(gate_stride)
-        scale_row_off = row_i32 * ArithValue(scale_stride)
-        shift_row_off = row_i32 * ArithValue(shift_stride)
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), _ELEM_BITS)
 
-        c_zero_f32 = arith.constant(0.0, type=f32)
-        c_one_f32 = arith.constant(1.0, type=f32)
-        eps_val = arith.constant(1e-6, type=f32)
-        D_float = arith.constant(float(D), type=f32)
+        y_div = _row_div(y_ptr, row)
+        ro_div = _row_div(res_out_ptr, row)
+        r_div = _row_div(res_ptr, row)
+        x_div = _row_div(x_ptr, row)
+        if const_expr(has_gate):
+            g_div = _row_div(gate_ptr, _bcast_row(row, gate_stride))
+        if const_expr(has_weight):
+            w_div = _flat_div(weight_ptr)
+            b_div = _flat_div(bias_ptr)
+        sc_div = _row_div(scale_ptr, _bcast_row(row, scale_stride))
+        sh_div = _row_div(shift_ptr, _bcast_row(row, shift_stride))
 
-        # LDS
-        LDS_SLOTS = NUM_WAVES * 2 + 2
-        ws_attr = ir.Attribute.parse("#gpu.address_space<workgroup>")
-        lds_i8_type = ir.MemRefType.get(
-            [ir.ShapedType.get_dynamic_size()], T.i8, memory_space=ws_attr
-        )
-        lds_f32_type = ir.MemRefType.get([LDS_SLOTS], f32, memory_space=ws_attr)
-        lds_i8 = _gpu.DynamicSharedMemoryOp(lds_i8_type).result
-        byte_zero = arith_ops.ConstantOp(
-            ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), 0)
-        ).result
-        lds = _memref.ViewOp(lds_f32_type, lds_i8, byte_zero, []).result
+        def wave_reduce_add(val):
+            w = val
+            for i in range_constexpr(len(_SHUFFLE_OFFSETS)):
+                w = w + fx.gpu.shuffle_xor(w, _SHUFFLE_OFFSETS[i], WARP_SIZE)
+            return w
 
-        lane_id = tid_i32 % arith.constant(WARP_SIZE, type=i32)
-        wave_id = tid_i32 // arith.constant(WARP_SIZE, type=i32)
-
-        # Phase 1: residual + gate*x, accumulate stats, save f32 in registers
-        _saved_ro_f32 = []
-        partial_sum = _v(c_zero_f32)
-        partial_sum_sq = _v(c_zero_f32)
+        # Phase 1: residual + gate*x, accumulate stats, keep f32 in registers.
+        saved_ro = []
+        partial_sum = c_zero
+        partial_sq = c_zero
 
         for it in range_constexpr(NUM_ITERS):
-            col = tid_i32 * arith.constant(VEC, type=i32) + arith.constant(
-                it * BLOCK * VEC, type=i32
-            )
-            off = row_off + col
+            idx = tid + it * BLOCK
 
-            r_vec = buffer_ops.buffer_load(r_rsrc, off, vec_width=VEC, dtype=bf16)
-            x_vec = buffer_ops.buffer_load(x_rsrc, off, vec_width=VEC, dtype=bf16)
-            r_f32 = arith_ops.ExtFOp(vec_f32_t, _v(r_vec)).result
-            x_f32 = arith_ops.ExtFOp(vec_f32_t, _v(x_vec)).result
+            r_f32 = _load_vec(copy_atom, r_div, idx).to(fx.Float32)
+            x_f32 = _load_vec(copy_atom, x_div, idx).to(fx.Float32)
 
             if const_expr(has_gate):
-                g_off = gate_row_off + col
-                g_vec = buffer_ops.buffer_load(g_rsrc, g_off, vec_width=VEC, dtype=bf16)
-                g_f32 = arith_ops.ExtFOp(vec_f32_t, _v(g_vec)).result
-                gx = arith_ops.MulFOp(g_f32, x_f32).result
-                ro_f32 = arith_ops.AddFOp(r_f32, gx).result
+                g_f32 = _load_vec(copy_atom, g_div, idx).to(fx.Float32)
+                ro_f32 = r_f32 + g_f32 * x_f32
             else:
-                ro_f32 = arith_ops.AddFOp(r_f32, x_f32).result
+                ro_f32 = r_f32 + x_f32
 
-            ro_bf16 = arith_ops.TruncFOp(vec_bf16_t, ro_f32).result
-            buffer_ops.buffer_store(ro_bf16, ro_rsrc, off)
-            _saved_ro_f32.append(ro_f32)
+            _store_vec(copy_atom, ro_div, idx, ro_f32.to(fx.BFloat16))
+            saved_ro.append(ro_f32)
 
             if const_expr(not is_rms):
-                v_sum = _vector.ReductionOp(
-                    f32, _vector.CombiningKind.ADD, ro_f32
-                ).result
-                partial_sum = arith_ops.AddFOp(partial_sum, v_sum).result
-            ro_sq = arith_ops.MulFOp(ro_f32, ro_f32).result
-            v_sum_sq = _vector.ReductionOp(f32, _vector.CombiningKind.ADD, ro_sq).result
-            partial_sum_sq = arith_ops.AddFOp(partial_sum_sq, v_sum_sq).result
+                partial_sum = partial_sum + ro_f32.reduce(fx.ReductionOp.ADD)
+            partial_sq = partial_sq + (ro_f32 * ro_f32).reduce(fx.ReductionOp.ADD)
 
-        # Intra-wave shuffle
-        width_c = _v(arith.constant(WARP_SIZE, type=i32))
-        w_sum = partial_sum
-        w_sq = partial_sum_sq
-        for sh in [32, 16, 8, 4, 2, 1]:
-            off_sh = _v(arith.constant(sh, type=i32))
-            if const_expr(not is_rms):
-                peer_sum = _gpu.ShuffleOp(
-                    w_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-                ).shuffleResult
-                w_sum = arith_ops.AddFOp(w_sum, peer_sum).result
-            peer_sq = _gpu.ShuffleOp(
-                w_sq, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-            ).shuffleResult
-            w_sq = arith_ops.AddFOp(w_sq, peer_sq).result
-
-        # Cross-wave LDS
-        lane_0 = arith.cmpi(CmpIPredicate.eq, lane_id, arith.constant(0, type=i32))
-        wave_idx = arith_ops.IndexCastOp(ir.IndexType.get(), _v(wave_id)).result
-
-        _if_lane0 = scf.IfOp(lane_0)
-        with ir.InsertionPoint(_if_lane0.then_block):
-            if const_expr(not is_rms):
-                _memref.StoreOp(w_sum, lds, [wave_idx])
-            sq_slot = arith_ops.AddIOp(
-                wave_idx,
-                arith_ops.ConstantOp(
-                    ir.IndexType.get(),
-                    ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES),
-                ).result,
-            ).result
-            _memref.StoreOp(w_sq, lds, [sq_slot])
-            scf.YieldOp([])
-        _gpu.BarrierOp()
-
-        wave_0 = arith.cmpi(CmpIPredicate.eq, wave_id, arith.constant(0, type=i32))
-        active = arith.andi(
-            wave_0,
-            arith.cmpi(CmpIPredicate.ult, lane_id, arith.constant(NUM_WAVES, type=i32)),
-        )
-        lane_idx = arith_ops.IndexCastOp(ir.IndexType.get(), _v(lane_id)).result
-        lane_idx_sq = arith_ops.AddIOp(
-            lane_idx,
-            arith_ops.ConstantOp(
-                ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES)
-            ).result,
-        ).result
-
-        if const_expr(is_rms):
-            _if_active = scf.IfOp(active, [f32], has_else=True)
-            with ir.InsertionPoint(_if_active.then_block):
-                sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
-                scf.YieldOp([sq_val])
-            with ir.InsertionPoint(_if_active.else_block):
-                scf.YieldOp([_v(c_zero_f32)])
-            loaded_sq = _if_active.results[0]
-            loaded_sum = _v(c_zero_f32)
-        else:
-            _if_active = scf.IfOp(active, [f32, f32], has_else=True)
-            with ir.InsertionPoint(_if_active.then_block):
-                s_val = _memref.LoadOp(lds, [lane_idx]).result
-                sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
-                scf.YieldOp([s_val, sq_val])
-            with ir.InsertionPoint(_if_active.else_block):
-                scf.YieldOp([_v(c_zero_f32), _v(c_zero_f32)])
-            loaded_sum = _if_active.results[0]
-            loaded_sq = _if_active.results[1]
-
-        final_sum = loaded_sum
-        final_sq = loaded_sq
-        for sh in [32, 16, 8, 4, 2, 1]:
-            off_sh = _v(arith.constant(sh, type=i32))
-            if const_expr(not is_rms):
-                ps = _gpu.ShuffleOp(
-                    final_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-                ).shuffleResult
-                final_sum = arith_ops.AddFOp(final_sum, ps).result
-            pq = _gpu.ShuffleOp(
-                final_sq, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-            ).shuffleResult
-            final_sq = arith_ops.AddFOp(final_sq, pq).result
-
-        both_0 = arith.andi(wave_0, lane_0)
-        final_sum_slot = arith_ops.ConstantOp(
-            ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES * 2)
-        ).result
-        final_sq_slot = arith_ops.ConstantOp(
-            ir.IndexType.get(),
-            ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES * 2 + 1),
-        ).result
-        _if_both = scf.IfOp(both_0)
-        with ir.InsertionPoint(_if_both.then_block):
-            if const_expr(not is_rms):
-                _memref.StoreOp(final_sum, lds, [final_sum_slot])
-            _memref.StoreOp(final_sq, lds, [final_sq_slot])
-            scf.YieldOp([])
-        _gpu.BarrierOp()
-
+        # Stage 1: intra-wave shuffle reduction.
         if const_expr(not is_rms):
-            total_sum = _memref.LoadOp(lds, [final_sum_slot]).result
-        else:
-            total_sum = _v(c_zero_f32)
-        total_sq = _memref.LoadOp(lds, [final_sq_slot]).result
+            w_sum = wave_reduce_add(partial_sum)
+        w_sq = wave_reduce_add(partial_sq)
 
-        # Norm
-        d_f = _v(D_float)
-        eps_v = _v(eps_val)
-        if const_expr(is_rms):
-            var = arith_ops.DivFOp(total_sq, d_f).result
-            var_eps = arith_ops.AddFOp(var, eps_v).result
-            rstd = math_ops.RsqrtOp(var_eps).result
-            mean = _v(c_zero_f32)
-        else:
-            mean = arith_ops.DivFOp(total_sum, d_f).result
-            mean_sq = arith_ops.MulFOp(mean, mean).result
-            var = arith_ops.SubFOp(
-                arith_ops.DivFOp(total_sq, d_f).result, mean_sq
-            ).result
-            var_eps = arith_ops.AddFOp(var, eps_v).result
-            rstd = math_ops.RsqrtOp(var_eps).result
+        if lane_id == 0:
+            if const_expr(not is_rms):
+                fx.memref_store(w_sum, s_sum, wave_id)
+            fx.memref_store(w_sq, s_sq, wave_id)
+        fx.gpu.barrier()
 
-        # Phase 2: normalize using register-cached f32 values (no HBM re-read)
-        mean_splat = _vector.BroadcastOp(vec_f32_t, mean).result
-        rstd_splat = _vector.BroadcastOp(vec_f32_t, rstd).result
-        one_splat = _vector.BroadcastOp(vec_f32_t, _v(c_one_f32)).result
-
-        for it in range_constexpr(NUM_ITERS):
-            col = tid_i32 * arith.constant(VEC, type=i32) + arith.constant(
-                it * BLOCK * VEC, type=i32
+        # Stage 2: wave 0 folds the per-wave partials and publishes the results.
+        if wave_id == 0:
+            in_range = lane_id < NUM_WAVES
+            lane_safe = in_range.select(lane_id, 0)
+            if const_expr(not is_rms):
+                v_sum = wave_reduce_add(
+                    in_range.select(fx.memref_load(s_sum, lane_safe), c_zero)
+                )
+            v_sq = wave_reduce_add(
+                in_range.select(fx.memref_load(s_sq, lane_safe), c_zero)
             )
-            off = row_off + col
+            if lane_id == 0:
+                if const_expr(not is_rms):
+                    fx.memref_store(v_sum, s_final, 0)
+                fx.memref_store(v_sq, s_final, 1)
+        fx.gpu.barrier()
 
-            ro_f32 = _saved_ro_f32[it]
+        total_sq = fx.memref_load(s_final, 1)
+
+        if const_expr(is_rms):
+            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+        else:
+            mean = fx.memref_load(s_final, 0) / n_float
+            var = total_sq / n_float - mean * mean
+            rstd = fx.math.rsqrt(var + _EPS)
+
+        # Phase 2: normalize from the register cache (no HBM re-read).
+        for it in range_constexpr(NUM_ITERS):
+            idx = tid + it * BLOCK
+            ro_f32 = saved_ro[it]
 
             if const_expr(is_rms):
-                x_hat = arith_ops.MulFOp(ro_f32, rstd_splat).result
+                x_hat = ro_f32 * rstd
             else:
-                centered = arith_ops.SubFOp(ro_f32, mean_splat).result
-                x_hat = arith_ops.MulFOp(centered, rstd_splat).result
+                x_hat = (ro_f32 - mean) * rstd
 
             if const_expr(has_weight):
-                w_vec = buffer_ops.buffer_load(w_rsrc, col, vec_width=VEC, dtype=bf16)
-                w_f32 = arith_ops.ExtFOp(vec_f32_t, _v(w_vec)).result
-                x_hat = arith_ops.MulFOp(x_hat, w_f32).result
-                b_vec = buffer_ops.buffer_load(b_rsrc, col, vec_width=VEC, dtype=bf16)
-                b_f32 = arith_ops.ExtFOp(vec_f32_t, _v(b_vec)).result
-                x_hat = arith_ops.AddFOp(x_hat, b_f32).result
+                x_hat = x_hat * _load_vec(copy_atom, w_div, idx).to(fx.Float32)
+                x_hat = x_hat + _load_vec(copy_atom, b_div, idx).to(fx.Float32)
 
-            sc_off = scale_row_off + col
-            sc_vec = buffer_ops.buffer_load(sc_rsrc, sc_off, vec_width=VEC, dtype=bf16)
-            sc_f32 = arith_ops.ExtFOp(vec_f32_t, _v(sc_vec)).result
-            sc_p1 = arith_ops.AddFOp(one_splat, sc_f32).result
-            x_hat = arith_ops.MulFOp(x_hat, sc_p1).result
+            sc_f32 = _load_vec(copy_atom, sc_div, idx).to(fx.Float32)
+            x_hat = x_hat * (sc_f32 + 1.0)
+            y_f32 = x_hat + _load_vec(copy_atom, sh_div, idx).to(fx.Float32)
 
-            sh_off = shift_row_off + col
-            sh_vec = buffer_ops.buffer_load(sh_rsrc, sh_off, vec_width=VEC, dtype=bf16)
-            sh_f32 = arith_ops.ExtFOp(vec_f32_t, _v(sh_vec)).result
-            y_f32 = arith_ops.AddFOp(x_hat, sh_f32).result
-
-            y_bf16 = arith_ops.TruncFOp(vec_bf16_t, y_f32).result
-            buffer_ops.buffer_store(y_bf16, y_rsrc, off)
+            _store_vec(copy_atom, y_div, idx, y_f32.to(fx.BFloat16))
 
     @flyc.jit
     def launch_fused_norm(
@@ -337,10 +309,6 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         shift_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-        grid_x = arith.index_cast(T.index, total_rows)
         launcher = flydsl_fused_residual_norm_ss_kernel(
             y,
             res_out,
@@ -356,10 +324,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
             scale_stride,
             shift_stride,
         )
-        LDS_BYTES = (NUM_WAVES * 2 + 2) * 4
-        launcher.launch(
-            grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), smem=LDS_BYTES, stream=stream
-        )
+        launcher.launch(grid=(total_rows, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch_fused_norm
 
@@ -547,6 +512,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
     )
     NUM_ITERS = D // (BLOCK * VEC)
+    SharedStorage = _make_reduction_storage(NUM_WAVES)
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def flydsl_norm_scale_shift_kernel(
@@ -556,237 +522,109 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         bias_ptr: fx.Tensor,
         scale_ptr: fx.Tensor,
         shift_ptr: fx.Tensor,
-        total_rows: Int32,
-        scale_stride: Int32,
-        shift_stride: Int32,
+        total_rows: fx.Int32,
+        scale_stride: fx.Int32,
+        shift_stride: fx.Int32,
     ):
         row = fx.block_idx.x
         tid = fx.thread_idx.x
+        lane_id = tid % WARP_SIZE
+        wave_id = tid // WARP_SIZE
 
-        i32 = T.i32
-        f32 = T.f32
-        bf16 = T.bf16
-        vec_f32_t = ir.VectorType.get([VEC], f32)
-        vec_bf16_t = ir.VectorType.get([VEC], bf16)
+        n_float = float(D)
+        c_zero = fx.Float32(0.0)
 
-        y_rsrc = buffer_ops.create_buffer_resource(y_ptr, max_size=True)
-        x_rsrc = buffer_ops.create_buffer_resource(x_ptr, max_size=True)
-        w_rsrc = buffer_ops.create_buffer_resource(weight_ptr, max_size=True)
-        b_rsrc = buffer_ops.create_buffer_resource(bias_ptr, max_size=True)
-        sc_rsrc = buffer_ops.create_buffer_resource(scale_ptr, max_size=True)
-        sh_rsrc = buffer_ops.create_buffer_resource(shift_ptr, max_size=True)
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        s_sum = lds.s_sum.view(fx.make_layout(NUM_WAVES, 1))
+        s_sq = lds.s_sq.view(fx.make_layout(NUM_WAVES, 1))
+        s_final = lds.s_final.view(fx.make_layout(2, 1))
 
-        row_i32 = ArithValue(row)
-        tid_i32 = ArithValue(tid)
-        D_i32 = arith.constant(D, type=i32)
-        row_off = row_i32 * D_i32
-        scale_row_off = row_i32 * ArithValue(scale_stride)
-        shift_row_off = row_i32 * ArithValue(shift_stride)
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), _ELEM_BITS)
 
-        c_zero_f32 = arith.constant(0.0, type=f32)
-        c_one_f32 = arith.constant(1.0, type=f32)
-        eps_val = arith.constant(1e-6, type=f32)
-        D_float = arith.constant(float(D), type=f32)
+        y_div = _row_div(y_ptr, row)
+        x_div = _row_div(x_ptr, row)
+        if const_expr(has_weight):
+            w_div = _flat_div(weight_ptr)
+            b_div = _flat_div(bias_ptr)
+        sc_div = _row_div(scale_ptr, _bcast_row(row, scale_stride))
+        sh_div = _row_div(shift_ptr, _bcast_row(row, shift_stride))
 
-        LDS_SLOTS = NUM_WAVES * 2 + 2
-        ws_attr = ir.Attribute.parse("#gpu.address_space<workgroup>")
-        lds_i8_type = ir.MemRefType.get(
-            [ir.ShapedType.get_dynamic_size()], T.i8, memory_space=ws_attr
-        )
-        lds_f32_type = ir.MemRefType.get([LDS_SLOTS], f32, memory_space=ws_attr)
-        lds_i8 = _gpu.DynamicSharedMemoryOp(lds_i8_type).result
-        byte_zero = arith_ops.ConstantOp(
-            ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), 0)
-        ).result
-        lds = _memref.ViewOp(lds_f32_type, lds_i8, byte_zero, []).result
+        def wave_reduce_add(val):
+            w = val
+            for i in range_constexpr(len(_SHUFFLE_OFFSETS)):
+                w = w + fx.gpu.shuffle_xor(w, _SHUFFLE_OFFSETS[i], WARP_SIZE)
+            return w
 
-        lane_id = tid_i32 % arith.constant(WARP_SIZE, type=i32)
-        wave_id = tid_i32 // arith.constant(WARP_SIZE, type=i32)
-
-        # Phase 1: load x, accumulate stats, save f32 in registers
-        _saved_x_f32 = []
-        partial_sum = _v(c_zero_f32)
-        partial_sum_sq = _v(c_zero_f32)
+        # Phase 1: load x, accumulate stats, keep f32 in registers.
+        saved_x = []
+        partial_sum = c_zero
+        partial_sq = c_zero
 
         for it in range_constexpr(NUM_ITERS):
-            col = tid_i32 * arith.constant(VEC, type=i32) + arith.constant(
-                it * BLOCK * VEC, type=i32
-            )
-            off = row_off + col
-
-            x_vec = buffer_ops.buffer_load(x_rsrc, off, vec_width=VEC, dtype=bf16)
-            x_f32 = arith_ops.ExtFOp(vec_f32_t, _v(x_vec)).result
-            _saved_x_f32.append(x_f32)
+            idx = tid + it * BLOCK
+            x_f32 = _load_vec(copy_atom, x_div, idx).to(fx.Float32)
+            saved_x.append(x_f32)
 
             if const_expr(not is_rms):
-                v_sum = _vector.ReductionOp(
-                    f32, _vector.CombiningKind.ADD, x_f32
-                ).result
-                partial_sum = arith_ops.AddFOp(partial_sum, v_sum).result
-            x_sq = arith_ops.MulFOp(x_f32, x_f32).result
-            v_sum_sq = _vector.ReductionOp(f32, _vector.CombiningKind.ADD, x_sq).result
-            partial_sum_sq = arith_ops.AddFOp(partial_sum_sq, v_sum_sq).result
+                partial_sum = partial_sum + x_f32.reduce(fx.ReductionOp.ADD)
+            partial_sq = partial_sq + (x_f32 * x_f32).reduce(fx.ReductionOp.ADD)
 
-        # Intra-wave shuffle reduction
-        width_c = _v(arith.constant(WARP_SIZE, type=i32))
-        w_sum = partial_sum
-        w_sq = partial_sum_sq
-        for sh in [32, 16, 8, 4, 2, 1]:
-            off_sh = _v(arith.constant(sh, type=i32))
-            if const_expr(not is_rms):
-                peer_sum = _gpu.ShuffleOp(
-                    w_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-                ).shuffleResult
-                w_sum = arith_ops.AddFOp(w_sum, peer_sum).result
-            peer_sq = _gpu.ShuffleOp(
-                w_sq, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-            ).shuffleResult
-            w_sq = arith_ops.AddFOp(w_sq, peer_sq).result
-
-        # Cross-wave LDS reduction
-        lane_0 = arith.cmpi(CmpIPredicate.eq, lane_id, arith.constant(0, type=i32))
-        wave_idx = arith_ops.IndexCastOp(ir.IndexType.get(), _v(wave_id)).result
-
-        _if_lane0 = scf.IfOp(lane_0)
-        with ir.InsertionPoint(_if_lane0.then_block):
-            if const_expr(not is_rms):
-                _memref.StoreOp(w_sum, lds, [wave_idx])
-            sq_slot = arith_ops.AddIOp(
-                wave_idx,
-                arith_ops.ConstantOp(
-                    ir.IndexType.get(),
-                    ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES),
-                ).result,
-            ).result
-            _memref.StoreOp(w_sq, lds, [sq_slot])
-            scf.YieldOp([])
-        _gpu.BarrierOp()
-
-        wave_0 = arith.cmpi(CmpIPredicate.eq, wave_id, arith.constant(0, type=i32))
-        active = arith.andi(
-            wave_0,
-            arith.cmpi(CmpIPredicate.ult, lane_id, arith.constant(NUM_WAVES, type=i32)),
-        )
-        lane_idx = arith_ops.IndexCastOp(ir.IndexType.get(), _v(lane_id)).result
-        lane_idx_sq = arith_ops.AddIOp(
-            lane_idx,
-            arith_ops.ConstantOp(
-                ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES)
-            ).result,
-        ).result
-
-        if const_expr(is_rms):
-            _if_active = scf.IfOp(active, [f32], has_else=True)
-            with ir.InsertionPoint(_if_active.then_block):
-                sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
-                scf.YieldOp([sq_val])
-            with ir.InsertionPoint(_if_active.else_block):
-                scf.YieldOp([_v(c_zero_f32)])
-            loaded_sq = _if_active.results[0]
-            loaded_sum = _v(c_zero_f32)
-        else:
-            _if_active = scf.IfOp(active, [f32, f32], has_else=True)
-            with ir.InsertionPoint(_if_active.then_block):
-                s_val = _memref.LoadOp(lds, [lane_idx]).result
-                sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
-                scf.YieldOp([s_val, sq_val])
-            with ir.InsertionPoint(_if_active.else_block):
-                scf.YieldOp([_v(c_zero_f32), _v(c_zero_f32)])
-            loaded_sum = _if_active.results[0]
-            loaded_sq = _if_active.results[1]
-
-        final_sum = loaded_sum
-        final_sq = loaded_sq
-        for sh in [32, 16, 8, 4, 2, 1]:
-            off_sh = _v(arith.constant(sh, type=i32))
-            if const_expr(not is_rms):
-                ps = _gpu.ShuffleOp(
-                    final_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-                ).shuffleResult
-                final_sum = arith_ops.AddFOp(final_sum, ps).result
-            pq = _gpu.ShuffleOp(
-                final_sq, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
-            ).shuffleResult
-            final_sq = arith_ops.AddFOp(final_sq, pq).result
-
-        both_0 = arith.andi(wave_0, lane_0)
-        final_sum_slot = arith_ops.ConstantOp(
-            ir.IndexType.get(), ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES * 2)
-        ).result
-        final_sq_slot = arith_ops.ConstantOp(
-            ir.IndexType.get(),
-            ir.IntegerAttr.get(ir.IndexType.get(), NUM_WAVES * 2 + 1),
-        ).result
-        _if_both = scf.IfOp(both_0)
-        with ir.InsertionPoint(_if_both.then_block):
-            if const_expr(not is_rms):
-                _memref.StoreOp(final_sum, lds, [final_sum_slot])
-            _memref.StoreOp(final_sq, lds, [final_sq_slot])
-            scf.YieldOp([])
-        _gpu.BarrierOp()
-
+        # Stage 1: intra-wave shuffle reduction.
         if const_expr(not is_rms):
-            total_sum = _memref.LoadOp(lds, [final_sum_slot]).result
-        else:
-            total_sum = _v(c_zero_f32)
-        total_sq = _memref.LoadOp(lds, [final_sq_slot]).result
+            w_sum = wave_reduce_add(partial_sum)
+        w_sq = wave_reduce_add(partial_sq)
 
-        d_f = _v(D_float)
-        eps_v = _v(eps_val)
-        if const_expr(is_rms):
-            var = arith_ops.DivFOp(total_sq, d_f).result
-            var_eps = arith_ops.AddFOp(var, eps_v).result
-            rstd = math_ops.RsqrtOp(var_eps).result
-            mean = _v(c_zero_f32)
-        else:
-            mean = arith_ops.DivFOp(total_sum, d_f).result
-            mean_sq = arith_ops.MulFOp(mean, mean).result
-            var = arith_ops.SubFOp(
-                arith_ops.DivFOp(total_sq, d_f).result, mean_sq
-            ).result
-            var_eps = arith_ops.AddFOp(var, eps_v).result
-            rstd = math_ops.RsqrtOp(var_eps).result
+        if lane_id == 0:
+            if const_expr(not is_rms):
+                fx.memref_store(w_sum, s_sum, wave_id)
+            fx.memref_store(w_sq, s_sq, wave_id)
+        fx.gpu.barrier()
 
-        # Phase 2: normalize from register cache + scale_shift → single output
-        mean_splat = _vector.BroadcastOp(vec_f32_t, mean).result
-        rstd_splat = _vector.BroadcastOp(vec_f32_t, rstd).result
-        one_splat = _vector.BroadcastOp(vec_f32_t, _v(c_one_f32)).result
-
-        for it in range_constexpr(NUM_ITERS):
-            col = tid_i32 * arith.constant(VEC, type=i32) + arith.constant(
-                it * BLOCK * VEC, type=i32
+        # Stage 2: wave 0 folds the per-wave partials and publishes the results.
+        if wave_id == 0:
+            in_range = lane_id < NUM_WAVES
+            lane_safe = in_range.select(lane_id, 0)
+            if const_expr(not is_rms):
+                v_sum = wave_reduce_add(
+                    in_range.select(fx.memref_load(s_sum, lane_safe), c_zero)
+                )
+            v_sq = wave_reduce_add(
+                in_range.select(fx.memref_load(s_sq, lane_safe), c_zero)
             )
-            off = row_off + col
+            if lane_id == 0:
+                if const_expr(not is_rms):
+                    fx.memref_store(v_sum, s_final, 0)
+                fx.memref_store(v_sq, s_final, 1)
+        fx.gpu.barrier()
 
-            x_f32 = _saved_x_f32[it]
+        total_sq = fx.memref_load(s_final, 1)
+
+        if const_expr(is_rms):
+            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+        else:
+            mean = fx.memref_load(s_final, 0) / n_float
+            var = total_sq / n_float - mean * mean
+            rstd = fx.math.rsqrt(var + _EPS)
+
+        # Phase 2: normalize from the register cache + scale_shift.
+        for it in range_constexpr(NUM_ITERS):
+            idx = tid + it * BLOCK
+            x_f32 = saved_x[it]
 
             if const_expr(is_rms):
-                x_hat = arith_ops.MulFOp(x_f32, rstd_splat).result
+                x_hat = x_f32 * rstd
             else:
-                centered = arith_ops.SubFOp(x_f32, mean_splat).result
-                x_hat = arith_ops.MulFOp(centered, rstd_splat).result
+                x_hat = (x_f32 - mean) * rstd
 
             if const_expr(has_weight):
-                w_vec = buffer_ops.buffer_load(w_rsrc, col, vec_width=VEC, dtype=bf16)
-                w_f32 = arith_ops.ExtFOp(vec_f32_t, _v(w_vec)).result
-                x_hat = arith_ops.MulFOp(x_hat, w_f32).result
-                b_vec = buffer_ops.buffer_load(b_rsrc, col, vec_width=VEC, dtype=bf16)
-                b_f32 = arith_ops.ExtFOp(vec_f32_t, _v(b_vec)).result
-                x_hat = arith_ops.AddFOp(x_hat, b_f32).result
+                x_hat = x_hat * _load_vec(copy_atom, w_div, idx).to(fx.Float32)
+                x_hat = x_hat + _load_vec(copy_atom, b_div, idx).to(fx.Float32)
 
-            sc_off = scale_row_off + col
-            sc_vec = buffer_ops.buffer_load(sc_rsrc, sc_off, vec_width=VEC, dtype=bf16)
-            sc_f32 = arith_ops.ExtFOp(vec_f32_t, _v(sc_vec)).result
-            sc_p1 = arith_ops.AddFOp(one_splat, sc_f32).result
-            x_hat = arith_ops.MulFOp(x_hat, sc_p1).result
+            sc_f32 = _load_vec(copy_atom, sc_div, idx).to(fx.Float32)
+            x_hat = x_hat * (sc_f32 + 1.0)
+            y_f32 = x_hat + _load_vec(copy_atom, sh_div, idx).to(fx.Float32)
 
-            sh_off = shift_row_off + col
-            sh_vec = buffer_ops.buffer_load(sh_rsrc, sh_off, vec_width=VEC, dtype=bf16)
-            sh_f32 = arith_ops.ExtFOp(vec_f32_t, _v(sh_vec)).result
-            y_f32 = arith_ops.AddFOp(x_hat, sh_f32).result
-
-            y_bf16 = arith_ops.TruncFOp(vec_bf16_t, y_f32).result
-            buffer_ops.buffer_store(y_bf16, y_rsrc, off)
+            _store_vec(copy_atom, y_div, idx, y_f32.to(fx.BFloat16))
 
     @flyc.jit
     def launch_norm_ss(
@@ -801,10 +639,6 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         shift_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-        grid_x = arith.index_cast(T.index, total_rows)
         launcher = flydsl_norm_scale_shift_kernel(
             y,
             x,
@@ -816,10 +650,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
             scale_stride,
             shift_stride,
         )
-        LDS_BYTES = (NUM_WAVES * 2 + 2) * 4
-        launcher.launch(
-            grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), smem=LDS_BYTES, stream=stream
-        )
+        launcher.launch(grid=(total_rows, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch_norm_ss
 
