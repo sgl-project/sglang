@@ -186,6 +186,11 @@ class BaseKVSender(ABC):
         """
         pass
 
+    @abstractmethod
+    def is_transfer_quiesced(self) -> bool:
+        """Return whether transport work can no longer access request buffers."""
+        ...
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod
