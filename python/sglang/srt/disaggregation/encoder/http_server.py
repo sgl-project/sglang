@@ -103,7 +103,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 
 
-def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+def _register_encoder_url_with_bootstrap():
     """Asynchronously register this encoder with each bootstrap URL.
 
     Spawns a daemon thread that retries each URL independently with bounded
@@ -175,7 +175,7 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
     ).start()
 
 
-def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
+def _unregister_encoder_url_from_bootstrap():
     host = get_serving().host
     if not host or host in ("0.0.0.0", "::"):
         host = get_local_ip_auto(get_serving().host)
@@ -229,8 +229,8 @@ def launch_server(server_args: ServerArgs):
     if get_disagg().encoder_register_urls:
         import atexit
 
-        _register_encoder_url_with_bootstrap(server_args)
-        atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
+        _register_encoder_url_with_bootstrap()
+        atexit.register(_unregister_encoder_url_from_bootstrap)
 
     uvicorn.run(app, host=get_serving().host, port=get_serving().port)
 
