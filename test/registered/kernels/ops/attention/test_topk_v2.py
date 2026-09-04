@@ -116,6 +116,13 @@ def _oversized_coarse_bin(batch: int, seq: int) -> torch.Tensor:
     return values.expand(batch, -1).contiguous()
 
 
+def _coarse_keys_12(values: torch.Tensor) -> torch.Tensor:
+    """Mirror extract_coarse_bin<12> for test-shape assertions."""
+    bits = values.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    ordered = torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    return ordered >> 4
+
+
 def _make_page_table(batch, num_pages, mode, device, per_row=False):
     if mode == "identity":
         pt = torch.arange(num_pages, dtype=torch.int32, device=device)
@@ -321,21 +328,27 @@ def test_topk_v2_oversized_coarse_bin(batch: int, seq: int, k: int) -> None:
         )
 
 
+@pytest.mark.parametrize("depth", [16, 8, 0])
 @torch.inference_mode()
-def test_topk_v2_oversized_bin_separates_at_low_byte() -> None:
-    """The fallback must descend through all four exact-key bytes."""
+def test_topk_v2_oversized_bin_separates_at_each_variable_byte(depth: int) -> None:
+    """The fallback must retain strict winners found at every variable byte."""
+    torch.manual_seed(20260904 + depth)
     per_side, k = 4097, 2048
-    low = torch.full((per_side,), 0x3F800000, dtype=torch.int32, device="cuda").view(
-        torch.float32
+    base = 0x3F000000
+    noise = torch.randint(
+        0, 1 << depth, (2 * per_side,), dtype=torch.int32, device="cuda"
     )
-    high = torch.full((per_side,), 0x3F800001, dtype=torch.int32, device="cuda").view(
-        torch.float32
-    )
+    bits = torch.full((2 * per_side,), base, dtype=torch.int32, device="cuda") + noise
+    bits[:per_side] += 1 << depth
+    values = bits[torch.randperm(2 * per_side, device="cuda")].view(torch.float32)
+    cutoff = torch.topk(values, k).values.min()
+    cutoff_bin = _coarse_keys_12(cutoff.view(1))[0]
+    assert int((_coarse_keys_12(values) == cutoff_bin).sum()) > 2048
     logical_length = 2 * per_side
     # The entry point requires a 16-byte-aligned physical row stride. Keep the
     # 8194-element logical row (and its scalar tail), backed by a padded stride.
     padded = torch.empty((1, (logical_length + 3) & ~3), device="cuda")
-    padded[0, :logical_length] = torch.cat([low, high])
+    padded[0, :logical_length] = values
     scores = padded[:, :logical_length]
     seq_lens = torch.tensor([logical_length], dtype=torch.int32, device="cuda")
 
@@ -346,10 +359,41 @@ def test_topk_v2_oversized_bin_separates_at_low_byte() -> None:
 
 @torch.inference_mode()
 def test_topk_v2_cluster_all_equal_overflow() -> None:
-    """Full-key ties larger than the cap fill exactly k distinct slots."""
+    """Full-key ties larger than the cap use captured candidates exactly."""
     seq, k = 131072, 2048
     scores = torch.full((1, seq), 0.75, dtype=torch.float32, device="cuda")
     seq_lens = torch.tensor([seq], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@pytest.mark.parametrize("value", [0.0, -0.0])
+@torch.inference_mode()
+def test_topk_v2_signed_zero_rows(value: float) -> None:
+    """The boundary classifier handles positive and negative zero rows."""
+    seq, k = 6000, 512
+    scores = torch.full((1, seq), value, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor([seq], dtype=torch.int32, device="cuda")
+
+    our_raw = _run_raw(scores, seq_lens, k)
+    ref_raw = _reference(scores, seq_lens, k)
+    _assert_topk_close(scores.cpu(), ref_raw, our_raw, 1, seq_lens.cpu(), k)
+
+
+@torch.inference_mode()
+def test_topk_v2_oversized_exact_tie_fills_one_tail_slot() -> None:
+    """Captured exact ties start after topk-1 strictly higher values."""
+    k, high_count, tie_count = 2048, 2047, 3000
+    high = 2.0 + torch.arange(high_count, dtype=torch.float32, device="cuda") * 1e-3
+    tie = torch.full((tie_count,), 0.75, dtype=torch.float32, device="cuda")
+    scores = torch.cat([tie, high]).unsqueeze(0)
+    assert (
+        int((_coarse_keys_12(scores[0]) == _coarse_keys_12(tie[:1])[0]).sum())
+        == tie_count
+    )
+    seq_lens = torch.tensor([scores.shape[1]], dtype=torch.int32, device="cuda")
 
     our_raw = _run_raw(scores, seq_lens, k)
     ref_raw = _reference(scores, seq_lens, k)

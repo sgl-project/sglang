@@ -220,11 +220,13 @@ class TestDsaKpoolTopkTransform(CustomTestCase):
             self._check_row(out[0], row, group_topk)
 
     def test_all_equal_rows_longer_than_stash(self):
-        # Every key is identical, so the overflow descent reaches the last key
-        # byte and must clip the final bin by exact ties only.
+        # Every key is identical, so the final scan must clip the exact ties
+        # without duplicating indices or leaving an output slot unfilled.
         for group_topk in GROUP_TOPKS:
             rows = [
                 torch.full((STASH_ENTRIES + 1,), 0.75),
+                torch.full((STASH_ENTRIES + 1,), 0.0),
+                torch.full((STASH_ENTRIES + 1,), -0.0),
             ]
             self._check_rows(rows, group_topk)
 

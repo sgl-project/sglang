@@ -530,14 +530,15 @@ struct TopKRadixBase : TopKConfig {
 
   /// Select the remaining entries directly from an oversized coarse threshold
   /// bin. The common path materializes at most kMaxNumTie candidates and calls
-  /// handle_tie(); this fallback instead rescans the row for each byte of the
-  /// ordered FP32 key. Candidates are only clipped after all four bytes match,
-  /// when they are exact-value ties and any subset is valid.
+  /// handle_tie(); this fallback instead discovers the exact ordered-FP32
+  /// cutoff without emitting after each byte, then fills disjoint strictly-
+  /// greater and exact-tie output ranges in one final scan.
   SGL_DEVICE static void handle_oversized_bin(
       const TopKProblem& problem,
       const uint32_t threshold_bin,
       const uint32_t above_count,
       const uint32_t equal_count,
+      const TieValue* captured,
       TieHandleSmem* scratch) {
     if (above_count >= problem.topk) return;
 
@@ -547,12 +548,10 @@ struct TopKRadixBase : TopKConfig {
     uint32_t remaining = target;
     uint32_t total_active = equal_count;
     uint32_t prefix = 0;
+    uint32_t strict_count = 0;
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
-
-    if (tx == 0) scratch->counter = 0;
-    __syncthreads();
 
 #pragma unroll
     for (int round = 0; round < 4; ++round) {
@@ -563,14 +562,52 @@ struct TopKRadixBase : TopKConfig {
       if (tx == 0) scratch->match = {kRadixSize, 0, 0};
       __syncthreads();
 
+      uint32_t local_min = UINT32_MAX;
+      uint32_t local_max = 0;
       for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
         if (val < v_lo || val >= v_hi) return;
         const uint32_t key = extract_exact_bin(val);
         if ((key & prefix_mask) == prefix) {
           atomicAdd(&scratch->histogram[0][(key >> shift) & 0xFFu], 1);
+          if (round == 0) {
+            local_min = key < local_min ? key : local_min;
+            local_max = key > local_max ? key : local_max;
+          }
         }
       });
-      __syncthreads();
+
+      if (round == 0) {
+        local_min = warp::reduce_min(local_min);
+        local_max = warp::reduce_max(local_max);
+        if (lane_id == 0) {
+          scratch->warp_sum[warp_id] = local_min;
+          scratch->histogram[1][warp_id] = local_max;
+        }
+        __syncthreads();
+
+        if (tx < kWarpSize) {
+          const auto min_key = warp::reduce_min(scratch->warp_sum[lane_id]);
+          const auto max_key = warp::reduce_max(scratch->histogram[1][lane_id]);
+          if (tx == 0) {
+            scratch->counter = min_key;
+            scratch->counter_final = max_key;
+          }
+        }
+        __syncthreads();
+
+        if (scratch->counter == scratch->counter_final) {
+          // The collect pass retained kMaxNumTie candidates, and target is at
+          // most kMaxTopK <= kMaxNumTie. With one exact key, any captured
+          // subset of the requested size is a valid top-k tail.
+          for (uint32_t t = tx; t < target; t += kBlockSize) {
+            problem.emit(above_count + t, captured[t].idx);
+          }
+          __syncthreads();
+          return;
+        }
+      } else {
+        __syncthreads();
+      }
 
       uint32_t hist_val = 0;
       uint32_t warp_inc = 0;
@@ -593,37 +630,32 @@ struct TopKRadixBase : TopKConfig {
       const auto [exact_threshold, above, equal, _] = scratch->match;
       if (exact_threshold >= kRadixSize) return;
 
-      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-        if (val < v_lo || val >= v_hi) return;
-        const uint32_t key = extract_exact_bin(val);
-        if ((key & prefix_mask) != prefix) return;
-        const uint32_t bin = (key >> shift) & 0xFFu;
-        if (bin > exact_threshold) {
-          const auto pos = atomicAdd(&scratch->counter, 1);
-          if (pos < target) problem.emit(above_count + pos, idx);
-        }
-      });
-      __syncthreads();
-
+      strict_count += above;
       remaining -= above;
-      if (remaining == 0) return;
-      if (round == 3) {
-        // Emit exact-value ties only after every strictly greater key has
-        // reserved its slot; combining the two in one atomic loop could let a
-        // tie race ahead and displace a greater value at the output bound.
-        for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-          if (val < v_lo || val >= v_hi) return;
-          if (extract_exact_bin(val) == (prefix | exact_threshold)) {
-            const auto pos = atomicAdd(&scratch->counter, 1);
-            if (pos < target) problem.emit(above_count + pos, idx);
-          }
-        });
-        __syncthreads();
-        return;
-      }
       total_active = equal;
       prefix |= exact_threshold << shift;
+      // Every thread consumes match/histogram state above; keep faster warps
+      // from clearing it for the next refinement round.
+      __syncthreads();
     }
+
+    if (tx == 0) {
+      scratch->counter = 0;
+      scratch->counter_final = 0;
+    }
+    __syncthreads();
+    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
+      if (val < v_lo || val >= v_hi) return;
+      const uint32_t key = extract_exact_bin(val);
+      if (key > prefix) {
+        const auto pos = atomicAdd(&scratch->counter, 1);
+        if (pos < strict_count) problem.emit(above_count + pos, idx);
+      } else if (key == prefix) {
+        const auto pos = atomicAdd(&scratch->counter_final, 1);
+        if (pos < remaining) problem.emit(above_count + strict_count + pos, idx);
+      }
+    });
+    __syncthreads();
   }
 };
 
@@ -730,7 +762,7 @@ struct TopKRegister : TopKRadixBase<12> {
     if (equal_count <= kMaxNumTie) {
       handle_tie(smem->tie.values, problem, above_count, equal_count, remain_topk, &smem->tie.handle);
     } else {
-      handle_oversized_bin(problem, threshold_bin, above_count, equal_count, &smem->tie.handle);
+      handle_oversized_bin(problem, threshold_bin, above_count, equal_count, smem->tie.values, &smem->tie.handle);
     }
   }
 };
@@ -805,7 +837,7 @@ struct TopKStreaming : TopKRegister<2> {
     if (equal_count <= kMaxNumTie) {
       handle_tie(smem->tie.values, problem, above_count, equal_count, remain_topk, &smem->tie.handle);
     } else {
-      handle_oversized_bin(problem, threshold_bin, above_count, equal_count, &smem->tie.handle);
+      handle_oversized_bin(problem, threshold_bin, above_count, equal_count, smem->tie.values, &smem->tie.handle);
     }
   }
 };
@@ -990,7 +1022,8 @@ struct TopKCluster : TopKRadixBase<10> {
         // owns the primary role or how chunks are assigned in the future.
         auto full_row_problem = problem;
         full_row_problem.in = full_row_in;
-        handle_oversized_bin(full_row_problem, threshold_bin, above_count, equal_count, &smem->tie.handle);
+        handle_oversized_bin(
+            full_row_problem, threshold_bin, above_count, equal_count, smem->tie.values, &smem->tie.handle);
       }
     }
   }
