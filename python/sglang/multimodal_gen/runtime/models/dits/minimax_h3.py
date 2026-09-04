@@ -22,12 +22,12 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
-    can_use_silu_mul_per_tensor_fp8,
+    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
-    silu_mul_per_tensor_fp8,
+    silu_mul_mxfp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -1199,12 +1199,10 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
-        if self.fc2.quant_method.accepts_fp8_per_tensor_input(
+        if self.fc2.quant_method.accepts_mxfp8_input(
             self.fc2
-        ) and can_use_silu_mul_per_tensor_fp8(hidden):
-            # SwiGLU fused with the per-tensor fp8 absmax; fc2 takes the
-            # prequantized (fp8, scale) input
-            out, _ = self.fc2(silu_mul_per_tensor_fp8(hidden))
+        ) and can_use_silu_mul_mxfp8(hidden):
+            out, _ = self.fc2(silu_mul_mxfp8(hidden))
             return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)

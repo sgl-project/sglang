@@ -118,11 +118,11 @@ def test_vdn_h3_pipeline_config_rejections() -> None:
         config.validate_server_args(_server_args(enable_breakable_cuda_graph=True))
     with pytest.raises(ValueError, match="no.*audited high-quality deployment"):
         config.validate_quality_deployment(server_args=None)
-    # defaults: the hybrid backend, and per-tensor scales for online fp8
+    # defaults: the hybrid backend, and online mxfp8 for --quantization fp8
     args = _server_args(quantization="fp8")
     config.validate_server_args(args)
     assert args.attention_backend == "hybrid_window_attn_h3"
-    assert args.quantization == "fp8_per_tensor"
+    assert args.quantization == "mxfp8"
 
 
 def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:

@@ -821,7 +821,6 @@ def _needs_device_weight_postprocess(
 
     serialized_flag_by_quant_name = {
         "fp8": "is_checkpoint_fp8_serialized",
-        "fp8_per_tensor": "is_checkpoint_fp8_serialized",
         "mxfp4": "is_checkpoint_mxfp4_serialized",
         "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
     }
@@ -1053,12 +1052,7 @@ def _resolve_quant_config(
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {
-            "fp8",
-            "fp8_per_tensor",
-            "mxfp4",
-            "kitchen_int8",
-        }:
+        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )

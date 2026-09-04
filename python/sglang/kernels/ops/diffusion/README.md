@@ -156,7 +156,7 @@ tensor copy per residual site.
 |---|---|---|
 | `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
-| `silu_mul_per_tensor_fp8` | Triton | bit-exact SwiGLU + per-tensor fp8 absmax/quant; fp8 producer for the `fp8_per_tensor` path |
+| `silu_mul_mxfp8` | Triton | bit-exact against `flashinfer.mxfp8_quantize(silu(gate) * up)`; SwiGLU + MXFP8 block quant with swizzled E8M0 scales, the prequantized input of the online `mxfp8` linear |
 
 ### Data movement and quantized layout producers
 
