@@ -43,6 +43,13 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla_pf_lf,
     )
 
+    try:
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer_mla_lf_pf
+    except ImportError:
+        # Added by the companion kernel change; keep this module importable
+        # while downstream builds pick up the new operator.
+        transfer_kv_per_layer_mla_lf_pf = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -310,9 +317,19 @@ class DSAIndexerPoolHost(HostKVCache):
                     item_size=self.indexer_page_stride_size,
                 )
             elif self.layout == "page_first":
-                raise ValueError(
-                    "Layer-sharded DSA indexer HiCache backup with page_first "
-                    "layout is not supported without a per-layer LF->PF kernel."
+                if transfer_kv_per_layer_mla_lf_pf is None:
+                    raise RuntimeError(
+                        "Layer-sharded DSA page-first backup requires the "
+                        "per-layer LF-to-PF kernel."
+                    )
+                transfer_kv_per_layer_mla_lf_pf(
+                    src=device_pool.index_k_with_scale_buffer[device_layer_id],
+                    dst=self.index_k_with_scale_buffer,
+                    src_indices=device_page_indices,
+                    dst_indices=host_page_indices,
+                    layer_id=host_layer_id,
+                    item_size=self.indexer_page_stride_size,
+                    dst_layout_dim=self.indexer_layout_dim,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -337,6 +354,9 @@ class DSAIndexerPoolHost(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if self._is_device_layer_sharded(device_pool):
+            # Per-layer generic kernels dereference both index arrays on device.
+            if io_backend == "kernel" and not host_indices.is_cuda:
+                host_indices = host_indices.to(device_indices.device, non_blocking=True)
             for layer_id in self._owned_device_layer_ids(device_pool):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend

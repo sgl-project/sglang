@@ -572,12 +572,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
+            self.enable_cp = self.attn_cp_size > 1
+            self.cp_suffix = (
+                f"cp{self.attn_cp_rank}_{self.attn_cp_size}" if self.enable_cp else ""
+            )
+
+            mha_suffix_parts = [str(self.local_rank)]
+            mla_suffix_parts = []
             if self.enable_pp:
-                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
-                self.mla_suffix = f"{self.pp_rank}"
-            else:
-                self.mha_suffix = f"{self.local_rank}"
-                self.mla_suffix = ""
+                mha_suffix_parts.append(str(self.pp_rank))
+                mla_suffix_parts.append(str(self.pp_rank))
+            if self.enable_cp:
+                mha_suffix_parts.append(self.cp_suffix)
+                mla_suffix_parts.append(self.cp_suffix)
+            self.mha_suffix = "_".join(mha_suffix_parts)
+            self.mla_suffix = "_".join(mla_suffix_parts)
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -588,12 +597,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp:
-                    self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}" for rank in target_ranks
-                    ]
-                else:
-                    self.mha_suffix = [f"{rank}" for rank in target_ranks]
+                self.mha_suffix = []
+                for rank in target_ranks:
+                    suffix_parts = [str(rank)]
+                    if self.enable_pp:
+                        suffix_parts.append(str(self.pp_rank))
+                    if self.enable_cp:
+                        suffix_parts.append(self.cp_suffix)
+                    self.mha_suffix.append("_".join(suffix_parts))
+
+            logger.info(
+                "Mooncake cache key suffixes initialized: mla=%r, mha=%r, "
+                "pp=%d/%d, attn_cp=%d/%d",
+                self.mla_suffix,
+                self.mha_suffix,
+                self.pp_rank,
+                self.pp_size,
+                self.attn_cp_rank,
+                self.attn_cp_size,
+            )
 
             self.registered_pools = {}
 
@@ -724,7 +746,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._use_group_semantics
 
     def _make_group_id(self, logical_key: str) -> str:
-        return f"sglang-hicache:{logical_key}"
+        cp_group_suffix = f":{self.cp_suffix}" if self.enable_cp else ""
+        return f"sglang-hicache:{logical_key}{cp_group_suffix}"
 
     def _expand_group_ids(
         self, logical_keys: List[str], key_multiplier: int
