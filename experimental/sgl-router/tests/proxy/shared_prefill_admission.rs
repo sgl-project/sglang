@@ -281,6 +281,52 @@ async fn chat_commits_the_admitted_prefill_backup() {
 }
 
 #[tokio::test]
+async fn capacity_exhaustion_does_not_return_503() {
+    let committed = Arc::new(Mutex::new(None));
+    let fixture = fixture(PolicyKind::SessionAware, |workers| {
+        Arc::new(AdmissionProbePolicy {
+            primary: Arc::clone(&workers[0]),
+            backup: Arc::clone(&workers[1]),
+            committed: Arc::clone(&committed),
+        })
+    })
+    .await;
+    for worker in &fixture.workers {
+        fixture.ctx.engine_load.set(
+            &worker.url,
+            0,
+            LoadStat {
+                num_running_reqs: 0,
+                num_waiting_reqs: 0,
+                num_tokens: 100,
+                max_total_num_tokens: 100,
+            },
+            Instant::now(),
+        );
+    }
+
+    assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
+    assert_eq!(
+        fixture
+            .backends
+            .iter()
+            .filter(|backend| backend.captured.lock().unwrap().last_body.is_some())
+            .count(),
+        1,
+        "the request must be dispatched to exactly one legal backend"
+    );
+    assert!(matches!(
+        committed.lock().unwrap().as_deref(),
+        Some("primary" | "backup")
+    ));
+    assert!(!fixture
+        .ctx
+        .metrics
+        .render()
+        .contains("sgl_router_policy_selection_failures_total{"));
+}
+
+#[tokio::test]
 async fn chat_records_proposal_empty() {
     let fixture = fixture(PolicyKind::SessionAware, |_| Arc::new(EmptyPolicy)).await;
 

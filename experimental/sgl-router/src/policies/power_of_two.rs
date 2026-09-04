@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::policies::admission::compare_prefill_pressure;
+use crate::policies::engine_load::EngineLoadSnapshot;
 use crate::policies::{Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use rand::Rng;
@@ -18,19 +19,7 @@ impl PowerOfTwoChoicesPolicy {
 
 impl Policy for PowerOfTwoChoicesPolicy {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        match workers.len() {
-            0 => None,
-            1 => Some(workers[0].clone()),
-            len => {
-                let mut rng = rand::thread_rng();
-                let i = rng.gen_range(0..len);
-                let mut j = rng.gen_range(0..len - 1);
-                if j >= i {
-                    j += 1;
-                }
-                Some(select_lower_pressure(&workers[i], &workers[j], ctx))
-            }
-        }
+        select_with_snapshot(workers, ctx.load_snapshot())
     }
 
     /// Returns the primary and backup from one sample.
@@ -62,12 +51,31 @@ impl Policy for PowerOfTwoChoicesPolicy {
     }
 }
 
+pub(crate) fn select_with_snapshot(
+    workers: &[Arc<Worker>],
+    snapshot: Option<&EngineLoadSnapshot>,
+) -> Option<Arc<Worker>> {
+    match workers.len() {
+        0 => None,
+        1 => Some(workers[0].clone()),
+        len => {
+            let mut rng = rand::thread_rng();
+            let i = rng.gen_range(0..len);
+            let mut j = rng.gen_range(0..len - 1);
+            if j >= i {
+                j += 1;
+            }
+            Some(select_lower_pressure(&workers[i], &workers[j], snapshot))
+        }
+    }
+}
+
 fn select_lower_pressure(
     left: &Arc<Worker>,
     right: &Arc<Worker>,
-    ctx: &SelectionContext<'_>,
+    snapshot: Option<&EngineLoadSnapshot>,
 ) -> Arc<Worker> {
-    ordered_pair(left, right, ctx).0
+    ordered_pair_with_snapshot(left, right, snapshot).0
 }
 
 fn ordered_pair(
@@ -75,7 +83,15 @@ fn ordered_pair(
     right: &Arc<Worker>,
     ctx: &SelectionContext<'_>,
 ) -> (Arc<Worker>, Arc<Worker>) {
-    if compare_prefill_pressure(left, right, ctx.load_snapshot()).is_gt() {
+    ordered_pair_with_snapshot(left, right, ctx.load_snapshot())
+}
+
+fn ordered_pair_with_snapshot(
+    left: &Arc<Worker>,
+    right: &Arc<Worker>,
+    snapshot: Option<&EngineLoadSnapshot>,
+) -> (Arc<Worker>, Arc<Worker>) {
+    if compare_prefill_pressure(left, right, snapshot).is_gt() {
         (Arc::clone(right), Arc::clone(left))
     } else {
         (Arc::clone(left), Arc::clone(right))

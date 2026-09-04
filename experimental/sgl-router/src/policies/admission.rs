@@ -6,6 +6,7 @@
 //! Decisions use only fields published in `LoadStat`.
 
 use crate::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
+use crate::policies::power_of_two::select_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, SelectionProposal};
 use crate::workers::Worker;
 use std::cmp::Ordering;
@@ -102,6 +103,7 @@ pub enum DecisionReason {
     /// Both Decode candidates were admitted; the lower-pressure backup won.
     BackupLoadComparison,
     RangeFallback,
+    CapacityFallbackPowerOfTwo,
 }
 
 #[derive(Clone)]
@@ -181,7 +183,13 @@ pub fn resolve_prefill(
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
         (true, _, _) => (Arc::clone(&proposal.primary), DecisionReason::Primary),
         (false, Some(backup), true) => (Arc::clone(backup), DecisionReason::BackupPrimaryAdmission),
-        _ => range_fallback(range, proposal, request_input_tokens, snapshot)?,
+        _ => {
+            let legal = legal_prefill_candidates(range, proposal);
+            range_fallback(&legal, request_input_tokens, snapshot).or_else(|| {
+                select_with_snapshot(&legal, Some(snapshot))
+                    .map(|worker| (worker, DecisionReason::CapacityFallbackPowerOfTwo))
+            })?
+        }
     };
     Some(FinalDecision {
         selected,
@@ -426,18 +434,12 @@ struct PressureKey<'a> {
 }
 
 fn range_fallback(
-    range: &CandidateRange<'_>,
-    proposal: &SelectionProposal,
+    legal: &[Arc<Worker>],
     request_input_tokens: u64,
     snapshot: &EngineLoadSnapshot,
 ) -> Option<(Arc<Worker>, DecisionReason)> {
-    let candidates = proposal
-        .eligible_workers
-        .as_deref()
-        .unwrap_or(range.workers);
-    let admitted = candidates
+    let admitted = legal
         .iter()
-        .filter(|worker| contains_worker(range, worker))
         .filter(|worker| is_prefill_admitted(worker, request_input_tokens, snapshot))
         .cloned()
         .collect::<Vec<_>>();
@@ -445,6 +447,20 @@ fn range_fallback(
     loads
         .min_by_pressure_key(admitted, FreshLoadLookup::compare_prefill_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
+}
+
+fn legal_prefill_candidates(
+    range: &CandidateRange<'_>,
+    proposal: &SelectionProposal,
+) -> Vec<Arc<Worker>> {
+    proposal
+        .eligible_workers
+        .as_deref()
+        .unwrap_or(range.workers)
+        .iter()
+        .filter(|worker| contains_worker(range, worker))
+        .cloned()
+        .collect()
 }
 
 fn decode_domain_fallback(
@@ -583,6 +599,53 @@ mod tests {
                 .id,
             unknown.id
         );
+    }
+
+    #[test]
+    fn all_capacity_rejected_falls_back_to_power_of_two_within_eligible_domain() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let filtered = worker("filtered");
+        let workers = vec![
+            Arc::clone(&primary),
+            Arc::clone(&backup),
+            Arc::clone(&filtered),
+        ];
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup))
+            .with_eligible_workers(vec![Arc::clone(&primary), Arc::clone(&backup)]);
+        let loads = snapshot(&[
+            (&primary, 0, 0, 100, 100),
+            (&backup, 0, 0, 100, 100),
+            (&filtered, 0, 0, 0, 100),
+        ]);
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &loads)
+            .expect("capacity exhaustion must degrade within the legal domain");
+
+        assert!(matches!(
+            decision.selected.id.0.as_str(),
+            "primary" | "backup"
+        ));
+        assert_eq!(decision.reason, DecisionReason::CapacityFallbackPowerOfTwo);
+    }
+
+    #[test]
+    fn capacity_fallback_uses_the_explicit_snapshot_for_power_of_two() {
+        let primary = worker("primary");
+        let backup = worker("backup");
+        let workers = vec![Arc::clone(&primary), Arc::clone(&backup)];
+        let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
+        let explicit = snapshot(&[(&primary, 0, 0, 100, 100), (&backup, 0, 10, 100, 100)]);
+        let opposite = snapshot(&[(&primary, 0, 10, 100, 100), (&backup, 0, 0, 100, 100)]);
+        let opposite_decision = select_with_snapshot(&workers, Some(&opposite))
+            .expect("the opposite snapshot has the same legal workers");
+        assert_eq!(opposite_decision.id, backup.id);
+
+        let decision = resolve_prefill(&CandidateRange::global(&workers), &proposal, 32, &explicit)
+            .expect("capacity exhaustion must degrade to Power-of-Two");
+
+        assert_eq!(decision.selected.id, primary.id);
+        assert_eq!(decision.load_snapshot_version, explicit.version);
     }
 
     #[test]

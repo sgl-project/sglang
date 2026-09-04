@@ -648,10 +648,9 @@ mod tests {
             (&ws[2], 0, 0, 0, 4_096),
         ]);
 
-        assert!(
-            resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot).is_none(),
-            "hard admission may refuse the filtered domain, but must never route to rejected c"
-        );
+        let decision = resolve_prefill(&CandidateRange::global(&ws), &proposal, 32, &snapshot)
+            .expect("capacity exhaustion must degrade inside the filtered domain");
+        assert!(matches!(decision.selected.id.0.as_str(), "a" | "b"));
     }
 
     #[test]
