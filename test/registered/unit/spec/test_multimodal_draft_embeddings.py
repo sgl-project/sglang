@@ -39,9 +39,12 @@ def test_eagle_mm_embeddings_survive_in_place_target_updates():
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
     )
 
-    with get_context().override_server_args(), patch(
-        "sglang.srt.managers.mm_utils.embed_mm_inputs",
-        return_value=(source_embeds, {}),
+    with (
+        get_context().override_server_args(),
+        patch(
+            "sglang.srt.managers.mm_utils.embed_mm_inputs",
+            return_value=(source_embeds, {}),
+        ),
     ):
         hidden_states = general_mm_embed_routine(
             input_ids=torch.arange(4),
