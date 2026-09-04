@@ -1512,7 +1512,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self._original_num_tokens = self.positions.shape[0]
-        self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.input_ids is not None:
+            self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
@@ -1539,7 +1540,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
 
-        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        # Chunked speculative prefills can reserve KV slots for the whole
+        # request while positions/input_ids only describe the current chunk.
+        # Keep the token-aligned cache locations to the active chunk before DP
+        # padding; otherwise a short first chunk produces a negative pad size.
+        self.out_cache_loc = self._pad_tensor_to_size(
+            self.out_cache_loc[: self._original_num_tokens], num_tokens
+        )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

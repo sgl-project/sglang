@@ -278,7 +278,6 @@ def _local_prefill_cuda_graph_vote(
     prefill_graph_runner,
     coordinated_prefill: bool,
     breakable_prefill: bool,
-    spec_algorithm: SpeculativeAlgorithm,
     model_config,
 ) -> bool:
     """This rank's vote for the prefill graph (min-reduced across dp
@@ -305,7 +304,6 @@ def _local_prefill_cuda_graph_vote(
         # decode->extend conversion eligibility; needs the captured-graph
         # prefill runner, not the eager fallback.
         and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
-        and spec_algorithm.is_none()
         and not local_batch.return_logprob
         # Grammar FSMs advance through the decode result path only.
         and not local_batch.has_grammar
@@ -401,7 +399,6 @@ def prepare_mlp_sync_batch_raw(
         prefill_graph_runner=prefill_graph_runner,
         coordinated_prefill=coordinated_prefill,
         breakable_prefill=breakable_prefill,
-        spec_algorithm=model_runner.spec_algorithm,
         model_config=model_runner.model_config,
     )
 
@@ -561,8 +558,8 @@ class SchedulerDPAttnAdapter:
         all falling to eager."""
         if batch is None or not batch.forward_mode.is_decode():
             return batch
-        # Global triggers from the gather. This rank's own eligibility (spec/
-        # TBO/CP/logprob/replayability) is folded into the min-reduced vote:
+        # Global triggers from the gather. This rank's own eligibility
+        # (TBO/CP/logprob/replayability) is folded into the min-reduced vote:
         # if it failed, can_run_dp_prefill_cuda_graph is already False.
         if not batch.is_extend_in_batch:
             return batch

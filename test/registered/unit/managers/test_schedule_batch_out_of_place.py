@@ -144,6 +144,24 @@ class _FakeReq:
 
 
 class TestMergeBatchOutOfPlace(unittest.TestCase):
+    def test_spec_decode_to_extend_uses_pending_bonus_token_as_input(self):
+        req = _FakeReq("spec", origin_len=3, output_len=2)
+        batch = ScheduleBatch(reqs=[req])
+        batch.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        batch.enable_overlap = True
+        batch.forward_mode = ForwardMode.DECODE
+        batch.chunked_req = object()
+        batch.prefill_stats = object()
+
+        batch.convert_decode_to_extend()
+
+        self.assertEqual(batch.forward_mode, ForwardMode.EXTEND)
+        # The last output token is the pending bonus token replayed as the
+        # one-token extend input, so the preceding four tokens are the prefix.
+        self.assertEqual(batch.prefix_lens, [4])
+        self.assertEqual(req.extend_range, Range(4, 5))
+        self.assertIs(batch.decoding_reqs, batch.reqs)
+
     def test_merge_batch_rebinds_lists_without_mutating_either_side(self):
         """merge_batch must build new list objects; no field of either side may be mutated in place."""
         self_batch = make_schedule_batch(

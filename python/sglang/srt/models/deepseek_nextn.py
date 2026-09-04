@@ -119,7 +119,7 @@ class DeepseekModelNextN(nn.Module):
             logger.warning(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
-            quant_config = None
+            quant_config = self._resolve_modelopt_nextn_quant_config(quant_config)
 
         self.vocab_size = config.vocab_size
 
@@ -174,21 +174,42 @@ class DeepseekModelNextN(nn.Module):
             self.cp_size = get_parallel().attn_cp_size
         else:
             self.cp_size = None
-        self.decoder = DeepseekV2DecoderLayer(
+        self.decoder = self._build_decoder(
+            config,
+            quant_config=quant_config,
+            moe_quant_config_override=moe_quant_config_override,
+            prefix=add_prefix(layer_name, prefix),
+            alt_stream=self.alt_stream,
+        )
+
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def _resolve_modelopt_nextn_quant_config(
+        self, quant_config: QuantizationConfig
+    ) -> Optional[QuantizationConfig]:
+        return None
+
+    def _build_decoder(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig],
+        moe_quant_config_override: Optional[QuantizationConfig],
+        prefix: str,
+        alt_stream: Optional[torch.cuda.Stream],
+    ) -> nn.Module:
+        return DeepseekV2DecoderLayer(
             config,
             0,
             quant_config=quant_config,
             moe_quant_config_override=moe_quant_config_override,
             is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
-            alt_stream=self.alt_stream,
+            prefix=prefix,
+            alt_stream=alt_stream,
             skip_rope=config.qk_rope_head_dim == 0,
             dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             mla_enable_prefill_cp=self.mla_enable_prefill_cp,
         )
-
-        self.shared_head = nn.Module()
-        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -383,7 +404,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
-        self.model = DeepseekModelNextN(
+        self.model = self._build_nextn_model(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -394,6 +415,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+    def _build_nextn_model(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+    ) -> DeepseekModelNextN:
+        return DeepseekModelNextN(config, quant_config, prefix=prefix)
 
     @torch.no_grad()
     def forward(

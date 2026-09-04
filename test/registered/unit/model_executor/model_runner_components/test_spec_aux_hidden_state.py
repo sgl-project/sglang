@@ -66,6 +66,41 @@ def test_draft_worker_does_not_budget_itself():
     assert config.eagle_draft_num_layers is None
 
 
+def test_glm5_native_nextn_does_not_enable_generic_eagle3_aux_capture():
+    kwargs = _resolve_kwargs()
+    kwargs["spec_algorithm"].is_eagle3.return_value = True
+    kwargs["model_config"].hf_config = SimpleNamespace(
+        architectures=["Glm5NextForConditionalGenerationNextN"],
+        eagle_config=None,
+    )
+
+    config = spec_aux_hidden_state.resolve_spec_aux_hidden_state_config(
+        **kwargs, is_draft_worker=False
+    )
+
+    assert not config.eagle_use_aux_hidden_state
+    assert config.eagle_aux_hidden_state_layer_ids is None
+
+
+def test_glm5_eagle3_checkpoint_config_can_explicitly_request_aux_capture():
+    kwargs = _resolve_kwargs()
+    kwargs["spec_algorithm"].is_eagle3.return_value = True
+    kwargs["model_config"].hf_config = SimpleNamespace(
+        architectures=["Glm5NextForConditionalGenerationNextN"],
+        eagle_config={
+            "use_aux_hidden_state": True,
+            "eagle_aux_hidden_state_layer_ids": [7],
+        },
+    )
+
+    config = spec_aux_hidden_state.resolve_spec_aux_hidden_state_config(
+        **kwargs, is_draft_worker=False
+    )
+
+    assert config.eagle_use_aux_hidden_state
+    assert config.eagle_aux_hidden_state_layer_ids == [7]
+
+
 @pytest.mark.parametrize(
     ("target_model_type", "draft_architecture", "expected"),
     [

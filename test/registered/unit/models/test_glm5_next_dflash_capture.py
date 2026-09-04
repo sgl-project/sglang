@@ -1,14 +1,17 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 from torch import nn
 
+from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
 from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
     Glm5NextModel,
 )
+from sglang.srt.models.glm5_next_nextn import Glm5NextModelNextN
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -86,6 +89,54 @@ def test_glm5_next_dflash_maps_target_layers_to_capture_points():
     assert model.capture_aux_hidden_states
     assert model.model.dflash_capture
     assert model.model.layers_to_capture == [6, 15, 25, 34, 43]
+
+
+def test_glm5_nextn_builds_glm_decoder_layer(monkeypatch):
+    decoder = object()
+    decoder_cls = MagicMock(return_value=decoder)
+    monkeypatch.setattr(
+        "sglang.srt.models.glm5_next_nextn.Glm5NextDecoderLayer", decoder_cls
+    )
+    model = Glm5NextModelNextN.__new__(Glm5NextModelNextN)
+    config = SimpleNamespace(num_hidden_layers=45, mhc=True)
+
+    actual = model._build_decoder(
+        config,
+        quant_config=None,
+        moe_quant_config_override=None,
+        prefix="model.decoder",
+        alt_stream=None,
+    )
+
+    assert actual is decoder
+    decoder_cls.assert_called_once()
+    call = decoder_cls.call_args.kwargs
+    assert call["config"] is not config
+    assert not call["config"].mhc
+    assert call | {"config": config} == {
+        "config": config,
+        "layer_id": 45,
+        "quant_config": None,
+        "moe_quant_config_override": None,
+        "is_nextn": True,
+        "prefix": "model.decoder",
+        "alt_stream": None,
+    }
+
+
+def test_glm5_nextn_preserves_modelopt_quantization_for_routed_experts():
+    model = Glm5NextModelNextN.__new__(Glm5NextModelNextN)
+    quant_config = MagicMock()
+
+    assert model._resolve_modelopt_nextn_quant_config(quant_config) is quant_config
+
+
+def test_glm5_nextn_exposes_logical_draft_layer_range(monkeypatch):
+    monkeypatch.setattr(DeepseekModelNextN, "__init__", lambda *args, **kwargs: None)
+    model = Glm5NextModelNextN(SimpleNamespace(num_hidden_layers=45))
+
+    assert model.start_layer == 45
+    assert model.end_layer == 46
 
 
 if __name__ == "__main__":
