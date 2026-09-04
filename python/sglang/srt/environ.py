@@ -658,6 +658,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
+    SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
@@ -675,7 +677,6 @@ class Envs:
     # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
-    SGLANG_ENABLE_CP_V2 = EnvBool(False)
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
@@ -1751,6 +1752,9 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         note="Note the unit change: milliseconds -> seconds.",
     ),
     # Removed without replacement.
+    "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
+        note="Strategy-based prefill context parallelism is now the only generic implementation."
+    ),
     "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),

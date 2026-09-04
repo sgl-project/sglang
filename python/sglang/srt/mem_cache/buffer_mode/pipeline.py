@@ -275,13 +275,15 @@ class BufferModePipeline:
         self._anchor_lock_cap_skips = 0
 
     def is_idle(self) -> bool:
-        """No queued or in-flight operation holds host staging or can restart I/O."""
+        """No pending or in-flight buffer-mode transfer work."""
         return not (
-            self.pending_write_queue
+            self.pending_hit_allocs
             or self.staged_prefetches
+            or self.ongoing_buffer_load_back
+            or self.pending_write_queue
+            or self.inflight_backup_node_ids
             or self.ongoing_write_through
             or self.ongoing_backup
-            or self.ongoing_buffer_load_back
         )
 
     # ---- backup pipeline (device -> staging -> storage) ----
