@@ -212,13 +212,9 @@ class ExpertLocationMetadata:
                     "topology-aware EPLB does not support elastic flat topology"
                 )
             if logical_count_by_rank is None:
-                raise ValueError(
-                    "topology-aware EPLB requires logical_count_by_rank"
-                )
+                raise ValueError("topology-aware EPLB requires logical_count_by_rank")
             if get_exec().moe.eplb_topology is None:
-                raise ValueError(
-                    "topology-aware EPLB requires --eplb-topology"
-                )
+                raise ValueError("topology-aware EPLB requires --eplb-topology")
             from sglang.srt.eplb.topology import load_rank_cost_matrix
 
             rank_cost_matrix = load_rank_cost_matrix(

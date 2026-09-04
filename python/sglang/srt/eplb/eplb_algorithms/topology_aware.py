@@ -38,7 +38,6 @@ import torch
 
 from sglang.srt.eplb.topology import _validate_rank_cost_matrix
 
-
 # A tiny communication budget lets the planner remove a critical-rank hot
 # spot without allowing the topology objective to drift materially.  The
 # default node-uniform fallback below still protects against a net regression.
@@ -107,9 +106,7 @@ def _assignment_to_maps(
     num_layers, num_experts = assignment.shape
     experts_per_rank = num_experts // num_ranks
     physical_to_logical = torch.empty_like(assignment)
-    logical_to_physical = torch.empty(
-        (num_layers, num_experts, 1), dtype=torch.int64
-    )
+    logical_to_physical = torch.empty((num_layers, num_experts, 1), dtype=torch.int64)
 
     for layer in range(num_layers):
         next_slot = [0] * num_ranks
@@ -176,16 +173,8 @@ def _build_swap_state(
 
     # A swap only changes the loads of the two ranks that own its experts.
     # Every other rank is already within the seed envelope.
-    new_first_load = (
-        rank_load[first_rank]
-        - total_load[:, None]
-        + total_load[None, :]
-    )
-    new_second_load = (
-        rank_load[second_rank]
-        - total_load[None, :]
-        + total_load[:, None]
-    )
+    new_first_load = rank_load[first_rank] - total_load[:, None] + total_load[None, :]
+    new_second_load = rank_load[second_rank] - total_load[None, :] + total_load[:, None]
     pair_mask &= new_first_load <= max_seed_load + 1e-12
     pair_mask &= new_second_load <= max_seed_load + 1e-12
 
@@ -291,13 +280,12 @@ def _run_load_swaps(
     if max_comm_regression_ratio == 0.0 or used_swaps >= max_swaps:
         return
 
-    communication_limit = (
-        communication_cost[expert_ids, assignment].sum().item()
-        * (1.0 + max_comm_regression_ratio)
+    communication_limit = communication_cost[expert_ids, assignment].sum().item() * (
+        1.0 + max_comm_regression_ratio
     )
-    rank_ids = torch.arange(
-        num_ranks, dtype=torch.int64, device=assignment.device
-    )[None, None, :]
+    rank_ids = torch.arange(num_ranks, dtype=torch.int64, device=assignment.device)[
+        None, None, :
+    ]
     for _ in range(max_swaps - used_swaps):
         (
             first_rank,
@@ -316,17 +304,18 @@ def _run_load_swaps(
             expert_ids,
         )
         pair_mask &= (
-            communication_cost[expert_ids, assignment].sum()
-            + delta_comm
+            communication_cost[expert_ids, assignment].sum() + delta_comm
             <= communication_limit + 1e-12
         )
 
         changed_rank = (rank_ids == first_rank[:, :, None]) | (
             rank_ids == second_rank[:, :, None]
         )
-        other_max = rank_load[None, None, :].masked_fill(
-            changed_rank, float("-inf")
-        ).amax(dim=-1)
+        other_max = (
+            rank_load[None, None, :]
+            .masked_fill(changed_rank, float("-inf"))
+            .amax(dim=-1)
+        )
         new_max = torch.maximum(
             torch.maximum(new_first_load, new_second_load), other_max
         )
@@ -341,9 +330,7 @@ def _run_load_swaps(
         )
         max_improving = new_max < old_max - 1e-12
         max_tied = (new_max - old_max).abs() <= 1e-12
-        pair_mask &= max_improving | (
-            max_tied & (new_sumsq < old_sumsq - 1e-12)
-        )
+        pair_mask &= max_improving | (max_tied & (new_sumsq < old_sumsq - 1e-12))
 
         feasible_max = new_max.masked_fill(~pair_mask, float("inf"))
         best_max = feasible_max.min()
@@ -386,14 +373,10 @@ def _improve_topology(
         raise ValueError("max_comm_regression_ratio must be non-negative")
     rank_load = _rank_loads(assignment, total_load, num_ranks)
     max_seed_load = (
-        rank_load.max().item()
-        if max_allowed_load is None
-        else float(max_allowed_load)
+        rank_load.max().item() if max_allowed_load is None else float(max_allowed_load)
     )
     num_experts = assignment.numel()
-    expert_ids = torch.arange(
-        num_experts, dtype=torch.int64, device=assignment.device
-    )
+    expert_ids = torch.arange(num_experts, dtype=torch.int64, device=assignment.device)
     if max_swaps is None:
         # Five rounds per local expert slot reach the useful local-search basin
         # on the observed 8-way EP workloads without a long scheduler pause.
@@ -404,9 +387,7 @@ def _improve_topology(
         # Reserve the remaining rounds for the critical-rank load phase.  A
         # communication-only search can otherwise consume the entire budget,
         # leaving no opportunity to fix a straggling destination rank.
-        communication_swaps = max(
-            1, int(max_swaps * _COMMUNICATION_PHASE_FRACTION)
-        )
+        communication_swaps = max(1, int(max_swaps * _COMMUNICATION_PHASE_FRACTION))
 
     used_swaps = _run_communication_swaps(
         assignment,
@@ -469,16 +450,12 @@ def rebalance_experts_topology_aware(
     assignment = torch.empty(
         (num_layers, num_logical_experts), dtype=torch.int64, device="cpu"
     )
-    node_uniform_assignment = _node_uniform_seed(
-        num_logical_experts, num_ranks
-    )
+    node_uniform_assignment = _node_uniform_seed(num_logical_experts, num_ranks)
     expert_ids = torch.arange(num_logical_experts, dtype=torch.int64)
     for layer in range(num_layers):
         total_load = counts[layer].sum(dim=0)
         communication_cost = counts[layer].transpose(0, 1).matmul(costs)
-        node_uniform_load = _rank_loads(
-            node_uniform_assignment, total_load, num_ranks
-        )
+        node_uniform_load = _rank_loads(node_uniform_assignment, total_load, num_ranks)
         max_allowed_load = node_uniform_load.max().item()
         assignment[layer] = _improve_topology(
             node_uniform_assignment.clone(),
@@ -491,9 +468,7 @@ def rebalance_experts_topology_aware(
         # A bounded local search can stop before finding a good swap sequence.
         # The node-uniform layout is always a valid fallback, so never return a
         # topology placement with a higher communication objective.
-        candidate_cost = communication_cost[
-            expert_ids, assignment[layer]
-        ].sum()
+        candidate_cost = communication_cost[expert_ids, assignment[layer]].sum()
         node_uniform_cost = communication_cost[
             expert_ids, node_uniform_assignment
         ].sum()

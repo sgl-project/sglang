@@ -582,10 +582,7 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
                 source_count = num_tokens_per_expert.detach().cpu().tolist()
             else:
                 source_count = list(num_tokens_per_expert)
-            if (
-                len(source_count)
-                != self._expert_location_metadata.num_physical_experts
-            ):
+            if len(source_count) != self._expert_location_metadata.num_physical_experts:
                 raise ValueError(
                     "DeepEP source expert counts must cover all physical experts "
                     f"(got {len(source_count)}, expected "
@@ -973,9 +970,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                     self._expert_location_metadata.physical_to_logical_map
                 ),
             )[0]
-            self._logical_count_by_source_of_buffered_step.append(
-                source_logical_count
-            )
+            self._logical_count_by_source_of_buffered_step.append(source_logical_count)
 
     def reset(self):
         super().reset()

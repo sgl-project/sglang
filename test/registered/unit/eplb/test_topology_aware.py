@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.arg_groups.parallel_hook import handle_eplb_and_dispatch
-from sglang.srt.eplb.topology import load_rank_cost_matrix
+from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm, rebalance_experts
 from sglang.srt.eplb.eplb_algorithms.topology_aware import (
     _improve_topology,
     _node_uniform_seed,
     _rank_loads,
     rebalance_experts_topology_aware,
 )
-from sglang.srt.eplb.eplb_algorithms import EplbAlgorithm, rebalance_experts
+from sglang.srt.eplb.topology import load_rank_cost_matrix
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -55,12 +55,10 @@ class TestTopologyAwarePlacement(CustomTestCase):
             ],
             dtype=torch.int64,
         )
-        costs = torch.tensor(
-            [[0.0, 1.0, 3.0], [1.0, 0.0, 2.0], [3.0, 2.0, 0.0]]
-        )
+        costs = torch.tensor([[0.0, 1.0, 3.0], [1.0, 0.0, 2.0], [3.0, 2.0, 0.0]])
 
-        physical_to_logical, logical_to_physical, _ = (
-            rebalance_experts_topology_aware(counts, costs)
+        physical_to_logical, logical_to_physical, _ = rebalance_experts_topology_aware(
+            counts, costs
         )
         for layer in range(counts.shape[0]):
             self.assertEqual(
@@ -159,9 +157,7 @@ class TestTopologyAwarePlacement(CustomTestCase):
         counts[0, 0] = torch.tensor([10, 9, 8, 7])
         costs = torch.tensor([[0.0, 10.0], [10.0, 0.0]])
 
-        physical_to_logical, _, _ = rebalance_experts_topology_aware(
-            counts, costs
-        )
+        physical_to_logical, _, _ = rebalance_experts_topology_aware(counts, costs)
         destination = torch.empty(4, dtype=torch.long)
         for rank in range(2):
             start = rank * 2
@@ -179,9 +175,7 @@ class TestTopologyAwarePlacement(CustomTestCase):
         total_load = counts[0].sum(dim=0)
         candidate_load = torch.zeros(2, dtype=torch.int64)
         candidate_load.scatter_add_(0, destination, total_load)
-        node_uniform_load = torch.tensor(
-            [total_load[:2].sum(), total_load[2:].sum()]
-        )
+        node_uniform_load = torch.tensor([total_load[:2].sum(), total_load[2:].sum()])
         self.assertLessEqual(candidate_load.max(), node_uniform_load.max())
 
     def test_load_phase_spends_only_explicit_communication_budget(self):
@@ -215,19 +209,13 @@ class TestTopologyAwarePlacement(CustomTestCase):
         )
         candidate_load = _rank_loads(assignment, total_load, 2)
         self.assertLess(candidate_load.max(), seed_load.max())
-        candidate_cost = communication[
-            torch.arange(4), assignment
-        ].sum().item()
+        candidate_cost = communication[torch.arange(4), assignment].sum().item()
         seed_cost = communication[torch.arange(4), seed].sum().item()
         self.assertLessEqual(candidate_cost, seed_cost * 21.0 + 1e-12)
 
     def test_system_phase_reserves_search_budget_for_critical_rank(self):
-        counts = torch.tensor(
-            [[28, 8, 23, 7], [0, 8, 21, 10]], dtype=torch.float64
-        )
-        costs = torch.tensor(
-            [[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64
-        )
+        counts = torch.tensor([[28, 8, 23, 7], [0, 8, 21, 10]], dtype=torch.float64)
+        costs = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
         total_load = counts.sum(dim=0)
         communication = counts.transpose(0, 1).matmul(costs)
         seed = _node_uniform_seed(4, 2)
@@ -273,9 +261,7 @@ class TestTopologyAwarePlacement(CustomTestCase):
             max_comm_regression_ratio=1.0,
         )
         candidate_load = _rank_loads(assignment, total_load, 3)
-        self.assertLess(
-            candidate_load.square().sum(), seed_load.square().sum()
-        )
+        self.assertLess(candidate_load.square().sum(), seed_load.square().sum())
         self.assertEqual(candidate_load.max(), seed_load.max())
 
     def test_rejects_negative_communication_budget(self):
@@ -330,7 +316,9 @@ class TestTopologyAwarePlacement(CustomTestCase):
             )
 
     def test_server_guard_requires_static_dispatch(self):
-        with self.assertRaisesRegex(ValueError, "requires.*ep-dispatch-algorithm static"):
+        with self.assertRaisesRegex(
+            ValueError, "requires.*ep-dispatch-algorithm static"
+        ):
             handle_eplb_and_dispatch(
                 SimpleNamespace(
                     eplb_algorithm="topology_aware",
@@ -389,17 +377,13 @@ class TestTopologyAwarePlacement(CustomTestCase):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
         costs = torch.zeros((2, 2), dtype=torch.float32)
         with self.assertRaisesRegex(NotImplementedError, "no redundant experts"):
-            rebalance_experts_topology_aware(
-                counts, costs, num_physical_experts=6
-            )
+            rebalance_experts_topology_aware(counts, costs, num_physical_experts=6)
 
     def test_rejects_inconsistent_physical_expert_dimension(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
         costs = torch.zeros((2, 2), dtype=torch.float32)
         with self.assertRaisesRegex(ValueError, "must match"):
-            rebalance_experts_topology_aware(
-                counts, costs, num_physical_experts=2
-            )
+            rebalance_experts_topology_aware(counts, costs, num_physical_experts=2)
 
     def test_rejects_nonzero_self_cost(self):
         counts = torch.ones((1, 2, 4), dtype=torch.int64)
