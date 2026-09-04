@@ -1222,9 +1222,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
         if self.num_fused_shared_experts == 0:
             return
-        assert (
-            self.num_fused_shared_experts == 1
-        ), f"Only 1 fused shared expert is supported for {type(self).__name__}"
+        assert self.num_fused_shared_experts == 1, (
+            f"Only 1 fused shared expert is supported for {type(self).__name__}"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):

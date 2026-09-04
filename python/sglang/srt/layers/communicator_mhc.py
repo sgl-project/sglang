@@ -53,9 +53,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 def tp_all_gather_hidden_states(hidden_states, forward_batch):
-    assert (
-        get_attn_tp_context().input_scattered
-    ), "Input scattered guarantees same num tokens in TP group."
+    assert get_attn_tp_context().input_scattered, (
+        "Input scattered guarantees same num tokens in TP group."
+    )
     total_tokens = forward_batch.input_ids.shape[0]
     output = hidden_states.new_empty((total_tokens, hidden_states.shape[-1]))
     get_tp_group().all_gather_into_tensor(output, hidden_states)
