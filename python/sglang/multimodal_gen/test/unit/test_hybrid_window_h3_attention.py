@@ -15,7 +15,7 @@ import math
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3 import (

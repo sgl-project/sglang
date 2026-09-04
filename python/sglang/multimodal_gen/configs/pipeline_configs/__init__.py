@@ -46,6 +46,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     FastH3PipelineConfig,
     MiniMaxH3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
     VDNH3PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig

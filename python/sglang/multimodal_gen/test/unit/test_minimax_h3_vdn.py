@@ -19,9 +19,11 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
     VDNH3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.minimax_h3 import VDNH3SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import VDNH3SamplingParams
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_non_diffusers_pipeline_name,
@@ -148,15 +150,15 @@ def test_hybrid_arch_config_from_transform_config_and_mapping() -> None:
     for source, expected in (
         (
             "transformer_blocks.7.attn.linear_attention.alpha.A_log",
-            "blocks.7.attn.linear_attention.alpha.A_log",
+            "blocks.7.attn.hybrid.linear_attention.alpha.A_log",
         ),
         (
             "transformer_blocks.7.attn.softmax_gate.up.bias",
-            "blocks.7.attn.softmax_gate.up.bias",
+            "blocks.7.attn.hybrid.softmax_gate.up.bias",
         ),
         (
             "transformer_blocks.7.attn.to_out_linear.weight",
-            "blocks.7.attn.to_out_linear.weight",
+            "blocks.7.attn.hybrid.to_out_linear.weight",
         ),
     ):
         targets = [
@@ -246,7 +248,7 @@ def test_scans_match_step_reference_and_text_seed() -> None:
 def test_frame_partial_sums_match_index_add(world: int) -> None:
     """The Ulysses frame-mean partial sums (reshape-sum over whole frames plus
     two edge rows sums, deterministic) equal the index_add formulation."""
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
         _vdn_frame_partial_sums,
     )
 

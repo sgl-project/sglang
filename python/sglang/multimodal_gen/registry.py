@@ -39,7 +39,6 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
     MiniMaxH3PipelineConfig,
-    VDNH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -85,6 +84,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
+    VDNH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -167,8 +169,8 @@ from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import (
     FastH3SamplingParams,
     MiniMaxH3SamplingParams,
-    VDNH3SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3_vdn import VDNH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,

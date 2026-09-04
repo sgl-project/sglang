@@ -32,7 +32,7 @@ from typing import Any
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends import (

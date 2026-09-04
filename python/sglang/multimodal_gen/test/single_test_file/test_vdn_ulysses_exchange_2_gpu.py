@@ -9,7 +9,7 @@ from sglang.test.test_utils import run_distributed_test
 
 
 def _check(rank: int) -> None:
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
         _vdn_a2a_heads_to_rows,
         _vdn_a2a_rows_to_heads,
         _vdn_merge_heads,
