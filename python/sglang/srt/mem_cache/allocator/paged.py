@@ -64,12 +64,21 @@ def alloc_extend_naive(
     local = j - start_pos[owner]
     last_loc_g = last_loc[owner]
 
-    if free_pages.numel() == 0:
-        out_indices.copy_(last_loc_g + 1 + local)
-        return
-
     ceil_prefix = (prefix_lens + page_size - 1) // page_size * page_size
     floor_seq = seq_lens // page_size * page_size
+
+    if free_pages.numel() == 0:
+        # The empty-pool fast path below is only valid when no request needs a
+        # new page. Unlike the old loop, which crashed on a too-small pool,
+        # the vectorized code cannot index into the empty tensor to fail, so
+        # check the contract explicitly instead of returning garbage.
+        ceil_seq = (seq_lens + page_size - 1) // page_size * page_size
+        assert torch.all(ceil_seq == ceil_prefix), (
+            "alloc_extend_naive: free_pages is empty but the batch requires "
+            "new pages; caller must ensure pool >= demand"
+        )
+        out_indices.copy_(last_loc_g + 1 + local)
+        return
 
     num1 = torch.clamp(seq_lens, max=ceil_prefix) - prefix_lens
     done_after_1 = (prefix_lens + num1) == seq_lens
