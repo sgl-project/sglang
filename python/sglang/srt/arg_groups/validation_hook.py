@@ -419,6 +419,31 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
 
 
+def validate_replayssm_spec_algorithm(server_args: Any):
+    """Reject NGRAM with --enable-linear-replayssm-spec.
+
+    NGRAM always builds a tree mask (retrieve_parent_token is set), but the
+    fold-every-commit verify requires a strict linear chain
+    (retrieve_parent_token is None). This runs before the dummy-model short
+    circuit so the config contradiction is caught even for config-check /
+    dummy validation, not only on a real model.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_linear_replayssm_spec:
+        return
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_ngram():
+        raise ValueError(
+            "--enable-linear-replayssm-spec does not support NGRAM: "
+            "NGRAM always builds a tree mask (retrieve_parent_token is "
+            "set), but the fold-every-commit verify requires a strict "
+            "linear chain (retrieve_parent_token is None). Use a "
+            "linear-chain draft (EAGLE with --speculative-eagle-topk 1, "
+            "DFLASH, or DSPARK) or drop --enable-linear-replayssm-spec."
+        )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
