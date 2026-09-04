@@ -30,7 +30,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -1372,8 +1375,11 @@ class BailingMoELinearForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
+            quant_method = getattr(self.lm_head, "quant_method", None)
+            if not should_apply_lm_head_quant_method(self.lm_head, quant_method):
+                hidden_states = hidden_states.float()
             return self.logits_processor(
-                input_ids, hidden_states.float(), self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch
             )
         else:
             return hidden_states
