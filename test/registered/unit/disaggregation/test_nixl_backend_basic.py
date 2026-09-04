@@ -13,7 +13,10 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingHandler,
+    PrefillStagingContext,
+)
 from sglang.srt.disaggregation.common.utils import pack_int_lists
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
@@ -776,10 +779,17 @@ class TestNixlNodeFailure(CustomTestCase):
         mgr.connection_lock = threading.Lock()
         # Connection keys are "{addr}_{dp_rank}_{cp_rank}_{tp_rank}".
         mgr.connection_pool = {
-            "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1"}],
-            "10.0.0.1:8998_0_0_1": [{"rank_ip": "10.0.0.1"}],
-            "10.0.0.2:8998_0_0_0": [{"rank_ip": "10.0.0.2"}],
+            "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1", "rank_port": 1}],
+            "10.0.0.1:8998_0_0_1": [{"rank_ip": "10.0.0.1", "rank_port": 2}],
+            "10.0.0.2:8998_0_0_0": [{"rank_ip": "10.0.0.2", "rank_port": 3}],
         }
+        mgr._staging_handler = object.__new__(DecodeStagingHandler)
+        mgr._staging_handler._wm_subscribers = {}
+        mgr._staging_handler._wm_subscribers_lock = threading.Lock()
+        mgr._staging_handler._wm_next_generation = 0
+        mgr._staging_handler.staging_allocator = SimpleNamespace(
+            get_watermark=lambda: (0, 0)
+        )
         mgr.prefill_info_table = {
             "10.0.0.1:8998": object(),
             "10.0.0.2:8998": object(),
@@ -802,8 +812,34 @@ class TestNixlNodeFailure(CustomTestCase):
 
     def test_handle_node_failure_removes_connections_and_marks_pending_rooms(self):
         mgr = self._make_manager()
+        failed_infos = mgr.connection_pool["10.0.0.1:8998_0_0_0"]
+        healthy_infos = mgr.connection_pool["10.0.0.2:8998_0_0_0"]
+        failed_receiver = SimpleNamespace(bootstrap_infos=failed_infos)
+        healthy_receiver = SimpleNamespace(bootstrap_infos=healthy_infos)
+        mgr._staging_handler.register_wm_subscriber(failed_receiver, "decode-session")
+        mgr._staging_handler.register_wm_subscriber(healthy_receiver, "decode-session")
 
-        mgr._handle_node_failure("10.0.0.1:8998")
+        snapshot_impl = mgr._staging_handler.snapshot_wm_subscribers
+        unregister_impl = mgr._staging_handler.unregister_wm_subscribers
+
+        def snapshot_while_connections_are_present(groups):
+            self.assertIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
+            return snapshot_impl(groups)
+
+        def unregister_after_connection_cleanup(tokens):
+            self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
+            return unregister_impl(tokens)
+
+        with patch.object(
+            mgr._staging_handler,
+            "snapshot_wm_subscribers",
+            side_effect=snapshot_while_connections_are_present,
+        ) as snapshot, patch.object(
+            mgr._staging_handler,
+            "unregister_wm_subscribers",
+            side_effect=unregister_after_connection_cleanup,
+        ) as unregister:
+            mgr._handle_node_failure("10.0.0.1:8998")
 
         self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool)
@@ -816,6 +852,17 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertIn(3, mgr.failure_records)
         self.assertIn(4, mgr.failure_records)
         self.assertNotIn(5, mgr.failure_records)
+        snapshot.assert_called_once_with(
+            [
+                [{"rank_ip": "10.0.0.1", "rank_port": 1}],
+                [{"rank_ip": "10.0.0.1", "rank_port": 2}],
+            ]
+        )
+        failed_key = tuple(str(info) for info in failed_infos)
+        healthy_key = tuple(str(info) for info in healthy_infos)
+        unregister.assert_called_once_with([(failed_key, 1)])
+        self.assertNotIn(failed_key, mgr._staging_handler._wm_subscribers)
+        self.assertIn(healthy_key, mgr._staging_handler._wm_subscribers)
 
     def test_late_failed_update_does_not_resurrect_cleared_room(self):
         mgr = object.__new__(CommonKVManager)
@@ -824,6 +871,86 @@ class TestNixlNodeFailure(CustomTestCase):
         CommonKVManager.update_status(mgr, 9, KVPoll.Failed)
 
         self.assertNotIn(9, mgr.request_status)
+
+
+class TestStagingWatermarkSubscriberLifecycle(CustomTestCase):
+    def _make_handler(self):
+        handler = object.__new__(DecodeStagingHandler)
+        handler._wm_subscribers = {}
+        handler._wm_subscribers_lock = threading.Lock()
+        handler._wm_next_generation = 0
+        handler.staging_allocator = SimpleNamespace(get_watermark=lambda: (0, 0))
+        return handler
+
+    def test_register_refreshes_receiver_and_bumps_generation(self):
+        handler = self._make_handler()
+        bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 1234}]
+        old_receiver = SimpleNamespace(bootstrap_infos=bootstrap_infos)
+        new_receiver = SimpleNamespace(bootstrap_infos=bootstrap_infos)
+
+        handler.register_wm_subscriber(old_receiver, "decode-session")
+        key = tuple(str(info) for info in bootstrap_infos)
+        self.assertEqual(
+            handler._wm_subscribers[key],
+            (old_receiver, "decode-session", 1),
+        )
+        handler.register_wm_subscriber(new_receiver, "decode-session")
+
+        self.assertEqual(
+            list(handler._wm_subscribers.values()),
+            [(new_receiver, "decode-session", 2)],
+        )
+
+    def test_snapshot_returns_tokens_only_for_known_subscribers(self):
+        handler = self._make_handler()
+        known_infos = [{"rank_ip": "10.0.0.1", "rank_port": 1234}]
+        unknown_infos = [{"rank_ip": "10.0.0.9", "rank_port": 9999}]
+        receiver = SimpleNamespace(bootstrap_infos=known_infos)
+        handler.register_wm_subscriber(receiver, "decode-session")
+
+        tokens = handler.snapshot_wm_subscribers([known_infos, [], unknown_infos])
+
+        known_key = tuple(str(info) for info in known_infos)
+        self.assertEqual(tokens, [(known_key, 1)])
+
+    def test_unregister_current_token_leaves_healthy_subscriber(self):
+        handler = self._make_handler()
+        failed_infos = [{"rank_ip": "10.0.0.1", "rank_port": 1234}]
+        healthy_infos = [{"rank_ip": "10.0.0.2", "rank_port": 5678}]
+        failed_receiver = SimpleNamespace(bootstrap_infos=failed_infos)
+        healthy_receiver = SimpleNamespace(bootstrap_infos=healthy_infos)
+        handler.register_wm_subscriber(failed_receiver, "failed-session")
+        handler.register_wm_subscriber(healthy_receiver, "healthy-session")
+
+        tokens = handler.snapshot_wm_subscribers([failed_infos])
+        removed = handler.unregister_wm_subscribers(tokens)
+
+        self.assertEqual(removed, 1)
+        failed_key = tuple(str(info) for info in failed_infos)
+        healthy_key = tuple(str(info) for info in healthy_infos)
+        self.assertNotIn(failed_key, handler._wm_subscribers)
+        self.assertEqual(
+            list(handler._wm_subscribers.values()),
+            [(healthy_receiver, "healthy-session", 2)],
+        )
+        self.assertIn(healthy_key, handler._wm_subscribers)
+
+    def test_unregister_stale_token_preserves_reregistered_subscriber(self):
+        handler = self._make_handler()
+        bootstrap_infos = [{"rank_ip": "10.0.0.1", "rank_port": 1234}]
+        old_receiver = SimpleNamespace(bootstrap_infos=bootstrap_infos)
+        new_receiver = SimpleNamespace(bootstrap_infos=bootstrap_infos)
+        handler.register_wm_subscriber(old_receiver, "decode-session")
+        stale_tokens = handler.snapshot_wm_subscribers([bootstrap_infos])
+
+        handler.register_wm_subscriber(new_receiver, "decode-session")
+        removed = handler.unregister_wm_subscribers(stale_tokens)
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(
+            list(handler._wm_subscribers.values()),
+            [(new_receiver, "decode-session", 2)],
+        )
 
 
 class TestNixlStaging(CustomTestCase):

@@ -99,6 +99,8 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
+        self._wm_subscribers_lock = threading.Lock()
+        self._wm_next_generation = 0
         # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
         # arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
@@ -108,17 +110,56 @@ class DecodeStagingHandler:
         if receiver is None or not receiver.bootstrap_infos:
             return
         key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key in self._wm_subscribers:
-            return
-
-        self._wm_subscribers[key] = (receiver, session_id)
-        # Watermark state is per prefill session. Send the current value so a
-        # new session's first allocation cannot wait on a missed update.
+        # Receivers are request-scoped. Refresh an existing endpoint entry so
+        # watermark sends never retain a receiver from an earlier request.
+        with self._wm_subscribers_lock:
+            self._wm_next_generation += 1
+            self._wm_subscribers[key] = (
+                receiver,
+                session_id,
+                self._wm_next_generation,
+            )
+        # Watermark state is per prefill session. Send the current value after
+        # publishing the subscriber, but outside the registry lock so a slow
+        # endpoint cannot block registration or failure cleanup.
         self._send_watermark(
             receiver,
             session_id,
             self.staging_allocator.get_watermark(),
         )
+
+    def snapshot_wm_subscribers(self, bootstrap_info_groups) -> list:
+        """Snapshot generation tokens for known watermark subscribers."""
+        keys = [
+            tuple(str(bootstrap_info) for bootstrap_info in bootstrap_infos)
+            for bootstrap_infos in bootstrap_info_groups
+            if bootstrap_infos
+        ]
+        with self._wm_subscribers_lock:
+            return [
+                (key, self._wm_subscribers[key][2])
+                for key in keys
+                if key in self._wm_subscribers
+            ]
+
+    def unregister_wm_subscribers(self, subscriber_tokens) -> int:
+        """Remove watermark subscribers whose generations still match."""
+        removed = 0
+        with self._wm_subscribers_lock:
+            for key, generation in subscriber_tokens:
+                subscriber = self._wm_subscribers.get(key)
+                if subscriber is None or subscriber[2] != generation:
+                    continue
+                _receiver, session_id, _generation = self._wm_subscribers.pop(key)
+                removed += 1
+                logger.info(
+                    "[STAGING] removed watermark subscriber key=%s "
+                    "session=%s generation=%s",
+                    key,
+                    session_id,
+                    generation,
+                )
+        return removed
 
     def num_writers_for(self, receiver) -> int:
         """Compute all TP and PP writers expected for a staging chunk."""
@@ -457,7 +498,9 @@ class DecodeStagingHandler:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
-        for receiver, session_id in list(self._wm_subscribers.values()):
+        with self._wm_subscribers_lock:
+            subscribers = list(self._wm_subscribers.values())
+        for receiver, session_id, _generation in subscribers:
             self._send_watermark(receiver, session_id, post_wm)
 
     @staticmethod
